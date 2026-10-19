@@ -145,7 +145,12 @@ impl Rig {
             .unwrap()
     }
     fn fill(&self, count: u64) {
-        *self.runner.entries.lock().unwrap()=(0..count).map(|n|ReadMessage::new(n,format!("m{n}"),json!({"info":{"id":format!("m{n}"),"role":if n%2==0{"user"}else{"assistant"},"time":{"created":1}},"parts":[{"id":format!("p{n}"),"type":"text","text":format!("message {n} ")+&"durable words ".repeat(16)}]})).with_tags(vec![tags::PartTag::tagged(format!("p{n}"),format!("§{}§",100+n*3))])).collect();
+        *self.runner.entries.lock().unwrap()=(0..count).map(|n| {
+            let part=if n%5>0 && n%5<4 {
+                json!({"id":format!("p{n}"),"type":"tool","tool":"read","callID":format!("call{n}"),"state":{"status":"completed","input":{"path":format!("file{n}")},"output":"exact spent output ".repeat(500)}})
+            } else {json!({"id":format!("p{n}"),"type":"text","text":format!("message {n} ")+&"durable words ".repeat(16)})};
+            ReadMessage::new(n,format!("m{n}"),json!({"info":{"id":format!("m{n}"),"role":if n%5==0{"user"}else{"assistant"},"time":{"created":1}},"parts":[part]})).with_tags(vec![tags::PartTag::tagged(format!("p{n}"),format!("§{}§",100+n*3))])
+        }).collect();
     }
     async fn notice(&self, seq: u64, size: u64, applied: Option<u64>) {
         let last = self.runner.entries.lock().unwrap().last().cloned().unwrap();
@@ -185,6 +190,27 @@ impl Rig {
     }
     fn newest(&self) -> Option<u64> {
         self.state().published_engine.keys().next_back().copied()
+    }
+    fn history(&self, end: u64, content: &str) {
+        let namespace = self.state().namespace();
+        let store = self.h.store.get().unwrap();
+        store
+            .replace_compartments(
+                &namespace,
+                &[mc_store::StoredCompartment {
+                    sequence: 1,
+                    start_message: 0,
+                    end_message: end as i64,
+                    end_message_id: format!("m{end}#0"),
+                    title: "history".into(),
+                    content: content.into(),
+                    p1: Some(content.into()),
+                    importance: 50,
+                    ..Default::default()
+                }],
+            )
+            .unwrap();
+        store.arm_soft_refresh(&namespace).unwrap();
     }
     async fn get(&self, version: u64) -> view::CompactionView {
         let answer = self
@@ -237,10 +263,13 @@ impl Rig {
                                 None => {
                                     let mut part = part.clone();
                                     if let Some(tag) = &row.tag {
-                                        part["text"] = json!(format!(
-                                            "{tag} {}",
-                                            part["text"].as_str().unwrap()
-                                        ));
+                                        let pointer = if part["type"] == "tool" {
+                                            "/state/output"
+                                        } else {
+                                            "/text"
+                                        };
+                                        let text = part.pointer_mut(pointer).unwrap();
+                                        *text = json!(format!("{tag} {}", text.as_str().unwrap()));
                                     }
                                     rendered.push(part);
                                 }
@@ -345,11 +374,20 @@ async fn defer_never_publishes_and_runner_tags_are_not_allocated() {
             .collect::<BTreeSet<_>>(),
         (0..40).map(|n| 100 + n * 3).collect()
     );
-    rig.notice(2, 90_000, None).await;
+    rig.history(20, "first completed historian summary");
+    rig.notice(2, 1_000, None).await;
+    let baseline = rig.newest().expect("new history publishes");
+    let binding = rig.h.facade_binding(7).unwrap();
+    assert!(rig.h.async_reduce(&binding, &[163, 166, 169]).await.is_ok());
+    rig.notice(3, 90_000, Some(baseline)).await;
     let version = rig.newest().expect("execute threshold publishes");
+    assert!(
+        version > baseline,
+        "queued reductions publish at execute threshold"
+    );
     let view = rig.get(version).await;
     let bytes = rig.render(&view);
-    rig.notice(3, 1000, Some(version)).await;
+    rig.notice(4, 1000, Some(version)).await;
     assert_eq!(rig.newest(), Some(version));
     assert_eq!(
         rig.render(&view),
@@ -363,7 +401,13 @@ async fn long_session_history_ride_ceiling_resync_and_restart() {
     let dir = tempfile::tempdir().unwrap();
     let rig = Rig::new(dir.path()).await;
     rig.fill(40);
-    rig.notice(1, 90_000, None).await;
+    rig.notice(1, 1_000, None).await;
+    rig.history(20, "initial historian summary");
+    rig.notice(2, 1_000, None).await;
+    let baseline = rig.newest().expect("initial history publication");
+    let binding = rig.h.facade_binding(7).unwrap();
+    assert!(rig.h.async_reduce(&binding, &[163, 166, 169]).await.is_ok());
+    rig.notice(3, 90_000, Some(baseline)).await;
     let first = rig.newest().unwrap();
     let _ = rig.render(&rig.get(first).await);
     let namespace = rig.state().namespace();
@@ -385,15 +429,16 @@ async fn long_session_history_ride_ceiling_resync_and_restart() {
         )
         .unwrap();
     store.arm_soft_refresh(&namespace).unwrap();
-    rig.notice(2, 1000, Some(first)).await;
+    rig.notice(4, 1000, Some(first)).await;
     let history = rig.newest().unwrap();
     assert!(history > first);
     let view = rig.get(history).await;
     let _ = rig.render(&view);
+    rig.history(20, "queued summary rides cache expiry");
     let ride = rig.ride("ttl_expired").await.expect("cache rebuild ride");
     assert!(ride.view_version > history);
     let _ = rig.render(&ride);
-    store.arm_soft_refresh(&namespace).unwrap();
+    rig.history(20, "queued summary rides ceiling");
     let ceiling = rig.ride("ceiling").await.expect("ceiling view");
     let _ = rig.render(&ceiling);
     let policy = CeilingPolicy::new(0.95, 10).with_on_overflow();
@@ -410,7 +455,7 @@ async fn long_session_history_ride_ceiling_resync_and_restart() {
     );
     *rig.runner.lineage.lock().unwrap() = "reverted".into();
     rig.fill(10);
-    rig.notice(3, 1000, None).await;
+    rig.notice(5, 1000, None).await;
     let restored = rig.newest().unwrap();
     assert!(restored > ceiling.view_version);
     assert_eq!(rig.get(restored).await.lineage_id, "reverted");
@@ -495,4 +540,65 @@ fn part_edit_bytes_participate_in_digest() {
     }
     assert_ne!(view.digest, independent_digest(&changed));
     assert!(changed.check().is_err());
+}
+
+#[tokio::test]
+async fn threshold_without_reclaimable_work_never_publishes() {
+    let dir = tempfile::tempdir().unwrap();
+    let rig = Rig::new(dir.path()).await;
+    rig.fill(40);
+    for entry in rig.runner.entries.lock().unwrap().iter_mut() {
+        entry.message["parts"] = json!([{"id":format!("p{}",entry.ordinal),"type":"text","text":format!("plain message {}",entry.ordinal)}]);
+    }
+    rig.notice(1, 90_000, None).await;
+    assert!(
+        rig.newest().is_none(),
+        "pressure alone grants no prefix mutation"
+    );
+}
+
+#[tokio::test]
+async fn versions_survive_provider_restart() {
+    let dir = tempfile::tempdir().unwrap();
+    let mut rig = Rig::new(dir.path()).await;
+    let reference = rig.reference.clone();
+    let first = rig
+        .h
+        .store
+        .get()
+        .unwrap()
+        .reserve_async_compaction_version(&reference, 0)
+        .unwrap();
+    rig.task.abort();
+    let _ = (&mut rig.task).await;
+    drop(rig);
+    let resumed = Rig::new(dir.path()).await;
+    let next = resumed
+        .h
+        .store
+        .get()
+        .unwrap()
+        .reserve_async_compaction_version(&reference, 0)
+        .unwrap();
+    assert!(
+        next > first,
+        "a restart must not reuse an allocated version"
+    );
+}
+
+#[tokio::test]
+async fn fork_descent_requires_recorded_digest() {
+    let dir = tempfile::tempdir().unwrap();
+    let rig = Rig::new(dir.path()).await;
+    rig.fill(40);
+    rig.notice(1, 1_000, None).await;
+    let state = rig.state();
+    let digest = contract::content_digest(&state.entries[&9].message);
+    assert_eq!(verified_descent(&state, &format!("L:9:{digest}")), Some(9));
+    assert_eq!(
+        verified_descent(&state, &format!("L:9:{}", "0".repeat(64))),
+        None,
+        "unverified descent must be a full resync"
+    );
+    assert_eq!(verified_descent(&state, &format!("other:9:{digest}")), None);
 }

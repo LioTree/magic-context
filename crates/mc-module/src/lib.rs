@@ -9438,11 +9438,14 @@ impl McHandler {
     }
 
     fn handle_session_flush_value(&self, channel: u16, request: &Value) -> HandlerOutcome {
-        let (session_id, _binding) =
-            match self.management_binding(channel, request, "session.flush") {
-                Ok(scope) => scope,
-                Err(outcome) => return outcome,
-            };
+        let (session_id, binding) = match self.management_binding(channel, request, "session.flush")
+        {
+            Ok(scope) => scope,
+            Err(outcome) => return outcome,
+        };
+        if let Some(outcome) = self.flush_async_compaction(&binding) {
+            return outcome;
+        }
         let store = match self.store.get() {
             Some(store) => store,
             None => return self.store_refusal(),
@@ -39853,6 +39856,7 @@ mod tests {
 
         let transcript: Vec<cortexkit_role_compaction_provider::status::StatusMessage> =
             serde_json::from_value(fixture["transcript"].clone()).unwrap();
+        let transcript = transcript.into_iter().map(Into::into).collect::<Vec<_>>();
         let mut scan = crate::providers::runner_todo::TodoScan::default();
         let derived = crate::providers::runner_todo::scan_status_messages(
             &mut scan,

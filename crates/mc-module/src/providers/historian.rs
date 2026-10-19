@@ -323,15 +323,18 @@ impl McHandler {
     }
 
     #[cfg(not(test))]
-    fn historian_settings_loader(&self) -> Box<dyn FnOnce(&Path) -> Value + Send> {
+    pub(super) fn historian_settings_loader(&self) -> Box<dyn FnOnce(&Path) -> Value + Send> {
         let resolver = crate::config_parity::TrustedConfigResolver::from_environment();
         Box::new(move |project_root| super::historian_config::trusted_settings(&resolver, project_root))
     }
 
     #[cfg(test)]
-    fn historian_settings_loader(&self) -> Box<dyn FnOnce(&Path) -> Value + Send> {
-        let settings=self.fixed_historian_settings.clone().unwrap_or_else(||json!({}));
-        Box::new(move |_|settings)
+    pub(super) fn historian_settings_loader(&self) -> Box<dyn FnOnce(&Path) -> Value + Send> {
+        let settings = self
+            .fixed_historian_settings
+            .clone()
+            .unwrap_or_else(|| json!({}));
+        Box::new(move |_| settings)
     }
 
     pub fn schedule_provider_historian(&self, binding: SessionBinding, key: Key) {

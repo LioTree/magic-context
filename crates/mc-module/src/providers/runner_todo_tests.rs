@@ -4,11 +4,11 @@ fn fixture() -> Value {
     serde_json::from_str(include_str!("../../testdata/runner-todo-transcript.json")).unwrap()
 }
 
-fn entries(value: &Value) -> Vec<compact::status::StatusMessage> {
+fn entries(value: &Value) -> Vec<codec::InboundMessage> {
     serde_json::from_value(value.clone()).unwrap()
 }
 
-fn entry(ordinal: u64, role: &str, content: Value) -> compact::status::StatusMessage {
+fn entry(ordinal: u64, role: &str, content: Value) -> codec::InboundMessage {
     serde_json::from_value(json!({
         "ordinal": ordinal,
         "mid": format!("m{ordinal}"),
@@ -17,7 +17,7 @@ fn entry(ordinal: u64, role: &str, content: Value) -> compact::status::StatusMes
     .unwrap()
 }
 
-fn todowrite(ordinal: u64, id: &str, todos: Value) -> compact::status::StatusMessage {
+fn todowrite(ordinal: u64, id: &str, todos: Value) -> codec::InboundMessage {
     entry(
         ordinal,
         "assistant",
@@ -25,12 +25,7 @@ fn todowrite(ordinal: u64, id: &str, todos: Value) -> compact::status::StatusMes
     )
 }
 
-fn outcome(
-    ordinal: u64,
-    id: &str,
-    output: Value,
-    is_error: bool,
-) -> compact::status::StatusMessage {
+fn outcome(ordinal: u64, id: &str, output: Value, is_error: bool) -> codec::InboundMessage {
     entry(
         ordinal,
         "tool",

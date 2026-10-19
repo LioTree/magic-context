@@ -121,7 +121,7 @@ impl TodoScan {
 pub(crate) fn scan_status_messages<'a>(
     scan: &mut TodoScan,
     lineage: &str,
-    entries: impl IntoIterator<Item = &'a compact::status::StatusMessage>,
+    entries: impl IntoIterator<Item = &'a codec::InboundMessage>,
 ) -> Result<Option<DerivedTodo>, HandlerOutcome> {
     let decoded = entries
         .into_iter()

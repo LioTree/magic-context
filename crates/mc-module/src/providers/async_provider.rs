@@ -51,13 +51,17 @@ pub(crate) struct Runtime {
 #[derive(Serialize, Deserialize)]
 pub(crate) struct AsyncRecord {
     #[serde(default)]
-    pub(crate) usage_policy: Option<Value>,
+    tag_index: BTreeMap<String, PartAddress>,
     #[serde(default)]
-    pub(crate) todo_scan: Option<Value>,
+    pub(crate) usage_policy: Option<super::usage_policy::UsagePolicyState>,
+    #[serde(default)]
+    pub(crate) todo_scan: Option<super::runner_todo::TodoScan>,
     #[serde(default)]
     pub(crate) runner_route: Option<Value>,
     #[serde(default)]
     pub(crate) dream_target: Option<Value>,
+    #[serde(default)]
+    pub(crate) reminder_cadence: Option<Value>,
     key: Key,
     runner_module: String,
     setup: compact::setup::SetupRequest,
@@ -76,6 +80,26 @@ pub(crate) struct AsyncRecord {
     generation: u64,
 }
 type State = AsyncRecord;
+
+#[derive(Serialize, Deserialize)]
+struct PartAddress {
+    ordinal: u64,
+    mid: String,
+    part: String,
+    digest: String,
+}
+
+fn verified_descent(state: &State, header: &str) -> Option<u64> {
+    let mut fields = header.rsplitn(3, ':');
+    let digest = fields.next()?;
+    let through = fields.next()?.parse::<u64>().ok()?;
+    let lineage = fields.next()?;
+    if state.lineage.as_deref() != Some(lineage) {
+        return None;
+    }
+    let entry = state.entries.get(&through)?;
+    (contract::content_digest(&entry.message) == digest).then_some(through)
+}
 
 impl State {
     fn reference(&self) -> String {
@@ -100,9 +124,11 @@ impl State {
             )
             .map_err(transient)
     }
-    fn reset(&mut self) -> Result<(), HandlerOutcome> {
+    fn reset(&mut self, store: &McStore) -> Result<(), HandlerOutcome> {
         self.resync = true;
         self.entries.clear();
+        self.tag_index.clear();
+        self.todo_scan = None;
         self.lineage = None;
         self.generation = self
             .generation
@@ -110,6 +136,10 @@ impl State {
             .ok_or_else(|| transient("async generation exhausted"))?;
         self.engine = transform::compaction::State::new(self.reference(), self.engine.preset);
         self.published_engine.clear();
+        self.save(store, &[])?;
+        store
+            .retire_unannounced_async_views(&self.reference())
+            .map_err(transient)?;
         Ok(())
     }
 }
@@ -235,10 +265,12 @@ impl McHandler {
         let chosen = preset(request.preset.as_deref())?;
         let mut engine = transform::compaction::State::new(reference.clone(), chosen);
         let mut state = State {
+            tag_index: BTreeMap::new(),
             usage_policy: None,
             todo_scan: None,
             runner_route: None,
             dream_target: None,
+            reminder_cadence: None,
             key,
             runner_module: match &binding.principal {
                 Some(subc_protocol::Principal::Reserved { module_id }) => module_id.clone(),
@@ -327,6 +359,13 @@ impl McHandler {
             })
             .collect::<Vec<_>>();
         codec.prepare_request(&mut template, &messages)?;
+        if let Some(policy) = &state.usage_policy {
+            template.emergency_recovery_armed = policy.emergency_recovery_armed;
+            if let Some(limit) = policy.limit_for(model) {
+                template.detected_context_limit = limit;
+                template.detected_context_limit_model_key = Some(model.into());
+            }
+        }
         let work = self.provider_work(channel, store, binding.clone(), state.key.clone())?;
         let mut context = compaction::producer_context(
             &work,
@@ -556,6 +595,11 @@ impl McHandler {
             store.pending_async_compaction_views().map_err(transient)?
         {
             let view: view::CompactionView = serde_json::from_str(&raw).map_err(transient)?;
+            if load(store, &reference)?.is_none_or(|state| {
+                state.resync || state.lineage.as_deref() != Some(&view.lineage_id)
+            }) {
+                continue;
+            }
             publisher
                 .publish(&notice::ViewReady::for_view(&view))
                 .await?;
@@ -597,11 +641,49 @@ impl McHandler {
         state = load(store, &notice.session_ref)?
             .ok_or_else(|| transient("async session disappeared"))?;
         let duplicate = notice.seq <= state.seq;
+        let mut descended = false;
+        if let Some(lineage) = message
+            .headers
+            .get("lineage_id")
+            .filter(|new| state.lineage.as_ref().is_some_and(|old| old != *new))
+        {
+            if let Some(through) = message
+                .headers
+                .get("descends_from")
+                .and_then(|header| verified_descent(&state, header))
+            {
+                let parent = state.lineage.clone().expect("held lineage");
+                state.entries.retain(|ordinal, _| *ordinal <= through);
+                state
+                    .tag_index
+                    .retain(|_, address| address.ordinal <= through);
+                state
+                    .engine
+                    .descend(lineage, &parent, through)
+                    .map_err(transient)?;
+                state.engine.last_applied = None;
+                state.lineage = Some(lineage.clone());
+                let retained = store
+                    .load_compartments(&state.namespace())
+                    .map_err(transient)?
+                    .into_iter()
+                    .filter(|row| row.end_message <= through as i64)
+                    .collect::<Vec<_>>();
+                store
+                    .replace_compartments(&state.namespace(), &retained)
+                    .map_err(transient)?;
+                descended = true;
+            } else {
+                state.reset(store)?;
+                state.save(store, &[])?;
+            }
+        }
         if !duplicate {
             state.applied = notice.applied_view_version;
             if let Some(applied) = state
                 .applied
                 .and_then(|version| state.published_engine.get(&version))
+                .filter(|view| Some(&view.range.lineage_id) == state.lineage.as_ref())
             {
                 state.engine.last_applied = Some(applied.clone());
             }
@@ -617,7 +699,7 @@ impl McHandler {
             state.conditions = Some(notice.to_headers());
         }
         let codec = codec::Codec::from_params(&Value::Object(state.setup.params.clone()))?;
-        let mut resynced = state.resync;
+        let mut resynced = state.resync || descended;
         for attempt in 0..2 {
             let from = state.entries.last_key_value().map_or(0, |(n, _)| *n);
             let read = self
@@ -634,16 +716,20 @@ impl McHandler {
                 state.resync = false;
                 break;
             }
-            state.reset()?;
+            state.reset(store)?;
             state.save(store, &[])?;
             resynced = true;
             if attempt == 1 {
-                return Err(transient(
-                    "async lineage is unstable; waiting for a matching notice",
-                ));
+                if let Err(error) = read {
+                    return Err(error);
+                }
+                tracing::warn!(session_ref=%notice.session_ref,"async digest mismatch; waiting for a matching notice");
+                return Ok(());
             }
         }
+        state.reindex()?;
         state.save(store, &tag_rows(&state, codec)?)?;
+        self.advance_async_policy(&mut state, &notice, codec)?;
         self.advance_async_reminders(&state.key, &notice).await?;
         if state.completed_seq < notice.seq || resynced {
             self.publish_async(0, &mut state, codec, resynced)?;
@@ -651,9 +737,7 @@ impl McHandler {
         state.completed_seq = state.seq;
         state.save(store, &[])?;
         drop(_serial);
-        if !duplicate {
-            self.schedule_async_historian(&state)?;
-        }
+        self.schedule_async_historian(&state)?;
         self.announce_async_views().await
     }
 
@@ -696,7 +780,11 @@ impl McHandler {
             {
                 return Err(transient("async transcript shortened"));
             }
-            let mut expected = from;
+            let mut expected = if state.entries.is_empty() && from == 0 {
+                entries.first().map_or(0, |entry| entry.ordinal.min(1))
+            } else {
+                from
+            };
             for entry in entries {
                 if entry.ordinal != expected {
                     return Err(transient("async transcript gap"));
@@ -772,17 +860,13 @@ impl McHandler {
         let status = transform::compaction::Status {
             lineage_id: state.lineage.clone().unwrap_or_default(),
             newest_ordinal: state.entries.last_key_value().map(|(n, _)| *n),
-            previous_usage: notice.last_usage.as_ref().map(|u| {
-                transform::compaction::PreviousUsage {
-                    input_tokens: Some(u.input),
-                    cached_input_tokens: Some(u.cache_read),
-                    cache_write_tokens: Some(u.cache_write),
-                }
-            }),
+            previous_usage: None,
             request_tokens: notice.est_tokens,
-            context_window: notice
-                .window
-                .or(state.setup.context_window)
+            context_window: state
+                .usage_policy
+                .as_ref()
+                .and_then(|policy| policy.limit_for(&notice.model))
+                .or(notice.window.or(state.setup.context_window))
                 .ok_or_else(|| invalid("window unknown"))?,
             prefix_rebuilding: ride,
             pipeline_switch: false,
@@ -801,14 +885,6 @@ impl McHandler {
             initial,
         )?;
         state.engine = engine;
-        #[cfg(test)]
-        eprintln!(
-            "async result {} {} {} {:?}",
-            state.namespace(),
-            notice.est_tokens,
-            output.prefix_bust_permitted,
-            output.answer
-        );
         let transform::compaction::Answer::Replacement(candidate) = output.answer else {
             return Ok(None);
         };
@@ -941,7 +1017,7 @@ impl McHandler {
                 .await
                 .is_err()
             {
-                state.reset()?;
+                state.reset(store)?;
                 state.save(store, &[])?;
                 return bytes(&ride::RideAnswer::nothing());
             }
@@ -1105,6 +1181,8 @@ impl McHandler {
             key: state.key.clone(),
             serial: Arc::clone(&self.provider_serial),
         });
+        let reference = state.reference();
+        let namespace = state.namespace();
         tokio::spawn(async move {
             let prepare = worker.clone();
             let result = tokio::task::spawn_blocking(move || {
@@ -1130,7 +1208,14 @@ impl McHandler {
             .await;
             match result {
                 Ok(Ok(PreparedHistorianAction::FireReady(prepared))) => {
-                    worker.spawn_historian_firing(prepared.task)
+                    let completion = worker.live_historian_completion_wait(&namespace);
+                    worker.spawn_historian_firing(prepared.task);
+                    if let Some(completion) = completion {
+                        completion.await;
+                    }
+                    if let Err(error) = worker.publish_async_wake(&reference).await {
+                        tracing::warn!(?error, "async historian view publication failed");
+                    }
                 }
                 Ok(Ok(_)) => {}
                 Ok(Err(error)) => tracing::warn!(?error, "async historian evaluation failed"),
@@ -1140,7 +1225,168 @@ impl McHandler {
         Ok(())
     }
 
-    fn async_historian_fields(&self, _state: &State) -> Value {
-        json!({})
+    fn async_historian_fields(&self, state: &State) -> Value {
+        let settings = self.historian_settings_loader()(&state.key.project);
+        Value::Object(
+            super::historian_config::resolve(&settings, &state.key.harness).request_fields(),
+        )
+    }
+}
+
+impl McHandler {
+    fn advance_async_policy(
+        &self,
+        state: &mut State,
+        notice: &notice::AdvanceNotice,
+        codec: codec::Codec,
+    ) -> Result<(), HandlerOutcome> {
+        let conditions = super::usage_policy::UsageConditions {
+            est_tokens: notice.est_tokens,
+            window: notice.window.or(state.setup.context_window).unwrap_or(0),
+            model: notice.model.clone(),
+            last_usage: notice
+                .last_usage
+                .as_ref()
+                .map(|usage| super::usage_policy::LastUsage {
+                    input: Some(usage.input),
+                    cache_read: Some(usage.cache_read),
+                    cache_write: Some(usage.cache_write),
+                    output: Some(usage.output),
+                    completed_at: None,
+                    finish_reason: None,
+                }),
+            provider_error: None,
+        };
+        let (policy, _) = super::usage_policy::advance(
+            &state.usage_policy.clone().unwrap_or_default(),
+            &conditions,
+            state.engine.preset == transform::compaction::Preset::Head,
+        );
+        state.usage_policy = Some(policy);
+        let mut scan = state.todo_scan.clone().unwrap_or_default();
+        let messages = state
+            .entries
+            .values()
+            .map(|entry| {
+                codec.decode_message(&InboundMessage {
+                    ordinal: entry.ordinal,
+                    mid: entry.mid.clone(),
+                    message: entry.message.clone(),
+                    raw_message: None,
+                })
+            })
+            .collect::<Result<Vec<_>, _>>()?;
+        if let Some(todo) = scan.advance(state.lineage.as_deref().unwrap_or_default(), &messages) {
+            self.store
+                .get()
+                .ok_or_else(|| transient("store unavailable"))?
+                .set_todo_state(
+                    &state.namespace(),
+                    &todo.state_json,
+                    &todo.owner_message_id,
+                    &todo.state_hash,
+                )
+                .map_err(transient)?;
+        }
+        state.todo_scan = Some(scan);
+        Ok(())
+    }
+}
+
+impl AsyncRecord {
+    fn reindex(&mut self) -> Result<(), HandlerOutcome> {
+        let mut index = BTreeMap::new();
+        for entry in self.entries.values() {
+            let native = parts(&entry.message)?;
+            if native.len() != entry.tags.len() {
+                return Err(invalid_field(
+                    "tags",
+                    "one row per exposed part is required",
+                ));
+            }
+            let mut keys = BTreeSet::new();
+            for (part, row) in native.iter().zip(&entry.tags) {
+                if row.part.is_empty() || row.part.len() > 256 || !keys.insert(&row.part) {
+                    return Err(invalid_field(
+                        "tags",
+                        "part keys must be distinct, nonempty and at most 256 bytes",
+                    ));
+                }
+                if let Some(tag) = &row.tag {
+                    if tags::parse_tag(tag).is_none() {
+                        return Err(invalid_field("tags", "malformed runner tag"));
+                    }
+                    let address = PartAddress {
+                        ordinal: entry.ordinal,
+                        mid: entry.mid.clone(),
+                        part: row.part.clone(),
+                        digest: contract::content_digest(part),
+                    };
+                    if index.insert(tag.clone(), address).is_some() {
+                        return Err(invalid_field("tags", "runner reused a tag"));
+                    }
+                }
+            }
+        }
+        self.tag_index = index;
+        Ok(())
+    }
+}
+
+impl McHandler {
+    async fn publish_async_wake(&self, reference: &str) -> Result<(), HandlerOutcome> {
+        let store = self
+            .store
+            .get()
+            .ok_or_else(|| transient("store unavailable"))?;
+        let Some(mut state) = load(store, reference)? else {
+            return Ok(());
+        };
+        let _serial = self.provider_serial.lock_for(&state.key).await;
+        state = load(store, reference)?.ok_or_else(|| transient("async session disappeared"))?;
+        let codec = codec::Codec::from_params(&Value::Object(state.setup.params.clone()))?;
+        self.publish_async(0, &mut state, codec, false)?;
+        state.save(store, &[])?;
+        drop(_serial);
+        self.announce_async_views().await
+    }
+
+    pub(crate) fn flush_async_compaction(
+        &self,
+        binding: &SessionBinding,
+    ) -> Option<HandlerOutcome> {
+        if binding.harness != session_resolver::RUNNER_BIND_HARNESS {
+            return None;
+        }
+        let store = self.store.get()?;
+        let rows = match store
+            .async_compaction_for_session(&binding.project_root.to_string_lossy(), &binding.session)
+        {
+            Ok(rows) => rows,
+            Err(error) => return Some(transient(error)),
+        };
+        if rows.is_empty() {
+            return None;
+        }
+        if rows.len() != 1 {
+            return Some(session_unresolved_error());
+        }
+        let state: State = match serde_json::from_str(&rows[0]) {
+            Ok(state) => state,
+            Err(error) => return Some(transient(error)),
+        };
+        match store.arm_soft_refresh(&state.namespace()) {
+            Ok(armed) => {
+                let worker = self.provider_historian_worker();
+                let reference = state.reference();
+                tokio::spawn(async move {
+                    if let Err(error) = worker.publish_async_wake(&reference).await {
+                        tracing::warn!(?error, "async flush view publication failed");
+                    }
+                });
+                Some(respond(json!({"ok":true,"armed":armed})))
+            }
+            Err(error) => Some(transient(error)),
+        }
     }
 }
