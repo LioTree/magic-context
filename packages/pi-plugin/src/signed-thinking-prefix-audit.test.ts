@@ -349,7 +349,8 @@ async function fixture(
 			hasPiParkedBustTrigger(sessionId),
 			!!prefixRecord?.first_kept &&
 				!!firstKept &&
-				servedMessageDigest(firstKept) === prefixRecord.first_kept.digest,
+				servedMessageDigest(firstKept, prefixRecord.provenance) ===
+					prefixRecord.first_kept.digest,
 		);
 		return { messages: output, bustedThisPass };
 	};
@@ -971,7 +972,9 @@ it(
 				const record = readServedPrefix(f.db, f.sessionId);
 				const actual = record && served[record.head.length];
 				expect(!!record?.first_kept && !!actual).toBe(true);
-				expect(record?.first_kept?.digest).toBe(servedMessageDigest(actual));
+				expect(record?.first_kept?.digest).toBe(
+					servedMessageDigest(actual, record!.provenance),
+				);
 			};
 			checkStored(f.served);
 			const firstKept = before.findIndex((message) =>

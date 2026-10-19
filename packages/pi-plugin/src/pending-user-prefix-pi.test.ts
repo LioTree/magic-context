@@ -9,7 +9,7 @@ import {
 	setHarness,
 } from "@magic-context/core/shared/harness";
 import * as tagTranscriptModule from "@magic-context/core/shared/tag-transcript";
-import { servedMessageDigest } from "../../plugin/src/hooks/magic-context/__tests__/served-prefix-evidence";
+import { wholeMessageDigest } from "../../plugin/src/hooks/magic-context/__tests__/served-prefix-evidence";
 import {
 	clearContextHandlerSession,
 	registerPiContextHandler,
@@ -183,7 +183,7 @@ it("OMP pending-user certificate replays a native-id tool loop byte-identically 
 	expect(f.record.turn).toStartWith("pi-msg-");
 	expect(f.record.pending_user).toEqual({
 		id: f.record.turn,
-		digest: servedMessageDigest(f.initial.at(-1)),
+		digest: wholeMessageDigest(f.initial.at(-1)),
 		branch_cursor: "prior",
 		branch_path: ["root", "history", "prior"],
 	});

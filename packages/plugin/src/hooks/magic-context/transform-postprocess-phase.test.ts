@@ -309,6 +309,10 @@ async function runPostTransformPhase(args: Parameters<typeof runUnfinalizedPostT
     return result;
 }
 
+// Production records the request's model in the provenance, and the first-kept
+// digest binds it, so a seeded record must name the model the test passes run on.
+const SEEDED_PREFIX_MODEL = { provider: "anthropic", id: "claude-opus-5-5" };
+
 function seedHeldServedPrefix(
     db: Database,
     sessionId: string,
@@ -328,6 +332,7 @@ function seedHeldServedPrefix(
             id_space: "opencode-v1-message",
             generation: "v1",
             projection: "messages",
+            model: SEEDED_PREFIX_MODEL,
         },
     });
 }
@@ -14152,6 +14157,7 @@ it("served prefix replay keeps the summary and does not consume a pending marker
             id_space: "opencode-v1-message",
             generation: "v1",
             projection: "messages",
+            model: SEEDED_PREFIX_MODEL,
         },
         cut: { mode: "inclusive", id: "covered" },
     });

@@ -2365,6 +2365,7 @@ export async function runPostTransformPhase(
         id_space: args.opencode2 ? "opencode-v2-message" : "opencode-v1-message",
         generation: args.opencode2 ? "v2" : "v1",
         projection: "messages",
+        model: { provider: args.resolvedProviderID, id: args.resolvedModelID },
     };
     const prefixSourceIds = new Set(
         (
@@ -4022,6 +4023,7 @@ export async function runPostTransformPhase(
                               prefixRecord,
                               args.messages,
                               (message) => message.info.id,
+                              prefixProvenance,
                           );
             }
             const candidateHead = !activeThinkingPrefixHold
@@ -5538,6 +5540,7 @@ export async function runPostTransformPhase(
                               prefixRecord,
                               args.messages,
                               (message) => message.info.id,
+                              prefixProvenance,
                           )
                         : null;
                 if (activeThinkingPrefixHold) {
