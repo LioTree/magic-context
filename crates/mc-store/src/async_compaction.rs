@@ -485,3 +485,102 @@ impl<'a> AsyncCompactionSave<'a> {
         })).map_err(McStoreError::from))
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use cortexkit_store_types::{Isolation, StorageBackend, StorageDescriptor};
+    use std::time::Instant;
+
+    fn entry(n: u64) -> (String, String) {
+        let output = if n % 997 == 3 {
+            "large spent tool output line\n".repeat(7_000)
+        } else if n % 101 == 7 {
+            "medium spent tool output line\n".repeat(1_100)
+        } else {
+            "spent tool output line\n".repeat(52)
+        };
+        let entry = serde_json::json!({"ordinal":n,"mid":format!("m{n}"),"message":{"info":{"id":format!("m{n}"),"role":"assistant"},"parts":[{"id":format!("p{n}"),"type":"tool","state":{"output":output}}]}});
+        let index = serde_json::json!([[format!("§{}§", 100 + n * 2), "0", "0".repeat(64)]]);
+        (entry.to_string(), index.to_string())
+    }
+
+    fn tag(namespace_tag: u64) -> McTagRow {
+        McTagRow {
+            tag_number: namespace_tag as i64,
+            block_id: format!("m{namespace_tag}#0"),
+            kind: "tool_result".into(),
+            token_count: 300,
+            created_at_ms: 1,
+            source_bytes: "spent tool output line\n".repeat(52).into_bytes().into(),
+        }
+    }
+
+    /// Time one ordinary notice's write transaction (small record, four new
+    /// entries with their tag rows, retention) against a conversation of
+    /// 1k-150k stored entries, without the provider's engine in the process.
+    /// Sizes come from `MC_ASYNC_STORE_SIZES`.
+    #[test]
+    #[ignore = "write-transaction scaling benchmark; run explicitly with --ignored --nocapture"]
+    fn notice_write_transaction_scaling_benchmark() {
+        let sizes = std::env::var("MC_ASYNC_STORE_SIZES")
+            .unwrap_or_else(|_| "1000,10000,50000,150000".into())
+            .split(',')
+            .map(|size| size.trim().parse::<u64>().unwrap())
+            .collect::<Vec<_>>();
+        println!("| stored entries | median notice write tx ms | p90 ms | store.db bytes |");
+        println!("|---:|---:|---:|---:|");
+        for size in sizes {
+            let dir = tempfile::tempdir().unwrap();
+            let path = dir.path().join("store.db");
+            let store = McStore::open(&StorageDescriptor {
+                module_id: "magic-context".into(),
+                storage_namespace: "mc_cache".into(),
+                isolation: Isolation::Module,
+                backend: StorageBackend::Sqlite {
+                    path: path.to_string_lossy().into_owned(),
+                },
+            })
+            .unwrap();
+            let state = "{\"record\":\"".to_string() + &"x".repeat(5_800) + "\"}";
+            let key = "[\"project\",\"s\",\"opencode\"]";
+            for chunk in (0..size).collect::<Vec<_>>().chunks(5_000) {
+                let tags = chunk.iter().map(|n| tag(100 + n * 2)).collect::<Vec<_>>();
+                let mut save = store.async_compaction_save("ref", key, "s", &state);
+                save.tags("engine", &tags);
+                for n in chunk {
+                    let (entry, index) = entry(*n);
+                    save.append_entry(*n, entry, index);
+                }
+                save.commit().unwrap();
+            }
+            let view = "v".repeat(size as usize * 1_200);
+            store
+                .save_async_compaction_view("ref", 1, &view, &view)
+                .unwrap();
+            let mut times = Vec::new();
+            for notice in 0..25u64 {
+                let first = size + notice * 4;
+                let tags = (first..first + 4)
+                    .map(|n| tag(100 + n * 2))
+                    .collect::<Vec<_>>();
+                let mut save = store.async_compaction_save("ref", key, "s", &state);
+                save.tags("engine", &tags).retain_views_from(1);
+                for n in first..first + 4 {
+                    let (entry, index) = entry(n);
+                    save.append_entry(n, entry, index);
+                }
+                let started = Instant::now();
+                save.commit().unwrap();
+                times.push(started.elapsed().as_secs_f64() * 1e3);
+            }
+            times.sort_by(f64::total_cmp);
+            let bytes = std::fs::metadata(&path).unwrap().len();
+            println!(
+                "| {size} | {:.3} | {:.3} | {bytes} |",
+                times[times.len() / 2],
+                times[times.len() * 9 / 10]
+            );
+        }
+    }
+}
