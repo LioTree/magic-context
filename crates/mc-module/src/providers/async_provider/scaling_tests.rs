@@ -15,7 +15,7 @@ use cortexkit_bus_inmemory::{InMemoryBus, InMemoryConfig};
 pub(super) mod save_meter {
     use std::collections::BTreeMap;
     use std::sync::Mutex;
-    use std::time::Instant;
+    use std::time::{Duration, Instant};
 
     #[derive(Clone, Copy, Debug, Default)]
     pub struct SaveStats {
@@ -30,7 +30,9 @@ pub(super) mod save_meter {
         reference: String,
         kind: &'static str,
         wall: Instant,
-        cpu: cpu_time::ThreadTime,
+        // Thread CPU at start, kept as a plain duration so a timer held
+        // across an await stays `Send`.
+        cpu: Duration,
     }
 
     pub fn start(reference: &str) -> Timer {
@@ -42,7 +44,7 @@ pub(super) mod save_meter {
             kind,
             reference: reference.into(),
             wall: Instant::now(),
-            cpu: cpu_time::ThreadTime::now(),
+            cpu: cpu_time::ThreadTime::now().as_duration(),
         }
     }
 
@@ -54,7 +56,10 @@ pub(super) mod save_meter {
                 .or_default();
             stats.saves += 1;
             stats.wall_nanos += self.wall.elapsed().as_nanos() as u64;
-            stats.cpu_nanos += self.cpu.elapsed().as_nanos() as u64;
+            stats.cpu_nanos += cpu_time::ThreadTime::now()
+                .as_duration()
+                .saturating_sub(self.cpu)
+                .as_nanos() as u64;
         }
     }
 
@@ -596,6 +601,40 @@ fn row(label: &str, size: u64, sample: &Sample) -> String {
     line
 }
 
+const PHASES: [&str; 8] = [
+    "load",
+    "phase:read",
+    "phase:index",
+    "phase:policy",
+    "phase:publish",
+    "phase:reminders",
+    "phase:cadence",
+    "phase:historian",
+];
+
+fn phase_stats(reference: &str) -> Vec<save_meter::SaveStats> {
+    PHASES
+        .iter()
+        .map(|kind| save_meter::read_kind(reference, kind))
+        .collect()
+}
+
+/// Thread-CPU milliseconds and call counts per notice phase since `before`.
+fn phases(reference: &str, before: &[save_meter::SaveStats]) -> String {
+    PHASES
+        .iter()
+        .zip(phase_stats(reference).iter().zip(before))
+        .map(|(kind, (now, then))| {
+            format!(
+                "{kind}={:.1}ms/{}",
+                (now.cpu_nanos - then.cpu_nanos) as f64 / 1e6,
+                now.saves - then.saves
+            )
+        })
+        .collect::<Vec<_>>()
+        .join(" ")
+}
+
 fn median(mut samples: Vec<Sample>) -> Sample {
     samples.sort_by(|a, b| a.save_wall_ms.total_cmp(&b.save_wall_ms));
     samples[samples.len() / 2]
@@ -636,11 +675,16 @@ async fn storage_scaling_benchmark() {
             .map(|(_, size)| *size as u64)
             .sum::<u64>();
         let mut notices = Vec::new();
+        let before = phase_stats(&rig.reference);
         for _ in 0..5 {
             rig.append(4);
             notices.push(rig.notice(1_000, Some(version)).await);
         }
         table.push(row("notice (+4 msgs)", size, &median(notices)));
+        eprintln!(
+            "phases over 5 notices at {size}: {}",
+            phases(&rig.reference, &before)
+        );
         let (record, entries) = rig.record_bytes();
         let (view_rows, view_bytes) = rig.views();
         let (answer, get) = rig

@@ -1483,6 +1483,8 @@ impl McHandler {
         }
         let codec = codec::Codec::from_params(&Value::Object(state.setup.params.clone()))?;
         let mut resynced = state.resync || descended;
+        #[cfg(test)]
+        let phase = scaling_tests::save_meter::start_kind(&notice.session_ref, "phase:read");
         for attempt in 0..2 {
             let from = state.entries.last_key_value().map_or(0, |(n, _)| *n);
             let read = self
@@ -1508,11 +1510,23 @@ impl McHandler {
                 return Ok(());
             }
         }
+        #[cfg(test)]
+        drop(phase);
+        #[cfg(test)]
+        let phase = scaling_tests::save_meter::start_kind(&notice.session_ref, "phase:index");
         state.reindex()?;
         state.restore_sources(store, codec)?;
         let rows = state.unsaved_tag_rows(codec)?;
         state.save(store, &rows)?;
+        #[cfg(test)]
+        drop(phase);
+        #[cfg(test)]
+        let phase = scaling_tests::save_meter::start_kind(&notice.session_ref, "phase:policy");
         self.advance_async_policy(&mut state, &notice, codec)?;
+        #[cfg(test)]
+        drop(phase);
+        #[cfg(test)]
+        let phase = scaling_tests::save_meter::start_kind(&notice.session_ref, "phase:publish");
         let pending_before = store
             .load_pending_agent_drops(&state.namespace())
             .map_err(transient)?
@@ -1526,14 +1540,28 @@ impl McHandler {
             .map_err(transient)?
             .len()
             < pending_before;
+        #[cfg(test)]
+        drop(phase);
+        #[cfg(test)]
+        let phase = scaling_tests::save_meter::start_kind(&notice.session_ref, "phase:reminders");
         self.advance_async_reminders(&mut state, &notice, codec, drops_applied)
             .await?;
+        #[cfg(test)]
+        drop(phase);
+        #[cfg(test)]
+        let phase = scaling_tests::save_meter::start_kind(&notice.session_ref, "phase:cadence");
         let historian_due = self.advance_async_historian_cadence(&mut state, codec)?;
         state.save(store, &[])?;
         drop(_serial);
+        #[cfg(test)]
+        drop(phase);
+        #[cfg(test)]
+        let phase = scaling_tests::save_meter::start_kind(&notice.session_ref, "phase:historian");
         if historian_due {
             self.schedule_async_historian(&state)?;
         }
+        #[cfg(test)]
+        drop(phase);
         self.announce_async_views().await
     }
 
