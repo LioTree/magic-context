@@ -1,5 +1,5 @@
-//! The historian's model chain, per-model limits, variants, timeout and output cap,
-//! resolved from ck-mc's own config.
+//! The historian's model chain, variants, timeout and output cap, resolved from
+//! ck-mc's own config, with model context/output limits filled from Fusiform.
 //!
 //! A host bridge that synchronizes its state sends the chain with `state_sync`, and a
 //! conversation that has received one keeps using it. A conversation nobody sends a
@@ -10,19 +10,26 @@
 //! (`packages/plugin/src/shared/historian-config-resolution.test.ts`, which also
 //! fails when the TypeScript side drifts from it), and the tests below compare
 //! against it.
-use std::collections::BTreeMap;
-use std::path::Path;
+use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
+use std::path::{Path, PathBuf};
+use std::sync::{Arc, Mutex};
+use std::time::{Duration, Instant};
 
 use serde_json::{json, Map, Value};
+use subc_client_rs::{CallError, CallOptions, CloseRouteOptions, ConsumerOptions, SubcConsumer};
+use subc_protocol::BindIdentity;
 
 use crate::config_parity::{ConfigResolveRequest, CoreConfigResolver};
 use crate::historian::HistorianModelLimits;
+use crate::route_targets::{RegisteredRoute, RouteTargetConfig};
 use mc_store::parity_schema_manifest::{CapabilityResult, Generation};
 
 /// The per-attempt historian timeout when the config sets none. It must equal the
 /// plugin's default, `DEFAULT_HISTORIAN_TIMEOUT_MS` in
 /// packages/plugin/src/config/schema/magic-context.ts:20.
 const DEFAULT_HISTORIAN_TIMEOUT_MS: u64 = 600_000;
+const FUSIFORM_LIMITS_CACHE_TTL: Duration = Duration::from_secs(60 * 60);
+const FUSIFORM_LOOKUP_TIMEOUT: Duration = Duration::from_secs(2);
 
 /// Counter recorded on a provider conversation once a host has sent a historian chain
 /// with `state_sync`. From then on the conversation keeps using the host's chain,
@@ -78,6 +85,331 @@ impl ConfiguredHistorian {
         }
         fields
     }
+}
+
+/// Process-local Fusiform limits cache. A provider-scoped catalog read is used when
+/// several configured models share a provider; a named read keeps single-model
+/// lookups precise, including Fusiform's `no_coverage` and `retired` disclosures.
+pub(crate) struct HistorianModelCatalog {
+    connection_file: Option<PathBuf>,
+    route_targets: RouteTargetConfig,
+    cache: Mutex<HashMap<String, CachedModelLimits>>,
+    fetch_locks: Mutex<HashMap<String, Arc<tokio::sync::Mutex<()>>>>,
+    warned: Mutex<HashSet<String>>,
+}
+
+#[derive(Clone)]
+struct CachedModelLimits {
+    fetched_at: Instant,
+    reply: CatalogModelLimits,
+}
+
+#[derive(Clone, Default)]
+struct CatalogModelLimits {
+    limits: BTreeMap<String, HistorianModelLimits>,
+    retired: BTreeSet<String>,
+}
+
+#[derive(Clone, Copy)]
+enum CatalogLookup<'a> {
+    Provider(&'a str),
+    Model { provider: &'a str, model: &'a str },
+}
+
+impl CatalogLookup<'_> {
+    fn cache_key(self) -> String {
+        match self {
+            Self::Provider(provider) => format!("provider:{provider}"),
+            Self::Model { provider, model } => format!("model:{provider}/{model}"),
+        }
+    }
+
+    fn arguments(self) -> Value {
+        match self {
+            Self::Provider(provider) => json!({
+                "provider_id": provider,
+                "fact_prefixes": ["limit."],
+            }),
+            Self::Model { provider, model } => json!({
+                "provider_id": provider,
+                "model_id": model,
+                "fact_prefixes": ["limit."],
+            }),
+        }
+    }
+}
+
+impl HistorianModelCatalog {
+    pub(crate) fn new(
+        connection_file: Option<PathBuf>,
+        route_targets: RouteTargetConfig,
+    ) -> Arc<Self> {
+        Arc::new(Self {
+            connection_file,
+            route_targets,
+            cache: Mutex::new(HashMap::new()),
+            fetch_locks: Mutex::new(HashMap::new()),
+            warned: Mutex::new(HashSet::new()),
+        })
+    }
+
+    /// Fill limits only for the chain resolved from ck-mc config. Host-synchronized
+    /// chains never call this method, so their request fields remain untouched.
+    async fn populate(
+        &self,
+        configured: &mut ConfiguredHistorian,
+        project_root: &Path,
+        harness: &str,
+    ) {
+        let mut by_provider = BTreeMap::<String, Vec<String>>::new();
+        for model in &configured.model_chain {
+            let Some((provider, _)) = model.split_once('/') else {
+                continue;
+            };
+            if provider.is_empty() {
+                continue;
+            }
+            by_provider
+                .entry(provider.to_string())
+                .or_default()
+                .push(model.clone());
+        }
+
+        for (provider, models) in by_provider {
+            let lookup = if models.len() > 1 {
+                CatalogLookup::Provider(&provider)
+            } else {
+                let Some((_, model_id)) = models[0].split_once('/') else {
+                    continue;
+                };
+                CatalogLookup::Model {
+                    provider: &provider,
+                    model: model_id,
+                }
+            };
+            let reply = self.lookup(lookup, project_root, harness).await;
+            for model in models {
+                if let Some(limits) = reply.as_ref().and_then(|reply| reply.limits.get(&model)) {
+                    configured.model_limits.insert(model, limits.clone());
+                } else if reply.is_some() {
+                    let retired = reply
+                        .as_ref()
+                        .is_some_and(|reply| reply.retired.contains(&model));
+                    self.warn_once(
+                        format!("uncovered:{model}"),
+                        &provider,
+                        Some(&model),
+                        if retired {
+                            "model is retired in Fusiform; using empty limits"
+                        } else {
+                            "model has no published Fusiform limits; using empty limits"
+                        },
+                    );
+                }
+            }
+        }
+    }
+
+    async fn lookup(
+        &self,
+        lookup: CatalogLookup<'_>,
+        project_root: &Path,
+        harness: &str,
+    ) -> Option<CatalogModelLimits> {
+        let key = lookup.cache_key();
+        if self.connection_file.is_none() {
+            self.warn_once(
+                "missing-connection-file".to_string(),
+                "fusiform",
+                None,
+                "no SubC connection file; using empty historian model limits",
+            );
+            return None;
+        }
+
+        let lock = {
+            let mut locks = self.fetch_locks.lock().expect("model limit fetch locks");
+            Arc::clone(
+                locks
+                    .entry(key.clone())
+                    .or_insert_with(|| Arc::new(tokio::sync::Mutex::new(()))),
+            )
+        };
+        let _guard = lock.lock().await;
+        let stale = {
+            let cache = self.cache.lock().expect("model limit cache");
+            if let Some(entry) = cache.get(&key) {
+                if entry.fetched_at.elapsed() < FUSIFORM_LIMITS_CACHE_TTL {
+                    return Some(entry.reply.clone());
+                }
+                Some(entry.reply.clone())
+            } else {
+                None
+            }
+        };
+
+        match self.fetch(lookup, project_root, harness).await {
+            Ok(reply) => {
+                self.cache.lock().expect("model limit cache").insert(
+                    key,
+                    CachedModelLimits {
+                        fetched_at: Instant::now(),
+                        reply: reply.clone(),
+                    },
+                );
+                Some(reply)
+            }
+            Err(error) => {
+                self.warn_once(
+                    format!("unavailable:{key}"),
+                    match lookup {
+                        CatalogLookup::Provider(provider)
+                        | CatalogLookup::Model { provider, .. } => provider,
+                    },
+                    None,
+                    &format!("Fusiform model-limit lookup failed ({error}); using empty limits"),
+                );
+                stale
+            }
+        }
+    }
+
+    async fn fetch(
+        &self,
+        lookup: CatalogLookup<'_>,
+        project_root: &Path,
+        harness: &str,
+    ) -> Result<CatalogModelLimits, String> {
+        let connection_file = self
+            .connection_file
+            .as_ref()
+            .ok_or_else(|| "no SubC connection file".to_string())?;
+        let target = self
+            .route_targets
+            .target(RegisteredRoute::FusiformCatalog)
+            .ok_or_else(|| "Fusiform catalog route is not registered".to_string())?;
+        let identity = BindIdentity::new(
+            project_root.to_path_buf(),
+            harness,
+            "ck-mc-historian-model-limits",
+        );
+        let consumer_options = ConsumerOptions {
+            handshake_timeout: FUSIFORM_LOOKUP_TIMEOUT,
+            call_timeout: FUSIFORM_LOOKUP_TIMEOUT,
+            ..ConsumerOptions::default()
+        };
+        let call = async {
+            let consumer = SubcConsumer::connect(connection_file, consumer_options)
+                .await
+                .map_err(|error| error.to_string())?;
+            let body = serde_json::to_vec(&json!({
+                "name": "catalog.get",
+                "arguments": lookup.arguments(),
+            }))
+            .map_err(|error| error.to_string())?;
+            let response = consumer
+                .call(
+                    target.clone(),
+                    identity.clone(),
+                    body,
+                    CallOptions {
+                        timeout: FUSIFORM_LOOKUP_TIMEOUT,
+                        route_retry_deadline: FUSIFORM_LOOKUP_TIMEOUT,
+                        ..CallOptions::default()
+                    },
+                )
+                .await;
+            consumer
+                .close_route(target, identity, CloseRouteOptions::default())
+                .await;
+            consumer.close().await;
+            let bytes = match response {
+                Ok(bytes) => bytes,
+                Err(CallError::Module(body)) if body.code == "no_coverage" => {
+                    return Ok(CatalogModelLimits::default());
+                }
+                Err(error) => return Err(error.to_string()),
+            };
+            let value: Value = serde_json::from_slice(&bytes).map_err(|error| error.to_string())?;
+            Ok(parse_catalog_limits(&value))
+        };
+        tokio::time::timeout(FUSIFORM_LOOKUP_TIMEOUT, call)
+            .await
+            .map_err(|_| "lookup timed out".to_string())?
+    }
+
+    fn warn_once(&self, key: String, provider: &str, model: Option<&str>, reason: &str) {
+        let first = self
+            .warned
+            .lock()
+            .expect("model limit warning set")
+            .insert(key);
+        if first {
+            tracing::warn!(
+                provider,
+                model = model.unwrap_or(""),
+                reason,
+                "mc-module: historian model limits unavailable"
+            );
+        }
+    }
+}
+
+/// Resolve the configured chain, then add context/output values from the Fusiform
+/// model catalog. The provider historian calls this only when no host `state_sync`
+/// chain has been recorded, so host-synchronized chains and their limits stay intact.
+pub(crate) async fn resolve_with_model_catalog(
+    settings: &Value,
+    harness: &str,
+    project_root: &Path,
+    catalog: &HistorianModelCatalog,
+) -> ConfiguredHistorian {
+    let mut configured = resolve(settings, harness);
+    catalog
+        .populate(&mut configured, project_root, harness)
+        .await;
+    configured
+}
+
+fn parse_catalog_limits(value: &Value) -> CatalogModelLimits {
+    let mut reply = CatalogModelLimits::default();
+    if let Some(models) = value.get("models").and_then(Value::as_object) {
+        for (model, facts) in models {
+            let Some(facts) = facts.as_object() else {
+                continue;
+            };
+            let context_wire = facts.get("limit.context").and_then(Value::as_u64);
+            let context = context_wire.and_then(|tokens| usize::try_from(tokens).ok());
+            let output_wire = facts.get("limit.output").and_then(Value::as_u64);
+            let output_is_placeholder = context_wire
+                .zip(output_wire)
+                .is_some_and(|(context, output)| output >= context);
+            let output = (!output_is_placeholder)
+                .then_some(output_wire)
+                .flatten()
+                .and_then(|tokens| u32::try_from(tokens).ok());
+            if context.is_some() || output.is_some() {
+                // Fusiform serves alias facts under the alias model key; keeping that
+                // key preserves the configured chain's own provider/model identity.
+                reply.limits.insert(
+                    model.clone(),
+                    HistorianModelLimits {
+                        context,
+                        input: None,
+                        output,
+                    },
+                );
+            }
+        }
+    }
+    if let Some(retired) = value.get("retired").and_then(Value::as_array) {
+        for entry in retired {
+            if let Some(model) = entry.get("model").and_then(Value::as_str) {
+                reply.retired.insert(model.to_string());
+            }
+        }
+    }
+    reply
 }
 
 /// The value as a trimmed string, or `None` when it is not a string or is blank; the
@@ -182,8 +514,9 @@ fn attempts(settings: &Value, harness: &str) -> (Option<Attempt>, Vec<Attempt>) 
     (primary, fallbacks)
 }
 
-/// Resolve the historian settings for a conversation of `harness` from trusted
-/// effective settings (the shape [`trusted_settings`] returns).
+/// Resolve the historian chain, variants, timeout and output cap from trusted settings.
+/// Per-model limits start empty and are filled by `resolve_with_model_catalog` when
+/// Fusiform is available.
 ///
 /// `settings` is the validated config object: `historian.<harness>.model`,
 /// `historian.<harness>.fallback_models`, the OpenCode `variant` or Pi/OMP
@@ -197,11 +530,9 @@ fn attempts(settings: &Value, harness: &str) -> (Option<Attempt>, Vec<Attempt>) 
 /// model's variant is the qualifier of its first attempt, so a qualifier written only
 /// on a later attempt of the same model is dropped (same file, :119-127).
 ///
-/// The plugin looks up per-model context and output limits in the host's model
-/// catalog (same file, :128-156). ck-mc has no catalog, so every chain model gets an
-/// empty entry, which is what the plugin sends for a model its catalog does not
-/// know. The historian window then comes from the user-tier
-/// `historian.context_limit_tokens` the module already applies to every firing.
+/// This synchronous resolver builds the configured chain and its empty limit entries.
+/// `resolve_with_model_catalog` fills those entries from Fusiform when a route is
+/// available; host-synchronized chains do not use either resolver.
 pub(crate) fn resolve(settings: &Value, harness: &str) -> ConfiguredHistorian {
     // Both OpenCode hosts read the `opencode` block, as the dreamer's model
     // resolution does (dream_runner.rs `resolve_task_models`).
@@ -272,8 +603,152 @@ pub(crate) fn trusted_settings(resolver: &dyn CoreConfigResolver, project_root: 
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::{HandlerOutcome, ModuleHandler};
+    use subc_client_rs::{BindDecision, RequestCtx, RouteBindRequest};
+    use subc_daemon::{
+        serve_listener, ConnectedClients, ControlHandler, Registry, Router, ServerAuth,
+    };
+    use subc_protocol::RouteTarget;
+    use subc_transport::{
+        generate_daemon_id, generate_key, write_atomic, ConnectionInfo, Endpoint, SCHEMA_VERSION,
+    };
+    use tokio::net::TcpListener;
 
     const FIXTURE: &str = include_str!("../../testdata/historian-config-resolution.json");
+
+    struct FakeFusiform {
+        requests: Arc<Mutex<Vec<Value>>>,
+    }
+
+    #[subc_client_rs::async_trait]
+    impl ModuleHandler for FakeFusiform {
+        async fn on_bind(&self, request: &RouteBindRequest) -> BindDecision {
+            assert_eq!(
+                request.target,
+                RouteTarget::ToolProvider {
+                    module_id: "fusiform".to_string()
+                }
+            );
+            BindDecision::accept()
+        }
+
+        async fn handle(&self, _ctx: RequestCtx, body: Vec<u8>) -> HandlerOutcome {
+            let request: Value = serde_json::from_slice(&body).unwrap();
+            self.requests.lock().unwrap().push(request.clone());
+            assert_eq!(request["name"], "catalog.get");
+            let arguments = &request["arguments"];
+            match arguments["provider_id"].as_str().unwrap() {
+                "google" => HandlerOutcome::Response(
+                    serde_json::to_vec(&json!({
+                        "models": {
+                            "google/main": {"limit.context": 200_000, "limit.output": 20_000},
+                            "google/alias": {"limit.context": 200_000, "limit.output": 20_000}
+                        },
+                        "aliased": [{
+                            "model": "google/alias",
+                            "target_provider_id": "google",
+                            "target_model_id": "main"
+                        }]
+                    }))
+                    .unwrap(),
+                ),
+                "placeholder" => HandlerOutcome::Response(
+                    serde_json::to_vec(&json!({
+                        "models": {
+                            "placeholder/model": {"limit.context": 200_000, "limit.output": 200_000}
+                        }
+                    }))
+                    .unwrap(),
+                ),
+                "unpublished" => HandlerOutcome::Response(
+                    serde_json::to_vec(&json!({
+                        "models": {"unpublished/model": {"limit.context": 200_000}}
+                    }))
+                    .unwrap(),
+                ),
+                "retired" => HandlerOutcome::Response(
+                    serde_json::to_vec(&json!({
+                        "models": {},
+                        "retired": [{"model": "retired/old", "retired_at_ms": 10}]
+                    }))
+                    .unwrap(),
+                ),
+                "uncovered" => HandlerOutcome::Error {
+                    code: "no_coverage".to_string(),
+                    message: "unknown provider/model".to_string(),
+                },
+                provider => panic!("unexpected provider lookup: {provider}"),
+            }
+        }
+    }
+
+    struct FakeFusiformRoute {
+        connection_file: PathBuf,
+        requests: Arc<Mutex<Vec<Value>>>,
+        module: tokio::task::JoinHandle<Result<(), subc_client_rs::SubcModuleError>>,
+        daemon: tokio::task::JoinHandle<Result<(), subc_daemon::ServerError>>,
+        _directory: tempfile::TempDir,
+    }
+
+    impl Drop for FakeFusiformRoute {
+        fn drop(&mut self) {
+            self.module.abort();
+            self.daemon.abort();
+        }
+    }
+
+    impl FakeFusiformRoute {
+        async fn start() -> Self {
+            let directory = tempfile::tempdir().unwrap();
+            assert_eq!(
+                mc_store::private_permissions::tighten_directory(directory.path(), true).failures,
+                0
+            );
+            let listener = TcpListener::bind(("127.0.0.1", 0)).await.unwrap();
+            let connection_file = directory.path().join("subc-connection.json");
+            let connection = ConnectionInfo {
+                schema: SCHEMA_VERSION,
+                wire_version: Some(subc_protocol::PROTOCOL_VERSION),
+                endpoints: vec![Endpoint {
+                    host: "127.0.0.1".into(),
+                    port: listener.local_addr().unwrap().port(),
+                }],
+                key: generate_key().unwrap(),
+                daemon_id: generate_daemon_id().unwrap(),
+                pid: std::process::id(),
+                daemon_ver: "historian-limits-test".into(),
+            };
+            write_atomic(&connection_file, &connection).unwrap();
+            let connected = ConnectedClients::new();
+            let control = Arc::new(
+                ControlHandler::new(Arc::new(Registry::default()))
+                    .with_connected_clients(connected.clone()),
+            );
+            let router = Arc::new(Router::with_control_handler(control));
+            let auth = ServerAuth::new(connection.key, connection.daemon_id, connection.daemon_ver)
+                .with_connected_clients(connected);
+            let daemon = tokio::spawn(serve_listener(listener, router, auth));
+            let requests = Arc::new(Mutex::new(Vec::new()));
+            let handler = FakeFusiform {
+                requests: Arc::clone(&requests),
+            };
+            let (_, serve) = subc_client_rs::serve_with_handle(
+                &connection_file,
+                crate::manifest("fusiform"),
+                handler,
+            )
+            .await
+            .unwrap();
+            let module = tokio::spawn(serve);
+            Self {
+                connection_file,
+                requests,
+                module,
+                daemon,
+                _directory: directory,
+            }
+        }
+    }
 
     /// Every case of the TypeScript-generated matrix resolves to exactly the fields
     /// the plugin resolves for it.
@@ -390,5 +865,139 @@ mod tests {
         assert!(resolved.model_chain.is_empty());
         assert_eq!(resolved.timeout_ms, DEFAULT_HISTORIAN_TIMEOUT_MS);
         assert_eq!(resolved.max_output_tokens, None);
+    }
+
+    #[tokio::test]
+    async fn fusiform_model_limits_cover_aliases_placeholder_output_and_no_coverage() {
+        let route = FakeFusiformRoute::start().await;
+        let catalog = HistorianModelCatalog::new(
+            Some(route.connection_file.clone()),
+            RouteTargetConfig::default(),
+        );
+        let settings = json!({"historian":{"opencode":{
+            "model":"google/main",
+            "fallback_models":[
+                "google/alias",
+                "placeholder/model",
+                "unpublished/model",
+                "retired/old",
+                "uncovered/model"
+            ]
+        }}});
+
+        let resolved = resolve_with_model_catalog(
+            &settings,
+            "opencode",
+            Path::new("/tmp/historian-limits-project"),
+            &catalog,
+        )
+        .await;
+        assert_eq!(resolved.model_limits["google/main"].context, Some(200_000));
+        assert_eq!(resolved.model_limits["google/main"].output, Some(20_000));
+        assert_eq!(resolved.model_limits["google/alias"].context, Some(200_000));
+        assert_eq!(resolved.model_limits["google/alias"].output, Some(20_000));
+        assert_eq!(
+            resolved.model_limits["placeholder/model"].context,
+            Some(200_000)
+        );
+        assert_eq!(resolved.model_limits["placeholder/model"].output, None);
+        assert_eq!(
+            resolved.model_limits["unpublished/model"].context,
+            Some(200_000)
+        );
+        assert_eq!(resolved.model_limits["unpublished/model"].output, None);
+        for model in ["retired/old", "uncovered/model"] {
+            let limit = &resolved.model_limits[model];
+            assert_eq!(limit.context, None);
+            assert_eq!(limit.input, None);
+            assert_eq!(limit.output, None);
+        }
+
+        let requests = route.requests.lock().unwrap().clone();
+        assert_eq!(requests.len(), 5, "catalog route calls: {requests:?}");
+        let google = requests
+            .iter()
+            .find(|request| request["arguments"]["provider_id"] == "google")
+            .unwrap();
+        assert_eq!(google["arguments"]["fact_prefixes"], json!(["limit."]));
+        assert!(google["arguments"].get("model_id").is_none());
+        let placeholder = requests
+            .iter()
+            .find(|request| request["arguments"]["provider_id"] == "placeholder")
+            .unwrap();
+        assert_eq!(placeholder["arguments"]["model_id"], "model");
+        let retired = requests
+            .iter()
+            .find(|request| request["arguments"]["provider_id"] == "retired")
+            .unwrap();
+        assert_eq!(retired["arguments"]["model_id"], "old");
+        let uncovered = requests
+            .iter()
+            .find(|request| request["arguments"]["provider_id"] == "uncovered")
+            .unwrap();
+        assert_eq!(uncovered["arguments"]["model_id"], "model");
+
+        let cached = resolve_with_model_catalog(
+            &settings,
+            "opencode",
+            Path::new("/tmp/historian-limits-project"),
+            &catalog,
+        )
+        .await;
+        assert_eq!(cached.request_fields(), resolved.request_fields());
+        assert_eq!(route.requests.lock().unwrap().len(), 5);
+    }
+
+    #[tokio::test]
+    async fn a_fetched_200k_window_first_model_gets_a_chunk_that_fits() {
+        let route = FakeFusiformRoute::start().await;
+        let catalog = HistorianModelCatalog::new(
+            Some(route.connection_file.clone()),
+            RouteTargetConfig::default(),
+        );
+        let settings = json!({"historian":{"opencode":{
+            "model":"google/main",
+            "fallback_models":["google/alias"]
+        }}});
+        let resolved = resolve_with_model_catalog(
+            &settings,
+            "opencode",
+            Path::new("/tmp/historian-limits-project"),
+            &catalog,
+        )
+        .await;
+        assert_eq!(
+            resolved.model_chain.first().map(String::as_str),
+            Some("google/main")
+        );
+        assert_eq!(resolved.model_limits["google/main"].context, Some(200_000));
+        crate::historian_chunk::assert_fetched_200k_window_sizes_chunk(
+            "google/main",
+            resolved.model_limits,
+        );
+    }
+
+    #[tokio::test]
+    async fn fusiform_unreachable_keeps_the_chain_and_empty_model_limits() {
+        let route = FakeFusiformRoute::start().await;
+        route.module.abort();
+        route.daemon.abort();
+        let catalog = HistorianModelCatalog::new(
+            Some(route.connection_file.clone()),
+            RouteTargetConfig::default(),
+        );
+        let settings = json!({"historian":{"opencode":{"model":"google/main"}}});
+        let resolved = resolve_with_model_catalog(
+            &settings,
+            "opencode",
+            Path::new("/tmp/historian-limits-project"),
+            &catalog,
+        )
+        .await;
+        assert_eq!(resolved.model_chain, ["google/main"]);
+        let limit = &resolved.model_limits["google/main"];
+        assert_eq!(limit.context, None);
+        assert_eq!(limit.input, None);
+        assert_eq!(limit.output, None);
     }
 }
