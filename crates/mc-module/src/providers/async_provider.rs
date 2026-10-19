@@ -1,4 +1,5 @@
 //! Runner-owned tags and durable, off-request compaction views.
+use super::codec::{InboundMessage, OutboundMessage};
 use super::*;
 use compact::async_group::{self as contract, ceiling::CeilingPolicy, notice, ride, view};
 use cortexkit_bus_trait::{ContentDigest, DurableOwner, Stream, StreamCursor};
@@ -318,7 +319,7 @@ impl McHandler {
         let messages = state
             .entries
             .values()
-            .map(|entry| compact::status::StatusMessage {
+            .map(|entry| InboundMessage {
                 ordinal: entry.ordinal,
                 mid: entry.mid.clone(),
                 message: entry.message.clone(),
@@ -392,7 +393,7 @@ fn tag_rows(state: &State, codec: codec::Codec) -> Result<Vec<mc_store::McTagRow
                 "runner must expose one tag row per part",
             ));
         }
-        let decoded = codec.decode_message(&compact::status::StatusMessage {
+        let decoded = codec.decode_message(&InboundMessage {
             ordinal: entry.ordinal,
             mid: entry.mid.clone(),
             message: entry.message.clone(),
@@ -417,7 +418,7 @@ fn tag_rows(state: &State, codec: codec::Codec) -> Result<Vec<mc_store::McTagRow
             let number = tags::parse_tag(tag)
                 .ok_or_else(|| invalid_field("tags", "malformed runner tag"))?;
             let (kind, text) = match &block.kind {
-                ck_wire::CkKind::Text { text } => ("text", text.as_str()),
+                ck_wire::CkKind::Text { text } => ("message", text.as_str()),
                 ck_wire::CkKind::ToolResult { output, .. } => match &output.kind {
                     ck_wire::CkOutputKind::Text { text }
                     | ck_wire::CkOutputKind::ErrorText { text } => ("tool_result", text.as_str()),
@@ -443,7 +444,7 @@ fn tag_rows(state: &State, codec: codec::Codec) -> Result<Vec<mc_store::McTagRow
 
 fn ranges(
     state: &State,
-    wire: &compact::answer::CompactionMessage,
+    wire: &OutboundMessage,
     engine: &transform::compaction::View,
 ) -> Result<Vec<view::ViewRange>, HandlerOutcome> {
     let end = state
@@ -800,6 +801,14 @@ impl McHandler {
             initial,
         )?;
         state.engine = engine;
+        #[cfg(test)]
+        eprintln!(
+            "async result {} {} {} {:?}",
+            state.namespace(),
+            notice.est_tokens,
+            output.prefix_bust_permitted,
+            output.answer
+        );
         let transform::compaction::Answer::Replacement(candidate) = output.answer else {
             return Ok(None);
         };
@@ -1076,7 +1085,7 @@ impl McHandler {
         let messages = state
             .entries
             .values()
-            .map(|entry| compact::status::StatusMessage {
+            .map(|entry| InboundMessage {
                 ordinal: entry.ordinal,
                 mid: entry.mid.clone(),
                 message: entry.message.clone(),

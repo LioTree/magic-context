@@ -327,6 +327,11 @@ async fn defer_never_publishes_and_runner_tags_are_not_allocated() {
     rig.notice(1, 1000, None).await;
     assert_eq!(rig.newest(), None, "defer must not publish");
     let state = rig.state();
+    assert_eq!(
+        tag_rows(&state, codec::Codec::OpencodeAiSdk).unwrap().len(),
+        40,
+        "all runner parts must be indexed"
+    );
     let rows = rig
         .h
         .store
