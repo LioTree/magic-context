@@ -96,6 +96,13 @@ pub trait BrocaPort {
     /// Release the session's routes. This is never a deletion: erasure is the
     /// runner's retention promise, fixed on the first send.
     async fn release(&mut self, session: &str);
+    /// The parent session when this port reaches a runner-lane conversation's own
+    /// runner rather than the configured Broca module. The carrier then admits the
+    /// child without a configured Broca runner and names this parent on every send,
+    /// because the runner admits the child only under a parent it runs.
+    fn session_runner_parent(&self) -> Option<&str> {
+        None
+    }
 }
 
 /// Task-level choices the executor makes once, with the trusted task context.
@@ -502,9 +509,12 @@ impl<P: BrocaPort> BrocaCarrier<P> {
             .check_control()
             .map_err(|e| error(format!("{e:?}")))?;
         // Broca runs dream work only when the user chose it; a harness default
-        // never moves work off the host.
-        if request.runner.kind != HistorianRunnerKind::Broca
-            || request.runner.source != RunnerSource::Configured
+        // never moves work off the host. A runner-lane conversation's own runner is
+        // that host, so a port to it needs no configured Broca runner.
+        let session_parent = self.port.session_runner_parent();
+        if session_parent.is_none()
+            && (request.runner.kind != HistorianRunnerKind::Broca
+                || request.runner.source != RunnerSource::Configured)
         {
             return Err(error("unavailable: broca_not_configured"));
         }
@@ -519,6 +529,7 @@ impl<P: BrocaPort> BrocaCarrier<P> {
             .ok_or_else(|| error("invalid_model"))?;
         if request.prompt.len() + request.system.len() > MAX_BODY
             || request.parent_session_id != self.context.scope.session.0
+            || session_parent.is_some_and(|parent| parent != request.parent_session_id)
             || request.directory != self.context.config.directory
             || request.max_steps == 0
             || request.temperature.is_some()
@@ -621,6 +632,9 @@ impl<P: BrocaPort> BrocaCarrier<P> {
         // and the runner freezes that allowlist when it admits the session.
         params.insert("tools".into(), json!([]));
         params.insert("stop_when".into(), json!({"max_steps": request.max_steps}));
+        if let Some(parent) = self.port.session_runner_parent() {
+            params.insert("parent".into(), json!(parent));
+        }
         let mut send = SendRequest::new(request.prompt.clone(), session)
             .with_runner_params(params)
             .with_retention(retention);

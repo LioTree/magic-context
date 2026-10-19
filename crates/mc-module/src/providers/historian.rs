@@ -760,6 +760,7 @@ impl McHandler {
                         })),
                         tag_snapshot: None,
                         reclaim_ride_available,
+                        runner_lane: true,
                         timings: &mut timings,
                     },
                 ))

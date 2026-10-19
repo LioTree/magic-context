@@ -6,7 +6,10 @@
 //! (`ownership::publish`) for the project and dispatches only those tasks: a
 //! project whose claimant has gone, or whose user switched Rust off, gets nothing.
 //! Host children are queued on the declaring claimant's session, in its project
-//! root; a Broca run uses the configured Broca runner.
+//! root; a Broca run uses the configured Broca runner. A project last seen on a
+//! runner-lane conversation (a route the daemon stamped with that conversation's
+//! runner module) sends its children to that runner, under that session, through
+//! the same llm-runner carrier as Broca and without any host claimant.
 //!
 //! Before planning, each task's Rust schedule adopts the TypeScript scheduler's
 //! progress, and after the run the TypeScript row adopts Rust's (see
@@ -27,8 +30,8 @@ use super::ownership::{self, ClaimantRegistry, OwnershipInput, Wiring};
 use crate::background::{self, ConfigInput};
 use crate::config_parity::{ConfigResolveRequest, CoreConfigResolver};
 use crate::dream_runner::resolve_task_models;
-use crate::historian_runner::HistorianRunnerKind;
-use crate::route_targets::RouteTargetConfig;
+use crate::historian_runner::{uses_session_runner, HistorianRunnerKind};
+use crate::route_targets::{RouteTargetConfig, SessionRunnerRoute};
 use mc_store::dream_scheduler::schedules::{TaskConfig, TaskName};
 use mc_store::dream_scheduler::SqliteDreamScheduler;
 use mc_store::parity_schema_manifest::{
@@ -57,6 +60,9 @@ pub struct DreamTarget {
     pub session: String,
     pub harness: String,
     pub seen_at_ms: i64,
+    /// The runner of the conversation this route belongs to, when it is a runner
+    /// lane; its session is [`Self::session`].
+    pub session_runner: Option<SessionRunnerRoute>,
 }
 
 struct SystemClock;
@@ -75,6 +81,9 @@ pub struct DreamRuns {
     /// The connection to the configured runner module, when this process declares a
     /// background-completion route to one. Without it no Broca run is possible.
     broca: Option<(PathBuf, RouteTargetConfig)>,
+    /// The daemon connection, which is all a runner-lane conversation's own runner
+    /// needs: its route target comes from the conversation, not from configuration.
+    connection_file: Option<PathBuf>,
     resolver: OnceLock<Arc<dyn CoreConfigResolver>>,
     clock: OnceLock<Arc<dyn Clock>>,
 }
@@ -86,8 +95,10 @@ impl DreamRuns {
             in_flight: Arc::default(),
             timer: AtomicBool::new(false),
             broca: connection_file
+                .clone()
                 .filter(|_| SubcBroca::target(route_targets).is_some())
                 .map(|file| (file, route_targets.clone())),
+            connection_file,
             resolver: OnceLock::new(),
             clock: OnceLock::new(),
         }
@@ -96,6 +107,12 @@ impl DreamRuns {
     /// Whether a Broca transport for dream children is wired in this process.
     pub fn broca_wired(&self) -> bool {
         self.broca.is_some()
+    }
+
+    /// Whether dream children can be sent to the runner that owns their parent
+    /// session (only a daemon connection is needed for that).
+    pub fn session_runner_wired(&self) -> bool {
+        self.connection_file.is_some()
     }
 
     /// Remember where `project` was last seen.
@@ -107,6 +124,11 @@ impl DreamRuns {
 
     fn target(&self, project: &str) -> Option<DreamTarget> {
         self.targets.lock().ok()?.get(project).cloned()
+    }
+
+    #[cfg(test)]
+    pub(crate) fn target_for_test(&self, project: &str) -> Option<DreamTarget> {
+        self.target(project)
     }
 
     fn fresh_projects(&self, now_ms: i64) -> Vec<String> {
@@ -197,13 +219,21 @@ impl DreamHandles {
         // freshness is judged by the same clock.
         let claimant = self.claimants.current(project, crate::now_ms());
         let target = self.runs.target(project);
-        // Host children are queued on the claimant's session in its root; without a
+        // A project last seen on a runner lane runs on that conversation's runner,
+        // under that session, whatever claimant may still be declared. Otherwise
+        // host children are queued on the claimant's session in its root; without a
         // claimant only a Broca run is possible, on the route the project was seen on.
-        let (directory, session, harness) = match (&claimant, target) {
-            (Some(c), _) if !c.directory.as_os_str().is_empty() => {
-                (c.directory.clone(), c.session.clone(), c.harness.clone())
+        let (directory, session, harness, session_runner) = match (&claimant, target) {
+            (_, Some(t)) if t.session_runner.is_some() => {
+                (t.directory, t.session, t.harness, t.session_runner)
             }
-            (_, Some(t)) => (t.directory, t.session, t.harness),
+            (Some(c), _) if !c.directory.as_os_str().is_empty() => (
+                c.directory.clone(),
+                c.session.clone(),
+                c.harness.clone(),
+                None,
+            ),
+            (_, Some(t)) => (t.directory, t.session, t.harness, None),
             _ => return None,
         };
         {
@@ -237,6 +267,7 @@ impl DreamHandles {
                 session: &session,
                 harness: &harness,
                 claimant: claimant.as_ref(),
+                session_runner: session_runner.as_ref(),
             };
             run.execute(captured, manual)
         };
@@ -280,6 +311,7 @@ struct Run<'a> {
     session: &'a str,
     harness: &'a str,
     claimant: Option<&'a ownership::ClaimantDeclaration>,
+    session_runner: Option<&'a SessionRunnerRoute>,
 }
 
 impl Run<'_> {
@@ -288,13 +320,21 @@ impl Run<'_> {
         captured: Arc<super::context::CapturedConfig>,
         manual: Option<ManualRun>,
     ) -> Result<RunReport, String> {
-        let published = ownership::publish(&OwnershipInput {
-            config: &captured.route,
-            settings: Some(&captured.effective),
-            harness: self.harness,
-            wiring: &self.handles.wiring,
-            claimant: self.claimant,
-        });
+        // An explicit `broca` keeps a runner lane on the configured Broca module;
+        // `host` or no choice means the conversation's own runner.
+        let session_runner = self
+            .session_runner
+            .filter(|_| uses_session_runner(captured.route.dreamer_runner_for(self.harness)));
+        let published = ownership::publish_on(
+            &OwnershipInput {
+                config: &captured.route,
+                settings: Some(&captured.effective),
+                harness: self.harness,
+                wiring: &self.handles.wiring,
+                claimant: self.claimant,
+            },
+            session_runner.map(|_| self.handles.runs.session_runner_wired()),
+        );
         if published.published.is_empty() {
             return Ok(Vec::new());
         }
@@ -326,8 +366,33 @@ impl Run<'_> {
                 let _ = scheduler.adopt_legacy(&scope, config, &legacy);
             }
         }
-        let report = match published.runner.kind {
-            HistorianRunnerKind::Host => {
+        let report = match (session_runner, published.runner.kind) {
+            (Some(route), _) => {
+                let Some(connection_file) = &self.handles.runs.connection_file else {
+                    return Ok(Vec::new());
+                };
+                let transport = Transport::Broca {
+                    ports: SubcBroca {
+                        connection_file: connection_file.clone(),
+                        route_targets: RouteTargetConfig::default(),
+                        project_root: captured.directory.clone(),
+                        harness: self.harness.to_owned(),
+                        session_runner: Some(route.clone()),
+                    },
+                    routes: self.handles.broca_routes.clone(),
+                    module_id: self.handles.module_id.clone(),
+                };
+                self.dispatch(
+                    transport,
+                    &scheduler,
+                    &scope,
+                    &captured,
+                    &configs,
+                    &published.published,
+                    manual,
+                )
+            }
+            (None, HistorianRunnerKind::Host) => {
                 let transport = Transport::<NoBroca>::Host {
                     queue: self.handles.queue.clone(),
                     fence_root,
@@ -342,7 +407,7 @@ impl Run<'_> {
                     manual,
                 )
             }
-            HistorianRunnerKind::Broca => {
+            (None, HistorianRunnerKind::Broca) => {
                 let Some((connection_file, route_targets)) = &self.handles.runs.broca else {
                     return Ok(Vec::new());
                 };
@@ -352,6 +417,7 @@ impl Run<'_> {
                         route_targets: route_targets.clone(),
                         project_root: captured.directory.clone(),
                         harness: self.harness.to_owned(),
+                        session_runner: None,
                     },
                     routes: self.handles.broca_routes.clone(),
                     module_id: self.handles.module_id.clone(),
