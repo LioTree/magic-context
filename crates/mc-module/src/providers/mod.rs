@@ -10,6 +10,8 @@ mod async_contract_vectors;
 mod async_provider;
 
 pub mod codec;
+#[cfg(test)]
+mod codec_native_tests;
 pub mod codec_opencode;
 pub mod codec_pi;
 pub mod compaction;

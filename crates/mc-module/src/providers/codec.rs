@@ -98,11 +98,12 @@ impl Codec {
             Self::OpencodeAiSdk => {
                 let decoded =
                     super::codec_opencode::decode_messages(std::slice::from_ref(message))?;
-                Ok(decoded
-                    .messages
-                    .into_iter()
-                    .next()
-                    .expect("one native message"))
+                decoded.messages.into_iter().next().ok_or_else(|| {
+                    error(
+                        "history_unreadable",
+                        "OpenCode entry did not decode to one message",
+                    )
+                })
             }
         }
     }
@@ -157,6 +158,59 @@ impl Codec {
             Self::Pi => super::codec_pi::encode_view(view, request),
             Self::OpencodeAiSdk => super::codec_opencode::encode_view(view, request, context),
         }
+    }
+
+    /// Decode a runner's transcript entries, oldest first, into the engine's
+    /// CK messages. Each entry is decoded on its own, so the result for an
+    /// entry never depends on how the transcript was paged. `mid` must be the
+    /// runner's own message id (OpenCode `info.id`, a Pi journal entry `id`):
+    /// an entry without one is refused, never assigned an id.
+    pub fn decode_entries(
+        self,
+        entries: &[InboundMessage],
+    ) -> Result<Vec<ck_wire::CkIngressMessage>, HandlerOutcome> {
+        entries
+            .iter()
+            .map(|entry| self.decode_message(entry))
+            .collect()
+    }
+
+    /// Render a view back into the runner's declared schema. `entries` are the
+    /// runner's held native messages for the view's lineage, so every message
+    /// the view leaves unchanged goes back as the runner's own bytes; `session`
+    /// is the runner's session name, which OpenCode stamps on messages ck-mc
+    /// authors (the history head). Messages ck-mc authors carry no native id;
+    /// the runner assigns one when it applies the view. Rendering takes no
+    /// engine reasoning-clear or tag decisions: those are already in the view's
+    /// messages, and provider and model restrictions are the runner's to apply.
+    /// The result is a pure function of the view, the session and the entries.
+    /// Broca's schema needs neither: its messages carry their native copy.
+    pub fn render_view(
+        self,
+        view: &transform::compaction::View,
+        session: &str,
+        entries: &[InboundMessage],
+    ) -> Result<OutboundMessage, HandlerOutcome> {
+        if self == Self::OwnedBroca {
+            return encode_view(view);
+        }
+        let mut request: TransformRequest = decode(&json!({"v":2,"kind":"compaction.step",
+            "serializer_profile":self.serializer_profile().wire_id(),"session_id":session,
+            "render_config":"","messages":[],"tool_present":false,"auto_search_enabled":false}))?;
+        self.prepare_request(&mut request, entries)?;
+        let tags = BTreeMap::new();
+        self.encode_view(
+            view,
+            &request,
+            &super::codec_opencode::NativeRenderContext {
+                reasoning_clear_units: &[],
+                tag_numbers: &tags,
+                mutation_exempt_mid: None,
+                lineage_anchor_mid: None,
+                transition_consumed: false,
+                native_reasoning_keep_mids: &[],
+            },
+        )
     }
 }
 
