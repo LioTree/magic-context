@@ -288,11 +288,12 @@ impl McHandler {
     /// refusals, configuration and token estimates with the request handler.
     /// The worker has its own store-open coordinator: dropping this auxiliary
     /// handler shuts down only that coordinator, never the request handler's.
-    fn provider_historian_worker(&self) -> Arc<Self> {
+    pub(super) fn provider_historian_worker(&self) -> Arc<Self> {
         Arc::clone(self.provider_historian_worker.get_or_init(|| {
             let mut worker = Self::new();
             worker.store = Arc::clone(&self.store);
             worker.provider_store = Arc::clone(&self.provider_store);
+            worker.provider_runner = Arc::clone(&self.provider_runner);
             worker.provider_serial = Arc::clone(&self.provider_serial);
             worker.provider_historian_budget = Arc::clone(&self.provider_historian_budget);
             worker.provider_historian_evaluations =

@@ -38,6 +38,7 @@ mod historian_claim;
 pub use historian_claim::with_historian_claim_fixture_entropy;
 mod historian_telemetry;
 pub use historian_telemetry::{HistorianInvocation, HistorianRunTelemetry};
+mod async_compaction;
 pub mod memory_history;
 pub mod memory_lifecycle;
 pub mod memory_projection;
@@ -3347,6 +3348,10 @@ const MIGRATIONS: &[Migration] = &[
         version: 73,
         // Retire whole-copy provider views; every lane now stores v2 recipes.
         statements: include_str!("migrations/store_073_provider_views_v1_retired.sql"),
+    },
+    Migration {
+        version: 74,
+        statements: include_str!("migrations/store_074_async_compaction.sql"),
     },
 ];
 

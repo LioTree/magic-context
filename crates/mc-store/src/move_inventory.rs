@@ -7,9 +7,9 @@ use rusqlite::Connection;
 use serde::{Deserialize, Serialize};
 
 /// Section-inventory protocol version serialized in move manifests.
-pub const INVENTORY_VERSION: u32 = 8;
+pub const INVENTORY_VERSION: u32 = 9;
 pub const CONTEXT_SCHEMA_VERSION: u32 = 102;
-pub const STORE_SCHEMA_VERSION: u32 = 73;
+pub const STORE_SCHEMA_VERSION: u32 = 74;
 pub const GLOBAL_USER_PROFILE_PROJECT_PATH: &str = "__global__";
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -2834,7 +2834,15 @@ pub const TABLES: &[TableInventory] = &[
         Some(KeyPolicy::Preserve),
         None
     ),
-    // store.db: 39 tables observed after fresh migration.
+// store.db: 41 tables observed after fresh migration.
+    table!(Module, "mc_async_compaction", Ship,
+        RowSelector::Predicate("session = ?1"), &["session_ref"],
+        &["session_ref", "conversation_key", "session", "state_json", "version_high_water"],
+        &[], Some(KeyPolicy::PreserveOrRefuseCollision), None),
+    table!(Module, "mc_async_compaction_views", Ship,
+        RowSelector::Predicate("session = ?1"),
+        &["session_ref", "version"], &["session_ref", "session", "version", "view_json", "announced"],
+        &[], Some(KeyPolicy::PreserveOrRefuseCollision), None),
     // Provider state cannot be rebuilt: it includes allocated versions and tags,
     // frozen catalog admission, and answers that the runner may not have applied.
     // Select every project/harness coordinate of this opaque host session. Both

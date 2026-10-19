@@ -5054,6 +5054,7 @@ impl McHandler {
                 Arc::clone(&move_visibility),
             )
         });
+        let bus_connection_file = connection_file.clone();
         let provider_runner: Arc<dyn session_resolver::ProviderRunner> = match connection_file {
             Some(path) => Arc::new(session_resolver::RealProviderRunner::new(
                 path,
@@ -5063,6 +5064,11 @@ impl McHandler {
         };
         let store = Arc::new(OnceLock::new());
         let provider_store = Arc::new(providers::Storage::new(Arc::clone(&store)));
+        *provider_store
+            .async_runtime
+            .connection_file
+            .lock()
+            .expect("bus connection file") = bus_connection_file;
         McHandler {
             agent_data,
             move_visibility,
@@ -16254,6 +16260,7 @@ impl ModuleHandler for McHandler {
             warn_if_log_directory_differs(&descriptor, log_directory);
         }
         self.begin_store_open(descriptor, origin);
+        self.start_async_compaction_background();
     }
 
     /// Return an atomics-only liveness snapshot. The SDK invokes this on its separate
@@ -16586,6 +16593,16 @@ impl McHandler {
         if let Some(method) = method {
             return match method {
                 "role.describe" => providers::describe(),
+                "compaction.setup"
+                | "view.get"
+                | "compaction.ride" => {
+                    self.handle_provider_value(
+                        channel,
+                        method,
+                        request.get("params").unwrap_or(&Value::Null),
+                    )
+                    .await
+                }
                 // Proves the store opened end-to-end and, when a session_id is supplied,
                 // returns the session's stored trace state directly from the module.
                 "health" | "status" | "diagnostics" => self.handle_status_value(&request),

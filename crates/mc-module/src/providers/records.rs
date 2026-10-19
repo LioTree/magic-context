@@ -51,6 +51,7 @@ pub struct Storage {
     /// If storage cannot record admission, the process remembers that fact until
     /// a full successful refetch. Discovery still serves its unchanged bytes.
     catalog_failures: Mutex<BTreeMap<(PathBuf, String), String>>,
+    pub(crate) async_runtime: super::async_provider::Runtime,
 }
 
 impl Storage {
@@ -58,6 +59,7 @@ impl Storage {
         Self {
             store,
             catalog_failures: Mutex::new(BTreeMap::new()),
+            async_runtime: Default::default(),
         }
     }
 
