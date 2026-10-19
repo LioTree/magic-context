@@ -233,6 +233,7 @@ pub fn describe() -> HandlerOutcome {
         json!({"version": hooks::PROVIDES, "ops": hooks::REQUIRED_OPS, "stability": "alpha"}),
     );
     answer["runner_groups"] = json!(runner_groups());
+    answer["reminder_templates"] = crate::runner_reminders::catalog();
     HandlerOutcome::Response(serde_jcs::to_vec(&answer).expect("build-only role JSON"))
 }
 
