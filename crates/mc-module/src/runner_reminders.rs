@@ -10,7 +10,7 @@ use std::{collections::BTreeMap, path::Path, time::Duration};
 
 use crate::{session_resolver::ProviderRunner, transform};
 
-const MAX: i64 = i64::MAX;
+const MAX: i64 = 100_000;
 const DELIVERY: [Mode; 3] = [Mode::TurnSystem, Mode::ToolResult, Mode::Steer];
 const SEARCH_DELIVERY: [Mode; 2] = [Mode::ToolResult, Mode::Steer];
 /// All reminder kinds expire five minutes after the observation that produced them.
@@ -116,6 +116,8 @@ fn template_use(id: &str, slots: Map<String, Value>) -> TemplateUse {
 }
 
 fn reduce_use(kind: &str, tokens: i64, count: usize, tags: &[u64]) -> TemplateUse {
+    // Clamp very large transcripts to the template bounds so every integer
+    // remains exactly representable by JSON consumers and the send stays valid.
     let count_kind = match count {
         0 => "zero",
         1 => "one",
@@ -124,7 +126,7 @@ fn reduce_use(kind: &str, tokens: i64, count: usize, tags: &[u64]) -> TemplateUs
     let hints = tags.len().min(4);
     let mut slots = Map::from_iter([(
         "tokens_k".into(),
-        json!((tokens.max(0) as f64 / 1000.0).round() as i64),
+        json!(((tokens.max(0) as f64 / 1000.0).round() as i64).min(MAX)),
     )]);
     if count > 1 {
         slots.insert("count".into(), json!(count.min(MAX as usize)));
@@ -149,8 +151,11 @@ fn time_use(gap_ms: i64) -> Option<TemplateUse> {
     };
     let mut parts = gap.split(' ');
     let (major, unit) = parse(parts.next()?)?;
+    // A long idle gap must not produce an integer outside the declared slots.
+    let major = major.clamp(1, MAX);
     Some(if let Some(minor) = parts.next() {
         let (minor, minor_unit) = parse(minor)?;
+        let minor = minor.clamp(1, 59);
         template_use(
             "mc.time.compound.v1",
             json!({"major":major,"major_unit":unit,"minor":minor,"minor_unit":minor_unit})
@@ -580,6 +585,49 @@ mod tests {
             delivery_order::render(&templates(), &use_, |_| false).is_err(),
             "unassigned tags must not render"
         );
+    }
+
+    #[test]
+    fn integer_slots_are_json_safe_and_senders_clamp_large_values() {
+        for template in templates() {
+            for (name, slot) in template.slots {
+                if let Slot::Integer { max, .. } = slot {
+                    assert_eq!(max, if name == "minor" { 59 } else { 100_000 });
+                }
+            }
+        }
+        let reduction = reduce_use("urgent", i64::MAX, usize::MAX, &[12]);
+        assert_eq!(reduction.slots["tokens_k"], 100_000);
+        assert_eq!(reduction.slots["count"], 100_000);
+        delivery_order::render(&templates(), &reduction, |tag| tag == 12).unwrap();
+        let time = time_use(i64::MAX).unwrap();
+        assert_eq!(time.slots["major"], 100_000);
+        if let Some(minor) = time.slots.get("minor") {
+            assert!(minor
+                .as_i64()
+                .is_some_and(|minor| (1..=59).contains(&minor)));
+        }
+        delivery_order::render(&templates(), &time, |_| false).unwrap();
+    }
+
+    #[test]
+    fn template_catalog_matches_pinned_digests() {
+        let pinned: Value =
+            serde_json::from_str(include_str!("../testdata/runner-reminder-catalog.json")).unwrap();
+        let actual = Value::Object(
+            catalog()["templates"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .map(|row| {
+                    (
+                        row["id"].as_str().unwrap().to_owned(),
+                        row["digest"].clone(),
+                    )
+                })
+                .collect(),
+        );
+        assert_eq!(actual, pinned);
     }
 
     #[derive(Default)]
