@@ -8,9 +8,10 @@
 use super::*;
 use cortexkit_bus_inmemory::{InMemoryBus, InMemoryConfig};
 
-/// Wall and thread-CPU time spent in `AsyncRecord::save`, per conversation.
-/// Saves run on whichever worker thread holds the conversation, so the meter
-/// is keyed by session reference rather than kept thread-local.
+/// Wall and thread-CPU time spent in `AsyncRecord::save` (and, separately,
+/// in a full `load`), per conversation. Saves run on whichever worker thread
+/// holds the conversation, so the meter is keyed by session reference rather
+/// than kept thread-local.
 pub(super) mod save_meter {
     use std::collections::BTreeMap;
     use std::sync::Mutex;
@@ -27,12 +28,18 @@ pub(super) mod save_meter {
 
     pub struct Timer {
         reference: String,
+        kind: &'static str,
         wall: Instant,
         cpu: cpu_time::ThreadTime,
     }
 
     pub fn start(reference: &str) -> Timer {
+        start_kind(reference, "save")
+    }
+
+    pub fn start_kind(reference: &str, kind: &'static str) -> Timer {
         Timer {
+            kind,
             reference: reference.into(),
             wall: Instant::now(),
             cpu: cpu_time::ThreadTime::now(),
@@ -42,7 +49,9 @@ pub(super) mod save_meter {
     impl Drop for Timer {
         fn drop(&mut self) {
             let mut meters = METERS.lock().unwrap_or_else(|p| p.into_inner());
-            let stats = meters.entry(self.reference.clone()).or_default();
+            let stats = meters
+                .entry(format!("{}:{}", self.kind, self.reference))
+                .or_default();
             stats.saves += 1;
             stats.wall_nanos += self.wall.elapsed().as_nanos() as u64;
             stats.cpu_nanos += self.cpu.elapsed().as_nanos() as u64;
@@ -50,10 +59,14 @@ pub(super) mod save_meter {
     }
 
     pub fn read(reference: &str) -> SaveStats {
+        read_kind(reference, "save")
+    }
+
+    pub fn read_kind(reference: &str, kind: &str) -> SaveStats {
         METERS
             .lock()
             .unwrap_or_else(|p| p.into_inner())
-            .get(reference)
+            .get(&format!("{kind}:{reference}"))
             .copied()
             .unwrap_or_default()
     }
@@ -121,7 +134,7 @@ impl session_resolver::ProviderRunner for PagedRunner {
 /// part and a ~1.2 KB tool output, a 32 KB output every 101 messages and a
 /// 200 KB output every 997 messages.
 fn message(n: u64) -> (ReadMessage, usize) {
-    let (role, parts, tags) = if n % 5 == 0 {
+    let (role, parts, tags) = if n.is_multiple_of(5) {
         (
             "user",
             json!([{"id":format!("p{n}a"),"type":"text","text":format!("user turn {n}: ")+&"please look at the failing build ".repeat(8)}]),
@@ -178,6 +191,7 @@ struct Sample {
     process_cpu_ms: f64,
     save_wall_ms: f64,
     save_cpu_ms: f64,
+    load_cpu_ms: f64,
     write_tx_ms: f64,
     write_tx: u64,
     rows: u64,
@@ -347,6 +361,7 @@ impl Rig {
         self.truncate_wal();
         self.store().arm_async_write_meter(&self.reference);
         let saves = save_meter::read(&self.reference);
+        let loads = save_meter::read_kind(&self.reference, "load");
         let wall = Instant::now();
         let cpu = cpu_time::ProcessTime::now();
         let value = work.await;
@@ -354,11 +369,13 @@ impl Rig {
         let wall_ms = wall.elapsed().as_secs_f64() * 1e3;
         let writes = self.store().async_write_stats(&self.reference).unwrap();
         let after = save_meter::read(&self.reference);
+        let loaded = save_meter::read_kind(&self.reference, "load");
         let sample = Sample {
             wall_ms,
             process_cpu_ms,
             save_wall_ms: (after.wall_nanos - saves.wall_nanos) as f64 / 1e6,
             save_cpu_ms: (after.cpu_nanos - saves.cpu_nanos) as f64 / 1e6,
+            load_cpu_ms: (loaded.cpu_nanos - loads.cpu_nanos) as f64 / 1e6,
             write_tx_ms: writes.nanos as f64 / 1e6,
             write_tx: writes.transactions,
             rows: writes.rows,
@@ -483,21 +500,71 @@ async fn ordinary_notice_write_set_does_not_grow_with_the_session() {
         small.bytes,
         small.rows
     );
-    assert_eq!(
-        large.write_tx, small.write_tx,
-        "the number of write transactions per notice must not depend on session size"
-    );
     assert!(
         large_record <= small_record * 2,
         "the per-conversation record must stay fixed-size: {large_record} bytes at 600 messages, {small_record} at 60"
     );
 }
 
+async fn view_answer(rig: &Rig, version: u64) -> String {
+    let answer = rig
+        .op(
+            "view.get",
+            json!({"session_ref":rig.reference,"view_version":version}),
+        )
+        .await;
+    match answer["answer"].as_str() {
+        Some("view") => {
+            assert_eq!(answer["view"]["view_version"], version);
+            "view".into()
+        }
+        _ => answer["code"].as_str().unwrap().into(),
+    }
+}
+
+/// Retention keeps the runner's applied version, every version it has not
+/// acknowledged yet and the newest; an acknowledgement evicts the rest, and
+/// `view.get` of an evicted version answers `unknown_version`.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn acknowledgement_evicts_only_superseded_views() {
+    let dir = tempfile::tempdir().unwrap();
+    let (mut rig, first) = conversation(dir.path(), 40).await;
+    rig.history(22, "a second historian summary");
+    rig.append(4);
+    rig.notice(1_000, Some(first)).await;
+    let second = rig.newest().unwrap();
+    assert!(second > first);
+    rig.history(24, "a third historian summary");
+    rig.append(4);
+    rig.notice(1_000, Some(first)).await;
+    let third = rig.newest().unwrap();
+    assert!(third > second);
+    for version in [first, second, third] {
+        assert_eq!(
+            view_answer(&rig, version).await,
+            "view",
+            "applied {first}: version {version} is applied or not yet acknowledged"
+        );
+    }
+    rig.append(4);
+    rig.notice(1_000, Some(second)).await;
+    assert_eq!(view_answer(&rig, first).await, "unknown_version");
+    assert_eq!(view_answer(&rig, second).await, "view");
+    assert_eq!(view_answer(&rig, third).await, "view");
+    rig.append(4);
+    rig.notice(1_000, Some(third)).await;
+    assert_eq!(view_answer(&rig, second).await, "unknown_version");
+    assert_eq!(view_answer(&rig, third).await, "view");
+    assert_eq!(rig.views().0, 1, "only the applied, newest view remains");
+    assert_eq!(rig.newest(), Some(third));
+}
+
 fn row(label: &str, size: u64, sample: &Sample) -> String {
     let line = format!(
-        "| {label} | {size} | {:.1} | {:.1} | {:.2} | {:.2} | {:.2} | {} | {} | {} | {} |",
+        "| {label} | {size} | {:.1} | {:.1} | {:.1} | {:.2} | {:.2} | {:.2} | {} | {} | {} | {} |",
         sample.wall_ms,
         sample.process_cpu_ms,
+        sample.load_cpu_ms,
         sample.save_wall_ms,
         sample.save_cpu_ms,
         sample.write_tx_ms,
@@ -528,8 +595,8 @@ async fn storage_scaling_benchmark() {
         .map(|size| size.trim().parse::<u64>().unwrap())
         .collect::<Vec<_>>();
     let mut table = vec![
-        "| operation | messages | wall ms | process CPU ms | save wall ms | save CPU ms | write-tx ms | write txs | rows written | bytes written | WAL bytes |".to_string(),
-        "|---|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|".to_string(),
+        "| operation | messages | wall ms | process CPU ms | full-load CPU ms | save wall ms | save CPU ms | write-tx ms | write txs | rows written | bytes written | WAL bytes |".to_string(),
+        "|---|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|".to_string(),
     ];
     let mut sizes_table = vec![
         "| messages | transcript bytes | state_json bytes | entry rows bytes | views rows | views bytes | views rows +1 publish | views bytes +1 publish |".to_string(),

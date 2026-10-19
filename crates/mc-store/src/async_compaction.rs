@@ -165,23 +165,70 @@ impl McStore {
             .map_err(Into::into)
     }
 
-    pub fn save_async_compaction(
+    /// Begin one atomic save of an async conversation: the small record plus
+    /// only the row changes the caller adds. Nothing is written until
+    /// [`AsyncCompactionSave::commit`].
+    pub fn async_compaction_save<'a>(
+        &'a self,
+        session_ref: &'a str,
+        key: &'a str,
+        session: &'a str,
+        state: &'a str,
+    ) -> AsyncCompactionSave<'a> {
+        AsyncCompactionSave {
+            store: self,
+            session_ref,
+            key,
+            session,
+            state,
+            namespace: "",
+            tags: &[],
+            truncate_entries: None,
+            entries: Vec::new(),
+            baselines: Vec::new(),
+            clear_engine_views: false,
+            retain_views_from: None,
+        }
+    }
+
+    /// Everything needed to rebuild a held conversation, read in one snapshot
+    /// from a reader connection so a long transcript never holds the writer.
+    pub fn load_async_compaction_rows(
         &self,
         session_ref: &str,
-        key: &str,
-        session: &str,
-        state: &str,
-        namespace: &str,
-        tags: &[McTagRow],
-    ) -> Result<(), McStoreError> {
-        metered!(session_ref, self.inner.with_conn_fenced(|conn| {
-            conn.execute("INSERT INTO mc_async_compaction(session_ref,conversation_key,session,state_json) VALUES(?1,?2,?3,?4)
-                ON CONFLICT(session_ref) DO UPDATE SET state_json=excluded.state_json",
-                params![session_ref,key,session,state])?;
-            crate::provider_log::insert_tags_tx(conn, namespace, tags)?;
-            let bytes = state.len() + tags.iter().map(|t| t.source_bytes.len() + t.block_id.len()).sum::<usize>();
-            Ok(((), 1 + tags.len() as u64, bytes as u64))
-        }).map_err(McStoreError::from))
+    ) -> Result<Option<AsyncCompactionRows>, McStoreError> {
+        self.inner
+            .with_read(|conn| {
+                let Some(state) = conn
+                    .query_row(
+                        "SELECT state_json FROM mc_async_compaction WHERE session_ref=?1",
+                        [session_ref],
+                        |row| row.get(0),
+                    )
+                    .optional()?
+                else {
+                    return Ok(None);
+                };
+                let entries = conn
+                    .prepare("SELECT ordinal,entry_json,index_json FROM mc_async_compaction_entries WHERE session_ref=?1 ORDER BY ordinal")?
+                    .query_map([session_ref], |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)))?
+                    .collect::<rusqlite::Result<_>>()?;
+                let engine_views = conn
+                    .prepare("SELECT version,engine_json FROM mc_async_compaction_views WHERE session_ref=?1 AND engine_json IS NOT NULL ORDER BY version")?
+                    .query_map([session_ref], |row| Ok((row.get(0)?, row.get(1)?)))?
+                    .collect::<rusqlite::Result<_>>()?;
+                let baselines = conn
+                    .prepare("SELECT slot,view_json FROM mc_async_compaction_baselines WHERE session_ref=?1")?
+                    .query_map([session_ref], |row| Ok((row.get(0)?, row.get(1)?)))?
+                    .collect::<rusqlite::Result<_>>()?;
+                Ok(Some(AsyncCompactionRows {
+                    state,
+                    entries,
+                    engine_views,
+                    baselines,
+                }))
+            })
+            .map_err(Into::into)
     }
 
     /// Reserve before building a view. A crash skips the reservation, never reuses it.
@@ -211,15 +258,16 @@ impl McStore {
         session_ref: &str,
         version: u64,
         view: &str,
+        engine: &str,
     ) -> Result<(), McStoreError> {
         metered!(
             session_ref,
             self.inner
                 .with_conn_fenced(|conn| {
                     conn.execute(
-            "INSERT INTO mc_async_compaction_views(session_ref,session,version,view_json) SELECT ?1,session,?2,?3 FROM mc_async_compaction WHERE session_ref=?1",
-            params![session_ref,version,view],
-        ).map(|rows| ((), rows as u64, view.len() as u64))
+            "INSERT INTO mc_async_compaction_views(session_ref,session,version,view_json,engine_json) SELECT ?1,session,?2,?3,?4 FROM mc_async_compaction WHERE session_ref=?1",
+            params![session_ref,version,view,engine],
+        ).map(|rows| ((), rows as u64, (view.len() + engine.len()) as u64))
                 })
                 .map_err(McStoreError::from)
         )
@@ -266,5 +314,153 @@ impl McStore {
                 })
                 .map_err(McStoreError::from)
         )
+    }
+}
+
+/// The stored rows of one async conversation, as read by
+/// [`McStore::load_async_compaction_rows`].
+pub struct AsyncCompactionRows {
+    pub state: String,
+    /// `(ordinal, entry_json, index_json)` in ordinal order.
+    pub entries: Vec<(u64, String, String)>,
+    /// `(version, engine_json)` for published views still usable as an
+    /// engine baseline, in version order.
+    pub engine_views: Vec<(u64, String)>,
+    /// `(slot, view_json)` for baselines stored outside the published views.
+    pub baselines: Vec<(String, String)>,
+}
+
+/// One pending atomic save; see [`McStore::async_compaction_save`].
+pub struct AsyncCompactionSave<'a> {
+    store: &'a McStore,
+    session_ref: &'a str,
+    key: &'a str,
+    session: &'a str,
+    state: &'a str,
+    namespace: &'a str,
+    tags: &'a [McTagRow],
+    truncate_entries: Option<Option<u64>>,
+    entries: Vec<(u64, String, String)>,
+    baselines: Vec<(&'static str, Option<String>)>,
+    clear_engine_views: bool,
+    retain_views_from: Option<u64>,
+}
+
+impl<'a> AsyncCompactionSave<'a> {
+    /// Runner tag rows to import into the engine namespace's tag table.
+    pub fn tags(&mut self, namespace: &'a str, tags: &'a [McTagRow]) -> &mut Self {
+        self.namespace = namespace;
+        self.tags = tags;
+        self
+    }
+
+    /// Delete held entries after `through` (all entries for `None`) before
+    /// appending. Several calls keep the earliest cut.
+    pub fn truncate_entries(&mut self, through: Option<u64>) -> &mut Self {
+        self.truncate_entries = Some(match (self.truncate_entries, through) {
+            (Some(None), _) | (_, None) => None,
+            (Some(Some(held)), Some(through)) => Some(held.min(through)),
+            (None, Some(through)) => Some(through),
+        });
+        self
+    }
+
+    /// Append one new held entry. An ordinal that is already stored is an
+    /// error, never an overwrite: held entries are immutable.
+    pub fn append_entry(
+        &mut self,
+        ordinal: u64,
+        entry_json: String,
+        index_json: String,
+    ) -> &mut Self {
+        self.entries.push((ordinal, entry_json, index_json));
+        self
+    }
+
+    /// Store (`Some`) or remove (`None`) the baseline kept in `slot`.
+    pub fn baseline(&mut self, slot: &'static str, view_json: Option<String>) -> &mut Self {
+        self.baselines.push((slot, view_json));
+        self
+    }
+
+    /// Forget every published view's engine form; their immutable runner
+    /// views stay retrievable.
+    pub fn clear_engine_views(&mut self) -> &mut Self {
+        self.clear_engine_views = true;
+        self
+    }
+
+    /// Record that versions below `floor` are no longer needed and delete
+    /// them, except the newest version, in this same transaction.
+    pub fn retain_views_from(&mut self, floor: u64) -> &mut Self {
+        self.retain_views_from = Some(floor);
+        self
+    }
+
+    pub fn commit(&self) -> Result<(), McStoreError> {
+        let Self {
+            store,
+            session_ref,
+            key,
+            session,
+            state,
+            namespace,
+            tags,
+            truncate_entries,
+            ref entries,
+            ref baselines,
+            clear_engine_views,
+            retain_views_from,
+        } = *self;
+        metered!(session_ref, store.inner.with_conn_fenced(|conn| {
+            let mut rows = conn.execute("INSERT INTO mc_async_compaction(session_ref,conversation_key,session,state_json) VALUES(?1,?2,?3,?4)
+                ON CONFLICT(session_ref) DO UPDATE SET state_json=excluded.state_json",
+                params![session_ref,key,session,state])? as u64;
+            let mut bytes = state.len();
+            if let Some(through) = truncate_entries {
+                rows += conn.execute(
+                    "DELETE FROM mc_async_compaction_entries WHERE session_ref=?1 AND ordinal>?2",
+                    params![session_ref, through.map_or(-1, |n| n as i64)],
+                )? as u64;
+            }
+            if !entries.is_empty() {
+                let mut insert = conn.prepare_cached("INSERT INTO mc_async_compaction_entries(session_ref,session,ordinal,entry_json,index_json) VALUES(?1,?2,?3,?4,?5)")?;
+                for (ordinal, entry, index) in entries {
+                    rows += insert.execute(params![session_ref, session, ordinal, entry, index])? as u64;
+                    bytes += entry.len() + index.len();
+                }
+            }
+            for (slot, view) in baselines {
+                rows += match view {
+                    Some(view) => {
+                        bytes += view.len();
+                        conn.execute("INSERT INTO mc_async_compaction_baselines(session_ref,session,slot,view_json) VALUES(?1,?2,?3,?4)
+                            ON CONFLICT(session_ref,slot) DO UPDATE SET view_json=excluded.view_json",
+                            params![session_ref, session, slot, view])?
+                    }
+                    None => conn.execute(
+                        "DELETE FROM mc_async_compaction_baselines WHERE session_ref=?1 AND slot=?2",
+                        params![session_ref, slot],
+                    )?,
+                } as u64;
+            }
+            if clear_engine_views {
+                rows += conn.execute(
+                    "UPDATE mc_async_compaction_views SET engine_json=NULL WHERE session_ref=?1 AND engine_json IS NOT NULL",
+                    [session_ref],
+                )? as u64;
+            }
+            if let Some(floor) = retain_views_from {
+                rows += conn.execute(
+                    "DELETE FROM mc_async_compaction_views WHERE session_ref=?1 AND version<?2
+                        AND version<(SELECT max(version) FROM mc_async_compaction_views WHERE session_ref=?1)",
+                    params![session_ref, floor],
+                )? as u64;
+            }
+            crate::provider_log::insert_tags_tx(conn, namespace, tags)?;
+            rows += tags.len() as u64;
+            bytes += tags.iter().map(|t| t.source_bytes.len() + t.block_id.len()).sum::<usize>();
+            Ok(((), rows, bytes as u64))
+        }).map_err(McStoreError::from))
     }
 }

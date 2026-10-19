@@ -2834,14 +2834,25 @@ pub const TABLES: &[TableInventory] = &[
         Some(KeyPolicy::Preserve),
         None
     ),
-// store.db: 41 tables observed after fresh migration.
+// store.db: 43 tables observed after fresh migration.
     table!(Module, "mc_async_compaction", Ship,
         RowSelector::Predicate("session = ?1"), &["session_ref"],
         &["session_ref", "conversation_key", "session", "state_json", "version_high_water"],
         &[], Some(KeyPolicy::PreserveOrRefuseCollision), None),
+    // The held transcript and engine baselines are part of the same async
+    // conversation record: without them the small record names a cursor and
+    // baselines that no longer exist, so they ship with it.
+    table!(Module, "mc_async_compaction_entries", Ship,
+        RowSelector::Predicate("session = ?1"),
+        &["session_ref", "ordinal"], &["session_ref", "session", "ordinal", "entry_json", "index_json"],
+        &[], Some(KeyPolicy::PreserveOrRefuseCollision), None),
     table!(Module, "mc_async_compaction_views", Ship,
         RowSelector::Predicate("session = ?1"),
-        &["session_ref", "version"], &["session_ref", "session", "version", "view_json", "announced"],
+        &["session_ref", "version"], &["session_ref", "session", "version", "view_json", "engine_json", "announced"],
+        &[], Some(KeyPolicy::PreserveOrRefuseCollision), None),
+    table!(Module, "mc_async_compaction_baselines", Ship,
+        RowSelector::Predicate("session = ?1"),
+        &["session_ref", "slot"], &["session_ref", "session", "slot", "view_json"],
         &[], Some(KeyPolicy::PreserveOrRefuseCollision), None),
     // Provider state cannot be rebuilt: it includes allocated versions and tags,
     // frozen catalog admission, and answers that the runner may not have applied.

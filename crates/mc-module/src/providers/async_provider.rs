@@ -95,7 +95,9 @@ pub(crate) struct AsyncRecord {
     last_discarded_drops: usize,
     #[serde(default)]
     last_transferred_drops: usize,
-    #[serde(default)]
+    /// Runner tag → part address for every held entry. Stored per entry in
+    /// `mc_async_compaction_entries.index_json`, not in this record.
+    #[serde(skip)]
     tag_index: BTreeMap<String, PartAddress>,
     #[serde(default)]
     pub(crate) usage_policy: Option<super::usage_policy::UsagePolicyState>,
@@ -107,14 +109,34 @@ pub(crate) struct AsyncRecord {
     pub(crate) dream_target: Option<Value>,
     #[serde(default)]
     pub(crate) reminder_cadence: Option<crate::runner_reminders::ReminderState>,
+    /// Generation of the tail-hygiene baseline the reminder cadence last saw.
+    /// The cadence is stored without the baseline itself: the baseline has one
+    /// measurement per tail part (it grows with the session), every reminder
+    /// pass replaces it from the engine's current one, and only its generation
+    /// is compared across notices.
+    #[serde(default)]
+    reminder_baseline_generation: Option<u64>,
     key: Key,
     runner_module: String,
     setup: compact::setup::SetupRequest,
     initial: Value,
+    /// Only the engine's fixed-size counters are in this record; its produced
+    /// and applied baselines are named by `engine_baselines`.
+    #[serde(with = "engine_header")]
     engine: transform::compaction::State,
+    #[serde(default)]
+    engine_baselines: EngineBaselines,
+    /// Engine forms of this generation's retained published views, stored
+    /// beside each view in `mc_async_compaction_views.engine_json`.
+    #[serde(skip)]
     published_engine: BTreeMap<u64, transform::compaction::View>,
     lineage: Option<String>,
+    /// The held transcript, stored one row per ordinal in
+    /// `mc_async_compaction_entries`.
+    #[serde(skip)]
     entries: BTreeMap<u64, ReadMessage>,
+    #[serde(skip)]
+    journal: Journal,
     seq: u64,
     completed_seq: u64,
     applied: Option<u64>,
@@ -125,6 +147,106 @@ pub(crate) struct AsyncRecord {
     generation: u64,
 }
 type State = AsyncRecord;
+
+/// Where an engine baseline (`last_produced` / `last_applied`) is stored.
+/// A baseline that is one of the retained published views is only named by
+/// version, so acknowledging a view never copies the whole transcript again.
+#[derive(Serialize, Deserialize, Default, Clone, Copy, PartialEq, Eq, Debug)]
+#[serde(rename_all = "snake_case")]
+enum Baseline {
+    #[default]
+    Absent,
+    Published(u64),
+    Stored,
+}
+
+#[derive(Serialize, Deserialize, Default, Clone, Copy, PartialEq, Eq, Debug)]
+struct EngineBaselines {
+    produced: Baseline,
+    applied: Baseline,
+}
+
+/// Identity of an engine view. Within one generation the engine allocates
+/// each view a fresh version, and a view only changes in place when a fork
+/// descent rewrites its range, so version, range and length identify it
+/// without comparing every message.
+type ViewIdentity = (u64, transform::compaction::Range, usize);
+
+fn view_identity(view: &transform::compaction::View) -> ViewIdentity {
+    (view.version, view.range.clone(), view.replacement.len())
+}
+
+/// What the store already holds for this record, so a save writes only the
+/// difference. Not persisted; rebuilt by every full load.
+#[derive(Default)]
+struct Journal {
+    /// False for a record read without its rows (a read-only check); saving
+    /// such a record would erase its transcript, so it is refused.
+    complete: bool,
+    /// Highest held ordinal already stored.
+    persisted_through: Option<u64>,
+    /// Highest held ordinal already in `tag_index`.
+    indexed_through: Option<u64>,
+    /// Stored entries to delete on the next save: after this ordinal, or all
+    /// of them for `Some(None)`.
+    truncate: Option<Option<u64>>,
+    /// The published views' engine forms belong to a discarded generation.
+    clear_published: bool,
+    /// Identities of the baselines as last stored.
+    produced: Option<ViewIdentity>,
+    applied: Option<ViewIdentity>,
+}
+
+impl Journal {
+    fn new_record() -> Self {
+        Self {
+            complete: true,
+            ..Self::default()
+        }
+    }
+}
+
+/// Serialize only the engine's fixed-size fields; its baselines are stored
+/// separately (see `EngineBaselines`).
+mod engine_header {
+    use super::transform::compaction::{Preset, State};
+    use serde::{Deserialize, Deserializer, Serialize, Serializer};
+
+    #[derive(Serialize, Deserialize)]
+    struct Header {
+        compaction_id: String,
+        preset: Preset,
+        version_high_water: u64,
+        rebuild_epoch: u64,
+    }
+
+    pub(super) fn serialize<S: Serializer>(
+        engine: &State,
+        serializer: S,
+    ) -> Result<S::Ok, S::Error> {
+        Header {
+            compaction_id: engine.compaction_id.clone(),
+            preset: engine.preset,
+            version_high_water: engine.version_high_water,
+            rebuild_epoch: engine.rebuild_epoch,
+        }
+        .serialize(serializer)
+    }
+
+    pub(super) fn deserialize<'de, D: Deserializer<'de>>(
+        deserializer: D,
+    ) -> Result<State, D::Error> {
+        let header = Header::deserialize(deserializer)?;
+        Ok(State {
+            compaction_id: header.compaction_id,
+            preset: header.preset,
+            version_high_water: header.version_high_water,
+            rebuild_epoch: header.rebuild_epoch,
+            last_produced: None,
+            last_applied: None,
+        })
+    }
+}
 
 #[derive(Serialize, Deserialize)]
 struct PartAddress {
@@ -213,20 +335,198 @@ impl State {
     fn namespace(&self) -> String {
         format!("{}:async:{}", self.key.engine_key(), self.generation)
     }
-    fn save(&self, store: &McStore, tag_rows: &[mc_store::McTagRow]) -> Result<(), HandlerOutcome> {
+    /// Persist this record in one transaction: the small record plus only
+    /// what changed since it was loaded or last saved (new held entries, a
+    /// transcript cut, changed baselines, view retention). `tag_rows` are the
+    /// runner tag rows of the newly held entries; see `unsaved_tag_rows`.
+    fn save(
+        &mut self,
+        store: &McStore,
+        tag_rows: &[mc_store::McTagRow],
+    ) -> Result<(), HandlerOutcome> {
         #[cfg(test)]
         let _timer = scaling_tests::save_meter::start(&self.reference());
-        store
-            .save_async_compaction(
-                &self.reference(),
-                &self.key.store_key().conversation_key(),
-                &self.key.session,
-                &serde_json::to_string(self).map_err(transient)?,
-                &self.namespace(),
-                tag_rows,
-            )
-            .map_err(transient)
+        if !self.journal.complete {
+            return Err(transient("async record was loaded without its transcript"));
+        }
+        self.reindex()?;
+        let mut baselines = Vec::new();
+        let produced = self.place_baseline(
+            self.engine.last_produced.as_ref(),
+            self.journal.produced.as_ref(),
+            self.engine_baselines.produced,
+        )?;
+        if let Some((mode, write)) = produced {
+            self.engine_baselines.produced = mode;
+            baselines.extend(write.map(|view| ("produced", view)));
+        }
+        let applied = self.place_baseline(
+            self.engine.last_applied.as_ref(),
+            self.journal.applied.as_ref(),
+            self.engine_baselines.applied,
+        )?;
+        if let Some((mode, write)) = applied {
+            self.engine_baselines.applied = mode;
+            baselines.extend(write.map(|view| ("applied", view)));
+        }
+        // Keep the applied version, everything newer (not yet acknowledged)
+        // and any version an engine baseline names; the store also keeps the
+        // newest version.
+        let retain_from = self.applied.map(|applied| {
+            [
+                self.engine_baselines.produced,
+                self.engine_baselines.applied,
+            ]
+            .into_iter()
+            .filter_map(|baseline| match baseline {
+                Baseline::Published(version) => Some(version),
+                _ => None,
+            })
+            .fold(applied, u64::min)
+        });
+        let mut appended = Vec::new();
+        for entry in self.unsaved_entries() {
+            appended.push((
+                entry.ordinal,
+                serde_json::to_string(entry).map_err(transient)?,
+                self.entry_index(entry)?,
+            ));
+        }
+        let reference = self.reference();
+        let key = self.key.store_key().conversation_key();
+        let namespace = self.namespace();
+        let state = serde_json::to_string(self).map_err(transient)?;
+        let mut save = store.async_compaction_save(&reference, &key, &self.key.session, &state);
+        save.tags(&namespace, tag_rows);
+        if let Some(through) = self.journal.truncate {
+            save.truncate_entries(through);
+        }
+        for (ordinal, entry, index) in appended {
+            save.append_entry(ordinal, entry, index);
+        }
+        for (slot, view) in baselines {
+            save.baseline(slot, view);
+        }
+        if self.journal.clear_published {
+            save.clear_engine_views();
+        }
+        if let Some(floor) = retain_from {
+            save.retain_views_from(floor);
+        }
+        if let Err(error) = save.commit() {
+            // The in-memory journal no longer describes the store; a retry
+            // must reload rather than save a wrong difference.
+            self.journal.complete = false;
+            return Err(transient(error));
+        }
+        self.journal.truncate = None;
+        self.journal.clear_published = false;
+        self.journal.persisted_through = self.entries.last_key_value().map(|(n, _)| *n);
+        self.journal.produced = self.engine.last_produced.as_ref().map(view_identity);
+        self.journal.applied = self.engine.last_applied.as_ref().map(view_identity);
+        if let Some(floor) = retain_from {
+            let newest = self.published_engine.last_key_value().map(|(n, _)| *n);
+            self.published_engine
+                .retain(|version, _| *version >= floor || Some(*version) == newest);
+        }
+        Ok(())
     }
+
+    /// Held entries not yet stored.
+    fn unsaved_entries(&self) -> impl Iterator<Item = &ReadMessage> {
+        let from = self
+            .journal
+            .persisted_through
+            .map_or(std::ops::Bound::Unbounded, std::ops::Bound::Excluded);
+        self.entries
+            .range((from, std::ops::Bound::Unbounded))
+            .map(|(_, entry)| entry)
+    }
+
+    /// Runner tag rows for the held entries not yet stored. Rows of stored
+    /// entries are already in the namespace's tag table.
+    fn unsaved_tag_rows(
+        &self,
+        codec: codec::Codec,
+    ) -> Result<Vec<mc_store::McTagRow>, HandlerOutcome> {
+        tag_rows_for(self.unsaved_entries(), codec)
+    }
+
+    /// The stored tag addresses of one entry: `[tag, part key, part digest]`
+    /// for each tagged part, taken from the index `reindex` built.
+    fn entry_index(&self, entry: &ReadMessage) -> Result<String, HandlerOutcome> {
+        let mut index = Vec::new();
+        for row in &entry.tags {
+            if let Some(tag) = &row.tag {
+                let address = self
+                    .tag_index
+                    .get(tag)
+                    .filter(|address| address.ordinal == entry.ordinal)
+                    .ok_or_else(|| transient("async entry saved before it was indexed"))?;
+                index.push([tag.as_str(), row.part.as_str(), address.digest.as_str()]);
+            }
+        }
+        serde_json::to_string(&index).map_err(transient)
+    }
+
+    /// Decide how a baseline is stored. `None` when it is unchanged since the
+    /// last save; otherwise its new placement and, for the baselines table,
+    /// the row to write (`Some(json)`) or delete (`None`).
+    #[allow(clippy::type_complexity)]
+    fn place_baseline(
+        &self,
+        view: Option<&transform::compaction::View>,
+        stored: Option<&ViewIdentity>,
+        previous: Baseline,
+    ) -> Result<Option<(Baseline, Option<Option<String>>)>, HandlerOutcome> {
+        let identity = view.map(view_identity);
+        if identity.as_ref() == stored {
+            return Ok(None);
+        }
+        let stale_row = (previous == Baseline::Stored).then_some(None);
+        let Some(view) = view else {
+            return Ok(Some((Baseline::Absent, stale_row)));
+        };
+        let published = self
+            .published_engine
+            .iter()
+            .rev()
+            .find(|(_, published)| Some(view_identity(published)) == identity)
+            .map(|(version, _)| *version);
+        Ok(Some(match published {
+            Some(version) => (Baseline::Published(version), stale_row),
+            None => (
+                Baseline::Stored,
+                Some(Some(serde_json::to_string(view).map_err(transient)?)),
+            ),
+        }))
+    }
+
+    /// Drop held entries after `through`, or all of them for `None`, with
+    /// their tag addresses; the next save deletes the stored rows.
+    fn truncate_entries(&mut self, through: Option<u64>) {
+        match through {
+            Some(through) => {
+                self.entries.retain(|ordinal, _| *ordinal <= through);
+                self.tag_index
+                    .retain(|_, address| address.ordinal <= through);
+            }
+            None => {
+                self.entries.clear();
+                self.tag_index.clear();
+            }
+        }
+        let journal = &mut self.journal;
+        journal.truncate = Some(match (journal.truncate, through) {
+            (Some(None), _) | (_, None) => None,
+            (Some(Some(held)), Some(through)) => Some(held.min(through)),
+            (None, Some(through)) => Some(through),
+        });
+        let cut = |held: Option<u64>| through.and_then(|through| held.map(|n| n.min(through)));
+        journal.persisted_through = cut(journal.persisted_through);
+        journal.indexed_through = cut(journal.indexed_through);
+    }
+
     fn reset(&mut self, store: &McStore) -> Result<(), HandlerOutcome> {
         if self.resync_sources.is_none() {
             let namespace = self.namespace();
@@ -328,8 +628,7 @@ impl State {
         self.resync = true;
         self.restored_no_new_content = false;
         self.restored_head = None;
-        self.entries.clear();
-        self.tag_index.clear();
+        self.truncate_entries(None);
         self.todo_scan = None;
         self.lineage = None;
         self.generation = self
@@ -338,6 +637,7 @@ impl State {
             .ok_or_else(|| transient("async generation exhausted"))?;
         self.engine = transform::compaction::State::new(self.reference(), self.engine.preset);
         self.published_engine.clear();
+        self.journal.clear_published = true;
         self.save(store, &[])?;
         store
             .retire_unannounced_async_views(&self.reference())
@@ -346,7 +646,78 @@ impl State {
     }
 }
 
+/// Load a conversation with its held transcript, tag index and engine
+/// baselines: everything a notice, ride or save needs.
 fn load(store: &McStore, reference: &str) -> Result<Option<State>, HandlerOutcome> {
+    #[cfg(test)]
+    let _timer = scaling_tests::save_meter::start_kind(reference, "load");
+    let Some(rows) = store
+        .load_async_compaction_rows(reference)
+        .map_err(transient)?
+    else {
+        return Ok(None);
+    };
+    let mut state: State = serde_json::from_str(&rows.state).map_err(transient)?;
+    for (ordinal, entry, index) in rows.entries {
+        let entry: ReadMessage = serde_json::from_str(&entry).map_err(transient)?;
+        let index: Vec<[String; 3]> = serde_json::from_str(&index).map_err(transient)?;
+        for [tag, part, digest] in index {
+            state.tag_index.insert(
+                tag,
+                PartAddress {
+                    ordinal,
+                    mid: entry.mid.clone(),
+                    part,
+                    digest,
+                },
+            );
+        }
+        state.entries.insert(ordinal, entry);
+    }
+    for (version, engine) in rows.engine_views {
+        state
+            .published_engine
+            .insert(version, serde_json::from_str(&engine).map_err(transient)?);
+    }
+    let mut stored = rows
+        .baselines
+        .into_iter()
+        .collect::<BTreeMap<String, String>>();
+    let mut resolve = |slot: &str, baseline: Baseline| match baseline {
+        Baseline::Absent => Ok(None),
+        Baseline::Published(version) => state
+            .published_engine
+            .get(&version)
+            .cloned()
+            .map(Some)
+            .ok_or_else(|| transient("async engine baseline view missing")),
+        Baseline::Stored => stored
+            .remove(slot)
+            .map(|raw| serde_json::from_str(&raw).map_err(transient))
+            .transpose()?
+            .map(Some)
+            .ok_or_else(|| transient("async engine baseline row missing")),
+    };
+    let produced = resolve("produced", state.engine_baselines.produced)?;
+    let applied = resolve("applied", state.engine_baselines.applied)?;
+    state.engine.last_produced = produced;
+    state.engine.last_applied = applied;
+    let through = state.entries.last_key_value().map(|(n, _)| *n);
+    state.journal = Journal {
+        complete: true,
+        persisted_through: through,
+        indexed_through: through,
+        truncate: None,
+        clear_published: false,
+        produced: state.engine.last_produced.as_ref().map(view_identity),
+        applied: state.engine.last_applied.as_ref().map(view_identity),
+    };
+    Ok(Some(state))
+}
+
+/// Load only the small record, for checks that never save: ownership,
+/// resync and lineage. Saving the result is refused.
+fn load_head(store: &McStore, reference: &str) -> Result<Option<State>, HandlerOutcome> {
     store
         .load_async_compaction(reference)
         .map_err(transient)?
@@ -501,7 +872,7 @@ impl McHandler {
             );
         }
         let reference = session_ref(&key.harness, &key.project.to_string_lossy(), &key.session);
-        if let Some(state) = load(store, &reference)? {
+        if let Some(state) = load_head(store, &reference)? {
             self.authorize_async(binding, &state)?;
             let project = self.historian_lane_project(channel, binding, store)?;
             self.record_session_runner_dream_target(
@@ -532,11 +903,14 @@ impl McHandler {
             last_discarded_drops: 0,
             last_transferred_drops: 0,
             tag_index: BTreeMap::new(),
+            engine_baselines: EngineBaselines::default(),
+            journal: Journal::new_record(),
             usage_policy: None,
             todo_scan: None,
             runner_route: None,
             dream_target: None,
             reminder_cadence: None,
+            reminder_baseline_generation: None,
             key,
             runner_module: match &binding.principal {
                 Some(subc_protocol::Principal::Reserved { module_id }) => module_id.clone(),
@@ -723,9 +1097,18 @@ fn stable_entry(left: &ReadMessage, right: &ReadMessage) -> bool {
 }
 
 fn tag_rows(state: &State, codec: codec::Codec) -> Result<Vec<mc_store::McTagRow>, HandlerOutcome> {
+    tag_rows_for(state.entries.values(), codec)
+}
+
+/// Tag rows for `entries`. A tag reused within them is refused here; reuse
+/// against already held entries is refused by `reindex`.
+fn tag_rows_for<'a>(
+    entries: impl Iterator<Item = &'a ReadMessage>,
+    codec: codec::Codec,
+) -> Result<Vec<mc_store::McTagRow>, HandlerOutcome> {
     let mut rows = Vec::new();
     let mut seen = BTreeSet::new();
-    for entry in state.entries.values() {
+    for entry in entries {
         let native = parts(&entry.message)?;
         if native.len() != entry.tags.len() {
             return Err(invalid_field(
@@ -953,7 +1336,7 @@ impl McHandler {
             store.pending_async_compaction_views().map_err(transient)?
         {
             let view: view::CompactionView = serde_json::from_str(&raw).map_err(transient)?;
-            if load(store, &reference)?.is_none_or(|state| {
+            if load_head(store, &reference)?.is_none_or(|state| {
                 state.resync || state.lineage.as_deref() != Some(&view.lineage_id)
             }) {
                 continue;
@@ -984,7 +1367,7 @@ impl McHandler {
             .store
             .get()
             .ok_or_else(|| transient("store unavailable"))?;
-        let Some(mut state) = load(store, &notice.session_ref)? else {
+        let Some(mut state) = load_head(store, &notice.session_ref)? else {
             return Ok(());
         };
         if message.subject
@@ -1011,10 +1394,7 @@ impl McHandler {
                 .and_then(|header| verified_descent(&state, header))
             {
                 let parent = state.lineage.clone().expect("held lineage");
-                state.entries.retain(|ordinal, _| *ordinal <= through);
-                state
-                    .tag_index
-                    .retain(|_, address| address.ordinal <= through);
+                state.truncate_entries(Some(through));
                 state
                     .engine
                     .descend(lineage, &parent, through)
@@ -1038,10 +1418,17 @@ impl McHandler {
         }
         if !duplicate {
             state.applied = notice.applied_view_version;
+            // Re-assign (and so re-store) the baseline only when the runner
+            // acknowledges a different view; it repeats its applied version on
+            // every notice.
             if let Some(applied) = state
                 .applied
                 .and_then(|version| state.published_engine.get(&version))
                 .filter(|view| Some(&view.range.lineage_id) == state.lineage.as_ref())
+                .filter(|view| {
+                    state.engine.last_applied.as_ref().map(view_identity)
+                        != Some(view_identity(view))
+                })
             {
                 state.engine.last_applied = Some(applied.clone());
             }
@@ -1085,7 +1472,8 @@ impl McHandler {
         }
         state.reindex()?;
         state.restore_sources(store, codec)?;
-        state.save(store, &tag_rows(&state, codec)?)?;
+        let rows = state.unsaved_tag_rows(codec)?;
+        state.save(store, &rows)?;
         self.advance_async_policy(&mut state, &notice, codec)?;
         let pending_before = store
             .load_pending_agent_drops(&state.namespace())
@@ -1284,6 +1672,16 @@ impl McHandler {
             .zip(prior)
             .and_then(|(written, prior)| i64::try_from(written).ok().zip(i64::try_from(prior).ok()))
             .map(|(written, prior)| written.saturating_sub(prior));
+        let loaded_generation = loaded
+            .meta
+            .tail_hygiene_baseline
+            .as_ref()
+            .map(|b| b.baseline_generation);
+        let prior_generation = if state.reminder_cadence.is_some() {
+            state.reminder_baseline_generation
+        } else {
+            loaded_generation
+        };
         let mut cadence = state.reminder_cadence.take().unwrap_or_else(|| {
             let mut cadence = crate::runner_reminders::ReminderState::default();
             cadence.meta = loaded.meta.clone();
@@ -1298,16 +1696,7 @@ impl McHandler {
             oldest_reclaimable_tags: &oldest,
             channel2_tags: &channel2,
             drops_applied,
-            baseline_refreshed: cadence
-                .meta
-                .tail_hygiene_baseline
-                .as_ref()
-                .map(|b| b.baseline_generation)
-                != loaded
-                    .meta
-                    .tail_hygiene_baseline
-                    .as_ref()
-                    .map(|b| b.baseline_generation),
+            baseline_refreshed: prior_generation != loaded_generation,
             hard_fold_coverage_advanced: loaded.meta.coverage_ordinal
                 > cadence.meta.coverage_ordinal,
             user_message_id: user.map(|message| message.mid.as_str()),
@@ -1328,6 +1717,11 @@ impl McHandler {
         )
         .await;
         cadence.meta.coverage_ordinal = loaded.meta.coverage_ordinal;
+        state.reminder_baseline_generation = cadence
+            .meta
+            .tail_hygiene_baseline
+            .take()
+            .map(|b| b.baseline_generation);
         state.reminder_cadence = Some(cadence);
         for error in outcome.errors {
             tracing::warn!(%error,"async reminder send unavailable");
@@ -1488,6 +1882,7 @@ impl McHandler {
                 &state.reference(),
                 version,
                 &serde_json::to_string(&view).map_err(transient)?,
+                &serde_json::to_string(&candidate).map_err(transient)?,
             )
             .map_err(transient)?;
         state.published_engine.insert(version, candidate);
@@ -1504,7 +1899,7 @@ impl McHandler {
             .store
             .get()
             .ok_or_else(|| transient("store unavailable"))?;
-        let Some(state) = load(store, &request.session_ref)? else {
+        let Some(state) = load_head(store, &request.session_ref)? else {
             return bytes(
                 &json!({"answer":"refuse","code":"unknown_session","reason":"Unknown async conversation"}),
             );
@@ -1559,7 +1954,7 @@ impl McHandler {
                 .store
                 .get()
                 .ok_or_else(|| transient("store unavailable"))?;
-            let Some(mut state) = load(store, &request.session_ref)? else {
+            let Some(mut state) = load_head(store, &request.session_ref)? else {
                 return bytes(&ride::RideAnswer::nothing());
             };
             self.authorize_async(binding, &state)?;
@@ -1586,7 +1981,8 @@ impl McHandler {
                 }
             }
             state.reindex()?;
-            state.save(store, &tag_rows(&state, codec)?)?;
+            let rows = state.unsaved_tag_rows(codec)?;
+            state.save(store, &rows)?;
             let worker = self.provider_historian_worker();
             let store = Arc::clone(store);
             let view = tokio::task::spawn_blocking(move || {
@@ -1687,7 +2083,7 @@ impl crate::historian::HistorianPublicationFence for AsyncHistoryFence {
             reason: "async lineage sources changed".into(),
         };
         let _serial = self.serial.try_lock_for(&self.key).map_err(|_| reject())?;
-        let state = load(store, &self.reference)
+        let state = load_head(store, &self.reference)
             .map_err(|_| reject())?
             .ok_or_else(reject)?;
         if state.resync || state.generation != self.generation {
@@ -1907,9 +2303,20 @@ impl McHandler {
 }
 
 impl AsyncRecord {
+    /// Validate and index the held entries not yet in `tag_index`. Held
+    /// entries never change, so each is validated and digested once; a tag
+    /// already held by an earlier entry is refused as reuse.
     fn reindex(&mut self) -> Result<(), HandlerOutcome> {
+        let from = self
+            .journal
+            .indexed_through
+            .map_or(std::ops::Bound::Unbounded, std::ops::Bound::Excluded);
         let mut index = BTreeMap::new();
-        for entry in self.entries.values() {
+        for entry in self
+            .entries
+            .range((from, std::ops::Bound::Unbounded))
+            .map(|(_, entry)| entry)
+        {
             let native = parts(&entry.message)?;
             if native.len() != entry.tags.len() {
                 return Err(invalid_field(
@@ -1935,13 +2342,18 @@ impl AsyncRecord {
                         part: row.part.clone(),
                         digest: contract::digest::content_digest(part),
                     };
-                    if index.insert(tag.clone(), address).is_some() {
+                    if self.tag_index.contains_key(tag)
+                        || index.insert(tag.clone(), address).is_some()
+                    {
                         return Err(invalid_field("tags", "runner reused a tag"));
                     }
                 }
             }
         }
-        self.tag_index = index;
+        self.tag_index.extend(index);
+        if let Some((last, _)) = self.entries.last_key_value() {
+            self.journal.indexed_through = Some(*last);
+        }
         Ok(())
     }
 }
@@ -1952,7 +2364,7 @@ impl McHandler {
             .store
             .get()
             .ok_or_else(|| transient("store unavailable"))?;
-        let Some(mut state) = load(store, reference)? else {
+        let Some(mut state) = load_head(store, reference)? else {
             return Ok(());
         };
         let _serial = self.provider_serial.lock_for(&state.key).await;
@@ -2277,7 +2689,7 @@ impl McHandler {
             .store
             .get()
             .ok_or_else(|| transient("store unavailable"))?;
-        let Some(mut state) = load(store, reference)? else {
+        let Some(mut state) = load_head(store, reference)? else {
             return Ok(());
         };
         let _serial = self.provider_serial.lock_for(&state.key).await;
