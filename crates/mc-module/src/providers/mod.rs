@@ -5,6 +5,8 @@ use serde::Serialize;
 use std::collections::{BTreeMap, BTreeSet};
 
 pub mod codec;
+#[cfg(test)]
+mod codec_native_tests;
 pub mod codec_opencode;
 pub mod codec_pi;
 pub mod compaction;
