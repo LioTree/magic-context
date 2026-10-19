@@ -14,14 +14,16 @@ pub mod write_meter {
 
     /// Totals since the meter was armed for a conversation. `bytes` counts the
     /// text/blob cells written; `rows` counts rows inserted, updated or deleted;
-    /// `nanos` is the wall time of the fenced write calls, from BEGIN IMMEDIATE
-    /// through COMMIT.
+    /// `nanos` is the wall time of the fenced write calls, including waiting
+    /// for the writer connection and the write lock; `held_nanos` is the time
+    /// the write lock was held, from the first statement through COMMIT.
     #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
     pub struct AsyncWriteStats {
         pub transactions: u64,
         pub rows: u64,
         pub bytes: u64,
         pub nanos: u64,
+        pub held_nanos: u64,
     }
 
     static METERS: Mutex<BTreeMap<String, AsyncWriteStats>> = Mutex::new(BTreeMap::new());
@@ -43,14 +45,33 @@ pub mod write_meter {
             .copied()
     }
 
-    pub(crate) fn record(session_ref: &str, started: Instant, rows: u64, bytes: u64) {
+    pub(crate) fn record(
+        session_ref: &str,
+        started: Instant,
+        held: Instant,
+        rows: u64,
+        bytes: u64,
+    ) {
         let mut meters = METERS.lock().unwrap_or_else(|p| p.into_inner());
         if let Some(stats) = meters.get_mut(session_ref) {
             stats.transactions += 1;
             stats.rows += rows;
             stats.bytes += bytes;
             stats.nanos += started.elapsed().as_nanos() as u64;
+            stats.held_nanos += held.elapsed().as_nanos() as u64;
         }
+    }
+}
+
+/// Wrap a fenced-write callback so it also reports when it started, that is,
+/// once the IMMEDIATE transaction holds the write lock.
+fn held<T>(
+    write: impl FnOnce(&rusqlite::Transaction<'_>) -> rusqlite::Result<(T, u64, u64)>,
+) -> impl FnOnce(&rusqlite::Transaction<'_>) -> rusqlite::Result<(T, u64, u64, std::time::Instant)>
+{
+    move |conn| {
+        let started = std::time::Instant::now();
+        write(conn).map(|(value, rows, bytes)| (value, rows, bytes, started))
     }
 }
 
@@ -61,10 +82,10 @@ macro_rules! metered {
         let started = std::time::Instant::now();
         let result = $write;
         #[cfg(feature = "test-support")]
-        if let Ok((_, rows, bytes)) = &result {
-            write_meter::record($session_ref, started, *rows, *bytes);
+        if let Ok((_, rows, bytes, held)) = &result {
+            write_meter::record($session_ref, started, *held, *rows, *bytes);
         }
-        result.map(|(value, _, _)| value)
+        result.map(|(value, ..)| value)
     }};
 }
 
@@ -127,7 +148,7 @@ impl McStore {
         Ok(copied)
     }
     pub fn retire_unannounced_async_views(&self, session_ref: &str) -> Result<(), McStoreError> {
-        metered!(session_ref, self.inner.with_conn_fenced(|conn|conn.execute("UPDATE mc_async_compaction_views SET announced=-1 WHERE session_ref=?1 AND announced=0",[session_ref]).map(|rows|((),rows as u64,0))).map_err(McStoreError::from))
+        metered!(session_ref, self.inner.with_conn_fenced(held(|conn|conn.execute("UPDATE mc_async_compaction_views SET announced=-1 WHERE session_ref=?1 AND announced=0",[session_ref]).map(|rows|((),rows as u64,0)))).map_err(McStoreError::from))
     }
     pub fn async_compaction_for_session(
         &self,
@@ -240,7 +261,7 @@ impl McStore {
         metered!(
             session_ref,
             self.inner
-                .with_conn_fenced(|conn| {
+                .with_conn_fenced(held(|conn| {
                     conn.query_row(
                         "UPDATE mc_async_compaction SET version_high_water=max(version_high_water,?2)+1
                 WHERE session_ref=?1 RETURNING version_high_water",
@@ -248,7 +269,7 @@ impl McStore {
                         |row| row.get(0),
                     )
                     .map(|version| (version, 1, 0))
-                })
+                }))
                 .map_err(McStoreError::from)
         )
     }
@@ -263,12 +284,12 @@ impl McStore {
         metered!(
             session_ref,
             self.inner
-                .with_conn_fenced(|conn| {
+                .with_conn_fenced(held(|conn| {
                     conn.execute(
             "INSERT INTO mc_async_compaction_views(session_ref,session,version,view_json,engine_json) SELECT ?1,session,?2,?3,?4 FROM mc_async_compaction WHERE session_ref=?1",
             params![session_ref,version,view,engine],
         ).map(|rows| ((), rows as u64, (view.len() + engine.len()) as u64))
-                })
+                }))
                 .map_err(McStoreError::from)
         )
     }
@@ -306,12 +327,12 @@ impl McStore {
         metered!(
             session_ref,
             self.inner
-                .with_conn_fenced(|conn| {
+                .with_conn_fenced(held(|conn| {
                     conn.execute(
             "UPDATE mc_async_compaction_views SET announced=1 WHERE session_ref=?1 AND version=?2",
             params![session_ref,version],
         ).map(|rows| ((), rows as u64, 0))
-                })
+                }))
                 .map_err(McStoreError::from)
         )
     }
@@ -412,7 +433,7 @@ impl<'a> AsyncCompactionSave<'a> {
             clear_engine_views,
             retain_views_from,
         } = *self;
-        metered!(session_ref, store.inner.with_conn_fenced(|conn| {
+        metered!(session_ref, store.inner.with_conn_fenced(held(|conn| {
             let mut rows = conn.execute("INSERT INTO mc_async_compaction(session_ref,conversation_key,session,state_json) VALUES(?1,?2,?3,?4)
                 ON CONFLICT(session_ref) DO UPDATE SET state_json=excluded.state_json",
                 params![session_ref,key,session,state])? as u64;
@@ -461,6 +482,6 @@ impl<'a> AsyncCompactionSave<'a> {
             rows += tags.len() as u64;
             bytes += tags.iter().map(|t| t.source_bytes.len() + t.block_id.len()).sum::<usize>();
             Ok(((), rows, bytes as u64))
-        }).map_err(McStoreError::from))
+        })).map_err(McStoreError::from))
     }
 }

@@ -193,6 +193,7 @@ struct Sample {
     save_cpu_ms: f64,
     load_cpu_ms: f64,
     write_tx_ms: f64,
+    lock_held_ms: f64,
     write_tx: u64,
     rows: u64,
     bytes: u64,
@@ -377,6 +378,7 @@ impl Rig {
             save_cpu_ms: (after.cpu_nanos - saves.cpu_nanos) as f64 / 1e6,
             load_cpu_ms: (loaded.cpu_nanos - loads.cpu_nanos) as f64 / 1e6,
             write_tx_ms: writes.nanos as f64 / 1e6,
+            lock_held_ms: writes.held_nanos as f64 / 1e6,
             write_tx: writes.transactions,
             rows: writes.rows,
             bytes: writes.bytes,
@@ -575,13 +577,14 @@ async fn acknowledgement_evicts_only_superseded_views() {
 
 fn row(label: &str, size: u64, sample: &Sample) -> String {
     let line = format!(
-        "| {label} | {size} | {:.1} | {:.1} | {:.1} | {:.2} | {:.2} | {:.2} | {} | {} | {} | {} |",
+        "| {label} | {size} | {:.1} | {:.1} | {:.1} | {:.2} | {:.2} | {:.2} | {:.2} | {} | {} | {} | {} |",
         sample.wall_ms,
         sample.process_cpu_ms,
         sample.load_cpu_ms,
         sample.save_wall_ms,
         sample.save_cpu_ms,
         sample.write_tx_ms,
+        sample.lock_held_ms,
         sample.write_tx,
         sample.rows,
         sample.bytes,
@@ -609,8 +612,8 @@ async fn storage_scaling_benchmark() {
         .map(|size| size.trim().parse::<u64>().unwrap())
         .collect::<Vec<_>>();
     let mut table = vec![
-        "| operation | messages | wall ms | process CPU ms | full-load CPU ms | save wall ms | save CPU ms | write-tx ms | write txs | rows written | bytes written | WAL bytes |".to_string(),
-        "|---|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|".to_string(),
+        "| operation | messages | wall ms | process CPU ms | full-load CPU ms | save wall ms | save CPU ms | write-tx call ms | write-lock held ms | write txs | rows written | bytes written | WAL bytes |".to_string(),
+        "|---|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|".to_string(),
     ];
     let mut sizes_table = vec![
         "| messages | transcript bytes | state_json bytes | entry rows bytes | views rows | views bytes | views rows +1 publish | views bytes +1 publish |".to_string(),
@@ -633,7 +636,7 @@ async fn storage_scaling_benchmark() {
             .map(|(_, size)| *size as u64)
             .sum::<u64>();
         let mut notices = Vec::new();
-        for _ in 0..3 {
+        for _ in 0..5 {
             rig.append(4);
             notices.push(rig.notice(1_000, Some(version)).await);
         }
