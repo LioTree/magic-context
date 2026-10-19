@@ -82,6 +82,7 @@ import {
     checkCompartmentTrigger,
     getProactiveCompartmentTriggerPercentage,
 } from "./compartment-trigger";
+import { recordCompartmentTriggerError } from "./compartment-trigger-error";
 import {
     type CtxReduceAvailabilityVerdict,
     primeCtxReduceSpawnPermission,
@@ -171,6 +172,7 @@ import {
     recordHighPressureNoEligibleHead,
     resolveOpenCodeProtectedTailBoundary,
 } from "./protected-tail-boundary";
+import { noteTransformPassForExactOrdinalReads } from "./raw-exact-ordinal-read";
 import { prepareRawSessionOrdinals, readRawSessionMessages } from "./read-session-chunk";
 import { findLastAssistantModelFromOpenCodeDb } from "./read-session-db";
 import { extractInMemoryMessageViews } from "./read-session-raw";
@@ -560,6 +562,8 @@ export interface TransformDeps {
         expandTools?: Record<string, string | false>;
         autoPromote: boolean;
         userMemoriesEnabled: boolean;
+        /** False when the dreamer is not runnable; see userObservationsRequested(). */
+        userObservationsRequested?: boolean;
         commitClusterTrigger?: { enabled: boolean; min_clusters: number };
         toastDurationMs?: number;
         chunkTokens: number;
@@ -606,6 +610,8 @@ export interface TransformDeps {
     getFallbackModelId?: (sessionId: string) => string | undefined;
     projectPath?: string;
     experimentalUserMemories?: boolean;
+    /** False when the dreamer is not runnable, so the historian skips user observations. */
+    userObservationsRequested?: boolean;
 
     /** When true, inject wall-clock gap markers (<!-- +Xm -->) on user messages and
      *  add compact date ranges to compartment headings in <session-history>.
@@ -1928,6 +1934,8 @@ export function createTransform(deps: TransformDeps) {
                     getNotificationParams: () => notificationParams,
                     experimentalUserMemories:
                         historianRun?.userMemoriesEnabled ?? deps.experimentalUserMemories,
+                    userObservationsRequested:
+                        historianRun?.userObservationsRequested ?? deps.userObservationsRequested,
                     experimentalTemporalAwareness: deps.experimentalTemporalAwareness,
                     historianTwoPass: historianRun?.twoPass ?? deps.historianTwoPass,
                     historianExpandTools: historianRun?.expandTools ?? deps.historianExpandTools,
@@ -2108,6 +2116,11 @@ export function createTransform(deps: TransformDeps) {
         }
 
         const ownerRatio = sessionDecisionCalibration(db, sessionId).proseRatio;
+        // A background historian run may be waiting for a worker to read exact
+        // message ordinals for its boundary check. Count this pass against that
+        // wait so the run gives up after a bounded number of passes (see
+        // EXACT_ORDINAL_READ_DEFER_PASS_CAP). Reads nothing and changes no output.
+        noteTransformPassForExactOrdinalReads(sessionId);
         // Do not await after snapshotting usage, model limits and protected-tail
         // state: the trigger must use that same decision state. The earlier owner
         // preparation waited at most 250ms. Recheck its digest here; if a peer
@@ -2180,8 +2193,7 @@ export function createTransform(deps: TransformDeps) {
                     triggerBoundarySnapshot = triggerResult.boundarySnapshot;
                 }
             } catch (error) {
-                passOutcome.record("compartment-trigger-failure");
-                sessionLog(sessionId, "compartment trigger failed (non-fatal):", error);
+                recordCompartmentTriggerError(passOutcome, sessionId, error);
             }
             logTransformTiming(sessionId, "compartmentTrigger", tTrigger);
         }
@@ -2613,6 +2625,8 @@ export function createTransform(deps: TransformDeps) {
             deferredHistoryRefreshSessions,
             experimentalUserMemories:
                 historianRun?.userMemoriesEnabled ?? deps.experimentalUserMemories,
+            userObservationsRequested:
+                historianRun?.userObservationsRequested ?? deps.userObservationsRequested,
             experimentalTemporalAwareness: deps.experimentalTemporalAwareness,
             historianTwoPass: historianRun?.twoPass ?? deps.historianTwoPass,
             historianExpandTools: historianRun?.expandTools ?? deps.historianExpandTools,

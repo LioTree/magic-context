@@ -711,6 +711,7 @@ async function sweepProject(
             executor,
             projectMemoryEnabled: reg.memoryEnabled !== false,
             rustOwnedTasks,
+            smartNotesEnabled: reg.smartNotesEnabled,
         });
         if (ran > 0) {
             log(`[dreamer] timer tick (${origin}) ${reg.projectIdentity} — ran ${ran} task(s)`);

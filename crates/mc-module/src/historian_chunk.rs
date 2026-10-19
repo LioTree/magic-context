@@ -710,6 +710,9 @@ pub struct HistorianAssemblerConfig {
     pub memory_enabled: bool,
     pub auto_promote: bool,
     pub user_memory_collection_enabled: bool,
+    /// False when the dreamer is not runnable; the historian prompt then asks it
+    /// to skip user observations (see `build_compartment_agent_prompt`).
+    pub user_observations_requested: bool,
     pub extraction_free: bool,
     pub in_emergency: bool,
     pub force_keep_last_compartment: bool,
@@ -878,6 +881,7 @@ struct HistorianPromptFitInput<'a> {
     compartments: &'a [ReferenceCompartment],
     memories: &'a [mc_store::StoredMemory],
     memory_enabled: bool,
+    user_observations_requested: bool,
     extraction_free: bool,
     /// Producer input limit after the output reserve and estimator margin.
     limit: Option<usize>,
@@ -973,6 +977,7 @@ fn fit_historian_prompt_selected(
             project_memory: &memory_block,
             input_source: &header,
             memory_enabled: input.memory_enabled,
+            user_observations_requested: input.user_observations_requested,
             extraction_free: input.extraction_free,
         });
         estimate_tokens(&prompt)
@@ -1312,6 +1317,7 @@ fn assemble_historian_firing_inner(
             compartments: &reference_compartments,
             memories: &memories,
             memory_enabled: config.memory_enabled,
+            user_observations_requested: config.user_observations_requested,
             extraction_free: config.extraction_free,
             limit: producer_input_limit,
             seed: &seed,
@@ -1475,6 +1481,7 @@ fn assemble_historian_firing_inner(
             project_memory: &memory_block,
             input_source: &input_source,
             memory_enabled: config.memory_enabled,
+            user_observations_requested: config.user_observations_requested,
             extraction_free: config.extraction_free,
         });
         let prose = estimate_tokens(&prompt) as f64;
@@ -1557,6 +1564,7 @@ fn assemble_historian_firing_inner(
         project_memory: &memory_block,
         input_source: &input_source,
         memory_enabled: config.memory_enabled,
+        user_observations_requested: config.user_observations_requested,
         extraction_free: config.extraction_free,
     });
     let fingerprint_items: Vec<_> = chunk
@@ -2675,6 +2683,7 @@ mod tests {
                 memory_enabled: false,
                 auto_promote: true,
                 user_memory_collection_enabled: false,
+                user_observations_requested: true,
                 extraction_free: false,
                 in_emergency: false,
                 force_keep_last_compartment: true,
@@ -2800,6 +2809,7 @@ mod tests {
                 memory_enabled: false,
                 auto_promote: true,
                 user_memory_collection_enabled: false,
+                user_observations_requested: true,
                 extraction_free: false,
                 in_emergency: false,
                 force_keep_last_compartment: true,
@@ -3092,6 +3102,7 @@ mod tests {
                 project_memory: "",
                 input_source: source,
                 memory_enabled: false,
+                user_observations_requested: true,
                 extraction_free: false,
             });
             let calibration = crate::decision_calibration::DecisionCalibration::for_model(Some(
@@ -3142,6 +3153,7 @@ mod tests {
             project_memory: "",
             input_source: &fitted.text,
             memory_enabled: false,
+            user_observations_requested: true,
             extraction_free: false,
         });
         let calibration = crate::decision_calibration::DecisionCalibration::for_model(Some(
@@ -3426,6 +3438,7 @@ mod tests {
             memory_enabled: false,
             auto_promote: false,
             user_memory_collection_enabled: false,
+            user_observations_requested: true,
             extraction_free: false,
             in_emergency: true,
             force_keep_last_compartment: false,
@@ -3568,6 +3581,7 @@ mod tests {
                 memory_enabled: false,
                 auto_promote: true,
                 user_memory_collection_enabled: false,
+                user_observations_requested: true,
                 extraction_free: false,
                 in_emergency,
                 force_keep_last_compartment: false,
@@ -3628,6 +3642,7 @@ mod tests {
                 memory_enabled: false,
                 auto_promote: true,
                 user_memory_collection_enabled: false,
+                user_observations_requested: true,
                 extraction_free: false,
                 in_emergency,
                 force_keep_last_compartment: false,
@@ -3713,6 +3728,7 @@ mod tests {
                 memory_enabled: false,
                 auto_promote: true,
                 user_memory_collection_enabled: false,
+                user_observations_requested: true,
                 extraction_free: false,
                 in_emergency: false,
                 force_keep_last_compartment: false,
@@ -4216,6 +4232,7 @@ mod prompt_fit_tests {
             compartments,
             memories,
             memory_enabled: true,
+            user_observations_requested: true,
             extraction_free: false,
             limit: Some(limit),
             seed: &seed,
@@ -4229,6 +4246,7 @@ mod prompt_fit_tests {
             project_memory: &fit.memory_block,
             input_source: "Messages 61-400:\n\n",
             memory_enabled: true,
+            user_observations_requested: true,
             extraction_free: false,
         });
         let sent = seed.provider_mass(
@@ -4279,6 +4297,7 @@ mod prompt_fit_tests {
                 project_memory: "",
                 input_source: "Messages 61-400:\n\n",
                 memory_enabled: true,
+                user_observations_requested: true,
                 extraction_free: false,
             });
             let limit = seed
@@ -4298,6 +4317,7 @@ mod prompt_fit_tests {
                 compartments: &compartments,
                 memories: &[],
                 memory_enabled: true,
+                user_observations_requested: true,
                 extraction_free: false,
                 limit: Some(limit),
                 seed: &seed,
@@ -4339,6 +4359,7 @@ mod prompt_fit_tests {
             project_memory: &render_historian_memory_block(&memories),
             input_source: "Messages 61-400:\n\n",
             memory_enabled: true,
+            user_observations_requested: true,
             extraction_free: false,
         });
         let full_mass = seed.provider_mass(
@@ -4372,6 +4393,7 @@ mod prompt_fit_tests {
                 compartments: &[],
                 memories: &memories,
                 memory_enabled: false,
+                user_observations_requested: true,
                 extraction_free: false,
                 limit,
                 seed: &seed,
@@ -4388,6 +4410,7 @@ mod prompt_fit_tests {
             project_memory: "<project-memory>private project memory</project-memory>",
             input_source: "Messages 1-5: transcript",
             memory_enabled: false,
+            user_observations_requested: true,
             extraction_free: false,
         });
         assert!(!prompt.contains("private project memory"));

@@ -126,6 +126,8 @@ export interface HistorianPromptFitArgs {
     /** Memories for the `<project-memory>` block; empty when there is none. */
     memories: Memory[] | (() => Memory[]);
     memoryEnabled: boolean;
+    /** Whether the historian is asked for user observations; see buildCompartmentAgentPrompt. */
+    userObservationsRequested?: boolean;
     extractionFree?: boolean;
     /** The run asks for source-anchored facts; see `buildCompartmentAgentPrompt`. */
     anchoredFacts?: boolean;
@@ -286,6 +288,7 @@ export function fitHistorianPrompt(args: HistorianPromptFitArgs): HistorianPromp
             ...blocks,
             inputSource: header,
             memoryEnabled: args.memoryEnabled,
+            userObservationsRequested: args.userObservationsRequested,
             extractionFree: args.extractionFree,
             anchoredFacts: args.anchoredFacts,
         });

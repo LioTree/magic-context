@@ -112,6 +112,9 @@ export interface MapMemoriesArgs {
 }
 
 export interface MapMemoriesResult {
+    failure?: unknown;
+    failureStage?: "child-start" | "prompt" | "apply";
+    deferred?: boolean;
     mapped: number;
     independent: number;
     /** Batches whose mappings were durably committed, not merely attempted. */
@@ -134,6 +137,8 @@ interface MapBatchOutcome {
     requeue?: MapMemoryInput[];
     /** Interrupted batches may still bank closed per-memory decisions. */
     failure?: {
+        error?: unknown;
+        stage?: "child-start" | "prompt" | "apply";
         class: MapBatchFailureClass;
         elapsedMs: number;
     };
@@ -183,8 +188,8 @@ function isDeferred(memory: MapMemoryInput, retries: Record<string, MappingRetry
     return !!retry && retry.content === contentKey(memory) && retry.deferUntil > Date.now();
 }
 
-function assistantText(messages: unknown[]): string {
-    return messages
+function assistantText(messages: unknown[]): string | null {
+    const joined = messages
         .filter(
             (message) =>
                 isRecord(message) &&
@@ -203,6 +208,7 @@ function assistantText(messages: unknown[]): string {
                     : ""),
         )
         .join("\n");
+    return joined.trim() ? joined : null;
 }
 
 function currentManifest(text: string): string {
@@ -210,6 +216,31 @@ function currentManifest(text: string): string {
     // in the same session. Validate that document, not the earlier rejected one.
     const start = text.lastIndexOf("<mappings>");
     return start < 0 ? text : text.slice(start);
+}
+
+export function parseMapMemoriesCompletion(
+    text: string,
+    completion: { messages?: unknown[] },
+    expectedIds: ReadonlySet<number>,
+): ReturnType<typeof validateMapMemoriesManifest> {
+    return validateMapMemoriesManifest(
+        currentManifest(assistantText(completion.messages ?? []) || text),
+        expectedIds,
+    );
+}
+
+export function validateClientMapMemories(
+    messages: unknown[],
+    expectedIds: ReadonlySet<number>,
+): ReturnType<typeof validateMapMemoriesManifest> {
+    if (hasLengthCappedOutput(messages)) {
+        throw new Error("map-memories returned length-capped output");
+    }
+    const raw = assistantText(messages);
+    if (raw == null) {
+        throw new Error("map-memories returned no output");
+    }
+    return validateMapMemoriesManifest(currentManifest(raw), expectedIds);
 }
 
 function logBatchUsage(messages: unknown[], committed: number, startedAt: number): void {
@@ -328,7 +359,10 @@ export async function mapMemories(args: MapMemoriesArgs): Promise<MapMemoriesRes
     const inputs = allInputs.filter((memory) => !isDeferred(memory, retries));
     result.remaining = allInputs.length;
     result.complete = result.remaining === 0;
-    if (inputs.length === 0) return result;
+    if (inputs.length === 0) {
+        if (allInputs.length > 0) result.deferred = true;
+        return result;
+    }
 
     const batches: Array<{ inputs: MapMemoryInput[]; isOmissionRetry: boolean }> = [];
     for (let i = 0; i < inputs.length; i += MAP_BATCH_SIZE) {
@@ -367,6 +401,10 @@ export async function mapMemories(args: MapMemoriesArgs): Promise<MapMemoriesRes
             const batch = batches[i];
             if (!batch) break;
             const outcome = await mapOneBatch(args, batch.inputs, sliceMs, abortController.signal);
+            if (outcome.failure) {
+                result.failure = outcome.failure.error;
+                result.failureStage = outcome.failure.stage;
+            }
             const committed = outcome.mapped + outcome.independent;
             runLeaseGuardedWrite(args.db, args.holderId, args.leaseKey, () => {
                 const committedIds = new Set(outcome.committedIds);
@@ -460,6 +498,7 @@ async function mapOneBatch(
     const startedAt = Date.now();
     let budgetFinalized = false;
     let failedCompletion: HiddenCompletion | undefined;
+    let stage: "child-start" | "prompt" | "apply" = "child-start";
     const onBudgetUpdate: NonNullable<MapMemoriesArgs["onBudgetUpdate"]> = (state) => {
         budgetFinalized ||= state.finalizeFired;
         args.onBudgetUpdate?.(state);
@@ -484,12 +523,16 @@ async function mapOneBatch(
                 fallbackModels: args.fallbackModels,
                 timeoutMs: sliceMs,
                 signal,
+                onOpened: () => {
+                    stage = "prompt";
+                },
                 onFailureOutput: (completion) => {
                     failedCompletion = completion;
                 },
                 parse: (text, completion) =>
-                    validateMapMemoriesManifest(
-                        currentManifest(assistantText(completion.messages ?? []) || text),
+                    parseMapMemoriesCompletion(
+                        text,
+                        completion,
                         new Set(batch.map((memory) => memory.id)),
                     ),
             });
@@ -497,6 +540,7 @@ async function mapOneBatch(
                 status: "completed",
                 messages: run.completion.messages ?? [],
             });
+            stage = "apply";
             const outcome = await applyParsedBatchMappings(
                 args,
                 batch,
@@ -536,6 +580,7 @@ async function mapOneBatch(
         );
         agentSessionId = typeof created?.id === "string" ? created.id : null;
         if (!agentSessionId) throw new Error("Could not create map-memories session.");
+        stage = "prompt";
 
         const run = await shared.promptSyncWithValidatedOutputRetry(
             client,
@@ -569,22 +614,14 @@ async function mapOneBatch(
                         preferResponseOnMissingData: true,
                     });
                 },
-                validateOutput: (messages) => {
-                    if (hasLengthCappedOutput(messages)) {
-                        throw new Error("map-memories returned length-capped output");
-                    }
-                    const text = currentManifest(assistantText(messages));
-                    if (!text) throw new Error("map-memories returned no output");
-                    return validateMapMemoriesManifest(
-                        text,
-                        new Set(batch.map((memory) => memory.id)),
-                    );
-                },
+                validateOutput: (messages) =>
+                    validateClientMapMemories(messages, new Set(batch.map((memory) => memory.id))),
             },
         );
         promptSettled = true;
 
         recordInvocation(args, startedAt, { status: "completed", messages: run.output });
+        stage = "apply";
         const outcome = await applyParsedBatchMappings(
             args,
             batch,
@@ -635,6 +672,8 @@ async function mapOneBatch(
         return {
             ...outcome,
             failure: {
+                error,
+                stage,
                 class: isTimeoutClassError(error) ? "timeout" : "other",
                 elapsedMs: Date.now() - startedAt,
             },

@@ -1457,6 +1457,7 @@ describe("signed prefix parking: Pi/OMP", () => {
 			"frozen-sentinel first application",
 			async (f) => {
 				await toolLoop(f, 4);
+				appendCompartments(f.db, f.sessionId, [FIRST_TURN_COMPARTMENT]);
 				signalPiHistoryRefresh(f.sessionId);
 				const held = await f.pass();
 				expect(f.mock.check(wire(held.messages))).toBeNull();
@@ -1505,6 +1506,7 @@ describe("signed prefix parking: Pi/OMP", () => {
 			"frozen-sentinel first application",
 			async (f) => {
 				await toolLoop(f, 4);
+				appendCompartments(f.db, f.sessionId, [FIRST_TURN_COMPARTMENT]);
 				signalPiHistoryRefresh(f.sessionId);
 				f.served = (await f.pass()).messages;
 				expect(hasPiParkedBustTrigger(f.sessionId)).toBe(true);
@@ -1593,6 +1595,17 @@ describe("step2b review: Pi/OMP", () => {
 				await toolLoop(f, 4);
 				queuePendingOp(f.db, f.sessionId, f.tag("old-read-b"), "drop");
 				signalPiPendingMaterialization(f.sessionId);
+				// Give the live wall an editable suffix; the older queued drop stays held.
+				f.respond(
+					(n) => [
+						read(`call-${n}-a`, `/project/src/file-${n}a.ts`),
+						read(`call-${n}-b`, `/project/src/file-${n}b.ts`),
+					],
+					(n) => [
+						[`call-${n}-a`, `export const a${n} = ${n};\n`.repeat(400)],
+						[`call-${n}-b`, `export const b${n} = ${n};\n`.repeat(400)],
+					],
+				);
 				f.setPercent(85);
 				f.served = (await f.pass()).messages;
 				expect(hasPiParkedBustTrigger(f.sessionId)).toBe(true);

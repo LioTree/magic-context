@@ -17,6 +17,8 @@ import { OpenCodeRetrospectiveRawProvider } from "../../features/magic-context/d
 import {
     buildDreamTaskRuntimeConfigs,
     userMemoryCollectionEnabled,
+    userObservationCollectionEnabled,
+    userObservationsRequested,
 } from "../../features/magic-context/dreamer/task-config";
 import { createDreamTaskExecutor } from "../../features/magic-context/dreamer/task-executor";
 import {
@@ -38,11 +40,7 @@ import {
     readSessionIdentityDecision,
     type SessionIdentityDecision,
 } from "../../features/magic-context/memory/session-identity-decision";
-import {
-    getAutoEmbeddingSessionCoverage,
-    getEmbeddingCoverageStatus,
-    getProjectEmbeddingSnapshot,
-} from "../../features/magic-context/project-embedding-registry";
+import { getEmbeddingCoverageStatus } from "../../features/magic-context/project-embedding-registry";
 import type { Scheduler } from "../../features/magic-context/scheduler";
 import {
     getDatabasePersistenceError,
@@ -63,13 +61,13 @@ import { ensureProjectRegisteredFromOpenCodeDirectory } from "../../plugin/embed
 import { buildStatusDetail } from "../../plugin/rpc-handlers";
 import type { PluginContext } from "../../plugin/types";
 import type { ConfigParseFailure } from "../../shared/config-diagnostics";
-import { isEmbeddingHostBusy } from "../../shared/embedding-activity";
 import { getErrorMessage } from "../../shared/error-message";
 import { log } from "../../shared/logger";
 import { resolveHistorianModel } from "../../shared/model-resolution";
 import type { PromptSurfaceConfig } from "../../shared/prompt-surface";
 import type { PromptSurfaceRuntime } from "../../shared/prompt-surface-runtime";
 import type { Database } from "../../shared/sqlite";
+import { maybeAutoEmbedSessionBackfill } from "./auto-embed-session";
 import { cavemanWordRulesForLanguage } from "./caveman";
 import { createMagicContextCommandHandler } from "./command-handler";
 import { clearToolPermissionDenied } from "./ctx-reduce-availability";
@@ -84,14 +82,7 @@ import {
     pauseEmbedHistoryDrain,
     runEmbedHistoryDrain,
 } from "./embed-history-runner";
-import {
-    autoEmbedAttemptedBySession,
-    autoEmbedIdentityBySession,
-    clearEmbedSessionState,
-    embedPauseBySession,
-    getEmbedDrainUiStatus,
-    invalidateAutoEmbedSession,
-} from "./embed-session-state";
+import { clearEmbedSessionState, getEmbedDrainUiStatus } from "./embed-session-state";
 import { createEventHandler } from "./event-handler";
 import {
     resolveContextLimit,
@@ -325,7 +316,8 @@ export function createMagicContextHook(deps: MagicContextDeps) {
             twoPass: config.historian?.two_pass === true,
             expandTools: config.historian?.expand_tools,
             autoPromote: config.memory?.auto_promote ?? true,
-            userMemoriesEnabled: userMemoryCollectionEnabled(config.dreamer),
+            userMemoriesEnabled: userObservationCollectionEnabled(config.dreamer),
+            userObservationsRequested: userObservationsRequested(config.dreamer),
             commitClusterTrigger: config.commit_cluster_trigger,
             chunkTokens: deriveHistorianChunkTokens(
                 resolveHistorianContextLimit(attempts.primary?.model),
@@ -506,6 +498,7 @@ export function createMagicContextHook(deps: MagicContextDeps) {
             // review-user-memories task (schedule != ""). Replaces the v1
             // user_memories.enabled flag that gated both collection and review.
             userMemoriesEnabled: historianRun.userMemoriesEnabled,
+            userObservationsRequested: historianRun.userObservationsRequested,
             ensureProjectRegistered: ensureProjectRegisteredFromOpenCodeDirectory,
             getNotificationParams: (sid) =>
                 getLiveNotificationParams(
@@ -583,77 +576,22 @@ export function createMagicContextHook(deps: MagicContextDeps) {
     };
 
     const maybeAutoEmbedSession = (sessionId: string): void => {
-        if (isEmbeddingHostBusy()) return;
         const directory = sessionDirectoryBySession.get(sessionId) ?? deps.directory;
         const identity = readSessionIdentityDecision(sessionId, directory, {
             allowHomeProject: deps.config.allow_home_project,
         })?.identity;
-        const snapshot = identity ? getProjectEmbeddingSnapshot(identity) : undefined;
-        const embedIdentity = snapshot
-            ? JSON.stringify([
-                  snapshot.providerIdentity,
-                  snapshot.chunkModelId,
-                  snapshot.runtimeFingerprint,
-              ])
-            : "off";
-        if (autoEmbedIdentityBySession.get(sessionId) !== embedIdentity) {
-            invalidateAutoEmbedSession(sessionId);
-        }
-        if (autoEmbedAttemptedBySession.has(sessionId)) return;
-        if (embedPauseBySession.has(sessionId)) return;
-        // No `memory.enabled` gate: history embedding runs whenever an embedding
-        // provider is configured and not `off` (checked via coverage below).
-        autoEmbedAttemptedBySession.add(sessionId);
-        autoEmbedIdentityBySession.set(sessionId, embedIdentity);
-        void (async () => {
-            // The autoEmbedAttemptedBySession claim is cleared on compartment
-            // writes or embedding-identity changes, not when coverage is already
-            // complete or a scan fails. Rechecking then would scan every turn.
-            try {
-                // Defer off the transform thread BEFORE any DB/config work.
-                // ensureProjectRegisteredFromOpenCodeDirectory is `async` but does
-                // its config load + stale-embedding wipe SYNCHRONOUSLY (no internal
-                // await), so awaiting it as the first statement would run that work
-                // on the transform's return path. A macrotask yield lets the
-                // transform return first, keeping the hot path clean.
-                await new Promise((resolve) => setTimeout(resolve, 0));
-                if (isEmbeddingHostBusy()) {
-                    invalidateAutoEmbedSession(sessionId);
-                    return;
-                }
-                await ensureProjectRegisteredFromOpenCodeDirectory(directory, db);
-                const sessionProjectIdentity = readSessionIdentityDecision(sessionId, directory, {
-                    allowHomeProject: deps.config.allow_home_project,
-                })?.identity;
-                if (!sessionProjectIdentity) {
-                    invalidateAutoEmbedSession(sessionId);
-                    return;
-                }
-                maybeSendProjectIdentitySessionWarning(sessionId, directory);
-                const coverage = await getAutoEmbeddingSessionCoverage(
-                    db,
-                    sessionProjectIdentity,
-                    sessionId,
-                );
-                if (!coverage.enabled) {
-                    invalidateAutoEmbedSession(sessionId);
-                    return;
-                }
-                const remaining = coverage.total - coverage.embedded;
-                if (remaining <= 0) return;
-                // The auto lane is a silent bootstrap trigger: no pre-announce, no
-                // busy/zero-work chatter, and the once-per-process latch never
-                // resets. Announce-then-drain looped every turn on large backlogs —
-                // the project-level passive backfill holds the drain lock for the
-                // whole (bounded, deferred-span) catch-up, so this drain returned
-                // "busy"/zero-work each pass, reset its own latch, and re-announced
-                // the same count forever. Retries belong to the passive backfill;
-                // progress lives in /ctx-embed status and the sidebar.
-                await executeEmbedHistory(sessionId, { silent: true });
-            } catch (error) {
-                log("[magic-context] auto-embed drain failed:", error);
-            }
-        })();
+        if (!identity) return;
+        maybeAutoEmbedSessionBackfill(
+            {
+                db,
+                projectIdentity: identity,
+                ensureRegistered: async () => {
+                    await ensureProjectRegisteredFromOpenCodeDirectory(directory, db);
+                    maybeSendProjectIdentitySessionWarning(sessionId, directory);
+                },
+            },
+            sessionId,
+        );
     };
 
     // Durable LKG replay: register the db-backed backend so slot drops clear the
@@ -742,7 +680,8 @@ export function createMagicContextHook(deps: MagicContextDeps) {
         projectPath,
         historianRunnable,
         compactionOff,
-        experimentalUserMemories: userMemoryCollectionEnabled(dreamerConfig),
+        experimentalUserMemories: userObservationCollectionEnabled(dreamerConfig),
+        userObservationsRequested: userObservationsRequested(dreamerConfig),
         experimentalTemporalAwareness: deps.config.temporal_awareness === true,
         muralEnabled: deps.config.mural?.enabled === true,
         historianTwoPass: deps.config.historian?.two_pass === true,
@@ -888,6 +827,7 @@ export function createMagicContextHook(deps: MagicContextDeps) {
             tasks: runtimeConfigs,
             executor,
             projectMemoryEnabled: deps.config.memory?.enabled !== false,
+            smartNotesEnabled: deps.config.smart_notes?.enabled,
         }).catch((error: unknown) => {
             log("[dreamer] scheduled task run failed:", error);
         });
@@ -1001,6 +941,7 @@ export function createMagicContextHook(deps: MagicContextDeps) {
                           db,
                           projectIdentity: projectPath,
                           projectMemoryEnabled: sampledDream.memory?.enabled,
+                          smartNotesEnabled: deps.config.smart_notes?.enabled,
                           tasks: buildDreamTaskRuntimeConfigs(
                               currentDreamer,
                               "opencode",

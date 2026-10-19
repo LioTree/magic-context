@@ -63,6 +63,7 @@ import {
 } from "./__tests__/strict-binding-mock";
 import { MARKER_SUMMARY_TEXT } from "./compaction-marker-manager";
 import { clearInjectionCache } from "./inject-compartments";
+import { requestPendingMaterialization } from "./pending-materialization";
 import { readServedPrefix } from "./served-prefix";
 import { createSystemPromptHashHandler } from "./system-prompt-hash";
 import type { MessageLike } from "./tag-messages";
@@ -587,7 +588,7 @@ async function nextUserTurn(f: Fixture, id: string): Promise<void> {
 async function prepareLane(f: Fixture, lane: Lane): Promise<void> {
     if (lane === "synthetic todo") {
         // The todo pair is anchored on a turn-start bust (here a /ctx-flush).
-        f.pendingMaterialization.add(f.sessionId);
+        requestPendingMaterialization(f.pendingMaterialization, f.sessionId, "user_flush");
         f.served = (await f.pass()).messages;
         expect(f.mock.check(wire(f.served))).toBeNull();
     }
@@ -662,7 +663,7 @@ function armAndBust(f: Fixture, lane: Lane, subagent: boolean): void {
             break;
     }
     if (lane === "/ctx-flush") {
-        f.pendingMaterialization.add(f.sessionId);
+        requestPendingMaterialization(f.pendingMaterialization, f.sessionId, "user_flush");
         return;
     }
     // A primary busts through the force band (its first pass at 85% may
@@ -1422,7 +1423,11 @@ for (const generation of ["v1", "v2"] as const) {
                             boundaryOrdinal: 6,
                             targetEndMessageId: null,
                         });
-                        f.pendingMaterialization.add(f.sessionId);
+                        requestPendingMaterialization(
+                            f.pendingMaterialization,
+                            f.sessionId,
+                            "user_flush",
+                        );
                         f.served = (await f.pass()).messages;
                         expect(f.mock.check(wire(f.served))).toBeNull();
                         expect(landed(f, MARKER_LANE, wire(f.served))).toBe(false);
@@ -1438,7 +1443,11 @@ for (const generation of ["v1", "v2"] as const) {
                         // admission rather than merely lacking permission to bust.
                         if (isPrefixBoundThinkingModel(MODEL.providerID, MODEL.modelID))
                             f.setUsage(95);
-                        f.pendingMaterialization.add(f.sessionId);
+                        requestPendingMaterialization(
+                            f.pendingMaterialization,
+                            f.sessionId,
+                            "user_flush",
+                        );
                         const afterMessages = (await f.pass()).messages;
                         const after = wire(afterMessages);
                         const error = f.mock.check(after);
@@ -1477,14 +1486,22 @@ for (const generation of ["v1", "v2"] as const) {
                 async (f) => {
                     await toolLoop(f, 4);
                     queuePendingOp(f.db, f.sessionId, f.tag("old-read-b"), "drop");
-                    f.pendingMaterialization.add(f.sessionId);
+                    requestPendingMaterialization(
+                        f.pendingMaterialization,
+                        f.sessionId,
+                        "user_flush",
+                    );
                     f.setUsage(85);
                     f.served = (await f.pass()).messages;
                     expect(f.mock.check(wire(f.served))).toBeNull();
                     expect(hasParkedBustTrigger(f.sessionId)).toBe(true);
                     // A repeated /ctx-flush shares the pending request; it must not authorize
                     // removal of a newly appended placeholder in this same signed turn.
-                    f.pendingMaterialization.add(f.sessionId);
+                    requestPendingMaterialization(
+                        f.pendingMaterialization,
+                        f.sessionId,
+                        "user_flush",
+                    );
                     f.respond(f.served, () => [{ type: "text", text: "[dropped §998§]" }], false);
                     const held = await f.pass();
                     expect(held.bustedThisPass).toBe(false);
@@ -1525,6 +1542,9 @@ for (const generation of ["v1", "v2"] as const) {
                     expect(JSON.stringify(wire(held.messages))).toContain("[dropped §998§]");
                     expect(f.mock.check(wire(held.messages))).toBeNull();
                     f.userTurn("execute-release", "Continue the parser work.");
+                    // The earlier execute pass queued the drop. Reaching 85% now
+                    // permits the prefix rebuild that can apply the queued drop.
+                    f.setUsage(85);
                     const release = await f.pass();
                     expect(release.bustedThisPass).toBe(true);
                     expect(f.mock.check(wire(release.messages))).toBeNull();
@@ -1650,6 +1670,7 @@ for (const generation of ["v1", "v2"] as const) {
                         expect(switched.bustedThisPass).toBe(false);
                         expect(getPendingOps(f.db, f.sessionId).length).toBe(1);
                         f.userTurn("review-model-release", "Continue on the new model.");
+                        f.setUsage(85);
                         const release = await f.pass();
                         expect(release.bustedThisPass).toBe(true);
                         expect(getPendingOps(f.db, f.sessionId).length).toBe(0);
@@ -1670,7 +1691,11 @@ for (const generation of ["v1", "v2"] as const) {
                 async (f) => {
                     await toolLoop(f, 4);
                     queuePendingOp(f.db, f.sessionId, f.tag("old-read-b"), "drop");
-                    f.pendingMaterialization.add(f.sessionId);
+                    requestPendingMaterialization(
+                        f.pendingMaterialization,
+                        f.sessionId,
+                        "user_flush",
+                    );
                     f.setUsage(85);
                     f.served = (await f.pass()).messages;
                     expect(hasParkedBustTrigger(f.sessionId)).toBe(true);
@@ -1706,7 +1731,11 @@ for (const generation of ["v1", "v2"] as const) {
                 "/ctx-flush",
                 async (f) => {
                     expect(getPendingOps(f.db, f.sessionId).length).toBe(0);
-                    f.pendingMaterialization.add(f.sessionId);
+                    requestPendingMaterialization(
+                        f.pendingMaterialization,
+                        f.sessionId,
+                        "user_flush",
+                    );
                     const result = await f.pass();
                     expect(f.mock.hasCurrentTurnThinking(wire(result.messages))).toBe(false);
                     expect(f.pendingMaterialization.has(f.sessionId)).toBe(false);
@@ -1729,7 +1758,7 @@ for (const generation of ["v1", "v2"] as const) {
             async (f) => {
                 await toolLoop(f, 4);
                 expect(getPendingOps(f.db, f.sessionId).length).toBe(0);
-                f.pendingMaterialization.add(f.sessionId);
+                requestPendingMaterialization(f.pendingMaterialization, f.sessionId, "user_flush");
                 const pass = await f.pass();
                 expect(f.mock.check(wire(pass.messages))).toBeNull();
                 // This child renders no synthetic history head and has no queued

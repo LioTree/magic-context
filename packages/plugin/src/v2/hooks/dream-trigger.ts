@@ -63,7 +63,7 @@ export function startDreamTrigger(
         };
         executor: HiddenCompletionExecutor;
         projectIdentity: () => string;
-        /** The project's `memory.enabled`; `false` keeps the identity unscheduled. */
+        /** The project's `memory.enabled`; `false` leaves its project-memory tasks unscheduled. */
         projectMemoryEnabled?: boolean;
         language?: string;
         mural?: { enabled: boolean };
@@ -135,6 +135,7 @@ export function startDreamTrigger(
                         projectIdentity,
                         projectMemoryEnabled: args.projectMemoryEnabled,
                         rustOwnedTasks,
+                        smartNotesEnabled: args.smartNotesEnabled,
                         tasks: runnable,
                         executor: createDreamTaskExecutor({
                             hiddenCompletionExecutor: args.executor,

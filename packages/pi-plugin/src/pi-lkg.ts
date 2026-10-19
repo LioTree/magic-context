@@ -1466,7 +1466,11 @@ export function createPiLkgCoordinator(
 			if (captureSlot(plan.sessionId, kept)) state.acceptedSlot = kept;
 			else state.syncCaptureRequired = true;
 		}
-		if (args.cacheBusting && !unchanged) {
+		if (
+			args.cacheBusting &&
+			!unchanged &&
+			(livePrior || loadPersistedLkgSlot(db, snapshot.sessionId))
+		) {
 			dropSlot(
 				snapshot.sessionId,
 				"lkg_cache_bust_pending_capture",

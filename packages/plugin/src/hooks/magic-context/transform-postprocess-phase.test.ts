@@ -97,7 +97,11 @@ import {
 } from "./inject-compartments";
 import * as noteNudger from "./note-nudger";
 import { createPassOutcome } from "./pass-outcome";
-import { recordSystemPromptEdit, requestPendingMaterialization } from "./pending-materialization";
+import {
+    pendingMaterializationOrigin,
+    recordSystemPromptEdit,
+    requestPendingMaterialization,
+} from "./pending-materialization";
 import * as readSessionFormatting from "./read-session-formatting";
 import { snapshotTrailingBlankSourceDecisions } from "./strip-content";
 import { stripStructuralNoise } from "./strip-structural-noise";
@@ -350,6 +354,19 @@ function basePostTransformArgs(
     messages: MessageLike[],
     overrides: Partial<PostTransformArgs> = {},
 ): PostTransformArgs {
+    // Raw set membership in these fixtures represents a command request. Use
+    // the production API so admission can distinguish it from deferred work.
+    if (
+        overrides.pendingMaterializationSessions?.has(sessionId) &&
+        pendingMaterializationOrigin(overrides.pendingMaterializationSessions, sessionId) ===
+            "pending_materialization"
+    ) {
+        requestPendingMaterialization(
+            overrides.pendingMaterializationSessions,
+            sessionId,
+            "user_flush",
+        );
+    }
     return {
         sessionId,
         db,
@@ -719,7 +736,11 @@ describe("postprocess replay-or-refuse", () => {
                     case "reasoning-removal-persistence-failure":
                     case "reasoning-removal-committed-read-failure":
                         args.resolvedProviderID = "openai";
-                        args.pendingMaterializationSessions.add(sessionId);
+                        requestPendingMaterialization(
+                            args.pendingMaterializationSessions,
+                            sessionId,
+                            "user_flush",
+                        );
                         args.keepReasoningTokens = 0;
                         messages.forEach((message, index) => {
                             args.messageTagNumbers.set(message, index + 1);
@@ -752,7 +773,11 @@ describe("postprocess replay-or-refuse", () => {
                         break;
                     case "merged-reasoning-strip-persistence-failure":
                     case "merged-reasoning-strip-exception":
-                        args.pendingMaterializationSessions.add(sessionId);
+                        requestPendingMaterialization(
+                            args.pendingMaterializationSessions,
+                            sessionId,
+                            "user_flush",
+                        );
                         spies.push(
                             spyOn(
                                 replayStorage,
@@ -767,7 +792,11 @@ describe("postprocess replay-or-refuse", () => {
                         expect(addTrailingBlankDecisions(db, sessionId, [["a1", "keep:2"]])).toBe(
                             true,
                         );
-                        args.pendingMaterializationSessions.add(sessionId);
+                        requestPendingMaterialization(
+                            args.pendingMaterializationSessions,
+                            sessionId,
+                            "user_flush",
+                        );
                         args.trailingBlankSourceDecisions = new Map([["a1", "strip"]]);
                         spies.push(
                             spyOn(
@@ -790,6 +819,11 @@ describe("postprocess replay-or-refuse", () => {
                         break;
                     case "proactive-thinking-strip-persistence-failure":
                         hostSystemChanged(sessionId, args.pendingMaterializationSessions);
+                        requestPendingMaterialization(
+                            args.pendingMaterializationSessions,
+                            sessionId,
+                            "user_flush",
+                        );
                         args.thinkingBindingRecoveryEnabledForModel = true;
                         // Isolate the proactive lane from merged-run detection.
                         messages.splice(2, 0, {
@@ -4886,7 +4920,7 @@ describe("executed m[0] hard-fold folds the execute pass in", () => {
             const fold = await pass();
             expect(fold.result.materialized).toBe(true);
             expect(lines).toContain(
-                "heuristics WILL RUN — reason=pending_materialization origin=pending_materialization, context=20.0%, turn=null",
+                "heuristics WILL RUN — reason=pending_materialization origin=user_flush, context=20.0%, turn=null",
             );
             expect(getPendingOps(db, sessionId)).toHaveLength(0);
             expect(pendingMaterializationSessions.has(sessionId)).toBe(false);
@@ -9773,6 +9807,7 @@ describe("marker-drain reasoning representation", () => {
                 ...first,
                 tagger,
                 resolvedProviderID: "anthropic",
+                readLastServedMessages: () => source(),
                 deferredMaterializationSessions: new Set([sessionId]),
                 hiddenMessagesAtCompactionSeam: [applyingRaw[1]],
                 deferredHistoryWasPendingAtPassStart: true,
@@ -11022,7 +11057,11 @@ describe("ride-only queued drops", () => {
                     await runPostTransformPhase({ ...args, schedulerDecision: "defer" });
                     expect(JSON.stringify(args.messages)).toBe(baseline);
                 }
-                args.pendingMaterializationSessions.add(sessionId);
+                requestPendingMaterialization(
+                    args.pendingMaterializationSessions,
+                    sessionId,
+                    "user_flush",
+                );
                 await runPostTransformPhase(args);
                 expect(getPendingOps(db, sessionId)).toHaveLength(0);
             } finally {
@@ -11069,7 +11108,7 @@ it("queued agent batches consume only one force episode", async () => {
     await runPostTransformPhase(args);
     expect(getPendingOps(db, sessionId)).toHaveLength(1);
     expect(JSON.stringify(args.messages)).toBe(frozen);
-    args.pendingMaterializationSessions.add(sessionId);
+    requestPendingMaterialization(args.pendingMaterializationSessions, sessionId, "user_flush");
     await runPostTransformPhase(args);
     expect(getPendingOps(db, sessionId)).toHaveLength(0);
 });
@@ -11237,6 +11276,9 @@ describe("pending-ops and heuristics permission labels", () => {
         initializeDatabase(db);
 
         const publishedHistory = await permissionLines("ses-ride-published-history", {
+            readLastServedMessages: () => [
+                { info: { role: "user" }, parts: [{ type: "text", text: "previous history" }] },
+            ],
             contextUsage: { percentage: 20, inputTokens: 1_000 },
             historyRebuiltThisPass: true,
             pendingCompartmentInjection: {

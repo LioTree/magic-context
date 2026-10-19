@@ -2078,6 +2078,29 @@ export function finalizeMessageRepresentation(
     return { clearedParts, mergedReasoningParts };
 }
 
+// The legacy renderer embeds history in the first user message rather than a separate synthetic history message.
+// Rebuilding its cache is not evidence that the provider will see different text.
+function legacyPublishedHeadChanged(args: RunPostTransformPhaseArgs): boolean {
+    if (!args.pendingCompartmentInjection || !args.readLastServedMessages) return false;
+    const served = args.readLastServedMessages();
+    // null explicitly means no earlier request was sent. A missing reader
+    // function or an empty array does not establish that first-request state.
+    if (served === null) return true;
+    const previous = served[0] as MessageLike | undefined;
+    if (!Array.isArray(previous?.parts) || !args.pendingCompartmentInjection) return false;
+    const text = previous.parts.find(
+        (part): part is { type: "text"; text: unknown } =>
+            typeof part === "object" &&
+            part !== null &&
+            "type" in part &&
+            part.type === "text" &&
+            "text" in part,
+    )?.text;
+    if (typeof text !== "string") return false;
+    const block = `<session-history>\n${args.pendingCompartmentInjection.block}\n</session-history>`;
+    return text !== block && !text.startsWith(`${block}\n\n`);
+}
+
 export async function runPostTransformPhase(
     args: RunPostTransformPhaseArgs,
 ): Promise<PostTransformPhaseResult> {
@@ -2773,15 +2796,18 @@ export async function runPostTransformPhase(
                 (triggerPermissions.force &&
                     getEmergencyInputSample(args.db, args.sessionId) === 0)),
         explicitFlush:
-            isExplicitFlush ||
-            (deferredMaterialize && triggerPermissions.materialization && !prefixPreflightFailed),
+            isExplicitFlush &&
+            hasPendingMaterializationOrigin(
+                args.pendingMaterializationSessions,
+                args.sessionId,
+                "user_flush",
+            ),
         publishedHistory:
-            publishedM1RefreshedThisPass ||
-            (!m0M1EnabledForFold &&
-                (args.pendingCompartmentInjection?.compartmentCount ?? 0) > 0 &&
-                (args.historyRebuiltThisPass ||
-                    args.rebuiltHistoryFromInitialPrepare ||
-                    (args.canConsumeDeferredLate && args.deferredHistoryWasPendingAtPassStart))),
+            !prefixPreflightFailed &&
+            (publishedM1RefreshedThisPass ||
+                (!m0M1EnabledForFold &&
+                    (args.pendingCompartmentInjection?.compartmentCount ?? 0) > 0 &&
+                    legacyPublishedHeadChanged(args))),
     };
     // Warm-cache thinking holds defer every new prefix edit. First render, idle
     // expiry and pressure relief can admit work, but the target guards still
@@ -5667,6 +5693,7 @@ import { prepareCompactionMarkerCandidates } from "../../features/magic-context/
 import {
     clearPendingMaterialization,
     clearSystemPromptEdit,
+    hasPendingMaterializationOrigin,
     hasSystemPromptEdit,
     pendingMaterializationOrigin,
     requestPendingMaterialization,

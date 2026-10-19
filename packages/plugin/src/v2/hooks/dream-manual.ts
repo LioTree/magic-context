@@ -130,6 +130,7 @@ export async function runManualDreamNow(args: {
                   }),
               }
             : {}),
+        smartNotesEnabled: args.smartNotesEnabled,
         tasks: selection.runnable,
         executor,
         ...(args.task !== undefined ? { task: args.task } : {}),

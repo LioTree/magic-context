@@ -62,6 +62,10 @@ function isolateDb(): void {
 // unused, so a minimal stub is sufficient.
 const ctx = { directory: process.cwd() } as unknown as PluginContext;
 
+// ctx_note advertises smart notes only with a runnable dreamer, which evaluates
+// them; the golden and field-list tests describe that full surface.
+const RUNNABLE_DREAMER = { dreamer: {} } as Partial<MagicContextPluginConfig>;
+
 function buildRegistry(
     config: Partial<MagicContextPluginConfig>,
     promptSurfaceRuntime?: PromptSurfaceRuntime,
@@ -80,7 +84,7 @@ function buildRegistry(
 describe("createToolRegistry — memory gating", () => {
     it("advertises only real ctx_* fields", () => {
         isolateDb();
-        const tools = buildRegistry({});
+        const tools = buildRegistry(RUNNABLE_DREAMER);
         const expectedFields: Record<string, string[]> = {
             ctx_reduce: ["drop"],
             ctx_expand: ["start", "end", "verbose", "message", "tag"],
@@ -109,6 +113,15 @@ describe("createToolRegistry — memory gating", () => {
             expect(jsonSchema.properties).not.toHaveProperty("reduced");
             expect(jsonSchema.properties).not.toHaveProperty("summary");
         }
+
+        // Without a dreamer block smart notes cannot run, so ctx_note drops surface_condition.
+        isolateDb();
+        const noDreamer = tool.schema.toJSONSchema(
+            tool.schema.object(buildRegistry({}).ctx_note?.args ?? {}),
+        ) as { properties?: Record<string, unknown> };
+        expect(Object.keys(noDreamer.properties ?? {}).sort()).toEqual(
+            expectedFields.ctx_note!.filter((field) => field !== "surface_condition").sort(),
+        );
     });
 
     it("keeps the primary memory surface free of the dreamer-only list tool and action", () => {
@@ -292,11 +305,14 @@ describe("createToolRegistry — prompt-surface registration", () => {
     it("matches the A1 golden for no config and explicit full", () => {
         const golden = readA1GoldenTools();
         isolateDb();
-        const implicit = buildRegistry({});
+        const implicit = buildRegistry(RUNNABLE_DREAMER);
         isolateDb();
         const explicit = buildRegistry({
+            ...RUNNABLE_DREAMER,
             prompt_surface: { default: "full" },
         } as Partial<MagicContextPluginConfig>);
+        isolateDb();
+        const noDreamer = buildRegistry({});
 
         expect(Object.keys(implicit).sort()).toEqual(Object.keys(golden).sort());
         expect(Object.keys(explicit).sort()).toEqual(Object.keys(golden).sort());
@@ -305,6 +321,16 @@ describe("createToolRegistry — prompt-surface registration", () => {
             expect(explicit[toolId]?.description).toBe(expected.description);
             expect(providerParameters(implicit[toolId])).toEqual(expected.parameters);
             expect(providerParameters(explicit[toolId])).toEqual(expected.parameters);
+            // Without a dreamer only ctx_note differs: it loses its smart-note text.
+            if (toolId === "ctx_note") {
+                expect(noDreamer[toolId]?.description).not.toBe(expected.description);
+                expect(JSON.stringify(providerParameters(noDreamer[toolId]))).not.toContain(
+                    "surface_condition",
+                );
+            } else {
+                expect(noDreamer[toolId]?.description).toBe(expected.description);
+                expect(providerParameters(noDreamer[toolId])).toEqual(expected.parameters);
+            }
         }
     });
 
@@ -345,10 +371,13 @@ describe("createToolRegistry — prompt-surface registration", () => {
             warn: (warning) => warnings.push(warning),
         });
         isolateDb();
-        const full = buildRegistry({});
+        const full = buildRegistry(RUNNABLE_DREAMER);
         isolateDb();
         const light = buildRegistry(
-            { prompt_surface: { default: "light" } } as Partial<MagicContextPluginConfig>,
+            {
+                ...RUNNABLE_DREAMER,
+                prompt_surface: { default: "light" },
+            } as Partial<MagicContextPluginConfig>,
             runtime,
         );
 

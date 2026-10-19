@@ -9,6 +9,7 @@ import { withContentLanguageDirective } from "./agents/language-directive";
 import { denyTaskRoutingToCallerAgents } from "./agents/permissions";
 import { loadPluginConfigDetailed } from "./config";
 import { isCompactionEnabled, isDreamerRunnable } from "./config/agent-disable";
+import { logConfigDependencyNotesOnce } from "./config/dependency-notes";
 import { createDreamerOutputCapSampler } from "./config/live-child-output-cap";
 import { dreamerRunConfig, historianRunConfig, pluginConfigReader } from "./config/live-run-config";
 import { migrateMagicContextConfigLocations } from "./config/migrate-config-location";
@@ -85,7 +86,11 @@ import {
     detectConflicts,
     resolveCompactionForBoot,
 } from "./shared/conflict-detector";
-import { getMagicContextStorageDir } from "./shared/data-path";
+import {
+    claimStorageBackupWarningCheck,
+    getMagicContextStorageDir,
+    isMagicContextStorageOutsideEngram,
+} from "./shared/data-path";
 import { registerExitAbort, unregisterExitAbort } from "./shared/exit-abort-registry";
 import { setHarness } from "./shared/harness";
 import { shapeV1HiddenMessage } from "./shared/hidden-zen-read";
@@ -115,6 +120,16 @@ import { setup } from "./v2/server";
 
 const BOOT_SERVER_DEADLINE_MS = 15_000;
 const RESOLVED_CONFIG_TIMEOUT_MS = 2_000;
+
+function warnStorageBackupOnce(storageDir: string): void {
+    if (!claimStorageBackupWarningCheck()) return;
+    if (isMagicContextStorageOutsideEngram(storageDir)) {
+        log(
+            `[magic-context] Magic Context storage is at ${storageDir}, outside the folder Engram backs up (~/.local/share/cortexkit/magic-context). It is not included in CortexKit backups.`,
+        );
+        flushLogger();
+    }
+}
 
 registerStandalonePluginMarker(packageMetadata.version);
 
@@ -241,6 +256,10 @@ const server: Plugin = async (ctx) => {
                 }
             }, 3000);
     }
+
+    // Settings that are on but inert because another section turns off what
+    // they rely on (for example smart notes with the dreamer disabled).
+    logConfigDependencyNotesOnce(pluginConfig, log);
 
     const openCodeDbResolution = resolveOpenCodeDbPath();
     if (
@@ -516,6 +535,7 @@ const server: Plugin = async (ctx) => {
     // `enabled` block lets the auto-update checker still coordinate even
     // when the rest of the runtime is disabled by config or conflicts.
     const storageDir = getMagicContextStorageDir();
+    warnStorageBackupOnce(storageDir);
 
     // Per-instance process-resident handles, hoisted to function scope so the
     // server.instance.disposed cleanup (wired into the event handler below, which

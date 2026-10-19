@@ -28,6 +28,7 @@ import {
     rememberGitIdentity,
     rememberPinnedProjectIdentity,
 } from "./project-identity-cache";
+import { isUnbornHeadOnDisk } from "./unborn-head";
 
 // execFileSync is intentional here (audit #19): this runs once per unique directory per process
 // lifetime when git is healthy, and successful git identities are cached in identityCache. The
@@ -90,6 +91,7 @@ export function shouldSkipHomeProjectMemory(directory: string): boolean {
     }
 }
 let execFileSyncForIdentity: typeof execFileSync = execFileSync;
+let gitTimeoutMs = GIT_TIMEOUT_MS;
 let userHomeDirectoryForIdentity = (): string => homedir();
 let nowMs = (): number => Date.now();
 let filesystemProbeObserverForTests: (() => void) | undefined;
@@ -248,7 +250,7 @@ function hasUnbornHead(directory: string): boolean {
         encoding: "utf8" as const,
         env: { ...process.env, LC_ALL: "C", LANG: "C" },
         stdio: ["ignore", "pipe", "pipe"] as ["ignore", "pipe", "pipe"],
-        timeout: GIT_TIMEOUT_MS,
+        timeout: gitTimeoutMs,
         windowsHide: true,
     };
     try {
@@ -277,7 +279,7 @@ function classifyGitError(error: unknown, rawDirectory: string): ProjectIdentity
         return new ProjectIdentityError(
             "git_timeout",
             rawDirectory,
-            `git rev-list timed out after ${GIT_TIMEOUT_MS}ms`,
+            `git rev-list timed out after ${gitTimeoutMs}ms`,
             asError(error),
         );
     }
@@ -368,6 +370,18 @@ export function resolveProjectIdentityStrict(
         );
     }
 
+    // A repository with no commits yet is recognized from its files before any git process
+    // starts. Asking git first made the answer depend on git returning within the timeout:
+    // on Windows the call ran into the timeout right after `git init`, and a timeout pauses
+    // memory features instead of using the directory identity. Unusual layouts still go to git.
+    if (isUnbornHeadOnDisk(canonical)) {
+        throw new ProjectIdentityError(
+            "no_commits",
+            directory,
+            "Git repository has no commits yet",
+        );
+    }
+
     let output: string;
     try {
         output = execFileSyncForIdentity("git", ["rev-list", "--max-parents=0", "HEAD"], {
@@ -375,7 +389,7 @@ export function resolveProjectIdentityStrict(
             encoding: "utf8",
             env: { ...process.env, LC_ALL: "C", LANG: "C" },
             stdio: ["ignore", "pipe", "pipe"],
-            timeout: GIT_TIMEOUT_MS,
+            timeout: gitTimeoutMs,
             windowsHide: true,
         }) as string;
     } catch (error) {
@@ -914,8 +928,10 @@ export function __setProjectIdentityTestHooks(hooks: {
     homeDirectory?: () => string;
     nowMs?: () => number;
     onFilesystemProbe?: () => void;
+    gitTimeoutMs?: number;
 }): void {
     execFileSyncForIdentity = hooks.execFileSync ?? execFileSync;
+    gitTimeoutMs = hooks.gitTimeoutMs ?? GIT_TIMEOUT_MS;
     userHomeDirectoryForIdentity = hooks.homeDirectory ?? (() => homedir());
     nowMs = hooks.nowMs ?? (() => Date.now());
     filesystemProbeObserverForTests = hooks.onFilesystemProbe;
@@ -963,6 +979,7 @@ export function __resetProjectIdentityForTests(): void {
     transientGitIdentityReuseLoggedDirectories.clear();
     sessionIdentityCache.clear();
     execFileSyncForIdentity = execFileSync;
+    gitTimeoutMs = GIT_TIMEOUT_MS;
     userHomeDirectoryForIdentity = (): string => homedir();
     nowMs = (): number => Date.now();
     filesystemProbeObserverForTests = undefined;

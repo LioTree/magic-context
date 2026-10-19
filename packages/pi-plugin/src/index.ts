@@ -28,6 +28,7 @@ import {
 	isCompactionEnabled,
 	isDreamerRunnable,
 } from "@magic-context/core/config/agent-disable";
+import { logConfigDependencyNotesOnce } from "@magic-context/core/config/dependency-notes";
 import {
 	changedLiveKeys,
 	dreamerRunConfig,
@@ -44,6 +45,8 @@ import type {
 import {
 	summarizeDreamSchedule,
 	userMemoryCollectionEnabled,
+	userObservationCollectionEnabled,
+	userObservationsRequested,
 } from "@magic-context/core/features/magic-context/dreamer/task-config";
 import {
 	type FailClosedReason,
@@ -111,7 +114,11 @@ import {
 	claimConfigParseFailuresOnce,
 	formatConfigParseNotice,
 } from "@magic-context/core/shared/config-diagnostics";
-import { getMagicContextStorageDir } from "@magic-context/core/shared/data-path";
+import {
+	claimStorageBackupWarningCheck,
+	getMagicContextStorageDir,
+	isMagicContextStorageOutsideEngram,
+} from "@magic-context/core/shared/data-path";
 import { setEmbeddingSessionBusy } from "@magic-context/core/shared/embedding-activity";
 import { setHarness } from "@magic-context/core/shared/harness";
 import { piModelRefToCanonical } from "@magic-context/core/shared/harness-provider-map";
@@ -1105,7 +1112,8 @@ export function resolveHistorianFromConfig(
 		historyBudgetPercentage: config.history_budget_percentage,
 		memoryEnabled: config.memory.enabled,
 		autoPromote: config.memory.auto_promote,
-		userMemoriesEnabled: userMemoryCollectionEnabled(config.dreamer),
+		userMemoriesEnabled: userObservationCollectionEnabled(config.dreamer),
+		userObservationsRequested: userObservationsRequested(config.dreamer),
 		language: config.language,
 		allowHomeProject: config.allow_home_project,
 	};
@@ -1193,6 +1201,15 @@ export default async function (pi: ExtensionAPI): Promise<void> {
 		databaseExitHookRegistered = true;
 	}
 	const storageDir = getMagicContextStorageDir();
+	if (
+		claimStorageBackupWarningCheck() &&
+		isMagicContextStorageOutsideEngram(storageDir)
+	) {
+		warn(
+			`Magic Context storage is at ${storageDir}, outside the folder Engram backs up (~/.local/share/cortexkit/magic-context). It is not included in CortexKit backups.`,
+		);
+		flushLogger();
+	}
 	const dbPath = join(storageDir, "context.db");
 	let openFailureCause: string | null = null;
 	const openStorage = async (): Promise<ContextDatabase | null> => {
@@ -1392,6 +1409,9 @@ async function startPiMagicContextRuntime(
 		`loaded v${PLUGIN_VERSION} | harness=${PI_HARNESS_KIND} (via ${PI_HARNESS_DETECTION.via}) | db=${dbPath} | ` +
 			`project=${projectIdentity || "(none)"} | dir=${projectDir}`,
 	);
+	// Settings that are on but inert because another section turns off what
+	// they rely on (for example smart notes with the dreamer disabled).
+	logConfigDependencyNotesOnce(config, log);
 	// Pi tools are registered once per process, so this mode is intentionally
 	// boot-resolved rather than following later /cd project config changes.
 	const compactionOff = !isCompactionEnabled(config);
@@ -2260,7 +2280,10 @@ async function startPiMagicContextRuntime(
 		memoryEnabled: bootProjectDeps.config.memory.enabled,
 		autoPromote: bootProjectDeps.config.memory.auto_promote,
 		compactionOff,
-		userMemoriesEnabled: userMemoryCollectionEnabled(
+		userMemoriesEnabled: userObservationCollectionEnabled(
+			bootProjectDeps.config.dreamer,
+		),
+		userObservationsRequested: userObservationsRequested(
 			bootProjectDeps.config.dreamer,
 		),
 		executeThresholdPercentage:
@@ -2285,7 +2308,10 @@ async function startPiMagicContextRuntime(
 				memoryEnabled: current.config.memory.enabled,
 				autoPromote: fresh.memory.auto_promote,
 				compactionOff,
-				userMemoriesEnabled: userMemoryCollectionEnabled(
+				userMemoriesEnabled: userObservationCollectionEnabled(
+					current.config.dreamer,
+				),
+				userObservationsRequested: userObservationsRequested(
 					current.config.dreamer,
 				),
 				executeThresholdPercentage: current.config.execute_threshold_percentage,

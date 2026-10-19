@@ -509,7 +509,14 @@ async function pi(signed: boolean, seed: number, active = false) {
                 } else if (!e.tool) user();
                 if (e.edit) instruction = `genuine instructions ${e.pass}`;
                 if (e.flush) piContext.signalPiPendingMaterialization(sessionId, "user_flush");
-                if (e.history) piContext.signalPiHistoryRefresh(sessionId);
+                if (e.history) {
+                    piContext.signalPiHistoryRefresh(sessionId);
+                    // Removing thinking from completed signed replies requires
+                    // permission to rebuild the request. History can be unchanged,
+                    // so this case also requests an explicit user flush.
+                    if (signed && !active)
+                        piContext.signalPiPendingMaterialization(sessionId, "user_flush");
+                }
                 if (e.model) {
                     model = model === "claude-opus-5-5" ? "claude-sonnet-4-6" : "claude-opus-5-5";
                     // Turns served by the other model have no protected-prefix

@@ -486,6 +486,9 @@ export interface PiHistorianDeps {
 	/** User-memory feature gate (`dreamer.user_memories.enabled`). Gates whether
 	 *  historian-extracted user observations are persisted as candidates. */
 	userMemoriesEnabled?: boolean;
+	/** False when the dreamer is not runnable, so the historian prompt asks it to
+	 *  skip user observations nothing could review. Undefined counts as true. */
+	userObservationsRequested?: boolean;
 	language?: string;
 	/** Optional callback invoked on successful publication for cache-bust signaling. */
 	onPublished?: () => void;
@@ -552,6 +555,7 @@ export async function runPiHistorian(deps: PiHistorianDeps): Promise<void> {
 		allowHomeProject,
 		autoPromote,
 		userMemoriesEnabled,
+		userObservationsRequested,
 		onPublished,
 		compartmentLeaseHolderId,
 		readBranchEntries,
@@ -851,6 +855,7 @@ export async function runPiHistorian(deps: PiHistorianDeps): Promise<void> {
 						: [],
 				memoryEnabled: memoryEnabled !== false,
 				anchoredFacts,
+				userObservationsRequested,
 			});
 			if (!promptFit.ok) {
 				telemetry.failureReason = promptFit.reason;
@@ -1041,6 +1046,7 @@ export async function runPiHistorian(deps: PiHistorianDeps): Promise<void> {
 				inputSource: `Messages ${chunk.startIndex}-${chunk.endIndex}:\n\n${chunkText}`,
 				memoryEnabled: memoryEnabled !== false,
 				anchoredFacts,
+				userObservationsRequested,
 			});
 
 			// Defensive: use MAX(sequence) + 1 over .length to survive any old

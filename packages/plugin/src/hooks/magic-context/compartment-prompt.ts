@@ -127,6 +127,12 @@ export interface CompartmentPromptInputs {
      *  disabled there is no fact store, so emitting facts is pure waste
      *  (and they would never be rendered). Defaults to enabled. */
     memoryEnabled?: boolean;
+    /** False when nothing will ever review user observations because the
+     *  dreamer is not runnable: the historian is told to skip the
+     *  `<user_observations>` block. Undefined or true leaves the prompt as is.
+     *  The system prompt keeps describing the block either way so its bytes
+     *  (and the provider prompt cache) stay the same for every configuration. */
+    userObservationsRequested?: boolean;
     /** Recomp structural rebuilds must use the extraction-free prompt. */
     extractionFree?: boolean;
     /** Ask the historian to prefix each fact with its source anchor (compartment
@@ -135,6 +141,9 @@ export interface CompartmentPromptInputs {
      *  existing memory; a later reconcile step compares them instead. */
     anchoredFacts?: boolean;
 }
+
+const USER_OBSERVATIONS_DISABLED_TOGGLE =
+    "<user_observation_extraction>disabled</user_observation_extraction>\nUser-memory review is not running (the dreamer is disabled): do NOT emit a <user_observations> block.";
 
 /**
  * Assemble the per-run historian USER prompt for the v8.7.5 system prompt.
@@ -167,6 +176,10 @@ export function buildCompartmentAgentPrompt(inputs: CompartmentPromptInputs): st
         );
     } else if (inputs.anchoredFacts && !inputs.extractionFree) {
         parts.push(HISTORIAN_FACT_ANCHOR_INSTRUCTION);
+    }
+    // The extraction-free toggle above already forbids <user_observations>.
+    if (inputs.userObservationsRequested === false && !inputs.extractionFree) {
+        parts.push(USER_OBSERVATIONS_DISABLED_TOGGLE);
     }
     parts.push("<new_messages>");
     parts.push(inputs.inputSource);
