@@ -473,33 +473,47 @@ async fn conversation(dir: &Path, size: u64) -> (Rig, u64) {
     (rig, version)
 }
 
-/// What one ordinary notice writes, after it appends four messages to an
-/// already acknowledged conversation of `size` messages.
-async fn ordinary_notice(size: u64) -> (Sample, u64) {
+/// What two ordinary notices write in a conversation of `size` messages: the
+/// first acknowledges a newly published view, the second repeats that
+/// acknowledgement. Each appends four messages. Also returns the size of the
+/// per-conversation record afterwards.
+async fn ordinary_notices(size: u64) -> (Sample, Sample, u64) {
     let dir = tempfile::tempdir().unwrap();
-    let (mut rig, version) = conversation(dir.path(), size).await;
+    let mut rig = Rig::new(dir.path()).await;
+    rig.append(size);
+    rig.notice(1_000, None).await;
+    rig.history(size / 2, "first completed historian summary");
+    rig.notice(1_000, None).await;
+    let version = rig.newest().expect("history publishes a view");
     rig.append(4);
-    let sample = rig.notice(1_000, Some(version)).await;
+    let acknowledging = rig.notice(1_000, Some(version)).await;
+    rig.append(4);
+    let repeating = rig.notice(1_000, Some(version)).await;
     assert_eq!(
         rig.newest(),
         Some(version),
         "an ordinary notice publishes nothing"
     );
-    (sample, rig.record_bytes().0)
+    (acknowledging, repeating, rig.record_bytes().0)
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn ordinary_notice_write_set_does_not_grow_with_the_session() {
-    let (small, small_record) = ordinary_notice(60).await;
-    let (large, large_record) = ordinary_notice(600).await;
-    assert!(
-        large.bytes <= small.bytes * 2 && large.rows <= small.rows * 2,
-        "a notice adding four messages wrote {} bytes in {} rows at 600 messages but {} bytes in {} rows at 60",
-        large.bytes,
-        large.rows,
-        small.bytes,
-        small.rows
-    );
+    let (small_ack, small, small_record) = ordinary_notices(60).await;
+    let (large_ack, large, large_record) = ordinary_notices(600).await;
+    for (label, small, large) in [
+        ("acknowledging a new view", small_ack, large_ack),
+        ("repeating an acknowledgement", small, large),
+    ] {
+        assert!(
+            large.bytes <= small.bytes * 2 && large.rows <= small.rows * 2,
+            "a notice {label} and adding four messages wrote {} bytes in {} rows at 600 messages but {} bytes in {} rows at 60",
+            large.bytes,
+            large.rows,
+            small.bytes,
+            small.rows
+        );
+    }
     assert!(
         large_record <= small_record * 2,
         "the per-conversation record must stay fixed-size: {large_record} bytes at 600 messages, {small_record} at 60"
