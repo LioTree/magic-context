@@ -6,6 +6,7 @@ import { runMigrations } from "../../features/magic-context/migrations";
 import { createScheduler } from "../../features/magic-context/scheduler";
 import { getOrCreateSessionMeta } from "../../features/magic-context/storage";
 import { initializeDatabase } from "../../features/magic-context/storage-db";
+import { getMergedReasoningStrippedIds } from "../../features/magic-context/storage-meta-persisted";
 import { deriveTagLoadFloor } from "../../features/magic-context/storage-tags";
 import { createTagger } from "../../features/magic-context/tagger";
 import { Database } from "../../shared/sqlite";
@@ -183,7 +184,7 @@ function openContext(dir: string): Database {
     return db;
 }
 
-async function firstPass(db: Database): Promise<MessageLike[]> {
+async function firstPass(db: Database, messages = conversation()): Promise<MessageLike[]> {
     const transform = createTransform({
         db,
         tagger: createTagger(),
@@ -196,9 +197,101 @@ async function firstPass(db: Database): Promise<MessageLike[]> {
         pendingMaterializationSessions: new Set(),
         lastHeuristicsTurnId: new Map(),
     });
-    const messages = conversation();
     await transform({}, { messages });
     return messages;
+}
+
+const REASONING_TYPES = new Set(["reasoning", "thinking", "redacted_thinking"]);
+
+/** Reasoning parts of a message that still carry content after the pass. */
+function renderedReasoning(messages: MessageLike[], id: string): number {
+    const message = messages.find((candidate) => candidate.info.id === id);
+    return (message?.parts ?? []).filter((part) => {
+        const record = part as { type?: unknown; text?: unknown };
+        return (
+            REASONING_TYPES.has(String(record.type)) &&
+            typeof record.text === "string" &&
+            record.text !== "" &&
+            record.text !== "[cleared]"
+        );
+    }).length;
+}
+
+function signedThinking(text: string): Record<string, unknown> {
+    return { type: "reasoning", text, metadata: { anthropic: { signature: `sig-${text}` } } };
+}
+
+/**
+ * A conversation where ck-mc removed the thinking of the first answer by age
+ * and, after a signed-thinking reset, the thinking of the current turn too;
+ * it kept the thinking of the second answer.
+ */
+function reasoningConversation(): MessageLike[] {
+    return [
+        user("msg_r1", "first question"),
+        assistant("msg_r2", [
+            signedThinking("old thought"),
+            { type: "text", text: "first answer" },
+        ]),
+        assistant("msg_r3", [
+            signedThinking("kept thought"),
+            { type: "text", text: "second answer" },
+        ]),
+        user("msg_r4", "second question"),
+        assistant("msg_r5", [
+            signedThinking("current thought"),
+            { type: "text", text: "working on it" },
+            tool("call_r", "output r"),
+        ]),
+    ];
+}
+
+function buildReasoningStore(path: string): void {
+    const store = new Database(path);
+    try {
+        store.exec(STORE_SCHEMA);
+        const insert = store.prepare(
+            "INSERT INTO mc_tags (session_id, tag_number, block_id, kind, created_at_ms) VALUES (?, ?, ?, ?, ?)",
+        );
+        insert.run(SESSION, 1, "msg_r1#0", "message", CK_ACTIVE_AT);
+        insert.run(SESSION, 2, "msg_r2#1", "message", CK_ACTIVE_AT);
+        insert.run(SESSION, 3, "msg_r3#1", "message", CK_ACTIVE_AT);
+        insert.run(SESSION, 4, "msg_r4#0", "message", CK_ACTIVE_AT);
+        insert.run(SESSION, 5, "msg_r5#1", "message", CK_ACTIVE_AT);
+        insert.run(SESSION, 6, "msg_r5#3", "tool_result", CK_ACTIVE_AT);
+        const identities = store.prepare(
+            "INSERT INTO mc_block_identities (session_id, mid, identities) VALUES (?, ?, ?)",
+        );
+        const kinds = (...list: string[]) =>
+            JSON.stringify(list.map((kind_tag) => ({ kind_tag, byte_fingerprint: "" })));
+        identities.run(SESSION, "msg_r1", kinds("text"));
+        identities.run(SESSION, "msg_r2", kinds("reasoning", "text"));
+        identities.run(SESSION, "msg_r3", kinds("reasoning", "text"));
+        identities.run(SESSION, "msg_r4", kinds("text"));
+        identities.run(SESSION, "msg_r5", kinds("reasoning", "text", "tool_call", "tool_result"));
+        store
+            .prepare(
+                "INSERT INTO mc_cache_frozen_chunks (session_id, chunk, body) VALUES (?, 0, ?)",
+            )
+            .run(
+                SESSION,
+                JSON.stringify([
+                    { key: "strip:reasoning_age:msg_r2", kind: "strip_reasoning_age" },
+                    {
+                        key: "strip:native_reasoning_keep:msg_r3",
+                        kind: "strip_native_reasoning_keep",
+                    },
+                    { key: "strip:reasoning_age:msg_r5", kind: "strip_reasoning_age" },
+                ]),
+            );
+        store
+            .prepare(
+                "INSERT INTO mc_cache_state (session_id, row_version, core_state, meta, last_activity_at) VALUES (?, 1, '{}', '{}', ?)",
+            )
+            .run(SESSION, CK_ACTIVE_AT);
+    } finally {
+        closeQuietly(store);
+    }
 }
 
 /** The `§N§` number at the start of a rendered text or tool output, or null. */
@@ -387,8 +480,9 @@ describe("legacy ck-mc tag import", () => {
             try {
                 if (withHistory) {
                     seedTypeScriptEra(db);
-                    // Older TypeScript-era rows numbered above ck-mc's high-water
-                    // mark, as on the long-running seats; none is on the wire.
+                    // TypeScript-era rows numbered above the fixture's high-water
+                    // mark (12), the shape the long-running Rust-mode sessions
+                    // have. None belongs to a message in this pass's messages.
                     const insert = db.prepare(
                         "INSERT INTO tags (session_id, message_id, type, status, byte_size, tag_number, harness, tool_owner_message_id) VALUES (?, ?, ?, ?, 10, ?, 'opencode', ?)",
                     );
@@ -447,6 +541,31 @@ describe("legacy ck-mc tag import", () => {
         expect(withHistory.loaded).toBe(baseline.loaded);
         // Saved text for the visible parts only: the history rows' text is gone too.
         expect(withHistory.sources).toBe(baseline.sources);
+    });
+
+    test("reasoning ck-mc removed stays removed on the first TypeScript pass, the current turn included", async () => {
+        buildReasoningStore(join(dir, "store.db"));
+        const db = openContext(dir);
+        try {
+            const messages = await firstPass(db, reasoningConversation());
+            expect(renderedReasoning(messages, "msg_r2")).toBe(0);
+            expect(renderedReasoning(messages, "msg_r5")).toBe(0);
+            const recorded = getMergedReasoningStrippedIds(db, SESSION);
+            expect(recorded.has("binding_mismatch:msg_r2")).toBe(true);
+            expect(recorded.has("binding_mismatch:msg_r5")).toBe(true);
+            // ck-mc left msg_r3's thinking in place (native_reasoning_keep), so
+            // the import must not record a removal for it.
+            expect(recorded.has("binding_mismatch:msg_r3")).toBe(false);
+            const marker = db
+                .prepare("SELECT value FROM schema_migrations_meta WHERE key = ?")
+                .get(legacyCkTagImportMarkerKey(SESSION)) as { value: string };
+            expect(JSON.parse(marker.value)).toMatchObject({
+                reasoningStripped: 2,
+                reasoningStripWider: 0,
+            });
+        } finally {
+            closeQuietly(db);
+        }
     });
 
     test("a session the TypeScript transform tagged after ck-mc keeps its numbering", () => {

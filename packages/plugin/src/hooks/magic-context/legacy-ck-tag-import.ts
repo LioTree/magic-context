@@ -24,13 +24,20 @@
  *  - the session counter continues above ck-mc's highest number;
  *  - drops ck-mc applied and drops still queued in ck-mc are carried over,
  *    replacing the TypeScript queue left over from before the switch;
- *  - session watermarks stored as tag numbers are translated to the new
- *    numbering so they cover the same messages as before.
+ *  - reasoning ck-mc removed from visible messages is recorded as
+ *    binding-mismatch removals, so it never comes back;
+ *  - the tool-reclaim watermark, stored as a tag number, is translated to the
+ *    new numbering so it covers the same messages as before; the reasoning
+ *    watermark is cleared, because the recorded removals replace it.
  * A marker row in `schema_migrations_meta` makes the import run once per
  * session. store.db is only ever opened read-only.
  */
 import { existsSync } from "node:fs";
 import { dirname, join } from "node:path";
+import {
+    addMergedReasoningStrippedIds,
+    thinkingBindingRecoveryFrozenId,
+} from "../../features/magic-context/storage-meta-persisted";
 import {
     WHITESPACE_ASSISTANT_INERT_FINGERPRINT_PREFIX,
     WHITESPACE_ASSISTANT_INERT_MESSAGE_PREFIX,
@@ -76,7 +83,29 @@ export interface LegacyCkTagSnapshot {
     blockKinds: Map<string, string[]>;
     /** Reductions ck-mc applied, keyed by block id, valued by reduction kind. */
     reductions: Map<string, string>;
+    /**
+     * Visible messages whose reasoning ck-mc removed, with the kinds of the
+     * units that removed it (see REASONING_STRIP_KINDS).
+     */
+    reasoningStrips: Map<string, Set<string>>;
 }
+
+/**
+ * ck-mc's frozen units that take reasoning out of an assistant message, keyed
+ * `strip:<kind>:<message id>`:
+ *  - `reasoning_age` removes every reasoning block of the message;
+ *  - `reasoning_clear` and `reasoning_clear_legacy` empty every reasoning
+ *    block and drop its signature, which the Anthropic adapter then omits;
+ *  - `merged_reasoning` removes the reasoning the serializer cannot keep in a
+ *    run of merged assistant steps, which can be fewer than all blocks.
+ * `native_reasoning_keep` is the opposite decision and is not listed.
+ */
+const REASONING_STRIP_KINDS = [
+    "reasoning_age",
+    "reasoning_clear_legacy",
+    "reasoning_clear",
+    "merged_reasoning",
+] as const;
 
 export type LegacyCkTagImportStatus =
     | "imported"
@@ -246,8 +275,10 @@ export function readLegacyCkTagSnapshot(
                     }
                 }
 
-                // Applied reductions are frozen decisions keyed `red:<block id>`.
+                // Applied reductions are frozen decisions keyed `red:<block id>`;
+                // reasoning removals are keyed `strip:<kind>:<message id>`.
                 const reductions = new Map<string, string>();
+                const reasoningStrips = new Map<string, Set<string>>();
                 if (tableExists(store, "mc_cache_frozen_chunks")) {
                     const chunks = store
                         .prepare(
@@ -261,13 +292,36 @@ export function readLegacyCkTagSnapshot(
                             if (unit === null || typeof unit !== "object") continue;
                             const { key, kind } = unit as { key?: unknown; kind?: unknown };
                             if (typeof key !== "string" || typeof kind !== "string") continue;
-                            if (!key.startsWith("red:")) continue;
-                            reductions.set(key.slice(4), kind);
+                            if (key.startsWith("red:")) {
+                                reductions.set(key.slice(4), kind);
+                                continue;
+                            }
+                            for (const stripKind of REASONING_STRIP_KINDS) {
+                                const prefix = `strip:${stripKind}:`;
+                                if (!key.startsWith(prefix)) continue;
+                                const messageId = key.slice(prefix.length);
+                                if (!visibleMessageIds.has(messageId)) break;
+                                let kinds = reasoningStrips.get(messageId);
+                                if (!kinds) {
+                                    kinds = new Set();
+                                    reasoningStrips.set(messageId, kinds);
+                                }
+                                kinds.add(stripKind);
+                                break;
+                            }
                         }
                     }
                 }
 
-                return { tags, highWater, lastActivityMs, pendingDrops, blockKinds, reductions };
+                return {
+                    tags,
+                    highWater,
+                    lastActivityMs,
+                    pendingDrops,
+                    blockKinds,
+                    reductions,
+                    reasoningStrips,
+                };
             })
             .deferred();
     } finally {
@@ -587,7 +641,7 @@ function translateWatermark(
     return Math.max(0, Math.min(coveredMax, uncoveredMin - 1));
 }
 
-const TAG_NUMBER_WATERMARKS = ["cleared_reasoning_through_tag", "tool_reclaim_watermark"] as const;
+const TAG_NUMBER_WATERMARKS = ["tool_reclaim_watermark"] as const;
 
 interface ApplyCounts {
     imported: number;
@@ -596,6 +650,8 @@ interface ApplyCounts {
     deleted: number;
     droppedImported: number;
     pendingImported: number;
+    reasoningStripped: number;
+    reasoningStripWider: number;
 }
 
 interface HistoryCandidateRow {
@@ -856,6 +912,37 @@ function applyLegacyCkImport(
         }
     }
 
+    // Reasoning ck-mc removed must stay removed: on models that sign thinking
+    // (Opus 5.5, Sonnet 5.5), a block that comes back invalidates every signed
+    // block produced while it was gone, and the provider rejects the request.
+    // The binding-mismatch entries are replayed on every pass for every
+    // provider and remove all reasoning of the named messages, active turn
+    // included. They are the exact set ck-mc served, so the tag-number
+    // reasoning watermark is cleared instead of translated: translated, it
+    // would also cover messages whose reasoning ck-mc kept.
+    const reasoningStripIds = [...snapshot.reasoningStrips.keys()].filter((id) =>
+        plan.wireMessageIds.has(id),
+    );
+    if (
+        reasoningStripIds.length > 0 &&
+        !addMergedReasoningStrippedIds(
+            db,
+            sessionId,
+            reasoningStripIds.map(thinkingBindingRecoveryFrozenId),
+        )
+    ) {
+        throw new Error("could not record ck-mc's reasoning removals");
+    }
+    // ck-mc's merged-run strip can keep some of a message's reasoning; removing
+    // all of it is the provider-safe side.
+    const reasoningStripWider = reasoningStripIds.filter((id) => {
+        const kinds = snapshot.reasoningStrips.get(id);
+        return kinds?.size === 1 && kinds.has("merged_reasoning");
+    }).length;
+    db.prepare(
+        "UPDATE session_meta SET cleared_reasoning_through_tag = 0 WHERE session_id = ?",
+    ).run(sessionId);
+
     // New numbers continue above everything either transform ever used.
     const finalMax = Math.max(
         highWater,
@@ -873,6 +960,8 @@ function applyLegacyCkImport(
         deleted,
         droppedImported,
         pendingImported,
+        reasoningStripped: reasoningStripIds.length,
+        reasoningStripWider,
     };
 }
 
