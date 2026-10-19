@@ -45,9 +45,8 @@ rusqlite = { workspace = true }
 # subc-protocol is resolved from crates.io, matching the role crate's dependency.
 cortexkit-role-tool-provider = "=0.5.0"
 cortexkit-role-agent-data = "0.1"
-# Typed llm-runner/v1 sends for Broca dream children: 0.2.4 adds the hard
-# per-session input-token cap (`budget.max_input_tokens`, `input_token_cap`).
-cortexkit-role-llm-runner = "=0.2.4"
+# Ordered reminder delivery and plan-declared, typed sender templates.
+cortexkit-role-llm-runner = { version = "=0.2.7", git = "https://github.com/cortexkit/commons", rev = "e1105b78358bbcfb463f6934f47225e165e16f48" }
 cortexkit-role-compaction-provider = { version = "=0.2.0", git = "https://github.com/cortexkit/commons", rev = "77f10f0fcfe465e6cab567dcf1a1bf8901c54547" }
 cortexkit-role-step-transform-provider = { version = "=0.2.0", git = "https://github.com/cortexkit/commons", rev = "77f10f0fcfe465e6cab567dcf1a1bf8901c54547" }
 # RFC 8785 (JCS) canonical JSON for tool.catalog's answer bytes and digests: the
