@@ -490,7 +490,7 @@ fn assert_metadata_and_inventory(store: &McStore, version: u32) {
             }
         }
     }
-    if version == 73 {
+    if version == 74 {
         store
             .inner
             .with_conn(|conn| {
@@ -499,8 +499,8 @@ fn assert_metadata_and_inventory(store: &McStore, version: u32) {
                 Ok(())
             })
             .unwrap();
-        assert_eq!(crate::move_inventory::INVENTORY_VERSION, 8);
-        assert_eq!(crate::move_inventory::STORE_SCHEMA_VERSION, 73);
+        assert_eq!(crate::move_inventory::INVENTORY_VERSION, 9);
+        assert_eq!(crate::move_inventory::STORE_SCHEMA_VERSION, 74);
     }
 }
 

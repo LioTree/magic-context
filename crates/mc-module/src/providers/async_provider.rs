@@ -22,6 +22,31 @@ struct Bus<S> {
     account: String,
 }
 
+struct RoutedRunner<'a> {
+    runner: &'a dyn session_resolver::ProviderRunner,
+    route: crate::route_targets::SessionRunnerRoute,
+}
+#[async_trait]
+impl session_resolver::ProviderRunner for RoutedRunner<'_> {
+    async fn call(
+        &self,
+        project: &Path,
+        session: &str,
+        method: &str,
+        params: Value,
+        budget: Duration,
+    ) -> Result<Value, SessionResolveError> {
+        if session != self.route.parent_session() {
+            return Err(SessionResolveError::InvalidResponse(
+                "session runner route mismatch".into(),
+            ));
+        }
+        self.runner
+            .call_for(&self.route, project, method, params, budget)
+            .await
+    }
+}
+
 #[async_trait]
 impl<S: Stream + 'static> Publisher for Bus<S> {
     async fn publish(&self, ready: &notice::ViewReady) -> Result<(), HandlerOutcome> {
@@ -102,6 +127,15 @@ fn verified_descent(state: &State, header: &str) -> Option<u64> {
 }
 
 impl State {
+    fn runner(&self) -> Result<crate::route_targets::SessionRunnerRoute, HandlerOutcome> {
+        crate::route_targets::SessionRunnerRoute::for_principal(
+            Some(&subc_protocol::Principal::Reserved {
+                module_id: self.runner_module.clone(),
+            }),
+            &self.key.session,
+        )
+        .ok_or_else(|| invalid_field("runner", "unsupported session runner principal"))
+    }
     fn reference(&self) -> String {
         session_ref(
             &self.key.harness,
@@ -150,6 +184,42 @@ fn load(store: &McStore, reference: &str) -> Result<Option<State>, HandlerOutcom
         .map_err(transient)?
         .map(|raw| serde_json::from_str(&raw).map_err(transient))
         .transpose()
+}
+
+fn checked_async_view(view: view::CompactionView) -> Result<view::CompactionView, HandlerOutcome> {
+    view.check().map_err(|error| transient(error.name()))?;
+    Ok(view)
+}
+
+struct OverflowFact {
+    reported_limit_tokens: Option<u64>,
+}
+
+fn ride_overflow(_request: &ride::RideRequest) -> Option<OverflowFact> {
+    // This contract has no overflow member on RideRequest, so a pause caused
+    // by a provider error cannot yet be distinguished from a size-based pause.
+    None
+}
+
+fn apply_ride_overflow(state: &mut State, fact: OverflowFact) {
+    let policy = state.usage_policy.get_or_insert_with(Default::default);
+    let model = state
+        .conditions
+        .as_ref()
+        .and_then(|headers| headers.get("model"))
+        .unwrap_or(&state.setup.model)
+        .clone();
+    policy.model = Some(model.clone());
+    if let Some(tokens) = fact.reported_limit_tokens.filter(|tokens| *tokens > 0) {
+        policy.learned_limit = Some(super::usage_policy::LearnedLimit {
+            tokens,
+            model,
+            provenance: Some(crate::scheduler::ContextLimitProvenance::Unknown),
+        });
+    }
+    if state.engine.preset == transform::compaction::Preset::Head {
+        policy.emergency_recovery_armed = true;
+    }
 }
 
 impl McHandler {
@@ -252,8 +322,17 @@ impl McHandler {
         }
         let reference = session_ref(&key.harness, &key.project.to_string_lossy(), &key.session);
         if let Some(state) = load(store, &reference)? {
+            self.authorize_async(binding, &state)?;
+            let project = self.historian_lane_project(channel, binding, store)?;
+            self.record_session_runner_dream_target(
+                &project,
+                &state.key.project,
+                &state.key.harness,
+                state.runner()?,
+            );
             if state.setup.params != request.params
                 || state.setup.composition != request.composition
+                || state.setup.preset != request.preset
             {
                 return Err(invalid_field("params", "async setup plan is frozen"));
             }
@@ -296,6 +375,19 @@ impl McHandler {
             resync: false,
             generation: 0,
         };
+        let route = state.runner()?;
+        state.runner_route =
+            Some(json!({"module_id":route.module_id(),"parent_session":route.parent_session()}));
+        let project = self.historian_lane_project(channel, binding, store)?;
+        state.dream_target = Some(
+            json!({"project":project,"directory":state.key.project,"harness":state.key.harness,"route":state.runner_route}),
+        );
+        self.record_session_runner_dream_target(
+            &project,
+            &state.key.project,
+            &state.key.harness,
+            route,
+        );
         let status = transform::compaction::Status {
             lineage_id: state.lineage.clone().unwrap_or_default(),
             newest_ordinal: None,
@@ -310,7 +402,7 @@ impl McHandler {
             last_not_applied: None,
         };
         let (template, output) =
-            self.async_engine(channel, binding, &state, codec, &status, &mut engine, true)?;
+            self.async_engine(channel, binding, &state, codec, &status, &mut engine)?;
         let transform::compaction::Answer::Replacement(initial) = &output.answer else {
             return Err(transient("async setup returned no initial view"));
         };
@@ -333,7 +425,6 @@ impl McHandler {
         codec: codec::Codec,
         status: &transform::compaction::Status,
         engine: &mut transform::compaction::State,
-        initial: bool,
     ) -> Result<(TransformRequest, transform::compaction::Output), HandlerOutcome> {
         let store = self
             .store
@@ -374,7 +465,7 @@ impl McHandler {
             false,
         );
         context.cache_ttl = "never".into();
-        let output = if initial {
+        let output = if engine.last_applied.is_none() {
             transform::compaction::setup(store, &template, &context, status, engine)
         } else {
             transform::compaction::step(store, &template, &context, status, engine)
@@ -720,9 +811,7 @@ impl McHandler {
             state.save(store, &[])?;
             resynced = true;
             if attempt == 1 {
-                if let Err(error) = read {
-                    return Err(error);
-                }
+                read?;
                 tracing::warn!(session_ref=%notice.session_ref,"async digest mismatch; waiting for a matching notice");
                 return Ok(());
             }
@@ -765,9 +854,9 @@ impl McHandler {
             }
             let page = self
                 .provider_runner
-                .call(
+                .call_for(
+                    &state.runner()?,
                     &state.key.project,
-                    &state.key.session,
                     "session.read",
                     params,
                     deadline.saturating_duration_since(Instant::now()),
@@ -953,8 +1042,12 @@ impl McHandler {
             gap_ms,
             ready_search_hint: None,
         };
+        let runner = RoutedRunner {
+            runner: self.provider_runner.as_ref(),
+            route: state.runner()?,
+        };
         let outcome = crate::runner_reminders::send_due_reminders(
-            self.provider_runner.as_ref(),
+            &runner,
             &state.key.project,
             &state.key.session,
             &mut cadence,
@@ -1024,16 +1117,8 @@ impl McHandler {
             last_not_applied: None,
         };
         let mut engine = state.engine.clone();
-        let initial = engine.last_applied.is_none();
-        let (template, output) = self.async_engine(
-            channel,
-            &binding,
-            state,
-            codec,
-            &status,
-            &mut engine,
-            initial,
-        )?;
+        let (template, output) =
+            self.async_engine(channel, &binding, state, codec, &status, &mut engine)?;
         state.engine = engine;
         let transform::compaction::Answer::Replacement(candidate) = output.answer else {
             return Ok(None);
@@ -1074,7 +1159,7 @@ impl McHandler {
         {
             view = view.with_cut(view::ViewCut::new(format!("v{version}"), through));
         }
-        view.check().map_err(|e| transient(e.name()))?;
+        let view = checked_async_view(view)?;
         store
             .save_async_compaction_view(
                 &state.reference(),
@@ -1172,6 +1257,11 @@ impl McHandler {
                 return bytes(&ride::RideAnswer::nothing());
             }
             let codec = codec::Codec::from_params(&Value::Object(state.setup.params.clone()))?;
+            if matches!(request.cause, ride::RideCause::Ceiling) {
+                if let Some(fact) = ride_overflow(&request) {
+                    apply_ride_overflow(&mut state, fact);
+                }
+            }
             state.reindex()?;
             state.save(store, &tag_rows(&state, codec)?)?;
             let worker = self.provider_historian_worker();
@@ -1359,6 +1449,7 @@ impl McHandler {
                         publication_fence: Some(fence),
                         tag_snapshot: None,
                         reclaim_ride_available: false,
+                        runner_lane: true,
                         timings: &mut timings,
                     },
                 ))

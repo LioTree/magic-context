@@ -26,6 +26,17 @@ pub const RUNNER_BIND_HARNESS: &str = "runner";
 /// module launch identity. They must never use the gateway's session resolver.
 #[async_trait]
 pub trait ProviderRunner: Send + Sync {
+    async fn call_for(
+        &self,
+        route: &crate::route_targets::SessionRunnerRoute,
+        project_root: &Path,
+        method: &str,
+        params: Value,
+        budget: Duration,
+    ) -> Result<Value, SessionResolveError> {
+        self.call(project_root, route.parent_session(), method, params, budget)
+            .await
+    }
     async fn call(
         &self,
         project_root: &Path,
@@ -52,6 +63,24 @@ impl RealProviderRunner {
 
 #[async_trait]
 impl ProviderRunner for RealProviderRunner {
+    async fn call_for(
+        &self,
+        route: &crate::route_targets::SessionRunnerRoute,
+        project_root: &Path,
+        method: &str,
+        params: Value,
+        budget: Duration,
+    ) -> Result<Value, SessionResolveError> {
+        self.call_target(
+            route.target(),
+            project_root,
+            route.parent_session(),
+            method,
+            params,
+            budget,
+        )
+        .await
+    }
     async fn call(
         &self,
         project_root: &Path,
@@ -64,6 +93,21 @@ impl ProviderRunner for RealProviderRunner {
             .route_targets
             .target(RegisteredRoute::ProviderRunner)
             .expect("provider runner has a registered target");
+        self.call_target(target, project_root, session, method, params, budget)
+            .await
+    }
+}
+
+impl RealProviderRunner {
+    async fn call_target(
+        &self,
+        target: RouteTarget,
+        project_root: &Path,
+        session: &str,
+        method: &str,
+        params: Value,
+        budget: Duration,
+    ) -> Result<Value, SessionResolveError> {
         let identity = BindIdentity::new(project_root.to_path_buf(), RUNNER_BIND_HARNESS, session);
         let work = async {
             let mut options = consumer_options();

@@ -6,10 +6,28 @@ struct Runner {
     entries: Mutex<Vec<ReadMessage>>,
     lineage: Mutex<String>,
     read_delay_ms: std::sync::atomic::AtomicU64,
+    routed_reads: std::sync::atomic::AtomicU64,
 }
 
 #[async_trait]
 impl session_resolver::ProviderRunner for Runner {
+    async fn call_for(
+        &self,
+        route: &crate::route_targets::SessionRunnerRoute,
+        project: &Path,
+        method: &str,
+        params: Value,
+        budget: Duration,
+    ) -> Result<Value, SessionResolveError> {
+        assert_eq!(route.module_id(), "thalamus-harness");
+        assert_eq!(route.parent_session(), "s");
+        if method == "session.read" {
+            self.routed_reads
+                .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        }
+        self.call(project, route.parent_session(), method, params, budget)
+            .await
+    }
     async fn call(
         &self,
         _: &Path,
@@ -188,7 +206,7 @@ impl Rig {
             let part=if n%5>0 && n%5<4 {
                 json!({"id":format!("p{n}"),"type":"tool","tool":"read","callID":format!("call{n}"),"state":{"status":"completed","input":{"path":format!("file{n}")},"output":"exact spent output ".repeat(500)}})
             } else {json!({"id":format!("p{n}"),"type":"text","text":format!("message {n} ")+&"durable words ".repeat(16)})};
-            ReadMessage::new(n,format!("m{n}"),json!({"info":{"id":format!("m{n}"),"role":if n%5==0{"user"}else{"assistant"},"time":{"created":1}},"parts":[part]})).with_tags(vec![tags::PartTag::tagged(format!("p{n}"),format!("§{}§",100+n*3))])
+            ReadMessage::new(n,format!("m{n}"),json!({"info":{"id":format!("m{n}"),"role":if n%5==0{"user"}else{"assistant"},"time":{"created":1}},"parts":[part]})).with_tags(vec![tags::PartTag::tagged("0",format!("§{}§",100+n*3))])
         }).collect();
     }
     async fn notice_with_descent(
@@ -588,6 +606,7 @@ fn part_edit_bytes_participate_in_digest() {
             )],
         )],
     );
+    let view = checked_async_view(view).unwrap();
     assert_eq!(view.digest, independent_digest(&view));
     let mut changed = view.clone();
     if let view::ViewRange::Keep { edits, .. } = &mut changed.ranges[0] {
@@ -803,4 +822,55 @@ async fn ride_deadline_returns_nothing_without_waiting_for_slow_runner() {
         .await;
     assert_eq!(answer["answer"], "nothing");
     assert!(started.elapsed() < Duration::from_millis(250));
+}
+
+#[tokio::test]
+async fn reads_use_the_admitted_runner_not_the_process_default() {
+    let dir = tempfile::tempdir().unwrap();
+    let rig = Rig::new(dir.path()).await;
+    rig.fill(10);
+    rig.notice(1, 1_000, None).await;
+    assert!(
+        rig.runner
+            .routed_reads
+            .load(std::sync::atomic::Ordering::Relaxed)
+            >= 2
+    );
+    let state = rig.state();
+    assert_eq!(state.runner_route.unwrap()["module_id"], "thalamus-harness");
+    assert_eq!(state.dream_target.unwrap()["route"]["parent_session"], "s");
+}
+
+#[tokio::test]
+async fn parsed_overflow_fact_with_reported_limit_updates_learned_limit() {
+    let dir = tempfile::tempdir().unwrap();
+    let rig = Rig::new(dir.path()).await;
+    rig.fill(10);
+    rig.notice(1, 1_000, None).await;
+    let mut state = rig.state();
+    apply_ride_overflow(
+        &mut state,
+        OverflowFact {
+            reported_limit_tokens: Some(80_000),
+        },
+    );
+    let policy = state.usage_policy.as_ref().unwrap();
+    assert_eq!(policy.limit_for("fixture"), Some(80_000));
+    assert!(policy.emergency_recovery_armed);
+}
+
+#[tokio::test]
+async fn plain_ceiling_ride_does_not_invent_a_learned_limit() {
+    let dir = tempfile::tempdir().unwrap();
+    let rig = Rig::new(dir.path()).await;
+    rig.fill(10);
+    rig.notice(1, 1_000, None).await;
+    let _ = rig.ride("ceiling").await;
+    assert!(rig
+        .state()
+        .usage_policy
+        .as_ref()
+        .unwrap()
+        .learned_limit
+        .is_none());
 }
