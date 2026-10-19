@@ -65,7 +65,10 @@ impl ConfiguredHistorian {
             })
             .collect();
         fields.insert("historian_model_limits".into(), Value::Object(limits));
-        fields.insert("historian_model_variants".into(), json!(self.model_variants));
+        fields.insert(
+            "historian_model_variants".into(),
+            json!(self.model_variants),
+        );
         fields.insert("historian_timeout_ms".into(), json!(self.timeout_ms));
         if let Some(max_output_tokens) = self.max_output_tokens {
             fields.insert(
@@ -155,9 +158,7 @@ fn attempts(settings: &Value, harness: &str) -> (Option<Attempt>, Vec<Attempt>) 
         .get("model")
         .and_then(|entry| normalize(entry, qualifier_key))
         .map(|mut attempt| {
-            attempt.qualifier = attempt
-                .qualifier
-                .or_else(|| text(block.get(qualifier_key)));
+            attempt.qualifier = attempt.qualifier.or_else(|| text(block.get(qualifier_key)));
             attempt
         });
     // Fallbacks are one value or a list, kept in declaration order, without malformed
@@ -304,7 +305,10 @@ mod tests {
             ["fixture-a/main", "fixture-b/fallback", "fixture-c/second"]
         );
         assert_eq!(
-            resolved.model_variants.get("fixture-c/second").map(String::as_str),
+            resolved
+                .model_variants
+                .get("fixture-c/second")
+                .map(String::as_str),
             Some("max")
         );
     }
@@ -361,7 +365,10 @@ mod tests {
             ["fixture-a/main", "fixture-b/fallback"]
         );
         assert_eq!(
-            resolved.model_variants.get("fixture-a/main").map(String::as_str),
+            resolved
+                .model_variants
+                .get("fixture-a/main")
+                .map(String::as_str),
             Some("high")
         );
         assert_eq!(resolved.timeout_ms, 90_000);
