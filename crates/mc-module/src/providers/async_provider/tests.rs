@@ -874,3 +874,38 @@ async fn plain_ceiling_ride_does_not_invent_a_learned_limit() {
         .learned_limit
         .is_none());
 }
+
+#[tokio::test]
+async fn synthetic_ids_never_fall_back_to_positional_transcript_matches() {
+    let dir = tempfile::tempdir().unwrap();
+    let rig = Rig::new(dir.path()).await;
+    rig.fill(1);
+    rig.notice(1, 1_000, None).await;
+    let state = rig.state();
+    let entry = &state.entries[&0];
+    let original = codec::Codec::OpencodeAiSdk
+        .decode_message(&InboundMessage {
+            ordinal: 0,
+            mid: entry.mid.clone(),
+            message: entry.message.clone(),
+            raw_message: None,
+        })
+        .unwrap();
+    let engine = transform::compaction::View {
+        compaction_id: "proof".into(),
+        version: 1,
+        range: transform::compaction::Range {
+            lineage_id: "L".into(),
+            from: 0,
+            to: 1,
+        },
+        replacement: vec![original.ck],
+    };
+    let wire:OutboundMessage=decode(&json!({"compaction_id":"proof","version":1,"range":{"from":0,"to":1},"replacement":[{"info":{"id":"synthetic-todo","role":"user"},"parts":[{"id":"synthetic-part","type":"text","text":"inserted content"}]},entry.message]})).unwrap();
+    let ranges = ranges(&state, &wire, &engine).unwrap();
+    assert!(matches!(
+        &ranges[0],
+        view::ViewRange::Replace { from: 0, to: 0, .. }
+    ));
+    assert!(matches!(&ranges[1],view::ViewRange::Keep{from:0,to:1,edits} if edits.is_empty()));
+}

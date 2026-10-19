@@ -110,10 +110,11 @@ const VIEWED_V1: [&str; 2] = ["broca", "claude-code"];
 const HARNESS: [&str; 4] = ["broca", "claude-code", "opencode", "opencode2"];
 
 /// Harnesses whose populated conversations still exist at `version`: migration
-/// 72 reset the two OpenCode ledgers.
+/// 72 reset the two OpenCode ledgers; 73 retired all remaining v1 view owners.
 fn seeded_harnesses(version: u32) -> impl Iterator<Item = &'static str> {
     HARNESS
         .into_iter()
+        .filter(move |_| version < 73)
         .filter(move |harness| version < 72 || !harness.starts_with("opencode"))
 }
 
@@ -523,6 +524,7 @@ fn assert_fault_rolls_back(descriptor: &StorageDescriptor, before: &Snapshot, ta
                                 68 => "mc_provider_policy_changes_v1",
                                 71 => "mc_provider_policy_preparations_v1",
                                 72 => "mc_provider_policy_cuts_v1",
+                                74 => "mc_async_compaction_views",
                                 _ => "",
                             }
                     }
@@ -851,6 +853,48 @@ fn assert_intent(store: &McStore, target: u32) {
             assert_eq!(
                 scalar::<u32>(store, "SELECT count(*) FROM mc_provider_catalogs_v1"),
                 4
+            );
+        }
+        74 => {
+            for table in ["mc_async_compaction", "mc_async_compaction_views"] {
+                assert_eq!(
+                    scalar::<u32>(store, &format!("SELECT count(*) FROM {table}")),
+                    0
+                );
+            }
+            store
+                .save_async_compaction(
+                    "async-ref",
+                    "[\"project\",\"async-owner\",\"opencode\"]",
+                    "async-owner",
+                    "{\"cursor\":7}",
+                    "async-engine",
+                    &[],
+                )
+                .unwrap();
+            assert_eq!(
+                store.load_async_compaction("async-ref").unwrap().as_deref(),
+                Some("{\"cursor\":7}")
+            );
+            let version = store
+                .reserve_async_compaction_version("async-ref", 0)
+                .unwrap();
+            assert_eq!(version, 1);
+            store
+                .save_async_compaction_view("async-ref", version, "{\"immutable\":true}")
+                .unwrap();
+            assert_eq!(
+                store
+                    .load_async_compaction_view("async-ref", version)
+                    .unwrap()
+                    .as_deref(),
+                Some("{\"immutable\":true}")
+            );
+            assert_eq!(
+                store
+                    .reserve_async_compaction_version("async-ref", 50)
+                    .unwrap(),
+                51
             );
         }
         _ => unreachable!(),
@@ -1497,3 +1541,4 @@ increment!(populated_69_to_70, 69);
 increment!(populated_70_to_71, 70);
 increment!(populated_71_to_72, 71);
 increment!(populated_72_to_73, 72);
+increment!(populated_73_to_74, 73);

@@ -598,16 +598,16 @@ fn ranges(
             .pointer("/info/id")
             .or_else(|| message.get("id"))
             .and_then(Value::as_str);
-        let original = mid
-            .and_then(|mid| state.entries.values().find(|entry| entry.mid == mid))
-            .or_else(|| {
-                engine
-                    .replacement
-                    .get(position)
-                    .filter(|m| !m.meta.synthetic)
-                    .and_then(|m| m.meta.ordinal)
-                    .and_then(|n| state.entries.get(&n))
-            });
+        let original = if let Some(mid) = mid {
+            state.entries.values().find(|entry| entry.mid == mid)
+        } else {
+            engine
+                .replacement
+                .get(position)
+                .filter(|m| !m.meta.synthetic)
+                .and_then(|m| m.meta.ordinal)
+                .and_then(|n| state.entries.get(&n))
+        };
         let Some(original) = original else {
             synthetic.push(message.clone());
             continue;
@@ -1206,7 +1206,7 @@ impl McHandler {
         binding: &SessionBinding,
         state: &State,
     ) -> Result<(), HandlerOutcome> {
-        if binding.project_root != state.key.project
+        if binding.project_root.as_os_str() != state.key.project.as_os_str()
             || !matches!(&binding.principal,Some(subc_protocol::Principal::Reserved{module_id}) if module_id==&state.runner_module)
         {
             return Err(invalid_field(
@@ -1431,7 +1431,17 @@ impl McHandler {
         });
         let reference = state.reference();
         let namespace = state.namespace();
+        let settings = self.historian_settings_loader()(&state.key.project);
+        let harness = state.key.harness.clone();
         tokio::spawn(async move {
+            let configured = super::historian_config::resolve_with_model_catalog(
+                &settings,
+                &harness,
+                &binding.project_root,
+                &worker.historian_model_catalog,
+            )
+            .await;
+            parsed.historian_model_limits = configured.model_limits;
             let prepare = worker.clone();
             let result = tokio::task::spawn_blocking(move || {
                 let projection = ck_wire::project_messages(&parsed.messages).map_err(transient)?;
