@@ -449,7 +449,7 @@ timeout_s = 2400
 
 [[control]]
 id = 'rs-identical-bytes-hard-grants-no-bust'
-guards = 'a HARD pass that serves the frozen prefix unchanged (an identical-bytes epoch fold) does not grant the bust permission, so queued work keeps waiting'
+guards = 'a HARD pass that serves the frozen prefix unchanged (an identical-bytes history-marker fold) does not grant the bust permission, so queued work keeps waiting'
 file = 'crates/mc-module/src/transform.rs'
 old = '''
     ) && !marker_hard_serves_frozen_prefix
@@ -461,7 +461,7 @@ test_file = 'crates/mc-module/src/transform.rs'
 runner = 'command'
 command = ['cargo', 'test', '--locked', '-p', 'mc-module', '--lib', '--', '--exact', '{test}']
 test_count_pattern = 'running {count} test'
-expect_red = ['transform::tests::identical_bytes_epoch_hard_holds_pending_drop_and_serves_identical_bytes']
+expect_red = ['transform::tests::identical_bytes_history_hard_holds_pending_drop_and_serves_identical_bytes']
 expect_message = 'assertion failed: !hard.prefix_bust_permitted'
 timeout_s = 2400
 
