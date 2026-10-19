@@ -2818,6 +2818,9 @@ struct FacadeScope {
     /// Daemon-bound filesystem path retained only for route-vocabulary enforcement.
     route_project_root: String,
     conversation_key: String,
+    /// The conversation is an asynchronous compaction conversation, so its
+    /// history tools take the async lane.
+    async_conversation: bool,
     memory_enabled: bool,
     /// Why memory is paused for this route, when its project identity is unavailable.
     memory_paused: Option<String>,
@@ -14849,9 +14852,22 @@ impl McHandler {
             binding.harness == OPENCODE_HARNESS || binding.harness == "opencode2";
         let transform_session_known =
             self.module_knows_transform_session(bound_session, &binding.project_root);
-        let conversation_key = if binding.harness == session_resolver::RUNNER_BIND_HARNESS {
+        // The bind's (project_root, session) names an asynchronous compaction
+        // conversation whatever harness the bind declares: an MCP facade binds
+        // a runner's conversation by its session alone. More than one match
+        // refuses rather than guessing; none keeps the harness's own path.
+        let async_key = if binding.harness == session_resolver::RUNNER_BIND_HARNESS
+            || self.store.get().is_some()
+        {
             self.async_compaction_namespace(&binding)?
-                .ok_or_else(session_unresolved_error)?
+        } else {
+            None
+        };
+        let async_conversation = async_key.is_some();
+        let conversation_key = if let Some(key) = async_key {
+            key
+        } else if binding.harness == session_resolver::RUNNER_BIND_HARNESS {
+            return Err(session_unresolved_error());
         } else if opencode_harness && transform_session_known {
             bound_session.to_string()
         } else {
@@ -14902,6 +14918,7 @@ impl McHandler {
             memory_project_path,
             route_project_root,
             conversation_key,
+            async_conversation,
             memory_enabled: binding.config.memory_enabled && memory_paused.is_none(),
             memory_paused,
         })
@@ -14929,10 +14946,7 @@ impl McHandler {
             Ok(scope) => scope,
             Err(outcome) => return outcome,
         };
-        if self
-            .facade_binding(channel)
-            .is_ok_and(|binding| binding.harness == session_resolver::RUNNER_BIND_HARNESS)
-        {
+        if facade_scope.async_conversation {
             return self.handle_provider_reduce(channel, &requested).await;
         }
         let store = match self.store_for_request().await {

@@ -83,8 +83,30 @@ impl session_resolver::ProviderRunner for Runner {
     }
 }
 
+/// A session resolver that resolves nothing and counts its lookups, so a
+/// test can tell whether a facade took the harness's own resolution path.
+#[derive(Default)]
+struct CountingResolver {
+    calls: std::sync::atomic::AtomicU64,
+}
+
+#[async_trait]
+impl session_resolver::SessionResolver for CountingResolver {
+    async fn resolve_session(
+        &self,
+        _: &Path,
+        _: &str,
+        _: &str,
+    ) -> Result<Option<session_resolver::ResolvedSession>, SessionResolveError> {
+        self.calls
+            .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        Ok(None)
+    }
+}
+
 struct Rig {
     h: Arc<McHandler>,
+    resolver: Arc<CountingResolver>,
     runner: Arc<Runner>,
     bus: Arc<InMemoryBus>,
     task: tokio::task::JoinHandle<()>,
@@ -134,6 +156,8 @@ impl Rig {
         let mut h = McHandler::new();
         h.store.set(store).ok().unwrap();
         h.provider_runner = runner.clone();
+        let resolver = Arc::new(CountingResolver::default());
+        h.session_resolver = resolver.clone();
         let config = McModuleConfig {
             inject_docs: false,
             protected_tokens_user: Some(0),
@@ -168,6 +192,7 @@ impl Rig {
         let reference = session_ref(harness, &dir.to_string_lossy(), "s");
         let rig = Self {
             h,
+            resolver,
             runner,
             bus,
             task,
@@ -1398,4 +1423,128 @@ async fn a_thalamus_attested_setup_routes_reads_sends_and_children_to_thalamus()
         assert_eq!(child.module_id(), "thalamus");
         assert_eq!(child.parent_session(), "s");
     }
+}
+
+/// A dispatch outcome as JSON: a response's body, or an error's code and message.
+fn outcome(result: HandlerOutcome) -> Value {
+    match result {
+        HandlerOutcome::Response(bytes) => serde_json::from_slice(&bytes).unwrap(),
+        HandlerOutcome::Error { code, message } => json!({"code":code,"message":message}),
+        other => json!({"other":format!("{other:?}")}),
+    }
+}
+
+impl Rig {
+    /// Bind `channel` like the runner route but with bind harness `harness`
+    /// and bind session `session`.
+    fn bind(&self, channel: u16, harness: &str, session: &str) {
+        let mut binding = self.h.facade_binding(7).unwrap();
+        binding.harness = harness.into();
+        binding.session = session.into();
+        binding.principal = None;
+        self.h.bind_route(channel, binding);
+    }
+    async fn tool(&self, channel: u16, name: &str, arguments: Value) -> Value {
+        outcome(
+            self.h
+                .dispatch_value(channel, json!({"name":name,"arguments":arguments}))
+                .await,
+        )
+    }
+}
+
+/// ctx tools find an asynchronous compaction conversation by the bind's
+/// (project_root, session), whatever harness the bind names: a Claude Code
+/// MCP facade bind and the runner bind reach the same conversation, and
+/// ctx_expand and ctx_search scope to the one ctx_reduce queues into.
+#[tokio::test]
+async fn any_bind_harness_resolves_the_async_conversation_first() {
+    let dir = tempfile::tempdir().unwrap();
+    let rig = Rig::open(
+        dir.path(),
+        "thalamus",
+        "claude-code",
+        json!({"serializer_profile":"anthropic-messages"}),
+    )
+    .await;
+    *rig.runner.entries.lock().unwrap() = anthropic_transcript(12);
+    rig.notice(1, 1_000, None).await;
+    let namespace = rig.state().namespace();
+    rig.bind(8, "claude-code", "s");
+    for channel in [7, 8] {
+        let scope = rig
+            .h
+            .resolve_facade_scope(channel, None, "memories", false)
+            .await
+            .unwrap_or_else(|e| panic!("channel {channel}: {e:?}"));
+        assert!(scope.async_conversation, "channel {channel}");
+        assert_eq!(scope.conversation_key, namespace, "channel {channel}");
+    }
+    let store = rig.h.store.get().unwrap();
+    let answer = rig
+        .tool(
+            8,
+            "ctx_reduce",
+            json!({"drop": anthropic_tag(2, 0).to_string()}),
+        )
+        .await;
+    assert_ne!(answer["isError"], true, "{answer}");
+    assert_eq!(store.load_pending_agent_drops(&namespace).unwrap().len(), 1);
+    let answer = rig
+        .tool(
+            7,
+            "ctx_reduce",
+            json!({"drop": anthropic_tag(6, 0).to_string()}),
+        )
+        .await;
+    assert_ne!(answer["isError"], true, "{answer}");
+    assert_eq!(store.load_pending_agent_drops(&namespace).unwrap().len(), 2);
+    for (name, arguments) in [
+        ("ctx_search", json!({"query":"durable words"})),
+        ("ctx_expand", json!({"start":0,"end":3})),
+    ] {
+        assert_eq!(
+            rig.tool(8, name, arguments.clone()).await,
+            rig.tool(7, name, arguments).await,
+            "{name} answers the claude-code bind from the same conversation"
+        );
+    }
+    assert_eq!(
+        rig.resolver
+            .calls
+            .load(std::sync::atomic::Ordering::Relaxed),
+        0,
+        "an async conversation never reaches the harness's session resolver"
+    );
+}
+
+/// With no asynchronous conversation for the bind's session, a non-runner
+/// bind keeps its own path: the harness's session resolver is asked, and
+/// the answer is the one that path gives.
+#[tokio::test]
+async fn without_an_async_conversation_a_harness_bind_keeps_its_own_path() {
+    let dir = tempfile::tempdir().unwrap();
+    let rig = Rig::open(
+        dir.path(),
+        "thalamus",
+        "claude-code",
+        json!({"serializer_profile":"anthropic-messages"}),
+    )
+    .await;
+    rig.bind(8, "claude-code", "instance-token");
+    let answer = rig.tool(8, "ctx_reduce", json!({"drop":"3"})).await;
+    assert_eq!(
+        rig.resolver
+            .calls
+            .load(std::sync::atomic::Ordering::Relaxed),
+        1,
+        "the claude-code bind asked its session resolver"
+    );
+    // The resolver resolves nothing, so the old path's unresolved refusal is
+    // the answer, exactly as a handler with no async table rows gives it.
+    assert_eq!(
+        answer,
+        outcome(session_unresolved_error()),
+        "unchanged unresolved-session answer"
+    );
 }
