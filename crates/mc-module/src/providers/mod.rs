@@ -115,6 +115,9 @@ pub fn describe() -> HandlerOutcome {
         }));
     answer["runner_groups"] = json!(runner_groups());
     answer["reminder_templates"] = crate::runner_reminders::catalog();
+    // ck-mc extension: the `params.serializer_profile` values Setup accepts,
+    // in the codec registry's fixed order.
+    answer["serializer_profiles"] = json!(codec::Codec::ALL.map(codec::Codec::wire_id));
     HandlerOutcome::Response(serde_jcs::to_vec(&answer).expect("build-only role JSON"))
 }
 
@@ -182,6 +185,24 @@ mod tests {
             .iter()
             .any(|op| op == "compaction.step" || op == "compaction.view.read"));
         assert!(answer.get("claude_code").is_none());
+    }
+
+    #[test]
+    fn discovery_lists_every_accepted_serializer_profile_in_fixed_order() {
+        let HandlerOutcome::Response(bytes) = describe() else {
+            panic!("role discovery failed")
+        };
+        let answer: Value = serde_json::from_slice(&bytes).unwrap();
+        assert_eq!(
+            answer["serializer_profiles"],
+            json!(["owned-broca", "opencode-aisdk", "pi", "anthropic-messages"])
+        );
+        for profile in answer["serializer_profiles"].as_array().unwrap() {
+            assert!(
+                codec::Codec::from_params(&json!({"serializer_profile": profile})).is_ok(),
+                "{profile} is advertised but refused"
+            );
+        }
     }
 
     #[tokio::test]
