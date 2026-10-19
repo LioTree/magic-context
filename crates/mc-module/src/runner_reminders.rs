@@ -191,10 +191,9 @@ pub struct ReminderConditions<'a> {
     pub baseline: Option<&'a mc_store::TailHygieneBaseline>,
     /// Newest eligible, unreduced, unserved tool result with text output.
     pub newest_tool_tag: Option<u64>,
-    /// Already filtered for protection, queued drops, tiny and control outputs.
-    pub oldest_reclaimable_tags: &'a [u64],
-    /// Separate channel-2 selection: unqueued, unprotected tool tags >=100 tokens.
-    pub channel2_tags: &'a [u64],
+    /// The tag hints a reminder names. Selecting them reads every tag in the
+    /// unsummarized tail, so they are computed only when a reminder is sent.
+    pub hints: &'a (dyn Fn() -> Result<ReminderHints, String> + Sync),
     pub drops_applied: bool,
     /// A fresh measurement, rather than a cached/invalid baseline.
     pub baseline_refreshed: bool,
@@ -208,11 +207,22 @@ pub struct ReminderConditions<'a> {
     pub ready_search_hint: Option<&'a str>,
 }
 
+/// Tag hints for a reduce reminder.
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct ReminderHints {
+    /// Already filtered for protection, queued drops, tiny and control outputs.
+    pub oldest_reclaimable: Vec<u64>,
+    /// Separate channel-2 selection: unqueued, unprotected tool tags >=100 tokens.
+    pub channel2: Vec<u64>,
+}
+
 #[derive(Debug, Default)]
 pub struct ReminderOutcome {
     pub issued: Vec<Value>,
     pub not_due: Vec<&'static str>,
     pub errors: Vec<String>,
+    /// The hints could not be computed; the caller must retry the notice.
+    pub hints_failed: Option<String>,
 }
 
 struct PreparedSend {
@@ -367,7 +377,21 @@ pub async fn send_due_reminders(
     let carrier = conditions
         .newest_tool_tag
         .filter(|tag| Some(*tag) != state.last_tool_tag);
+    let mut hints: Option<ReminderHints> = None;
+    let mut hints = || -> Result<ReminderHints, String> {
+        if hints.is_none() {
+            hints = Some((conditions.hints)()?);
+        }
+        Ok(hints.clone().expect("hints computed"))
+    };
     if decision.fire && !conditions.drops_applied && carrier.is_some() {
+        let selected = match hints() {
+            Ok(selected) => selected,
+            Err(error) => {
+                outcome.hints_failed = Some(error);
+                return outcome;
+            }
+        };
         let kind = if decision.sticky {
             "sticky"
         } else {
@@ -382,7 +406,7 @@ pub async fn send_due_reminders(
             kind,
             decision.reclaimable_tokens,
             count,
-            conditions.oldest_reclaimable_tags,
+            &selected.oldest_reclaimable,
         );
         if issue(
             runner,
@@ -431,6 +455,13 @@ pub async fn send_due_reminders(
         state.meta.channel2_pressure_latched = false;
     }
     if pressure && !state.meta.channel2_pressure_latched {
+        let selected = match hints() {
+            Ok(selected) => selected,
+            Err(error) => {
+                outcome.hints_failed = Some(error);
+                return outcome;
+            }
+        };
         let (u, _) = crate::tail_hygiene::effective_tail_hygiene(
             baseline.as_ref().expect("evaluable baseline"),
         );
@@ -438,7 +469,7 @@ pub async fn send_due_reminders(
             "channel2",
             u,
             transform::reclaimable_tool_output_count(baseline.as_ref()),
-            conditions.channel2_tags,
+            &selected.channel2,
         );
         if issue(
             runner,
@@ -691,8 +722,12 @@ mod tests {
             real_user_turn_count: 1,
             baseline: Some(baseline),
             newest_tool_tag: Some(21),
-            oldest_reclaimable_tags: &[12, 15],
-            channel2_tags: &[12],
+            hints: &|| {
+                Ok(ReminderHints {
+                    oldest_reclaimable: vec![12, 15],
+                    channel2: vec![12],
+                })
+            },
             drops_applied: false,
             baseline_refreshed: true,
             hard_fold_coverage_advanced: false,

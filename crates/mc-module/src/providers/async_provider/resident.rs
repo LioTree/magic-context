@@ -1,0 +1,308 @@
+//! Resident per-conversation state for the async compaction provider.
+//!
+//! A conversation's `AsyncRecord` stays in memory between notices, so a notice
+//! reads and folds in only the entries the runner added since the last one.
+//! The held transcript is kept in its stored JSON form (`HeldEntry`), not as a
+//! `serde_json::Value` tree per entry: a tree costs several times the JSON it
+//! came from, and only a view build needs whole messages. Engine views are kept
+//! serialized (`EngineView`) and parsed only when the engine runs.
+//!
+//! Persistence is unchanged: append-only entry rows plus the small record. A
+//! resident record is reused only while the stored small record is exactly the
+//! JSON this process last saved or loaded; anything else is rebuilt from rows.
+use super::*;
+use std::collections::HashMap;
+
+/// What a notice needs to know about one held entry without decoding it
+/// again, recorded once when the entry is first decoded with the
+/// conversation's codec (`AsyncRecord::fold_entries`).
+#[derive(Clone, Copy, Default, Debug, PartialEq, Eq)]
+pub(super) struct EntryFacts {
+    /// An authored user message: role `user` with no tool result in it.
+    pub real_user: bool,
+    /// Tool-result blocks the codec decodes from the message.
+    pub tool_results: u64,
+}
+
+/// One held transcript entry.
+pub(crate) struct HeldEntry {
+    pub(super) mid: String,
+    /// `serde_json` of the runner's `ReadMessage`, byte-identical to the
+    /// stored `mc_async_compaction_entries.entry_json`.
+    raw: Box<str>,
+}
+
+impl HeldEntry {
+    pub(super) fn from_read(entry: &ReadMessage) -> Result<Self, HandlerOutcome> {
+        Ok(Self {
+            mid: entry.mid.clone(),
+            raw: serde_json::to_string(entry).map_err(transient)?.into(),
+        })
+    }
+
+    /// An entry as stored. Only its `mid` is read here; the rest stays JSON.
+    pub(super) fn from_stored(raw: String) -> Result<Self, HandlerOutcome> {
+        #[derive(Deserialize)]
+        struct Head {
+            mid: String,
+        }
+        let head: Head = serde_json::from_str(&raw).map_err(transient)?;
+        Ok(Self {
+            mid: head.mid,
+            raw: raw.into_boxed_str(),
+        })
+    }
+
+    pub(super) fn raw(&self) -> &str {
+        &self.raw
+    }
+
+    /// The whole runner message.
+    pub(super) fn read(&self) -> Result<ReadMessage, HandlerOutcome> {
+        #[cfg(test)]
+        counters::parsed(1);
+        serde_json::from_str(&self.raw).map_err(transient)
+    }
+
+    pub(super) fn inbound(&self) -> Result<InboundMessage, HandlerOutcome> {
+        let entry = self.read()?;
+        Ok(InboundMessage {
+            ordinal: entry.ordinal,
+            mid: entry.mid,
+            message: entry.message,
+        })
+    }
+
+    /// Heap and container bytes this entry keeps alive.
+    pub(super) fn retained_bytes(&self) -> usize {
+        // The map node, the Arc and the struct itself, conservatively.
+        const OVERHEAD: usize = 128;
+        OVERHEAD + self.raw.len() + self.mid.capacity()
+    }
+}
+
+/// A serialized engine view, parsed only when the engine needs it. Its JSON is
+/// byte-identical to what the store holds for it (`engine_json` or a stored
+/// baseline row), so a baseline can be written without serializing again.
+#[derive(Clone)]
+pub(super) struct EngineView {
+    pub(super) identity: ViewIdentity,
+    pub(super) json: Arc<str>,
+}
+
+impl EngineView {
+    pub(super) fn of(view: &transform::compaction::View) -> Result<Self, HandlerOutcome> {
+        Ok(Self::with_json(
+            view,
+            serde_json::to_string(view).map_err(transient)?.into(),
+        ))
+    }
+
+    pub(super) fn with_json(view: &transform::compaction::View, json: Arc<str>) -> Self {
+        Self {
+            identity: view_identity(view),
+            json,
+        }
+    }
+
+    /// A stored engine view. Only what its identity needs is read; the
+    /// messages stay JSON until the engine runs.
+    pub(super) fn parse(json: String) -> Result<Self, HandlerOutcome> {
+        #[derive(Deserialize)]
+        struct Head {
+            version: u64,
+            range: transform::compaction::Range,
+            replacement: Vec<serde::de::IgnoredAny>,
+        }
+        let head: Head = serde_json::from_str(&json).map_err(transient)?;
+        Ok(Self {
+            identity: (head.version, head.range, head.replacement.len()),
+            json: json.into(),
+        })
+    }
+
+    pub(super) fn view(&self) -> Result<transform::compaction::View, HandlerOutcome> {
+        #[cfg(test)]
+        counters::engine_view_parsed();
+        serde_json::from_str(&self.json).map_err(transient)
+    }
+}
+
+/// Running aggregates over the held entries' facts.
+#[derive(Clone, Default, Debug, PartialEq, Eq)]
+pub(super) struct Aggregates {
+    /// Highest ordinal whose facts are counted below.
+    pub through: Option<u64>,
+    pub real_users: u64,
+    pub tool_results: u64,
+    /// Ordinal and mid of the newest authored user message.
+    pub last_user: Option<(u64, String)>,
+}
+
+impl Aggregates {
+    pub(super) fn add(&mut self, ordinal: u64, mid: &str, facts: EntryFacts) {
+        self.through = Some(ordinal);
+        self.tool_results += facts.tool_results;
+        if facts.real_user {
+            self.real_users += 1;
+            self.last_user = Some((ordinal, mid.to_owned()));
+        }
+    }
+}
+
+/// Conversations held in memory between operations, with a process-wide byte
+/// budget. A record is taken out for the duration of one operation (under the
+/// conversation's provider lock) and put back only after that operation's
+/// final save succeeded, so the held copy always equals the store.
+pub(crate) struct ResidentCache {
+    budget: usize,
+    clock: u64,
+    held: HashMap<String, Held>,
+    #[cfg(test)]
+    pub(super) evictions: u64,
+    #[cfg(test)]
+    pub(super) oracle: bool,
+}
+
+struct Held {
+    state: AsyncRecord,
+    bytes: usize,
+    used: u64,
+}
+
+/// Default process-wide budget for resident conversations. One 150k-message
+/// conversation (≈278 MB of transcript) holds roughly 1.7× that in memory, so
+/// this keeps a few long conversations resident without nearing 2 GB.
+const DEFAULT_BUDGET: usize = 1536 * 1024 * 1024;
+
+impl Default for ResidentCache {
+    fn default() -> Self {
+        Self {
+            budget: std::env::var("MC_ASYNC_RESIDENT_BUDGET_BYTES")
+                .ok()
+                .and_then(|value| value.parse().ok())
+                .unwrap_or(DEFAULT_BUDGET),
+            clock: 0,
+            held: HashMap::new(),
+            #[cfg(test)]
+            evictions: 0,
+            #[cfg(test)]
+            oracle: false,
+        }
+    }
+}
+
+impl ResidentCache {
+    /// Take a conversation out if it is held and still equals the stored
+    /// small record `stored`.
+    pub(super) fn take(&mut self, reference: &str, stored: &str) -> Option<AsyncRecord> {
+        let held = self.held.remove(reference)?;
+        (held.state.journal.saved_json.as_deref() == Some(stored)).then_some(held.state)
+    }
+
+    pub(super) fn forget(&mut self, reference: &str) {
+        self.held.remove(reference);
+    }
+
+    /// Put a conversation back, evicting the least recently used others
+    /// while the budget is exceeded. A conversation larger than the whole
+    /// budget is not kept; its next operation rebuilds it from rows.
+    pub(super) fn put(&mut self, state: AsyncRecord) {
+        #[cfg(test)]
+        if self.oracle {
+            return;
+        }
+        if !state.journal.complete || state.journal.saved_json.is_none() {
+            return;
+        }
+        let bytes = state.retained_bytes();
+        let reference = state.reference();
+        self.held.remove(&reference);
+        if bytes > self.budget {
+            return;
+        }
+        let mut total = bytes + self.held.values().map(|held| held.bytes).sum::<usize>();
+        while total > self.budget {
+            let Some(oldest) = self
+                .held
+                .iter()
+                .min_by_key(|(_, held)| held.used)
+                .map(|(reference, _)| reference.clone())
+            else {
+                break;
+            };
+            if let Some(evicted) = self.held.remove(&oldest) {
+                total -= evicted.bytes;
+                #[cfg(test)]
+                {
+                    self.evictions += 1;
+                }
+            }
+        }
+        self.clock += 1;
+        self.held.insert(
+            reference,
+            Held {
+                state,
+                bytes,
+                used: self.clock,
+            },
+        );
+    }
+
+    #[cfg(test)]
+    pub(super) fn set_budget(&mut self, budget: usize) {
+        self.budget = budget;
+    }
+
+    #[cfg(test)]
+    pub(super) fn held_bytes(&self, reference: &str) -> Option<usize> {
+        self.held.get(reference).map(|held| held.bytes)
+    }
+}
+
+/// Test counters of transcript work, per thread: how many held entries were
+/// parsed from JSON and decoded by the codec, and how many engine passes and
+/// engine-view parses ran. A notice that publishes nothing must keep these
+/// independent of the conversation's length.
+#[cfg(test)]
+pub(crate) mod counters {
+    use std::cell::Cell;
+
+    thread_local! {
+        static PARSED: Cell<u64> = const { Cell::new(0) };
+        static DECODED: Cell<u64> = const { Cell::new(0) };
+        static ENGINE: Cell<u64> = const { Cell::new(0) };
+        static VIEWS: Cell<u64> = const { Cell::new(0) };
+    }
+
+    #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+    pub struct Work {
+        pub parsed: u64,
+        pub decoded: u64,
+        pub engine_passes: u64,
+        pub engine_views: u64,
+    }
+
+    pub fn parsed(count: u64) {
+        PARSED.with(|cell| cell.set(cell.get() + count));
+    }
+    pub fn decoded(count: u64) {
+        DECODED.with(|cell| cell.set(cell.get() + count));
+    }
+    pub fn engine_pass() {
+        ENGINE.with(|cell| cell.set(cell.get() + 1));
+    }
+    pub fn engine_view_parsed() {
+        VIEWS.with(|cell| cell.set(cell.get() + 1));
+    }
+
+    pub fn read() -> Work {
+        Work {
+            parsed: PARSED.with(Cell::get),
+            decoded: DECODED.with(Cell::get),
+            engine_passes: ENGINE.with(Cell::get),
+            engine_views: VIEWS.with(Cell::get),
+        }
+    }
+}

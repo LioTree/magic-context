@@ -732,7 +732,7 @@ async fn fork_descent_requires_recorded_digest() {
     rig.fill(40);
     rig.notice(1, 1_000, None).await;
     let state = rig.state();
-    let digest = contract::digest::content_digest(&state.entries[&9].message);
+    let digest = contract::digest::content_digest(&state.entries[&9].read().unwrap().message);
     assert_eq!(verified_descent(&state, &format!("L:9:{digest}")), Some(9));
     assert_eq!(
         verified_descent(&state, &format!("L:9:{}", "0".repeat(64))),
@@ -795,7 +795,7 @@ async fn fork_descent_preserves_only_verified_prefix_state() {
     rig.fill(40);
     rig.notice(1, 1_000, None).await;
     let before = rig.state();
-    let digest = contract::digest::content_digest(&before.entries[&9].message);
+    let digest = contract::digest::content_digest(&before.entries[&9].read().unwrap().message);
     rig.runner.entries.lock().unwrap().truncate(10);
     *rig.runner.lineage.lock().unwrap() = "fork:verified".into();
     rig.notice_with_descent(2, 1_000, None, Some(format!("L:9:{digest}")))
@@ -962,7 +962,7 @@ async fn synthetic_ids_never_fall_back_to_positional_transcript_matches() {
     rig.fill(1);
     rig.notice(1, 1_000, None).await;
     let state = rig.state();
-    let entry = &state.entries[&0];
+    let entry = state.entries[&0].read().unwrap();
     let original = codec::Codec::OpencodeAiSdk
         .decode_message(&InboundMessage {
             ordinal: 0,
@@ -1016,7 +1016,7 @@ async fn restored_lineage_reuses_history_embeddings_and_reanchors_only_surviving
         &InboundMessage {
             ordinal: 21,
             mid: "m21".into(),
-            message: held.entries[&21].message.clone(),
+            message: held.entries[&21].read().unwrap().message,
         },
     )
     .unwrap();

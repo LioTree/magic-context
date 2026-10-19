@@ -5,10 +5,12 @@ use compact::{self as contract, ceiling::CeilingPolicy, notice, ride, view};
 use cortexkit_bus_trait::{ContentDigest, DurableOwner, Stream, StreamCursor};
 use cortexkit_role_llm_runner::{read::ReadMessage, session_ref, tags};
 use serde::Deserialize;
+mod resident;
 #[cfg(test)]
 mod scaling_tests;
 #[cfg(test)]
 mod tests;
+use resident::{EngineView, HeldEntry};
 
 fn bus_id(reference: &str, kind: &str, sequence: u64) -> String {
     format!("{reference}:{kind}:{sequence}")
@@ -77,6 +79,8 @@ pub(crate) struct Runtime {
     pub(crate) bootstrapped: OnceLock<()>,
     publisher: Mutex<Option<Arc<dyn Publisher>>>,
     unconfigured_logged: OnceLock<()>,
+    /// Conversations kept in memory between operations; see `resident`.
+    pub(crate) resident: Mutex<resident::ResidentCache>,
 }
 
 #[derive(Serialize, Deserialize)]
@@ -129,12 +133,25 @@ pub(crate) struct AsyncRecord {
     /// Engine forms of this generation's retained published views, stored
     /// beside each view in `mc_async_compaction_views.engine_json`.
     #[serde(skip)]
-    published_engine: BTreeMap<u64, transform::compaction::View>,
+    published_engine: BTreeMap<u64, EngineView>,
+    /// The engine's produced and applied baselines, kept serialized. While a
+    /// record is at rest `engine.last_produced` and `engine.last_applied` are
+    /// `None`; `engine_with_baselines` parses these for an engine pass and
+    /// `adopt_engine` takes the pass's result back.
+    #[serde(skip)]
+    produced_view: Option<EngineView>,
+    #[serde(skip)]
+    applied_view: Option<EngineView>,
     lineage: Option<String>,
     /// The held transcript, stored one row per ordinal in
     /// `mc_async_compaction_entries`.
     #[serde(skip)]
-    entries: BTreeMap<u64, ReadMessage>,
+    entries: BTreeMap<u64, Arc<HeldEntry>>,
+    /// Per-entry facts and their running totals; see `fold_entries`.
+    #[serde(skip)]
+    facts: BTreeMap<u64, resident::EntryFacts>,
+    #[serde(skip)]
+    aggregates: resident::Aggregates,
     #[serde(skip)]
     journal: Journal,
     seq: u64,
@@ -195,6 +212,9 @@ struct Journal {
     /// Identities of the baselines as last stored.
     produced: Option<ViewIdentity>,
     applied: Option<ViewIdentity>,
+    /// The small record exactly as last saved or loaded. A resident record is
+    /// reused only while the store still holds this JSON.
+    saved_json: Option<String>,
 }
 
 impl Journal {
@@ -311,7 +331,7 @@ fn verified_descent(state: &State, header: &str) -> Option<u64> {
     if state.lineage.as_deref() != Some(lineage) {
         return None;
     }
-    let entry = state.entries.get(&through)?;
+    let entry = state.entries.get(&through)?.read().ok()?;
     (contract::digest::content_digest(&entry.message) == digest).then_some(through)
 }
 
@@ -352,19 +372,19 @@ impl State {
         self.reindex()?;
         let mut baselines = Vec::new();
         let produced = self.place_baseline(
-            self.engine.last_produced.as_ref(),
+            self.produced_view.as_ref(),
             self.journal.produced.as_ref(),
             self.engine_baselines.produced,
-        )?;
+        );
         if let Some((mode, write)) = produced {
             self.engine_baselines.produced = mode;
             baselines.extend(write.map(|view| ("produced", view)));
         }
         let applied = self.place_baseline(
-            self.engine.last_applied.as_ref(),
+            self.applied_view.as_ref(),
             self.journal.applied.as_ref(),
             self.engine_baselines.applied,
-        )?;
+        );
         if let Some((mode, write)) = applied {
             self.engine_baselines.applied = mode;
             baselines.extend(write.map(|view| ("applied", view)));
@@ -385,11 +405,11 @@ impl State {
             .fold(applied, u64::min)
         });
         let mut appended = Vec::new();
-        for entry in self.unsaved_entries() {
+        for (ordinal, entry) in self.unsaved_entries() {
             appended.push((
-                entry.ordinal,
-                serde_json::to_string(entry).map_err(transient)?,
-                self.entry_index(entry)?,
+                *ordinal,
+                entry.raw().to_owned(),
+                self.entry_index(*ordinal)?,
             ));
         }
         let reference = self.reference();
@@ -405,7 +425,7 @@ impl State {
             save.append_entry(ordinal, entry, index);
         }
         for (slot, view) in baselines {
-            save.baseline(slot, view);
+            save.baseline(slot, view.map(|json| json.to_string()));
         }
         if self.journal.clear_published {
             save.clear_engine_views();
@@ -422,8 +442,12 @@ impl State {
         self.journal.truncate = None;
         self.journal.clear_published = false;
         self.journal.persisted_through = self.entries.last_key_value().map(|(n, _)| *n);
-        self.journal.produced = self.engine.last_produced.as_ref().map(view_identity);
-        self.journal.applied = self.engine.last_applied.as_ref().map(view_identity);
+        self.journal.produced = self
+            .produced_view
+            .as_ref()
+            .map(|view| view.identity.clone());
+        self.journal.applied = self.applied_view.as_ref().map(|view| view.identity.clone());
+        self.journal.saved_json = Some(state);
         if let Some(floor) = retain_from {
             let newest = self.published_engine.last_key_value().map(|(n, _)| *n);
             self.published_engine
@@ -433,14 +457,12 @@ impl State {
     }
 
     /// Held entries not yet stored.
-    fn unsaved_entries(&self) -> impl Iterator<Item = &ReadMessage> {
+    fn unsaved_entries(&self) -> impl Iterator<Item = (&u64, &Arc<HeldEntry>)> {
         let from = self
             .journal
             .persisted_through
             .map_or(std::ops::Bound::Unbounded, std::ops::Bound::Excluded);
-        self.entries
-            .range((from, std::ops::Bound::Unbounded))
-            .map(|(_, entry)| entry)
+        self.entries.range((from, std::ops::Bound::Unbounded))
     }
 
     /// Runner tag rows for the held entries not yet stored. Rows of stored
@@ -449,12 +471,17 @@ impl State {
         &self,
         codec: codec::Codec,
     ) -> Result<Vec<mc_store::McTagRow>, HandlerOutcome> {
-        tag_rows_for(self.unsaved_entries(), codec)
+        tag_rows_for(self.unsaved_entries().map(|(_, entry)| entry), codec)
     }
 
     /// The stored tag addresses of one entry: `[tag, part key, part digest]`
     /// for each tagged part, taken from the index `reindex` built.
-    fn entry_index(&self, entry: &ReadMessage) -> Result<String, HandlerOutcome> {
+    fn entry_index(&self, ordinal: u64) -> Result<String, HandlerOutcome> {
+        let entry = self
+            .entries
+            .get(&ordinal)
+            .ok_or_else(|| transient("async entry missing"))?
+            .read()?;
         let mut index = Vec::new();
         for row in &entry.tags {
             if let Some(tag) = &row.tag {
@@ -475,31 +502,100 @@ impl State {
     #[allow(clippy::type_complexity)]
     fn place_baseline(
         &self,
-        view: Option<&transform::compaction::View>,
+        view: Option<&EngineView>,
         stored: Option<&ViewIdentity>,
         previous: Baseline,
-    ) -> Result<Option<(Baseline, Option<Option<String>>)>, HandlerOutcome> {
-        let identity = view.map(view_identity);
-        if identity.as_ref() == stored {
-            return Ok(None);
+    ) -> Option<(Baseline, Option<Option<Arc<str>>>)> {
+        let identity = view.map(|view| &view.identity);
+        if identity == stored {
+            return None;
         }
         let stale_row = (previous == Baseline::Stored).then_some(None);
         let Some(view) = view else {
-            return Ok(Some((Baseline::Absent, stale_row)));
+            return Some((Baseline::Absent, stale_row));
         };
         let published = self
             .published_engine
             .iter()
             .rev()
-            .find(|(_, published)| Some(view_identity(published)) == identity)
+            .find(|(_, published)| Some(&published.identity) == identity)
             .map(|(version, _)| *version);
-        Ok(Some(match published {
+        Some(match published {
             Some(version) => (Baseline::Published(version), stale_row),
-            None => (
-                Baseline::Stored,
-                Some(Some(serde_json::to_string(view).map_err(transient)?)),
-            ),
-        }))
+            None => (Baseline::Stored, Some(Some(Arc::clone(&view.json)))),
+        })
+    }
+
+    /// The engine state with its baselines parsed, for one engine pass or a
+    /// descent. Hand the result back with `adopt_engine`.
+    fn engine_with_baselines(&self) -> Result<transform::compaction::State, HandlerOutcome> {
+        let mut engine = self.engine.clone();
+        engine.last_produced = self
+            .produced_view
+            .as_ref()
+            .map(EngineView::view)
+            .transpose()?;
+        engine.last_applied = self
+            .applied_view
+            .as_ref()
+            .map(EngineView::view)
+            .transpose()?;
+        Ok(engine)
+    }
+
+    /// Take back an engine state from `engine_with_baselines`. A baseline
+    /// whose identity is unchanged keeps its serialized form: within one
+    /// generation the engine only replaces a baseline with a view of another
+    /// version, and a descent changes the range, so an equal identity means
+    /// equal content (the same rule the save journal relies on).
+    fn adopt_engine(
+        &mut self,
+        mut engine: transform::compaction::State,
+    ) -> Result<(), HandlerOutcome> {
+        fn adopt(
+            held: &mut Option<EngineView>,
+            view: Option<transform::compaction::View>,
+            published: &BTreeMap<u64, EngineView>,
+        ) -> Result<(), HandlerOutcome> {
+            let Some(view) = view else {
+                *held = None;
+                return Ok(());
+            };
+            let identity = view_identity(&view);
+            if held.as_ref().is_some_and(|held| held.identity == identity) {
+                return Ok(());
+            }
+            *held = Some(
+                match published.values().rev().find(|p| p.identity == identity) {
+                    Some(published) => published.clone(),
+                    None => EngineView::of(&view)?,
+                },
+            );
+            Ok(())
+        }
+        adopt(
+            &mut self.produced_view,
+            engine.last_produced.take(),
+            &self.published_engine,
+        )?;
+        match engine.last_applied.take() {
+            // Setup's initial view is both baselines: keep one serialized copy.
+            Some(applied)
+                if self
+                    .produced_view
+                    .as_ref()
+                    .is_some_and(|produced| produced.identity == view_identity(&applied))
+                    && self
+                        .applied_view
+                        .as_ref()
+                        .is_none_or(|held| held.identity != view_identity(&applied)) =>
+            {
+                self.applied_view = self.produced_view.clone();
+            }
+            applied => adopt(&mut self.applied_view, applied, &self.published_engine)?,
+        }
+        self.engine = engine;
+        Ok(())
     }
 
     /// Drop held entries after `through`, or all of them for `None`, with
@@ -510,12 +606,15 @@ impl State {
                 self.entries.retain(|ordinal, _| *ordinal <= through);
                 self.tag_index
                     .retain(|_, address| address.ordinal <= through);
+                self.facts.retain(|ordinal, _| *ordinal <= through);
             }
             None => {
                 self.entries.clear();
                 self.tag_index.clear();
+                self.facts.clear();
             }
         }
+        self.recount_facts();
         let journal = &mut self.journal;
         journal.truncate = Some(match (journal.truncate, through) {
             (Some(None), _) | (_, None) => None,
@@ -527,9 +626,130 @@ impl State {
         journal.indexed_through = cut(journal.indexed_through);
     }
 
+    /// Recompute the running totals from the per-entry facts, after a cut.
+    /// Reads no entry: the facts are already decoded.
+    fn recount_facts(&mut self) {
+        let mut aggregates = resident::Aggregates::default();
+        for (ordinal, facts) in &self.facts {
+            if aggregates
+                .through
+                .is_some_and(|through| through + 1 != *ordinal)
+            {
+                break;
+            }
+            let mid = self
+                .entries
+                .get(ordinal)
+                .map_or("", |entry| entry.mid.as_str());
+            aggregates.add(*ordinal, mid, *facts);
+        }
+        // Facts past a gap are dropped: `fold_entries` recomputes them.
+        if let Some(through) = aggregates.through {
+            self.facts.retain(|ordinal, _| *ordinal <= through);
+        } else {
+            self.facts.clear();
+        }
+        self.aggregates = aggregates;
+    }
+
+    /// Decode, once each, the held entries not yet folded into the running
+    /// totals, plus any entries a todo scan still needs (all of them when the
+    /// scan restarts for a new lineage). Returns the decoded entries in
+    /// ordinal order: exactly those after the earlier of the two cursors.
+    fn fold_entries(
+        &mut self,
+        codec: codec::Codec,
+        todo_through: Option<Option<u64>>,
+    ) -> Result<Vec<ck_wire::CkIngressMessage>, HandlerOutcome> {
+        let first_held = self.entries.first_key_value().map(|(n, _)| *n);
+        // The facts are contiguous from the first held entry.
+        let folded = self
+            .aggregates
+            .through
+            .filter(|_| self.facts.keys().next().copied() == first_held);
+        if folded.is_none() {
+            self.facts.clear();
+            self.aggregates = resident::Aggregates::default();
+        }
+        let from = match todo_through {
+            Some(todo) => match (folded, todo) {
+                (Some(folded), Some(todo)) => Some(folded.min(todo)),
+                _ => None,
+            },
+            None => folded,
+        };
+        let range = from.map_or(std::ops::Bound::Unbounded, std::ops::Bound::Excluded);
+        let mut decoded = Vec::new();
+        for (ordinal, entry) in self.entries.range((range, std::ops::Bound::Unbounded)) {
+            let message = decoded_entry(codec, &entry.inbound()?)?;
+            if folded.is_none_or(|folded| *ordinal > folded) {
+                let tool_results = message
+                    .ck
+                    .content
+                    .iter()
+                    .filter(|block| matches!(block.kind, ck_wire::CkKind::ToolResult { .. }))
+                    .count() as u64;
+                let facts = resident::EntryFacts {
+                    real_user: message.ck.role == "user" && tool_results == 0,
+                    tool_results,
+                };
+                self.facts.insert(*ordinal, facts);
+                self.aggregates.add(*ordinal, &entry.mid, facts);
+            }
+            decoded.push(message);
+        }
+        Ok(decoded)
+    }
+
+    /// Bytes this record keeps alive while resident.
+    fn retained_bytes(&self) -> usize {
+        let mut views = Vec::new();
+        let mut bytes = std::mem::size_of::<Self>();
+        for view in self
+            .published_engine
+            .values()
+            .chain(&self.produced_view)
+            .chain(&self.applied_view)
+        {
+            if !views.iter().any(|seen| Arc::ptr_eq(seen, &view.json)) {
+                bytes += view.json.len() + 64;
+                views.push(Arc::clone(&view.json));
+            }
+        }
+        bytes += self
+            .entries
+            .values()
+            .map(|entry| entry.retained_bytes())
+            .sum::<usize>();
+        bytes += self
+            .tag_index
+            .iter()
+            .map(|(tag, address)| {
+                160 + tag.len() + address.mid.len() + address.part.len() + address.digest.len()
+            })
+            .sum::<usize>();
+        bytes += self.facts.len() * 64;
+        bytes
+    }
+
     fn reset(&mut self, store: &McStore) -> Result<(), HandlerOutcome> {
         if self.resync_sources.is_none() {
             let namespace = self.namespace();
+            // A resync is rare; it reads every held message once for its digest.
+            let digests = self
+                .entries
+                .iter()
+                .map(|(ordinal, entry)| {
+                    Ok((
+                        *ordinal,
+                        contract::digest::content_digest(&entry.read()?.message),
+                    ))
+                })
+                .collect::<Result<BTreeMap<u64, String>, HandlerOutcome>>()?;
+            let source = |ordinal: &u64, entry: &Arc<HeldEntry>| SourceMessage {
+                mid: entry.mid.clone(),
+                digest: digests[ordinal].clone(),
+            };
             store
                 .resume_pending_context_write(&namespace)
                 .map_err(transient)?;
@@ -547,10 +767,7 @@ impl State {
                     let messages = if start <= end && self.entries.contains_key(&end) {
                         self.entries
                             .range(start..=end)
-                            .map(|(_, entry)| SourceMessage {
-                                mid: entry.mid.clone(),
-                                digest: contract::digest::content_digest(&entry.message),
-                            })
+                            .map(|(ordinal, entry)| source(ordinal, entry))
                             .collect()
                     } else {
                         Vec::new()
@@ -600,10 +817,7 @@ impl State {
                         messages: self
                             .entries
                             .range(..*to)
-                            .map(|(_, entry)| SourceMessage {
-                                mid: entry.mid.clone(),
-                                digest: contract::digest::content_digest(&entry.message),
-                            })
+                            .map(|(ordinal, entry)| source(ordinal, entry))
                             .collect(),
                     })
                 }
@@ -617,11 +831,8 @@ impl State {
                 head,
                 messages: self
                     .entries
-                    .values()
-                    .map(|entry| SourceMessage {
-                        mid: entry.mid.clone(),
-                        digest: contract::digest::content_digest(&entry.message),
-                    })
+                    .iter()
+                    .map(|(ordinal, entry)| source(ordinal, entry))
                     .collect(),
             });
         }
@@ -636,6 +847,8 @@ impl State {
             .checked_add(1)
             .ok_or_else(|| transient("async generation exhausted"))?;
         self.engine = transform::compaction::State::new(self.reference(), self.engine.preset);
+        self.produced_view = None;
+        self.applied_view = None;
         self.published_engine.clear();
         self.journal.clear_published = true;
         self.save(store, &[])?;
@@ -659,7 +872,7 @@ fn load(store: &McStore, reference: &str) -> Result<Option<State>, HandlerOutcom
     };
     let mut state: State = serde_json::from_str(&rows.state).map_err(transient)?;
     for (ordinal, entry, index) in rows.entries {
-        let entry: ReadMessage = serde_json::from_str(&entry).map_err(transient)?;
+        let entry = HeldEntry::from_stored(entry)?;
         let index: Vec<[String; 3]> = serde_json::from_str(&index).map_err(transient)?;
         for [tag, part, digest] in index {
             state.tag_index.insert(
@@ -672,12 +885,12 @@ fn load(store: &McStore, reference: &str) -> Result<Option<State>, HandlerOutcom
                 },
             );
         }
-        state.entries.insert(ordinal, entry);
+        state.entries.insert(ordinal, Arc::new(entry));
     }
     for (version, engine) in rows.engine_views {
         state
             .published_engine
-            .insert(version, serde_json::from_str(&engine).map_err(transient)?);
+            .insert(version, EngineView::parse(engine)?);
     }
     let mut stored = rows
         .baselines
@@ -693,15 +906,15 @@ fn load(store: &McStore, reference: &str) -> Result<Option<State>, HandlerOutcom
             .ok_or_else(|| transient("async engine baseline view missing")),
         Baseline::Stored => stored
             .remove(slot)
-            .map(|raw| serde_json::from_str(&raw).map_err(transient))
+            .map(EngineView::parse)
             .transpose()?
             .map(Some)
             .ok_or_else(|| transient("async engine baseline row missing")),
     };
     let produced = resolve("produced", state.engine_baselines.produced)?;
     let applied = resolve("applied", state.engine_baselines.applied)?;
-    state.engine.last_produced = produced;
-    state.engine.last_applied = applied;
+    state.produced_view = produced;
+    state.applied_view = applied;
     let through = state.entries.last_key_value().map(|(n, _)| *n);
     state.journal = Journal {
         complete: true,
@@ -709,8 +922,15 @@ fn load(store: &McStore, reference: &str) -> Result<Option<State>, HandlerOutcom
         indexed_through: through,
         truncate: None,
         clear_published: false,
-        produced: state.engine.last_produced.as_ref().map(view_identity),
-        applied: state.engine.last_applied.as_ref().map(view_identity),
+        produced: state
+            .produced_view
+            .as_ref()
+            .map(|view| view.identity.clone()),
+        applied: state
+            .applied_view
+            .as_ref()
+            .map(|view| view.identity.clone()),
+        saved_json: Some(rows.state),
     };
     Ok(Some(state))
 }
@@ -925,8 +1145,12 @@ impl McHandler {
             initial: Value::Null,
             engine: engine.clone(),
             published_engine: BTreeMap::new(),
+            produced_view: None,
+            applied_view: None,
             lineage: request.lineage_id.clone(),
             entries: BTreeMap::new(),
+            facts: BTreeMap::new(),
+            aggregates: Default::default(),
             seq: 0,
             completed_seq: 0,
             applied: None,
@@ -968,10 +1192,18 @@ impl McHandler {
             return Err(transient("async setup returned no initial view"));
         };
         let wire = rendered_view(codec, initial, &state)?;
-        state.engine = engine;
+        state.adopt_engine(engine)?;
         // `serializer_profile` is a ck-mc extension member: the profile this
         // Setup accepted, so the runner can confirm ck-mc reads its schema.
         state.initial = json!({"answer":"ready","request_id":request.request_id,"initial":wire, "ceiling":CeilingPolicy::new(0.95,300_000).with_on_overflow(),"serializer_profile":codec.wire_id()});
+        // A conversation set up again under the same reference must never
+        // reuse a resident copy of an earlier one.
+        self.provider_store
+            .async_runtime
+            .resident
+            .lock()
+            .expect("async resident cache")
+            .forget(&reference);
         state.save(store, &[])?;
         bytes(&state.initial)
     }
@@ -998,15 +1230,9 @@ impl McHandler {
         let mut template: TransformRequest = decode(
             &json!({"v":2,"kind":"compaction.step","session_id":state.namespace(),"messages":[],"render_config":serde_json::to_string(&state.setup.params).map_err(transient)?,"model_key":model,"tool_present":false,"auto_search_enabled":false}),
         )?;
-        let messages = state
-            .entries
-            .values()
-            .map(|entry| InboundMessage {
-                ordinal: entry.ordinal,
-                mid: entry.mid.clone(),
-                message: entry.message.clone(),
-            })
-            .collect::<Vec<_>>();
+        #[cfg(test)]
+        resident::counters::engine_pass();
+        let messages = inbound_messages(state.entries.values())?;
         codec.prepare_request(&mut template, &messages)?;
         template.native_tail_section = true;
         if let Some(policy) = &state.usage_policy {
@@ -1054,10 +1280,19 @@ fn parts(message: &Value) -> Result<std::borrow::Cow<'_, [Value]>, HandlerOutcom
         .ok_or_else(|| invalid_field("message", "codec must expose an ordered parts array"))
 }
 
+/// Whole runner messages for `entries`, for a pass over the transcript.
+fn inbound_messages<'a>(
+    entries: impl Iterator<Item = &'a Arc<HeldEntry>>,
+) -> Result<Vec<InboundMessage>, HandlerOutcome> {
+    entries.map(|entry| entry.inbound()).collect()
+}
+
 fn decoded_entry(
     codec: codec::Codec,
     entry: &InboundMessage,
 ) -> Result<ck_wire::CkIngressMessage, HandlerOutcome> {
+    #[cfg(test)]
+    resident::counters::decoded(1);
     codec
         .decode_entries(std::slice::from_ref(entry))?
         .pop()
@@ -1069,15 +1304,7 @@ fn rendered_view(
     view: &transform::compaction::View,
     state: &State,
 ) -> Result<OutboundMessage, HandlerOutcome> {
-    let entries = state
-        .entries
-        .values()
-        .map(|entry| InboundMessage {
-            ordinal: entry.ordinal,
-            mid: entry.mid.clone(),
-            message: entry.message.clone(),
-        })
-        .collect::<Vec<_>>();
+    let entries = inbound_messages(state.entries.values())?;
     codec.render_view(view, &state.key.session, &entries)
 }
 
@@ -1125,15 +1352,36 @@ fn tag_rows(state: &State, codec: codec::Codec) -> Result<Vec<mc_store::McTagRow
     tag_rows_for(state.entries.values(), codec)
 }
 
+/// The runner tag row of `number`, as `tag_rows` would list it, reading only
+/// the entry that holds the tag. Every held entry was decoded and checked by
+/// `tag_rows_for` when it was first stored, so no other entry can change the
+/// answer.
+fn tag_row(
+    state: &State,
+    codec: codec::Codec,
+    number: u64,
+) -> Result<Option<mc_store::McTagRow>, HandlerOutcome> {
+    let Some(address) = tags::format_tag(number).and_then(|tag| state.tag_index.get(&tag)) else {
+        return Ok(None);
+    };
+    let Some(entry) = state.entries.get(&address.ordinal) else {
+        return Ok(None);
+    };
+    Ok(tag_rows_for(std::iter::once(entry), codec)?
+        .into_iter()
+        .find(|row| u64::try_from(row.tag_number).ok() == Some(number)))
+}
+
 /// Tag rows for `entries`. A tag reused within them is refused here; reuse
 /// against already held entries is refused by `reindex`.
 fn tag_rows_for<'a>(
-    entries: impl Iterator<Item = &'a ReadMessage>,
+    entries: impl Iterator<Item = &'a Arc<HeldEntry>>,
     codec: codec::Codec,
 ) -> Result<Vec<mc_store::McTagRow>, HandlerOutcome> {
     let mut rows = Vec::new();
     let mut seen = BTreeSet::new();
     for entry in entries {
+        let entry = entry.read()?;
         let native = parts(&entry.message)?;
         if native.len() != entry.tags.len() {
             return Err(invalid_field(
@@ -1223,13 +1471,18 @@ fn ranges(
         .get("render_tags")
         .and_then(Value::as_bool)
         == Some(true);
+    // The first held entry with each mid, as an ordinal-order search finds it.
+    let mut by_mid = HashMap::with_capacity(state.entries.len());
+    for (ordinal, entry) in &state.entries {
+        by_mid.entry(entry.mid.as_str()).or_insert(*ordinal);
+    }
     for (position, message) in wire.replacement.iter().enumerate() {
         let mid = message
             .pointer("/info/id")
             .or_else(|| message.get("id"))
             .and_then(Value::as_str);
         let original = if let Some(mid) = mid {
-            state.entries.values().find(|entry| entry.mid == mid)
+            by_mid.get(mid).and_then(|n| state.entries.get(n))
         } else {
             engine
                 .replacement
@@ -1242,6 +1495,7 @@ fn ranges(
             synthetic.push(message.clone());
             continue;
         };
+        let original = original.read()?;
         if original.ordinal < next {
             return Err(transient("async render reordered transcript"));
         }
@@ -1342,6 +1596,7 @@ fn append_view_gap(
         *next = replacement_to;
     }
     for (ordinal, entry) in state.entries.range(*next..to) {
+        let entry = entry.read()?;
         let edits = entry
             .tags
             .iter()
@@ -1355,6 +1610,60 @@ fn append_view_gap(
     }
     *next = to;
     Ok(())
+}
+
+/// The tag hints a reduce reminder names: the oldest reclaimable tool outputs
+/// in the unsummarized tail and the channel-2 selection. Reads every held
+/// message and every tag row, so it runs only when a reminder is sent.
+fn async_reminder_hints(
+    store: &McStore,
+    state: &State,
+    codec: codec::Codec,
+    loaded: &mc_store::LoadedState,
+    config: &McModuleConfig,
+    window: u64,
+) -> Result<crate::runner_reminders::ReminderHints, HandlerOutcome> {
+    let namespace = state.namespace();
+    let rows = store.load_tags_for_session(&namespace).map_err(transient)?;
+    let messages = state
+        .entries
+        .values()
+        .map(|entry| decoded_entry(codec, &entry.inbound()?))
+        .collect::<Result<Vec<_>, _>>()?;
+    let projection = ck_wire::project_messages(&messages).map_err(transient)?;
+    let mut active =
+        transform::active_tags_for_nudge(&loaded.core, &loaded.meta, &projection, &rows, None);
+    active.retain(|tag| {
+        rows.iter()
+            .find(|row| row.tag_number == tag.tag_number)
+            .is_some_and(|row| !loaded.meta.protected_tool_block_ids.contains(&row.block_id))
+    });
+    let protection = crate::protection_window::ProtectionWindow::from_persisted_rows(
+        &rows,
+        config.resolve_protected_tokens(window).floor,
+    );
+    let pending = store
+        .load_pending_agent_drops(&namespace)
+        .map_err(transient)?;
+    let queued = rows
+        .iter()
+        .filter(|row| pending.iter().any(|drop| drop.target_id == row.block_id))
+        .map(|row| row.tag_number)
+        .collect::<HashSet<_>>();
+    Ok(crate::runner_reminders::ReminderHints {
+        oldest_reclaimable: transform::oldest_reclaimable_hint(
+            &active,
+            &protection.cutoff,
+            &queued,
+        )
+        .into_iter()
+        .filter_map(|(number, _)| u64::try_from(number).ok())
+        .collect(),
+        channel2: transform::oldest_channel2_hint(&active, &protection.cutoff, &queued)
+            .into_iter()
+            .filter_map(|(number, _)| u64::try_from(number).ok())
+            .collect(),
+    })
 }
 
 impl McHandler {
@@ -1417,7 +1726,8 @@ impl McHandler {
             ));
         }
         let _serial = self.provider_serial.lock_for(&state.key).await;
-        state = load(store, &notice.session_ref)?
+        state = self
+            .checkout(store, &notice.session_ref)?
             .ok_or_else(|| transient("async session disappeared"))?;
         let duplicate = notice.seq <= state.seq;
         let mut descended = false;
@@ -1433,11 +1743,12 @@ impl McHandler {
             {
                 let parent = state.lineage.clone().expect("held lineage");
                 state.truncate_entries(Some(through));
-                state
-                    .engine
+                let mut engine = state.engine_with_baselines()?;
+                engine
                     .descend(lineage, &parent, through)
                     .map_err(transient)?;
-                state.engine.last_applied = None;
+                engine.last_applied = None;
+                state.adopt_engine(engine)?;
                 state.lineage = Some(lineage.clone());
                 let retained = store
                     .load_compartments(&state.namespace())
@@ -1462,13 +1773,12 @@ impl McHandler {
             if let Some(applied) = state
                 .applied
                 .and_then(|version| state.published_engine.get(&version))
-                .filter(|view| Some(&view.range.lineage_id) == state.lineage.as_ref())
+                .filter(|view| Some(&view.identity.1.lineage_id) == state.lineage.as_ref())
                 .filter(|view| {
-                    state.engine.last_applied.as_ref().map(view_identity)
-                        != Some(view_identity(view))
+                    state.applied_view.as_ref().map(|held| &held.identity) != Some(&view.identity)
                 })
             {
-                state.engine.last_applied = Some(applied.clone());
+                state.applied_view = Some(applied.clone());
             }
             state.acknowledgements = notice.events.iter().map(notice::Event::token).collect();
             for token in &state.acknowledgements {
@@ -1494,6 +1804,8 @@ impl McHandler {
                 && state
                     .entries
                     .get(&notice.through_ordinal)
+                    .map(|entry| entry.read())
+                    .transpose()?
                     .is_some_and(|entry| {
                         contract::digest::content_digest(&entry.message) == notice.through_digest
                     });
@@ -1531,7 +1843,9 @@ impl McHandler {
             .load_pending_agent_drops(&state.namespace())
             .map_err(transient)?
             .len();
-        if state.completed_seq < notice.seq || resynced {
+        if (state.completed_seq < notice.seq || resynced)
+            && (resynced || !self.async_engine_can_skip(&state, &notice)?)
+        {
             self.publish_async(0, &mut state, codec, resynced)?;
         }
         state.completed_seq = state.seq;
@@ -1552,7 +1866,6 @@ impl McHandler {
         let phase = scaling_tests::save_meter::start_kind(&notice.session_ref, "phase:cadence");
         let historian_due = self.advance_async_historian_cadence(&mut state, codec)?;
         state.save(store, &[])?;
-        drop(_serial);
         #[cfg(test)]
         drop(phase);
         #[cfg(test)]
@@ -1560,6 +1873,8 @@ impl McHandler {
         if historian_due {
             self.schedule_async_historian(&state)?;
         }
+        self.checkin(state);
+        drop(_serial);
         #[cfg(test)]
         drop(phase);
         self.announce_async_views().await
@@ -1617,11 +1932,13 @@ impl McHandler {
                     .checked_add(1)
                     .ok_or_else(|| invalid("ordinal exhausted"))?;
                 if let Some(held) = state.entries.get(&entry.ordinal) {
-                    if !stable_entry(held, &entry) {
+                    if !stable_entry(&held.read()?, &entry) {
                         return Err(transient("async entry changed on re-read"));
                     }
                 } else {
-                    state.entries.insert(entry.ordinal, entry);
+                    state
+                        .entries
+                        .insert(entry.ordinal, Arc::new(HeldEntry::from_read(&entry)?));
                 }
             }
             let Some(next) = page["next_from_ordinal"].as_u64() else {
@@ -1646,13 +1963,17 @@ impl McHandler {
             .store
             .get()
             .ok_or_else(|| transient("store unavailable"))?;
-        let loaded = store.load(&state.namespace()).map_err(transient)?;
-        let rows = store
-            .load_tags_for_session(&state.namespace())
-            .map_err(transient)?;
-        let messages = state
-            .entries
-            .values()
+        let namespace = state.namespace();
+        let loaded = store.load(&namespace).map_err(transient)?;
+        let config = self.effective_config(&state.key.project);
+        // Only the newest one or two entries are read here. The running
+        // totals cover the rest; the tag hints, which need the whole tail,
+        // are computed only if a reminder is actually sent.
+        let mut newest = state.entries.values().rev();
+        let last_entry = newest.next().map(|entry| entry.read()).transpose()?;
+        let prior_entry = newest.next().map(|entry| entry.read()).transpose()?;
+        let last = last_entry
+            .as_ref()
             .map(|entry| {
                 decoded_entry(
                     codec,
@@ -1663,77 +1984,44 @@ impl McHandler {
                     },
                 )
             })
-            .collect::<Result<Vec<_>, _>>()?;
-        let projection = ck_wire::project_messages(&messages).map_err(transient)?;
-        let mut active =
-            transform::active_tags_for_nudge(&loaded.core, &loaded.meta, &projection, &rows, None);
-        active.retain(|tag| {
-            rows.iter()
-                .find(|row| row.tag_number == tag.tag_number)
-                .is_some_and(|row| !loaded.meta.protected_tool_block_ids.contains(&row.block_id))
-        });
-        let config = self.effective_config(&state.key.project);
-        let window = crate::protection_window::ProtectionWindow::from_persisted_rows(
-            &rows,
-            config
-                .resolve_protected_tokens(notice.window.or(state.setup.context_window).unwrap_or(0))
-                .floor,
-        );
-        let pending = store
-            .load_pending_agent_drops(&state.namespace())
-            .map_err(transient)?;
-        let queued = rows
-            .iter()
-            .filter(|row| pending.iter().any(|drop| drop.target_id == row.block_id))
-            .map(|row| row.tag_number)
-            .collect::<HashSet<_>>();
-        let oldest = transform::oldest_reclaimable_hint(&active, &window.cutoff, &queued)
-            .into_iter()
-            .filter_map(|(number, _)| u64::try_from(number).ok())
-            .collect::<Vec<_>>();
-        let channel2 = transform::oldest_channel2_hint(&active, &window.cutoff, &queued)
-            .into_iter()
-            .filter_map(|(number, _)| u64::try_from(number).ok())
-            .collect::<Vec<_>>();
-        let last = messages.last();
-        let carrier = last
-            .filter(|message| {
-                message
-                    .ck
-                    .content
+            .transpose()?;
+        let carries_result = |message: &ck_wire::CkIngressMessage| {
+            message
+                .ck
+                .content
+                .iter()
+                .any(|block| matches!(block.kind, ck_wire::CkKind::ToolResult { .. }))
+        };
+        let carrier = match last.as_ref().filter(|message| carries_result(message)) {
+            Some(message) => {
+                // The last message's tag rows: the runner's rows are named
+                // `mid#index` for each decoded block, and this lane mints no
+                // others, so these are all the rows of that message.
+                let blocks = (0..message.ck.content.len())
+                    .map(|index| format!("{}#{index}", message.mid))
+                    .collect::<Vec<_>>();
+                let blocks = blocks.iter().map(String::as_str).collect::<Vec<_>>();
+                let prefix = format!("{}#", message.mid);
+                store
+                    .load_tags_for_blocks(&namespace, &blocks)
+                    .map_err(transient)?
                     .iter()
-                    .any(|block| matches!(block.kind, ck_wire::CkKind::ToolResult { .. }))
-            })
-            .and_then(|message| {
-                rows.iter().rev().find(|row| {
-                    row.kind == "tool_result"
-                        && row.block_id.starts_with(&format!("{}#", message.mid))
-                        && row.token_count > 0
-                })
-            })
-            .and_then(|row| u64::try_from(row.tag_number).ok());
-        let user = last.filter(|message| {
-            message.ck.role == "user"
-                && !message
-                    .ck
-                    .content
-                    .iter()
-                    .any(|block| matches!(block.kind, ck_wire::CkKind::ToolResult { .. }))
-        });
-        let users = messages
-            .iter()
-            .filter(|message| {
-                message.ck.role == "user"
-                    && !message
-                        .ck
-                        .content
-                        .iter()
-                        .any(|block| matches!(block.kind, ck_wire::CkKind::ToolResult { .. }))
-            })
-            .count() as u64;
-        let mut entries = state.entries.values().rev();
-        let written = entries.next().and_then(|entry| entry.written_at);
-        let prior = entries.next().and_then(|entry| entry.written_at);
+                    .rev()
+                    .find(|row| {
+                        row.kind == "tool_result"
+                            && row.block_id.starts_with(&prefix)
+                            && row.token_count > 0
+                    })
+                    .and_then(|row| u64::try_from(row.tag_number).ok())
+            }
+            None => None,
+        };
+        let user = last
+            .as_ref()
+            .filter(|message| message.ck.role == "user" && !carries_result(message));
+        let users = state.aggregates.real_users;
+        let written = last_entry.as_ref().and_then(|entry| entry.written_at);
+        let prior = prior_entry.as_ref().and_then(|entry| entry.written_at);
         let gap_ms = written
             .zip(prior)
             .and_then(|(written, prior)| i64::try_from(written).ok().zip(i64::try_from(prior).ok()))
@@ -1753,14 +2041,19 @@ impl McHandler {
             cadence.meta = loaded.meta.clone();
             cadence
         });
+        let window = notice.window.or(state.setup.context_window).unwrap_or(0);
+        let held: &State = state;
+        let hints = || {
+            async_reminder_hints(store, held, codec, &loaded, &config, window)
+                .map_err(|error| format!("{error:?}"))
+        };
         let conditions = crate::runner_reminders::ReminderConditions {
-            notice_id: &bus_id(&state.reference(), "advanced", notice.seq),
+            notice_id: &bus_id(&held.reference(), "advanced", notice.seq),
             now_ms: now_ms().max(0) as u64,
             real_user_turn_count: users,
             baseline: loaded.meta.tail_hygiene_baseline.as_ref(),
             newest_tool_tag: carrier,
-            oldest_reclaimable_tags: &oldest,
-            channel2_tags: &channel2,
+            hints: &hints,
             drops_applied,
             baseline_refreshed: prior_generation != loaded_generation,
             hard_fold_coverage_advanced: loaded.meta.coverage_ordinal
@@ -1772,16 +2065,19 @@ impl McHandler {
         };
         let runner = RoutedRunner {
             runner: self.provider_runner.as_ref(),
-            route: state.runner()?,
+            route: held.runner()?,
         };
         let outcome = crate::runner_reminders::send_due_reminders(
             &runner,
-            &state.key.project,
-            &state.key.session,
+            &held.key.project,
+            &held.key.session,
             &mut cadence,
             &conditions,
         )
         .await;
+        if let Some(error) = outcome.hints_failed {
+            return Err(transient(error));
+        }
         cadence.meta.coverage_ordinal = loaded.meta.coverage_ordinal;
         state.reminder_baseline_generation = cadence
             .meta
@@ -1847,14 +2143,15 @@ impl McHandler {
             last_applied_version: None,
             last_not_applied: None,
         };
-        let mut engine = state.engine.clone();
+        let mut engine = state.engine_with_baselines()?;
         let (_template, output) =
             self.async_engine(channel, &binding, state, codec, &status, &mut engine)?;
-        state.engine = engine;
         let transform::compaction::Answer::Replacement(mut candidate) = output.answer else {
+            state.adopt_engine(engine)?;
             return Ok(None);
         };
         if !ride && !output.prefix_bust_permitted {
+            state.adopt_engine(engine)?;
             return Ok(None);
         }
         let wire = rendered_view(codec, &candidate, state)?;
@@ -1904,31 +2201,26 @@ impl McHandler {
                     .take_while(|message| message.meta.synthetic)
                     .count();
                 candidate.replacement.splice(..prefix, decoded);
-                state.engine.last_produced = Some(candidate.clone());
-                if state
-                    .engine
+                engine.last_produced = Some(candidate.clone());
+                if engine
                     .last_applied
                     .as_ref()
                     .is_some_and(|view| view.version == candidate.version)
                 {
-                    state.engine.last_applied = Some(candidate.clone());
+                    engine.last_applied = Some(candidate.clone());
                 }
             }
         }
         let version = store
             .reserve_async_compaction_version(&state.reference(), state.applied.unwrap_or(0))
             .map_err(transient)?;
-        let last = state
-            .entries
-            .last_key_value()
-            .expect("nonempty transcript")
-            .1;
+        let (last_ordinal, last) = state.entries.last_key_value().expect("nonempty transcript");
         let mut view = view::CompactionView::new(
             state.reference(),
             version,
             state.lineage.as_deref().unwrap_or_default(),
             compact::lineage::MessageRef {
-                ordinal: last.ordinal,
+                ordinal: *last_ordinal,
                 mid: last.mid.clone(),
             },
             ranges,
@@ -1943,15 +2235,21 @@ impl McHandler {
             view = view.with_cut(view::ViewCut::new(format!("v{version}"), through));
         }
         let view = checked_async_view(view)?;
+        let engine_json: Arc<str> = serde_json::to_string(&candidate).map_err(transient)?.into();
         store
             .save_async_compaction_view(
                 &state.reference(),
                 version,
                 &serde_json::to_string(&view).map_err(transient)?,
-                &serde_json::to_string(&candidate).map_err(transient)?,
+                &engine_json,
             )
             .map_err(transient)?;
-        state.published_engine.insert(version, candidate);
+        state
+            .published_engine
+            .insert(version, EngineView::with_json(&candidate, engine_json));
+        // The produced baseline is this published view; adopting after the
+        // insert shares its serialized form instead of serializing it again.
+        state.adopt_engine(engine)?;
         Ok(Some(view))
     }
 
@@ -2025,9 +2323,11 @@ impl McHandler {
             };
             self.authorize_async(binding, &state)?;
             let _serial = self.provider_serial.lock_for(&state.key).await;
-            state = load(store, &request.session_ref)?
+            state = self
+                .checkout(store, &request.session_ref)?
                 .ok_or_else(|| transient("async session disappeared"))?;
             if state.resync {
+                self.checkin(state);
                 return bytes(&ride::RideAnswer::nothing());
             }
             let from = state.entries.last_key_value().map_or(0, |(n, _)| *n);
@@ -2055,6 +2355,7 @@ impl McHandler {
                 let _serial = _serial;
                 let view = worker.publish_async(0, &mut state, codec, true)?;
                 state.save(&store, &[])?;
+                worker.checkin(state);
                 Ok::<_, HandlerOutcome>(view)
             })
             .await
@@ -2089,24 +2390,35 @@ impl McHandler {
         }
         let state: State = serde_json::from_str(&rows[0]).map_err(transient)?;
         let _serial = self.provider_serial.lock_for(&state.key).await;
-        let state = load(store, &state.reference())?
+        let state = self
+            .checkout(store, &state.reference())?
             .ok_or_else(|| transient("async session disappeared"))?;
         if state.resync {
+            self.checkin(state);
             return Err(transient("async transcript resync in progress"));
         }
         let codec = codec::Codec::from_params(&Value::Object(state.setup.params.clone()))?;
-        let tags = tag_rows(&state, codec)?;
         let mut targets = Vec::new();
         let mut unknown = Vec::new();
         for number in requested {
-            match tags
-                .iter()
-                .find(|row| u64::try_from(row.tag_number).ok() == Some(*number))
-            {
-                Some(row) => targets.push(row.block_id.clone()),
+            #[cfg(test)]
+            let row = if self.async_oracle() {
+                tag_rows(&state, codec)?
+                    .into_iter()
+                    .find(|row| u64::try_from(row.tag_number).ok() == Some(*number))
+            } else {
+                tag_row(&state, codec, *number)?
+            };
+            #[cfg(not(test))]
+            let row = tag_row(&state, codec, *number)?;
+            match row {
+                Some(row) => targets.push(row.block_id),
                 None => unknown.push(*number),
             }
         }
+        let namespace = state.namespace();
+        // Queuing a drop changes no part of the record.
+        self.checkin(state);
         if targets.is_empty() {
             return Ok(tool_error_result(format!(
                 "Refused: no valid tags to queue. {}",
@@ -2114,13 +2426,7 @@ impl McHandler {
             )));
         }
         store
-            .append_pending_agent_drops_with_command(
-                &state.namespace(),
-                None,
-                &targets,
-                now_ms(),
-                false,
-            )
+            .append_pending_agent_drops_with_command(&namespace, None, &targets, now_ms(), false)
             .map_err(transient)?;
         Ok(mcp_text_result(
             format!(
@@ -2196,16 +2502,9 @@ impl McHandler {
             .map_err(transient)?;
         }
         let mut parsed: TransformRequest = decode(&request)?;
-        let messages = state
-            .entries
-            .values()
-            .map(|entry| InboundMessage {
-                ordinal: entry.ordinal,
-                mid: entry.mid.clone(),
-                message: entry.message.clone(),
-            })
-            .collect::<Vec<_>>();
-        codec.prepare_request(&mut parsed, &messages)?;
+        // The evaluation reads the whole transcript; it runs off the notice's
+        // path, from this snapshot of the held entries (shared, not copied).
+        let snapshot = state.entries.values().cloned().collect::<Vec<_>>();
         let store = Arc::clone(
             self.store
                 .get()
@@ -2235,6 +2534,10 @@ impl McHandler {
             parsed.historian_model_limits = configured.model_limits;
             let prepare = worker.clone();
             let result = tokio::task::spawn_blocking(move || {
+                let messages = inbound_messages(snapshot.iter())?;
+                drop(snapshot);
+                codec.prepare_request(&mut parsed, &messages)?;
+                drop(messages);
                 let projection = ck_wire::project_messages(&parsed.messages).map_err(transient)?;
                 let mut timings = HistorianTriggerTimings::default();
                 Ok::<_, HandlerOutcome>(prepare.prepare_historian_fire(
@@ -2276,9 +2579,15 @@ impl McHandler {
                 Ok(Ok(PreparedHistorianAction::Busy { completion, .. })) => {
                     completion.await;
                     if let Some(store) = worker.store.get() {
-                        if let Ok(Some(state)) = load(store, &reference) {
-                            if state.historian_pending {
-                                let _ = worker.schedule_async_historian(&state);
+                        if let Ok(Some(head)) = load_head(store, &reference) {
+                            if head.historian_pending {
+                                let _serial = worker.provider_serial.lock_for(&head.key).await;
+                                if let Ok(Some(state)) = worker.checkout(store, &reference) {
+                                    if state.historian_pending {
+                                        let _ = worker.schedule_async_historian(&state);
+                                    }
+                                    worker.checkin(state);
+                                }
                             }
                         }
                     }
@@ -2337,21 +2646,16 @@ impl McHandler {
         );
         state.usage_policy = Some(policy);
         let mut scan = state.todo_scan.clone().unwrap_or_default();
-        let messages = state
-            .entries
-            .values()
-            .map(|entry| {
-                decoded_entry(
-                    codec,
-                    &InboundMessage {
-                        ordinal: entry.ordinal,
-                        mid: entry.mid.clone(),
-                        message: entry.message.clone(),
-                    },
-                )
-            })
-            .collect::<Result<Vec<_>, _>>()?;
-        if let Some(todo) = scan.advance(state.lineage.as_deref().unwrap_or_default(), &messages) {
+        let lineage = state.lineage.clone().unwrap_or_default();
+        // The scan skips messages at or before its cursor, so it needs only
+        // the newer ones; a scan for another lineage restarts from the first.
+        let todo_through = if scan.lineage == lineage {
+            scan.through
+        } else {
+            None
+        };
+        let messages = state.fold_entries(codec, Some(todo_through))?;
+        if let Some(todo) = scan.advance(&lineage, &messages) {
             self.store
                 .get()
                 .ok_or_else(|| transient("store unavailable"))?
@@ -2383,6 +2687,7 @@ impl AsyncRecord {
             .range((from, std::ops::Bound::Unbounded))
             .map(|(_, entry)| entry)
         {
+            let entry = entry.read()?;
             let native = parts(&entry.message)?;
             if native.len() != entry.tags.len() {
                 return Err(invalid_field(
@@ -2425,6 +2730,114 @@ impl AsyncRecord {
 }
 
 impl McHandler {
+    fn resident_cache(&self) -> std::sync::MutexGuard<'_, resident::ResidentCache> {
+        self.provider_store
+            .async_runtime
+            .resident
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+    }
+
+    /// Whether this handler runs the full-recompute path: every operation
+    /// rebuilds the conversation from rows, every notice runs the engine and
+    /// every aggregate is a full scan. Tests compare it against the resident
+    /// path.
+    #[cfg(test)]
+    pub(super) fn async_oracle(&self) -> bool {
+        self.resident_cache().oracle
+    }
+
+    /// Take a conversation for one operation. Call only under its provider
+    /// lock. The resident copy is used when the store still holds exactly the
+    /// record it was saved or loaded with; otherwise it is rebuilt from rows.
+    /// Hand it back with `checkin` after the operation's last save.
+    fn checkout(&self, store: &McStore, reference: &str) -> Result<Option<State>, HandlerOutcome> {
+        let Some(stored) = store.load_async_compaction(reference).map_err(transient)? else {
+            self.resident_cache().forget(reference);
+            return Ok(None);
+        };
+        if let Some(state) = self.resident_cache().take(reference, &stored) {
+            return Ok(Some(state));
+        }
+        load(store, reference)
+    }
+
+    /// Keep a conversation resident after an operation whose last save
+    /// succeeded (or that changed nothing).
+    fn checkin(&self, state: State) {
+        self.resident_cache().put(state);
+    }
+
+    /// True when this notice's engine pass could not publish, so it can be
+    /// skipped: no usage threshold, pending engine work or classifier input
+    /// asks for a prefix rewrite. A skipped pass would have answered no-op and
+    /// left the record unchanged. Ported from the host lane's resident step,
+    /// which skipped the same passes on the same inputs.
+    fn async_engine_can_skip(
+        &self,
+        state: &State,
+        notice: &notice::AdvanceNotice,
+    ) -> Result<bool, HandlerOutcome> {
+        #[cfg(test)]
+        if self.async_oracle() {
+            return Ok(false);
+        }
+        if state.resync || state.entries.is_empty() {
+            return Ok(true);
+        }
+        let store = self
+            .store
+            .get()
+            .ok_or_else(|| transient("store unavailable"))?;
+        let namespace = state.namespace();
+        let window = state
+            .usage_policy
+            .as_ref()
+            .and_then(|policy| policy.limit_for(&notice.model))
+            .or(notice.window.or(state.setup.context_window))
+            .ok_or_else(|| invalid("window unknown"))?;
+        let model = state
+            .conditions
+            .as_ref()
+            .and_then(|headers| headers.get("model"))
+            .map(String::as_str)
+            .unwrap_or(&state.setup.model);
+        let meta = store.load_meta(&namespace).map_err(transient)?.meta;
+        let binding = self.async_binding(state);
+        let config = &binding.config;
+        let usage = notice.est_tokens as f64 * 100.0 / window.max(1) as f64;
+        let policy = state.usage_policy.as_ref();
+        let pressure = usage >= config.resolve_execute_threshold(Some(model)).percentage
+            || usage >= 85.0
+            || usage >= 95.0
+            || meta.emergency_drain_active
+            || policy.is_some_and(|policy| policy.emergency_recovery_armed);
+        let forced_work = !meta.initialized
+            || meta.soft_refresh_pending
+            || meta.pending_rewrite.is_some()
+            || meta.bootstrap_seed_fold_pending
+            || meta.deferred_execute_state.is_some()
+            || meta.pending_compaction_marker.is_some()
+            || meta.boundary_divergence_pending_count > 0
+            || !meta.reasoning_clear_initialized
+            || meta.last_model_key != model
+            || state.restored_head.is_some()
+            || state.engine.preset != transform::compaction::Preset::Head;
+        if pressure || forced_work {
+            return Ok(false);
+        }
+        // The same producer context `async_engine` gives the engine.
+        let work = self.provider_work(0, store, binding.clone(), state.key.clone())?;
+        let mut context = compaction::producer_context(&work, model, window, false);
+        context.cache_ttl = "never".into();
+        Ok(
+            transform::compaction::skip_facts(store, &namespace, &context, model, window)
+                .map_err(transient)?
+                .as_ref()
+                .is_some_and(transform::compaction::can_skip_classified),
+        )
+    }
+
     async fn publish_async_wake(&self, reference: &str) -> Result<(), HandlerOutcome> {
         let store = self
             .store
@@ -2434,10 +2847,13 @@ impl McHandler {
             return Ok(());
         };
         let _serial = self.provider_serial.lock_for(&state.key).await;
-        state = load(store, reference)?.ok_or_else(|| transient("async session disappeared"))?;
+        state = self
+            .checkout(store, reference)?
+            .ok_or_else(|| transient("async session disappeared"))?;
         let codec = codec::Codec::from_params(&Value::Object(state.setup.params.clone()))?;
         self.publish_async(0, &mut state, codec, false)?;
         state.save(store, &[])?;
+        self.checkin(state);
         drop(_serial);
         self.announce_async_views().await
     }
@@ -2517,9 +2933,15 @@ impl AsyncRecord {
         let Some(source) = &self.resync_sources else {
             return Ok(());
         };
-        let by_mid = self
+        // Restoring sources after a resync is rare; it reads every held
+        // message once.
+        let held = self
             .entries
             .values()
+            .map(|entry| entry.read())
+            .collect::<Result<Vec<_>, _>>()?;
+        let by_mid = held
+            .iter()
             .map(|entry| (entry.mid.as_str(), entry))
             .collect::<BTreeMap<_, _>>();
         let mut retained = Vec::new();
@@ -2661,7 +3083,7 @@ impl AsyncRecord {
             .map(|message| (message.mid.as_str(), message.digest.as_str()))
             .collect::<BTreeMap<_, _>>();
         self.restored_no_new_content = retained.len() == source.history.len()
-            && self.entries.values().all(|entry| {
+            && held.iter().all(|entry| {
                 old_messages.get(entry.mid.as_str()).is_some_and(|digest| {
                     *digest == contract::digest::content_digest(&entry.message)
                 })
@@ -2684,28 +3106,15 @@ impl McHandler {
         if state.engine.preset != transform::compaction::Preset::Head {
             return Ok(false);
         }
-        let mut user = None;
-        let mut tools = 0;
-        for entry in state.entries.values() {
-            let message = decoded_entry(
-                codec,
-                &InboundMessage {
-                    ordinal: entry.ordinal,
-                    mid: entry.mid.clone(),
-                    message: entry.message.clone(),
-                },
-            )?;
-            let results = message
-                .ck
-                .content
-                .iter()
-                .filter(|block| matches!(block.kind, ck_wire::CkKind::ToolResult { .. }))
-                .count() as u64;
-            tools += results;
-            if message.ck.role == "user" && results == 0 {
-                user = Some(entry.mid.clone());
-            }
-        }
+        // Every held entry is folded into the running totals by the policy
+        // step that precedes this one.
+        state.fold_entries(codec, None)?;
+        let user = state
+            .aggregates
+            .last_user
+            .as_ref()
+            .map(|(_, mid)| mid.clone());
+        let tools = state.aggregates.tool_results;
         let facts = HistorianCadence {
             user,
             tools,
@@ -2759,11 +3168,14 @@ impl McHandler {
             return Ok(());
         };
         let _serial = self.provider_serial.lock_for(&state.key).await;
-        state = load(store, reference)?.ok_or_else(|| transient("async session disappeared"))?;
+        state = self
+            .checkout(store, reference)?
+            .ok_or_else(|| transient("async session disappeared"))?;
         if state.generation == generation && &state.historian_cadence == cadence {
             state.historian_pending = false;
             state.save(store, &[])?;
         }
+        self.checkin(state);
         Ok(())
     }
 }
