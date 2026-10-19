@@ -8,7 +8,7 @@ fn review_request(entries: &[(&str, &str)]) -> TransformRequest {
     let messages = entries
         .iter()
         .enumerate()
-        .map(|(ordinal, (mid, raw))| compact::status::StatusMessage {
+        .map(|(ordinal, (mid, raw))| codec::InboundMessage {
             mid: (*mid).into(),
             ordinal: ordinal as u64,
             message: codec_claude_code::from_wire(&serde_json::from_str(raw).unwrap(), Some(raw))

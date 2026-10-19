@@ -1,7 +1,7 @@
 // Compare provider historian results with the full engine and inject interruptions
 // before launch, during claims, and during publication.
 
-fn review_sync(h: &McHandler, entries: &[compact::status::StatusMessage], inputs: Value) {
+fn review_sync(h: &McHandler, entries: &[codec::InboundMessage], inputs: Value) {
     // Synchronize without launching a worker so the test controls crash boundaries.
     h.sync_provider_pass_inputs_locked(
         &binding(h),
@@ -341,7 +341,7 @@ async fn review_m5_20000_message_scan_cost() {
 
 fn review_full_native(
     h: &McHandler,
-    entries: &[compact::status::StatusMessage],
+    entries: &[codec::InboundMessage],
     usage: u64,
     active: bool,
 ) -> (Value, bool) {
@@ -559,7 +559,7 @@ async fn review_m5_identity_conflict_is_atomic_and_background_retries() {
     eprintln!("M5_REVIEW identity conflict: direct error; scheduled retry flag=true; no partial insert; wire reply already returned, diagnostic is background-only");
 }
 
-async fn review_hook_message(h: &McHandler, entry: &compact::status::StatusMessage) -> Value {
+async fn review_hook_message(h: &McHandler, entry: &codec::InboundMessage) -> Value {
     let mut params = hook(entry, false);
     let tool = entry.message["parts"][0]["type"] == "tool";
     let source = if tool {

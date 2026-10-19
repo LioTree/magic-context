@@ -173,7 +173,7 @@ fn engine_request(tokens: u64) -> TransformRequest {
     let entries = [message(1), message(2), message(3)]
         .into_iter()
         .map(|v| serde_json::from_value(v).unwrap())
-        .collect::<Vec<compact::status::StatusMessage>>();
+        .collect::<Vec<codec::InboundMessage>>();
     let mut request: TransformRequest = decode(&json!({"v":2,"kind":"transform",
         "session_id":"s","serializer_profile":"opencode-aisdk","messages":[],
         "model_key":"fixture","render_config":"full-request-fixture","tool_present":false,

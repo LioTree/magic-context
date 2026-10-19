@@ -149,7 +149,7 @@ pub(super) fn from_wire(
 }
 
 pub(super) fn decode_message(
-    entry: &compact::status::StatusMessage,
+    entry: &codec::InboundMessage,
 ) -> Result<ck_wire::CkIngressMessage, HandlerOutcome> {
     let validated = envelope(&entry.message["message"], entry.message.get("raw_message"))?;
     let native = &validated["message"];
@@ -448,7 +448,7 @@ fn same_identity_prefix(
 }
 
 pub(super) fn whole_message_endpoint(
-    entry: &compact::status::StatusMessage,
+    entry: &codec::InboundMessage,
     boundary: &str,
 ) -> Result<compact::view::NativeEndpoint, HandlerOutcome> {
     let native = envelope(&entry.message["message"], entry.message.get("raw_message"))?;
@@ -486,7 +486,7 @@ pub(super) fn encode_view(
     view: &transform::compaction::View,
     request: &TransformRequest,
     covered: Option<u64>,
-) -> Result<(compact::answer::CompactionMessage, Vec<String>), HandlerOutcome> {
+) -> Result<(codec::OutboundMessage, Vec<String>), HandlerOutcome> {
     let raw = view
         .replacement
         .iter()
@@ -598,7 +598,7 @@ pub(super) fn encode_view(
         .map(|r| serde_json::from_str(r).map_err(transient))
         .collect::<Result<Vec<_>, _>>()?;
     Ok((
-        compact::answer::CompactionMessage::new(
+        codec::OutboundMessage::new(
             &view.compaction_id,
             view.version,
             compact::answer::Range::new(view.range.from, view.range.to),
@@ -658,15 +658,15 @@ mod tests {
     use super::super::codec::Codec;
     use super::*;
 
-    fn entry(raw: &str, ordinal: u64) -> compact::status::StatusMessage {
-        compact::status::StatusMessage {
+    fn entry(raw: &str, ordinal: u64) -> codec::InboundMessage {
+        codec::InboundMessage {
             raw_message: None,
             mid: format!("cc-{ordinal}"),
             ordinal,
             message: envelope(&serde_json::from_str(raw).unwrap(), Some(&json!(raw))).unwrap(),
         }
     }
-    fn request(messages: &[compact::status::StatusMessage]) -> TransformRequest {
+    fn request(messages: &[codec::InboundMessage]) -> TransformRequest {
         let mut request: TransformRequest = decode(&json!({"v":2,"kind":"compaction.step","session_id":"cc","messages":[],"render_config":"","tool_present":false,"auto_search_enabled":false})).unwrap();
         Codec::ClaudeCodeAnthropic
             .prepare_request(&mut request, messages)
@@ -689,7 +689,7 @@ mod tests {
         ))
         .unwrap();
         for case in status["messages"].as_array().unwrap() {
-            let mut entry: compact::status::StatusMessage =
+            let mut entry: codec::InboundMessage =
                 serde_json::from_value(case["message"].clone()).unwrap();
             let raw = entry.raw_message.clone().unwrap();
             assert_eq!(serde_json::to_value(&entry).unwrap(), case["message"]);
@@ -709,7 +709,7 @@ mod tests {
             assert_eq!(serde_json::to_value(&call).unwrap(), case["request"]);
             let admitted =
                 from_wire(call.message.as_ref().unwrap(), call.raw_message.as_deref()).unwrap();
-            let entry = compact::status::StatusMessage {
+            let entry = codec::InboundMessage {
                 mid: "hook".into(),
                 ordinal: 0,
                 message: admitted,

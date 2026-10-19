@@ -410,7 +410,7 @@ async fn post_assistant_addresses_text_blocks_and_never_nontext_parts() {
 
 #[test]
 fn broca_real_messages_round_trip_byte_exactly() {
-    let entries: Vec<compact::status::StatusMessage> = serde_json::from_str(include_str!(
+    let entries: Vec<codec::InboundMessage> = serde_json::from_str(include_str!(
         "../tests/fixtures/tool-catalog/broca-session-read-messages.json"
     ))
     .unwrap();
@@ -439,8 +439,8 @@ fn codec_rejects_unknown_fields_and_blocks_instead_of_dropping_them() {
     }
 }
 
-fn view(messages: Vec<Value>) -> compact::answer::CompactionMessage {
-    compact::answer::CompactionMessage::new(
+fn view(messages: Vec<Value>) -> codec::OutboundMessage {
+    codec::OutboundMessage::new(
         "compact",
         1,
         compact::answer::Range::new(0, 0),
@@ -459,7 +459,7 @@ fn validator_refuses_authored_cache_prefix_blocks() {
 fn validator_preserves_carried_origin_and_omits_authored_origin() {
     let mut carried = user(0, "summary");
     carried["message"]["origin"] = json!({"provider_module_id":"fixture","model_id":"m"});
-    let entry: compact::status::StatusMessage = serde_json::from_value(carried).unwrap();
+    let entry: codec::InboundMessage = serde_json::from_value(carried).unwrap();
     let decoded = decode_message(&entry).unwrap();
     assert_eq!(encode_message(&decoded.ck).unwrap(), entry.message);
     let mut changed = decoded.ck;
@@ -822,7 +822,7 @@ async fn reminder_on_second_page_is_observed_once_and_no_read_when_not_due() {
     ingest(
         &mut record,
         "L",
-        &decode::<Vec<compact::status::StatusMessage>>(&json!(history)).unwrap(),
+        &decode::<Vec<codec::InboundMessage>>(&json!(history)).unwrap(),
     )
     .unwrap();
     handler.provider_store.save(&key, &record).unwrap();
@@ -863,7 +863,7 @@ async fn reminder_on_second_page_is_observed_once_and_no_read_when_not_due() {
 
 #[test]
 fn validator_keeps_carried_cache_markers_but_refuses_unknown_output_fields() {
-    let mut entry: compact::status::StatusMessage = serde_json::from_value(user(0, "raw")).unwrap();
+    let mut entry: codec::InboundMessage = serde_json::from_value(user(0, "raw")).unwrap();
     entry.message["cache_prefix_blocks"] = json!(1);
     let mut record = Record::default();
     ingest(&mut record, "L", std::slice::from_ref(&entry)).unwrap();

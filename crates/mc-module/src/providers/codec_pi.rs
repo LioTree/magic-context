@@ -2,7 +2,7 @@
 use super::*;
 
 pub(super) fn decode_messages(
-    messages: &[compact::status::StatusMessage],
+    messages: &[codec::InboundMessage],
 ) -> Result<crate::codec::DecodedHarnessMessages, HandlerOutcome> {
     for message in messages {
         if message.message.get("id").and_then(Value::as_str) != Some(message.mid.as_str())
@@ -47,7 +47,7 @@ pub(super) fn decode_messages(
 pub(super) fn encode_view(
     view: &transform::compaction::View,
     request: &TransformRequest,
-) -> Result<compact::answer::CompactionMessage, HandlerOutcome> {
+) -> Result<codec::OutboundMessage, HandlerOutcome> {
     let native = request
         .native_messages
         .as_deref()
@@ -55,7 +55,7 @@ pub(super) fn encode_view(
     let source = native
         .iter()
         .zip(&request.messages)
-        .map(|(message, ingress)| compact::status::StatusMessage {
+        .map(|(message, ingress)| codec::InboundMessage {
             raw_message: None,
             mid: ingress.mid.clone(),
             ordinal: ingress.ordinal,
@@ -63,7 +63,7 @@ pub(super) fn encode_view(
         })
         .collect::<Vec<_>>();
     let sidecar = decode_messages(&source)?.sidecar;
-    Ok(compact::answer::CompactionMessage::new(
+    Ok(codec::OutboundMessage::new(
         &view.compaction_id,
         view.version,
         compact::answer::Range::new(view.range.from, view.range.to),
@@ -78,7 +78,7 @@ pub(super) fn decode_hook_messages(
     store: &McStore,
     key: &Key,
     lineage: &str,
-    entry: compact::status::StatusMessage,
+    entry: codec::InboundMessage,
 ) -> Result<crate::codec::DecodedHarnessMessages, HandlerOutcome> {
     let mut entries = Vec::new();
     if entry
@@ -102,7 +102,7 @@ pub(super) fn decode_hook_messages(
             if message.pointer("/message/role").and_then(Value::as_str) == Some("assistant") {
                 entries.clear();
             }
-            entries.push(compact::status::StatusMessage {
+            entries.push(codec::InboundMessage {
                 raw_message: None,
                 mid: source.mid,
                 ordinal: source.ordinal,
@@ -120,7 +120,7 @@ mod tests {
 
     #[test]
     fn journal_identity_beats_repeated_timestamp_and_response_aliases() {
-        let entries: Vec<_> = ["entry-a", "entry-b"].into_iter().enumerate().map(|(i, id)| compact::status::StatusMessage {
+        let entries: Vec<_> = ["entry-a", "entry-b"].into_iter().enumerate().map(|(i, id)| codec::InboundMessage {
             raw_message: None, mid: id.into(), ordinal: 41 + i as u64,
             message: json!({"id":id,"type":"message","parentId":null,"message":{"role":"assistant","timestamp":1,"responseId":"same-response","content":[{"type":"text","text":id,"textSignature":"sig"}]}}),
         }).collect();
@@ -146,7 +146,7 @@ mod tests {
             json!({"id":"wrong","message":{"role":"user","content":"text"}}),
             json!({"role":"user","content":"text"}),
         ] {
-            assert!(decode_messages(&[compact::status::StatusMessage {
+            assert!(decode_messages(&[codec::InboundMessage {
                 raw_message: None,
                 mid: "expected".into(),
                 ordinal: 1,

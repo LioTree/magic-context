@@ -29,7 +29,7 @@ fn engine_request(messages: &[Value], auto_search: bool) -> TransformRequest {
     let entries = messages
         .iter()
         .enumerate()
-        .map(|(n, message)| compact::status::StatusMessage {
+        .map(|(n, message)| codec::InboundMessage {
             raw_message: None,
             mid: message["info"]["id"].as_str().unwrap().into(),
             ordinal: n as u64 + 1,

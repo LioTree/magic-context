@@ -19,8 +19,8 @@ fn error_code(outcome: HandlerOutcome) -> String {
         other => panic!("expected named refusal, got {other:?}"),
     }
 }
-fn entry(raw: &str, ordinal: u64) -> compact::status::StatusMessage {
-    compact::status::StatusMessage {
+fn entry(raw: &str, ordinal: u64) -> codec::InboundMessage {
+    codec::InboundMessage {
         raw_message: None,
         mid: format!("m{ordinal}"),
         ordinal,
@@ -31,7 +31,7 @@ fn entry(raw: &str, ordinal: u64) -> compact::status::StatusMessage {
         .unwrap(),
     }
 }
-fn request(entries: &[compact::status::StatusMessage]) -> TransformRequest {
+fn request(entries: &[codec::InboundMessage]) -> TransformRequest {
     let mut request: TransformRequest = decode(&json!({"v":2,"kind":"compaction.step","session_id":"cc","messages":[],"render_config":"","tool_present":false,"auto_search_enabled":false})).unwrap();
     codec::Codec::ClaudeCodeAnthropic
         .prepare_request(&mut request, entries)
@@ -123,7 +123,7 @@ async fn raw_fuzz_setup_step_admission_hook_and_identity_replacement() {
             stored["message"],
             serde_json::from_str::<Value>(&raw).unwrap()
         );
-        let request = request(&[compact::status::StatusMessage {
+        let request = request(&[codec::InboundMessage {
             raw_message: None,
             mid: "m".into(),
             ordinal: 0,

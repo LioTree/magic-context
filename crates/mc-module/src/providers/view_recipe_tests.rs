@@ -450,7 +450,7 @@ fn v2_pi_recipe_round_trips_the_whole_host_view() {
     ]
     .into_iter()
     .enumerate()
-    .map(|(ordinal, message)| compact::status::StatusMessage {
+    .map(|(ordinal, message)| codec::InboundMessage {
         raw_message: None,
         mid: message["id"].as_str().unwrap().into(),
         ordinal: ordinal as u64,

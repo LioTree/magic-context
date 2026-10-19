@@ -355,7 +355,7 @@ mod tests {
             message_id: "m".into(),
             part_index: 1,
         };
-        let wire = compact::answer::CompactionMessage::new(
+        let wire = codec::OutboundMessage::new(
             "compaction",
             7,
             compact::answer::Range::new(0, 2),

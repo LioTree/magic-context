@@ -6,7 +6,7 @@ use crate::codec::DecodedHarnessMessages;
 /// absolute ordinal or the positional fallback used by full-request decoding.
 /// Retain the original native values so rendering never authors their metadata.
 pub(super) fn decode_messages(
-    messages: &[compact::status::StatusMessage],
+    messages: &[codec::InboundMessage],
 ) -> Result<DecodedHarnessMessages, HandlerOutcome> {
     for message in messages {
         let native = &message.message;
@@ -85,7 +85,7 @@ pub(super) fn encode_view(
     view: &transform::compaction::View,
     request: &TransformRequest,
     context: &NativeRenderContext<'_>,
-) -> Result<compact::answer::CompactionMessage, HandlerOutcome> {
+) -> Result<codec::OutboundMessage, HandlerOutcome> {
     if request.serializer_profile != SerializerProfile::OpencodeAiSdk.wire_id()
         || !request.serve_native
         || request.native_messages.is_none()
@@ -115,7 +115,7 @@ pub(super) fn encode_view(
         .into_iter()
         .map(|message| message.as_ref().clone())
         .collect();
-    Ok(compact::answer::CompactionMessage::new(
+    Ok(codec::OutboundMessage::new(
         &view.compaction_id,
         view.version,
         compact::answer::Range::new(view.range.from, view.range.to),
@@ -157,7 +157,7 @@ pub(super) fn encode_resident_view(
     arena: &super::resident_bytes::ByteArena,
     key: [u8; 32],
     engine_bytes: &[std::borrow::Cow<'_, [u8]>],
-) -> Result<Option<compact::answer::CompactionMessage>, HandlerOutcome> {
+) -> Result<Option<codec::OutboundMessage>, HandlerOutcome> {
     if previous.encoding_key != Some(key)
         || view.replacement.len() < 2
         || previous.engine.len() != view.replacement.len()
@@ -213,7 +213,7 @@ pub(super) fn encode_resident_view(
     for &document in previous.native.iter().skip(2) {
         native.push(serde_json::from_slice(&arena.bytes(document)).map_err(transient)?);
     }
-    Ok(Some(compact::answer::CompactionMessage::new(
+    Ok(Some(codec::OutboundMessage::new(
         &view.compaction_id,
         view.version,
         compact::answer::Range::new(view.range.from, view.range.to),
@@ -237,7 +237,7 @@ mod tests {
         Codec::OpencodeAiSdk
             .prepare_request(
                 &mut request,
-                &[compact::status::StatusMessage {
+                &[codec::InboundMessage {
                     raw_message: None,
                     mid: "assistant".into(),
                     ordinal: 1,
@@ -319,11 +319,11 @@ mod tests {
         );
     }
 
-    fn entries(messages: &[Value]) -> Vec<compact::status::StatusMessage> {
+    fn entries(messages: &[Value]) -> Vec<codec::InboundMessage> {
         messages
             .iter()
             .enumerate()
-            .map(|(index, message)| compact::status::StatusMessage {
+            .map(|(index, message)| codec::InboundMessage {
                 raw_message: None,
                 mid: message["info"]["id"].as_str().unwrap().into(),
                 ordinal: 4_000 + index as u64,
@@ -430,7 +430,7 @@ mod tests {
         codec: Codec,
         view: &transform::compaction::View,
         request: &TransformRequest,
-    ) -> compact::answer::CompactionMessage {
+    ) -> codec::OutboundMessage {
         let tags = BTreeMap::new();
         codec
             .encode_view(
@@ -606,7 +606,7 @@ mod tests {
             json!({"info":{"id":"m","role":"user"},"parts":{}}),
             json!({"info":{"id":"other","role":"user"},"parts":[]}),
         ] {
-            let entry = compact::status::StatusMessage {
+            let entry = codec::InboundMessage {
                 raw_message: None,
                 mid: "m".into(),
                 ordinal: 1,

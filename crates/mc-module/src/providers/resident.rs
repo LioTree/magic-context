@@ -110,7 +110,7 @@ impl ResidentState {
         for message in &authority.tail {
             let native: Value =
                 serde_json::from_slice(&message.message_bytes).map_err(|e| e.to_string())?;
-            let entry = compact::status::StatusMessage {
+            let entry = codec::InboundMessage {
                 ordinal: message.ordinal,
                 mid: message.mid.clone(),
                 message: native,

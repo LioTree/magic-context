@@ -137,7 +137,7 @@ mod tests {
 
     #[test]
     fn live_tail_clone_preserves_decoder_identity_and_projection() {
-        let source = compact::status::StatusMessage {
+        let source = codec::InboundMessage {
             mid: "m11".into(),
             ordinal: 11,
             raw_message: None,

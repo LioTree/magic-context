@@ -78,7 +78,7 @@ fn request(messages: &[Value], search: bool) -> TransformRequest {
     let entries = messages
         .iter()
         .enumerate()
-        .map(|(n, m)| compact::status::StatusMessage {
+        .map(|(n, m)| codec::InboundMessage {
             raw_message: None,
             ordinal: n as u64 + 1,
             mid: m["info"]["id"].as_str().unwrap().into(),
@@ -444,7 +444,7 @@ async fn drive_overlay_corpus_with(
             let served_entries = served_native
                 .iter()
                 .enumerate()
-                .map(|(n, m)| compact::status::StatusMessage {
+                .map(|(n, m)| codec::InboundMessage {
                     raw_message: None,
                     mid: m["info"]["id"].as_str().unwrap().into(),
                     ordinal: n as u64 + 1,

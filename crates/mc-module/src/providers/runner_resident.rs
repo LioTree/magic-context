@@ -6,7 +6,7 @@ use super::*;
 use std::ops::{Deref, DerefMut};
 
 fn decode_entry(
-    entry: &compact::status::StatusMessage,
+    entry: &codec::InboundMessage,
 ) -> Result<ck_wire::CkIngressMessage, HandlerOutcome> {
     // Compatibility execution historically installed ingress through the JSON
     // TransformRequest decoder. Preserve its optional-field presence semantics
@@ -229,7 +229,7 @@ impl RunnerRecord<'_> {
     pub fn checked_view(
         &mut self,
         view: &transform::compaction::View,
-    ) -> Result<compact::answer::CompactionMessage, HandlerOutcome> {
+    ) -> Result<codec::OutboundMessage, HandlerOutcome> {
         if self.lease.is_none() {
             return codec::checked_view(view, &self.state.record);
         }

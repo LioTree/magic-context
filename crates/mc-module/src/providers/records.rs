@@ -104,7 +104,7 @@ pub struct Record {
     pub catalog: Option<Catalog>,
     pub setup: Option<Setup>,
     pub hook: Option<HookState>,
-    pub messages: BTreeMap<String, BTreeMap<u64, compact::status::StatusMessage>>,
+    pub messages: BTreeMap<String, BTreeMap<u64, codec::InboundMessage>>,
     pub pending_drops: BTreeSet<u64>,
     pub last_answer: Option<Value>,
     pub wait_request: Option<String>,
@@ -242,7 +242,7 @@ impl Storage {
         &self,
         key: &Key,
         record: &Record,
-        messages: &BTreeMap<String, BTreeMap<u64, compact::status::StatusMessage>>,
+        messages: &BTreeMap<String, BTreeMap<u64, codec::InboundMessage>>,
         raw: &str,
         token: &(u64, Option<u64>),
     ) -> Result<(), HandlerOutcome> {
@@ -255,7 +255,7 @@ impl Storage {
         &self,
         key: &Key,
         record: &Record,
-        messages: &BTreeMap<String, BTreeMap<u64, compact::status::StatusMessage>>,
+        messages: &BTreeMap<String, BTreeMap<u64, codec::InboundMessage>>,
         raw: &mut Value,
     ) -> Result<Vec<mc_store::ProviderViewRecipe>, HandlerOutcome> {
         let store = self.store()?;
@@ -309,7 +309,7 @@ impl Storage {
         &self,
         key: &Key,
         record: &Record,
-        messages: &BTreeMap<String, BTreeMap<u64, compact::status::StatusMessage>>,
+        messages: &BTreeMap<String, BTreeMap<u64, codec::InboundMessage>>,
         delta: Option<(&(u64, Option<u64>), &str)>,
     ) -> Result<(), HandlerOutcome> {
         // A host switch adopts the full-request engine namespace. Compatibility
@@ -467,7 +467,7 @@ fn text_targets(message: &ck_wire::CkIngressMessage) -> Vec<(String, String, Str
 pub fn ingest(
     record: &mut Record,
     lineage: &str,
-    messages: &[compact::status::StatusMessage],
+    messages: &[codec::InboundMessage],
 ) -> Result<(), HandlerOutcome> {
     for entry in messages {
         let held = record.messages.entry(lineage.into()).or_default();
@@ -602,7 +602,7 @@ pub async fn scan(
             return Err(transient("transcript lineage changed"));
         }
         lineage = Some(page_lineage.into());
-        let messages: Vec<compact::status::StatusMessage> = decode(
+        let messages: Vec<codec::InboundMessage> = decode(
             page.get("messages")
                 .ok_or_else(|| transient("transcript page omitted messages"))?,
         )?;
@@ -665,7 +665,7 @@ mod tests {
     #[test]
     fn held_ordinal_with_another_mid_refuses_by_field() {
         let mut record = Record::default();
-        let entry: compact::status::StatusMessage =
+        let entry: codec::InboundMessage =
             decode(&json!({"ordinal":4000,"mid":"held","message":{"role":"user","content":[]}}))
                 .unwrap();
         record

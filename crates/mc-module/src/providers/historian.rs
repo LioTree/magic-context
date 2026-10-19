@@ -601,7 +601,7 @@ impl McHandler {
                         }
                         let last = held.last().unwrap().ordinal;
                         for m in held {
-                            let entry = compact::status::StatusMessage {
+                            let entry = codec::InboundMessage {
                                 raw_message: None,
                                 mid: m.mid,
                                 ordinal: m.ordinal,
@@ -1253,23 +1253,23 @@ mod tests {
             .await,
         );
     }
-    fn text(ordinal: u64, role: &str, words: usize) -> compact::status::StatusMessage {
+    fn text(ordinal: u64, role: &str, words: usize) -> codec::InboundMessage {
         let mid = format!("m{ordinal}");
-        compact::status::StatusMessage {
+        codec::InboundMessage {
             raw_message: None,
             mid: mid.clone(),
             ordinal,
             message: json!({"info":{"id":mid,"role":role,"time":{"created":ordinal*1000}},"parts":[{"id":format!("p{ordinal}"),"type":"text","text":format!("message {ordinal} {}", "word ".repeat(words))}]}),
         }
     }
-    fn corpus() -> Vec<compact::status::StatusMessage> {
+    fn corpus() -> Vec<codec::InboundMessage> {
         (1..=80)
             .map(|n| text(n, if n % 2 == 1 { "user" } else { "assistant" }, 800))
             .collect()
     }
     fn sync(
         h: &McHandler,
-        appended: &[compact::status::StatusMessage],
+        appended: &[codec::InboundMessage],
         chain: &[String],
         complete: bool,
         inputs: Value,
@@ -1284,7 +1284,7 @@ mod tests {
         )
         .unwrap();
     }
-    fn hook(entry: &compact::status::StatusMessage, complete: bool) -> Value {
+    fn hook(entry: &codec::InboundMessage, complete: bool) -> Value {
         let mut params = json!({"session":"s","harness":"opencode","lineage_id":"L","subject_mid":entry.mid,"subject_ordinal":entry.ordinal,"message":entry.message,"hook":if entry.message["info"]["role"]=="user" {"pre_user"} else {"post_assistant"},"blocks":[entry.message["parts"][0]["text"]],"step_id":"step"});
         if complete {
             params["pass_complete"] = json!(true);
@@ -1309,7 +1309,7 @@ mod tests {
     }
     fn oracle(
         h: &McHandler,
-        entries: &[compact::status::StatusMessage],
+        entries: &[codec::InboundMessage],
         chain: &[String],
         inputs: Value,
     ) -> PreparedHistorianAction {
@@ -1588,7 +1588,7 @@ mod tests {
     fn step(id: &str, newest: u64) -> Value {
         json!({"session":"s","harness":"opencode","request_id":id,"lineage_id":"L","step_id":"st","step_kind":"user_turn","model":"fixture","context_window":100000,"estimate":{"request_tokens":1000},"messages":[],"newest":{"ordinal":newest,"mid":format!("m{newest}")},"now":2})
     }
-    async fn warm(h: &McHandler, entries: &[compact::status::StatusMessage]) -> Value {
+    async fn warm(h: &McHandler, entries: &[codec::InboundMessage]) -> Value {
         let store = h.store.get().unwrap();
         store
             .replace_compartments(
@@ -1622,7 +1622,7 @@ mod tests {
     }
     async fn prepared_append(
         h: &McHandler,
-        entries: &[compact::status::StatusMessage],
+        entries: &[codec::InboundMessage],
     ) -> Box<PreparedHistorianFiring> {
         sync(
             h,
@@ -1844,7 +1844,7 @@ mod tests {
             .await
             .unwrap()
             .is_some());
-        let tools = (2..=26).map(|ordinal| { let mid = format!("m{ordinal}"); compact::status::StatusMessage { raw_message: None, ordinal, mid: mid.clone(), message: json!({"info":{"id":mid,"role":"assistant"},"parts":[{"id":format!("p{ordinal}"),"type":"tool","tool":"read","callID":format!("call{ordinal}"),"state":{"status":"completed","input":{},"output":"result"}}]}) } }).collect::<Vec<_>>();
+        let tools = (2..=26).map(|ordinal| { let mid = format!("m{ordinal}"); codec::InboundMessage { raw_message: None, ordinal, mid: mid.clone(), message: json!({"info":{"id":mid,"role":"assistant"},"parts":[{"id":format!("p{ordinal}"),"type":"tool","tool":"read","callID":format!("call{ordinal}"),"state":{"status":"completed","input":{},"output":"result"}}]}) } }).collect::<Vec<_>>();
         sync(&h, &tools[..24], &[], true, json!({}));
         assert!(worker
             .prepare_provider_historian(&binding(&h), &key(&h))
@@ -1873,7 +1873,7 @@ mod tests {
 
     fn full_request_during_run(
         h: &McHandler,
-        entries: &[compact::status::StatusMessage],
+        entries: &[codec::InboundMessage],
     ) -> transform::TransformWithProjection {
         let b = binding(h);
         let config = &b.config;
@@ -2171,7 +2171,7 @@ mod tests {
             signature(&oracle(&baseline, &entries, &chain, inputs.clone())).0,
             "full-request control crosses the trigger before the delayed evaluation"
         );
-        let tools = (81..=105).map(|ordinal| { let mid = format!("m{ordinal}"); compact::status::StatusMessage { raw_message: None, ordinal, mid: mid.clone(), message: json!({"info":{"id":mid,"role":"assistant"},"parts":[{"id":format!("p{ordinal}"),"type":"tool","tool":"read","callID":format!("call{ordinal}"),"state":{"status":"completed","input":{},"output":"result"}}]}) } }).collect::<Vec<_>>();
+        let tools = (81..=105).map(|ordinal| { let mid = format!("m{ordinal}"); codec::InboundMessage { raw_message: None, ordinal, mid: mid.clone(), message: json!({"info":{"id":mid,"role":"assistant"},"parts":[{"id":format!("p{ordinal}"),"type":"tool","tool":"read","callID":format!("call{ordinal}"),"state":{"status":"completed","input":{},"output":"result"}}]}) } }).collect::<Vec<_>>();
         sync(&h, &tools, &chain, true, inputs.clone());
         entries.extend(tools);
         let actual = worker

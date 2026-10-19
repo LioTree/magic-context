@@ -88,7 +88,7 @@ struct HostSetup {
 #[derive(Clone, Serialize, Deserialize)]
 pub(crate) struct HostView {
     pub(super) engine: transform::compaction::View,
-    pub(super) wire: compact::answer::CompactionMessage,
+    pub(super) wire: codec::OutboundMessage,
     #[serde(default)]
     pub(super) coverage: Option<HostCoverage>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -214,13 +214,13 @@ fn non_tag_messages_since(
     key: &Key,
     lineage: &ProviderLineage,
     first: u64,
-) -> Result<Vec<compact::status::StatusMessage>, HandlerOutcome> {
+) -> Result<Vec<codec::InboundMessage>, HandlerOutcome> {
     let mut messages = store
         .load_provider_messages_since(&key.store_key(), &lineage.lineage_id, first)
         .map_err(transient)?
         .into_iter()
         .map(|m| {
-            Ok(compact::status::StatusMessage {
+            Ok(codec::InboundMessage {
                 raw_message: None,
                 ordinal: m.ordinal,
                 mid: m.mid,
@@ -765,7 +765,7 @@ fn prime_resident_fold(
     let users = users
         .into_iter()
         .map(|message| {
-            Ok(compact::status::StatusMessage {
+            Ok(codec::InboundMessage {
                 mid: message.mid,
                 ordinal: message.ordinal,
                 raw_message: None,
@@ -1621,7 +1621,7 @@ fn covered_boundary_span(
     ordinal: u64,
 ) -> Result<
     (
-        Vec<compact::status::StatusMessage>,
+        Vec<codec::InboundMessage>,
         Vec<ck_wire::CkIngressMessage>,
     ),
     HandlerOutcome,
@@ -2111,7 +2111,7 @@ impl McHandler {
         let head_slots = view.head_slots.clone();
         let answer = compact::setup::SetupAnswer::Ready {
             request_id: request.request_id,
-            initial: view.wire,
+            initial: view.wire.into(),
             stability: setup.setup.stability.clone(),
             call_when: Some(setup.setup.call_when.clone()),
         };
@@ -2243,7 +2243,7 @@ impl McHandler {
             .messages
             .iter()
             .map(|m| {
-                let mut m = m.clone();
+                let mut m = codec::InboundMessage::from(m.clone());
                 if codec == Codec::ClaudeCodeAnthropic {
                     m.message =
                         super::codec_claude_code::from_wire(&m.message, m.raw_message.as_deref())?;
@@ -2756,7 +2756,7 @@ impl McHandler {
         let setup = record.setup.as_ref().expect("setup");
         let answer = compact::setup::SetupAnswer::Ready {
             request_id: request.request_id,
-            initial,
+            initial: initial.into(),
             stability: setup.stability.clone(),
             call_when: Some(setup.call_when.clone()),
         };
@@ -2841,7 +2841,13 @@ impl McHandler {
             ));
         }
         let work = self.provider_work(channel, &store, binding, key.clone())?;
-        ingest(&mut record, &request.lineage_id, &request.messages)?;
+        let messages = request
+            .messages
+            .iter()
+            .cloned()
+            .map(Into::into)
+            .collect::<Vec<_>>();
+        ingest(&mut record, &request.lineage_id, &messages)?;
         record.save(&self.provider_store, &key)?;
         fault("MessagesIngested");
         let normalized = status(params, &record)?;
@@ -2950,7 +2956,7 @@ impl McHandler {
                     channel2_directive: None,
                     bootstrap_complete: None,
                     request_id: request.request_id,
-                    compaction: record.checked_view(&view)?,
+                    compaction: record.checked_view(&view)?.into(),
                     coverage: None,
                 }
             }
@@ -3147,7 +3153,7 @@ mod host_tests {
         let entries = native
             .iter()
             .enumerate()
-            .map(|(i, m)| compact::status::StatusMessage {
+            .map(|(i, m)| codec::InboundMessage {
                 raw_message: None,
                 ordinal: i as u64 + 1,
                 mid: m["info"]["id"].as_str().unwrap().into(),
@@ -4460,7 +4466,7 @@ mod host_tests {
                     .iter()
                     .cloned()
                     .map(|v| serde_json::from_value(v).unwrap())
-                    .collect::<Vec<compact::status::StatusMessage>>()
+                    .collect::<Vec<codec::InboundMessage>>()
             };
             Codec::OpencodeAiSdk
                 .prepare_request(&mut req, &decode_entries(&entries[..2]))

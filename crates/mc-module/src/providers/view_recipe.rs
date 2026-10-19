@@ -132,7 +132,7 @@ fn original(
     message: &mc_store::provider_records::ProviderMessage,
 ) -> Result<(Value, Value), HandlerOutcome> {
     let native: Value = serde_json::from_slice(&message.message_bytes).map_err(transient)?;
-    let entry = compact::status::StatusMessage {
+    let entry = codec::InboundMessage {
         ordinal: message.ordinal,
         mid: message.mid.clone(),
         message: native.clone(),
@@ -560,7 +560,7 @@ fn source_item(
     ordinal: u64,
     native: Value,
 ) -> Result<Item, HandlerOutcome> {
-    let entry = compact::status::StatusMessage {
+    let entry = codec::InboundMessage {
         ordinal,
         mid: mid.into(),
         message: native,
@@ -1243,7 +1243,7 @@ pub(super) fn runner_recipe(
     store: &McStore,
     key: &mc_store::ProviderSessionKey,
     view: &transform::compaction::View,
-    messages: &BTreeMap<String, BTreeMap<u64, compact::status::StatusMessage>>,
+    messages: &BTreeMap<String, BTreeMap<u64, codec::InboundMessage>>,
     base: Option<u64>,
     state: &str,
 ) -> Result<ProviderViewRecipe, HandlerOutcome> {

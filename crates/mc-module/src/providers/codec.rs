@@ -2,6 +2,74 @@
 use super::*;
 use serde::Deserialize;
 
+/// A transcript message held by the compaction engine, independent of its transport.
+#[derive(Clone, Debug, PartialEq, Deserialize, Serialize)]
+pub(crate) struct InboundMessage {
+    pub ordinal: u64,
+    pub mid: String,
+    pub message: Value,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub raw_message: Option<String>,
+}
+
+/// The engine's rendered replacement and the transcript range it covers.
+#[derive(Clone, Debug, PartialEq, Deserialize, Serialize)]
+pub(crate) struct OutboundMessage {
+    pub compaction_id: String,
+    pub version: u64,
+    pub range: compact::answer::Range,
+    pub replacement: Vec<Value>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub raw_view: Option<Box<compact::view::FrozenView>>,
+}
+
+impl OutboundMessage {
+    pub fn new(
+        compaction_id: impl Into<String>,
+        version: u64,
+        range: compact::answer::Range,
+        replacement: Vec<Value>,
+    ) -> Self {
+        Self {
+            compaction_id: compaction_id.into(),
+            version,
+            range,
+            replacement,
+            raw_view: None,
+        }
+    }
+
+    #[cfg(test)]
+    pub fn with_raw_view(mut self, view: compact::view::FrozenView) -> Self {
+        self.raw_view = Some(Box::new(view));
+        self
+    }
+}
+
+impl From<compact::status::StatusMessage> for InboundMessage {
+    fn from(message: compact::status::StatusMessage) -> Self {
+        Self {
+            ordinal: message.ordinal,
+            mid: message.mid,
+            message: message.message,
+            raw_message: message.raw_message,
+        }
+    }
+}
+
+impl From<OutboundMessage> for compact::answer::CompactionMessage {
+    fn from(message: OutboundMessage) -> Self {
+        let mut wire = Self::new(
+            message.compaction_id,
+            message.version,
+            message.range,
+            message.replacement,
+        );
+        wire.raw_view = message.raw_view;
+        wire
+    }
+}
+
 /// Missing profile preserves the original Broca plan's strict native codec.
 /// Only profiles with a provider transcript codec are admitted here; accepting
 /// another engine profile would silently decode the runner's wrong schema.
@@ -45,7 +113,7 @@ impl Codec {
 
     pub fn decode_message(
         self,
-        message: &compact::status::StatusMessage,
+        message: &codec::InboundMessage,
     ) -> Result<ck_wire::CkIngressMessage, HandlerOutcome> {
         match self {
             Self::OwnedBroca => decode_message(message),
@@ -74,7 +142,7 @@ impl Codec {
     pub fn prepare_request(
         self,
         request: &mut TransformRequest,
-        messages: &[compact::status::StatusMessage],
+        messages: &[codec::InboundMessage],
     ) -> Result<(), HandlerOutcome> {
         let (ingress, native) = match self {
             Self::Pi => (
@@ -120,7 +188,7 @@ impl Codec {
         view: &transform::compaction::View,
         request: &TransformRequest,
         context: &super::codec_opencode::NativeRenderContext<'_>,
-    ) -> Result<compact::answer::CompactionMessage, HandlerOutcome> {
+    ) -> Result<codec::OutboundMessage, HandlerOutcome> {
         match self {
             Self::OwnedBroca => encode_view(view),
             Self::Pi => super::codec_pi::encode_view(view, request),
@@ -202,7 +270,7 @@ fn native(message: &Value) -> Result<NativeMessage, HandlerOutcome> {
 /// Preserve the native shell for unchanged content; authored content cannot
 /// inherit cache markers, origin attribution or encrypted reasoning.
 pub fn decode_message(
-    message: &compact::status::StatusMessage,
+    message: &codec::InboundMessage,
 ) -> Result<ck_wire::CkIngressMessage, HandlerOutcome> {
     use ck_wire::{
         CkKind, CkOutputKind, CkToolOutput, CkWireBlock, CkWireMessage, HarnessMeta, ProviderExtras,
@@ -390,13 +458,13 @@ pub(super) fn encode_message(message: &ck_wire::CkWireMessage) -> Result<Value, 
 
 pub fn encode_view(
     view: &transform::compaction::View,
-) -> Result<compact::answer::CompactionMessage, HandlerOutcome> {
+) -> Result<codec::OutboundMessage, HandlerOutcome> {
     let replacement = view
         .replacement
         .iter()
         .map(encode_message)
         .collect::<Result<Vec<_>, _>>()?;
-    Ok(compact::answer::CompactionMessage::new(
+    Ok(codec::OutboundMessage::new(
         &view.compaction_id,
         view.version,
         compact::answer::Range::new(view.range.from, view.range.to),
@@ -405,7 +473,7 @@ pub fn encode_view(
 }
 
 pub(super) fn validate_replacement(
-    view: &compact::answer::CompactionMessage,
+    view: &codec::OutboundMessage,
     record: &Record,
     lineage: &str,
 ) -> Result<(), HandlerOutcome> {
@@ -418,7 +486,7 @@ pub(super) fn validate_replacement(
 }
 
 pub(super) fn validate_replacement_with(
-    view: &compact::answer::CompactionMessage,
+    view: &codec::OutboundMessage,
     record: &Record,
     lineage: &str,
     is_carried: impl Fn(&Value) -> bool,
@@ -502,7 +570,7 @@ pub(super) fn validate_replacement_with(
 pub(super) fn checked_view(
     view: &transform::compaction::View,
     record: &Record,
-) -> Result<compact::answer::CompactionMessage, HandlerOutcome> {
+) -> Result<codec::OutboundMessage, HandlerOutcome> {
     let answer = encode_view(view)?;
     validate_replacement(&answer, record, &view.range.lineage_id)?;
     Ok(answer)
@@ -518,7 +586,7 @@ mod dispatch_tests {
             let codec = Codec::from_params(&params).unwrap();
             assert_eq!(codec, Codec::OwnedBroca);
             assert_eq!(codec.serializer_profile(), SerializerProfile::OwnedBroca);
-            let entries: Vec<compact::status::StatusMessage> = serde_json::from_str(include_str!(
+            let entries: Vec<codec::InboundMessage> = serde_json::from_str(include_str!(
                 "../tests/fixtures/tool-catalog/broca-session-read-messages.json"
             ))
             .unwrap();
@@ -529,7 +597,7 @@ mod dispatch_tests {
                     bytes(&entry.message).unwrap()
                 );
             }
-            let invalid_entry = compact::status::StatusMessage {
+            let invalid_entry = codec::InboundMessage {
                 raw_message: None,
                 mid: "m".into(),
                 ordinal: 1,

@@ -47,7 +47,7 @@ struct ProviderPassInput {
     ordered_ids: Option<Vec<String>>,
     lineage_id: String,
     descends_from: Option<HostDescent>,
-    appended: Vec<compact::status::StatusMessage>,
+    appended: Vec<codec::InboundMessage>,
     physical_tail: Option<ProviderTail>,
     exact_pass_plan: Option<String>,
     marker_hard_serves_frozen_prefix: Option<bool>,
@@ -331,7 +331,7 @@ impl McHandler {
                 "only post_tool addresses a tool result",
             ));
         }
-        let entry = compact::status::StatusMessage {
+        let entry = codec::InboundMessage {
             raw_message: None,
             mid: mid.into(),
             ordinal,
@@ -1005,7 +1005,7 @@ impl McHandler {
                 through_ordinal: fields.descends_from.as_ref().map(|d| d.through_ordinal),
             }
         };
-        let entry = compact::status::StatusMessage {
+        let entry = codec::InboundMessage {
             raw_message: None,
             mid: mid.into(),
             ordinal,
@@ -2381,7 +2381,7 @@ mod host_tests {
             ),
             (41, "u#0", "message")
         );
-        let entry = compact::status::StatusMessage {
+        let entry = codec::InboundMessage {
             raw_message: None,
             mid: "a".into(),
             ordinal: 2,
