@@ -128,6 +128,18 @@ impl EngineView {
     }
 }
 
+/// The engine's cache state for one namespace, as fully loaded at a row
+/// version. Every write to that state advances the row version, so an equal
+/// version (and user-profile version, which the load fills in from the host)
+/// means an equal state.
+pub(super) struct CachedEngineState {
+    pub namespace: String,
+    pub row_version: u64,
+    pub user_profile_version: u64,
+    pub bytes: usize,
+    pub loaded: Arc<mc_store::LoadedState>,
+}
+
 /// Running aggregates over the held entries' facts.
 #[derive(Clone, Default, Debug, PartialEq, Eq)]
 pub(super) struct Aggregates {
@@ -137,15 +149,44 @@ pub(super) struct Aggregates {
     pub tool_results: u64,
     /// Ordinal and mid of the newest authored user message.
     pub last_user: Option<(u64, String)>,
+    /// Tool calls without a result yet, and whether some result had no
+    /// earlier call: the engine refuses a working range in either case, so a
+    /// notice must then run it rather than skip it.
+    pub open_calls: BTreeSet<String>,
+    pub orphan_result: bool,
 }
 
 impl Aggregates {
-    pub(super) fn add(&mut self, ordinal: u64, mid: &str, facts: EntryFacts) {
+    pub(super) fn add(
+        &mut self,
+        ordinal: u64,
+        mid: &str,
+        facts: EntryFacts,
+        message: &ck_wire::CkIngressMessage,
+    ) {
         self.through = Some(ordinal);
         self.tool_results += facts.tool_results;
         if facts.real_user {
             self.real_users += 1;
             self.last_user = Some((ordinal, mid.to_owned()));
+        }
+        // The same arc check `working_range` makes over the whole range.
+        for block in &message.ck.content {
+            match &block.kind {
+                ck_wire::CkKind::ToolCall {
+                    id,
+                    provider_executed: false,
+                    ..
+                } => {
+                    self.open_calls.insert(id.clone());
+                }
+                ck_wire::CkKind::ToolResult {
+                    id,
+                    provider_executed: false,
+                    ..
+                } if !self.open_calls.remove(id) => self.orphan_result = true,
+                _ => {}
+            }
         }
     }
 }
@@ -207,7 +248,7 @@ impl ResidentCache {
     /// Put a conversation back, evicting the least recently used others
     /// while the budget is exceeded. A conversation larger than the whole
     /// budget is not kept; its next operation rebuilds it from rows.
-    pub(super) fn put(&mut self, state: AsyncRecord) {
+    pub(super) fn put(&mut self, mut state: AsyncRecord) {
         #[cfg(test)]
         if self.oracle {
             return;
@@ -270,6 +311,7 @@ pub(crate) mod counters {
     use std::cell::Cell;
 
     thread_local! {
+        static REASON: std::cell::RefCell<String> = const { std::cell::RefCell::new(String::new()) };
         static PARSED: Cell<u64> = const { Cell::new(0) };
         static DECODED: Cell<u64> = const { Cell::new(0) };
         static ENGINE: Cell<u64> = const { Cell::new(0) };
@@ -292,6 +334,13 @@ pub(crate) mod counters {
     }
     pub fn engine_pass() {
         ENGINE.with(|cell| cell.set(cell.get() + 1));
+    }
+    /// Why the last notice on this thread ran the engine.
+    pub fn engine_reason(reason: &str) {
+        REASON.with(|cell| *cell.borrow_mut() = reason.to_owned());
+    }
+    pub fn last_engine_reason() -> String {
+        REASON.with(|cell| cell.borrow().clone())
     }
     pub fn engine_view_parsed() {
         VIEWS.with(|cell| cell.set(cell.get() + 1));

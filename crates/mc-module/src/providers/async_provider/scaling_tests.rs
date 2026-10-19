@@ -527,6 +527,59 @@ async fn ordinary_notice_write_set_does_not_grow_with_the_session() {
     );
 }
 
+/// The transcript work one notice that publishes nothing does in a
+/// conversation of `size` messages: entries parsed from JSON, messages
+/// decoded by the codec, engine passes and engine views parsed. Also returns
+/// why the engine last ran on this thread.
+async fn quiet_notice_work(size: u64) -> (resident::counters::Work, String) {
+    let dir = tempfile::tempdir().unwrap();
+    let (mut rig, version) = conversation(dir.path(), size).await;
+    rig.append(4);
+    rig.notice(1_000, Some(version)).await;
+    let before = resident::counters::read();
+    rig.append(4);
+    rig.notice(1_000, Some(version)).await;
+    let after = resident::counters::read();
+    assert_eq!(
+        rig.newest(),
+        Some(version),
+        "a quiet notice publishes nothing"
+    );
+    (
+        resident::counters::Work {
+            parsed: after.parsed - before.parsed,
+            decoded: after.decoded - before.decoded,
+            engine_passes: after.engine_passes - before.engine_passes,
+            engine_views: after.engine_views - before.engine_views,
+        },
+        resident::counters::last_engine_reason(),
+    )
+}
+
+/// A notice that adds four messages and publishes nothing reads only those
+/// messages: no engine pass, no engine view, and the same number of parsed
+/// and decoded entries at 600 messages as at 60. The counters are per thread,
+/// so this runs on a single-threaded runtime.
+#[tokio::test]
+async fn a_quiet_notice_reads_only_what_it_added() {
+    let (small, small_reason) = quiet_notice_work(60).await;
+    let (large, large_reason) = quiet_notice_work(600).await;
+    assert_eq!(
+        (small.engine_passes, large.engine_passes),
+        (0, 0),
+        "a quiet notice ran the engine: {small_reason} / {large_reason}"
+    );
+    assert_eq!((small.engine_views, large.engine_views), (0, 0));
+    assert!(
+        large.parsed <= small.parsed && large.decoded <= small.decoded,
+        "a quiet notice's transcript work grew with the session: {large:?} at 600 messages, {small:?} at 60"
+    );
+    assert!(
+        large.decoded <= 12 && large.parsed <= 40,
+        "a quiet notice adding four messages read {large:?}"
+    );
+}
+
 async fn view_answer(rig: &Rig, version: u64) -> String {
     let answer = rig
         .op(

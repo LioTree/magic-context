@@ -5,6 +5,8 @@ use compact::{self as contract, ceiling::CeilingPolicy, notice, ride, view};
 use cortexkit_bus_trait::{ContentDigest, DurableOwner, Stream, StreamCursor};
 use cortexkit_role_llm_runner::{read::ReadMessage, session_ref, tags};
 use serde::Deserialize;
+#[cfg(test)]
+mod differential_tests;
 mod resident;
 #[cfg(test)]
 mod scaling_tests;
@@ -75,6 +77,10 @@ pub(crate) struct Runtime {
     completed_notice: std::sync::atomic::AtomicU64,
     #[cfg(test)]
     historian_evaluations: std::sync::atomic::AtomicU64,
+    /// Historian evaluations spawned and not yet finished, so a test can wait
+    /// for the background work a notice started.
+    #[cfg(test)]
+    historian_inflight: Arc<std::sync::atomic::AtomicU64>,
     pub(crate) connection_file: Mutex<Option<PathBuf>>,
     pub(crate) bootstrapped: OnceLock<()>,
     publisher: Mutex<Option<Arc<dyn Publisher>>>,
@@ -147,11 +153,18 @@ pub(crate) struct AsyncRecord {
     /// `mc_async_compaction_entries`.
     #[serde(skip)]
     entries: BTreeMap<u64, Arc<HeldEntry>>,
-    /// Per-entry facts and their running totals; see `fold_entries`.
-    #[serde(skip)]
-    facts: BTreeMap<u64, resident::EntryFacts>,
+    /// Running totals over the held entries' decoded facts; see
+    /// `fold_entries`.
     #[serde(skip)]
     aggregates: resident::Aggregates,
+    /// Bytes held by the entries through the given ordinal, so the resident
+    /// size is updated by what each operation added.
+    #[serde(skip)]
+    entry_bytes: (Option<u64>, usize),
+    /// The engine's cache state as last fully loaded for the reminder pass;
+    /// see `engine_cache_state`.
+    #[serde(skip)]
+    cache_state: Option<resident::CachedEngineState>,
     #[serde(skip)]
     journal: Journal,
     seq: u64,
@@ -606,15 +619,16 @@ impl State {
                 self.entries.retain(|ordinal, _| *ordinal <= through);
                 self.tag_index
                     .retain(|_, address| address.ordinal <= through);
-                self.facts.retain(|ordinal, _| *ordinal <= through);
             }
             None => {
                 self.entries.clear();
                 self.tag_index.clear();
-                self.facts.clear();
             }
         }
-        self.recount_facts();
+        // A cut is rare (a fork descent or a resync): the next notice folds
+        // the remaining entries again from the first.
+        self.aggregates = resident::Aggregates::default();
+        self.entry_bytes = (None, 0);
         let journal = &mut self.journal;
         journal.truncate = Some(match (journal.truncate, through) {
             (Some(None), _) | (_, None) => None,
@@ -626,32 +640,6 @@ impl State {
         journal.indexed_through = cut(journal.indexed_through);
     }
 
-    /// Recompute the running totals from the per-entry facts, after a cut.
-    /// Reads no entry: the facts are already decoded.
-    fn recount_facts(&mut self) {
-        let mut aggregates = resident::Aggregates::default();
-        for (ordinal, facts) in &self.facts {
-            if aggregates
-                .through
-                .is_some_and(|through| through + 1 != *ordinal)
-            {
-                break;
-            }
-            let mid = self
-                .entries
-                .get(ordinal)
-                .map_or("", |entry| entry.mid.as_str());
-            aggregates.add(*ordinal, mid, *facts);
-        }
-        // Facts past a gap are dropped: `fold_entries` recomputes them.
-        if let Some(through) = aggregates.through {
-            self.facts.retain(|ordinal, _| *ordinal <= through);
-        } else {
-            self.facts.clear();
-        }
-        self.aggregates = aggregates;
-    }
-
     /// Decode, once each, the held entries not yet folded into the running
     /// totals, plus any entries a todo scan still needs (all of them when the
     /// scan restarts for a new lineage). Returns the decoded entries in
@@ -661,16 +649,9 @@ impl State {
         codec: codec::Codec,
         todo_through: Option<Option<u64>>,
     ) -> Result<Vec<ck_wire::CkIngressMessage>, HandlerOutcome> {
-        let first_held = self.entries.first_key_value().map(|(n, _)| *n);
-        // The facts are contiguous from the first held entry.
-        let folded = self
-            .aggregates
-            .through
-            .filter(|_| self.facts.keys().next().copied() == first_held);
-        if folded.is_none() {
-            self.facts.clear();
-            self.aggregates = resident::Aggregates::default();
-        }
+        // The facts cover the held entries contiguously from the first one,
+        // through `aggregates.through`.
+        let folded = self.aggregates.through;
         let from = match todo_through {
             Some(todo) => match (folded, todo) {
                 (Some(folded), Some(todo)) => Some(folded.min(todo)),
@@ -693,16 +674,32 @@ impl State {
                     real_user: message.ck.role == "user" && tool_results == 0,
                     tool_results,
                 };
-                self.facts.insert(*ordinal, facts);
-                self.aggregates.add(*ordinal, &entry.mid, facts);
+                self.aggregates.add(*ordinal, &entry.mid, facts, &message);
             }
             decoded.push(message);
         }
         Ok(decoded)
     }
 
-    /// Bytes this record keeps alive while resident.
-    fn retained_bytes(&self) -> usize {
+    /// Bytes this record keeps alive while resident. Entries are counted
+    /// from where the last count stopped; tag addresses are estimated per tag.
+    fn retained_bytes(&mut self) -> usize {
+        let (through, mut entries) = self.entry_bytes;
+        let from = match through {
+            Some(through) if self.entries.contains_key(&through) => {
+                std::ops::Bound::Excluded(through)
+            }
+            _ => {
+                entries = 0;
+                std::ops::Bound::Unbounded
+            }
+        };
+        entries += self
+            .entries
+            .range((from, std::ops::Bound::Unbounded))
+            .map(|(_, entry)| entry.retained_bytes())
+            .sum::<usize>();
+        self.entry_bytes = (self.entries.last_key_value().map(|(n, _)| *n), entries);
         let mut views = Vec::new();
         let mut bytes = std::mem::size_of::<Self>();
         for view in self
@@ -716,20 +713,10 @@ impl State {
                 views.push(Arc::clone(&view.json));
             }
         }
-        bytes += self
-            .entries
-            .values()
-            .map(|entry| entry.retained_bytes())
-            .sum::<usize>();
-        bytes += self
-            .tag_index
-            .iter()
-            .map(|(tag, address)| {
-                160 + tag.len() + address.mid.len() + address.part.len() + address.digest.len()
-            })
-            .sum::<usize>();
-        bytes += self.facts.len() * 64;
-        bytes
+        // A tag address: map node, tag, mid, part key and a 64-byte digest.
+        const TAG_ADDRESS: usize = 288;
+        let cache_state = self.cache_state.as_ref().map_or(0, |cached| cached.bytes);
+        bytes + entries + self.tag_index.len() * TAG_ADDRESS + cache_state
     }
 
     fn reset(&mut self, store: &McStore) -> Result<(), HandlerOutcome> {
@@ -1149,8 +1136,9 @@ impl McHandler {
             applied_view: None,
             lineage: request.lineage_id.clone(),
             entries: BTreeMap::new(),
-            facts: BTreeMap::new(),
             aggregates: Default::default(),
+            entry_bytes: Default::default(),
+            cache_state: None,
             seq: 0,
             completed_seq: 0,
             applied: None,
@@ -1964,7 +1952,7 @@ impl McHandler {
             .get()
             .ok_or_else(|| transient("store unavailable"))?;
         let namespace = state.namespace();
-        let loaded = store.load(&namespace).map_err(transient)?;
+        let loaded = self.engine_cache_state(store, state)?;
         let config = self.effective_config(&state.key.project);
         // Only the newest one or two entries are read here. The running
         // totals cover the rest; the tag hints, which need the whole tail,
@@ -2044,7 +2032,7 @@ impl McHandler {
         let window = notice.window.or(state.setup.context_window).unwrap_or(0);
         let held: &State = state;
         let hints = || {
-            async_reminder_hints(store, held, codec, &loaded, &config, window)
+            async_reminder_hints(store, held, codec, loaded.as_ref(), &config, window)
                 .map_err(|error| format!("{error:?}"))
         };
         let conditions = crate::runner_reminders::ReminderConditions {
@@ -2089,6 +2077,47 @@ impl McHandler {
             tracing::warn!(%error,"async reminder send unavailable");
         }
         Ok(())
+    }
+
+    /// The engine's cache state (core and meta) for the reminder pass. The
+    /// full load reads every tail hygiene measurement, so the resident record
+    /// keeps the last one and reuses it while the small row's version is
+    /// unchanged. The first reminder pass of a generation always loads it,
+    /// because it copies the whole meta into the reminder cadence.
+    fn engine_cache_state(
+        &self,
+        store: &McStore,
+        state: &mut State,
+    ) -> Result<Arc<mc_store::LoadedState>, HandlerOutcome> {
+        let namespace = state.namespace();
+        #[cfg(test)]
+        if self.async_oracle() {
+            return Ok(Arc::new(store.load(&namespace).map_err(transient)?));
+        }
+        if state.reminder_cadence.is_some() {
+            let small = store.load_meta(&namespace).map_err(transient)?;
+            if let Some(cached) = state.cache_state.as_ref().filter(|cached| {
+                cached.namespace == namespace
+                    && small.row_version == Some(cached.row_version)
+                    && small.meta.user_profile_version == cached.user_profile_version
+            }) {
+                return Ok(Arc::clone(&cached.loaded));
+            }
+        }
+        let loaded = Arc::new(store.load(&namespace).map_err(transient)?);
+        state.cache_state = loaded.row_version.map(|row_version| {
+            let bytes = serde_json::to_vec(&loaded.meta).map_or(0, |bytes| bytes.len())
+                + serde_json::to_vec(&loaded.core).map_or(0, |bytes| bytes.len());
+            resident::CachedEngineState {
+                namespace,
+                row_version,
+                user_profile_version: loaded.meta.user_profile_version,
+                // Parsed structures take more than their JSON.
+                bytes: bytes * 2,
+                loaded: Arc::clone(&loaded),
+            }
+        });
+        Ok(loaded)
     }
 
     fn async_binding(&self, state: &State) -> SessionBinding {
@@ -2523,7 +2552,21 @@ impl McHandler {
         let cadence = state.historian_cadence.clone();
         let settings = self.historian_settings_loader()(&state.key.project);
         let harness = state.key.harness.clone();
+        #[cfg(test)]
+        let inflight = {
+            struct Inflight(Arc<std::sync::atomic::AtomicU64>);
+            impl Drop for Inflight {
+                fn drop(&mut self) {
+                    self.0.fetch_sub(1, std::sync::atomic::Ordering::SeqCst);
+                }
+            }
+            let counter = Arc::clone(&self.provider_store.async_runtime.historian_inflight);
+            counter.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            Inflight(counter)
+        };
         tokio::spawn(async move {
+            #[cfg(test)]
+            let _inflight = inflight;
             let configured = super::historian_config::resolve_with_model_catalog(
                 &settings,
                 &harness,
@@ -2807,35 +2850,95 @@ impl McHandler {
         let config = &binding.config;
         let usage = notice.est_tokens as f64 * 100.0 / window.max(1) as f64;
         let policy = state.usage_policy.as_ref();
-        let pressure = usage >= config.resolve_execute_threshold(Some(model)).percentage
-            || usage >= 85.0
-            || usage >= 95.0
-            || meta.emergency_drain_active
-            || policy.is_some_and(|policy| policy.emergency_recovery_armed);
-        let forced_work = !meta.initialized
-            || meta.soft_refresh_pending
-            || meta.pending_rewrite.is_some()
-            || meta.bootstrap_seed_fold_pending
-            || meta.deferred_execute_state.is_some()
-            || meta.pending_compaction_marker.is_some()
-            || meta.boundary_divergence_pending_count > 0
-            || !meta.reasoning_clear_initialized
-            || meta.last_model_key != model
-            || state.restored_head.is_some()
-            || state.engine.preset != transform::compaction::Preset::Head;
-        if pressure || forced_work {
+        let blockers = [
+            (
+                usage >= config.resolve_execute_threshold(Some(model)).percentage,
+                "execute_threshold",
+            ),
+            (usage >= 85.0, "force_band"),
+            (usage >= 95.0 || meta.emergency_drain_active, "emergency"),
+            (
+                policy.is_some_and(|policy| policy.emergency_recovery_armed),
+                "emergency_recovery_armed",
+            ),
+            (!meta.initialized, "uninitialized"),
+            (meta.soft_refresh_pending, "soft_refresh_pending"),
+            (meta.pending_rewrite.is_some(), "pending_rewrite"),
+            (
+                meta.bootstrap_seed_fold_pending,
+                "bootstrap_seed_fold_pending",
+            ),
+            (
+                meta.deferred_execute_state.is_some(),
+                "deferred_execute_state",
+            ),
+            (
+                meta.pending_compaction_marker.is_some(),
+                "pending_compaction_marker",
+            ),
+            (
+                meta.boundary_divergence_pending_count > 0,
+                "boundary_divergence",
+            ),
+            (
+                !meta.reasoning_clear_initialized,
+                "reasoning_clear_uninitialized",
+            ),
+            (meta.last_model_key != model, "model_changed"),
+            (state.restored_head.is_some(), "restored_head"),
+            (
+                state.engine.preset != transform::compaction::Preset::Head,
+                "subagent_preset",
+            ),
+            // The engine refuses a range that cuts a tool arc; run it so the
+            // notice fails the same way.
+            (
+                state.aggregates.through != state.entries.last_key_value().map(|(n, _)| *n),
+                "unfolded_entries",
+            ),
+            (
+                !state.aggregates.open_calls.is_empty() || state.aggregates.orphan_result,
+                "open_tool_arc",
+            ),
+        ];
+        if let Some((_, reason)) = blockers.iter().find(|(blocks, _)| *blocks) {
+            #[cfg(test)]
+            resident::counters::engine_reason(reason);
+            let _ = reason;
             return Ok(false);
         }
         // The same producer context `async_engine` gives the engine.
         let work = self.provider_work(0, store, binding.clone(), state.key.clone())?;
         let mut context = compaction::producer_context(&work, model, window, false);
         context.cache_ttl = "never".into();
-        Ok(
-            transform::compaction::skip_facts(store, &namespace, &context, model, window)
-                .map_err(transient)?
-                .as_ref()
-                .is_some_and(transform::compaction::can_skip_classified),
+        let facts = transform::compaction::skip_facts_with(
+            store, &namespace, &context, model, window, true,
         )
+        .map_err(transient)?;
+        let skip = facts
+            .as_ref()
+            .is_some_and(transform::compaction::can_skip_classified);
+        #[cfg(test)]
+        if !skip {
+            let units = store
+                .load_compaction_trigger_core(&namespace)
+                .ok()
+                .flatten()
+                .map(|core| {
+                    core.frozen_units
+                        .iter()
+                        .map(|unit| unit.key.split(':').next().unwrap_or_default().to_owned())
+                        .collect::<BTreeSet<_>>()
+                })
+                .unwrap_or_default();
+            resident::counters::engine_reason(&format!(
+                "classifier {facts:?} units={units:?} protected={:?} seed={} rewrite={}",
+                meta.protected_tokens_effective,
+                meta.bootstrap_seed_fold_pending,
+                meta.pending_rewrite.is_some()
+            ));
+        }
+        Ok(skip)
     }
 
     async fn publish_async_wake(&self, reference: &str) -> Result<(), HandlerOutcome> {

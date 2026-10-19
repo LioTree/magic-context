@@ -2459,6 +2459,24 @@ pub mod compaction {
         model: &str,
         window: u64,
     ) -> Result<Option<ClassifierInput>, TransformError> {
+        skip_facts_with(store, namespace, ctx, model, window, false)
+    }
+
+    /// [`skip_facts`] for a caller whose held transcript is append-only and
+    /// digest-checked, as the async compaction provider's is: any change to a
+    /// held message forces a resync, which runs the engine. Replay treatments
+    /// then cannot meet content they need to repair, and project docs enter
+    /// the prefix only when a HARD pass renders it, so neither forces the
+    /// engine on its own the way they must for a host whose history can
+    /// change under it.
+    pub fn skip_facts_with(
+        store: &McStore,
+        namespace: &str,
+        ctx: &ProducerContext<'_>,
+        model: &str,
+        window: u64,
+        immutable_history: bool,
+    ) -> Result<Option<ClassifierInput>, TransformError> {
         let Some(core) = store.load_compaction_trigger_core(namespace)? else {
             return Ok(None);
         };
@@ -2494,8 +2512,9 @@ pub mod compaction {
             hard_fold_requested: first_fold || external || protection || meta.bootstrap_seed_fold_pending || meta.pending_rewrite.is_some()
                 // Replay treatments can need content-dependent repair. Without
                 // decoding content a preflight cannot prove them safe to skip.
-                || core.frozen_units.iter().any(|u| !matches!(u.key.as_str(), "m0" | "m1" | "m0-mural"))
-                || ctx.inject_docs,
+                || (!immutable_history
+                    && (core.frozen_units.iter().any(|u| !matches!(u.key.as_str(), "m0" | "m1" | "m0-mural"))
+                        || ctx.inject_docs)),
             boundary_present: true,
             reconcile_pending: core.reconcile_pending,
             m1_revision_changed: signal.revision != meta.m1_revision,
