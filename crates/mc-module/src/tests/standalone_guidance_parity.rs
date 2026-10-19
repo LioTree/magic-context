@@ -81,11 +81,12 @@ fn module_config(row: &Value, override_sample: &str, compaction_enabled: bool) -
     config
 }
 
-/// The catalog's `system_text.text` for `preset` with the composition a mode-3
-/// runner admits: Magic Context compacts the session and is listed with the
-/// tools it serves under this configuration and these params. The catalog
-/// refuses a composition whose list differs from what it serves, so a wrong
-/// list here fails the row loudly instead of comparing the wrong text.
+/// The catalog's `system_text.text` for `preset`, asked the way a runner asks
+/// when it admits a session: the request's composition names Magic Context as
+/// the session's compaction provider and lists the Magic Context tools that
+/// `config` and `params` serve. The catalog refuses a composition whose tool
+/// list differs from the list it serves, so a wrong list built here fails the
+/// row instead of comparing the wrong text.
 fn served_text(preset: &str, params: Value, config: &CatalogConfig) -> Result<String, String> {
     let role = tool_catalog::Preset::parse(preset).expect("known preset");
     let excluded: Vec<&str> = params["exclude"]
@@ -183,8 +184,9 @@ fn catalog_system_text_matches_standalone_guidance_for_every_configuration() {
             "subagent" => "worker",
             other => panic!("unknown session kind {other}"),
         };
-        // A session without ctx_reduce: compaction's tool off in config, and
-        // the runner excluding the tool. One way when ctx_reduce is callable.
+        // A row without ctx_reduce is checked both ways a session can lack the
+        // tool: config turns compaction's tool off, or the runner excludes it
+        // with `params.exclude`. A row with ctx_reduce is checked once.
         let ways: Vec<(bool, Value)> = if flag(row, "ctx_reduce") {
             vec![(true, json!({}))]
         } else {
@@ -215,6 +217,11 @@ fn catalog_system_text_matches_standalone_guidance_for_every_configuration() {
         "{} failures over {} rows (a row without ctx_reduce is checked two ways); first:\n{}",
         failures.len(),
         fixture.rows.len(),
-        failures.iter().take(3).cloned().collect::<Vec<_>>().join("\n\n")
+        failures
+            .iter()
+            .take(3)
+            .cloned()
+            .collect::<Vec<_>>()
+            .join("\n\n")
     );
 }

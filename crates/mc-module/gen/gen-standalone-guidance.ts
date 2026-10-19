@@ -216,9 +216,10 @@ async function capture(): Promise<string> {
             };
             let composed: string;
             if (row.harness === "opencode") {
-                // `hook.ts` builds the handler from config; a session whose first
-                // user message's tools map denies ctx_reduce is the per-session
-                // way OpenCode makes ctx_reduce uncallable.
+                // `hook.ts` builds the handler from config. OpenCode freezes
+                // whether a session may call ctx_reduce from the tools map on its
+                // first user message, so a row without ctx_reduce gives that
+                // message a map that denies the tool.
                 availability.resolveCtxReduceAvailabilityFromMessages(sessionId, [
                     { info: { role: "user", tools: row.ctx_reduce ? {} : { ctx_reduce: false } } },
                 ]);
