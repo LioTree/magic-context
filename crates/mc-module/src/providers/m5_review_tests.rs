@@ -689,9 +689,13 @@ async fn review_wait_idle(h: &McHandler) {
     .expect("recovery must release the durable veto");
 }
 
+/// A module kill at each point of a runner-lane run: after the send but before the
+/// runner's terminal, after the terminal but before publication, and after
+/// publication. A restart follows the same run on the session's runner: it neither
+/// sends again nor loses the output, and publishes exactly once.
 #[tokio::test]
 async fn review_m5_provider_crash_claim_report_publish_matrix() {
-    for phase in ["queued", "claimed", "reported", "published"] {
+    for phase in ["sent", "terminal", "published"] {
         let dir = tempfile::tempdir().unwrap();
         let h = handler(dir.path());
         declare(&h).await;
@@ -716,70 +720,28 @@ async fn review_m5_provider_crash_claim_report_publish_matrix() {
             p.task,
         ));
         let run = pending(&h).await;
-        let mut claim = Value::Null;
-        if phase != "queued" {
-            claim = dispatch(&h, json!({"method":"historian.claim","v":1,"run_id":run["run_id"],"claimant_instance_id":"first-host"})).await;
-            assert_eq!(claim["ok"], true);
-        }
-        let output = format!(
-            r#"<output><compartments><compartment start="{from}" end="{to}" title="crash recovery" episode_type="feature" importance="60"><p1>recovered history</p1><p2>short summary</p2><p3>arc</p3><p4 /></compartment></compartments><meta><messages_processed>{from}-{to}</messages_processed><unprocessed_from>{}</unprocessed_from></meta></output>"#,
-            to + 1
-        );
         if phase == "published" {
-            let reply = dispatch(&h,json!({"method":"historian.complete","v":1,"run_id":run["run_id"],"token":claim["token"],"output":{"text":output,"length_capped":false}})).await;
-            assert_eq!(reply["ok"], true);
+            claim_and_report(&h, run.clone(), from, to).await;
             task.await.unwrap().unwrap();
         } else {
             task.abort();
             assert!(matches!(task.await, Err(error) if error.is_cancelled()));
+            if phase == "terminal" {
+                claim_and_report(&h, run.clone(), from, to).await;
+            }
         }
         drop(h);
         let restarted = handler(dir.path());
-        if phase == "reported" {
-            let reply = dispatch(&restarted,json!({"method":"historian.complete","v":1,"run_id":run["run_id"],"token":claim["token"],"output":{"text":output,"length_capped":false}})).await;
-            assert_eq!(reply["ok"], true);
-        }
         review_sync(&restarted, &[], json!({}));
         restarted
             .provider_historian_worker()
             .prepare_provider_historian(&binding(&restarted), &key(&restarted))
             .await
             .unwrap();
-        if phase == "queued" || phase == "claimed" {
-            let claimed = if phase == "queued" {
-                let offered = pending(&restarted).await;
-                assert_eq!(offered["run_id"], run["run_id"]);
-                dispatch(&restarted,json!({"method":"historian.claim","v":1,"run_id":run["run_id"],"claimant_instance_id":"second-host"})).await
-            } else {
-                let store = restarted.store.get().unwrap();
-                let project = restarted
-                    .route_project(7, store, &binding(&restarted))
-                    .unwrap()
-                    .key;
-                let takeover = store
-                    .claim_historian_run(
-                        &project,
-                        run["run_id"].as_str().unwrap(),
-                        "second-host",
-                        claim["claim_deadline_ms"].as_i64().unwrap(),
-                    )
-                    .unwrap();
-                let mc_store::HistorianClaimOutcome::Claimed(takeover) = takeover else {
-                    panic!("stale lease must transfer")
-                };
-                let late = dispatch(&restarted,json!({"method":"historian.complete","v":1,"run_id":run["run_id"],"token":claim["token"],"output":{"text":output,"length_capped":false}})).await;
-                assert_eq!(late["refusal"], "superseded_token");
-                json!({"ok":true,"token":takeover.token})
-            };
-            assert_eq!(claimed["ok"], true);
-            let reply = dispatch(&restarted,json!({"method":"historian.complete","v":1,"run_id":run["run_id"],"token":claimed["token"],"output":{"text":output,"length_capped":false}})).await;
-            assert_eq!(reply["ok"], true);
-            review_sync(&restarted, &[], json!({}));
-            restarted
-                .provider_historian_worker()
-                .prepare_provider_historian(&binding(&restarted), &key(&restarted))
-                .await
-                .unwrap();
+        if phase == "sent" {
+            let offered = pending(&restarted).await;
+            assert_eq!(offered["run_id"], run["run_id"]);
+            claim_and_report(&restarted, offered, from, to).await;
         }
         review_wait_idle(&restarted).await;
         assert_eq!(
@@ -792,6 +754,11 @@ async fn review_m5_provider_crash_claim_report_publish_matrix() {
                 .len(),
             1,
             "phase={phase}: exactly one publication"
+        );
+        assert_eq!(
+            runner(&restarted).sends().len(),
+            1,
+            "phase={phase}: the restart sends nothing new"
         );
         assert!(
             dispatch(&restarted, json!({"method":"historian.pending","v":1})).await["runs"]

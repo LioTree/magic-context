@@ -42,6 +42,8 @@ pub(crate) mod resident_hooks;
 mod resident_view;
 mod runner_resident;
 mod session_delete;
+#[cfg(test)]
+pub(crate) mod session_runner_fake;
 mod step_transform;
 #[cfg(test)]
 mod tests;
@@ -459,6 +461,7 @@ impl McHandler {
                 store.prepare_provider_wal();
             }
         }
+        let setup_binding = (method == "compaction.setup").then(|| binding.clone());
         let result = match method {
             "compaction.setup" => self.provider_setup(channel, binding, params).await,
             "compaction.step" => self.provider_step(channel, binding, params).await,
@@ -472,6 +475,11 @@ impl McHandler {
             if let Some(store) = self.store.get() {
                 store.finish_provider_wal();
             }
+        }
+        if let (Ok(_), Some(binding)) = (&result, setup_binding) {
+            // An admitted runner-lane conversation is where its dream children
+            // will run, on the same runner, under this session.
+            self.record_runner_lane_dream_target(channel, &binding);
         }
         match result {
             Ok(bytes) => HandlerOutcome::Response(bytes),

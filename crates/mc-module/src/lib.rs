@@ -436,7 +436,7 @@ use historian_host::{HostReportDeliveryError, HostRunLedger, HostRunReport};
 use historian_producer::{HistorianProducer, HistorianProducerConfig, HistorianProducerError};
 use historian_runner::HistorianRunnerKind;
 use prompt_surface::{PromptSurfacePreset, PromptSurfaceSelection};
-use route_targets::{route_targets, RouteTargetConfig};
+use route_targets::{route_targets, RouteTargetConfig, SessionRunnerRoute};
 use scheduler::MIN_PLAUSIBLE_CONTEXT_LIMIT;
 use selection::SelKind;
 #[cfg(test)]
@@ -4297,6 +4297,38 @@ pub trait HistorianProducerFactory: Send + Sync {
         &self,
         project_root: &Path,
     ) -> Result<Box<dyn HistorianProducerDriver + Send>, HistorianProducerError>;
+
+    /// Connect a producer whose runs go to a runner-lane conversation's own runner
+    /// (`route`), as hidden children of that conversation's session. A factory that
+    /// cannot reach session runners refuses rather than falling back to the
+    /// configured runner, which would run the call outside the session's host.
+    async fn connect_session_runner(
+        &self,
+        _project_root: &Path,
+        route: &SessionRunnerRoute,
+    ) -> Result<Box<dyn HistorianProducerDriver + Send>, HistorianProducerError> {
+        Err(HistorianProducerError::Subc(
+            historian_producer::ProducerErrorBody::untagged(
+                "session_runner_unavailable",
+                format!(
+                    "no session runner transport for module {}",
+                    route.module_id()
+                ),
+            ),
+        ))
+    }
+}
+
+/// The route a runner-lane conversation's background model calls take, or `None`
+/// for a conversation that keeps the configured runner (it is not on a runner lane,
+/// or the user explicitly configured `broca`).
+fn session_runner_route(
+    binding: &SessionBinding,
+    resolved: historian_runner::ResolvedRunner,
+) -> Option<SessionRunnerRoute> {
+    historian_runner::uses_session_runner(resolved)
+        .then(|| SessionRunnerRoute::for_principal(binding.principal.as_ref(), &binding.session))
+        .flatten()
 }
 
 struct RealHistorianProducerFactory {
@@ -4320,6 +4352,28 @@ impl HistorianProducerFactory for RealHistorianProducerFactory {
                     "opencode",
                 )
             })
+            .await?,
+        ))
+    }
+
+    async fn connect_session_runner(
+        &self,
+        project_root: &Path,
+        route: &SessionRunnerRoute,
+    ) -> Result<Box<dyn HistorianProducerDriver + Send>, HistorianProducerError> {
+        Ok(Box::new(
+            HistorianProducer::connect_to_session_runner(
+                HistorianProducerConfig {
+                    handshake_timeout: Duration::from_secs(2),
+                    route_targets: self.route_targets.clone(),
+                    ..HistorianProducerConfig::new(
+                        self.connection_file.clone(),
+                        project_root,
+                        "opencode",
+                    )
+                },
+                route.clone(),
+            )
             .await?,
         ))
     }
@@ -4551,6 +4605,9 @@ struct HistorianPrepareContext<'a> {
     /// Early pass-through paths leave this absent and retain the legacy store fallback.
     tag_snapshot: Option<Arc<Vec<McTagRow>>>,
     reclaim_ride_available: bool,
+    /// Whether the conversation is on a runner lane: its firings and restart
+    /// reattach run on its own runner. Only the provider (runner-lane) path sets it.
+    runner_lane: bool,
     timings: &'a mut HistorianTriggerTimings,
 }
 
@@ -4558,6 +4615,7 @@ struct ReattachPublicationGuards {
     rust_background_enabled: bool,
     snapshot_generation: Option<u64>,
     log_fence: Option<Arc<dyn historian::HistorianPublicationFence>>,
+    session_runner: Option<SessionRunnerRoute>,
 }
 
 #[derive(Default)]
@@ -4867,6 +4925,10 @@ struct HistorianFiringTask {
     runner: HistorianRunnerKind,
     /// Waiters for runs queued for a claimant. Unused by the in-module runner.
     host_runs: Arc<HostRunLedger>,
+    /// Set for a runner-lane conversation: the completion runs on the
+    /// conversation's own runner over llm-runner, never on the claim queue and
+    /// never on the configured runner, whatever `runner` says.
+    session_runner: Option<SessionRunnerRoute>,
     model_chain_generation: u64,
     runner_refusal_cache: Arc<HistorianRunnerRefusalCache>,
     live_guard: SessionSetGuard,
@@ -6745,6 +6807,7 @@ impl McHandler {
             rust_background_enabled,
             snapshot_generation,
             log_fence: log_publication_fence,
+            session_runner,
         } = guards;
         let project_path = binding.project_root.to_string_lossy().to_string();
         let harness = binding.harness.clone();
@@ -7040,7 +7103,14 @@ impl McHandler {
                             }
                             historian::RestartAction::ReattachProducer { .. } => {}
                         }
-                        let mut producer = factory.connect(&project_root).await?;
+                        // A run started on the conversation's own runner is
+                        // followed there; its run id means nothing to any other.
+                        let mut producer = match &session_runner {
+                            Some(route) => {
+                                factory.connect_session_runner(&project_root, route).await?
+                            }
+                            None => factory.connect(&project_root).await?,
+                        };
                         reattach_historian_producer(
                             &mut *producer,
                             historian::HistorianReattachRequest {
@@ -7131,6 +7201,7 @@ impl McHandler {
             publication_fence,
             tag_snapshot,
             reclaim_ride_available,
+            runner_lane,
             timings,
         } = prepare;
         let trigger_timer = HistorianTriggerTimer {
@@ -7208,6 +7279,9 @@ impl McHandler {
         let cfg = self.effective_config(&binding.project_root);
         let rust_background_enabled =
             rust_background_enabled.unwrap_or_else(|| cfg.rust_background_enabled());
+        let session_runner = runner_lane
+            .then(|| session_runner_route(binding, cfg.historian_runner_for(&binding.harness)))
+            .flatten();
         if loaded.meta.historian.state != HistorianPhase::Idle {
             let no_fire = self
                 .maybe_spawn_reattach(
@@ -7217,6 +7291,7 @@ impl McHandler {
                         rust_background_enabled,
                         snapshot_generation,
                         log_fence: publication_fence.clone(),
+                        session_runner: session_runner.clone(),
                     },
                     binding,
                     projection,
@@ -7756,6 +7831,7 @@ impl McHandler {
                 firing,
                 runner: self.record_historian_runner(&parsed.session_id, &cfg, &binding.harness),
                 host_runs: Arc::clone(&self.host_runs),
+                session_runner,
                 model_chain_generation,
                 runner_refusal_cache: Arc::clone(&self.historian_runner_refusals),
                 live_guard,
@@ -7924,6 +8000,9 @@ impl McHandler {
                 &binding.harness,
             ),
             host_runs: Arc::clone(&self.host_runs),
+            // Wrapup belongs to the request-driven transform path, which keeps the
+            // configured runner.
+            session_runner: None,
             model_chain_generation,
             runner_refusal_cache: Arc::clone(&self.historian_runner_refusals),
             live_guard,
@@ -8027,6 +8106,7 @@ impl McHandler {
             firing,
             runner,
             host_runs,
+            session_runner,
             model_chain_generation,
             runner_refusal_cache,
             live_guard,
@@ -8047,7 +8127,7 @@ impl McHandler {
         );
         let failure_started_at_ms = firing.now_ms;
         let configured_failure_backoff_at_ms = firing.failure_backoff_at_ms;
-        if runner == HistorianRunnerKind::Host {
+        if runner == HistorianRunnerKind::Host && session_runner.is_none() {
             // The host lane never opens a Broca route, so there is no connect step
             // to fail: the run is queued and this task waits for a claimant.
             let mut request = firing.as_fire_request(
@@ -8081,7 +8161,11 @@ impl McHandler {
             }
             return result;
         }
-        let result = match factory.connect(&project_root).await {
+        let connected = match &session_runner {
+            Some(route) => factory.connect_session_runner(&project_root, route).await,
+            None => factory.connect(&project_root).await,
+        };
+        let result = match connected {
             Ok(mut producer) => {
                 let mut request = firing.as_fire_request(
                     &store,
@@ -12320,6 +12404,7 @@ impl McHandler {
                     publication_fence: None,
                     tag_snapshot: result.historian_tags.clone(),
                     reclaim_ride_available: result.reclaim_ride_available,
+                    runner_lane: false,
                     timings: &mut trigger_timings,
                 },
             ) {
@@ -12354,6 +12439,7 @@ impl McHandler {
                                 publication_fence: None,
                                 tag_snapshot: result.historian_tags.clone(),
                                 reclaim_ride_available: result.reclaim_ride_available,
+                                runner_lane: false,
                                 timings: &mut trigger_timings,
                             },
                         ) {
@@ -12429,6 +12515,7 @@ impl McHandler {
                     publication_fence: None,
                     tag_snapshot: result.historian_tags.clone(),
                     reclaim_ride_available: result.reclaim_ride_available,
+                    runner_lane: false,
                     timings: &mut trigger_timings,
                 },
             ) {
@@ -13971,7 +14058,13 @@ impl McHandler {
                 &ledger_session,
                 runner_choices::RunnerChoice::new(dreamer_runner, &binding.harness),
             );
-        if host_completion.is_none() && dreamer_runner.kind == HistorianRunnerKind::Host {
+        // A runner-lane route runs the completion on its own runner, so it is never
+        // asked to run and resend it as a host completion.
+        let session_runner = session_runner_route(&binding, dreamer_runner);
+        if host_completion.is_none()
+            && dreamer_runner.kind == HistorianRunnerKind::Host
+            && session_runner.is_none()
+        {
             tracing::info!(
                 "mc-module: classify runner=host ({}): the host runs the completion for command {command_id}",
                 dreamer_runner.source.describe()
@@ -14047,7 +14140,15 @@ impl McHandler {
                     attempt_errors.push(format!("{model}: {detail}"));
                 }
             };
-            let mut producer = match self.producer_factory.connect(&binding.project_root).await {
+            let connected = match &session_runner {
+                Some(route) => {
+                    self.producer_factory
+                        .connect_session_runner(&binding.project_root, route)
+                        .await
+                }
+                None => self.producer_factory.connect(&binding.project_root).await,
+            };
+            let mut producer = match connected {
                 Ok(producer) => producer,
                 Err(error) => {
                     record_attempt("connect_failed", error.to_string());

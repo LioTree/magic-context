@@ -328,7 +328,14 @@ impl Ownership {
 }
 
 /// Why `task` is not published for this input, or `None` when Rust runs it.
-fn withheld_reason(task: TaskName, input: &OwnershipInput<'_>) -> Option<String> {
+/// `session_runner` is set when the project's children go to a runner-lane
+/// conversation's own runner (see `historian_runner::uses_session_runner`); its
+/// value says whether this process can open routes to that runner at all.
+fn withheld_reason(
+    task: TaskName,
+    input: &OwnershipInput<'_>,
+    session_runner: Option<bool>,
+) -> Option<String> {
     if !input.config.rust_background_enabled() {
         return Some("inactive".into());
     }
@@ -341,6 +348,24 @@ fn withheld_reason(task: TaskName, input: &OwnershipInput<'_>) -> Option<String>
     let Some(settings) = input.settings else {
         return Some("config_unavailable".into());
     };
+    if let Some(wired) = session_runner {
+        // The child runs in the session's own runner through the same llm-runner
+        // carrier as Broca, so it needs the same model and file-read guarantees,
+        // but neither a configured Broca runner nor a host claimant.
+        if !wired {
+            return Some("session_runner_unwired".into());
+        }
+        if resolve_task_models(settings, input.harness, task.as_str())
+            .primary
+            .is_none()
+        {
+            return Some("session_runner_model_required".into());
+        }
+        if reads_repository(roles) && !input.wiring.broca_file_read {
+            return Some("session_runner_file_read".into());
+        }
+        return None;
+    }
     let runner = input.config.dreamer_runner_for(input.harness);
     match runner.kind {
         HistorianRunnerKind::Broca => {
@@ -362,12 +387,7 @@ fn withheld_reason(task: TaskName, input: &OwnershipInput<'_>) -> Option<String>
             }
             // A child whose tools are not all served by Magic Context itself reads
             // files through AFT, which only a runner declaring file reads carries.
-            let reads_files = roles.iter().any(|role| {
-                role.tools()
-                    .iter()
-                    .any(|tool| !super::broca_carrier::MC_TOOLS.contains(tool))
-            });
-            if reads_files && !input.wiring.broca_file_read {
+            if reads_repository(roles) && !input.wiring.broca_file_read {
                 return Some("broca_file_read".into());
             }
             None
@@ -386,12 +406,29 @@ fn withheld_reason(task: TaskName, input: &OwnershipInput<'_>) -> Option<String>
     }
 }
 
+/// Whether any of these roles opens a child with a tool Magic Context does not
+/// serve itself: such a tool reads the repository through AFT.
+fn reads_repository(roles: &[DreamRole]) -> bool {
+    roles.iter().any(|role| {
+        role.tools()
+            .iter()
+            .any(|tool| !super::broca_carrier::MC_TOOLS.contains(tool))
+    })
+}
+
 /// Compute the published list. Pure: the caller supplies every input.
 pub fn publish(input: &OwnershipInput<'_>) -> Ownership {
+    publish_on(input, None)
+}
+
+/// Compute the published list. With `session_runner` set, the project's children
+/// run on a runner-lane conversation's own runner, and the value says whether this
+/// process can reach it; with `None` they run on the configured runner.
+pub fn publish_on(input: &OwnershipInput<'_>, session_runner: Option<bool>) -> Ownership {
     let mut published = Vec::new();
     let mut withheld = Vec::new();
     for task in CANONICAL_TASKS {
-        match withheld_reason(task, input) {
+        match withheld_reason(task, input, session_runner) {
             None => published.push(task),
             Some(reason) => withheld.push((task, reason)),
         }

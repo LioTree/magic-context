@@ -103,6 +103,63 @@ impl RouteTargetConfig {
     }
 }
 
+/// The runner module that owns OpenCode and Pi sessions on a runner lane.
+pub const THALAMUS_HARNESS_MODULE_ID: &str = "thalamus-harness";
+
+/// Runner modules that can run a session's background model calls (historian and
+/// dreamer) as hidden children of that same session, inside the session's own host.
+/// A conversation is on a runner lane when the daemon stamped one of these modules as
+/// the principal of the route that admitted it.
+pub const SESSION_RUNNER_MODULE_IDS: [&str; 2] =
+    [THALAMUS_HARNESS_MODULE_ID, DEFAULT_RUNNER_MODULE_ID];
+
+/// Where a runner-lane conversation's background model calls go: the llm-runner
+/// management surface of the module that runs the conversation, with the
+/// conversation's own session named as the parent of each hidden child.
+///
+/// The parent cannot ride the route's `BindIdentity` (it has no attribute field; its
+/// session slot names the child), so every send on this route carries it as the
+/// runner parameter `parent`. The runner uses it to admit `reserved:magic-context`
+/// only for sessions whose compaction provider is Magic Context.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct SessionRunnerRoute {
+    module_id: String,
+    parent_session: String,
+}
+
+impl SessionRunnerRoute {
+    /// The route for a conversation admitted under `principal` with runner session
+    /// `parent_session`. `None` when the principal is not a session runner module:
+    /// such a conversation keeps the process-configured routes.
+    pub fn for_principal(
+        principal: Option<&subc_protocol::Principal>,
+        parent_session: &str,
+    ) -> Option<Self> {
+        let Some(subc_protocol::Principal::Reserved { module_id }) = principal else {
+            return None;
+        };
+        (SESSION_RUNNER_MODULE_IDS.contains(&module_id.as_str()) && !parent_session.is_empty())
+            .then(|| Self {
+                module_id: module_id.clone(),
+                parent_session: parent_session.to_string(),
+            })
+    }
+
+    pub fn module_id(&self) -> &str {
+        &self.module_id
+    }
+
+    pub fn parent_session(&self) -> &str {
+        &self.parent_session
+    }
+
+    pub(crate) fn target(&self) -> RouteTarget {
+        RouteTarget::ManagementSurface {
+            module_id: self.module_id.clone(),
+        }
+    }
+}
+
 /// Every route-opening purpose in this crate. Callers must select one of these instead of
 /// constructing a `RouteTarget` directly.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]

@@ -765,6 +765,7 @@ impl McHandler {
                         })),
                         tag_snapshot: None,
                         reclaim_ride_available,
+                        runner_lane: true,
                         timings: &mut timings,
                     },
                 ))
@@ -807,6 +808,7 @@ impl McHandler {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::providers::session_runner_fake::FakeSessionRunner;
 
     #[tokio::test]
     async fn prepared_but_unlaunched_fire_retries_after_restart() {
@@ -1197,8 +1199,12 @@ mod tests {
     include!("historian_bounded_tests.rs");
     include!("m5_review_tests.rs");
 
+    /// The runner-lane fixture: the route is stamped `reserved:thalamus-harness`, so
+    /// historian firings go to that session's runner, here the fake session runner
+    /// kept for `path` (shared by a handler rebuilt on the same directory).
     fn handler(path: &Path) -> McHandler {
         let mut h = McHandler::new();
+        h.producer_factory = FakeSessionRunner::for_project(path).factory();
         h.provider_historian_budget = historian_budget::Budget::new(2, 512);
         h.fixed_config = Some(McModuleConfig {
             inject_docs: false,
@@ -1339,6 +1345,7 @@ mod tests {
                 publication_fence: None,
                 tag_snapshot: None,
                 reclaim_ride_available: inputs["reclaim_ride_available"].as_bool().unwrap_or(false),
+                runner_lane: true,
                 timings: &mut timings,
             },
         )
@@ -1572,18 +1579,22 @@ mod tests {
     async fn dispatch(h: &McHandler, value: Value) -> Value {
         response(h.dispatch_value(7, value).await)
     }
+    fn runner(h: &McHandler) -> Arc<FakeSessionRunner> {
+        FakeSessionRunner::for_project(&binding(h).project_root)
+    }
+    /// The historian run this conversation's own runner is working on. Runner
+    /// lanes never use the claim queue, so it must stay empty the whole time.
     async fn pending(h: &McHandler) -> Value {
-        tokio::time::timeout(Duration::from_secs(5), async {
-            loop {
-                let value = dispatch(h, json!({"method":"historian.pending","v":1})).await;
-                if let Some(run) = value["runs"].as_array().and_then(|runs| runs.first()) {
-                    return run.clone();
-                }
-                tokio::task::yield_now().await;
-            }
-        })
-        .await
-        .expect("a real historian run must enter the existing claim queue")
+        let send = tokio::time::timeout(Duration::from_secs(5), runner(h).next_unfinished())
+            .await
+            .expect("a real historian run must reach the session's own runner");
+        let queue = dispatch(h, json!({"method":"historian.pending","v":1})).await;
+        assert!(
+            queue["runs"].as_array().is_none_or(Vec::is_empty),
+            "a runner-lane run must never enter the claim queue: {queue}"
+        );
+        json!({"run_id": send.run_id, "send_id": send.send_id, "model": send.model,
+            "module": send.route.module_id(), "parent": send.route.parent_session()})
     }
     fn step(id: &str, newest: u64) -> Value {
         json!({"session":"s","harness":"opencode","request_id":id,"lineage_id":"L","step_id":"st","step_kind":"user_turn","model":"fixture","context_window":100000,"estimate":{"request_tokens":1000},"messages":[],"newest":{"ordinal":newest,"mid":format!("m{newest}")},"now":2})
@@ -1642,16 +1653,19 @@ mod tests {
         };
         p
     }
+    /// Finish the run on the session's runner, as its terminal would. The run went
+    /// to the conversation's own runner, named the conversation as its parent and
+    /// used the stored model chain.
     async fn claim_and_report(h: &McHandler, run: Value, from: u64, to: u64) {
-        let claim = dispatch(h,json!({"method":"historian.claim","v":1,"run_id":run["run_id"],"claimant_instance_id":"m5-host"})).await;
-        assert_eq!(claim["ok"], true, "{claim}");
-        assert_eq!(claim["model_chain"], json!(["test/model"]));
+        assert_eq!(run["module"], "thalamus-harness", "{run}");
+        assert_eq!(run["parent"], "s", "{run}");
+        assert_eq!(run["model"], "test/model", "{run}");
+        assert_eq!(runner(h).fixed_connects(), 0, "no configured-runner route");
         let output = format!(
             r#"<output><compartments><compartment start="{from}" end="{to}" title="ordinary append" episode_type="feature" importance="60"><p1>published provider history</p1><p2>short summary</p2><p3>arc</p3><p4 /></compartment></compartments><meta><messages_processed>{from}-{to}</messages_processed><unprocessed_from>{}</unprocessed_from></meta></output>"#,
             to + 1
         );
-        let complete = dispatch(h,json!({"method":"historian.complete","v":1,"run_id":run["run_id"],"token":claim["token"],"output":{"text":output,"length_capped":false}})).await;
-        assert_eq!(complete["ok"], true, "{complete}");
+        runner(h).finish(run["run_id"].as_str().unwrap(), output);
     }
 
     #[tokio::test]
@@ -1732,6 +1746,173 @@ mod tests {
         assert_eq!(before, after);
     }
 
+    /// A THALAMUS (OpenCode) runner-lane conversation's historian reaches that
+    /// session's own runner, `thalamus-harness`, naming the conversation as the
+    /// parent. It never opens the configured `broca` route and never enters the
+    /// claim queue, and its output publishes through the same CAS.
+    #[tokio::test]
+    async fn a_thalamus_session_historian_runs_on_its_own_runner_never_broca_or_claims() {
+        let dir = tempfile::tempdir().unwrap();
+        let h = handler(dir.path());
+        declare(&h).await;
+        let entries = corpus();
+        warm(&h, &entries[..3]).await;
+        let p = prepared_append(&h, &entries).await;
+        assert_eq!(
+            p.task
+                .session_runner
+                .as_ref()
+                .map(|route| (route.module_id(), route.parent_session())),
+            Some(("thalamus-harness", "s"))
+        );
+        let (from, to) = (p.task.firing.from_ordinal, p.task.firing.to_ordinal);
+        let worker = h.provider_historian_worker();
+        let task = tokio::spawn(McHandler::execute_historian_firing_task(
+            worker.producer_factory.clone(),
+            p.task,
+        ));
+        let run = tokio::time::timeout(Duration::from_secs(5), runner(&h).next_unfinished())
+            .await
+            .expect("the firing must reach the session's runner");
+        let queue = dispatch(&h, json!({"method":"historian.pending","v":1})).await;
+        assert!(
+            queue["runs"].as_array().is_none_or(Vec::is_empty),
+            "no claim queue on a runner lane: {queue}"
+        );
+        assert_eq!(
+            runner(&h).fixed_connects(),
+            0,
+            "no route to the configured broca module"
+        );
+        assert_eq!(
+            runner(&h)
+                .connects()
+                .iter()
+                .map(|route| (
+                    route.module_id().to_string(),
+                    route.parent_session().to_string()
+                ))
+                .collect::<Vec<_>>(),
+            vec![("thalamus-harness".to_string(), "s".to_string())]
+        );
+        claim_and_report(&h, pending(&h).await, from, to).await;
+        tokio::time::timeout(Duration::from_secs(5), task)
+            .await
+            .unwrap()
+            .unwrap()
+            .unwrap();
+        assert_eq!(run.model, "test/model");
+        assert_eq!(runner(&h).sends().len(), 1);
+        assert_eq!(
+            h.store.get().unwrap().load_compartments("s").unwrap().len(),
+            2
+        );
+    }
+
+    /// Admitting a runner-lane conversation makes it its project's dream target,
+    /// carrying the conversation's own runner and session: the dream tick then sends
+    /// that project's children there rather than to a host claimant.
+    #[tokio::test]
+    async fn an_admitted_runner_lane_conversation_is_its_projects_dream_parent() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut h = handler(dir.path());
+        h.fixed_config.as_mut().unwrap().rust_background_enabled = true;
+        declare(&h).await;
+        warm(&h, &corpus()[..3]).await;
+        let store = h.store.get().unwrap();
+        let project = h.historian_lane_project(7, &binding(&h), store).unwrap();
+        let target = h
+            .dream_runs
+            .target_for_test(&project)
+            .expect("dream target");
+        assert_eq!(target.session, "s");
+        assert_eq!(
+            target
+                .session_runner
+                .as_ref()
+                .map(|route| (route.module_id(), route.parent_session())),
+            Some(("thalamus-harness", "s"))
+        );
+    }
+
+    /// An explicitly configured `broca` is a deliberate choice of runner: a runner
+    /// lane then keeps the configured Broca module route rather than its own runner.
+    #[tokio::test]
+    async fn an_explicit_broca_runner_keeps_a_runner_lane_on_the_configured_route() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut h = handler(dir.path());
+        h.fixed_config.as_mut().unwrap().historian_runner = Some(HistorianRunnerKind::Broca);
+        declare(&h).await;
+        let entries = corpus();
+        warm(&h, &entries[..3]).await;
+        let p = prepared_append(&h, &entries).await;
+        assert!(p.task.session_runner.is_none());
+        let worker = h.provider_historian_worker();
+        let _ = tokio::time::timeout(
+            Duration::from_secs(5),
+            McHandler::execute_historian_firing_task(worker.producer_factory.clone(), p.task),
+        )
+        .await
+        .unwrap();
+        assert_eq!(runner(&h).fixed_connects(), 1);
+        assert!(runner(&h).connects().is_empty());
+        assert!(runner(&h).sends().is_empty());
+    }
+
+    /// The route comes from each conversation's own binding: its daemon-stamped
+    /// runner module and its session, which every send names as the parent.
+    #[test]
+    fn each_runner_lane_conversation_routes_to_its_own_runner_and_session() {
+        let lane = |module: &str, session: &str| {
+            let mut binding = SessionBinding {
+                connection_incarnation: 0,
+                native_generation: None,
+                principal: Some(subc_protocol::Principal::Reserved {
+                    module_id: module.into(),
+                }),
+                scope: None,
+                project_root: PathBuf::from("/project"),
+                harness: "opencode".into(),
+                session: session.into(),
+                model_key: None,
+                config: McModuleConfig::default(),
+                history_budget_tokens: 0.0,
+            };
+            let unset = crate::session_runner_route(
+                &binding,
+                binding.config.historian_runner_for("opencode"),
+            );
+            binding.config.historian_runner = Some(HistorianRunnerKind::Broca);
+            let broca = crate::session_runner_route(
+                &binding,
+                binding.config.historian_runner_for("opencode"),
+            );
+            (
+                unset.map(|route| {
+                    (
+                        route.module_id().to_string(),
+                        route.parent_session().to_string(),
+                    )
+                }),
+                broca,
+            )
+        };
+        assert_eq!(
+            lane("thalamus-harness", "ses-a"),
+            (Some(("thalamus-harness".into(), "ses-a".into())), None)
+        );
+        assert_eq!(
+            lane("thalamus-harness", "ses-b"),
+            (Some(("thalamus-harness".into(), "ses-b".into())), None)
+        );
+        assert_eq!(
+            lane("broca", "ses-c"),
+            (Some(("broca".into(), "ses-c".into())), None)
+        );
+        // Claude Code's gateway (`reserved:thalamus`) is not a session runner lane.
+        assert_eq!(lane("thalamus", "ses-d"), (None, None));
+    }
+
     #[tokio::test]
     async fn i4_provider_task_overrides_builder_off_default_with_captured_activation() {
         let dir = tempfile::tempdir().unwrap();
@@ -1778,12 +1959,14 @@ mod tests {
         ));
         let store = h.store.get().unwrap();
         assert_eq!(store.load_compartments("s").unwrap().len(), 1);
-        assert!(store
-            .load_parked_historian_run("s")
-            .unwrap()
-            .unwrap()
-            .report
-            .is_some());
+        // The deferred report stays recoverable: the run's output is durable on the
+        // session's runner, and the historian waits on that run for a later re-drain
+        // instead of parking a report for a claimant.
+        assert_eq!(
+            store.load_meta("s").unwrap().meta.historian.state,
+            HistorianPhase::AwaitingProducer
+        );
+        assert!(store.load_parked_historian_run("s").unwrap().is_none());
     }
 
     #[tokio::test]
@@ -1973,8 +2156,9 @@ mod tests {
                 .len(),
             1
         );
-        // Stop the in-memory firing task and host claim ledger. The database
-        // keeps the historian phase, claim row and provider message log.
+        // Stop the in-memory firing task, as killing this module after the send but
+        // before the run finishes would. The database keeps the historian phase and provider
+        // message log; the run itself stays on the session's runner.
         task.abort();
         assert!(task.await.unwrap_err().is_cancelled());
         drop(worker);
@@ -2060,7 +2244,12 @@ mod tests {
         })
         .await
         .unwrap();
-        assert_eq!(restarted.store.get().unwrap().load_compartments("s").unwrap().len(),2,"parked report uses the log fence and existing CAS, not an absent full-request snapshot");
+        assert_eq!(restarted.store.get().unwrap().load_compartments("s").unwrap().len(),2,"the reattached run publishes through the log fence and existing CAS, not an absent full-request snapshot");
+        assert_eq!(
+            runner(&restarted).sends().len(),
+            1,
+            "the restart follows the run it had sent; it sends nothing new"
+        );
     }
 
     #[tokio::test]

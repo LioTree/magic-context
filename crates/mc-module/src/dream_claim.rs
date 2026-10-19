@@ -130,6 +130,10 @@ impl McHandler {
                 session: binding.session.clone(),
                 harness: binding.harness.clone(),
                 seen_at_ms: now_ms(),
+                // A dream management route is the claim protocol's own route; only
+                // an admitted runner-lane conversation records a session runner
+                // (see `record_runner_lane_dream_target`).
+                session_runner: None,
             },
         );
         // Tests drive runs explicitly; a background timer would race them.
@@ -204,6 +208,45 @@ impl McHandler {
             wiring: &wiring,
             claimant: claimant.as_ref(),
         })
+    }
+
+    /// Remember an admitted runner-lane conversation as its project's dream target:
+    /// the tick then sends that project's dream children to the conversation's own
+    /// runner, as hidden children of this session, instead of queueing them for a
+    /// host claimant. Only while the Rust dreamer is switched on, as for
+    /// [`Self::record_dream_target`].
+    pub(crate) fn record_runner_lane_dream_target(&self, channel: u16, binding: &SessionBinding) {
+        let Some(session_runner) = crate::route_targets::SessionRunnerRoute::for_principal(
+            binding.principal.as_ref(),
+            &binding.session,
+        ) else {
+            return;
+        };
+        if self.host_provider_conversation(binding).is_none()
+            || !self
+                .effective_config(&binding.project_root)
+                .rust_background_enabled()
+        {
+            return;
+        }
+        let Some(store) = self.store.get() else {
+            return;
+        };
+        let Ok(project) = self.historian_lane_project(channel, binding, store) else {
+            return;
+        };
+        self.dream_runs.record(
+            &project,
+            DreamTarget {
+                directory: binding.project_root.clone(),
+                session: binding.session.clone(),
+                harness: binding.harness.clone(),
+                seen_at_ms: now_ms(),
+                session_runner: Some(session_runner),
+            },
+        );
+        #[cfg(not(test))]
+        self.dream_handles().ensure_timer();
     }
 
     /// `dream.ownership {v:1, claimant?}` answers with the published list for the
