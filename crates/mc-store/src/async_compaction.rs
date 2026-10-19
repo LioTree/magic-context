@@ -3,7 +3,82 @@
 use crate::{McStore, McStoreError, McTagRow};
 use rusqlite::{params, OptionalExtension};
 
+/// Write accounting for one async conversation, compiled only for sibling-crate
+/// tests. It lets a test prove that a notice's write set does not grow with the
+/// held transcript, and lets a benchmark report write-transaction time.
+#[cfg(feature = "test-support")]
+pub mod write_meter {
+    use std::collections::BTreeMap;
+    use std::sync::Mutex;
+    use std::time::Instant;
+
+    /// Totals since the meter was armed for a conversation. `bytes` counts the
+    /// text/blob cells written; `rows` counts rows inserted, updated or deleted;
+    /// `nanos` is the wall time of the fenced write calls, from BEGIN IMMEDIATE
+    /// through COMMIT.
+    #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+    pub struct AsyncWriteStats {
+        pub transactions: u64,
+        pub rows: u64,
+        pub bytes: u64,
+        pub nanos: u64,
+    }
+
+    static METERS: Mutex<BTreeMap<String, AsyncWriteStats>> = Mutex::new(BTreeMap::new());
+
+    /// Start (or restart) counting writes for `session_ref`.
+    pub fn arm(session_ref: &str) {
+        METERS
+            .lock()
+            .unwrap_or_else(|p| p.into_inner())
+            .insert(session_ref.into(), AsyncWriteStats::default());
+    }
+
+    /// The totals for an armed conversation; `None` when it is not armed.
+    pub fn read(session_ref: &str) -> Option<AsyncWriteStats> {
+        METERS
+            .lock()
+            .unwrap_or_else(|p| p.into_inner())
+            .get(session_ref)
+            .copied()
+    }
+
+    pub(crate) fn record(session_ref: &str, started: Instant, rows: u64, bytes: u64) {
+        let mut meters = METERS.lock().unwrap_or_else(|p| p.into_inner());
+        if let Some(stats) = meters.get_mut(session_ref) {
+            stats.transactions += 1;
+            stats.rows += rows;
+            stats.bytes += bytes;
+            stats.nanos += started.elapsed().as_nanos() as u64;
+        }
+    }
+}
+
+/// Records one fenced write for the test meter; compiles to nothing otherwise.
+macro_rules! metered {
+    ($session_ref:expr, $write:expr) => {{
+        #[cfg(feature = "test-support")]
+        let started = std::time::Instant::now();
+        let result = $write;
+        #[cfg(feature = "test-support")]
+        if let Ok((_, rows, bytes)) = &result {
+            write_meter::record($session_ref, started, *rows, *bytes);
+        }
+        result.map(|(value, _, _)| value)
+    }};
+}
+
 impl McStore {
+    /// Start counting this conversation's async-table writes (test builds only).
+    #[cfg(feature = "test-support")]
+    pub fn arm_async_write_meter(&self, session_ref: &str) {
+        write_meter::arm(session_ref);
+    }
+    /// Writes counted since [`Self::arm_async_write_meter`] (test builds only).
+    #[cfg(feature = "test-support")]
+    pub fn async_write_stats(&self, session_ref: &str) -> Option<write_meter::AsyncWriteStats> {
+        write_meter::read(session_ref)
+    }
     pub fn clear_async_compaction_drops(&self, namespace: &str) -> Result<usize, McStoreError> {
         self.inner
             .with_conn_fenced(|conn| {
@@ -52,7 +127,7 @@ impl McStore {
         Ok(copied)
     }
     pub fn retire_unannounced_async_views(&self, session_ref: &str) -> Result<(), McStoreError> {
-        self.inner.with_conn_fenced(|conn|conn.execute("UPDATE mc_async_compaction_views SET announced=-1 WHERE session_ref=?1 AND announced=0",[session_ref]).map(|_|())).map_err(Into::into)
+        metered!(session_ref, self.inner.with_conn_fenced(|conn|conn.execute("UPDATE mc_async_compaction_views SET announced=-1 WHERE session_ref=?1 AND announced=0",[session_ref]).map(|rows|((),rows as u64,0))).map_err(McStoreError::from))
     }
     pub fn async_compaction_for_session(
         &self,
@@ -99,12 +174,14 @@ impl McStore {
         namespace: &str,
         tags: &[McTagRow],
     ) -> Result<(), McStoreError> {
-        self.inner.with_conn_fenced(|conn| {
+        metered!(session_ref, self.inner.with_conn_fenced(|conn| {
             conn.execute("INSERT INTO mc_async_compaction(session_ref,conversation_key,session,state_json) VALUES(?1,?2,?3,?4)
                 ON CONFLICT(session_ref) DO UPDATE SET state_json=excluded.state_json",
                 params![session_ref,key,session,state])?;
-            crate::provider_log::insert_tags_tx(conn, namespace, tags)
-        }).map_err(Into::into)
+            crate::provider_log::insert_tags_tx(conn, namespace, tags)?;
+            let bytes = state.len() + tags.iter().map(|t| t.source_bytes.len() + t.block_id.len()).sum::<usize>();
+            Ok(((), 1 + tags.len() as u64, bytes as u64))
+        }).map_err(McStoreError::from))
     }
 
     /// Reserve before building a view. A crash skips the reservation, never reuses it.
@@ -113,16 +190,20 @@ impl McStore {
         session_ref: &str,
         applied: u64,
     ) -> Result<u64, McStoreError> {
-        self.inner
-            .with_conn_fenced(|conn| {
-                conn.query_row(
-                    "UPDATE mc_async_compaction SET version_high_water=max(version_high_water,?2)+1
+        metered!(
+            session_ref,
+            self.inner
+                .with_conn_fenced(|conn| {
+                    conn.query_row(
+                        "UPDATE mc_async_compaction SET version_high_water=max(version_high_water,?2)+1
                 WHERE session_ref=?1 RETURNING version_high_water",
-                    params![session_ref, applied],
-                    |row| row.get(0),
-                )
-            })
-            .map_err(Into::into)
+                        params![session_ref, applied],
+                        |row| row.get(0),
+                    )
+                    .map(|version| (version, 1, 0))
+                })
+                .map_err(McStoreError::from)
+        )
     }
 
     pub fn save_async_compaction_view(
@@ -131,14 +212,17 @@ impl McStore {
         version: u64,
         view: &str,
     ) -> Result<(), McStoreError> {
-        self.inner
-            .with_conn_fenced(|conn| {
-                conn.execute(
+        metered!(
+            session_ref,
+            self.inner
+                .with_conn_fenced(|conn| {
+                    conn.execute(
             "INSERT INTO mc_async_compaction_views(session_ref,session,version,view_json) SELECT ?1,session,?2,?3 FROM mc_async_compaction WHERE session_ref=?1",
             params![session_ref,version,view],
-        ).map(|_| ())
-            })
-            .map_err(Into::into)
+        ).map(|rows| ((), rows as u64, view.len() as u64))
+                })
+                .map_err(McStoreError::from)
+        )
     }
 
     pub fn load_async_compaction_view(
@@ -171,13 +255,16 @@ impl McStore {
         session_ref: &str,
         version: u64,
     ) -> Result<(), McStoreError> {
-        self.inner
-            .with_conn_fenced(|conn| {
-                conn.execute(
+        metered!(
+            session_ref,
+            self.inner
+                .with_conn_fenced(|conn| {
+                    conn.execute(
             "UPDATE mc_async_compaction_views SET announced=1 WHERE session_ref=?1 AND version=?2",
             params![session_ref,version],
-        ).map(|_| ())
-            })
-            .map_err(Into::into)
+        ).map(|rows| ((), rows as u64, 0))
+                })
+                .map_err(McStoreError::from)
+        )
     }
 }

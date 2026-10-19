@@ -6,6 +6,8 @@ use cortexkit_bus_trait::{ContentDigest, DurableOwner, Stream, StreamCursor};
 use cortexkit_role_llm_runner::{read::ReadMessage, session_ref, tags};
 use serde::Deserialize;
 #[cfg(test)]
+mod scaling_tests;
+#[cfg(test)]
 mod tests;
 
 fn bus_id(reference: &str, kind: &str, sequence: u64) -> String {
@@ -212,6 +214,8 @@ impl State {
         format!("{}:async:{}", self.key.engine_key(), self.generation)
     }
     fn save(&self, store: &McStore, tag_rows: &[mc_store::McTagRow]) -> Result<(), HandlerOutcome> {
+        #[cfg(test)]
+        let _timer = scaling_tests::save_meter::start(&self.reference());
         store
             .save_async_compaction(
                 &self.reference(),
