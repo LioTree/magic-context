@@ -1835,6 +1835,45 @@ mod tests {
         );
     }
 
+    /// Recording a runner-lane dream target needs no admitted conversation, plan,
+    /// pass barrier or route channel: a handler that has only the project, root,
+    /// harness and the conversation's route can call it, and the switch-off rule
+    /// still holds.
+    #[test]
+    fn a_session_runner_dream_target_is_recorded_without_any_sync_lane_state() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut h = handler(dir.path());
+        let route = crate::route_targets::SessionRunnerRoute::for_background_call(
+            Some(&subc_protocol::Principal::Reserved {
+                module_id: "thalamus-harness".into(),
+            }),
+            "ses-async",
+            h.fixed_config
+                .as_ref()
+                .unwrap()
+                .dreamer_runner_for("opencode"),
+        )
+        .expect("host and unset map to the session runner");
+        assert!(!h.record_session_runner_dream_target(
+            "project-key",
+            dir.path(),
+            "opencode",
+            route.clone()
+        ));
+        assert!(h.dream_runs.target_for_test("project-key").is_none());
+        h.fixed_config.as_mut().unwrap().rust_background_enabled = true;
+        assert!(h.record_session_runner_dream_target(
+            "project-key",
+            dir.path(),
+            "opencode",
+            route.clone()
+        ));
+        let target = h.dream_runs.target_for_test("project-key").unwrap();
+        assert_eq!(target.session, "ses-async");
+        assert_eq!(target.directory, dir.path());
+        assert_eq!(target.session_runner, Some(route));
+    }
+
     /// An explicitly configured `broca` is a deliberate choice of runner: a runner
     /// lane then keeps the configured Broca module route rather than its own runner.
     #[tokio::test]

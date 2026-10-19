@@ -4321,14 +4321,13 @@ pub trait HistorianProducerFactory: Send + Sync {
 
 /// The route a runner-lane conversation's background model calls take, or `None`
 /// for a conversation that keeps the configured runner (it is not on a runner lane,
-/// or the user explicitly configured `broca`).
-fn session_runner_route(
+/// or the user explicitly configured `broca`). See
+/// [`SessionRunnerRoute::for_background_call`].
+pub(crate) fn session_runner_route(
     binding: &SessionBinding,
     resolved: historian_runner::ResolvedRunner,
 ) -> Option<SessionRunnerRoute> {
-    historian_runner::uses_session_runner(resolved)
-        .then(|| SessionRunnerRoute::for_principal(binding.principal.as_ref(), &binding.session))
-        .flatten()
+    SessionRunnerRoute::for_background_call(binding.principal.as_ref(), &binding.session, resolved)
 }
 
 struct RealHistorianProducerFactory {

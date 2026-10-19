@@ -131,8 +131,8 @@ impl McHandler {
                 harness: binding.harness.clone(),
                 seen_at_ms: now_ms(),
                 // A dream management route is the claim protocol's own route; only
-                // an admitted runner-lane conversation records a session runner
-                // (see `record_runner_lane_dream_target`).
+                // a runner-lane conversation records a session runner
+                // (see `record_session_runner_dream_target`).
                 session_runner: None,
             },
         );
@@ -210,43 +210,63 @@ impl McHandler {
         })
     }
 
-    /// Remember an admitted runner-lane conversation as its project's dream target:
-    /// the tick then sends that project's dream children to the conversation's own
-    /// runner, as hidden children of this session, instead of queueing them for a
-    /// host claimant. Only while the Rust dreamer is switched on, as for
-    /// [`Self::record_dream_target`].
+    /// Remember a runner-lane conversation as its project's dream target: the tick
+    /// then sends that project's dream children to `route` (the conversation's own
+    /// runner, as hidden children of `route.parent_session()`) instead of queueing
+    /// them for a host claimant. `project` is the project key the store files the
+    /// project's dream schedule under; `directory` is where children work.
+    ///
+    /// Nothing here reads a pass barrier, a provider plan or a route channel, so
+    /// any handler that has admitted the conversation can call it. Returns whether
+    /// the target was recorded: only while the Rust dreamer is switched on for
+    /// `directory`, as for [`Self::record_dream_target`].
+    pub(crate) fn record_session_runner_dream_target(
+        &self,
+        project: &str,
+        directory: &std::path::Path,
+        harness: &str,
+        route: crate::route_targets::SessionRunnerRoute,
+    ) -> bool {
+        if !self.effective_config(directory).rust_background_enabled() {
+            return false;
+        }
+        self.dream_runs.record(
+            project,
+            DreamTarget {
+                directory: directory.to_path_buf(),
+                session: route.parent_session().to_owned(),
+                harness: harness.to_owned(),
+                seen_at_ms: now_ms(),
+                session_runner: Some(route),
+            },
+        );
+        #[cfg(not(test))]
+        self.dream_handles().ensure_timer();
+        true
+    }
+
+    /// [`Self::record_session_runner_dream_target`] for the conversation bound to
+    /// `channel`: its project, root, harness, and the runner the daemon stamped on
+    /// the route. A route without a session-runner principal records nothing.
     pub(crate) fn record_runner_lane_dream_target(&self, channel: u16, binding: &SessionBinding) {
-        let Some(session_runner) = crate::route_targets::SessionRunnerRoute::for_principal(
+        let Some(route) = crate::route_targets::SessionRunnerRoute::for_principal(
             binding.principal.as_ref(),
             &binding.session,
         ) else {
             return;
         };
-        if self.host_provider_conversation(binding).is_none()
-            || !self
-                .effective_config(&binding.project_root)
-                .rust_background_enabled()
-        {
-            return;
-        }
         let Some(store) = self.store.get() else {
             return;
         };
         let Ok(project) = self.historian_lane_project(channel, binding, store) else {
             return;
         };
-        self.dream_runs.record(
+        self.record_session_runner_dream_target(
             &project,
-            DreamTarget {
-                directory: binding.project_root.clone(),
-                session: binding.session.clone(),
-                harness: binding.harness.clone(),
-                seen_at_ms: now_ms(),
-                session_runner: Some(session_runner),
-            },
+            &binding.project_root,
+            &binding.harness,
+            route,
         );
-        #[cfg(not(test))]
-        self.dream_handles().ensure_timer();
     }
 
     /// `dream.ownership {v:1, claimant?}` answers with the published list for the

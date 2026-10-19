@@ -145,6 +145,23 @@ impl SessionRunnerRoute {
             })
     }
 
+    /// The route a background model call (historian firing, dream child, classify)
+    /// for this conversation takes, or `None` when it keeps the process-configured
+    /// runner: the conversation is not on a runner lane, or the user explicitly chose
+    /// `broca` (`resolved` is the role's runner, e.g.
+    /// `McModuleConfig::historian_runner_for(harness)`). Depends only on the
+    /// conversation's daemon-stamped principal and session, never on how the
+    /// conversation reports its progress.
+    pub fn for_background_call(
+        principal: Option<&subc_protocol::Principal>,
+        parent_session: &str,
+        resolved: crate::historian_runner::ResolvedRunner,
+    ) -> Option<Self> {
+        crate::historian_runner::uses_session_runner(resolved)
+            .then(|| Self::for_principal(principal, parent_session))
+            .flatten()
+    }
+
     pub fn module_id(&self) -> &str {
         &self.module_id
     }
