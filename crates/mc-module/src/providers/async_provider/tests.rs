@@ -1548,3 +1548,52 @@ async fn without_an_async_conversation_a_harness_bind_keeps_its_own_path() {
         "unchanged unresolved-session answer"
     );
 }
+
+/// An accepted Setup names the serializer profile it accepted; an unknown
+/// profile is refused by field and no conversation is recorded.
+#[tokio::test]
+async fn setup_echoes_the_accepted_serializer_profile_and_refuses_an_unknown_one() {
+    for (params, expected) in [
+        (
+            json!({"serializer_profile":"anthropic-messages"}),
+            "anthropic-messages",
+        ),
+        (
+            json!({"serializer_profile":"opencode-aisdk"}),
+            "opencode-aisdk",
+        ),
+    ] {
+        let dir = tempfile::tempdir().unwrap();
+        let rig = Rig::open(dir.path(), "thalamus", "claude-code", params.clone()).await;
+        let setup = json!({"session":"s","harness":"claude-code","request_id":"again","model":"fixture","context_window":100_000,"composition":{"render_tags":true},"params":params,"lineage_id":"L","now":1});
+        let answer = rig.op("compaction.setup", setup).await;
+        assert_eq!(answer["answer"], "ready");
+        assert_eq!(answer["serializer_profile"], expected, "{answer}");
+        assert_eq!(rig.state().initial["serializer_profile"], expected);
+    }
+    let dir = tempfile::tempdir().unwrap();
+    let rig = Rig::open(
+        dir.path(),
+        "thalamus",
+        "claude-code",
+        json!({"serializer_profile":"anthropic-messages"}),
+    )
+    .await;
+    rig.bind(8, "runner", "other");
+    let refused = rig
+        .h
+        .dispatch_value(
+            8,
+            json!({"method":"compaction.setup","params":{"session":"other","harness":"claude-code","request_id":"bad","model":"fixture","context_window":100_000,"composition":{},"params":{"serializer_profile":"claude-code-anthropic"},"lineage_id":"L","now":1}}),
+        )
+        .await;
+    match refused {
+        HandlerOutcome::ErrorWithDetail { code, detail, .. } => {
+            assert_eq!(code, "invalid_params");
+            assert_eq!(detail, json!({"field":"params.serializer_profile"}));
+        }
+        other => panic!("unknown profile was not refused by field: {other:?}"),
+    }
+    let other = session_ref("claude-code", &dir.path().to_string_lossy(), "other");
+    assert!(load(rig.h.store.get().unwrap(), &other).unwrap().is_none());
+}

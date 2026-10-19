@@ -591,7 +591,9 @@ impl McHandler {
         };
         let wire = rendered_view(codec, initial, &state)?;
         state.engine = engine;
-        state.initial = json!({"answer":"ready","request_id":request.request_id,"initial":wire, "ceiling":CeilingPolicy::new(0.95,300_000).with_on_overflow()});
+        // `serializer_profile` is a ck-mc extension member: the profile this
+        // Setup accepted, so the runner can confirm ck-mc reads its schema.
+        state.initial = json!({"answer":"ready","request_id":request.request_id,"initial":wire, "ceiling":CeilingPolicy::new(0.95,300_000).with_on_overflow(),"serializer_profile":codec.wire_id()});
         state.save(store, &[])?;
         bytes(&state.initial)
     }
