@@ -126,6 +126,10 @@ fn runner_profiles_select_their_codec_and_the_gateway_profile_is_unknown() {
             Codec::OpencodeAiSdk,
         ),
         (json!({"serializer_profile":"pi"}), Codec::Pi),
+        (
+            json!({"serializer_profile":"anthropic-messages"}),
+            Codec::AnthropicMessages,
+        ),
     ] {
         assert_eq!(Codec::from_params(&params).unwrap(), expected);
     }

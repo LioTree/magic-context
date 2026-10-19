@@ -3,6 +3,8 @@ use cortexkit_bus_inmemory::{InMemoryBus, InMemoryConfig};
 
 #[derive(Default)]
 struct Runner {
+    /// The session runner module the conversation was admitted under.
+    module: String,
     entries: Mutex<Vec<ReadMessage>>,
     lineage: Mutex<String>,
     read_delay_ms: std::sync::atomic::AtomicU64,
@@ -19,7 +21,7 @@ impl session_resolver::ProviderRunner for Runner {
         params: Value,
         budget: Duration,
     ) -> Result<Value, SessionResolveError> {
-        assert_eq!(route.module_id(), "thalamus-harness");
+        assert_eq!(route.module_id(), self.module);
         assert_eq!(route.parent_session(), "s");
         if method == "session.read" {
             self.routed_reads
@@ -87,6 +89,7 @@ struct Rig {
     bus: Arc<InMemoryBus>,
     task: tokio::task::JoinHandle<()>,
     reference: String,
+    module: String,
 }
 impl Drop for Rig {
     fn drop(&mut self) {
@@ -103,6 +106,17 @@ fn response(result: HandlerOutcome) -> Value {
 
 impl Rig {
     async fn new(dir: &Path) -> Self {
+        Self::open(
+            dir,
+            "thalamus-harness",
+            "opencode",
+            json!({"serializer_profile":"opencode-aisdk"}),
+        )
+        .await
+    }
+    /// A rig whose route is admitted under runner module `module` and whose
+    /// conversation is set up for `harness` with plan `params`.
+    async fn open(dir: &Path, module: &str, harness: &str, params: Value) -> Self {
         let descriptor = StorageDescriptor {
             module_id: DEFAULT_MODULE_ID.into(),
             storage_namespace: "mc_cache".into(),
@@ -113,6 +127,7 @@ impl Rig {
         };
         let store = Arc::new(McStore::open_for_test(&descriptor).unwrap());
         let runner = Arc::new(Runner {
+            module: module.into(),
             lineage: Mutex::new("L".into()),
             ..Default::default()
         });
@@ -130,7 +145,7 @@ impl Rig {
             7,
             SessionBinding {
                 principal: Some(subc_protocol::Principal::Reserved {
-                    module_id: "thalamus-harness".into(),
+                    module_id: module.into(),
                 }),
                 scope: None,
                 project_root: dir.into(),
@@ -150,15 +165,16 @@ impl Rig {
             .start_compaction_bus(bus.clone(), "fixture".into())
             .await
             .unwrap();
-        let reference = session_ref("opencode", &dir.to_string_lossy(), "s");
+        let reference = session_ref(harness, &dir.to_string_lossy(), "s");
         let rig = Self {
             h,
             runner,
             bus,
             task,
             reference,
+            module: module.into(),
         };
-        let answer=rig.op("compaction.setup",json!({"session":"s","harness":"opencode","request_id":"setup","model":"fixture","context_window":100_000,"composition":{"render_tags":true},"params":{"serializer_profile":"opencode-aisdk"},"lineage_id":"L","now":1})).await;
+        let answer=rig.op("compaction.setup",json!({"session":"s","harness":harness,"request_id":"setup","model":"fixture","context_window":100_000,"composition":{"render_tags":true},"params":params,"lineage_id":"L","now":1})).await;
         assert_eq!(answer["answer"], "ready", "{answer}");
         assert_eq!(answer["ceiling"]["at_share"], 0.95);
         rig
@@ -214,6 +230,19 @@ impl Rig {
         applied: Option<u64>,
         descent: Option<String>,
     ) {
+        self.notice_with(seq, size, applied, descent, Vec::new())
+            .await;
+    }
+    /// Publish advance notice `seq` with the runner's `events` and wait for
+    /// the provider to finish ingesting it.
+    async fn notice_with(
+        &self,
+        seq: u64,
+        size: u64,
+        applied: Option<u64>,
+        descent: Option<String>,
+        events: Vec<notice::Event>,
+    ) {
         let last = self.runner.entries.lock().unwrap().last().cloned().unwrap();
         let mut notice = notice::AdvanceNotice::new(
             &self.reference,
@@ -228,6 +257,9 @@ impl Rig {
         if let Some(version) = applied {
             notice = notice.with_applied_view_version(version);
         }
+        if !events.is_empty() {
+            notice = notice.with_events(events);
+        }
         let mut headers = notice.to_headers();
         headers.insert(
             "lineage_id".into(),
@@ -240,7 +272,7 @@ impl Rig {
         let receipt = self
             .bus
             .publish(
-                &notice::event_subject("fixture", "thalamus-harness", notice::ADVANCED_EVENT),
+                &notice::event_subject("fixture", &self.module, notice::ADVANCED_EVENT),
                 &bus_id(&self.reference, "advanced", seq),
                 notice.digest().parse().unwrap(),
                 headers,
@@ -924,7 +956,7 @@ async fn synthetic_ids_never_fall_back_to_positional_transcript_matches() {
         replacement: vec![original.ck],
     };
     let wire:OutboundMessage=decode(&json!({"compaction_id":"proof","version":1,"range":{"from":0,"to":1},"replacement":[{"info":{"id":"synthetic-todo","role":"user"},"parts":[{"id":"synthetic-part","type":"text","text":"inserted content"}]},entry.message]})).unwrap();
-    let ranges = ranges(&state, &wire, &engine, None).unwrap();
+    let ranges = ranges(&state, codec::Codec::OpencodeAiSdk, &wire, &engine, None).unwrap();
     assert!(matches!(
         &ranges[0],
         view::ViewRange::Replace { from: 0, to: 0, .. }
@@ -1079,4 +1111,221 @@ async fn restored_lineage_reuses_history_embeddings_and_reanchors_only_surviving
     })
     .await
     .expect("a real new user turn must still wake the historian");
+}
+
+/// The runner tag llm-runner would serve for part `part` of message `n` in
+/// [`anthropic_transcript`].
+fn anthropic_tag(n: u64, part: u64) -> u64 {
+    1_000 + n * 10 + part
+}
+
+/// A Claude Code transcript in the `anthropic-messages` schema, repeating a
+/// four-message turn: a string-content prompt, an assistant message with a
+/// signed thinking block, its tool result, and a final answer. Text and tool
+/// result parts are tagged; thinking and tool_use parts carry no tag.
+fn anthropic_transcript(count: u64) -> Vec<ReadMessage> {
+    (0..count)
+        .map(|n| {
+            let tagged = |part: u64| tags::PartTag::tagged(part.to_string(), format!("§{}§", anthropic_tag(n, part)));
+            let (message, rows) = match n % 4 {
+                0 => (
+                    json!({"role":"user","content":format!("message {n} ")+&"durable words ".repeat(16)}),
+                    vec![tagged(0)],
+                ),
+                1 => (
+                    json!({"role":"assistant","content":[
+                        {"type":"thinking","thinking":format!("plan {n}"),"signature":format!("EqQBsig{n}+/==")},
+                        {"type":"text","text":format!("reading file {n} ")+&"careful words ".repeat(8)},
+                        {"type":"tool_use","id":format!("toolu_{n}"),"name":"read","input":{"path":format!("file{n}")}},
+                    ]}),
+                    vec![tags::PartTag::untagged("0"), tagged(1), tags::PartTag::untagged("2")],
+                ),
+                2 => (
+                    json!({"role":"user","content":[
+                        {"type":"tool_result","tool_use_id":format!("toolu_{}", n - 1),"content":"exact spent output ".repeat(500)},
+                    ]}),
+                    vec![tagged(0)],
+                ),
+                _ => (
+                    json!({"role":"assistant","content":[{"type":"text","text":format!("answer {n} ")+&"durable words ".repeat(16)}]}),
+                    vec![tagged(0)],
+                ),
+            };
+            ReadMessage::new(n, format!("m{n}"), message).with_tags(rows)
+        })
+        .collect()
+}
+
+impl Rig {
+    /// Apply `view` to the runner's `anthropic-messages` transcript the way
+    /// the runner does: replacement ranges as sent, kept parts with their
+    /// rendered tags, edited parts with their edit bytes.
+    fn render_anthropic(&self, view: &view::CompactionView) -> Vec<Value> {
+        assert_eq!(independent_digest(view), view.digest);
+        let entries = self.runner.entries.lock().unwrap();
+        let mut output = Vec::new();
+        for range in &view.ranges {
+            match range {
+                view::ViewRange::Replace { bytes, .. } => {
+                    output.extend(serde_json::from_str::<Vec<Value>>(bytes).unwrap())
+                }
+                view::ViewRange::Keep { from, to, edits } => {
+                    for entry in entries
+                        .iter()
+                        .filter(|e| e.ordinal >= *from && e.ordinal < *to)
+                    {
+                        let mut rendered = Vec::new();
+                        for (part, row) in parts(&entry.message).unwrap().iter().zip(&entry.tags) {
+                            match edits
+                                .iter()
+                                .find(|e| e.ordinal == entry.ordinal && e.part == row.part)
+                            {
+                                Some(edit) if edit.drop => {}
+                                Some(edit) => rendered.push(
+                                    serde_json::from_str(edit.bytes.as_ref().unwrap()).unwrap(),
+                                ),
+                                None => rendered.push(render_part(part, row.tag.as_deref(), true)),
+                            }
+                        }
+                        let mut message = entry.message.clone();
+                        message["content"] = match rendered.as_slice() {
+                            [Value::String(text)] => json!(text),
+                            _ => json!(rendered),
+                        };
+                        output.push(message);
+                    }
+                }
+                _ => panic!("unknown range kind"),
+            }
+        }
+        output.extend(
+            entries
+                .iter()
+                .filter(|e| e.ordinal > view.covers_through.ordinal)
+                .map(|e| e.message.clone()),
+        );
+        output
+    }
+}
+
+#[tokio::test]
+async fn anthropic_messages_session_publishes_part_edits_beside_signed_thinking() {
+    let dir = tempfile::tempdir().unwrap();
+    let rig = Rig::open(
+        dir.path(),
+        "thalamus-harness",
+        "claude-code",
+        json!({"serializer_profile":"anthropic-messages"}),
+    )
+    .await;
+    let transcript = anthropic_transcript(39);
+    *rig.runner.entries.lock().unwrap() = transcript.clone();
+    rig.notice(1, 1_000, None).await;
+    assert_eq!(rig.newest(), None, "defer must not publish");
+    let state = rig.state();
+    assert_eq!(
+        tag_rows(&state, codec::Codec::AnthropicMessages)
+            .unwrap()
+            .len(),
+        39,
+        "every tagged text and tool result part must be indexed"
+    );
+    rig.history(20, "first completed historian summary");
+    rig.notice(2, 1_000, None).await;
+    let baseline = rig.newest().expect("new history publishes");
+    // Message 21 is an assistant message whose first part is a signed
+    // thinking block; drop its text part, and the tool result after it.
+    rig.queue(&[anthropic_tag(21, 1), anthropic_tag(22, 0)])
+        .await;
+    rig.notice(3, 90_000, Some(baseline)).await;
+    let version = rig.newest().expect("execute threshold publishes");
+    assert!(version > baseline);
+    let view = rig.get(version).await;
+    assert!(
+        matches!(view.ranges[0], view::ViewRange::Replace { from: 0, .. }),
+        "the view inserts the history head before every kept message"
+    );
+    let edits: Vec<_> = view
+        .ranges
+        .iter()
+        .flat_map(|range| match range {
+            view::ViewRange::Keep { edits, .. } => edits.clone(),
+            _ => Vec::new(),
+        })
+        .collect();
+    let near: Vec<_> = edits
+        .iter()
+        .filter(|edit| edit.ordinal == 21 || edit.ordinal == 22)
+        .map(|edit| (edit.ordinal, edit.part.as_str(), edit.drop))
+        .collect();
+    assert_eq!(
+        near,
+        [(21, "1", false), (22, "0", false)],
+        "the dropped parts get their placeholders; the signed thinking part beside them is kept"
+    );
+    // The head insertion invalidates every later signature, but removing those
+    // blocks is the runner's companion edit (or it defers the view): the view
+    // itself never edits a thinking part.
+    for edit in &edits {
+        let content = &transcript[edit.ordinal as usize].message["content"];
+        let part = content.get(edit.part.parse::<usize>().unwrap());
+        assert!(
+            part.is_none_or(|part| part["type"] != "thinking"),
+            "the view edited a signed thinking part: {edit:?}"
+        );
+    }
+    let rendered = rig.render_anthropic(&view);
+    let applied = rendered
+        .iter()
+        .find(|message| message["content"][2]["id"] == "toolu_21")
+        .expect("message 21 stays in the rendered request");
+    assert_eq!(
+        bytes(&applied["content"][0]).unwrap(),
+        bytes(&transcript[21].message["content"][0]).unwrap(),
+        "the signed thinking block and its signature are the runner's own bytes"
+    );
+    assert_ne!(applied["content"][1], transcript[21].message["content"][1]);
+    for message in rendered.iter().filter(|m| m["role"] == "assistant") {
+        if let Some(signed) = message["content"]
+            .as_array()
+            .and_then(|parts| parts.iter().find(|p| p["type"] == "thinking"))
+        {
+            let source = transcript
+                .iter()
+                .find(|entry| entry.message["content"][0] == *signed)
+                .expect("every rendered thinking block is a runner block");
+            assert_eq!(
+                bytes(signed).unwrap(),
+                bytes(&source.message["content"][0]).unwrap()
+            );
+        }
+    }
+    // A view is immutable: the same version is served again unchanged.
+    assert_eq!(rig.get(version).await, view);
+    // The runner applies the view with the provider's companion strip and says
+    // so. That fact is recorded, and it is not a reason for a new view: the
+    // next notice with no new work publishes nothing, so the runner and ck-mc
+    // never chase each other's bytes.
+    rig.notice_with(
+        4,
+        90_000,
+        Some(version),
+        None,
+        vec![notice::Event::ViewCompanion {
+            view_version: version,
+            edit: notice::companion_edits::STRIP_SIGNED_REASONING.into(),
+        }],
+    )
+    .await;
+    assert_eq!(
+        rig.state().acknowledgements,
+        [format!("view_companion:{version}:strip_signed_reasoning")]
+    );
+    assert_eq!(
+        rig.newest(),
+        Some(version),
+        "a companion apply needs no new view"
+    );
+    rig.notice(5, 90_000, Some(version)).await;
+    assert_eq!(rig.newest(), Some(version));
 }

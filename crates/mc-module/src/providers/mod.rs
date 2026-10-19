@@ -12,6 +12,7 @@ mod async_provider;
 mod describe_fixture_tests;
 
 pub mod codec;
+pub mod codec_anthropic;
 #[cfg(test)]
 mod codec_native_tests;
 pub mod codec_opencode;
