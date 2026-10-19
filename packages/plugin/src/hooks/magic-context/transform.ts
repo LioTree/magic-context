@@ -133,6 +133,7 @@ import {
     captureLatestTurnOriginals,
     prepareLatestThinkingRecovery,
 } from "./latest-thinking-recovery";
+import { importLegacyCkTagsOnce } from "./legacy-ck-tag-import";
 import { currentLkgRequestIdentity } from "./lkg-measured-request";
 import { loadPersistedLkgSlot, saveLkgSlotToDb } from "./lkg-persist";
 import {
@@ -903,6 +904,14 @@ export function createTransform(deps: TransformDeps) {
             withoutSqliteTransformPass(() =>
                 scheduleReconciliation(db, sessionId, host.hostMessageReconciliationSource),
             );
+        }
+
+        // A session the retired Rust transform served has its tag numbers in
+        // store.db. Carry them into context.db once, before anything reads tags,
+        // so the model keeps seeing the numbers it already knows.
+        if (!deps.compactionOff) {
+            const imported = importLegacyCkTagsOnce({ db, sessionId, messages });
+            if (imported.status === "imported") deps.tagger.cleanup(sessionId);
         }
 
         const tUserMsg = performance.now();

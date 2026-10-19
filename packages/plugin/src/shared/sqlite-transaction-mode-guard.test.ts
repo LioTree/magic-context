@@ -41,6 +41,8 @@ const READ_ONLY_DEFERRED_TRANSACTIONS: Record<string, string> = {
         "reads an LKG slot row and its prefix slices as one consistent snapshot; never writes (a failed verification clears the slot afterwards, outside this transaction)",
     "packages/plugin/src/features/magic-context/storage-host-runner.ts#loadHostRunnerRecord":
         "reads runner state, entries, ids and views in one coherent cold-path snapshot; never repairs or writes",
+    "packages/plugin/src/hooks/magic-context/legacy-ck-tag-import.ts#readLegacyCkTagSnapshot":
+        "reads one session's ck-mc tags, queued drops and applied reductions from store.db as one snapshot over a read-only connection; never writes",
 };
 
 const REPOSITORY_ROOT = resolve(import.meta.dir, "../../../..");
