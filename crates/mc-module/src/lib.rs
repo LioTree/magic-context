@@ -21337,6 +21337,11 @@ pub fn manifest_with_route_targets(
     manifest_with_route_targets_and_smart_notes(module_id, resolved_routes, true)
 }
 
+/// The ctx tool facades resolve a bind's `(project_root, session)` to an
+/// asynchronous compaction conversation whatever harness the bind names, so
+/// an MCP facade may bind a runner's conversation by its session alone.
+pub const MCP_CONVERSATION_BINDING_V1: &str = "mcp-conversation-binding/v1";
+
 pub fn manifest_with_route_targets_and_smart_notes(
     module_id: &str,
     resolved_routes: &RouteTargetConfig,
@@ -21350,7 +21355,10 @@ pub fn manifest_with_route_targets_and_smart_notes(
     // Keep the existing model tools separate from the opt-in internal move service.
     // Leave ModuleManifest.bindings unset: it can request separate stores per
     // project, whereas MC uses one machine-wide store with project-keyed rows.
-    let mut capabilities = vec![cortexkit_role_compaction_provider::PROVIDES.to_string()];
+    let mut capabilities = vec![
+        cortexkit_role_compaction_provider::PROVIDES.to_string(),
+        MCP_CONVERSATION_BINDING_V1.to_string(),
+    ];
     let mut provides = vec![ProviderRole::ToolProvider {
         tools,
         identity_scope: vec![IdentityScope::Project, IdentityScope::Session],
@@ -24066,6 +24074,18 @@ mod tests {
             vec![ConsumerRole::ServiceClient {
                 of: route_targets::expected_routes_for_tests("broca")
             }]
+        );
+        let mut expected_capabilities = vec![
+            "compaction-provider/v1".to_string(),
+            "mcp-conversation-binding/v1".to_string(),
+        ];
+        if agent_data::ENABLED {
+            expected_capabilities.push(cortexkit_role_agent_data::PROVIDES.to_string());
+        }
+        assert_eq!(
+            m.capabilities.as_ref().map(|c| &c.provides),
+            Some(&expected_capabilities),
+            "capability list is pinned"
         );
         let ProviderRole::ToolProvider { tools, .. } = &m.provides[0] else {
             panic!("magic-context must expose a tool provider role");

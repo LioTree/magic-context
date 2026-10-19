@@ -126,7 +126,12 @@ fn manifest_before_participant(
     .trust_tier(Some(TrustTier::FirstParty))
     .protocol_ver(subc_protocol::PROTOCOL_VERSION)
     .capabilities(Some(subc_protocol::manifest::CapabilityDeclarations {
-        provides: vec![cortexkit_role_compaction_provider::PROVIDES.to_string()],
+        // The facades' conversation binding is a declared capability since
+        // mcp-conversation-binding/v1; it changes no route or service.
+        provides: vec![
+            cortexkit_role_compaction_provider::PROVIDES.to_string(),
+            crate::MCP_CONVERSATION_BINDING_V1.to_string(),
+        ],
         requires: vec![],
         must_never_reach: vec![],
     }))

@@ -430,7 +430,10 @@ mod tests {
             .expect("provider roles remain declared");
         assert_eq!(
             capabilities.provides,
-            vec![cortexkit_role_compaction_provider::PROVIDES.to_string(),]
+            vec![
+                cortexkit_role_compaction_provider::PROVIDES.to_string(),
+                crate::MCP_CONVERSATION_BINDING_V1.to_string(),
+            ]
         );
         assert!(capabilities.requires.is_empty());
         assert!(capabilities.must_never_reach.is_empty());
