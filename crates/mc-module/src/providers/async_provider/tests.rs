@@ -1329,3 +1329,73 @@ async fn anthropic_messages_session_publishes_part_edits_beside_signed_thinking(
     rig.notice(5, 90_000, Some(version)).await;
     assert_eq!(rig.newest(), Some(version));
 }
+
+/// THALAMUS's Claude Code gateway (module `thalamus`) is a session runner: a
+/// Setup attested by it is accepted, and the conversation's transcript reads,
+/// sends and background children all route to that module. The fake runner
+/// asserts the routed module on every call it receives.
+#[tokio::test]
+async fn a_thalamus_attested_setup_routes_reads_sends_and_children_to_thalamus() {
+    let dir = tempfile::tempdir().unwrap();
+    let rig = Rig::open(
+        dir.path(),
+        "thalamus",
+        "claude-code",
+        json!({"serializer_profile":"anthropic-messages"}),
+    )
+    .await;
+    *rig.runner.entries.lock().unwrap() = anthropic_transcript(12);
+    rig.notice(1, 1_000, None).await;
+    assert!(
+        rig.runner
+            .routed_reads
+            .load(std::sync::atomic::Ordering::Relaxed)
+            >= 1,
+        "transcript reads go through the session runner route"
+    );
+    let state = rig.state();
+    assert_eq!(state.runner_module, "thalamus");
+    let route = state.runner().unwrap();
+    assert_eq!(route.module_id(), "thalamus");
+    assert_eq!(
+        state.runner_route.as_ref().unwrap()["module_id"],
+        "thalamus"
+    );
+    assert_eq!(
+        state.dream_target.as_ref().unwrap()["route"]["module_id"],
+        "thalamus"
+    );
+    // A send (a reminder) takes the same routed interface as the reads.
+    let sent = rig
+        .h
+        .provider_runner
+        .call_for(
+            &route,
+            dir.path(),
+            "session.send",
+            json!({}),
+            Duration::from_secs(1),
+        )
+        .await
+        .unwrap();
+    assert_eq!(sent["state"], "pending");
+    // Historian and dreamer children of a Claude Code conversation run on the
+    // conversation's own runner.
+    let principal = subc_protocol::Principal::Reserved {
+        module_id: "thalamus".into(),
+    };
+    let config = McModuleConfig::default();
+    for resolved in [
+        config.historian_runner_for("claude-code"),
+        config.dreamer_runner_for("claude-code"),
+    ] {
+        let child = crate::route_targets::SessionRunnerRoute::for_background_call(
+            Some(&principal),
+            "s",
+            resolved,
+        )
+        .expect("a thalamus conversation's children use its session runner");
+        assert_eq!(child.module_id(), "thalamus");
+        assert_eq!(child.parent_session(), "s");
+    }
+}

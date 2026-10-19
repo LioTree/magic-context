@@ -114,9 +114,13 @@ pub const THALAMUS_HARNESS_MODULE_ID: &str = "thalamus-harness";
 /// Runner modules that can run a session's background model calls (historian and
 /// dreamer) as hidden children of that same session, inside the session's own host.
 /// A conversation is on a runner lane when the daemon stamped one of these modules as
-/// the principal of the route that admitted it.
-pub const SESSION_RUNNER_MODULE_IDS: [&str; 2] =
-    [THALAMUS_HARNESS_MODULE_ID, DEFAULT_RUNNER_MODULE_ID];
+/// the principal of the route that admitted it. `thalamus` is the Claude Code
+/// gateway serving its sessions as a runner (`anthropic-messages`).
+pub const SESSION_RUNNER_MODULE_IDS: [&str; 3] = [
+    THALAMUS_HARNESS_MODULE_ID,
+    DEFAULT_RUNNER_MODULE_ID,
+    DEFAULT_THALAMUS_MODULE_ID,
+];
 
 /// Where a runner-lane conversation's background model calls go: the llm-runner
 /// management surface of the module that runs the conversation, with the
@@ -352,6 +356,28 @@ mod tests {
 
     use super::executable_staging;
     use super::*;
+
+    #[test]
+    fn every_session_runner_module_gets_its_own_route() {
+        for module in ["thalamus-harness", "broca", "thalamus"] {
+            let principal = subc_protocol::Principal::Reserved {
+                module_id: module.into(),
+            };
+            let route = SessionRunnerRoute::for_principal(Some(&principal), "s")
+                .unwrap_or_else(|| panic!("{module} is a session runner"));
+            assert_eq!(route.module_id(), module);
+            assert_eq!(
+                route.target(),
+                RouteTarget::ManagementSurface {
+                    module_id: module.into()
+                }
+            );
+        }
+        let other = subc_protocol::Principal::Reserved {
+            module_id: "fusiform".into(),
+        };
+        assert!(SessionRunnerRoute::for_principal(Some(&other), "s").is_none());
+    }
 
     #[test]
     fn route_targets_follow_the_resolved_runner() {
