@@ -3269,6 +3269,11 @@ export async function runPostTransformPhase(
                 new Set(),
                 (reduction) => droppedTokenReductions.push(reduction),
             );
+        // Read the queue depth before the early commit below empties it, so the
+        // decision log reports how many queued operations this pass applies.
+        const pendingOpsDepthAtDecision = shouldApplyPendingOps
+            ? formatPendingOpsDepth()
+            : undefined;
         // Commit queued edits with their omissions before session-wide heuristic
         // discovery; the latter must not extend the queued edit's write hold.
         const preparedPending =
@@ -3284,7 +3289,7 @@ export async function runPostTransformPhase(
                         : `${reclaimRideLabel(rideSignals)} (scheduler=${args.schedulerDecision})`;
                 sessionLog(
                     args.sessionId,
-                    `pending ops WILL APPLY — reason=${applyReason}, pendingOps=${formatPendingOpsDepth()}, context=${args.contextUsage.percentage.toFixed(1)}%`,
+                    `pending ops WILL APPLY — reason=${applyReason}, pendingOps=${pendingOpsDepthAtDecision}, context=${args.contextUsage.percentage.toFixed(1)}%`,
                 );
                 const tApply = performance.now();
                 // P0 perf: don't pass `args.tags` here. applyPendingOperations
