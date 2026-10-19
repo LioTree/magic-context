@@ -8575,6 +8575,12 @@ async function runCompactionOffPipeline(
 					stableId,
 					boundary,
 					true,
+					undefined,
+					{
+						provider: args.resolvedProviderID,
+						id: args.resolvedModelID,
+						api: args.providerApi,
+					},
 				)
 			: undefined;
 	let injectionResult: PiInjectionResult | null = null;
@@ -8996,6 +9002,11 @@ function piPassMayRewritePrefix(args: RunPipelineArgs): boolean {
 			false,
 			false,
 			args.prefixBranch,
+			{
+				provider: args.resolvedProviderID,
+				id: args.resolvedModelID,
+				api: args.providerApi,
+			},
 		);
 		if (
 			prefix.needsRepair(args.messages, stableId) ||
@@ -9291,6 +9302,11 @@ function runSynchronousPipeline(
 					protectedSignedPrefix,
 					false,
 					args.prefixBranch,
+					{
+						provider: args.resolvedProviderID,
+						id: args.resolvedModelID,
+						api: args.providerApi,
+					},
 				)
 			: undefined;
 	if (prefixPass && !protectedSignedPrefix) {

@@ -12,7 +12,7 @@ import { createTagger } from "../../features/magic-context/tagger";
 import { createMessagesTransformHandler } from "../../plugin/messages-transform";
 import { Database } from "../../shared/sqlite";
 import { createTestTempDir } from "../../shared/test-temp-dir";
-import { servedMessageDigest } from "./__tests__/served-prefix-evidence";
+import { servedMessageDigest, wholeMessageDigest } from "./__tests__/served-prefix-evidence";
 import { DegradedPassRefusalError } from "./degraded-pass-refusal";
 import { clearInjectionCache } from "./inject-compartments";
 import {
@@ -104,12 +104,85 @@ function checkFirst(db: Database, served: MessageLike[]) {
     expect(record?.first_kept).not.toBeNull();
     const actual = served.find((row) => row.info.id === record?.first_kept?.id);
     expect(actual).toBeDefined();
-    expect(record?.first_kept?.digest).toBe(servedMessageDigest(actual));
+    expect(record?.first_kept?.digest).toBe(servedMessageDigest(actual, record!.provenance));
     return record!;
 }
 
 for (const generation of ["v1", "v2"] as const)
     describe(`served prefix ${generation}`, () => {
+        it("host-only summary edits serve the fresh held request", async () => {
+            const f = fixture(generation);
+            await f.pass();
+            const assistant = message("active", "assistant", "first answer");
+            assistant.parts.unshift(reasoning("active"));
+            f.raw.push(assistant);
+            const held = await f.pass();
+            const record = checkFirst(f.db, held);
+            Object.assign(f.raw[0].info, {
+                summary: { diffs: [] },
+                time: { created: 123 },
+                ui: "changed",
+            });
+            f.raw.push(message("fresh-tail", "assistant", "fresh request, not last good"));
+            const fresh = await f.pass();
+            expect(fresh.some((row) => row.info.id === "fresh-tail")).toBe(true);
+            expect(fresh).not.toEqual(held);
+            expect(readServedPrefix(f.db, "prefix")).toEqual(record);
+        });
+        it("provider-visible tool input before kept thinking still refuses", async () => {
+            const f = fixture(generation);
+            const older = message("older-tool", "assistant");
+            older.parts = [
+                {
+                    type: "tool",
+                    tool: "bash",
+                    callID: "call",
+                    state: { status: "completed", input: { command: "pwd" }, output: "result" },
+                },
+            ];
+            f.raw.unshift(older);
+            await f.pass();
+            const assistant = message("active", "assistant");
+            assistant.parts.unshift(reasoning("active"));
+            f.raw.push(assistant);
+            const record = checkFirst(f.db, await f.pass());
+            expect(record.first_kept!.id).toBe("older-tool");
+            (older.parts[0] as { state: { input: unknown } }).state.input = {
+                command: "changed provider bytes",
+            };
+            let failure: unknown;
+            try {
+                await f.pass();
+            } catch (error) {
+                failure = error;
+            }
+            expect(failure).toBeInstanceOf(DegradedPassRefusalError);
+            expect(String((failure as Error).cause)).toContain("first kept digest mismatch");
+            expect(readServedPrefix(f.db, "prefix")).toEqual(record);
+        });
+        it("legacy whole-envelope digests wait for a permitted rebuild without a refusal loop", async () => {
+            const f = fixture(generation);
+            const initial = await f.pass();
+            const legacy = checkFirst(f.db, initial);
+            legacy.first_kept!.digest = wholeMessageDigest(
+                initial.find((row) => row.info.id === "turn"),
+            );
+            f.db
+                .prepare("UPDATE session_meta SET served_prefix = ? WHERE session_id = 'prefix'")
+                .run(JSON.stringify(legacy));
+            Object.assign(f.raw[0].info, { summary: { diffs: [] } });
+            const assistant = message("active", "assistant");
+            assistant.parts.unshift(reasoning("active"));
+            f.raw.push(assistant);
+            for (let pass = 0; pass < 2; pass++) {
+                expect((await f.pass()).some((row) => row.info.id === "active")).toBe(true);
+                expect(readServedPrefix(f.db, "prefix")).toEqual(legacy);
+            }
+            f.raw.push(message("next"));
+            const rebuilt = checkFirst(f.db, await f.pass());
+            expect(rebuilt.first_kept!.digest).toStartWith("provider-input-v1:");
+            expect(rebuilt.turn).toBe("next");
+        });
         it("replays after cache clear and restart, and refuses only the missing seam pass", async () => {
             const f = fixture(generation);
             f.raw.unshift(message("older", "assistant", "earlier answer"));
@@ -282,7 +355,7 @@ it("records the served mural, summary and first kept occurrence across a databas
         provenance,
         cut: { mode: "partial", id: "kept" },
     });
-    expect(record.first_kept?.digest).toBe(servedMessageDigest(first));
+    expect(record.first_kept?.digest).toBe(servedMessageDigest(first, record.provenance));
     db.close();
     const reopened = database(path);
     const restored = readServedPrefix<MessageLike>(reopened, "prefix")!;

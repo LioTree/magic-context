@@ -4,12 +4,14 @@ import { isRecord } from "../../shared/record-type-guard";
 import type { Database } from "../../shared/sqlite";
 import { DegradedPassRefusalError } from "./degraded-pass-refusal";
 import { isAdmissionUser } from "./edit-admission";
+import { PREFIX_DIGEST_FORMAT, servedPrefixProjection } from "./served-prefix-projection";
 
 export interface PrefixProvenance {
     host: "opencode-v1" | "opencode-v2" | "pi";
     id_space: string;
     generation: string;
     projection: "messages";
+    model?: { provider?: string; id?: string; api?: string };
 }
 
 export interface ServedPrefix<M> {
@@ -28,12 +30,15 @@ export interface ServedPrefix<M> {
     };
 }
 
-// The returned message bytes include tool-input key order; sorting fields
-// would hide a prefix change from the replay fence.
+// Whole-message identity is still used by Pi's separate pending-user certificate.
 export function prefixMessageDigest(message: unknown): string {
     const serialized = JSON.stringify(message);
     if (serialized === undefined) throw new Error("Cannot digest an absent served message");
     return createHash("sha256").update(serialized).digest("hex");
+}
+
+export function firstKeptDigest(message: unknown, provenance: PrefixProvenance): string {
+    return PREFIX_DIGEST_FORMAT + prefixMessageDigest(servedPrefixProjection(message, provenance));
 }
 
 export function prefixTurn<M>(
@@ -170,13 +175,18 @@ export function validateServedPrefix<M>(
     record: ServedPrefix<M>,
     messages: readonly M[],
     stableId: (message: M, index: number) => string | undefined,
+    provenance: PrefixProvenance = record.provenance,
 ): string | null {
     if (!record.first_kept) return null;
     const found = messages.filter(
         (message, index) => stableId(message, index) === record.first_kept?.id,
     );
     if (found.length !== 1) return "first kept id missing or ambiguous";
-    return prefixMessageDigest(found[0]) === record.first_kept.digest
+    // Pre-projection records cannot prove provider identity. Keep their seam/head
+    // while held, then replace the record on the next permitted rebuild. Comparing
+    // incompatible formats would otherwise refuse every held pass after upgrade.
+    if (/^[0-9a-f]{64}$/.test(record.first_kept.digest)) return null;
+    return firstKeptDigest(found[0], provenance) === record.first_kept.digest
         ? null
         : "first kept digest mismatch";
 }
@@ -200,7 +210,7 @@ export function writeServedPrefix<M>(args: {
         summary: args.summary,
         first_kept:
             args.firstKept && args.firstKeptId
-                ? { id: args.firstKeptId, digest: prefixMessageDigest(args.firstKept) }
+                ? { id: args.firstKeptId, digest: firstKeptDigest(args.firstKept, args.provenance) }
                 : null,
         cut_mode: args.cut ?? { mode: "none", id: null },
         turn: args.turn,

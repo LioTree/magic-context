@@ -44,6 +44,7 @@ export class PiPendingUserRefusalError extends DegradedPassRefusalError {
 
 /** Refuse a context transformation with a missing first-kept message, without blocking later transformations from re-reading host history. */
 export class PiPrefixPass {
+	private readonly provenance: PrefixProvenance;
 	readonly turn: string | null;
 	private readonly nativeTurn: string | null;
 	readonly record: ServedPrefix<unknown> | null;
@@ -58,7 +59,9 @@ export class PiPrefixPass {
 		public boundary: boolean,
 		private readonly off: boolean,
 		private readonly branch?: PiPrefixBranch,
+		model?: PrefixProvenance["model"],
 	) {
+		this.provenance = { ...provenance, ...(model ? { model } : {}) };
 		this.nativeTurn = prefixTurn(messages, stableId);
 		let record: ServedPrefix<unknown> | null = null;
 		try {
@@ -115,7 +118,7 @@ export class PiPrefixPass {
 		stableId = this.ids(stableId);
 		const problem = prefixRecordProblem(
 			this.record,
-			provenance,
+			this.provenance,
 			this.turn,
 			this.boundary,
 		);
@@ -145,7 +148,12 @@ export class PiPrefixPass {
 			return null;
 		}
 		if (this.off && this.boundary) {
-			const mismatch = validateServedPrefix(this.record, messages, stableId);
+			const mismatch = validateServedPrefix(
+				this.record,
+				messages,
+				stableId,
+				this.provenance,
+			);
 			if (mismatch) {
 				this.unverified(mismatch);
 				return null;
@@ -191,10 +199,16 @@ export class PiPrefixPass {
 		if (this.boundary || this.off) return false;
 		stableId = this.ids(stableId);
 		return (
-			prefixRecordProblem(this.record, provenance, this.turn, false) !== null ||
+			prefixRecordProblem(this.record, this.provenance, this.turn, false) !==
+				null ||
 			(this.replayed &&
 				!!this.record &&
-				validateServedPrefix(this.record, messages, stableId) !== null)
+				validateServedPrefix(
+					this.record,
+					messages,
+					stableId,
+					this.provenance,
+				) !== null)
 		);
 	}
 	finish(
@@ -221,7 +235,12 @@ export class PiPrefixPass {
 		}
 		if (this.boundary) {
 			if (this.replayed && this.record) {
-				const problem = validateServedPrefix(this.record, messages, stableId);
+				const problem = validateServedPrefix(
+					this.record,
+					messages,
+					stableId,
+					this.provenance,
+				);
 				if (problem && !this.off) refuseServedPrefix(problem, this.sessionId);
 				if (problem) {
 					this.unverified(problem);
@@ -268,7 +287,7 @@ export class PiPrefixPass {
 						? undefined
 						: stableId(first, messages.indexOf(first)),
 				turn,
-				provenance,
+				provenance: this.provenance,
 				pendingUser,
 				cut:
 					this.replayed && this.record

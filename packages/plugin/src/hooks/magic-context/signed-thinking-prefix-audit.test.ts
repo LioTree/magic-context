@@ -73,7 +73,9 @@ function storedPrefixValidates(db: Database, sessionId: string, messages: Messag
     const record = readServedPrefix<MessageLike>(db, sessionId);
     const first = messages.find((message) => message.info.id === record?.first_kept?.id);
     return (
-        !!record?.first_kept && !!first && servedMessageDigest(first) === record.first_kept.digest
+        !!record?.first_kept &&
+        !!first &&
+        servedMessageDigest(first, record.provenance) === record.first_kept.digest
     );
 }
 
@@ -382,7 +384,8 @@ async function fixture(
             hasParkedBustTrigger(sessionId),
             !!prefixRecord?.first_kept &&
                 !!firstKept &&
-                servedMessageDigest(firstKept) === prefixRecord.first_kept.digest,
+                servedMessageDigest(firstKept, prefixRecord.provenance) ===
+                    prefixRecord.first_kept.digest,
         );
         return { messages, bustedThisPass };
     };
@@ -1032,7 +1035,9 @@ for (const generation of ["v1", "v2"] as const) {
                         (message) => message.info.id === record?.first_kept?.id,
                     );
                     expect(!!record?.first_kept && !!actual).toBe(true);
-                    expect(record?.first_kept?.digest).toBe(servedMessageDigest(actual));
+                    expect(record?.first_kept?.digest).toBe(
+                        servedMessageDigest(actual, record!.provenance),
+                    );
                 };
                 checkStored(f.served);
                 const firstKept = before.findIndex((message) =>

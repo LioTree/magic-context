@@ -459,7 +459,9 @@ export async function runPiHoldDriver(options: {
 						"Served-window witness has no recorded first raw message",
 					);
 				const first = result.messages[record.head.length];
-				expect(record.first_kept.digest).toBe(servedMessageDigest(first));
+				expect(record.first_kept.digest).toBe(
+					servedMessageDigest(first, record.provenance),
+				);
 				const held = activeTurnSignedBlocks(result.messages) > 0;
 				if (held) {
 					expect(record).toEqual(recordBefore);

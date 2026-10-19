@@ -9,7 +9,10 @@ import {
 	readServedPrefix,
 	writeServedPrefix,
 } from "@magic-context/core/hooks/magic-context/served-prefix";
-import { servedMessageDigest } from "../../plugin/src/hooks/magic-context/__tests__/served-prefix-evidence";
+import {
+	servedMessageDigest,
+	wholeMessageDigest,
+} from "../../plugin/src/hooks/magic-context/__tests__/served-prefix-evidence";
 import {
 	clearContextHandlerSession,
 	registerPiContextHandler,
@@ -37,6 +40,119 @@ const thought = (sig: string) => ({
 	type: "thinking",
 	thinking: `Thought ${sig}`,
 	thinkingSignature: sig,
+});
+
+function heldFixture() {
+	const db = createTestDb();
+	const id = "pi-prefix-scope";
+	cleanups.push(() => {
+		clearContextHandlerSession(id);
+		db.close();
+	});
+	const fake = createFakePi();
+	registerPiContextHandler(fake.pi as never, {
+		db,
+		signedThinkingHold: "on",
+		injection: {
+			injectionBudgetTokens: 4000,
+			memoryEnabled: false,
+			injectDocs: false,
+		},
+	});
+	const handler = fake.handlers.get("context")!;
+	const raw = [userMessage("Task")];
+	const ids = ["turn"];
+	const pass = async () => {
+		const messages = structuredClone(raw);
+		const ctx = { ...fakeContext(id, process.cwd(), ids, messages), model };
+		const result = (await handler({ messages } as never, ctx as never)) as {
+			messages: unknown[];
+		};
+		expect(result).toBeDefined();
+		return result.messages;
+	};
+	const thinking = () => {
+		raw.push(
+			assistantMessage("Current", 2, {
+				...model,
+				model: model.id,
+				content: [thought("active"), { type: "text", text: "Current" }],
+			}),
+		);
+		ids.push("active");
+	};
+	return { db, id, raw, ids, pass, thinking };
+}
+
+it("Pi host-only timestamps serve the fresh held request", async () => {
+	const f = heldFixture();
+	await f.pass();
+	f.thinking();
+	const held = await f.pass();
+	const record = readServedPrefix(f.db, f.id);
+	Object.assign(f.raw[0], {
+		timestamp: 12345,
+		details: { summary: "UI only" },
+	});
+	f.raw.push(assistantMessage("Fresh request, not last good", 3));
+	f.ids.push("fresh");
+	const fresh = await f.pass();
+	expect(fresh).not.toEqual(held);
+	expect(JSON.stringify(fresh)).toContain("Fresh request, not last good");
+	expect(readServedPrefix(f.db, f.id)).toEqual(record);
+});
+
+it("Pi provider-visible text before kept thinking still refuses", async () => {
+	const f = heldFixture();
+	await f.pass();
+	f.thinking();
+	await f.pass();
+	const record = readServedPrefix(f.db, f.id);
+	const ids = new Map<unknown, string>(
+		f.raw.map((row, index) => [row, f.ids[index]]),
+	);
+	const stable = (row: unknown) => ids.get(row);
+	const rows: unknown[] = [...f.raw];
+	const prefix = new PiPrefixPass(
+		f.db,
+		f.id,
+		rows,
+		stable,
+		true,
+		false,
+		undefined,
+		{ provider: model.provider, id: model.id, api: model.api },
+	);
+	const injection = prefix.replay(rows, stable)!;
+	expect(injection).not.toBeNull();
+	prefix.finish(rows, injection.syntheticLeadingCount, stable);
+	f.raw[0].content = "changed provider bytes";
+	expect(() =>
+		prefix.finish(rows, injection.syntheticLeadingCount, stable),
+	).toThrow("first kept digest mismatch");
+	expect(readServedPrefix(f.db, f.id)).toEqual(record);
+});
+
+it("Pi legacy whole-envelope digests wait for a permitted rebuild without a refusal loop", async () => {
+	const f = heldFixture();
+	const initial = await f.pass();
+	const legacy = readServedPrefix(f.db, f.id)!;
+	legacy.first_kept!.digest = wholeMessageDigest(initial[legacy.head.length]);
+	f.db
+		.prepare("UPDATE session_meta SET served_prefix = ? WHERE session_id = ?")
+		.run(JSON.stringify(legacy), f.id);
+	Object.assign(f.raw[0], { timestamp: 42 });
+	f.thinking();
+	for (let pass = 0; pass < 2; pass++) {
+		expect(JSON.stringify(await f.pass())).toContain("Current");
+		expect(readServedPrefix(f.db, f.id)).toEqual(legacy);
+	}
+	f.raw.push(userMessage("Next task", 3));
+	f.ids.push("next");
+	await f.pass();
+	const rebuilt = readServedPrefix(f.db, f.id)!;
+	expect(rebuilt.first_kept!.digest).toStartWith("provider-input-v1:");
+	expect(rebuilt.turn).toBe("next");
 });
 
 for (const subagent of [false, true])
@@ -85,7 +201,7 @@ for (const subagent of [false, true])
 			if (!record)
 				throw new Error("First serve did not persist a prefix record");
 			expect(record.first_kept?.digest).toBe(
-				servedMessageDigest(initial[record.head.length]),
+				servedMessageDigest(initial[record.head.length], record.provenance),
 			);
 			const head = initial.slice(0, record.head.length);
 			raw.push(
@@ -180,7 +296,9 @@ it("Pi first-kept reasoning mutation refuses by digest instead of rewriting the 
 	if (!injection)
 		throw new Error("Reasoning fixture record should validate before mutation");
 	pass.finish(raw, injection.syntheticLeadingCount, stable);
-	expect(record.first_kept?.digest).toBe(servedMessageDigest(older));
+	expect(record.first_kept?.digest).toBe(
+		servedMessageDigest(older, record.provenance),
+	);
 	(older as { content: unknown[] }).content.shift();
 	let failure: unknown;
 	try {
