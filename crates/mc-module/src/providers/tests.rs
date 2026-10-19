@@ -1067,3 +1067,75 @@ fn meters_module_duration_includes_waiting_for_the_conversation_lock() {
         );
     });
 }
+
+fn applied(initial: &Value) -> Value {
+    json!({"compaction_id":initial["initial"]["compaction_id"],"version":initial["initial"]["version"]})
+}
+
+#[tokio::test]
+async fn runner_step_runs_the_usage_policy_and_keeps_its_state_in_the_record() {
+    let dir = tempfile::tempdir().unwrap();
+    let h = handler(dir.path(), Arc::new(Runner::default()));
+    let initial = response(dispatch(&h, "compaction.setup", setup("s", "head")).await);
+    let mut overflow = step("s", vec![user(0, "hello")], Some(0));
+    overflow["last_applied"] = applied(&initial);
+    overflow["previous_provider_code"] =
+        json!("This model's maximum context length is 50000 tokens.");
+    let answer = response(dispatch(&h, "compaction.step", overflow).await);
+    assert!(matches!(
+        answer["answer"].as_str(),
+        Some("noop" | "compaction_message")
+    ));
+    let k = key(&h, "s", "broca");
+    let policy = h.provider_store.load(&k).unwrap().usage_policy.unwrap();
+    assert!(policy.emergency_recovery_armed);
+    assert_eq!(policy.limit_for("fixture"), Some(50_000));
+
+    // The next step is for another model: the old model's arm does not carry over.
+    let mut switched = step("s", vec![], Some(0));
+    switched["request_id"] = json!("switched");
+    switched["model"] = json!("other");
+    switched["last_applied"] = answer
+        .get("compaction")
+        .map(|view| json!({"compaction_id":view["compaction_id"],"version":view["version"]}))
+        .unwrap_or_else(|| applied(&initial));
+    let answer = response(dispatch(&h, "compaction.step", switched).await);
+    assert!(matches!(
+        answer["answer"].as_str(),
+        Some("noop" | "compaction_message")
+    ));
+    let policy = h.provider_store.load(&k).unwrap().usage_policy.unwrap();
+    assert_eq!(policy.model.as_deref(), Some("other"));
+    assert!(!policy.emergency_recovery_armed);
+}
+
+#[tokio::test]
+async fn runner_step_records_todo_state_from_the_transcript_for_primaries_only() {
+    let fixture: Value =
+        serde_json::from_str(include_str!("../../testdata/runner-todo-transcript.json")).unwrap();
+    let transcript = fixture["transcript"].as_array().unwrap().clone();
+    let newest = transcript.last().unwrap()["ordinal"].as_u64();
+    let dir = tempfile::tempdir().unwrap();
+    let h = handler(dir.path(), Arc::new(Runner::default()));
+    for (session, preset, recorded) in [("s", "head", true), ("w", "worker", false)] {
+        let initial = response(dispatch(&h, "compaction.setup", setup(session, preset)).await);
+        let mut status = step(session, transcript.clone(), newest);
+        status["last_applied"] = applied(&initial);
+        let answer = response(dispatch(&h, "compaction.step", status).await);
+        assert!(matches!(
+            answer["answer"].as_str(),
+            Some("noop" | "compaction_message")
+        ));
+        let k = key(&h, session, "broca");
+        let meta = h.store.get().unwrap().load(&k.engine_key()).unwrap().meta;
+        if recorded {
+            assert_eq!(
+                meta.last_todo_state.as_deref(),
+                fixture["expected_state_json"].as_str()
+            );
+            assert_eq!(meta.last_todo_state_owner_message_id.as_deref(), Some("m1"));
+        } else {
+            assert_eq!(meta.last_todo_state, None, "{preset}");
+        }
+    }
+}

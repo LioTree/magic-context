@@ -1805,6 +1805,74 @@ fn status(
     Ok(status)
 }
 
+/// Run the runner-lane usage policy for one step: store its new state in the
+/// record and measure this step against its decision (the learned limit's
+/// window, and the estimate in place of an all-zero usage reading).
+fn apply_usage_policy(
+    record: &mut Record,
+    params: &Value,
+    status: &mut transform::compaction::Status,
+    arm_recovery: bool,
+) -> super::usage_policy::UsageDecision {
+    let conditions =
+        super::usage_policy::UsageConditions::from_step_params(params, status.context_window);
+    let (state, decision) = super::usage_policy::advance(
+        &record.usage_policy.clone().unwrap_or_default(),
+        &conditions,
+        arm_recovery,
+    );
+    record.usage_policy = Some(state);
+    status.context_window = decision.effective_window;
+    if !decision.use_measured_usage {
+        status.previous_usage = None;
+    }
+    decision
+}
+
+#[cfg(test)]
+mod usage_policy_wiring_tests {
+    use super::*;
+
+    fn params(extra: Value) -> Value {
+        let mut params =
+            json!({"model":"m","context_window":200_000,"estimate":{"request_tokens":7_000}});
+        params
+            .as_object_mut()
+            .unwrap()
+            .extend(extra.as_object().unwrap().clone());
+        params
+    }
+
+    #[test]
+    fn a_learned_limit_lowers_the_window_the_step_is_measured_against() {
+        let params = params(json!({
+            "previous_provider_code": "maximum context length is 120000 tokens",
+        }));
+        let mut record = Record::default();
+        let mut normalized = status(&params, &record).unwrap();
+        let decision = apply_usage_policy(&mut record, &params, &mut normalized, true);
+        assert!(decision.emergency_recovery_armed);
+        assert_eq!(normalized.context_window, 120_000);
+        assert_eq!(
+            record.usage_policy.as_ref().and_then(|p| p.limit_for("m")),
+            Some(120_000)
+        );
+    }
+
+    #[test]
+    fn an_all_zero_reading_falls_back_to_the_estimate() {
+        let params = params(json!({
+            "previous_usage": {"input":0,"cache_read":0,"cache_write":0,"output":3,"completed_at":5,"finish_reason":"stop"},
+        }));
+        let mut record = Record::default();
+        let mut normalized = status(&params, &record).unwrap();
+        assert_eq!(normalized.usage().current_total_input_tokens, 0);
+        apply_usage_policy(&mut record, &params, &mut normalized, true);
+        assert_eq!(normalized.usage().current_total_input_tokens, 7_000);
+        assert_eq!(normalized.context_window, 200_000);
+    }
+}
+
 /// Compare frame-derived decisions through the real decoder and scheduler.
 /// Omitting message rendering and history mutations keeps saved-view changes out of this comparison.
 #[cfg(test)]
@@ -1864,6 +1932,15 @@ fn execute(
         "session_id":work.key.engine_key(),"render_config":serde_json::to_string(&setup.request.params).map_err(transient)?,
         "model_key":setup.request.model,"messages":[],"tool_present":false,"auto_search_enabled":false}),
     )?;
+    // The runner lane's usage policy, not a host, owns the overflow arm and
+    // the learned limit; hand both to the engine the way a host request does.
+    if let Some(policy) = record.usage_policy.as_ref() {
+        template.emergency_recovery_armed = policy.emergency_recovery_armed;
+        if let Some(limit) = policy.model.as_deref().and_then(|m| policy.limit_for(m)) {
+            template.detected_context_limit = limit;
+            template.detected_context_limit_model_key = template.model_key.clone();
+        }
+    }
     let mut context = producer_context(work, &setup.request.model, status.context_window, false);
     record.prepare_fold(store, &work.key, status, &mut template, initial)?;
     // The runner reports cache expiry through prefix_rebuilding. It supplies no
@@ -2844,7 +2921,23 @@ impl McHandler {
         ingest(&mut record, &request.lineage_id, &request.messages)?;
         record.save(&self.provider_store, &key)?;
         fault("MessagesIngested");
-        let normalized = status(params, &record)?;
+        let mut normalized = status(params, &record)?;
+        let head = record
+            .setup
+            .as_ref()
+            .is_some_and(|s| s.state.preset == transform::compaction::Preset::Head);
+        apply_usage_policy(&mut record, params, &mut normalized, head);
+        // Only a primary (head preset) conversation keeps todo state. The host
+        // bridges skip subagent sessions too: a subagent's todo list is not the
+        // session's own.
+        if head {
+            super::runner_todo::record_from_transcript(
+                &store,
+                &key,
+                &mut record,
+                &request.lineage_id,
+            )?;
+        }
         let complete = request
             .newest
             .as_ref()

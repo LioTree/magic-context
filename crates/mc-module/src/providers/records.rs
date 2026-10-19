@@ -109,6 +109,12 @@ pub struct Record {
     pub last_answer: Option<Value>,
     pub wait_request: Option<String>,
     pub wait_view: Option<transform::compaction::View>,
+    /// Runner-lane usage and overflow policy state (see `usage_policy`).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub usage_policy: Option<super::usage_policy::UsagePolicyState>,
+    /// How far the transcript has been read for `todowrite` state (see `runner_todo`).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub todo_scan: Option<super::runner_todo::TodoScan>,
 }
 
 /// Record pointers of the runner's produced, applied and waiting views.
