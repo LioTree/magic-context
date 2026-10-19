@@ -2816,6 +2816,15 @@ export async function runPostTransformPhase(
     // Every first-application lane and m[1] refresh uses this same permission.
     // It authorizes mutation; individual lanes may still find no eligible work.
     const isCacheBustingPass = publishedWorkDrainAllowed;
+    // A pass allowed to rebuild the whole prefix (cache-busting, with no signed
+    // thinking held) must also retire a replayed last-good recovery tail. If the
+    // tail stayed, work this pass commits, such as a queued drop that waited for
+    // kept thinking, would be recorded as applied but never reach the request.
+    if (args.normalizeRecoveryTail && isCacheBustingPass && !activeThinkingPrefixHold) {
+        args.normalizeRecoveryTail();
+        args.tags = getTagsBySession(args.db, args.sessionId);
+        newTargets = protectTargets();
+    }
     if (
         freezeM0M1 &&
         materializationRequested &&
