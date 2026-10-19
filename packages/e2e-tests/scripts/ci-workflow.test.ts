@@ -62,7 +62,7 @@ test("artifact consumers start setup immediately and gate tests on artifacts", (
 });
 
 test("same-run artifact downloads retry transient failures and guard consumers", () => {
-    const ciConsumers = ["rust-mc-module-lib", "rust-mc-module-parity", "e2e-rust-hermetic", "rust-raw-replay-review"];
+    const ciConsumers = ["rust-mc-module-lib", "rust-mc-module-parity", "e2e-rust-hermetic"];
     const actualCiConsumers = Object.entries(workflow.jobs)
         .filter(([, job]) => job.steps.some((step) => step.run?.includes("scripts/download-ci-artifact.py") && /--artifact-(?:id|name)/.test(step.run)))
         .map(([id]) => id)
@@ -82,7 +82,6 @@ test("same-run artifact downloads retry transient failures and guard consumers",
         "ci.yml:e2e-rust-hermetic",
         "ci.yml:rust-mc-module-lib",
         "ci.yml:rust-mc-module-parity",
-        "ci.yml:rust-raw-replay-review",
         "release.yml:e2e-rust-hermetic",
     ]);
     for (const { workflow: current } of allWorkflowDocuments) {
@@ -243,35 +242,24 @@ test("remaining Rust crates retain Bun migration oracles and hermetic archives r
     expect(unpack).toContain('test -x "packages/e2e-tests/.cache/prebuilt/$binary"');
 });
 
-test("raw replay review reuses the hermetic driver and requires the pinned live witnesses", async () => {
-    const producer = workflow.jobs["e2e-rust-hermetic-build"]!;
-    const build = producer.steps.find((step) => step.name === "Build hermetic binary pair (including fault-injection variant)")!;
-    expect(build.run).toContain("--example transform_replay");
-    expect(build.run).toContain("rust-raw-replay-probe");
-
-    const review = workflow.jobs["rust-raw-replay-review"]!;
-    expect(review.name).toBe("Rust (raw replay review)");
-    expect(review.needs).toEqual(["e2e-rust-hermetic-build"]);
-    expect(review["timeout-minutes"]).toBe(120);
-    const wait = review.steps.find((step) => step.uses === "./.github/actions/wait-ci-artifact")!;
-    expect(wait.with!.artifact).toBe("rust-hermetic-binaries-${{ github.sha }}");
-
-    const fetch = review.steps.find((step) => step.name === "Fetch pinned master baseline")!;
-    expect(fetch.run).toContain("scripts/rust-raw-replay-baseline.commit");
-    expect(fetch.run).toContain("git fetch --no-tags --depth=1 origin");
-    expect(fetch.run).toContain("Cargo.toml Cargo.lock crates");
-    const pin = await Bun.file(resolve(root, "scripts/rust-raw-replay-baseline.commit")).text();
-    expect(pin.trim()).toMatch(/^[0-9a-f]{40}$/);
-
-    const run = review.steps.find((step) => step.name === "Run staged raw replay witnesses")!;
-    expect(run.env!.MC_RAW_REPLAY_REQUIRED).toBe("1");
-    expect(run.env!.MC_REVIEW_ASSERT_LIVENESS).toBe("1");
-    expect(run.run).toContain("rust-cache-review.test.ts");
-    expect(run.run).toContain("rust-cache-r2.test.ts");
-    expect(run.run).toContain("rust-cache-restart.test.ts");
-    expect(run.run).toContain("release recovery census");
-    expect(run.run).toContain("no-freeze SQL");
-    expect(run.run).toContain("seed (a19f37|badc0de|c001d00d|92e41b|67d5a3)");
+test("raw replay review stays retired with the TypeScript full-array Rust transform", async () => {
+    // Its witnesses were plugin review tests of the deleted full-array transform.
+    // A job that still pointed at them could only fail with "matched 0 tests".
+    expect(workflow.jobs["rust-raw-replay-review"]).toBeUndefined();
+    expect(workflow.jobs["ci-summary"]!.needs).not.toContain("rust-raw-replay-review");
+    const text = await Bun.file(resolve(root, ".github/workflows/ci.yml")).text();
+    expect(text).toContain("Rust (raw replay review) is retired.");
+    for (const path of [
+        "packages/plugin/review-tests/rust-cache-review.test.ts",
+        "packages/plugin/review-tests/rust-cache-r2.test.ts",
+        "packages/plugin/review-tests/rust-cache-restart.test.ts",
+        "packages/plugin/src/hooks/magic-context/rust-mode-transform.ts",
+    ]) {
+        expect(await Bun.file(resolve(root, path)).exists()).toBe(false);
+    }
+    for (const step of Object.values(workflow.jobs).flatMap((job) => job.steps ?? [])) {
+        expect(step.run ?? "").not.toContain("test-rust-raw-replay.sh");
+    }
 });
 
 test("raw replay baseline assembly keeps release sources separate from train sources", () => {
