@@ -13,6 +13,42 @@ function attachments(value: unknown) {
         : value;
 }
 
+// OpenCode 2 forwards these native content parts to its provider converter
+// unchanged apart from the `synthetic` flag (v2/hooks/payload.ts commit(), the
+// `const { synthetic, ...clean } = part` branch). The fields are the part schemas
+// of @opencode/ai 2.0.22 (dist/schema/messages.d.ts): its protocols read
+// `metadata` too, for example Anthropic citations and file ids
+// (dist/protocols/anthropic-messages.js:509-607), so it is provider-visible.
+const OC2_NATIVE_PART_FIELDS: Readonly<Record<string, readonly string[]>> = {
+    text: ["type", "text", "cache", "metadata", "providerMetadata"],
+    reasoning: ["type", "text", "encrypted", "cache", "metadata", "providerMetadata"],
+    media: ["type", "media", "filename", "cache", "metadata", "providerMetadata"],
+    "tool-call": [
+        "type",
+        "id",
+        "name",
+        "namespace",
+        "input",
+        "providerExecuted",
+        "cache",
+        "metadata",
+        "providerMetadata",
+    ],
+    "tool-result": [
+        "type",
+        "id",
+        "name",
+        "namespace",
+        "result",
+        "providerExecuted",
+        "cache",
+        "metadata",
+        "providerMetadata",
+    ],
+    compaction: ["type", "provider", "id", "text", "encrypted"],
+    effort: ["type", "effort", "previous"],
+};
+
 function openCodePart(value: unknown, v2: boolean, role: unknown): unknown {
     if (!isRecord(value)) return value;
     const type = value.type;
@@ -23,17 +59,10 @@ function openCodePart(value: unknown, v2: boolean, role: unknown): unknown {
         if (type === "file") return pick(value, ["type", "mime", "url", "filename"]);
         return type === "compaction" || type === "subtask" ? { type } : undefined;
     }
-    // OpenCode 1 forwards text/reasoning metadata as providerMetadata; step-start
-    // controls splitting. OpenCode 2 forwards native content fields at commit.
-    if (type === "text" || type === "reasoning")
-        return pick(
-            value,
-            v2
-                ? type === "reasoning"
-                    ? ["type", "text", "encrypted", "providerMetadata"]
-                    : ["type", "text", "cache"]
-                : ["type", "text", "metadata"],
-        );
+    // OpenCode 1 forwards text/reasoning metadata as providerMetadata
+    // (fixture lines 199-205 and 286-298); step-start controls message splitting.
+    if (!v2 && (type === "text" || type === "reasoning"))
+        return pick(value, ["type", "text", "metadata"]);
     if (!v2 && type === "step-start") return { type };
     if (type === "tool" && isRecord(value.state)) {
         const state = value.state;
@@ -60,34 +89,14 @@ function openCodePart(value: unknown, v2: boolean, role: unknown): unknown {
             state: projected,
         };
     }
-    // OC2 payload.ts:600-718 forwards native content, not store part ids or
-    // synthetic flags. Media and result values are opaque host converter inputs.
     if (v2) {
-        if (type === "tool-call")
-            return pick(value, [
-                "type",
-                "id",
-                "name",
-                "input",
-                "providerExecuted",
-                "providerMetadata",
-            ]);
-        if (type === "tool-result")
-            return pick(value, [
-                "type",
-                "id",
-                "name",
-                "result",
-                "providerExecuted",
-                "providerMetadata",
-                "cache",
-            ]);
-        if (type === "media")
-            return pick(value, ["type", "media", "metadata", "filename", "cache"]);
+        const fields = typeof type === "string" ? OC2_NATIVE_PART_FIELDS[type] : undefined;
+        if (fields) return pick(value, fields);
+        // commit() turns a store file part into media from its mime type and URL.
         if (type === "file") return pick(value, ["type", "mime", "url"]);
-        if (type === "compaction") return pick(value, ["type", "provider", "text", "encrypted"]);
-        if (type === "effort") return pick(value, ["type", "effort", "previous"]);
     }
+    // Every other part type is dropped by the host converter (OpenCode 1) or
+    // rejected by commit() (OpenCode 2), so it never reaches the provider.
     return undefined;
 }
 
