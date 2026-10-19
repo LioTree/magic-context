@@ -14685,7 +14685,7 @@ fn tag_rows_for_hygiene(
     rows
 }
 
-fn active_tags_for_nudge(
+pub(crate) fn active_tags_for_nudge(
     core: &CoreState,
     meta: &ModuleMeta,
     projection: &FlatProjection,
@@ -14983,7 +14983,7 @@ fn channel2_token_aggregate(baseline: Option<&TailHygieneBaseline>) -> Option<(i
     Some(effective_tail_hygiene(baseline))
 }
 
-fn oldest_channel2_hint(
+pub(crate) fn oldest_channel2_hint(
     active_tags: &[ActiveTagForNudge],
     protection_cutoff: &TagNumberCutoffProjection,
     queued_tag_numbers: &HashSet<i64>,

@@ -5,6 +5,7 @@ use cortexkit_bus_inmemory::{InMemoryBus, InMemoryConfig};
 struct Runner {
     entries: Mutex<Vec<ReadMessage>>,
     lineage: Mutex<String>,
+    read_delay_ms: std::sync::atomic::AtomicU64,
 }
 
 #[async_trait]
@@ -17,7 +18,21 @@ impl session_resolver::ProviderRunner for Runner {
         params: Value,
         _: Duration,
     ) -> Result<Value, SessionResolveError> {
+        if method == "session.send" {
+            return Ok(json!({"state":"pending","submission_id":"reminder"}));
+        }
+        if method == "role.describe" {
+            return Ok(
+                json!({"majors":[{"version":"llm-runner/v1","ops":["role.describe","session.baseline","session.send"]}],"implementation_version":"fake","session_capabilities_from":"baseline","capabilities":["delivery_order"]}),
+            );
+        }
         assert_eq!(method, "session.read");
+        let delay = self
+            .read_delay_ms
+            .load(std::sync::atomic::Ordering::Relaxed);
+        if delay > 0 {
+            tokio::time::sleep(Duration::from_millis(delay)).await;
+        }
         let lineage = self.lineage.lock().unwrap().clone();
         if params["lineage_id"]
             .as_str()
@@ -144,6 +159,30 @@ impl Rig {
             .unwrap()
             .unwrap()
     }
+    async fn queue(&self, numbers: &[u64]) {
+        let drop = numbers
+            .iter()
+            .map(u64::to_string)
+            .collect::<Vec<_>>()
+            .join(",");
+        let answer = response(
+            self.h
+                .dispatch_value(7, json!({"name":"ctx_reduce","arguments":{"drop":drop}}))
+                .await,
+        );
+        assert_ne!(answer["isError"], true, "{answer}");
+        assert!(
+            !self
+                .h
+                .store
+                .get()
+                .unwrap()
+                .load_pending_agent_drops(&self.state().namespace())
+                .unwrap()
+                .is_empty(),
+            "the public ctx_reduce route must enqueue engine work"
+        );
+    }
     fn fill(&self, count: u64) {
         *self.runner.entries.lock().unwrap()=(0..count).map(|n| {
             let part=if n%5>0 && n%5<4 {
@@ -152,7 +191,13 @@ impl Rig {
             ReadMessage::new(n,format!("m{n}"),json!({"info":{"id":format!("m{n}"),"role":if n%5==0{"user"}else{"assistant"},"time":{"created":1}},"parts":[part]})).with_tags(vec![tags::PartTag::tagged(format!("p{n}"),format!("§{}§",100+n*3))])
         }).collect();
     }
-    async fn notice(&self, seq: u64, size: u64, applied: Option<u64>) {
+    async fn notice_with_descent(
+        &self,
+        seq: u64,
+        size: u64,
+        applied: Option<u64>,
+        descent: Option<String>,
+    ) {
         let last = self.runner.entries.lock().unwrap().last().cloned().unwrap();
         let mut notice = notice::AdvanceNotice::new(
             &self.reference,
@@ -166,13 +211,22 @@ impl Rig {
         if let Some(version) = applied {
             notice = notice.with_applied_view_version(version);
         }
+        let mut headers = notice.to_headers();
+        headers.insert(
+            "lineage_id".into(),
+            self.runner.lineage.lock().unwrap().clone(),
+        );
+        if let Some(descent) = descent {
+            headers.insert("descends_from".into(), descent);
+        }
+        let notice = notice::AdvanceNotice::from_headers(&headers).unwrap();
         let receipt = self
             .bus
             .publish(
                 &notice::event_subject("fixture", "thalamus-harness", notice::ADVANCED_EVENT),
                 &bus_id(&self.reference, "advanced", seq),
                 notice.digest().parse().unwrap(),
-                notice.to_headers(),
+                headers,
             )
             .await
             .unwrap();
@@ -187,6 +241,9 @@ impl Rig {
         })
         .await
         .expect("notice ingested");
+    }
+    async fn notice(&self, seq: u64, size: u64, applied: Option<u64>) {
+        self.notice_with_descent(seq, size, applied, None).await;
     }
     fn newest(&self) -> Option<u64> {
         self.state().published_engine.keys().next_back().copied()
@@ -377,8 +434,7 @@ async fn defer_never_publishes_and_runner_tags_are_not_allocated() {
     rig.history(20, "first completed historian summary");
     rig.notice(2, 1_000, None).await;
     let baseline = rig.newest().expect("new history publishes");
-    let binding = rig.h.facade_binding(7).unwrap();
-    assert!(rig.h.async_reduce(&binding, &[163, 166, 169]).await.is_ok());
+    rig.queue(&[163, 166, 169]).await;
     rig.notice(3, 90_000, Some(baseline)).await;
     let version = rig.newest().expect("execute threshold publishes");
     assert!(
@@ -405,8 +461,7 @@ async fn long_session_history_ride_ceiling_resync_and_restart() {
     rig.history(20, "initial historian summary");
     rig.notice(2, 1_000, None).await;
     let baseline = rig.newest().expect("initial history publication");
-    let binding = rig.h.facade_binding(7).unwrap();
-    assert!(rig.h.async_reduce(&binding, &[163, 166, 169]).await.is_ok());
+    rig.queue(&[163, 166, 169]).await;
     rig.notice(3, 90_000, Some(baseline)).await;
     let first = rig.newest().unwrap();
     let _ = rig.render(&rig.get(first).await);
@@ -601,4 +656,151 @@ async fn fork_descent_requires_recorded_digest() {
         "unverified descent must be a full resync"
     );
     assert_eq!(verified_descent(&state, &format!("other:9:{digest}")), None);
+}
+
+#[tokio::test]
+async fn published_part_edits_have_full_digest() {
+    let dir = tempfile::tempdir().unwrap();
+    let rig = Rig::new(dir.path()).await;
+    rig.fill(40);
+    rig.notice(1, 1_000, None).await;
+    rig.history(20, "history before explicit reduction");
+    rig.notice(2, 1_000, None).await;
+    let baseline = rig.newest().unwrap();
+    rig.queue(&[163]).await;
+    rig.notice(3, 90_000, Some(baseline)).await;
+    let view = rig.get(rig.newest().unwrap()).await;
+    assert_eq!(view.digest, independent_digest(&view));
+    let edits = view
+        .ranges
+        .iter()
+        .filter_map(|range| match range {
+            view::ViewRange::Keep { edits, .. } => Some(edits),
+            _ => None,
+        })
+        .flatten()
+        .collect::<Vec<_>>();
+    assert!(
+        edits.iter().any(|edit| edit
+            .bytes
+            .as_ref()
+            .is_some_and(|bytes| bytes.contains("[dropped §163§]"))),
+        "queued reductions must be part edits carrying the exact drop placeholder"
+    );
+    let _ = rig.render(&view);
+}
+
+#[tokio::test]
+async fn runner_ordinals_may_start_at_one() {
+    let dir = tempfile::tempdir().unwrap();
+    let rig = Rig::new(dir.path()).await;
+    rig.fill(10);
+    rig.runner
+        .entries
+        .lock()
+        .unwrap()
+        .retain(|entry| entry.ordinal > 0);
+    rig.notice(1, 1_000, None).await;
+    assert_eq!(rig.state().entries.first_key_value().unwrap().0, &1);
+}
+
+#[tokio::test]
+async fn fork_descent_preserves_only_verified_prefix_state() {
+    let dir = tempfile::tempdir().unwrap();
+    let rig = Rig::new(dir.path()).await;
+    rig.fill(40);
+    rig.notice(1, 1_000, None).await;
+    let before = rig.state();
+    let digest = contract::content_digest(&before.entries[&9].message);
+    rig.runner.entries.lock().unwrap().truncate(10);
+    *rig.runner.lineage.lock().unwrap() = "fork:verified".into();
+    rig.notice_with_descent(2, 1_000, None, Some(format!("L:9:{digest}")))
+        .await;
+    let retained = rig.state();
+    assert_eq!(retained.generation, before.generation);
+    assert_eq!(retained.tag_index.len(), 10);
+    assert_eq!(retained.lineage.as_deref(), Some("fork:verified"));
+    *rig.runner.lineage.lock().unwrap() = "fork:unverified".into();
+    rig.notice_with_descent(
+        3,
+        1_000,
+        None,
+        Some(format!("fork:verified:9:{}", "0".repeat(64))),
+    )
+    .await;
+    let reread = rig.state();
+    assert!(reread.generation > retained.generation);
+    assert_eq!(reread.tag_index.len(), 10);
+    assert_eq!(reread.lineage.as_deref(), Some("fork:unverified"));
+}
+
+#[tokio::test]
+async fn ordinary_execute_with_only_drops_defers_but_m1_refresh_publishes() {
+    let dir = tempfile::tempdir().unwrap();
+    let rig = Rig::new(dir.path()).await;
+    rig.fill(40);
+    rig.notice(1, 1_000, None).await;
+    rig.history(10, "stable baseline history");
+    rig.notice(2, 1_000, None).await;
+    let baseline = rig.newest().unwrap();
+    rig.queue(&[163, 166, 169]).await;
+    rig.notice(3, 75_000, Some(baseline)).await;
+    assert_eq!(
+        rig.newest(),
+        Some(baseline),
+        "ordinary Execute does not originate a bust for drops alone"
+    );
+    let namespace = rig.state().namespace();
+    let store = rig.h.store.get().unwrap();
+    assert_eq!(store.load_pending_agent_drops(&namespace).unwrap().len(), 3);
+    let mut rows = store.load_compartments(&namespace).unwrap();
+    rows.push(mc_store::StoredCompartment {
+        sequence: 2,
+        start_message: 11,
+        end_message: 15,
+        end_message_id: "m15#0".into(),
+        title: "delta".into(),
+        content: "queued in-session history delta".into(),
+        p1: Some("queued in-session history delta".into()),
+        importance: 50,
+        ..Default::default()
+    });
+    store.replace_compartments(&namespace, &rows).unwrap();
+    rig.notice(4, 1_000, Some(baseline)).await;
+    assert_eq!(
+        rig.newest(),
+        Some(baseline),
+        "M1 delta remains queued below Execute"
+    );
+    rig.notice(5, 75_000, Some(baseline)).await;
+    let version = rig.newest().unwrap();
+    assert!(
+        version > baseline,
+        "ordinary Execute publishes an M1 refresh, carrying queued drops"
+    );
+    assert!(store
+        .load_pending_agent_drops(&namespace)
+        .unwrap()
+        .is_empty());
+    let _ = rig.render(&rig.get(version).await);
+}
+
+#[tokio::test]
+async fn ride_deadline_returns_nothing_without_waiting_for_slow_runner() {
+    let dir = tempfile::tempdir().unwrap();
+    let rig = Rig::new(dir.path()).await;
+    rig.fill(10);
+    rig.notice(1, 1_000, None).await;
+    rig.runner
+        .read_delay_ms
+        .store(500, std::sync::atomic::Ordering::Relaxed);
+    let started = Instant::now();
+    let answer = rig
+        .op(
+            "compaction.ride",
+            json!({"session_ref":rig.reference,"cause":"ceiling","deadline_ms":10}),
+        )
+        .await;
+    assert_eq!(answer["answer"], "nothing");
+    assert!(started.elapsed() < Duration::from_millis(250));
 }

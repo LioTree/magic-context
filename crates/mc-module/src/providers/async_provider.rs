@@ -61,7 +61,7 @@ pub(crate) struct AsyncRecord {
     #[serde(default)]
     pub(crate) dream_target: Option<Value>,
     #[serde(default)]
-    pub(crate) reminder_cadence: Option<Value>,
+    pub(crate) reminder_cadence: Option<crate::runner_reminders::ReminderState>,
     key: Key,
     runner_module: String,
     setup: compact::setup::SetupRequest,
@@ -730,11 +730,21 @@ impl McHandler {
         state.reindex()?;
         state.save(store, &tag_rows(&state, codec)?)?;
         self.advance_async_policy(&mut state, &notice, codec)?;
-        self.advance_async_reminders(&state.key, &notice).await?;
+        let pending_before = store
+            .load_pending_agent_drops(&state.namespace())
+            .map_err(transient)?
+            .len();
         if state.completed_seq < notice.seq || resynced {
             self.publish_async(0, &mut state, codec, resynced)?;
         }
         state.completed_seq = state.seq;
+        let drops_applied = store
+            .load_pending_agent_drops(&state.namespace())
+            .map_err(transient)?
+            .len()
+            < pending_before;
+        self.advance_async_reminders(&mut state, &notice, codec, drops_applied)
+            .await?;
         state.save(store, &[])?;
         drop(_serial);
         self.schedule_async_historian(&state)?;
@@ -813,9 +823,149 @@ impl McHandler {
 
     async fn advance_async_reminders(
         &self,
-        _key: &Key,
-        _conditions: &notice::AdvanceNotice,
+        state: &mut State,
+        notice: &notice::AdvanceNotice,
+        codec: codec::Codec,
+        drops_applied: bool,
     ) -> Result<(), HandlerOutcome> {
+        let store = self
+            .store
+            .get()
+            .ok_or_else(|| transient("store unavailable"))?;
+        let loaded = store.load(&state.namespace()).map_err(transient)?;
+        let rows = store
+            .load_tags_for_session(&state.namespace())
+            .map_err(transient)?;
+        let messages = state
+            .entries
+            .values()
+            .map(|entry| {
+                codec.decode_message(&InboundMessage {
+                    ordinal: entry.ordinal,
+                    mid: entry.mid.clone(),
+                    message: entry.message.clone(),
+                    raw_message: None,
+                })
+            })
+            .collect::<Result<Vec<_>, _>>()?;
+        let projection = ck_wire::project_messages(&messages).map_err(transient)?;
+        let mut active =
+            transform::active_tags_for_nudge(&loaded.core, &loaded.meta, &projection, &rows, None);
+        active.retain(|tag| {
+            rows.iter()
+                .find(|row| row.tag_number == tag.tag_number)
+                .is_some_and(|row| !loaded.meta.protected_tool_block_ids.contains(&row.block_id))
+        });
+        let config = self.effective_config(&state.key.project);
+        let window = crate::protection_window::ProtectionWindow::from_persisted_rows(
+            &rows,
+            config
+                .resolve_protected_tokens(notice.window.or(state.setup.context_window).unwrap_or(0))
+                .floor,
+        );
+        let pending = store
+            .load_pending_agent_drops(&state.namespace())
+            .map_err(transient)?;
+        let queued = rows
+            .iter()
+            .filter(|row| pending.iter().any(|drop| drop.target_id == row.block_id))
+            .map(|row| row.tag_number)
+            .collect::<HashSet<_>>();
+        let oldest = transform::oldest_reclaimable_hint(&active, &window.cutoff, &queued)
+            .into_iter()
+            .filter_map(|(number, _)| u64::try_from(number).ok())
+            .collect::<Vec<_>>();
+        let channel2 = transform::oldest_channel2_hint(&active, &window.cutoff, &queued)
+            .into_iter()
+            .filter_map(|(number, _)| u64::try_from(number).ok())
+            .collect::<Vec<_>>();
+        let last = messages.last();
+        let carrier = last
+            .filter(|message| {
+                message
+                    .ck
+                    .content
+                    .iter()
+                    .any(|block| matches!(block.kind, ck_wire::CkKind::ToolResult { .. }))
+            })
+            .and_then(|message| {
+                rows.iter().rev().find(|row| {
+                    row.kind == "tool_result"
+                        && row.block_id.starts_with(&format!("{}#", message.mid))
+                        && row.token_count > 0
+                })
+            })
+            .and_then(|row| u64::try_from(row.tag_number).ok());
+        let user = last.filter(|message| {
+            message.ck.role == "user"
+                && !message
+                    .ck
+                    .content
+                    .iter()
+                    .any(|block| matches!(block.kind, ck_wire::CkKind::ToolResult { .. }))
+        });
+        let users = messages
+            .iter()
+            .filter(|message| {
+                message.ck.role == "user"
+                    && !message
+                        .ck
+                        .content
+                        .iter()
+                        .any(|block| matches!(block.kind, ck_wire::CkKind::ToolResult { .. }))
+            })
+            .count() as u64;
+        let mut entries = state.entries.values().rev();
+        let written = entries.next().and_then(|entry| entry.written_at);
+        let prior = entries.next().and_then(|entry| entry.written_at);
+        let gap_ms = written
+            .zip(prior)
+            .and_then(|(written, prior)| i64::try_from(written).ok().zip(i64::try_from(prior).ok()))
+            .map(|(written, prior)| written.saturating_sub(prior));
+        let mut cadence = state.reminder_cadence.take().unwrap_or_else(|| {
+            let mut cadence = crate::runner_reminders::ReminderState::default();
+            cadence.meta = loaded.meta.clone();
+            cadence
+        });
+        let conditions = crate::runner_reminders::ReminderConditions {
+            notice_id: &bus_id(&state.reference(), "advanced", notice.seq),
+            now_ms: now_ms().max(0) as u64,
+            real_user_turn_count: users,
+            baseline: loaded.meta.tail_hygiene_baseline.as_ref(),
+            newest_tool_tag: carrier,
+            oldest_reclaimable_tags: &oldest,
+            channel2_tags: &channel2,
+            drops_applied,
+            baseline_refreshed: cadence
+                .meta
+                .tail_hygiene_baseline
+                .as_ref()
+                .map(|b| b.baseline_generation)
+                != loaded
+                    .meta
+                    .tail_hygiene_baseline
+                    .as_ref()
+                    .map(|b| b.baseline_generation),
+            hard_fold_coverage_advanced: loaded.meta.coverage_ordinal
+                > cadence.meta.coverage_ordinal,
+            user_message_id: user.map(|message| message.mid.as_str()),
+            temporal_enabled: config.temporal_awareness,
+            gap_ms,
+            ready_search_hint: None,
+        };
+        let outcome = crate::runner_reminders::send_due_reminders(
+            self.provider_runner.as_ref(),
+            &state.key.project,
+            &state.key.session,
+            &mut cadence,
+            &conditions,
+        )
+        .await;
+        cadence.meta.coverage_ordinal = loaded.meta.coverage_ordinal;
+        state.reminder_cadence = Some(cadence);
+        for error in outcome.errors {
+            tracing::warn!(%error,"async reminder send unavailable");
+        }
         Ok(())
     }
 
@@ -1022,10 +1172,18 @@ impl McHandler {
                 return bytes(&ride::RideAnswer::nothing());
             }
             let codec = codec::Codec::from_params(&Value::Object(state.setup.params.clone()))?;
+            state.reindex()?;
             state.save(store, &tag_rows(&state, codec)?)?;
-            let view = self.publish_async(0, &mut state, codec, true)?;
-            state.save(store, &[])?;
-            drop(_serial);
+            let worker = self.provider_historian_worker();
+            let store = Arc::clone(store);
+            let view = tokio::task::spawn_blocking(move || {
+                let _serial = _serial;
+                let view = worker.publish_async(0, &mut state, codec, true)?;
+                state.save(&store, &[])?;
+                Ok::<_, HandlerOutcome>(view)
+            })
+            .await
+            .map_err(transient)??;
             self.announce_async_views().await?;
             match view {
                 Some(view) => bytes(&ride::RideAnswer::view(view)),
@@ -1387,6 +1545,32 @@ impl McHandler {
                 Some(respond(json!({"ok":true,"armed":armed})))
             }
             Err(error) => Some(transient(error)),
+        }
+    }
+}
+
+impl McHandler {
+    pub(crate) fn async_compaction_namespace(
+        &self,
+        binding: &SessionBinding,
+    ) -> Result<Option<String>, HandlerOutcome> {
+        let store = self
+            .store
+            .get()
+            .ok_or_else(|| transient("store unavailable"))?;
+        let rows = store
+            .async_compaction_for_session(&binding.project_root.to_string_lossy(), &binding.session)
+            .map_err(transient)?;
+        match rows.as_slice() {
+            [] => Ok(None),
+            [raw] => {
+                let state: State = serde_json::from_str(raw).map_err(transient)?;
+                if state.resync {
+                    return Err(transient("async transcript resync in progress"));
+                }
+                Ok(Some(state.namespace()))
+            }
+            _ => Err(session_unresolved_error()),
         }
     }
 }

@@ -14741,7 +14741,8 @@ impl McHandler {
         let transform_session_known =
             self.module_knows_transform_session(bound_session, &binding.project_root);
         let conversation_key = if binding.harness == session_resolver::RUNNER_BIND_HARNESS {
-            self.provider_store.tool_key(&binding)?.engine_key()
+            self.async_compaction_namespace(&binding)?
+                .ok_or_else(session_unresolved_error)?
         } else if opencode_harness && transform_session_known {
             bound_session.to_string()
         } else {
