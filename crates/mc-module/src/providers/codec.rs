@@ -56,21 +56,50 @@ pub enum Codec {
     OwnedBroca,
     OpencodeAiSdk,
     Pi,
+    /// llm-runner's `anthropic-messages` profile: entries are Anthropic
+    /// Messages request messages, rendered under the Claude Code serializer.
+    AnthropicMessages,
 }
 
 impl Codec {
+    /// Every profile `from_params` admits, in the fixed order `role.describe`
+    /// advertises them.
+    pub const ALL: [Self; 4] = [
+        Self::OwnedBroca,
+        Self::OpencodeAiSdk,
+        Self::Pi,
+        Self::AnthropicMessages,
+    ];
+
+    /// The `params.serializer_profile` string that selects this codec.
+    pub const fn wire_id(self) -> &'static str {
+        match self {
+            Self::OwnedBroca => "owned-broca",
+            Self::OpencodeAiSdk => "opencode-aisdk",
+            Self::Pi => "pi",
+            Self::AnthropicMessages => {
+                cortexkit_role_llm_runner::serializer_profile::ANTHROPIC_MESSAGES
+            }
+        }
+    }
+
     /// Takes the plan item's opaque `params`, not the operation envelope.
     pub fn from_params(params: &Value) -> Result<Self, HandlerOutcome> {
         match params.get("serializer_profile") {
             None => Ok(Self::OwnedBroca),
-            Some(Value::String(profile)) if profile == "owned-broca" => Ok(Self::OwnedBroca),
-            Some(Value::String(profile)) if profile == "opencode-aisdk" => Ok(Self::OpencodeAiSdk),
-            Some(Value::String(profile)) if profile == "pi" => Ok(Self::Pi),
-            _ => Err(HandlerOutcome::ErrorWithDetail {
-                code: "invalid_params".into(),
-                message: "unknown provider serializer profile".into(),
-                detail: json!({"field":"params.serializer_profile"}),
-            }),
+            Some(Value::String(profile)) => Self::ALL
+                .into_iter()
+                .find(|codec| codec.wire_id() == profile)
+                .ok_or_else(Self::unknown_profile),
+            Some(_) => Err(Self::unknown_profile()),
+        }
+    }
+
+    fn unknown_profile() -> HandlerOutcome {
+        HandlerOutcome::ErrorWithDetail {
+            code: "invalid_params".into(),
+            message: "unknown provider serializer profile".into(),
+            detail: json!({"field":"params.serializer_profile"}),
         }
     }
 
@@ -79,6 +108,9 @@ impl Codec {
             Self::OwnedBroca => SerializerProfile::OwnedBroca,
             Self::OpencodeAiSdk => SerializerProfile::OpencodeAiSdk,
             Self::Pi => SerializerProfile::Pi,
+            // The engine's existing Anthropic serializer: the healing and
+            // rendering rules of the full-array Claude Code route.
+            Self::AnthropicMessages => SerializerProfile::ClaudeCodeAnthropic,
         }
     }
 
@@ -88,6 +120,7 @@ impl Codec {
     ) -> Result<ck_wire::CkIngressMessage, HandlerOutcome> {
         match self {
             Self::OwnedBroca => decode_message(message),
+            Self::AnthropicMessages => super::codec_anthropic::decode_message(message),
             Self::Pi => Ok(
                 super::codec_pi::decode_messages(std::slice::from_ref(message))?
                     .messages
@@ -127,6 +160,13 @@ impl Codec {
                     .collect::<Result<Vec<_>, _>>()?,
                 None,
             ),
+            Self::AnthropicMessages => (
+                messages
+                    .iter()
+                    .map(super::codec_anthropic::decode_message)
+                    .collect::<Result<Vec<_>, _>>()?,
+                Some(messages.iter().map(|m| m.message.clone()).collect()),
+            ),
             Self::OpencodeAiSdk => {
                 let decoded = super::codec_opencode::decode_messages(messages)?;
                 (
@@ -142,6 +182,12 @@ impl Codec {
         };
         request.messages = ingress;
         request.native_messages = native;
+        // Every `anthropic-messages` entry is an Anthropic Messages API
+        // message, so the engine applies Anthropic's signed-thinking turn rules
+        // whatever the session's model is called.
+        if self == Self::AnthropicMessages && request.provider_id.is_none() {
+            request.provider_id = Some("anthropic".into());
+        }
         request.serve_native = self == Self::OpencodeAiSdk;
         request.serializer_profile = self.serializer_profile().wire_id().into();
         Ok(())
@@ -155,8 +201,24 @@ impl Codec {
     ) -> Result<codec::OutboundMessage, HandlerOutcome> {
         match self {
             Self::OwnedBroca => encode_view(view),
+            Self::AnthropicMessages => super::codec_anthropic::encode_view(view),
             Self::Pi => super::codec_pi::encode_view(view, request),
             Self::OpencodeAiSdk => super::codec_opencode::encode_view(view, request, context),
+        }
+    }
+
+    /// For each part of `rendered`, the index of the runner part of the same
+    /// message it was decoded from (`None` for an engine-authored part), when
+    /// the schema's parts carry no ids of their own to match by. `None` keeps
+    /// matching by part id, then by position.
+    pub fn part_origins(
+        self,
+        message: &ck_wire::CkWireMessage,
+        rendered: &Value,
+    ) -> Option<Vec<Option<usize>>> {
+        match self {
+            Self::AnthropicMessages => super::codec_anthropic::part_origins(message, rendered),
+            Self::OwnedBroca | Self::OpencodeAiSdk | Self::Pi => None,
         }
     }
 
@@ -164,7 +226,9 @@ impl Codec {
     /// CK messages. Each entry is decoded on its own, so the result for an
     /// entry never depends on how the transcript was paged. `mid` must be the
     /// runner's own message id (OpenCode `info.id`, a Pi journal entry `id`):
-    /// an entry without one is refused, never assigned an id.
+    /// an entry without one is refused, never assigned an id. An
+    /// `anthropic-messages` body has no id member, so its `mid` is the one
+    /// the runner's read envelope names.
     pub fn decode_entries(
         self,
         entries: &[InboundMessage],

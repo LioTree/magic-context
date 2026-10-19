@@ -15,6 +15,7 @@
 use super::broca_carrier::{BrocaPort, PortError};
 use super::executor::BrocaPorts;
 use crate::route_targets::{RegisteredRoute, RouteTargetConfig, SessionRunnerRoute};
+use crate::session_resolver::llm_runner_role_versions;
 use serde_json::{json, Value};
 use std::path::PathBuf;
 use std::time::Duration;
@@ -134,6 +135,7 @@ impl BrocaPort for SubcBrocaPort {
                 CallOptions {
                     timeout: OP_TIMEOUT,
                     route_retry_deadline: OP_TIMEOUT,
+                    role_versions: Some(llm_runner_role_versions()),
                     ..CallOptions::default()
                 },
             )
@@ -163,6 +165,7 @@ impl BrocaPort for SubcBrocaPort {
                     SubscribeOptions {
                         route_open_timeout: OP_TIMEOUT,
                         route_retry_deadline: OP_TIMEOUT,
+                        role_versions: Some(llm_runner_role_versions()),
                         ..SubscribeOptions::default()
                     },
                 )
@@ -193,7 +196,14 @@ impl BrocaPort for SubcBrocaPort {
         }
         if let (Ok((target, identity)), Some(consumer)) = (self.route(session), &self.consumer) {
             consumer
-                .close_route(target, identity, CloseRouteOptions::default())
+                .close_route(
+                    target,
+                    identity,
+                    CloseRouteOptions {
+                        role_versions: Some(llm_runner_role_versions()),
+                        ..CloseRouteOptions::default()
+                    },
+                )
                 .await;
         }
     }

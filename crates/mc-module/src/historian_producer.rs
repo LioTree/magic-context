@@ -1398,8 +1398,8 @@ impl HistorianProducer {
             admission_facts: None,
             // Historian routes carry no session scope; they run under the module's own identity.
             scope: None,
-            // The historian runner is not a versioned role route.
-            role_versions: None,
+            // The historian runner is an llm-runner management surface.
+            role_versions: Some(crate::session_resolver::llm_runner_role_versions()),
         };
         let corr = self.next_corr();
         let body = serde_json::to_vec(&request)?;
@@ -2043,7 +2043,11 @@ fn retry_after_secs_from_value(value: &Value) -> Option<u64> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use std::{collections::VecDeque, net::SocketAddr, sync::Arc};
+    use std::{
+        collections::{BTreeMap, VecDeque},
+        net::SocketAddr,
+        sync::Arc,
+    };
 
     use serde_json::json;
     use subc_transport::{
@@ -2532,6 +2536,7 @@ mod tests {
     struct ServerLog {
         route_sessions: Vec<String>,
         route_targets: Vec<subc_protocol::RouteTarget>,
+        route_role_versions: Vec<Option<BTreeMap<String, String>>>,
         role_describes: Vec<Value>,
         sends: Vec<Value>,
         subscribes: Vec<Value>,
@@ -2625,7 +2630,10 @@ mod tests {
                             let req: ClientControlRequest =
                                 serde_json::from_slice(&frame.body).unwrap();
                             if let ClientControlRequest::RouteOpen {
-                                identity, target, ..
+                                identity,
+                                target,
+                                role_versions,
+                                ..
                             } = req
                             {
                                 let route = next_route;
@@ -2634,6 +2642,7 @@ mod tests {
                                 let mut log = log_task.lock().await;
                                 log.route_sessions.push(identity.session);
                                 log.route_targets.push(target);
+                                log.route_role_versions.push(role_versions);
                                 drop(log);
                                 send_response_frame(
                                     &mut stream,
@@ -3165,6 +3174,14 @@ mod tests {
             }],
             "the configured broca target must not be used for a THALAMUS session"
         );
+        assert_eq!(
+            log.route_role_versions,
+            vec![Some(BTreeMap::from([(
+                "llm-runner".to_string(),
+                "v1".to_string()
+            )]))],
+            "a runner route declares it speaks llm-runner/v1"
+        );
         assert_eq!(log.route_sessions, vec!["mc-hist-1".to_string()]);
         let send = &log.sends[0];
         assert_eq!(send["parent"], "ses-parent");
@@ -3190,6 +3207,13 @@ mod tests {
             vec![subc_protocol::RouteTarget::ManagementSurface {
                 module_id: "llm-runner".into()
             }]
+        );
+        assert_eq!(
+            log.route_role_versions,
+            vec![Some(BTreeMap::from([(
+                "llm-runner".to_string(),
+                "v1".to_string()
+            )]))]
         );
         assert!(log.sends[0].get("parent").is_none());
         assert!(log.sends[0].get("stop_when").is_none());

@@ -2818,6 +2818,9 @@ struct FacadeScope {
     /// Daemon-bound filesystem path retained only for route-vocabulary enforcement.
     route_project_root: String,
     conversation_key: String,
+    /// The conversation is an asynchronous compaction conversation, so its
+    /// history tools take the async lane.
+    async_conversation: bool,
     memory_enabled: bool,
     /// Why memory is paused for this route, when its project identity is unavailable.
     memory_paused: Option<String>,
@@ -14849,9 +14852,22 @@ impl McHandler {
             binding.harness == OPENCODE_HARNESS || binding.harness == "opencode2";
         let transform_session_known =
             self.module_knows_transform_session(bound_session, &binding.project_root);
-        let conversation_key = if binding.harness == session_resolver::RUNNER_BIND_HARNESS {
+        // The bind's (project_root, session) names an asynchronous compaction
+        // conversation whatever harness the bind declares: an MCP facade binds
+        // a runner's conversation by its session alone. More than one match
+        // refuses rather than guessing; none keeps the harness's own path.
+        let async_key = if binding.harness == session_resolver::RUNNER_BIND_HARNESS
+            || self.store.get().is_some()
+        {
             self.async_compaction_namespace(&binding)?
-                .ok_or_else(session_unresolved_error)?
+        } else {
+            None
+        };
+        let async_conversation = async_key.is_some();
+        let conversation_key = if let Some(key) = async_key {
+            key
+        } else if binding.harness == session_resolver::RUNNER_BIND_HARNESS {
+            return Err(session_unresolved_error());
         } else if opencode_harness && transform_session_known {
             bound_session.to_string()
         } else {
@@ -14902,6 +14918,7 @@ impl McHandler {
             memory_project_path,
             route_project_root,
             conversation_key,
+            async_conversation,
             memory_enabled: binding.config.memory_enabled && memory_paused.is_none(),
             memory_paused,
         })
@@ -14929,10 +14946,7 @@ impl McHandler {
             Ok(scope) => scope,
             Err(outcome) => return outcome,
         };
-        if self
-            .facade_binding(channel)
-            .is_ok_and(|binding| binding.harness == session_resolver::RUNNER_BIND_HARNESS)
-        {
+        if facade_scope.async_conversation {
             return self.handle_provider_reduce(channel, &requested).await;
         }
         let store = match self.store_for_request().await {
@@ -21337,6 +21351,11 @@ pub fn manifest_with_route_targets(
     manifest_with_route_targets_and_smart_notes(module_id, resolved_routes, true)
 }
 
+/// The ctx tool facades resolve a bind's `(project_root, session)` to an
+/// asynchronous compaction conversation whatever harness the bind names, so
+/// an MCP facade may bind a runner's conversation by its session alone.
+pub const MCP_CONVERSATION_BINDING_V1: &str = "mcp-conversation-binding/v1";
+
 pub fn manifest_with_route_targets_and_smart_notes(
     module_id: &str,
     resolved_routes: &RouteTargetConfig,
@@ -21350,7 +21369,10 @@ pub fn manifest_with_route_targets_and_smart_notes(
     // Keep the existing model tools separate from the opt-in internal move service.
     // Leave ModuleManifest.bindings unset: it can request separate stores per
     // project, whereas MC uses one machine-wide store with project-keyed rows.
-    let mut capabilities = vec![cortexkit_role_compaction_provider::PROVIDES.to_string()];
+    let mut capabilities = vec![
+        cortexkit_role_compaction_provider::PROVIDES.to_string(),
+        MCP_CONVERSATION_BINDING_V1.to_string(),
+    ];
     let mut provides = vec![ProviderRole::ToolProvider {
         tools,
         identity_scope: vec![IdentityScope::Project, IdentityScope::Session],
@@ -24066,6 +24088,18 @@ mod tests {
             vec![ConsumerRole::ServiceClient {
                 of: route_targets::expected_routes_for_tests("broca")
             }]
+        );
+        let mut expected_capabilities = vec![
+            "compaction-provider/v1".to_string(),
+            "mcp-conversation-binding/v1".to_string(),
+        ];
+        if agent_data::ENABLED {
+            expected_capabilities.push(cortexkit_role_agent_data::PROVIDES.to_string());
+        }
+        assert_eq!(
+            m.capabilities.as_ref().map(|c| &c.provides),
+            Some(&expected_capabilities),
+            "capability list is pinned"
         );
         let ProviderRole::ToolProvider { tools, .. } = &m.provides[0] else {
             panic!("magic-context must expose a tool provider role");

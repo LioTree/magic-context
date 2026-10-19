@@ -969,7 +969,9 @@ impl McHandler {
         };
         let wire = rendered_view(codec, initial, &state)?;
         state.engine = engine;
-        state.initial = json!({"answer":"ready","request_id":request.request_id,"initial":wire, "ceiling":CeilingPolicy::new(0.95,300_000).with_on_overflow()});
+        // `serializer_profile` is a ck-mc extension member: the profile this
+        // Setup accepted, so the runner can confirm ck-mc reads its schema.
+        state.initial = json!({"answer":"ready","request_id":request.request_id,"initial":wire, "ceiling":CeilingPolicy::new(0.95,300_000).with_on_overflow(),"serializer_profile":codec.wire_id()});
         state.save(store, &[])?;
         bytes(&state.initial)
     }
@@ -1022,22 +1024,33 @@ impl McHandler {
             false,
         );
         context.cache_ttl = "never".into();
+        // On this lane the runner owns the model provider's companion edit:
+        // views never remove the signed reasoning they invalidate.
+        let signed = transform::compaction::SignedReasoning::RunnerCompanion;
         let output = if engine.last_applied.is_none() {
-            transform::compaction::setup(store, &template, &context, status, engine)
+            transform::compaction::setup_with(store, &template, &context, status, engine, signed)
         } else {
-            transform::compaction::step(store, &template, &context, status, engine)
+            transform::compaction::step_with(store, &template, &context, status, engine, signed)
         }
         .map_err(transient)?;
         Ok((template, output))
     }
 }
 
-fn parts(message: &Value) -> Result<&Vec<Value>, HandlerOutcome> {
+fn parts(message: &Value) -> Result<std::borrow::Cow<'_, [Value]>, HandlerOutcome> {
+    // An Anthropic message may carry its content as one string instead of a
+    // block array; the runner exposes that string as the message's one part.
+    if let Some(text @ Value::String(_)) = message.get("content") {
+        if message.get("parts").is_none() {
+            return Ok(std::borrow::Cow::Owned(vec![text.clone()]));
+        }
+    }
     message
         .get("parts")
         .or_else(|| message.get("content"))
         .or_else(|| message.pointer("/message/content"))
         .and_then(Value::as_array)
+        .map(|parts| std::borrow::Cow::Borrowed(parts.as_slice()))
         .ok_or_else(|| invalid_field("message", "codec must expose an ordered parts array"))
 }
 
@@ -1073,7 +1086,19 @@ fn render_part(part: &Value, tag: Option<&str>, render: bool) -> Value {
     if !render {
         return part;
     }
-    for pointer in ["/text", "/state/output", "/state/error", "/output/text"] {
+    if let Value::String(text) = &part {
+        return json!(tags::render_text(
+            tags::RenderKind::ToolResultText,
+            tag,
+            text
+        ));
+    }
+    // An Anthropic `tool_result` may carry its output as a plain `content` string.
+    let anthropic_result = (part["type"] == "tool_result").then_some("/content");
+    for pointer in ["/text", "/state/output", "/state/error", "/output/text"]
+        .into_iter()
+        .chain(anthropic_result)
+    {
         if let Some(value) = part.pointer_mut(pointer).filter(|v| v.is_string()) {
             *value = json!(tags::render_text(
                 tags::RenderKind::ToolResultText,
@@ -1169,6 +1194,7 @@ fn tag_rows_for<'a>(
 
 fn ranges(
     state: &State,
+    codec: codec::Codec,
     wire: &OutboundMessage,
     engine: &transform::compaction::View,
     history_through: Option<u64>,
@@ -1231,10 +1257,22 @@ fn ranges(
         }
         let before = parts(&original.message)?;
         let after = parts(message)?;
+        // Which runner part each rendered part came from, for schemas whose
+        // parts have no ids: a removed part then shifts the rest left, so
+        // position alone would pair a kept part with its neighbour's bytes.
+        let origins = engine
+            .replacement
+            .get(position)
+            .and_then(|ck| codec.part_origins(ck, message));
         let mut edits = Vec::new();
         for (index, (part, row)) in before.iter().zip(&original.tags).enumerate() {
             let expected = render_part(part, row.tag.as_deref(), render);
-            let changed = if let Some(id) = part.get("id").and_then(Value::as_str) {
+            let changed = if let Some(origins) = &origins {
+                origins
+                    .iter()
+                    .position(|origin| *origin == Some(index))
+                    .and_then(|at| after.get(at))
+            } else if let Some(id) = part.get("id").and_then(Value::as_str) {
                 after
                     .iter()
                     .find(|p| p.get("id").and_then(Value::as_str) == Some(id))
@@ -1797,7 +1835,7 @@ impl McHandler {
             .map_err(transient)?
             .meta
             .coverage_ordinal;
-        let mut ranges = ranges(state, &wire, &candidate, coverage)?;
+        let mut ranges = ranges(state, codec, &wire, &candidate, coverage)?;
         if let Some(head) = state.restored_head.take() {
             if let Some(view::ViewRange::Replace { from: 0, to, bytes }) =
                 ranges.first_mut().filter(|range| range.to() == head.to)

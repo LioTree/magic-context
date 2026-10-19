@@ -471,11 +471,17 @@ pub enum RecipeLane {
 }
 
 impl RecipeLane {
-    fn host(codec: Codec) -> Self {
+    /// The recipe lane for a host-lane conversation's codec. An
+    /// `anthropic-messages` session exists only on the asynchronous runner
+    /// lane, which keeps its views in its own table, so it has no recipe lane.
+    fn host(codec: Codec) -> Result<Self, HandlerOutcome> {
         match codec {
-            Codec::OpencodeAiSdk => Self::OpencodeAiSdk,
-            Codec::OwnedBroca => Self::OwnedBroca,
-            Codec::Pi => Self::Pi,
+            Codec::OpencodeAiSdk => Ok(Self::OpencodeAiSdk),
+            Codec::OwnedBroca => Ok(Self::OwnedBroca),
+            Codec::Pi => Ok(Self::Pi),
+            Codec::AnthropicMessages => Err(transient(
+                "anthropic-messages views are not stored as host recipes",
+            )),
         }
     }
 
@@ -940,7 +946,7 @@ pub fn save_host(
         .map(|c| serde_json::from_str::<Value>(&c.params_json).map_err(transient))
         .transpose()?
         .unwrap_or_else(|| json!({}));
-    let lane = RecipeLane::host(Codec::from_params(&params)?);
+    let lane = RecipeLane::host(Codec::from_params(&params)?)?;
     if lane == RecipeLane::OpencodeAiSdk {
         return save(store, key, view, state);
     }
