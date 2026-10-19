@@ -121,10 +121,13 @@ function piPart(value: unknown): unknown {
     return fields ? pick(value, fields) : value;
 }
 
-// Message-level fields the same converters read. Assistant provider/api/model/
-// stopReason select same-model signature replay or error omission; tool results
-// carry call linkage and deferred tool loading (anthropic-messages.js, 0.83:810-835);
-// 0.87 adds the thinking level and system-message tool and section updates.
+// Message-level fields read by the same pi-ai converters as PI_PART_FIELDS
+// (@earendil-works/pi-ai 0.83 through 0.87). On assistant messages,
+// provider/api/model/stopReason decide whether a signature is replayed (same
+// model) or an errored turn is omitted. On tool results, toolCallId/toolName/
+// isError link the result to its call and addedToolNames loads deferred tools
+// (0.83 anthropic-messages.js:810-835). pi-ai 0.87 also reads the assistant's
+// providerThinkingLevel and a system message's sections/toolsAdded/toolsRemoved.
 const PI_MESSAGE_FIELDS = [
     "role",
     "provider",
@@ -142,13 +145,19 @@ const PI_MESSAGE_FIELDS = [
 ] as const;
 
 /**
- * Hash inputs to the pinned host converters, not the mutable host envelope.
- * Fixed projection key order ignores host property insertion order; opaque tool
- * arguments/provider values retain their order because the converter sends it.
- * Converter identity and current model bind the interpretation of those inputs.
- * OpenCode 2 also restores original call/result fields in payload.commit().
- * Those separate fields never reached this digest, even before projection.
- * They are frozen by provider-record replay, but remain unfenced in TS mode.
+ * The part of a served message that the host's converter reads, i.e. what the
+ * provider is sent for it; host-only envelope fields (OpenCode `info.summary`,
+ * Pi timestamps) are left out. The projection emits its own fixed key order,
+ * because the converters build new objects and the host's property order never
+ * reaches the provider. Opaque values the converter passes through (tool
+ * arguments, provider metadata) keep their own key order, because that order
+ * does reach the provider. The converter label and the request model are part
+ * of the projection because they decide how these inputs become provider bytes.
+ *
+ * Not covered: OpenCode 2's commit() (v2/hooks/payload.ts) also copies tool-call
+ * and tool-result fields such as providerExecuted from the host's original
+ * draft, which the transformed message never carries. Saved provider requests
+ * replay those fields unchanged, but this digest cannot detect a change to them.
  */
 export function servedPrefixProjection(message: unknown, provenance: PrefixProvenance): unknown {
     if (!isRecord(message)) throw new Error("Cannot project an absent served message");
