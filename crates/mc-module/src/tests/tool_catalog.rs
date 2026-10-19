@@ -1066,3 +1066,66 @@ async fn only_a_route_that_declared_the_role_gets_unknown_tool() {
         "facade_envelope_not_supported"
     );
 }
+
+/// A Claude Code subagent conversation (`<session_id>/<agent_id>`) fetches its
+/// guidance with `{"preset":"worker","params":{"model":"<provider>/<model>"}}`.
+/// Its `system_text` is byte-identical to the guidance standalone OpenCode
+/// injects into a subagent for the same model: the generator's matrix records
+/// that text as the `subagent` variant, rendered by the plugin's own
+/// `buildMagicContextSection(..., subagentMode)`, for the surface the model
+/// resolves to. OpenCode's subagent text ignores the memory, smart-notes,
+/// temporal, caveman and language settings, and the matrix shows the same
+/// digest for every combination of them. `reader` serves the same text.
+#[test]
+fn worker_system_text_is_standalone_opencode_subagent_guidance_for_the_model() {
+    let path = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+        .join("testdata/tool-catalog-guidance-matrix.json");
+    let matrix: Value = serde_json::from_str(&std::fs::read_to_string(path).unwrap()).unwrap();
+    let opencode_subagent = |surface: &str| {
+        let digests: std::collections::BTreeSet<(u64, String)> = matrix["cases"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .filter(|case| {
+                case["variant"] == "subagent"
+                    && case["surface"] == surface
+                    && case["override"] == false
+            })
+            .map(|case| {
+                (
+                    case["bytes"].as_u64().unwrap(),
+                    case["sha256"].as_str().unwrap().to_string(),
+                )
+            })
+            .collect();
+        assert_eq!(digests.len(), 1, "subagent/{surface} depends on a flag");
+        digests.into_iter().next().unwrap()
+    };
+    let template: Value = serde_json::from_str(
+        &std::fs::read_to_string(examples_dir().join("worker.request.json")).unwrap(),
+    )
+    .unwrap();
+    let config = example_catalog_config();
+    // The example config serves claude-haiku-4-5 the light surface.
+    for (model, surface) in [
+        ("anthropic/claude-sonnet-4-5", "full"),
+        ("anthropic/claude-haiku-4-5", "light"),
+    ] {
+        for preset in ["worker", "reader"] {
+            let mut request = template.clone();
+            request["preset"] = json!(preset);
+            request["params"] = json!({"model": model});
+            request["system_text"] = json!({"preset": preset, "params": {"model": model}});
+            let answer: Value = serde_json::from_slice(
+                &tool_catalog::catalog_answer_bytes(&request, &config).unwrap(),
+            )
+            .unwrap();
+            let text = answer["system_text"]["text"].as_str().unwrap();
+            assert_eq!(
+                (text.len() as u64, sha256_hex(text.as_bytes())),
+                opencode_subagent(surface),
+                "{preset} {model}"
+            );
+        }
+    }
+}
