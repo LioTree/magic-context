@@ -4,6 +4,53 @@ use crate::{McStore, McStoreError, McTagRow};
 use rusqlite::{params, OptionalExtension};
 
 impl McStore {
+    pub fn clear_async_compaction_drops(&self, namespace: &str) -> Result<usize, McStoreError> {
+        self.inner
+            .with_conn_fenced(|conn| {
+                conn.execute(
+                    "DELETE FROM pending_agent_drops WHERE session_id=?1",
+                    [namespace],
+                )
+            })
+            .map_err(Into::into)
+    }
+    /// Copy source-validated history artifacts without invoking an embedding model.
+    /// The caller retains its resync intent until this idempotent copy completes.
+    pub fn copy_async_history_artifacts(
+        &self,
+        source: &str,
+        target: &str,
+        sequences: &[(i64, i64)],
+    ) -> Result<usize, McStoreError> {
+        self.resume_pending_context_write(source)?;
+        self.resume_pending_context_write(target)?;
+        let (copied,mapped)=self.context_write(&["compartments","compartment_chunk_embeddings"],|conn| {
+            let mut copied=0;
+            let mut mapped=Vec::new();
+            for (old_sequence,new_sequence) in sequences {
+                let ids:Option<(i64,i64,i64)>=conn.query_row("SELECT old.id,new.id,new.start_message-old.start_message FROM compartments old JOIN compartments new
+                    ON new.session_id=?2 AND new.sequence=?4 WHERE old.session_id=?1 AND old.sequence=?3
+                    AND old.content=new.content AND old.p1 IS new.p1 AND old.p2 IS new.p2 AND old.p3 IS new.p3 AND old.p4 IS new.p4",
+                    params![source,target,old_sequence,new_sequence],|row|Ok((row.get(0)?,row.get(1)?,row.get(2)?))).optional()?;
+                let Some((old_id,new_id,shift))=ids else {continue;};
+                mapped.push((*old_sequence,*new_sequence,shift));
+                conn.execute("UPDATE compartments SET p1_embedding=(SELECT p1_embedding FROM compartments WHERE id=?1),p1_embedding_model_id=(SELECT p1_embedding_model_id FROM compartments WHERE id=?1) WHERE id=?2",params![old_id,new_id])?;
+                copied+=conn.execute("INSERT INTO compartment_chunk_embeddings(compartment_id,session_id,project_path,harness,window_index,start_ordinal,end_ordinal,chunk_hash,model_id,dims,vector,created_at)
+                    SELECT ?2,?3,project_path,harness,window_index,start_ordinal+?4,end_ordinal+?4,chunk_hash,model_id,dims,vector,created_at FROM compartment_chunk_embeddings WHERE compartment_id=?1
+                    ON CONFLICT(compartment_id,model_id,window_index) DO UPDATE SET session_id=excluded.session_id,project_path=excluded.project_path,harness=excluded.harness,start_ordinal=excluded.start_ordinal,end_ordinal=excluded.end_ordinal,chunk_hash=excluded.chunk_hash,dims=excluded.dims,vector=excluded.vector,created_at=excluded.created_at",
+                    params![old_id,new_id,target,shift])?;
+            }
+            Ok((copied,mapped))
+        })?;
+        self.inner.with_conn_fenced(|conn| {
+            for (old_sequence,new_sequence,shift) in mapped {
+                conn.execute("INSERT INTO mc_chunk_transcripts(session_id,compartment_seq,start_ordinal,end_ordinal,transcript_deflate,created_at_ms) SELECT ?2,?4,start_ordinal+?5,end_ordinal+?5,transcript_deflate,created_at_ms FROM mc_chunk_transcripts WHERE session_id=?1 AND compartment_seq=?3
+                    ON CONFLICT(session_id,compartment_seq) DO UPDATE SET start_ordinal=excluded.start_ordinal,end_ordinal=excluded.end_ordinal,transcript_deflate=excluded.transcript_deflate,created_at_ms=excluded.created_at_ms",params![source,target,old_sequence,new_sequence,shift])?;
+            }
+            Ok(())
+        })?;
+        Ok(copied)
+    }
     pub fn retire_unannounced_async_views(&self, session_ref: &str) -> Result<(), McStoreError> {
         self.inner.with_conn_fenced(|conn|conn.execute("UPDATE mc_async_compaction_views SET announced=-1 WHERE session_ref=?1 AND announced=0",[session_ref]).map(|_|())).map_err(Into::into)
     }

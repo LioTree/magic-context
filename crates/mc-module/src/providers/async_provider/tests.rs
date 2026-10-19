@@ -902,10 +902,96 @@ async fn synthetic_ids_never_fall_back_to_positional_transcript_matches() {
         replacement: vec![original.ck],
     };
     let wire:OutboundMessage=decode(&json!({"compaction_id":"proof","version":1,"range":{"from":0,"to":1},"replacement":[{"info":{"id":"synthetic-todo","role":"user"},"parts":[{"id":"synthetic-part","type":"text","text":"inserted content"}]},entry.message]})).unwrap();
-    let ranges = ranges(&state, &wire, &engine).unwrap();
+    let ranges = ranges(&state, &wire, &engine, None).unwrap();
     assert!(matches!(
         &ranges[0],
         view::ViewRange::Replace { from: 0, to: 0, .. }
     ));
     assert!(matches!(&ranges[1],view::ViewRange::Keep{from:0,to:1,edits} if edits.is_empty()));
+}
+
+#[tokio::test]
+async fn restored_lineage_reuses_history_embeddings_and_reanchors_only_surviving_drops() {
+    let dir = tempfile::tempdir().unwrap();
+    let rig = Rig::new(dir.path()).await;
+    rig.fill(40);
+    rig.notice(1, 1_000, None).await;
+    rig.history(20, "published history survives a runner backup restore");
+    rig.notice(2, 1_000, None).await;
+    let old_version = rig.newest().unwrap();
+    rig.notice(3, 1_000, Some(old_version)).await;
+    let old_view = rig.get(old_version).await;
+    assert_eq!(
+        old_view.ranges[0].to(),
+        21,
+        "the history replacement must remove its covered raw prefix"
+    );
+    let old_head = match &old_view.ranges[0] {
+        view::ViewRange::Replace { bytes, .. } => bytes.clone(),
+        _ => panic!("history head"),
+    };
+    rig.queue(&[163, 208]).await;
+    let before = rig.state();
+    let source = before.namespace();
+    let store = rig.h.store.get().unwrap();
+    store.with_context_conn_for_test(|conn| {
+        conn.execute("INSERT INTO compartment_chunk_embeddings(compartment_id,session_id,project_path,harness,window_index,start_ordinal,end_ordinal,chunk_hash,model_id,dims,vector,created_at) SELECT id,?1,'fixture','opencode',0,0,20,'unchanged-chunk-hash','fixture-model',1,x'0000803f',1 FROM compartments WHERE session_id=?1 AND sequence=1",[&source])?;
+        Ok(())
+    }).unwrap();
+    {
+        let mut entries = rig.runner.entries.lock().unwrap();
+        entries.truncate(31);
+        for entry in entries.iter_mut() {
+            entry.tags[0].tag = Some(format!("§{}§", 9_000 + entry.ordinal * 3));
+        }
+    }
+    *rig.runner.lineage.lock().unwrap() = "runner-restored".into();
+    rig.notice(4, 1_000, None).await;
+    let after = rig.state();
+    assert!(after.generation > before.generation);
+    assert_eq!(after.last_discarded_drops, 1);
+    assert_eq!(after.last_transferred_drops, 1);
+    let restored = rig.get(rig.newest().unwrap()).await;
+    let new_head = match &restored.ranges[0] {
+        view::ViewRange::Replace { bytes, .. } => bytes,
+        _ => panic!("restored history head"),
+    };
+    assert_eq!(
+        new_head, &old_head,
+        "restored history head must remain byte-identical"
+    );
+    assert!(after.tag_index.contains_key("§9063§"));
+    let dropped = restored.ranges.iter().any(|range| match range {
+        view::ViewRange::Keep { edits, .. } => edits.iter().any(|edit| {
+            let action = edit.drop
+                || edit
+                    .bytes
+                    .as_ref()
+                    .is_some_and(|bytes| bytes.contains("[dropped §9063§]"));
+            edit.mid == "m21" && edit.part == "0" && action
+        }),
+        _ => false,
+    });
+    assert!(dropped,"surviving drop must address the re-read part, including an emptied part removed by the engine");
+    assert!(store.load_pending_agent_drops(&source).unwrap().is_empty());
+    let target = after.namespace();
+    let embedding: Vec<(String, Vec<u8>)> = store
+        .with_context_read(|conn| {
+            conn.prepare(
+                "SELECT chunk_hash,vector FROM compartment_chunk_embeddings WHERE session_id=?1",
+            )?
+            .query_map([&target], |row| Ok((row.get(0)?, row.get(1)?)))?
+            .collect()
+        })
+        .unwrap();
+    assert_eq!(
+        embedding,
+        vec![("unchanged-chunk-hash".into(), vec![0, 0, 128, 63])],
+        "copy vectors without an embedding call"
+    );
+    assert_eq!(
+        store.load_compartments(&target).unwrap()[0].content,
+        "published history survives a runner backup restore"
+    );
+    let _ = rig.render(&restored);
 }

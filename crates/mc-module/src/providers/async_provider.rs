@@ -76,6 +76,14 @@ pub(crate) struct Runtime {
 #[derive(Serialize, Deserialize)]
 pub(crate) struct AsyncRecord {
     #[serde(default)]
+    resync_sources: Option<ResyncSources>,
+    #[serde(default)]
+    restored_head: Option<RestoredHead>,
+    #[serde(default)]
+    last_discarded_drops: usize,
+    #[serde(default)]
+    last_transferred_drops: usize,
+    #[serde(default)]
     tag_index: BTreeMap<String, PartAddress>,
     #[serde(default)]
     pub(crate) usage_policy: Option<super::usage_policy::UsagePolicyState>,
@@ -112,6 +120,43 @@ struct PartAddress {
     mid: String,
     part: String,
     digest: String,
+}
+
+#[derive(Serialize, Deserialize)]
+struct SourceMessage {
+    mid: String,
+    digest: String,
+}
+#[derive(Serialize, Deserialize)]
+struct HistorySource {
+    compartment: mc_store::StoredCompartment,
+    messages: Vec<SourceMessage>,
+}
+#[derive(Serialize, Deserialize)]
+struct DropSource {
+    mid: String,
+    part: String,
+    digest: String,
+    queued_at_ms: i64,
+}
+#[derive(Serialize, Deserialize)]
+struct ResyncSources {
+    namespace: String,
+    history: Vec<HistorySource>,
+    drops: Vec<DropSource>,
+    queued_count: usize,
+    head: Option<HistoryHeadSource>,
+}
+
+#[derive(Serialize, Deserialize)]
+struct HistoryHeadSource {
+    bytes: String,
+    messages: Vec<SourceMessage>,
+}
+#[derive(Serialize, Deserialize)]
+struct RestoredHead {
+    bytes: String,
+    to: u64,
 }
 
 fn verified_descent(state: &State, header: &str) -> Option<u64> {
@@ -159,7 +204,97 @@ impl State {
             .map_err(transient)
     }
     fn reset(&mut self, store: &McStore) -> Result<(), HandlerOutcome> {
+        if self.resync_sources.is_none() {
+            let namespace = self.namespace();
+            store
+                .resume_pending_context_write(&namespace)
+                .map_err(transient)?;
+            let history = store
+                .load_compartments(&namespace)
+                .map_err(transient)?
+                .into_iter()
+                .map(|compartment| {
+                    let start = (compartment.start_message.max(0) as u64).max(
+                        self.entries
+                            .first_key_value()
+                            .map_or(0, |(ordinal, _)| *ordinal),
+                    );
+                    let end = compartment.end_message.max(0) as u64;
+                    let messages = if start <= end && self.entries.contains_key(&end) {
+                        self.entries
+                            .range(start..=end)
+                            .map(|(_, entry)| SourceMessage {
+                                mid: entry.mid.clone(),
+                                digest: contract::content_digest(&entry.message),
+                            })
+                            .collect()
+                    } else {
+                        Vec::new()
+                    };
+                    HistorySource {
+                        compartment,
+                        messages,
+                    }
+                })
+                .collect();
+            let codec = codec::Codec::from_params(&Value::Object(self.setup.params.clone()))?;
+            let rows = tag_rows(self, codec)?;
+            let queued = store
+                .load_pending_agent_drops(&namespace)
+                .map_err(transient)?;
+            let drops = queued
+                .iter()
+                .filter_map(|drop| {
+                    let row = rows.iter().find(|row| row.block_id == drop.target_id)?;
+                    let tag = tags::format_tag(u64::try_from(row.tag_number).ok()?)?;
+                    let address = self.tag_index.get(&tag)?;
+                    Some(DropSource {
+                        mid: address.mid.clone(),
+                        part: address.part.clone(),
+                        digest: address.digest.clone(),
+                        queued_at_ms: drop.queued_at_ms,
+                    })
+                })
+                .collect();
+            let applied = self
+                .applied
+                .map(|version| {
+                    store
+                        .load_async_compaction_view(&self.reference(), version)
+                        .map_err(transient)
+                })
+                .transpose()?
+                .flatten()
+                .map(|raw| serde_json::from_str::<view::CompactionView>(&raw).map_err(transient))
+                .transpose()?;
+            let head = applied.and_then(|view| match view.ranges.first()? {
+                view::ViewRange::Replace { from: 0, to, bytes }
+                    if *to == 0 || self.entries.contains_key(&(to - 1)) =>
+                {
+                    Some(HistoryHeadSource {
+                        bytes: bytes.clone(),
+                        messages: self
+                            .entries
+                            .range(..*to)
+                            .map(|(_, entry)| SourceMessage {
+                                mid: entry.mid.clone(),
+                                digest: contract::content_digest(&entry.message),
+                            })
+                            .collect(),
+                    })
+                }
+                _ => None,
+            });
+            self.resync_sources = Some(ResyncSources {
+                namespace,
+                history,
+                drops,
+                queued_count: queued.len(),
+                head,
+            });
+        }
         self.resync = true;
+        self.restored_head = None;
         self.entries.clear();
         self.tag_index.clear();
         self.todo_scan = None;
@@ -344,6 +479,10 @@ impl McHandler {
         let chosen = preset(request.preset.as_deref())?;
         let mut engine = transform::compaction::State::new(reference.clone(), chosen);
         let mut state = State {
+            resync_sources: None,
+            restored_head: None,
+            last_discarded_drops: 0,
+            last_transferred_drops: 0,
             tag_index: BTreeMap::new(),
             usage_policy: None,
             todo_scan: None,
@@ -450,6 +589,7 @@ impl McHandler {
             })
             .collect::<Vec<_>>();
         codec.prepare_request(&mut template, &messages)?;
+        template.native_tail_section = true;
         if let Some(policy) = &state.usage_policy {
             template.emergency_recovery_armed = policy.emergency_recovery_armed;
             if let Some(limit) = policy.limit_for(model) {
@@ -576,6 +716,7 @@ fn ranges(
     state: &State,
     wire: &OutboundMessage,
     engine: &transform::compaction::View,
+    history_through: Option<u64>,
 ) -> Result<Vec<view::ViewRange>, HandlerOutcome> {
     let end = state
         .entries
@@ -587,6 +728,14 @@ fn ranges(
     let mut ranges = Vec::new();
     let mut synthetic = Vec::new();
     let mut next = 0;
+    let history_end = history_through
+        .map_or(0, |through| through.saturating_add(1))
+        .max(
+            state
+                .entries
+                .first_key_value()
+                .map_or(0, |(ordinal, _)| *ordinal),
+        );
     let render = state
         .setup
         .composition
@@ -616,12 +765,14 @@ fn ranges(
             return Err(transient("async render reordered transcript"));
         }
         if original.ordinal > next || !synthetic.is_empty() {
-            ranges.push(view::ViewRange::replace(
-                next,
+            append_view_gap(
+                state,
+                &mut ranges,
+                &mut synthetic,
+                &mut next,
                 original.ordinal,
-                serde_json::to_string(&synthetic).map_err(transient)?,
-            ));
-            synthetic.clear();
+                history_end,
+            )?;
         }
         let before = parts(&original.message)?;
         let after = parts(message)?;
@@ -660,13 +811,57 @@ fn ranges(
         next = original.ordinal + 1;
     }
     if next < end || !synthetic.is_empty() {
-        ranges.push(view::ViewRange::replace(
-            next,
+        append_view_gap(
+            state,
+            &mut ranges,
+            &mut synthetic,
+            &mut next,
             end,
-            serde_json::to_string(&synthetic).map_err(transient)?,
-        ));
+            history_end,
+        )?;
     }
     Ok(ranges)
+}
+
+fn append_view_gap(
+    state: &State,
+    ranges: &mut Vec<view::ViewRange>,
+    synthetic: &mut Vec<Value>,
+    next: &mut u64,
+    to: u64,
+    history_end: u64,
+) -> Result<(), HandlerOutcome> {
+    let prefix = ranges.is_empty() && *next == 0;
+    let replacement_to = if prefix {
+        to.min(history_end)
+    } else if !synthetic.is_empty() {
+        to
+    } else {
+        *next
+    };
+    if replacement_to > *next || !synthetic.is_empty() {
+        ranges.push(view::ViewRange::replace(
+            *next,
+            replacement_to,
+            serde_json::to_string(synthetic).map_err(transient)?,
+        ));
+        synthetic.clear();
+        *next = replacement_to;
+    }
+    for (ordinal, entry) in state.entries.range(*next..to) {
+        let edits = entry
+            .tags
+            .iter()
+            .map(|part| view::PartEdit::drop(*ordinal, &entry.mid, &part.part))
+            .collect();
+        ranges.push(view::ViewRange::keep_with_edits(
+            *ordinal,
+            *ordinal + 1,
+            edits,
+        ));
+    }
+    *next = to;
+    Ok(())
 }
 
 impl McHandler {
@@ -817,6 +1012,7 @@ impl McHandler {
             }
         }
         state.reindex()?;
+        state.restore_sources(store, codec)?;
         state.save(store, &tag_rows(&state, codec)?)?;
         self.advance_async_policy(&mut state, &notice, codec)?;
         let pending_before = store
@@ -1120,7 +1316,7 @@ impl McHandler {
         let (template, output) =
             self.async_engine(channel, &binding, state, codec, &status, &mut engine)?;
         state.engine = engine;
-        let transform::compaction::Answer::Replacement(candidate) = output.answer else {
+        let transform::compaction::Answer::Replacement(mut candidate) = output.answer else {
             return Ok(None);
         };
         if !ride && !output.prefix_bust_permitted {
@@ -1131,7 +1327,61 @@ impl McHandler {
             &template,
             &codec_opencode::NativeRenderContext::from(&output.engine),
         )?;
-        let ranges = ranges(state, &wire, &candidate)?;
+        let coverage = store
+            .load_meta(&state.namespace())
+            .map_err(transient)?
+            .meta
+            .coverage_ordinal;
+        let mut ranges = ranges(state, &wire, &candidate, coverage)?;
+        if let Some(head) = state.restored_head.take() {
+            if let Some(view::ViewRange::Replace { from: 0, to, bytes }) =
+                ranges.first_mut().filter(|range| range.to() == head.to)
+            {
+                let _ = to;
+                *bytes = head.bytes.clone();
+                let messages: Vec<Value> = serde_json::from_str(&head.bytes).map_err(transient)?;
+                let mut decoded = Vec::new();
+                for (index, mut message) in messages.into_iter().enumerate() {
+                    let mid = message
+                        .pointer("/info/id")
+                        .or_else(|| message.get("id"))
+                        .and_then(Value::as_str)
+                        .map(str::to_owned)
+                        .unwrap_or_else(|| format!("restored-head-{index}"));
+                    if message.get("info").is_some_and(Value::is_object)
+                        && message.pointer("/info/id").is_none()
+                    {
+                        // Synthetic heads have no transcript id. This id is only
+                        // temporary decoder input; the published bytes stay unchanged.
+                        message["info"]["id"] = json!(mid);
+                    }
+                    let mut entry = codec.decode_message(&InboundMessage {
+                        ordinal: 0,
+                        mid,
+                        message,
+                        raw_message: None,
+                    })?;
+                    entry.ck.meta.synthetic = true;
+                    entry.ck.meta.ordinal = None;
+                    decoded.push(entry.ck);
+                }
+                let prefix = candidate
+                    .replacement
+                    .iter()
+                    .take_while(|message| message.meta.synthetic)
+                    .count();
+                candidate.replacement.splice(..prefix, decoded);
+                state.engine.last_produced = Some(candidate.clone());
+                if state
+                    .engine
+                    .last_applied
+                    .as_ref()
+                    .is_some_and(|view| view.version == candidate.version)
+                {
+                    state.engine.last_applied = Some(candidate.clone());
+                }
+            }
+        }
         let version = store
             .reserve_async_compaction_version(&state.reference(), state.applied.unwrap_or(0))
             .map_err(transient)?;
@@ -1673,5 +1923,160 @@ impl McHandler {
             }
             _ => Err(session_unresolved_error()),
         }
+    }
+}
+
+impl AsyncRecord {
+    fn restore_sources(
+        &mut self,
+        store: &McStore,
+        codec: codec::Codec,
+    ) -> Result<(), HandlerOutcome> {
+        let Some(source) = &self.resync_sources else {
+            return Ok(());
+        };
+        let by_mid = self
+            .entries
+            .values()
+            .map(|entry| (entry.mid.as_str(), entry))
+            .collect::<BTreeMap<_, _>>();
+        let mut retained = Vec::new();
+        let mut sequences = Vec::new();
+        for history in &source.history {
+            let mapped = history
+                .messages
+                .iter()
+                .map(|old| {
+                    by_mid
+                        .get(old.mid.as_str())
+                        .copied()
+                        .filter(|entry| contract::content_digest(&entry.message) == old.digest)
+                })
+                .collect::<Option<Vec<_>>>();
+            let Some(mapped) = mapped.filter(|mapped| {
+                !mapped.is_empty()
+                    && mapped
+                        .windows(2)
+                        .all(|pair| pair[0].ordinal.checked_add(1) == Some(pair[1].ordinal))
+            }) else {
+                break;
+            };
+            let mut compartment = history.compartment.clone();
+            let first = mapped.first().unwrap();
+            let last = mapped.last().unwrap();
+            if retained.is_empty()
+                && self
+                    .entries
+                    .first_key_value()
+                    .is_some_and(|(_, entry)| entry.mid != first.mid)
+            {
+                break;
+            }
+            if retained
+                .last()
+                .is_some_and(|prior: &mc_store::StoredCompartment| {
+                    prior.end_message.checked_add(1) != Some(first.ordinal as i64)
+                })
+            {
+                break;
+            }
+            compartment.start_message = first.ordinal as i64;
+            compartment.end_message = last.ordinal as i64;
+            let start_part = compartment
+                .start_message_id
+                .rsplit_once('#')
+                .map(|(_, part)| part)
+                .unwrap_or("0")
+                .to_owned();
+            let end_part = compartment
+                .end_message_id
+                .rsplit_once('#')
+                .map(|(_, part)| part)
+                .unwrap_or("0")
+                .to_owned();
+            compartment.start_message_id = format!("{}#{start_part}", first.mid);
+            compartment.end_message_id = format!("{}#{end_part}", last.mid);
+            sequences.push((history.compartment.sequence, compartment.sequence));
+            retained.push(compartment);
+        }
+        let namespace = self.namespace();
+        store
+            .replace_compartments(&namespace, &retained)
+            .map_err(transient)?;
+        let copied = store
+            .copy_async_history_artifacts(&source.namespace, &namespace, &sequences)
+            .map_err(transient)?;
+        let rows = tag_rows(self, codec)?;
+        let mut transferred = 0;
+        for drop in &source.drops {
+            let matched = self.tag_index.iter().find(|(_, address)| {
+                address.mid == drop.mid
+                    && address.part == drop.part
+                    && address.digest == drop.digest
+            });
+            let Some((tag, _)) = matched else {
+                continue;
+            };
+            let Some(number) = tags::parse_tag(tag) else {
+                continue;
+            };
+            let Some(row) = rows
+                .iter()
+                .find(|row| u64::try_from(row.tag_number).ok() == Some(number))
+            else {
+                continue;
+            };
+            store
+                .append_pending_agent_drops(
+                    &namespace,
+                    std::slice::from_ref(&row.block_id),
+                    drop.queued_at_ms,
+                )
+                .map_err(transient)?;
+            transferred += 1;
+        }
+        store
+            .clear_async_compaction_drops(&source.namespace)
+            .map_err(transient)?;
+        if let Some(head) = &source.head {
+            let mapped = head
+                .messages
+                .iter()
+                .map(|old| {
+                    by_mid
+                        .get(old.mid.as_str())
+                        .copied()
+                        .filter(|entry| contract::content_digest(&entry.message) == old.digest)
+                })
+                .collect::<Option<Vec<_>>>();
+            if let Some(mapped) = mapped.filter(|mapped| {
+                mapped
+                    .windows(2)
+                    .all(|pair| pair[0].ordinal.checked_add(1) == Some(pair[1].ordinal))
+                    && mapped.first().is_none_or(|first| {
+                        self.entries
+                            .first_key_value()
+                            .is_some_and(|(_, entry)| entry.mid == first.mid)
+                    })
+            }) {
+                let to = mapped
+                    .last()
+                    .map(|entry| entry.ordinal + 1)
+                    .unwrap_or_else(|| {
+                        self.entries
+                            .first_key_value()
+                            .map_or(0, |(ordinal, _)| *ordinal)
+                    });
+                self.restored_head = Some(RestoredHead {
+                    bytes: head.bytes.clone(),
+                    to,
+                });
+            }
+        }
+        self.last_discarded_drops = source.queued_count.saturating_sub(transferred);
+        self.last_transferred_drops = transferred;
+        tracing::info!(session_ref=%self.reference(),history_compartments=retained.len(),copied_chunk_embeddings=copied,transferred_drops=transferred,discarded_drops=self.last_discarded_drops,"async lineage sources revalidated");
+        self.resync_sources = None;
+        Ok(())
     }
 }
