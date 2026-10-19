@@ -1,15 +1,18 @@
 //! Runner-lane reminders are sends, never edits to a tool result or user message.
 //! Synchronous provider hooks deliberately do not call this module.
 
-use cortexkit_role_llm_runner::delivery_order::{self, PlanSender, Slot, Template, TemplateUse};
+use cortexkit_role_llm_runner::delivery_order::{
+    self, DeliveryOrder, Mode, PlanSender, Slot, Template, TemplateUse,
+};
+use cortexkit_role_llm_runner::send::SendRequest;
 use serde_json::{json, Map, Value};
 use std::{collections::BTreeMap, path::Path, time::Duration};
 
 use crate::{session_resolver::ProviderRunner, transform};
 
 const MAX: i64 = i64::MAX;
-const DELIVERY: [&str; 3] = ["turn_system", "tool_result", "steer"];
-const SEARCH_DELIVERY: [&str; 2] = ["tool_result", "steer"];
+const DELIVERY: [Mode; 3] = [Mode::TurnSystem, Mode::ToolResult, Mode::Steer];
+const SEARCH_DELIVERY: [Mode; 2] = [Mode::ToolResult, Mode::Steer];
 /// All reminder kinds expire five minutes after the observation that produced them.
 pub const REMINDER_TTL_MS: u64 = 300_000;
 
@@ -240,9 +243,20 @@ impl PreparedSend {
         self.wire_request(send_id)
     }
 
-    fn wire_request(&self, _send_id: String) -> Value {
-        // Replaced with the runner crate's array-delivery builder once pinned.
-        unimplemented!("awaiting the array-delivery contract revision")
+    fn wire_request(&self, send_id: String) -> Value {
+        let modes = if self.template.is_some() {
+            DELIVERY.to_vec()
+        } else {
+            SEARCH_DELIVERY.to_vec()
+        };
+        let mut order = DeliveryOrder::new(modes)
+            .with_dedupe_key(format!("mc.{}", self.kind))
+            .with_expires_at_ms(self.expires_at_ms);
+        if let Some(template) = &self.template {
+            order = order.with_template(template.clone());
+        }
+        let request = SendRequest::new(&self.prompt, send_id).with_delivery_order(&order);
+        serde_json::to_value(request).expect("typed reminder send serializes")
     }
 }
 
@@ -593,6 +607,11 @@ mod tests {
                     "capabilities":if self.missing_capability {vec![]} else {vec!["delivery_order"]}
                 })),
                 "session.send" => {
+                    let request: SendRequest = serde_json::from_value(params.clone()).unwrap();
+                    request.check_delivery_order(&["delivery_order"]).unwrap();
+                    if let Some(template) = request.delivery_order().unwrap().unwrap().template {
+                        delivery_order::render(&templates(), &template, |_| true).unwrap();
+                    }
                     self.sends.lock().unwrap().push(params);
                     if self.refuse {
                         Ok(json!({"error":{"code":"invalid_params"}}))

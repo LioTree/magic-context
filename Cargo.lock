@@ -262,7 +262,7 @@ dependencies = [
 [[package]]
 name = "cortexkit-role-llm-runner"
 version = "0.2.7"
-source = "git+https://github.com/cortexkit/commons?rev=e1105b78358bbcfb463f6934f47225e165e16f48#e1105b78358bbcfb463f6934f47225e165e16f48"
+source = "git+https://github.com/cortexkit/commons?rev=88e2733a16416dd5b541d4de75bc7813c9db5e92#88e2733a16416dd5b541d4de75bc7813c9db5e92"
 dependencies = [
  "serde",
  "serde_jcs",
