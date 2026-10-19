@@ -4175,6 +4175,10 @@ pub struct McHandler {
     fixed_config: Option<McModuleConfig>,
     #[cfg(test)]
     fixed_dream_settings: Option<Value>,
+    /// Trusted settings the provider historian resolves its models from when no host
+    /// sent a chain. Tests never read the environment's config; unset means `{}`.
+    #[cfg(test)]
+    fixed_historian_settings: Option<Value>,
     /// Replaces the production executor wiring in fixtures, so publication can be
     /// exercised for tasks this build does not yet run.
     #[cfg(test)]
@@ -5099,6 +5103,8 @@ impl McHandler {
             #[cfg(test)]
             fixed_dream_settings: None,
             #[cfg(test)]
+            fixed_historian_settings: None,
+            #[cfg(test)]
             dream_wiring: None,
             reattaching_sessions: Arc::new(Mutex::new(HashSet::new())),
             live_historian_sessions: Arc::new(Mutex::new(HashMap::new())),
@@ -5552,6 +5558,7 @@ impl McHandler {
             resolve_project_identity_for_test: AtomicBool::new(false),
             fixed_config: Some(config),
             fixed_dream_settings: None,
+            fixed_historian_settings: None,
             dream_wiring: None,
             reattaching_sessions: Arc::new(Mutex::new(HashSet::new())),
             live_historian_sessions: Arc::new(Mutex::new(HashMap::new())),

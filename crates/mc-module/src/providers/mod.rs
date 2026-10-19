@@ -14,6 +14,7 @@ pub mod compaction;
 pub mod fold_prefix;
 pub mod fold_working;
 pub mod historian;
+pub(crate) mod historian_config;
 pub mod historian_budget;
 pub mod hygiene_memo;
 pub mod policy_summary;
