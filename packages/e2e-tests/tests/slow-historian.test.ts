@@ -6,7 +6,6 @@ import {
     forEachHost,
     type ScenarioHarness,
 } from "../src/scenario-hosts";
-import { FOLD_SKIP_REASON } from "../src/rust-scenario-support";
 
 /**
  * Slow historian, fast main agent.
@@ -190,14 +189,6 @@ forEachHost(import.meta.url, "slow historian vs fast main", (host) => {
                     JSON.stringify(request.body).includes("turn 12:"),
             );
             expect(mainRequestAtT12).toBeDefined();
-
-            if (process.env.MC_E2E_MODE === "rust") {
-                // The hermetic Broca producer is intentionally immediate, so this
-                // delay-ordering assertion remains limited to the mock-backed TS leg.
-                console.log(`[rust-e2e] slow-historian delay assertions SKIPPED: ${FOLD_SKIP_REASON}`);
-                await turn12Promise;
-                return;
-            }
 
             await h.waitFor(
                 () => h.mock.requests().find((request) => isHistorianRequest(request.body)),
