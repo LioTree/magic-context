@@ -24,6 +24,7 @@ mod fold_working;
 mod historian;
 pub(crate) mod historian_budget;
 mod historian_config;
+pub(crate) use historian_config::HistorianModelCatalog;
 #[cfg(test)]
 pub(crate) mod hook_probe;
 #[cfg(test)]

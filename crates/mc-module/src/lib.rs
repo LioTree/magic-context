@@ -4214,6 +4214,7 @@ pub struct McHandler {
     provider_serial: Arc<providers::ProviderSerial>,
     provider_resident: Arc<providers::resident_hooks::ResidentHooks>,
     provider_runner: Arc<dyn session_resolver::ProviderRunner>,
+    historian_model_catalog: Arc<providers::HistorianModelCatalog>,
     provider_historian_worker: OnceLock<Arc<McHandler>>,
     provider_historian_budget: Arc<providers::historian_budget::Budget>,
     provider_historian_evaluations: Arc<Mutex<HashSet<String>>>,
@@ -5068,13 +5069,16 @@ impl McHandler {
                 Arc::clone(&move_visibility),
             )
         });
-        let provider_runner: Arc<dyn session_resolver::ProviderRunner> = match connection_file {
-            Some(path) => Arc::new(session_resolver::RealProviderRunner::new(
-                path,
-                route_targets,
-            )),
-            None => Arc::new(session_resolver::MissingProviderRunner),
-        };
+        let provider_runner: Arc<dyn session_resolver::ProviderRunner> =
+            match connection_file.as_ref() {
+                Some(path) => Arc::new(session_resolver::RealProviderRunner::new(
+                    path.clone(),
+                    route_targets.clone(),
+                )),
+                None => Arc::new(session_resolver::MissingProviderRunner),
+            };
+        let historian_model_catalog =
+            providers::HistorianModelCatalog::new(connection_file.clone(), route_targets);
         let store = Arc::new(OnceLock::new());
         let provider_store = Arc::new(providers::Storage::new(Arc::clone(&store)));
         McHandler {
@@ -5131,6 +5135,7 @@ impl McHandler {
             provider_serial: Arc::new(providers::ProviderSerial::default()),
             provider_resident: Arc::new(providers::resident_hooks::ResidentHooks::default()),
             provider_runner,
+            historian_model_catalog,
             provider_historian_worker: OnceLock::new(),
             provider_historian_budget: providers::historian_budget::Budget::process(),
             provider_historian_evaluations: Arc::new(Mutex::new(HashSet::new())),
@@ -5590,6 +5595,10 @@ impl McHandler {
             provider_serial: Arc::new(providers::ProviderSerial::default()),
             provider_resident: Arc::new(providers::resident_hooks::ResidentHooks::default()),
             provider_runner: Arc::new(session_resolver::MissingProviderRunner),
+            historian_model_catalog: providers::HistorianModelCatalog::new(
+                None,
+                RouteTargetConfig::default(),
+            ),
             provider_historian_worker: OnceLock::new(),
             provider_historian_budget: providers::historian_budget::Budget::process(),
             provider_historian_evaluations: Arc::new(Mutex::new(HashSet::new())),

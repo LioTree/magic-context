@@ -2845,6 +2845,24 @@ mod tests {
         (calibrated, limit)
     }
 
+    pub(crate) fn assert_fetched_200k_window_sizes_chunk(
+        model: &str,
+        model_limits: BTreeMap<String, crate::historian::HistorianModelLimits>,
+    ) {
+        let messages = long_narrative_session(400);
+        let firing = assemble_for_chain(&messages, &[model, LARGE_FALLBACK], model_limits, 400_000);
+        let (calibrated, limit) = attempt_admission(&firing, 0);
+        assert!(
+            calibrated <= limit as f64,
+            "the fetched primary window must fit the historian prompt: calibrated_tokens={calibrated} limit={limit}"
+        );
+        assert!(
+            firing.to_ordinal < 400,
+            "chunk was not sized for the 200k window"
+        );
+        assert_eq!(firing.chunk.chunk.end_index, firing.to_ordinal);
+    }
+
     #[test]
     fn small_primary_gets_a_chunk_that_fits_its_window_before_a_large_fallback() {
         let messages = long_narrative_session(400);
@@ -4141,6 +4159,9 @@ mod tests {
         assert_eq!(fixture.call_transform()["kind"], "transform");
     }
 }
+
+#[cfg(test)]
+pub(crate) use tests::assert_fetched_200k_window_sizes_chunk;
 
 #[cfg(test)]
 mod calibration_budget_tests {

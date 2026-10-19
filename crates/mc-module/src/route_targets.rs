@@ -95,6 +95,11 @@ impl RouteTargetConfig {
                 service_id: "session-door".into(),
             });
         }
+        if route == RegisteredRoute::FusiformCatalog {
+            return Some(RouteTarget::ToolProvider {
+                module_id: "fusiform".into(),
+            });
+        }
         route
             .module_id(self)
             .map(|module_id| RouteTarget::ManagementSurface {
@@ -112,15 +117,17 @@ pub(crate) enum RegisteredRoute {
     SessionResolve,
     HistorianRunner,
     ProviderRunner,
+    FusiformCatalog,
     EntorhinalResolve,
     SynapseRerank,
 }
 
 impl RegisteredRoute {
-    const ALL: [Self; 7] = [
+    const ALL: [Self; 8] = [
         Self::SessionResolve,
         Self::HistorianRunner,
         Self::ProviderRunner,
+        Self::FusiformCatalog,
         Self::EngramDoor,
         Self::EntorhinalSessionRef,
         Self::EntorhinalResolve,
@@ -134,6 +141,7 @@ impl RegisteredRoute {
             Self::SessionResolve => Some(DEFAULT_THALAMUS_MODULE_ID),
             Self::HistorianRunner => config.runner_module_id(),
             Self::ProviderRunner => Some(config.provider_runner_module_id()),
+            Self::FusiformCatalog => Some("fusiform"),
             Self::EntorhinalResolve => Some("entorhinal"),
             Self::SynapseRerank => Some("synapse"),
         }
@@ -152,6 +160,8 @@ impl RegisteredRoute {
             // Callbacks and transcript reads spend no provider quota. Declaring this target
             // does not open a connection or require the runner to be registered at startup.
             Self::ProviderRunner => Vec::new(),
+            // Model limits are a read-only catalog lookup and spend no provider quota.
+            Self::FusiformCatalog => Vec::new(),
             // Explicit mc.retrieval searches may call Synapse. Declaring this target
             // neither connects to Synapse nor starts automatic retrieval work.
             Self::SynapseRerank => Vec::new(),
@@ -236,9 +246,16 @@ pub(crate) fn catalog_provider_target_for_test() -> RouteTarget {
 #[cfg(test)]
 pub(crate) fn expected_routes_for_tests(runner: &str) -> Vec<String> {
     #[cfg(feature = "agent-data")]
-    let routes = vec!["thalamus", runner, "engram", "entorhinal", "synapse"];
+    let routes = vec![
+        "thalamus",
+        runner,
+        "fusiform",
+        "engram",
+        "entorhinal",
+        "synapse",
+    ];
     #[cfg(not(feature = "agent-data"))]
-    let routes = vec!["thalamus", runner, "entorhinal", "synapse"];
+    let routes = vec!["thalamus", runner, "fusiform", "entorhinal", "synapse"];
     routes.into_iter().map(str::to_owned).collect()
 }
 
@@ -296,6 +313,19 @@ mod tests {
         );
         assert!(host.target(RegisteredRoute::HistorianRunner).is_none());
         assert!(self_signals(&host).is_empty());
+    }
+
+    #[test]
+    fn fusiform_catalog_is_a_static_read_only_tool_provider_route() {
+        let config = RouteTargetConfig::host_runner();
+        assert_eq!(
+            config.target(RegisteredRoute::FusiformCatalog),
+            Some(RouteTarget::ToolProvider {
+                module_id: "fusiform".to_string()
+            })
+        );
+        assert!(RegisteredRoute::FusiformCatalog.self_signals().is_empty());
+        assert!(route_targets(&config).contains(&"fusiform".to_string()));
     }
 
     #[test]
@@ -476,6 +506,10 @@ mod tests {
                 };
                 let module_id = match target {
                     RouteTarget::ManagementSurface { module_id } => module_id,
+                    RouteTarget::ToolProvider { module_id } => {
+                        assert_eq!(route, RegisteredRoute::FusiformCatalog);
+                        module_id
+                    }
                     RouteTarget::InternalService {
                         module_id,
                         service_id,
@@ -484,7 +518,6 @@ mod tests {
                         assert_eq!(service_id, "session-door");
                         module_id
                     }
-                    _ => panic!("registered route has an unexpected target kind"),
                 };
                 assert!(
                     consumed.contains(&module_id),

@@ -307,6 +307,7 @@ impl McHandler {
             worker.provider_store = Arc::clone(&self.provider_store);
             worker.provider_serial = Arc::clone(&self.provider_serial);
             worker.provider_resident = Arc::clone(&self.provider_resident);
+            worker.historian_model_catalog = Arc::clone(&self.historian_model_catalog);
             worker.provider_historian_budget = Arc::clone(&self.provider_historian_budget);
             worker.provider_historian_evaluations =
                 Arc::clone(&self.provider_historian_evaluations);
@@ -700,12 +701,17 @@ impl McHandler {
             let load = self.historian_settings_loader();
             let project_root = binding.project_root.clone();
             let harness = key.harness.clone();
-            Some(
-                tokio::task::spawn_blocking(move || {
-                    super::historian_config::resolve(&load(&project_root), &harness)
-                })
+            let settings = tokio::task::spawn_blocking(move || load(&project_root))
                 .await
-                .map_err(transient)?,
+                .map_err(transient)?;
+            Some(
+                super::historian_config::resolve_with_model_catalog(
+                    &settings,
+                    &harness,
+                    &binding.project_root,
+                    &self.historian_model_catalog,
+                )
+                .await,
             )
         };
         let serial = self.provider_serial.lock_for(key).await;
