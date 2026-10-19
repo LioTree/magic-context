@@ -442,13 +442,13 @@ function estimateInputTokenCount(input: unknown, serializedInput: string | null)
  * directly. Mirrors the per-part logic so a tag's token_count matches what the
  * content actually costs on the wire.
  */
-function estimateTextTagTokenCount(text: string): number {
+export function estimateTextTagTokenCount(text: string): number {
     if (!text) return 0;
     if (text.startsWith("data:image/")) return estimateImageTokensFromDataUrl(text);
     return estimateTokens(text);
 }
 
-function extractToolTagMetadata(part: unknown): {
+export function extractToolTagMetadata(part: unknown): {
     toolName: string | null;
     inputByteSize: number;
     inputTokenCount: number;
