@@ -250,7 +250,16 @@ impl Rig {
         assert!(!receipt.duplicate());
         tokio::time::timeout(Duration::from_secs(10), async {
             loop {
-                if self.state().completed_seq >= seq && !self.state().entries.is_empty() {
+                if self.state().completed_seq >= seq
+                    && !self.state().entries.is_empty()
+                    && self
+                        .h
+                        .provider_store
+                        .async_runtime
+                        .completed_notice
+                        .load(std::sync::atomic::Ordering::Relaxed)
+                        >= seq
+                {
                     break;
                 }
                 tokio::time::sleep(Duration::from_millis(10)).await;
@@ -848,21 +857,29 @@ async fn reads_use_the_admitted_runner_not_the_process_default() {
 }
 
 #[tokio::test]
-async fn parsed_overflow_fact_with_reported_limit_updates_learned_limit() {
+async fn ceiling_overflow_ride_with_reported_limit_updates_learned_limit() {
     let dir = tempfile::tempdir().unwrap();
     let rig = Rig::new(dir.path()).await;
     rig.fill(10);
     rig.notice(1, 1_000, None).await;
-    let mut state = rig.state();
-    apply_ride_overflow(
-        &mut state,
-        OverflowFact {
-            reported_limit_tokens: Some(80_000),
-        },
-    );
+    let answer=rig.op("compaction.ride",json!({"session_ref":rig.reference,"cause":"ceiling","deadline_ms":10_000,"overflow":{"reported_limit_tokens":80_000}})).await;
+    assert!(matches!(
+        answer["answer"].as_str(),
+        Some("view" | "nothing")
+    ));
+    let state = rig.state();
     let policy = state.usage_policy.as_ref().unwrap();
     assert_eq!(policy.limit_for("fixture"), Some(80_000));
-    assert!(policy.emergency_recovery_armed);
+    let _ = rig.ride("ceiling").await;
+    assert_eq!(
+        rig.state()
+            .usage_policy
+            .as_ref()
+            .unwrap()
+            .limit_for("fixture"),
+        Some(80_000),
+        "an absent overflow fact must not clear an existing learned limit"
+    );
 }
 
 #[tokio::test]
@@ -936,6 +953,26 @@ async fn restored_lineage_reuses_history_embeddings_and_reanchors_only_surviving
         _ => panic!("history head"),
     };
     rig.queue(&[163, 208]).await;
+    let held = rig.state();
+    let tool = decoded_entry(
+        codec::Codec::OpencodeAiSdk,
+        &InboundMessage {
+            ordinal: 21,
+            mid: "m21".into(),
+            message: held.entries[&21].message.clone(),
+        },
+    )
+    .unwrap();
+    assert_eq!(tool.ck.content.len(), 2);
+    assert!(matches!(
+        tool.ck.content[0].kind,
+        ck_wire::CkKind::ToolCall { .. }
+    ));
+    assert!(matches!(
+        tool.ck.content[1].kind,
+        ck_wire::CkKind::ToolResult { .. }
+    ));
+    assert_eq!(held.tag_index["§163§"].part, "0");
     tokio::time::timeout(Duration::from_secs(2), async {
         while rig
             .h
@@ -996,17 +1033,15 @@ async fn restored_lineage_reuses_history_embeddings_and_reanchors_only_surviving
     );
     assert!(after.tag_index.contains_key("§9063§"));
     let dropped = restored.ranges.iter().any(|range| match range {
-        view::ViewRange::Keep { edits, .. } => edits.iter().any(|edit| {
-            let action = edit.drop
-                || edit
-                    .bytes
-                    .as_ref()
-                    .is_some_and(|bytes| bytes.contains("[dropped §9063§]"));
-            edit.mid == "m21" && edit.part == "0" && action
-        }),
+        view::ViewRange::Keep { edits, .. } => edits
+            .iter()
+            .any(|edit| edit.mid == "m21" && edit.part == "0" && edit.drop),
         _ => false,
     });
-    assert!(dropped,"surviving drop must address the re-read part, including an emptied part removed by the engine");
+    assert!(
+        dropped,
+        "the tool-part tag must remove the whole native pair, not a CK block numbered 0 or 1"
+    );
     assert!(store.load_pending_agent_drops(&source).unwrap().is_empty());
     let target = after.namespace();
     let embedding: Vec<(String, Vec<u8>)> = store

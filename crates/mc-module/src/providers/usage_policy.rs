@@ -61,6 +61,7 @@ pub(crate) struct LastUsage {
 
 impl LastUsage {
     /// Read the wire's `previous_usage` object without filling missing members.
+    #[cfg(test)]
     pub fn from_value(value: &Value) -> Option<Self> {
         let object = value.as_object()?;
         let number = |field: &str| object.get(field).and_then(Value::as_u64);
@@ -114,6 +115,7 @@ impl UsageConditions {
     /// Build the conditions from a `compaction.step` request's own fields.
     /// `window` is the already resolved window (the request's value, or the
     /// Setup's when the request omits it).
+    #[cfg(test)]
     pub fn from_step_params(params: &Value, window: u64) -> Self {
         Self {
             est_tokens: params

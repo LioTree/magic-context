@@ -68,6 +68,8 @@ impl<S: Stream + 'static> Publisher for Bus<S> {
 #[derive(Default)]
 pub(crate) struct Runtime {
     #[cfg(test)]
+    completed_notice: std::sync::atomic::AtomicU64,
+    #[cfg(test)]
     historian_evaluations: std::sync::atomic::AtomicU64,
     pub(crate) connection_file: Mutex<Option<PathBuf>>,
     pub(crate) bootstrapped: OnceLock<()>,
@@ -357,10 +359,10 @@ struct OverflowFact {
     reported_limit_tokens: Option<u64>,
 }
 
-fn ride_overflow(_request: &ride::RideRequest) -> Option<OverflowFact> {
-    // This contract has no overflow member on RideRequest, so a pause caused
-    // by a provider error cannot yet be distinguished from a size-based pause.
-    None
+fn ride_overflow(request: &ride::RideRequest) -> Option<OverflowFact> {
+    request.ceiling_overflow().map(|overflow| OverflowFact {
+        reported_limit_tokens: overflow.reported_limit_tokens,
+    })
 }
 
 fn apply_ride_overflow(state: &mut State, fact: OverflowFact) {
@@ -425,6 +427,19 @@ impl McHandler {
                     }
                 };
                 let result = self.advance_compaction(&account, &delivery.message).await;
+                #[cfg(test)]
+                if result.is_ok() {
+                    let seq = delivery
+                        .message
+                        .headers
+                        .get("seq")
+                        .and_then(|seq| seq.parse().ok())
+                        .unwrap_or(0);
+                    self.provider_store
+                        .async_runtime
+                        .completed_notice
+                        .fetch_max(seq, std::sync::atomic::Ordering::Relaxed);
+                }
                 let settled = match result {
                     Ok(()) => cursor.ack().await,
                     Err(HandlerOutcome::ErrorWithDetail { ref code, .. })
@@ -569,16 +584,12 @@ impl McHandler {
             last_applied_version: None,
             last_not_applied: None,
         };
-        let (template, output) =
+        let (_template, output) =
             self.async_engine(channel, binding, &state, codec, &status, &mut engine)?;
         let transform::compaction::Answer::Replacement(initial) = &output.answer else {
             return Err(transient("async setup returned no initial view"));
         };
-        let wire = codec.encode_view(
-            initial,
-            &template,
-            &codec_opencode::NativeRenderContext::from(&output.engine),
-        )?;
+        let wire = rendered_view(codec, initial, &state)?;
         state.engine = engine;
         state.initial = json!({"answer":"ready","request_id":request.request_id,"initial":wire, "ceiling":CeilingPolicy::new(0.95,300_000).with_on_overflow()});
         state.save(store, &[])?;
@@ -652,6 +663,33 @@ fn parts(message: &Value) -> Result<&Vec<Value>, HandlerOutcome> {
         .ok_or_else(|| invalid_field("message", "codec must expose an ordered parts array"))
 }
 
+fn decoded_entry(
+    codec: codec::Codec,
+    entry: &InboundMessage,
+) -> Result<ck_wire::CkIngressMessage, HandlerOutcome> {
+    codec
+        .decode_entries(std::slice::from_ref(entry))?
+        .pop()
+        .ok_or_else(|| error("history_unreadable", "runner entry has no model message"))
+}
+
+fn rendered_view(
+    codec: codec::Codec,
+    view: &transform::compaction::View,
+    state: &State,
+) -> Result<OutboundMessage, HandlerOutcome> {
+    let entries = state
+        .entries
+        .values()
+        .map(|entry| InboundMessage {
+            ordinal: entry.ordinal,
+            mid: entry.mid.clone(),
+            message: entry.message.clone(),
+        })
+        .collect::<Vec<_>>();
+    codec.render_view(view, &state.key.session, &entries)
+}
+
 fn render_part(part: &Value, tag: Option<&str>, render: bool) -> Value {
     let mut part = part.clone();
     if !render {
@@ -691,11 +729,14 @@ fn tag_rows(state: &State, codec: codec::Codec) -> Result<Vec<mc_store::McTagRow
                 "runner must expose one tag row per part",
             ));
         }
-        let decoded = codec.decode_message(&InboundMessage {
-            ordinal: entry.ordinal,
-            mid: entry.mid.clone(),
-            message: entry.message.clone(),
-        })?;
+        let decoded = decoded_entry(
+            codec,
+            &InboundMessage {
+                ordinal: entry.ordinal,
+                mid: entry.mid.clone(),
+                message: entry.message.clone(),
+            },
+        )?;
         for (index, block) in decoded.ck.content.iter().enumerate() {
             let native_index = block
                 .provider_extras
@@ -1155,11 +1196,14 @@ impl McHandler {
             .entries
             .values()
             .map(|entry| {
-                codec.decode_message(&InboundMessage {
-                    ordinal: entry.ordinal,
-                    mid: entry.mid.clone(),
-                    message: entry.message.clone(),
-                })
+                decoded_entry(
+                    codec,
+                    &InboundMessage {
+                        ordinal: entry.ordinal,
+                        mid: entry.mid.clone(),
+                        message: entry.message.clone(),
+                    },
+                )
             })
             .collect::<Result<Vec<_>, _>>()?;
         let projection = ck_wire::project_messages(&messages).map_err(transient)?;
@@ -1340,7 +1384,7 @@ impl McHandler {
             last_not_applied: None,
         };
         let mut engine = state.engine.clone();
-        let (template, output) =
+        let (_template, output) =
             self.async_engine(channel, &binding, state, codec, &status, &mut engine)?;
         state.engine = engine;
         let transform::compaction::Answer::Replacement(mut candidate) = output.answer else {
@@ -1349,11 +1393,7 @@ impl McHandler {
         if !ride && !output.prefix_bust_permitted {
             return Ok(None);
         }
-        let wire = codec.encode_view(
-            &candidate,
-            &template,
-            &codec_opencode::NativeRenderContext::from(&output.engine),
-        )?;
+        let wire = rendered_view(codec, &candidate, state)?;
         let coverage = store
             .load_meta(&state.namespace())
             .map_err(transient)?
@@ -1382,11 +1422,14 @@ impl McHandler {
                         // temporary decoder input; the published bytes stay unchanged.
                         message["info"]["id"] = json!(mid);
                     }
-                    let mut entry = codec.decode_message(&InboundMessage {
-                        ordinal: 0,
-                        mid,
-                        message,
-                    })?;
+                    let mut entry = decoded_entry(
+                        codec,
+                        &InboundMessage {
+                            ordinal: 0,
+                            mid,
+                            message,
+                        },
+                    )?;
                     entry.ck.meta.synthetic = true;
                     entry.ck.meta.ordinal = None;
                     decoded.push(entry.ck);
@@ -1832,11 +1875,14 @@ impl McHandler {
             .entries
             .values()
             .map(|entry| {
-                codec.decode_message(&InboundMessage {
-                    ordinal: entry.ordinal,
-                    mid: entry.mid.clone(),
-                    message: entry.message.clone(),
-                })
+                decoded_entry(
+                    codec,
+                    &InboundMessage {
+                        ordinal: entry.ordinal,
+                        mid: entry.mid.clone(),
+                        message: entry.message.clone(),
+                    },
+                )
             })
             .collect::<Result<Vec<_>, _>>()?;
         if let Some(todo) = scan.advance(state.lineage.as_deref().unwrap_or_default(), &messages) {
@@ -2159,11 +2205,14 @@ impl McHandler {
         let mut user = None;
         let mut tools = 0;
         for entry in state.entries.values() {
-            let message = codec.decode_message(&InboundMessage {
-                ordinal: entry.ordinal,
-                mid: entry.mid.clone(),
-                message: entry.message.clone(),
-            })?;
+            let message = decoded_entry(
+                codec,
+                &InboundMessage {
+                    ordinal: entry.ordinal,
+                    mid: entry.mid.clone(),
+                    message: entry.message.clone(),
+                },
+            )?;
             let results = message
                 .ck
                 .content

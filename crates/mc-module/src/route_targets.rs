@@ -192,16 +192,18 @@ pub(crate) enum RegisteredRoute {
     HistorianRunner,
     ProviderRunner,
     FusiformCatalog,
+    CompactionBus,
     EntorhinalResolve,
     SynapseRerank,
 }
 
 impl RegisteredRoute {
-    const ALL: [Self; 8] = [
+    const ALL: [Self; 9] = [
         Self::SessionResolve,
         Self::HistorianRunner,
         Self::ProviderRunner,
         Self::FusiformCatalog,
+        Self::CompactionBus,
         Self::EngramDoor,
         Self::EntorhinalSessionRef,
         Self::EntorhinalResolve,
@@ -216,6 +218,7 @@ impl RegisteredRoute {
             Self::HistorianRunner => config.runner_module_id(),
             Self::ProviderRunner => Some(config.provider_runner_module_id()),
             Self::FusiformCatalog => Some("fusiform"),
+            Self::CompactionBus => Some("ckbus"),
             Self::EntorhinalResolve => Some("entorhinal"),
             Self::SynapseRerank => Some("synapse"),
         }
@@ -236,6 +239,7 @@ impl RegisteredRoute {
             Self::ProviderRunner => Vec::new(),
             // Model limits are a read-only catalog lookup and spend no provider quota.
             Self::FusiformCatalog => Vec::new(),
+            Self::CompactionBus => Vec::new(),
             // Explicit mc.retrieval searches may call Synapse. Declaring this target
             // neither connects to Synapse nor starts automatic retrieval work.
             Self::SynapseRerank => Vec::new(),
@@ -324,12 +328,20 @@ pub(crate) fn expected_routes_for_tests(runner: &str) -> Vec<String> {
         "thalamus",
         runner,
         "fusiform",
+        "ckbus",
         "engram",
         "entorhinal",
         "synapse",
     ];
     #[cfg(not(feature = "agent-data"))]
-    let routes = vec!["thalamus", runner, "fusiform", "entorhinal", "synapse"];
+    let routes = vec![
+        "thalamus",
+        runner,
+        "fusiform",
+        "ckbus",
+        "entorhinal",
+        "synapse",
+    ];
     routes.into_iter().map(str::to_owned).collect()
 }
 

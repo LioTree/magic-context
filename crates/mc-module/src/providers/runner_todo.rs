@@ -118,6 +118,7 @@ impl TodoScan {
 
 /// Decode `entries` (one lineage, ascending ordinals) with the runner lane's
 /// codec and advance `scan` over them.
+#[cfg(test)]
 pub(crate) fn scan_status_messages<'a>(
     scan: &mut TodoScan,
     lineage: &str,

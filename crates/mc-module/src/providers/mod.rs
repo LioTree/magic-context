@@ -8,6 +8,8 @@ mod async_bus;
 #[cfg(test)]
 mod async_contract_vectors;
 mod async_provider;
+#[cfg(test)]
+mod describe_fixture_tests;
 
 pub mod codec;
 #[cfg(test)]

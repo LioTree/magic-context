@@ -1,9 +1,10 @@
 //! Modules authenticate to the bus through ck-bus; the signing seed never
 //! leaves the issuer. Reconnects obtain a fresh credential, not a local fallback.
 use super::*;
+use crate::route_targets::{RegisteredRoute, RouteTargetConfig};
 use base64::{engine::general_purpose::STANDARD, Engine as _};
 use subc_client_rs::{CallOptions, ConsumerIdentity, ConsumerOptions, SubcConsumer};
-use subc_protocol::{BindIdentity, RouteTarget};
+use subc_protocol::BindIdentity;
 
 async fn call(
     consumer: &SubcConsumer,
@@ -14,9 +15,9 @@ async fn call(
 ) -> Result<Value, String> {
     let bytes = consumer
         .call(
-            RouteTarget::ManagementSurface {
-                module_id: "ckbus".into(),
-            },
+            RouteTargetConfig::default()
+                .target(RegisteredRoute::CompactionBus)
+                .expect("compaction bus route is registered"),
             BindIdentity::new(
                 connection.parent().unwrap_or(Path::new("/")),
                 "runner",
