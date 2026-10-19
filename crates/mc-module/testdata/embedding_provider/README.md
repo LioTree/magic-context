@@ -28,8 +28,17 @@ match the provider's complete identity. Dimensions, recipes and generation are c
 configuration generation is checked again after IO. A vector store must separately
 check current source hashes and writer generations before publishing.
 
-The HTTP provider has no automatic retries and no batch-size cap. It sends each
-supplied batch in one POST. Three failed calls in sixty seconds open the circuit
+The HTTP provider has no batch-size cap and no automatic retries after a failure.
+It sends each supplied batch in one POST. HTTP 429 is back-pressure, as in
+TypeScript, and never counts toward the circuit: the endpoint enters a cooldown
+from `Retry-After` (delta-seconds or an HTTP date, capped at sixty seconds), or
+else an exponential backoff from one second, doubled per consecutive 429, capped
+at thirty seconds, plus up to 25% jitter. Queries fail at once with
+`rate_limited` and send nothing during the cooldown; passage batches wait it out
+and resend until a real result, cancellation or the caller's deadline. Unlike
+TypeScript, which shares the cooldown between providers on the same endpoint and
+API key, the cooldown belongs to one provider instance: this client keeps no
+process-wide state and derives nothing from the key. Three failed calls in sixty seconds open the circuit
 for five minutes; one half-open probe is admitted. A thirty-second internal timeout
 counts as a failure, while caller cancellation/deadline and reload do not. Responses
 with missing slots, empty/nonfinite vectors or wrong dimensions are typed failures,
@@ -59,7 +68,9 @@ bits, stored model IDs, error classes and retryability independently against the
 TypeScript results. Cases cover every built-in HTTP model-prefix family, explicit
 empty/false overrides, whitespace, Unicode/surrogate-safe truncation, query safety
 margin versus passage limit, optional fields, batches, shuffled/absent indices,
-HTTP failures, malformed envelopes and model substitution. A separate typed-error
+HTTP failures, a 429 rate limit (reported by `capture.ts` as `rateLimited`, since
+TypeScript records no failure class for it), malformed envelopes and model
+substitution. A separate typed-error
 test covers partial missing slots. No real network or store is used.
 
 Mutation control: change `HTTP_BATCH_SIZE` in `embedding_provider.rs` from
