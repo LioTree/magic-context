@@ -1,10 +1,7 @@
 //! The historian's model chain, variants, timeout and output cap, resolved from
 //! ck-mc's own config, with model context/output limits filled from Fusiform.
 //!
-//! A host bridge that synchronizes its state sends the chain with `state_sync`, and a
-//! conversation that has received one keeps using it. A conversation nobody sends a
-//! chain for (a runner lane, or any host conversation without `state_sync`) resolves
-//! the same settings here, from the user's trusted config, with the precedence and
+//! Runner conversations resolve settings from the user's trusted config, with the precedence and
 //! defaults the TypeScript plugin uses. The committed fixture
 //! `testdata/historian-config-resolution.json` is generated from the TypeScript code
 //! (`packages/plugin/src/shared/historian-config-resolution.test.ts`, which also
@@ -30,11 +27,6 @@ use mc_store::parity_schema_manifest::{CapabilityResult, Generation};
 const DEFAULT_HISTORIAN_TIMEOUT_MS: u64 = 600_000;
 const FUSIFORM_LIMITS_CACHE_TTL: Duration = Duration::from_secs(60 * 60);
 const FUSIFORM_LOOKUP_TIMEOUT: Duration = Duration::from_secs(2);
-
-/// Counter recorded on a provider conversation once a host has sent a historian chain
-/// with `state_sync`. From then on the conversation keeps using the host's chain,
-/// even an empty one, exactly as it did before ck-mc could resolve the chain itself.
-pub(super) const CHAIN_SYNCED_COUNTER: &str = "historian_model_chain_synced";
 
 /// The historian settings resolved for one harness.
 #[derive(Debug, Clone, Default)]
@@ -356,8 +348,7 @@ impl HistorianModelCatalog {
 }
 
 /// Resolve the configured chain, then add context/output values from the Fusiform
-/// model catalog. The provider historian calls this only when no host `state_sync`
-/// chain has been recorded, so host-synchronized chains and their limits stay intact.
+/// model catalog before preparing a runner's background historian call.
 pub(crate) async fn resolve_with_model_catalog(
     settings: &Value,
     harness: &str,

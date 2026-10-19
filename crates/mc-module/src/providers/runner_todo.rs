@@ -130,53 +130,6 @@ pub(crate) fn scan_status_messages<'a>(
     Ok(scan.advance(lineage, &decoded))
 }
 
-/// Decode the record's messages after the scan cursor and record a newer
-/// todo state in the conversation's engine namespace.
-pub(super) fn record_from_transcript(
-    store: &McStore,
-    key: &Key,
-    record: &mut Record,
-    lineage: &str,
-) -> Result<Option<DerivedTodo>, HandlerOutcome> {
-    // Advance a copy and commit it only after the state is written, so a
-    // failed write is retried on the next step instead of being skipped.
-    let mut scan = record.todo_scan.clone().unwrap_or_default();
-    let after = if scan.lineage == lineage {
-        scan.through
-    } else {
-        None
-    };
-    let entries = record
-        .messages
-        .get(lineage)
-        .into_iter()
-        .flat_map(|entries| entries.range(after.map_or(0, |a| a.saturating_add(1))..))
-        .map(|(_, entry)| entry);
-    let derived = scan_status_messages(&mut scan, lineage, entries)?;
-    let Some(derived) = derived else {
-        record.todo_scan = Some(scan);
-        return Ok(None);
-    };
-    // The same namespace the record saves its engine state to.
-    let namespace = store
-        .load_provider_conversation(&key.store_key())
-        .map_err(transient)?
-        .map_or_else(
-            || key.engine_key(),
-            |conversation| conversation.engine_namespace,
-        );
-    store
-        .set_todo_state(
-            &namespace,
-            &derived.state_json,
-            &derived.owner_message_id,
-            &derived.state_hash,
-        )
-        .map_err(transient)?;
-    record.todo_scan = Some(scan);
-    Ok(Some(derived))
-}
-
 #[cfg(test)]
 #[path = "runner_todo_tests.rs"]
 mod tests;

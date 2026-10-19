@@ -244,30 +244,6 @@ impl McHandler {
         true
     }
 
-    /// [`Self::record_session_runner_dream_target`] for the conversation bound to
-    /// `channel`: its project, root, harness, and the runner the daemon stamped on
-    /// the route. A route without a session-runner principal records nothing.
-    pub(crate) fn record_runner_lane_dream_target(&self, channel: u16, binding: &SessionBinding) {
-        let Some(route) = crate::route_targets::SessionRunnerRoute::for_principal(
-            binding.principal.as_ref(),
-            &binding.session,
-        ) else {
-            return;
-        };
-        let Some(store) = self.store.get() else {
-            return;
-        };
-        let Ok(project) = self.historian_lane_project(channel, binding, store) else {
-            return;
-        };
-        self.record_session_runner_dream_target(
-            &project,
-            &binding.project_root,
-            &binding.harness,
-            route,
-        );
-    }
-
     /// `dream.ownership {v:1, claimant?}` answers with the published list for the
     /// route's project; it is the only list a plugin's scheduler consults.
     ///

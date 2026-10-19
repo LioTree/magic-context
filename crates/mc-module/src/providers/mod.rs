@@ -5,6 +5,8 @@ use serde::Serialize;
 use std::collections::{BTreeMap, BTreeSet};
 
 mod async_bus;
+#[cfg(test)]
+mod async_contract_vectors;
 mod async_provider;
 
 pub mod codec;
@@ -21,9 +23,9 @@ pub mod hygiene_memo;
 pub mod policy_summary;
 pub mod records;
 mod reduce;
+pub mod resident_bytes;
 pub(crate) mod runner_todo;
 pub(crate) mod usage_policy;
-pub mod resident_bytes;
 pub mod view_recipe;
 
 pub(crate) use historian::RunCompletion;
@@ -120,19 +122,34 @@ fn invalid_field(field: &str, message: impl ToString) -> HandlerOutcome {
 }
 
 impl McHandler {
-    pub(crate) async fn handle_provider_value(&self,channel:u16,method:&str,params:&Value)->HandlerOutcome {
-        let binding=match self.facade_binding(channel) {Ok(binding)=>binding,Err(_)=>return error("route_unbound","compaction requires a bound runner route")};
-        if binding.harness!=session_resolver::RUNNER_BIND_HARNESS {return error("route_unbound","compaction requires a runner bind");}
-        if let Some(session)=params.get("session").and_then(Value::as_str) {
-            if let Some(refusal)=self.provider_store.catalog_refusal(&binding,session) {return refusal;}
-        }
-        let result=match method {
-            "compaction.setup"=>self.async_setup(channel,&binding,params).await.and_then(|bytes|bytes.ok_or_else(||invalid("async Setup returned no answer"))),
-            "view.get"=>self.async_view_get(&binding,params).await,
-            "compaction.ride"=>self.async_ride(&binding,params).await,
-            _=>Err(invalid("unknown compaction operation")),
+    pub(crate) async fn handle_provider_value(
+        &self,
+        channel: u16,
+        method: &str,
+        params: &Value,
+    ) -> HandlerOutcome {
+        let binding = match self.facade_binding(channel) {
+            Ok(binding) => binding,
+            Err(_) => return error("route_unbound", "compaction requires a bound runner route"),
         };
-        match result {Ok(bytes)=>HandlerOutcome::Response(bytes),Err(error)=>error}
+        if binding.harness != session_resolver::RUNNER_BIND_HARNESS {
+            return error("route_unbound", "compaction requires a runner bind");
+        }
+        if let Some(session) = params.get("session").and_then(Value::as_str) {
+            if let Some(refusal) = self.provider_store.catalog_refusal(&binding, session) {
+                return refusal;
+            }
+        }
+        let result = match method {
+            "compaction.setup" => self.async_setup(channel, &binding, params).await,
+            "view.get" => self.async_view_get(&binding, params).await,
+            "compaction.ride" => self.async_ride(&binding, params).await,
+            _ => Err(invalid("unknown compaction operation")),
+        };
+        match result {
+            Ok(bytes) => HandlerOutcome::Response(bytes),
+            Err(error) => error,
+        }
     }
 }
 

@@ -294,7 +294,7 @@ impl McHandler {
             worker.store = Arc::clone(&self.store);
             worker.provider_store = Arc::clone(&self.provider_store);
             worker.provider_runner = Arc::clone(&self.provider_runner);
-            worker.historian_model_catalog=self.historian_model_catalog.clone();
+            worker.historian_model_catalog = self.historian_model_catalog.clone();
             worker.provider_serial = Arc::clone(&self.provider_serial);
             worker.provider_historian_budget = Arc::clone(&self.provider_historian_budget);
             worker.provider_historian_evaluations =
@@ -326,7 +326,9 @@ impl McHandler {
     #[cfg(not(test))]
     pub(super) fn historian_settings_loader(&self) -> Box<dyn FnOnce(&Path) -> Value + Send> {
         let resolver = crate::config_parity::TrustedConfigResolver::from_environment();
-        Box::new(move |project_root| super::historian_config::trusted_settings(&resolver, project_root))
+        Box::new(move |project_root| {
+            super::historian_config::trusted_settings(&resolver, project_root)
+        })
     }
 
     #[cfg(test)]

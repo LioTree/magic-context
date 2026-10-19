@@ -1,7 +1,7 @@
 //! Runner-owned tags and durable, off-request compaction views.
 use super::codec::{InboundMessage, OutboundMessage};
 use super::*;
-use compact::async_group::{self as contract, ceiling::CeilingPolicy, notice, ride, view};
+use compact::{self as contract, ceiling::CeilingPolicy, notice, ride, view};
 use cortexkit_bus_trait::{ContentDigest, DurableOwner, Stream, StreamCursor};
 use cortexkit_role_llm_runner::{read::ReadMessage, session_ref, tags};
 use serde::Deserialize;
@@ -67,6 +67,8 @@ impl<S: Stream + 'static> Publisher for Bus<S> {
 
 #[derive(Default)]
 pub(crate) struct Runtime {
+    #[cfg(test)]
+    historian_evaluations: std::sync::atomic::AtomicU64,
     pub(crate) connection_file: Mutex<Option<PathBuf>>,
     pub(crate) bootstrapped: OnceLock<()>,
     publisher: Mutex<Option<Arc<dyn Publisher>>>,
@@ -75,6 +77,12 @@ pub(crate) struct Runtime {
 
 #[derive(Serialize, Deserialize)]
 pub(crate) struct AsyncRecord {
+    #[serde(default)]
+    historian_cadence: Option<HistorianCadence>,
+    #[serde(default)]
+    historian_pending: bool,
+    #[serde(default)]
+    restored_no_new_content: bool,
     #[serde(default)]
     resync_sources: Option<ResyncSources>,
     #[serde(default)]
@@ -146,6 +154,16 @@ struct ResyncSources {
     drops: Vec<DropSource>,
     queued_count: usize,
     head: Option<HistoryHeadSource>,
+    #[serde(default)]
+    messages: Vec<SourceMessage>,
+}
+
+#[derive(Serialize, Deserialize, Clone, PartialEq, Eq)]
+struct HistorianCadence {
+    user: Option<String>,
+    tools: u64,
+    model: String,
+    settings: String,
 }
 
 #[derive(Serialize, Deserialize)]
@@ -168,7 +186,7 @@ fn verified_descent(state: &State, header: &str) -> Option<u64> {
         return None;
     }
     let entry = state.entries.get(&through)?;
-    (contract::content_digest(&entry.message) == digest).then_some(through)
+    (contract::digest::content_digest(&entry.message) == digest).then_some(through)
 }
 
 impl State {
@@ -225,7 +243,7 @@ impl State {
                             .range(start..=end)
                             .map(|(_, entry)| SourceMessage {
                                 mid: entry.mid.clone(),
-                                digest: contract::content_digest(&entry.message),
+                                digest: contract::digest::content_digest(&entry.message),
                             })
                             .collect()
                     } else {
@@ -278,7 +296,7 @@ impl State {
                             .range(..*to)
                             .map(|(_, entry)| SourceMessage {
                                 mid: entry.mid.clone(),
-                                digest: contract::content_digest(&entry.message),
+                                digest: contract::digest::content_digest(&entry.message),
                             })
                             .collect(),
                     })
@@ -291,9 +309,18 @@ impl State {
                 drops,
                 queued_count: queued.len(),
                 head,
+                messages: self
+                    .entries
+                    .values()
+                    .map(|entry| SourceMessage {
+                        mid: entry.mid.clone(),
+                        digest: contract::digest::content_digest(&entry.message),
+                    })
+                    .collect(),
             });
         }
         self.resync = true;
+        self.restored_no_new_content = false;
         self.restored_head = None;
         self.entries.clear();
         self.tag_index.clear();
@@ -429,10 +456,7 @@ impl McHandler {
         channel: u16,
         binding: &SessionBinding,
         params: &Value,
-    ) -> Result<Option<Vec<u8>>, HandlerOutcome> {
-        if host_binding(binding) {
-            return Ok(None);
-        }
+    ) -> Result<Vec<u8>, HandlerOutcome> {
         let request: compact::setup::SetupRequest = decode(params)?;
         let mut key = Key::new(binding, &request.session, &request.harness)?;
         key.session.clone_from(&request.session);
@@ -453,7 +477,9 @@ impl McHandler {
                 .async_runtime
                 .unconfigured_logged
                 .get_or_init(|| tracing::warn!("async compaction bus not configured"));
-            return bytes(&json!({"answer":"refuse","request_id":request.request_id,"code":"provider_busy","provider_code":"bus_not_ready","reason":"Async compaction bus not ready"})).map(Some);
+            return bytes(
+                &json!({"answer":"refuse","request_id":request.request_id,"code":"provider_busy","provider_code":"bus_not_ready","reason":"Async compaction bus not ready"}),
+            );
         }
         let reference = session_ref(&key.harness, &key.project.to_string_lossy(), &key.session);
         if let Some(state) = load(store, &reference)? {
@@ -473,12 +499,15 @@ impl McHandler {
             }
             let mut answer = state.initial;
             answer["request_id"] = json!(request.request_id);
-            return bytes(&answer).map(Some);
+            return bytes(&answer);
         }
         let codec = codec::Codec::from_params(&Value::Object(request.params.clone()))?;
         let chosen = preset(request.preset.as_deref())?;
         let mut engine = transform::compaction::State::new(reference.clone(), chosen);
         let mut state = State {
+            historian_cadence: None,
+            historian_pending: false,
+            restored_no_new_content: false,
             resync_sources: None,
             restored_head: None,
             last_discarded_drops: 0,
@@ -553,7 +582,7 @@ impl McHandler {
         state.engine = engine;
         state.initial = json!({"answer":"ready","request_id":request.request_id,"initial":wire, "ceiling":CeilingPolicy::new(0.95,300_000).with_on_overflow()});
         state.save(store, &[])?;
-        bytes(&state.initial).map(Some)
+        bytes(&state.initial)
     }
 
     fn async_engine(
@@ -585,7 +614,6 @@ impl McHandler {
                 ordinal: entry.ordinal,
                 mid: entry.mid.clone(),
                 message: entry.message.clone(),
-                raw_message: None,
             })
             .collect::<Vec<_>>();
         codec.prepare_request(&mut template, &messages)?;
@@ -667,7 +695,6 @@ fn tag_rows(state: &State, codec: codec::Codec) -> Result<Vec<mc_store::McTagRow
             ordinal: entry.ordinal,
             mid: entry.mid.clone(),
             message: entry.message.clone(),
-            raw_message: None,
         })?;
         for (index, block) in decoded.ck.content.iter().enumerate() {
             let native_index = block
@@ -996,7 +1023,7 @@ impl McHandler {
                     .entries
                     .get(&notice.through_ordinal)
                     .is_some_and(|entry| {
-                        contract::content_digest(&entry.message) == notice.through_digest
+                        contract::digest::content_digest(&entry.message) == notice.through_digest
                     });
             if verified {
                 state.resync = false;
@@ -1030,9 +1057,12 @@ impl McHandler {
             < pending_before;
         self.advance_async_reminders(&mut state, &notice, codec, drops_applied)
             .await?;
+        let historian_due = self.advance_async_historian_cadence(&mut state, codec)?;
         state.save(store, &[])?;
         drop(_serial);
-        self.schedule_async_historian(&state)?;
+        if historian_due {
+            self.schedule_async_historian(&state)?;
+        }
         self.announce_async_views().await
     }
 
@@ -1129,7 +1159,6 @@ impl McHandler {
                     ordinal: entry.ordinal,
                     mid: entry.mid.clone(),
                     message: entry.message.clone(),
-                    raw_message: None,
                 })
             })
             .collect::<Result<Vec<_>, _>>()?;
@@ -1260,8 +1289,6 @@ impl McHandler {
 
     fn async_binding(&self, state: &State) -> SessionBinding {
         SessionBinding {
-            connection_incarnation: 0,
-            native_generation: None,
             principal: Some(subc_protocol::Principal::Reserved {
                 module_id: state.runner_module.clone(),
             }),
@@ -1359,7 +1386,6 @@ impl McHandler {
                         ordinal: 0,
                         mid,
                         message,
-                        raw_message: None,
                     })?;
                     entry.ck.meta.synthetic = true;
                     entry.ck.meta.ordinal = None;
@@ -1394,7 +1420,7 @@ impl McHandler {
             state.reference(),
             version,
             state.lineage.as_deref().unwrap_or_default(),
-            compact::status::MessageRef {
+            compact::lineage::MessageRef {
                 ordinal: last.ordinal,
                 mid: last.mid.clone(),
             },
@@ -1629,6 +1655,11 @@ impl McHandler {
         if state.engine.preset != transform::compaction::Preset::Head {
             return Ok(());
         }
+        #[cfg(test)]
+        self.provider_store
+            .async_runtime
+            .historian_evaluations
+            .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
         let binding = self.async_binding(state);
         let codec = codec::Codec::from_params(&Value::Object(state.setup.params.clone()))?;
         let mut request = self.async_historian_fields(state);
@@ -1663,7 +1694,6 @@ impl McHandler {
                 ordinal: entry.ordinal,
                 mid: entry.mid.clone(),
                 message: entry.message.clone(),
-                raw_message: None,
             })
             .collect::<Vec<_>>();
         codec.prepare_request(&mut parsed, &messages)?;
@@ -1681,6 +1711,8 @@ impl McHandler {
         });
         let reference = state.reference();
         let namespace = state.namespace();
+        let generation = state.generation;
+        let cadence = state.historian_cadence.clone();
         let settings = self.historian_settings_loader()(&state.key.project);
         let harness = state.key.harness.clone();
         tokio::spawn(async move {
@@ -1717,6 +1749,12 @@ impl McHandler {
             .await;
             match result {
                 Ok(Ok(PreparedHistorianAction::FireReady(prepared))) => {
+                    if let Err(error) = worker
+                        .finish_async_historian_evaluation(&reference, generation, &cadence)
+                        .await
+                    {
+                        tracing::warn!(?error, "async historian cadence save failed");
+                    }
                     let completion = worker.live_historian_completion_wait(&namespace);
                     worker.spawn_historian_firing(prepared.task);
                     if let Some(completion) = completion {
@@ -1726,7 +1764,24 @@ impl McHandler {
                         tracing::warn!(?error, "async historian view publication failed");
                     }
                 }
-                Ok(Ok(_)) => {}
+                Ok(Ok(PreparedHistorianAction::Busy { completion, .. })) => {
+                    completion.await;
+                    if let Some(store) = worker.store.get() {
+                        if let Ok(Some(state)) = load(store, &reference) {
+                            if state.historian_pending {
+                                let _ = worker.schedule_async_historian(&state);
+                            }
+                        }
+                    }
+                }
+                Ok(Ok(PreparedHistorianAction::Complete(_))) => {
+                    if let Err(error) = worker
+                        .finish_async_historian_evaluation(&reference, generation, &cadence)
+                        .await
+                    {
+                        tracing::warn!(?error, "async historian cadence save failed");
+                    }
+                }
                 Ok(Err(error)) => tracing::warn!(?error, "async historian evaluation failed"),
                 Err(error) => tracing::warn!(%error, "async historian worker failed"),
             }
@@ -1781,7 +1836,6 @@ impl McHandler {
                     ordinal: entry.ordinal,
                     mid: entry.mid.clone(),
                     message: entry.message.clone(),
-                    raw_message: None,
                 })
             })
             .collect::<Result<Vec<_>, _>>()?;
@@ -1829,7 +1883,7 @@ impl AsyncRecord {
                         ordinal: entry.ordinal,
                         mid: entry.mid.clone(),
                         part: row.part.clone(),
-                        digest: contract::content_digest(part),
+                        digest: contract::digest::content_digest(part),
                     };
                     if index.insert(tag.clone(), address).is_some() {
                         return Err(invalid_field("tags", "runner reused a tag"));
@@ -1947,10 +2001,9 @@ impl AsyncRecord {
                 .messages
                 .iter()
                 .map(|old| {
-                    by_mid
-                        .get(old.mid.as_str())
-                        .copied()
-                        .filter(|entry| contract::content_digest(&entry.message) == old.digest)
+                    by_mid.get(old.mid.as_str()).copied().filter(|entry| {
+                        contract::digest::content_digest(&entry.message) == old.digest
+                    })
                 })
                 .collect::<Option<Vec<_>>>();
             let Some(mapped) = mapped.filter(|mapped| {
@@ -2043,10 +2096,9 @@ impl AsyncRecord {
                 .messages
                 .iter()
                 .map(|old| {
-                    by_mid
-                        .get(old.mid.as_str())
-                        .copied()
-                        .filter(|entry| contract::content_digest(&entry.message) == old.digest)
+                    by_mid.get(old.mid.as_str()).copied().filter(|entry| {
+                        contract::digest::content_digest(&entry.message) == old.digest
+                    })
                 })
                 .collect::<Option<Vec<_>>>();
             if let Some(mapped) = mapped.filter(|mapped| {
@@ -2075,8 +2127,112 @@ impl AsyncRecord {
         }
         self.last_discarded_drops = source.queued_count.saturating_sub(transferred);
         self.last_transferred_drops = transferred;
+        let old_messages = source
+            .messages
+            .iter()
+            .map(|message| (message.mid.as_str(), message.digest.as_str()))
+            .collect::<BTreeMap<_, _>>();
+        self.restored_no_new_content = retained.len() == source.history.len()
+            && self.entries.values().all(|entry| {
+                old_messages.get(entry.mid.as_str()).is_some_and(|digest| {
+                    *digest == contract::digest::content_digest(&entry.message)
+                })
+            });
+        if !self.restored_no_new_content {
+            self.historian_pending = true;
+        }
         tracing::info!(session_ref=%self.reference(),history_compartments=retained.len(),copied_chunk_embeddings=copied,transferred_drops=transferred,discarded_drops=self.last_discarded_drops,"async lineage sources revalidated");
         self.resync_sources = None;
+        Ok(())
+    }
+}
+
+impl McHandler {
+    fn advance_async_historian_cadence(
+        &self,
+        state: &mut State,
+        codec: codec::Codec,
+    ) -> Result<bool, HandlerOutcome> {
+        if state.engine.preset != transform::compaction::Preset::Head {
+            return Ok(false);
+        }
+        let mut user = None;
+        let mut tools = 0;
+        for entry in state.entries.values() {
+            let message = codec.decode_message(&InboundMessage {
+                ordinal: entry.ordinal,
+                mid: entry.mid.clone(),
+                message: entry.message.clone(),
+            })?;
+            let results = message
+                .ck
+                .content
+                .iter()
+                .filter(|block| matches!(block.kind, ck_wire::CkKind::ToolResult { .. }))
+                .count() as u64;
+            tools += results;
+            if message.ck.role == "user" && results == 0 {
+                user = Some(entry.mid.clone());
+            }
+        }
+        let facts = HistorianCadence {
+            user,
+            tools,
+            model: state
+                .conditions
+                .as_ref()
+                .and_then(|headers| headers.get("model"))
+                .unwrap_or(&state.setup.model)
+                .clone(),
+            settings: sha256_hex(
+                &serde_jcs::to_vec(&self.async_historian_fields(state)).map_err(transient)?,
+            ),
+        };
+        if state.restored_no_new_content
+            && state
+                .historian_cadence
+                .as_ref()
+                .is_some_and(|prior| prior.model == facts.model && prior.settings == facts.settings)
+        {
+            state.historian_cadence = Some(facts);
+            state.historian_pending = false;
+            state.restored_no_new_content = false;
+            return Ok(false);
+        }
+        state.restored_no_new_content = false;
+        let due = state.historian_pending
+            || state.historian_cadence.as_ref().is_none_or(|prior| {
+                prior.user != facts.user
+                    || prior.model != facts.model
+                    || prior.settings != facts.settings
+                    || facts.tools >= prior.tools.saturating_add(25)
+            });
+        if due {
+            state.historian_cadence = Some(facts);
+            state.historian_pending = true;
+        }
+        Ok(due)
+    }
+
+    async fn finish_async_historian_evaluation(
+        &self,
+        reference: &str,
+        generation: u64,
+        cadence: &Option<HistorianCadence>,
+    ) -> Result<(), HandlerOutcome> {
+        let store = self
+            .store
+            .get()
+            .ok_or_else(|| transient("store unavailable"))?;
+        let Some(mut state) = load(store, reference)? else {
+            return Ok(());
+        };
+        let _serial = self.provider_serial.lock_for(&state.key).await;
+        state = load(store, reference)?.ok_or_else(|| transient("async session disappeared"))?;
+        if state.generation == generation && &state.historian_cadence == cadence {
+            state.historian_pending = false;
+            state.save(store, &[])?;
+        }
         Ok(())
     }
 }

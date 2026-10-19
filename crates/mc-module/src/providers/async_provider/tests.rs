@@ -129,8 +129,6 @@ impl Rig {
         h.bind_route(
             7,
             SessionBinding {
-                connection_incarnation: 1,
-                native_generation: None,
                 principal: Some(subc_protocol::Principal::Reserved {
                     module_id: "thalamus-harness".into(),
                 }),
@@ -220,8 +218,9 @@ impl Rig {
         let mut notice = notice::AdvanceNotice::new(
             &self.reference,
             seq,
+            self.runner.lineage.lock().unwrap().clone(),
             last.ordinal,
-            contract::content_digest(&last.message),
+            contract::digest::content_digest(&last.message),
             size,
             "fixture",
         )
@@ -591,7 +590,7 @@ fn part_edit_bytes_participate_in_digest() {
         "00000000000000000000000000000000",
         1,
         "L",
-        compact::status::MessageRef {
+        compact::lineage::MessageRef {
             ordinal: 0,
             mid: "m0".into(),
         },
@@ -667,7 +666,7 @@ async fn fork_descent_requires_recorded_digest() {
     rig.fill(40);
     rig.notice(1, 1_000, None).await;
     let state = rig.state();
-    let digest = contract::content_digest(&state.entries[&9].message);
+    let digest = contract::digest::content_digest(&state.entries[&9].message);
     assert_eq!(verified_descent(&state, &format!("L:9:{digest}")), Some(9));
     assert_eq!(
         verified_descent(&state, &format!("L:9:{}", "0".repeat(64))),
@@ -730,7 +729,7 @@ async fn fork_descent_preserves_only_verified_prefix_state() {
     rig.fill(40);
     rig.notice(1, 1_000, None).await;
     let before = rig.state();
-    let digest = contract::content_digest(&before.entries[&9].message);
+    let digest = contract::digest::content_digest(&before.entries[&9].message);
     rig.runner.entries.lock().unwrap().truncate(10);
     *rig.runner.lineage.lock().unwrap() = "fork:verified".into();
     rig.notice_with_descent(2, 1_000, None, Some(format!("L:9:{digest}")))
@@ -838,6 +837,13 @@ async fn reads_use_the_admitted_runner_not_the_process_default() {
     );
     let state = rig.state();
     assert_eq!(state.runner_route.unwrap()["module_id"], "thalamus-harness");
+    let project = state.dream_target.as_ref().unwrap()["project"]
+        .as_str()
+        .unwrap();
+    assert!(
+        rig.h.dream_runs.target_for_test(project).is_none(),
+        "background-disabled conversations must not start a dream schedule"
+    );
     assert_eq!(state.dream_target.unwrap()["route"]["parent_session"], "s");
 }
 
@@ -888,7 +894,6 @@ async fn synthetic_ids_never_fall_back_to_positional_transcript_matches() {
             ordinal: 0,
             mid: entry.mid.clone(),
             message: entry.message.clone(),
-            raw_message: None,
         })
         .unwrap();
     let engine = transform::compaction::View {
@@ -931,6 +936,26 @@ async fn restored_lineage_reuses_history_embeddings_and_reanchors_only_surviving
         _ => panic!("history head"),
     };
     rig.queue(&[163, 208]).await;
+    tokio::time::timeout(Duration::from_secs(2), async {
+        while rig
+            .h
+            .provider_store
+            .async_runtime
+            .historian_evaluations
+            .load(std::sync::atomic::Ordering::Relaxed)
+            == 0
+        {
+            tokio::task::yield_now().await;
+        }
+    })
+    .await
+    .unwrap();
+    let evaluations = rig
+        .h
+        .provider_store
+        .async_runtime
+        .historian_evaluations
+        .load(std::sync::atomic::Ordering::Relaxed);
     let before = rig.state();
     let source = before.namespace();
     let store = rig.h.store.get().unwrap();
@@ -951,6 +976,15 @@ async fn restored_lineage_reuses_history_embeddings_and_reanchors_only_surviving
     assert!(after.generation > before.generation);
     assert_eq!(after.last_discarded_drops, 1);
     assert_eq!(after.last_transferred_drops, 1);
+    assert_eq!(
+        rig.h
+            .provider_store
+            .async_runtime
+            .historian_evaluations
+            .load(std::sync::atomic::Ordering::Relaxed),
+        evaluations,
+        "a restore of known messages must not even schedule another historian evaluation"
+    );
     let restored = rig.get(rig.newest().unwrap()).await;
     let new_head = match &restored.ranges[0] {
         view::ViewRange::Replace { bytes, .. } => bytes,
@@ -994,4 +1028,20 @@ async fn restored_lineage_reuses_history_embeddings_and_reanchors_only_surviving
         "published history survives a runner backup restore"
     );
     let _ = rig.render(&restored);
+    rig.runner.entries.lock().unwrap().push(ReadMessage::new(31,"new-user-after-restore",json!({"info":{"id":"new-user-after-restore","role":"user","time":{"created":2}},"parts":[{"id":"new-part","type":"text","text":"a genuinely new turn"}]})).with_tags(vec![tags::PartTag::tagged("0","§20000§")]));
+    rig.notice(5, 1_000, None).await;
+    tokio::time::timeout(Duration::from_secs(2), async {
+        while rig
+            .h
+            .provider_store
+            .async_runtime
+            .historian_evaluations
+            .load(std::sync::atomic::Ordering::Relaxed)
+            == evaluations
+        {
+            tokio::task::yield_now().await;
+        }
+    })
+    .await
+    .expect("a real new user turn must still wake the historian");
 }

@@ -260,7 +260,10 @@ impl PreparedSend {
         if let Some(template) = &self.template {
             order = order.with_template(template.clone());
         }
-        let request = SendRequest::new(&self.prompt, send_id).with_delivery_order(&order);
+        let mut request = SendRequest::new(&self.prompt, send_id).with_delivery_order(&order);
+        if self.template.is_some() {
+            request.prompt = None;
+        }
         serde_json::to_value(request).expect("typed reminder send serializes")
     }
 }
@@ -759,8 +762,8 @@ mod tests {
             sends[1]["template"]["slots"],
             json!({"major":2,"major_unit":"h","minor":1,"minor_unit":"m"})
         );
-        assert_eq!(sends[0]["prompt"], "");
-        assert_eq!(sends[1]["prompt"], "");
+        assert!(sends[0].get("prompt").is_none());
+        assert!(sends[1].get("prompt").is_none());
         assert!(sends[2].get("template").is_none());
         assert!(sends[2]["prompt"]
             .as_str()

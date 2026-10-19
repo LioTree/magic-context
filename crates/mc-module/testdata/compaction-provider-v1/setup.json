@@ -1,0 +1,307 @@
+{
+  "requests": [
+    {
+      "name": "a fresh session, nothing written yet",
+      "request": {
+        "session": "ses_01J9Z",
+        "harness": "broca",
+        "request_id": "cr-000001",
+        "preset": "head",
+        "params": {},
+        "composition": {
+          "providers": [
+            {
+              "provider": "aft",
+              "tools": [
+                {
+                  "name": "read",
+                  "capabilities": [
+                    "code.read/v1"
+                  ]
+                }
+              ]
+            },
+            {
+              "provider": "magic-context",
+              "tools": []
+            }
+          ]
+        },
+        "model": "anthropic/claude-opus-4-5",
+        "context_window": 200000,
+        "output_limit": 64000,
+        "now": 1790000000000
+      }
+    },
+    {
+      "name": "the first user message is already written",
+      "request": {
+        "session": "ses_01J9Z",
+        "harness": "broca",
+        "request_id": "cr-000001",
+        "lineage_id": "lin_7",
+        "params": {
+          "historian": "off"
+        },
+        "composition": {
+          "providers": []
+        },
+        "model": "openai/gpt-5",
+        "variant": "high",
+        "newest": {
+          "ordinal": 1,
+          "mid": "m1"
+        },
+        "now": 1790000000000
+      }
+    }
+  ],
+  "answers": [
+    {
+      "name": "a head of two messages before every message",
+      "answer": {
+        "answer": "ready",
+        "request_id": "cr-000001",
+        "initial": {
+          "compaction_id": "mc:ses_01J9Z:head-1",
+          "version": 1,
+          "range": {
+            "from": 0,
+            "to": 0
+          },
+          "replacement": [
+            {
+              "role": "user",
+              "content": [
+                {
+                  "type": "text",
+                  "text": "<m0: project docs and memories>"
+                }
+              ]
+            },
+            {
+              "role": "user",
+              "content": [
+                {
+                  "type": "text",
+                  "text": "<m1: session history>"
+                }
+              ]
+            }
+          ]
+        }
+      }
+    },
+    {
+      "name": "no head: an empty initial view",
+      "answer": {
+        "answer": "ready",
+        "request_id": "cr-000001",
+        "initial": {
+          "compaction_id": "empty",
+          "version": 1,
+          "range": {
+            "from": 0,
+            "to": 0
+          },
+          "replacement": []
+        }
+      }
+    },
+    {
+      "name": "setup refused",
+      "answer": {
+        "answer": "refuse",
+        "request_id": "cr-000001",
+        "code": "misconfigured",
+        "reason": "preset 'head' needs a memory store, and none is configured"
+      },
+      "retryable": false
+    },
+    {
+      "name": "setup refused with the provider's own reason in provider_code",
+      "answer": {
+        "answer": "refuse",
+        "request_id": "cr-000001",
+        "code": "misconfigured",
+        "reason": "preset 'head' needs a memory store, and none is configured",
+        "provider_code": "mc:no_memory_store"
+      },
+      "retryable": false
+    },
+    {
+      "name": "setup refused with a code the role does not name: decodes, never retried",
+      "answer": {
+        "answer": "refuse",
+        "request_id": "cr-000001",
+        "code": "acme_own_code",
+        "reason": "x"
+      },
+      "retryable": false
+    }
+  ],
+  "tolerated": [
+    {
+      "name": "refuse still carrying the removed retryable member: ignored, code decides",
+      "answer": {
+        "answer": "refuse",
+        "request_id": "cr-000001",
+        "code": "misconfigured",
+        "reason": "x",
+        "retryable": true
+      },
+      "retryable": false
+    },
+    {
+      "name": "a ready answer still carrying the removed stability and call_when: ignored",
+      "answer": {
+        "answer": "ready",
+        "request_id": "cr-000001",
+        "initial": {
+          "compaction_id": "x",
+          "version": 1,
+          "range": {
+            "from": 0,
+            "to": 0
+          },
+          "replacement": []
+        },
+        "stability": [
+          {
+            "index": 0,
+            "rank": 2
+          }
+        ],
+        "call_when": {
+          "default": 0.8
+        }
+      }
+    }
+  ],
+  "undecodable": [
+    {
+      "name": "unknown answer",
+      "answer": {
+        "answer": "maybe",
+        "request_id": "cr-000001"
+      }
+    },
+    {
+      "name": "ready without an initial message",
+      "answer": {
+        "answer": "ready",
+        "request_id": "cr-000001"
+      }
+    },
+    {
+      "name": "no request id",
+      "answer": {
+        "answer": "ready",
+        "initial": {
+          "compaction_id": "x",
+          "version": 1,
+          "range": {
+            "from": 0,
+            "to": 0
+          },
+          "replacement": []
+        }
+      }
+    },
+    {
+      "name": "refuse without a code",
+      "answer": {
+        "answer": "refuse",
+        "request_id": "cr-000001",
+        "reason": "x"
+      }
+    }
+  ],
+  "model_view": [
+    {
+      "name": "a non-empty range keeps its half-open ends",
+      "compaction": {
+        "compaction_id": "mc:snap-118",
+        "version": 7,
+        "range": {
+          "from": 3,
+          "to": 41
+        },
+        "replacement": []
+      },
+      "source": {
+        "kind": "replacement",
+        "compaction_id": "mc:snap-118",
+        "version": 7,
+        "from_ordinal": 3,
+        "to_ordinal": 41
+      }
+    },
+    {
+      "name": "setup's head: an empty range at 0 is an insertion before every message",
+      "compaction": {
+        "compaction_id": "mc:head-1",
+        "version": 1,
+        "range": {
+          "from": 0,
+          "to": 0
+        },
+        "replacement": []
+      },
+      "source": {
+        "kind": "replacement",
+        "compaction_id": "mc:head-1",
+        "version": 1,
+        "from_ordinal": 0,
+        "to_ordinal": 0
+      }
+    },
+    {
+      "name": "an empty range later in the lineage inserts before its ordinal",
+      "compaction": {
+        "compaction_id": "mc:note-4",
+        "version": 4,
+        "range": {
+          "from": 12,
+          "to": 12
+        },
+        "replacement": []
+      },
+      "source": {
+        "kind": "replacement",
+        "compaction_id": "mc:note-4",
+        "version": 4,
+        "from_ordinal": 12,
+        "to_ordinal": 12
+      }
+    },
+    {
+      "name": "an inverted range is never applied, so it has no source",
+      "compaction": {
+        "compaction_id": "c",
+        "version": 1,
+        "range": {
+          "from": 9,
+          "to": 4
+        },
+        "replacement": []
+      },
+      "source": null
+    }
+  ],
+  "malformed_initial": [
+    {
+      "name": "inverted range",
+      "compaction": {
+        "compaction_id": "c",
+        "version": 1,
+        "range": {
+          "from": 9,
+          "to": 4
+        },
+        "replacement": []
+      },
+      "problem": "range_inverted"
+    }
+  ]
+}

@@ -16714,9 +16714,7 @@ impl McHandler {
         if let Some(method) = method {
             return match method {
                 "role.describe" => providers::describe(),
-                "compaction.setup"
-                | "view.get"
-                | "compaction.ride" => {
+                "compaction.setup" | "view.get" | "compaction.ride" => {
                     self.handle_provider_value(
                         channel,
                         method,
@@ -39965,9 +39963,8 @@ mod tests {
             json!({ "ok": true })
         );
 
-        let transcript: Vec<cortexkit_role_compaction_provider::status::StatusMessage> =
+        let transcript: Vec<crate::providers::codec::InboundMessage> =
             serde_json::from_value(fixture["transcript"].clone()).unwrap();
-        let transcript = transcript.into_iter().map(Into::into).collect::<Vec<_>>();
         let mut scan = crate::providers::runner_todo::TodoScan::default();
         let derived = crate::providers::runner_todo::scan_status_messages(
             &mut scan,
