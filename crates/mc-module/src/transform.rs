@@ -2658,6 +2658,22 @@ pub mod compaction {
         pub prefix_bust_permitted: bool,
     }
 
+    /// Who removes the signed reasoning a view invalidates. An Anthropic
+    /// signature covers every byte before its block, so once a view changes
+    /// an earlier message (a history head insertion included) every later
+    /// signed reasoning block must leave the request.
+    #[derive(Clone, Copy, Debug, PartialEq, Eq)]
+    pub enum SignedReasoning {
+        /// The view itself removes those blocks.
+        Strip,
+        /// The view keeps them. The runner applies it with the provider's
+        /// companion edit (or defers it) and reports `view_companion` or
+        /// `view_deferred`: the asynchronous compaction-provider contract
+        /// makes model-provider rules the runner's duty, so the view carries
+        /// only the provider's own edits.
+        RunnerCompanion,
+    }
+
     /// Produce Setup's full initial view. Setup is the only call that can initialize
     /// the served head without a previous view; ordinary steps require that view.
     pub fn setup(
@@ -2667,7 +2683,19 @@ pub mod compaction {
         status: &Status,
         state: &mut State,
     ) -> Result<Output, TransformError> {
-        run(store, template, ctx, status, state, true, None)
+        setup_with(store, template, ctx, status, state, SignedReasoning::Strip)
+    }
+
+    /// [`setup`], choosing who removes the signed reasoning the view invalidates.
+    pub fn setup_with(
+        store: &McStore,
+        template: &TransformRequest,
+        ctx: &ProducerContext<'_>,
+        status: &Status,
+        state: &mut State,
+        signed: SignedReasoning,
+    ) -> Result<Output, TransformError> {
+        run(store, template, ctx, status, state, true, None, signed)
     }
 
     pub fn step(
@@ -2677,7 +2705,19 @@ pub mod compaction {
         status: &Status,
         state: &mut State,
     ) -> Result<Output, TransformError> {
-        run(store, template, ctx, status, state, false, None)
+        step_with(store, template, ctx, status, state, SignedReasoning::Strip)
+    }
+
+    /// [`step`], choosing who removes the signed reasoning the view invalidates.
+    pub fn step_with(
+        store: &McStore,
+        template: &TransformRequest,
+        ctx: &ProducerContext<'_>,
+        status: &Status,
+        state: &mut State,
+        signed: SignedReasoning,
+    ) -> Result<Output, TransformError> {
+        run(store, template, ctx, status, state, false, None, signed)
     }
 
     pub trait AppliedComparison {
@@ -2692,9 +2732,19 @@ pub mod compaction {
         state: &mut State,
         comparison: &dyn AppliedComparison,
     ) -> Result<Output, TransformError> {
-        run(store, template, ctx, status, state, false, Some(comparison))
+        run(
+            store,
+            template,
+            ctx,
+            status,
+            state,
+            false,
+            Some(comparison),
+            SignedReasoning::Strip,
+        )
     }
 
+    #[allow(clippy::too_many_arguments)]
     fn run(
         store: &McStore,
         template: &TransformRequest,
@@ -2703,6 +2753,7 @@ pub mod compaction {
         state: &mut State,
         initial: bool,
         comparison: Option<&dyn AppliedComparison>,
+        signed: SignedReasoning,
     ) -> Result<Output, TransformError> {
         if !ctx.compaction_enabled || status.context_window == 0 {
             return Err(TransformError::LineageProtocol(
@@ -2845,7 +2896,7 @@ pub mod compaction {
         // in a View; this transport-only copy does not authorize new prefix edits.
         let transport_replay = host && status.pipeline_switch;
         if initial || permitted || transport_replay {
-            let replacement = replacement(&engine.response, &req, state.preset)?;
+            let replacement = replacement(&engine.response, &req, state.preset, signed)?;
             let candidate = View {
                 compaction_id: state.compaction_id.clone(),
                 version: 0,
@@ -2969,6 +3020,7 @@ pub mod compaction {
         response: &TransformResponse,
         req: &TransformRequest,
         preset: Preset,
+        signed: SignedReasoning,
     ) -> Result<Vec<CkWireMessage>, TransformError> {
         let messages = response
             .ck_messages
@@ -3020,6 +3072,9 @@ pub mod compaction {
             nonempty_text(message);
         }
         out.retain(|m| !m.content.is_empty());
+        if signed == SignedReasoning::RunnerCompanion {
+            return Ok(out);
+        }
         // Compare CK bytes, not metadata or message IDs. An insertion/deletion is an
         // edit too, so a head insertion strips every later signed block. Never alter
         // a signature's text: discard the entire reasoning block instead.
@@ -33663,6 +33718,7 @@ pub(crate) mod tests {
     include!("tests/image_stripping_review_witness.rs");
     include!("tests/processed_images.rs");
     include!("tests/image_anthropic_differential.rs");
+    include!("tests/compaction_signed_reasoning_companion.rs");
     include!("tests/independent_image_review.rs");
     include!("tests/signed_prefix_hold_review_r2.rs");
     include!("tests/signed_prefix_hold_review_r3.rs");

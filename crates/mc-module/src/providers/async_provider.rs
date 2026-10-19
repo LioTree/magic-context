@@ -644,10 +644,13 @@ impl McHandler {
             false,
         );
         context.cache_ttl = "never".into();
+        // On this lane the runner owns the model provider's companion edit:
+        // views never remove the signed reasoning they invalidate.
+        let signed = transform::compaction::SignedReasoning::RunnerCompanion;
         let output = if engine.last_applied.is_none() {
-            transform::compaction::setup(store, &template, &context, status, engine)
+            transform::compaction::setup_with(store, &template, &context, status, engine, signed)
         } else {
-            transform::compaction::step(store, &template, &context, status, engine)
+            transform::compaction::step_with(store, &template, &context, status, engine, signed)
         }
         .map_err(transient)?;
         Ok((template, output))
