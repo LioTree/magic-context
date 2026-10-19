@@ -357,6 +357,7 @@ pub mod engram_catalog;
 mod reclaim_distance;
 pub mod route_targets;
 pub mod runner_choices;
+pub mod runner_reminders;
 pub mod scheduler;
 pub mod selection;
 pub mod session_resolver;
