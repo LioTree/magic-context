@@ -37,8 +37,8 @@ const getTagNumberByMessageIdStatements = new WeakMap<Database, PreparedStatemen
 const getAssignableTagNumberByMessageIdStatements = new WeakMap<Database, PreparedStatement>();
 const hasPiFallbackMessageTagStatements = new WeakMap<Database, PreparedStatement>();
 
-const WHITESPACE_ASSISTANT_INERT_MESSAGE_PREFIX = "__mc_whitespace_assistant_inert__:";
-const WHITESPACE_ASSISTANT_INERT_FINGERPRINT_PREFIX = "mc:whitespace-assistant:";
+export const WHITESPACE_ASSISTANT_INERT_MESSAGE_PREFIX = "__mc_whitespace_assistant_inert__:";
+export const WHITESPACE_ASSISTANT_INERT_FINGERPRINT_PREFIX = "mc:whitespace-assistant:";
 
 function getInsertTagStatement(db: Database): PreparedStatement {
     let stmt = insertTagStatements.get(db);

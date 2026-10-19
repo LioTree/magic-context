@@ -15,9 +15,11 @@
  *  - every visible block ck-mc tagged gets the same number on its TypeScript
  *    identity (`<message id>:p<part index>` for text, call id + owner message
  *    for tools);
- *  - any other context.db tag row holding a number at or below ck-mc's highest
- *    number moves above every number either side used, together with its
- *    source_contents rows, so numbers the model saw now name
+ *  - context.db tag rows whose message is no longer on the wire (history
+ *    behind OpenCode's compaction marker) are deleted with their saved source
+ *    text, so later passes never load them; any other row holding a number at
+ *    or below ck-mc's highest number moves above every number either side
+ *    used, with its source_contents row, so numbers the model saw now name
  *    either the block ck-mc showed or nothing;
  *  - the session counter continues above ck-mc's highest number;
  *  - drops ck-mc applied and drops still queued in ck-mc are carried over,
@@ -29,6 +31,10 @@
  */
 import { existsSync } from "node:fs";
 import { dirname, join } from "node:path";
+import {
+    WHITESPACE_ASSISTANT_INERT_FINGERPRINT_PREFIX,
+    WHITESPACE_ASSISTANT_INERT_MESSAGE_PREFIX,
+} from "../../features/magic-context/storage-tags";
 import { getHarness } from "../../shared/harness";
 import { sessionLog } from "../../shared/logger";
 import { Database, getSqliteDatabasePath } from "../../shared/sqlite";
@@ -90,6 +96,8 @@ export interface LegacyCkTagImportResult {
     inserted?: number;
     /** context.db rows moved above the high-water mark to free ck-mc's numbers. */
     relocated?: number;
+    /** TypeScript-era rows (and their saved text) deleted because their message is off the wire. */
+    deleted?: number;
     /** ck-mc tags whose message is not in this pass's messages (number reserved only). */
     notVisible?: number;
     /** ck-mc tags whose block could not be matched exactly to a part. */
@@ -327,6 +335,10 @@ export interface LegacyCkImportPlan {
     notVisible: number;
     unmatched: number;
     pendingSkipped: number;
+    /** Ids of the messages in this pass; tag rows owned by any other message are history. */
+    wireMessageIds: Set<string>;
+    /** Tool call ids in this pass, for legacy tool rows that never recorded an owner. */
+    wireCallIds: Set<string>;
 }
 
 function identityKey(identity: PlannedTag["identity"]): string {
@@ -496,7 +508,29 @@ export function planLegacyCkImport(
         pending.push({ tagNumber, queuedAt: drop.queuedAt });
     }
 
-    return { tags, numberByIdentity, pending, notVisible, unmatched, pendingSkipped };
+    const wireCallIds = new Set<string>();
+    for (const message of messages) {
+        for (const part of message.parts) {
+            if (isToolPartWithOutput(part)) wireCallIds.add(part.callID);
+            else if (
+                part !== null &&
+                typeof part === "object" &&
+                typeof (part as { callID?: unknown }).callID === "string"
+            )
+                wireCallIds.add((part as { callID: string }).callID);
+        }
+    }
+
+    return {
+        tags,
+        numberByIdentity,
+        pending,
+        notVisible,
+        unmatched,
+        pendingSkipped,
+        wireMessageIds: new Set(visible.keys()),
+        wireCallIds,
+    };
 }
 
 interface ExistingRow {
@@ -559,8 +593,85 @@ interface ApplyCounts {
     imported: number;
     inserted: number;
     relocated: number;
+    deleted: number;
     droppedImported: number;
     pendingImported: number;
+}
+
+interface HistoryCandidateRow {
+    id: number;
+    tagNumber: number;
+    type: string;
+    messageId: string;
+    owner: string | null;
+    fingerprint: string | null;
+}
+
+/**
+ * The message a tag row belongs to: the owner for tools, the `<message id>`
+ * before `:p<n>` / `:file<n>` for text and files, and for a retired whitespace
+ * row the message named in its fingerprint. Null when the row names none.
+ */
+function rowMessageId(row: HistoryCandidateRow): string | null {
+    if (row.type === "tool") return row.owner;
+    if (row.messageId.startsWith(WHITESPACE_ASSISTANT_INERT_MESSAGE_PREFIX)) {
+        const contentId = row.fingerprint?.startsWith(WHITESPACE_ASSISTANT_INERT_FINGERPRINT_PREFIX)
+            ? row.fingerprint.slice(WHITESPACE_ASSISTANT_INERT_FINGERPRINT_PREFIX.length)
+            : null;
+        return contentId ? contentId.slice(0, contentId.lastIndexOf(":")) : null;
+    }
+    const separator = row.messageId.lastIndexOf(":");
+    return separator > 0 ? row.messageId.slice(0, separator) : row.messageId;
+}
+
+/**
+ * Delete TypeScript-era tag rows whose message is no longer in this pass's
+ * messages, with their saved source text. Those messages sit behind OpenCode's
+ * compaction marker, so no pass renders them again. Kept, their numbers sit
+ * above the imported window and every later pass would load them through the
+ * tagger's live-wire floor. Nothing needs them for correctness: the readers
+ * that scan every row of a session only count them for display or return
+ * "unknown tag" for a number the model can no longer see.
+ */
+function deleteHistoryRows(
+    db: Database,
+    sessionId: string,
+    plan: LegacyCkImportPlan,
+    identityRowIds: ReadonlySet<number>,
+): number {
+    const rows = db
+        .prepare(
+            `SELECT id, tag_number AS tagNumber, type, message_id AS messageId,
+                    tool_owner_message_id AS owner, entry_fingerprint AS fingerprint
+             FROM tags WHERE session_id = ?`,
+        )
+        .all(sessionId) as HistoryCandidateRow[];
+    const deleteIds: number[] = [];
+    const deleteNumbers: number[] = [];
+    for (const row of rows) {
+        if (identityRowIds.has(row.id)) continue;
+        const messageId = rowMessageId(row);
+        if (messageId !== null && plan.wireMessageIds.has(messageId)) continue;
+        // A tool row from before owners were recorded is claimed by its call id.
+        if (row.type === "tool" && row.owner === null && plan.wireCallIds.has(row.messageId))
+            continue;
+        deleteIds.push(row.id);
+        deleteNumbers.push(row.tagNumber);
+    }
+    if (deleteIds.length === 0) return 0;
+    db.prepare(
+        "DELETE FROM source_contents WHERE session_id = ? AND tag_id IN (SELECT value FROM json_each(?))",
+    ).run(sessionId, JSON.stringify(deleteNumbers));
+    db.prepare(
+        "DELETE FROM tags WHERE session_id = ? AND id IN (SELECT value FROM json_each(?))",
+    ).run(sessionId, JSON.stringify(deleteIds));
+    // Saved text whose tag row is already gone can only ever be restored onto
+    // the wrong part once its number is reused.
+    db.prepare(
+        `DELETE FROM source_contents WHERE session_id = ?
+         AND tag_id NOT IN (SELECT tag_number FROM tags WHERE session_id = ?)`,
+    ).run(sessionId, sessionId);
+    return deleteIds.length;
 }
 
 /** Write the plan into context.db. Runs inside the caller's write transaction. */
@@ -577,6 +688,25 @@ function applyLegacyCkImport(
         "SELECT counter AS value FROM session_meta WHERE session_id = ?",
         sessionId,
     );
+
+    const existing = plan.tags.map((planned) => findExistingRow(db, sessionId, planned.identity));
+    const keepIds: number[] = [];
+    const keepNumbers: number[] = [];
+    plan.tags.forEach((planned, index) => {
+        const row = existing[index];
+        if (row && row.tagNumber === planned.tagNumber) {
+            keepIds.push(row.id);
+            keepNumbers.push(row.tagNumber);
+        }
+    });
+
+    const deleted = deleteHistoryRows(
+        db,
+        sessionId,
+        plan,
+        new Set(existing.flatMap((row) => (row ? [row.id] : []))),
+    );
+
     // Moving rows by a constant larger than every number in use keeps their
     // order and can never land on an occupied number.
     const offset = Math.max(
@@ -590,17 +720,6 @@ function applyLegacyCkImport(
         ),
     );
 
-    const existing = plan.tags.map((planned) => findExistingRow(db, sessionId, planned.identity));
-    const keepIds: number[] = [];
-    const keepNumbers: number[] = [];
-    plan.tags.forEach((planned, index) => {
-        const row = existing[index];
-        if (row && row.tagNumber === planned.tagNumber) {
-            keepIds.push(row.id);
-            keepNumbers.push(row.tagNumber);
-        }
-    });
-
     // Session meta must exist (with this harness) before tag rows change, the
     // same order the tagger uses when it allocates.
     db.prepare(
@@ -608,8 +727,10 @@ function applyLegacyCkImport(
          ON CONFLICT(session_id) DO UPDATE SET counter = MAX(session_meta.counter, excluded.counter)`,
     ).run(sessionId, counter, harness);
 
-    // Counted up front: the statement's change count would include rows the
-    // tag triggers touch.
+    // What is left at or below the high-water mark after the history delete
+    // belongs to messages still on the wire that ck-mc did not tag (a file part,
+    // for example). Counted up front: the statement's change count would
+    // include rows the tag triggers touch.
     const relocated = (
         db
             .prepare(
@@ -749,6 +870,7 @@ function applyLegacyCkImport(
         imported: plan.tags.length,
         inserted,
         relocated,
+        deleted,
         droppedImported,
         pendingImported,
     };
@@ -840,7 +962,7 @@ export function importLegacyCkTagsOnce(args: {
         if (result.status === "imported") {
             sessionLog(
                 sessionId,
-                `legacy tag import: high-water=${result.highWater} imported=${result.imported} inserted=${result.inserted} relocated=${result.relocated} dropped=${result.droppedImported} pending=${result.pendingImported} pendingSkipped=${result.pendingSkipped} notVisible=${result.notVisible} unmatched=${result.unmatched}`,
+                `legacy tag import: high-water=${result.highWater} imported=${result.imported} inserted=${result.inserted} relocated=${result.relocated} deleted=${result.deleted} dropped=${result.droppedImported} pending=${result.pendingImported} pendingSkipped=${result.pendingSkipped} notVisible=${result.notVisible} unmatched=${result.unmatched}`,
             );
         }
         return result;

@@ -6,6 +6,7 @@ import { runMigrations } from "../../features/magic-context/migrations";
 import { createScheduler } from "../../features/magic-context/scheduler";
 import { getOrCreateSessionMeta } from "../../features/magic-context/storage";
 import { initializeDatabase } from "../../features/magic-context/storage-db";
+import { deriveTagLoadFloor } from "../../features/magic-context/storage-tags";
 import { createTagger } from "../../features/magic-context/tagger";
 import { Database } from "../../shared/sqlite";
 import { closeQuietly } from "../../shared/sqlite-helpers";
@@ -146,10 +147,11 @@ function buildStore(path: string): void {
 
 /**
  * context.db as the TypeScript transform left it before the switch: its own
- * numbering reused 5 and 6 for older messages (6 is still active), the first
- * answer carries TypeScript number 3 with saved source text, and the counter
- * stops at 6, so an unaware allocator would hand out 7 next — ck-mc's number
- * for call_a.
+ * numbering reused 5 and 6 for older messages that are no longer on the wire
+ * (6 is still active), the first answer carries TypeScript number 3 with saved
+ * source text, the follow-up message carries TypeScript number 2, and the
+ * counter stops at 6, so an unaware allocator would hand out 7 next — ck-mc's
+ * number for call_a.
  */
 function seedTypeScriptEra(db: Database): void {
     getOrCreateSessionMeta(db, SESSION);
@@ -159,12 +161,13 @@ function seedTypeScriptEra(db: Database): void {
     insert.run(SESSION, "msg_old_1:p0", "compacted", 5);
     insert.run(SESSION, "msg_old_2:p0", "active", 6);
     insert.run(SESSION, "msg_02:p1", "active", 3);
-    db.prepare(
+    insert.run(SESSION, "msg_05:p0", "active", 2);
+    const source = db.prepare(
         "INSERT INTO source_contents (tag_id, session_id, content, created_at) VALUES (?, ?, ?, ?)",
-    ).run(3, SESSION, "first answer", CK_ACTIVE_AT - 1_000_000);
-    db.prepare(
-        "INSERT INTO source_contents (tag_id, session_id, content, created_at) VALUES (?, ?, ?, ?)",
-    ).run(6, SESSION, "old message two", CK_ACTIVE_AT - 1_000_000);
+    );
+    source.run(3, SESSION, "first answer", CK_ACTIVE_AT - 1_000_000);
+    source.run(6, SESSION, "old message two", CK_ACTIVE_AT - 1_000_000);
+    source.run(2, SESSION, "follow-up after the switch", CK_ACTIVE_AT - 1_000_000);
     db.prepare(
         "INSERT INTO pending_ops (session_id, tag_id, operation, queued_at) VALUES (?, 6, 'drop', 1)",
     ).run(SESSION);
@@ -258,20 +261,36 @@ describe("legacy ck-mc tag import", () => {
             expect(fresh).not.toBeNull();
             expect(fresh as number).toBeGreaterThan(CK_HIGH_WATER);
 
-            // Numbers 5 and 6 now name ck-mc's parts; the older TypeScript rows moved up.
+            // Numbers 5 and 6 now name ck-mc's parts. The older TypeScript rows
+            // belonged to messages no longer on the wire, so they are gone with
+            // their saved text; the visible follow-up kept its own row, moved
+            // above the high-water mark with its saved text.
             expect(tagRow(db, 5)?.messageId).toBe("msg_01:p0");
             expect(tagRow(db, 6)?.messageId).toBe("msg_02:p1");
             expect(tagRow(db, 7)).toMatchObject({ messageId: "call_a", owner: "msg_02" });
+            const history = db
+                .prepare(
+                    "SELECT COUNT(*) AS n FROM tags WHERE session_id = ? AND message_id LIKE 'msg_old_%'",
+                )
+                .get(SESSION) as { n: number };
+            expect(history.n).toBe(0);
+            const historySource = db
+                .prepare(
+                    "SELECT COUNT(*) AS n FROM source_contents WHERE session_id = ? AND content = 'old message two'",
+                )
+                .get(SESSION) as { n: number };
+            expect(historySource.n).toBe(0);
             const relocated = db
                 .prepare(
-                    "SELECT tag_number AS n FROM tags WHERE session_id = ? AND message_id = 'msg_old_2:p0'",
+                    "SELECT tag_number AS n FROM tags WHERE session_id = ? AND message_id = 'msg_05:p0'",
                 )
                 .get(SESSION) as { n: number };
             expect(relocated.n).toBeGreaterThan(CK_HIGH_WATER);
+            expect(fresh).toBe(relocated.n);
             const relocatedSource = db
                 .prepare("SELECT content FROM source_contents WHERE session_id = ? AND tag_id = ?")
                 .get(SESSION, relocated.n) as { content: string };
-            expect(relocatedSource.content).toBe("old message two");
+            expect(relocatedSource.content).toBe("follow-up after the switch");
 
             // ck-mc's applied drop survives on call_c's tag.
             expect(tagRow(db, 10)).toMatchObject({
@@ -357,6 +376,77 @@ describe("legacy ck-mc tag import", () => {
         } finally {
             closeQuietly(db);
         }
+    });
+
+    test("TypeScript history behind the compaction marker is deleted, so the tagger loads only what a session without history loads", async () => {
+        /** Rows a cold tagger loads for the conversation at the floor the transform derives. */
+        const loadedAfterFirstPass = async (root: string, withHistory: boolean) => {
+            mkdirSync(root, { recursive: true });
+            buildStore(join(root, "store.db"));
+            const db = openContext(root);
+            try {
+                if (withHistory) {
+                    seedTypeScriptEra(db);
+                    // Older TypeScript-era rows numbered above ck-mc's high-water
+                    // mark, as on the long-running seats; none is on the wire.
+                    const insert = db.prepare(
+                        "INSERT INTO tags (session_id, message_id, type, status, byte_size, tag_number, harness, tool_owner_message_id) VALUES (?, ?, ?, ?, 10, ?, 'opencode', ?)",
+                    );
+                    const source = db.prepare(
+                        "INSERT INTO source_contents (tag_id, session_id, content, created_at) VALUES (?, ?, ?, ?)",
+                    );
+                    for (let n = 13; n < 1_013; n += 1) {
+                        if (n % 2 === 0)
+                            insert.run(
+                                SESSION,
+                                `toolu_${n}`,
+                                "tool",
+                                "dropped",
+                                n,
+                                `msg_hist_${n}`,
+                            );
+                        else
+                            insert.run(
+                                SESSION,
+                                `msg_hist_${n}:p0`,
+                                "message",
+                                "compacted",
+                                n,
+                                null,
+                            );
+                        source.run(n, SESSION, `history ${n}`, CK_ACTIVE_AT - 1_000_000);
+                    }
+                    db.prepare("UPDATE session_meta SET counter = 1012 WHERE session_id = ?").run(
+                        SESSION,
+                    );
+                }
+                await firstPass(db);
+                const floor = deriveTagLoadFloor(
+                    db,
+                    SESSION,
+                    conversation()
+                        .map((message) => message.info.id)
+                        [Symbol.iterator](),
+                );
+                const tagger = createTagger();
+                tagger.initFromDb(SESSION, db, floor);
+                const sources = db
+                    .prepare("SELECT COUNT(*) AS n FROM source_contents WHERE session_id = ?")
+                    .get(SESSION) as { n: number };
+                return {
+                    loaded: tagger.getHeapStats?.().assignmentEntries,
+                    sources: sources.n,
+                };
+            } finally {
+                closeQuietly(db);
+            }
+        };
+        const withHistory = await loadedAfterFirstPass(join(dir, "history"), true);
+        const baseline = await loadedAfterFirstPass(join(dir, "baseline"), false);
+        expect(baseline.loaded).toBeGreaterThan(0);
+        expect(withHistory.loaded).toBe(baseline.loaded);
+        // Saved text for the visible parts only: the history rows' text is gone too.
+        expect(withHistory.sources).toBe(baseline.sources);
     });
 
     test("a session the TypeScript transform tagged after ck-mc keeps its numbering", () => {
