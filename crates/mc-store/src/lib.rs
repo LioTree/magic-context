@@ -7800,7 +7800,6 @@ impl<'a> FacadeMutationTxn<'a> {
 pub struct McStore {
     inner: Arc<SqliteStore>,
     move_path: Option<std::path::PathBuf>,
-    provider_wal: Mutex<Option<provider_wal::ProviderWal>>,
     native_snapshot_fallbacks: Mutex<HashMap<String, cache_codec::NativeSnapshotRejection>>,
     // Distinguishes independent stores in the process-local tag baseline cache. Production
     // opens one store for the module lifetime; tests and embedded callers may open several.
@@ -8515,7 +8514,6 @@ impl McStore {
                 }
                 _ => None,
             },
-            provider_wal: Mutex::new(None),
             native_snapshot_fallbacks: Mutex::new(HashMap::new()),
             tag_cache_namespace: Arc::new(std::sync::atomic::AtomicU64::new(
                 NEXT_TAG_CACHE_NAMESPACE.fetch_add(1, Ordering::Relaxed),
