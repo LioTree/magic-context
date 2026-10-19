@@ -250,12 +250,12 @@ perturb(
     "pi",
     {
         role: "system",
-        content: "Update",
+        content: [{ type: "text", text: "Update" }],
         sections: { rules: "Rules" },
         toolsAdded: [{ name: "read" }],
         toolsRemoved: [{ name: "write" }],
     },
-    ["content", "sections.rules", "toolsAdded.0.name", "toolsRemoved.0.name"],
+    ["content.0.text", "sections.rules", "toolsAdded.0.name", "toolsRemoved.0.name"],
 );
 perturb(
     "pi",
