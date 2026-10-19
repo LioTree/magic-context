@@ -6,7 +6,7 @@ use crate::dream_dispatch::ownership::{
     self, ClaimantDeclaration, Ownership, OwnershipInput, Wiring,
 };
 use crate::dream_dispatch::tick::{DreamHandles, DreamTarget, ManualRun};
-use crate::{invalid_params_error, now_ms, providers, respond, McHandler, SessionBinding};
+use crate::{invalid_params_error, now_ms, ops_facade, respond, McHandler, SessionBinding};
 use mc_store::dream_scheduler::schedules::TaskName;
 use serde_json::{json, Value};
 use std::sync::Arc;
@@ -51,8 +51,7 @@ impl McHandler {
                 message: format!("{method} on a channel with no session binding"),
             })?;
         if binding.principal.is_some() {
-            providers::admit_host_lane(&binding)
-                .and_then(|()| providers::admit_harness_module(&binding))?;
+            ops_facade::authorize_harness_scope(&binding)?;
         } else if !plugin_lane(&binding) {
             return Err(HandlerOutcome::Error {
                 code: "host_lane_requires_plugin".into(),

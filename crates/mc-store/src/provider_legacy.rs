@@ -1,5 +1,4 @@
-//! Compatibility codec for the older runner observation lane. Only explicit
-//! legacy callers hydrate a whole record; the hook API reads the small row.
+//! Historical runner-record fixtures used only by schema and migration tests.
 use super::provider_log::*;
 use crate::provider_view_recipe::{prune_tx, save_recipe_tx, view_roots_tx};
 use crate::{McTagRow, ProviderSessionKey, ProviderViewRecipe};

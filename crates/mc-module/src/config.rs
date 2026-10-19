@@ -501,28 +501,6 @@ pub fn user_smart_notes_enabled() -> bool {
         .unwrap_or(true)
 }
 
-/// A startup-only limit on charged resident cache bytes, not process memory.
-/// SQLite caches, temporary rebuilds and allocator high-water are outside this
-/// charge; a 75-session fleet used about 0.82 GB charged and 2.3 GB RSS.
-/// Projects and requests cannot raise it. Invalid values keep the 1 GiB default.
-pub fn user_provider_resident_process_cap() -> usize {
-    user_provider_resident_process_cap_at(&user_config_path())
-}
-
-pub fn user_provider_resident_process_cap_at(path: &Path) -> usize {
-    fs::read_to_string(path)
-        .ok()
-        .and_then(|raw| parse_config_text(&raw).ok())
-        .and_then(|config| {
-            config
-                .get("rust_provider_resident_process_cap_mb")
-                .and_then(Value::as_u64)
-        })
-        .filter(|value| *value > 0)
-        .map(|value| value.min(1024) as usize * 1024 * 1024)
-        .unwrap_or(1024 * 1024 * 1024)
-}
-
 /// Startup-only process limits. Neither projects nor provider requests can
 /// increase the resources reserved for background historian work.
 pub fn user_provider_historian_budget() -> (usize, usize) {
@@ -1473,33 +1451,6 @@ mod cache_ttl_tests {
 
 #[cfg(test)]
 mod tests {
-    #[test]
-    fn resident_process_limit_is_a_startup_user_setting_with_a_one_gib_ceiling() {
-        let dir = tempfile::tempdir().unwrap();
-        let path = dir.path().join("user.jsonc");
-        assert_eq!(
-            user_provider_resident_process_cap_at(&path),
-            1024 * 1024 * 1024
-        );
-        for (value, mb) in [
-            ("64", 64),
-            ("1", 1),
-            ("2048", 1024),
-            ("0", 1024),
-            ("true", 1024),
-            ("\"64\"", 1024),
-        ] {
-            fs::write(
-                &path,
-                format!("{{\"rust_provider_resident_process_cap_mb\":{value}}}"),
-            )
-            .unwrap();
-            assert_eq!(
-                user_provider_resident_process_cap_at(&path),
-                mb * 1024 * 1024
-            );
-        }
-    }
     #[test]
     fn owner_prep_activation_is_explicit_boolean_user_only_and_default_off() {
         use super::{merge_tiers_with_warnings, McModuleConfig};

@@ -9,7 +9,7 @@ use mc_store::ProviderPreparationWrite;
 const MAX_PREPARED_PARTS: usize = 100_000;
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
-pub(super) struct MeasuredPart {
+pub struct MeasuredPart {
     position: PartKey,
     measurement: TailHygienePartMeasurement,
     stored: TailHygienePartMeasurement,
@@ -24,7 +24,7 @@ struct PreparedPolicy {
     newest_ordinal: u64,
 }
 
-pub(crate) fn prepare(
+pub fn prepare(
     index: &ProviderPolicyIndex<'_>,
     engine_policy: &Value,
     protected_floor: u64,
@@ -92,7 +92,7 @@ pub(crate) fn prepare(
     }))
 }
 
-pub(super) fn changed_measurement(
+pub fn changed_measurement(
     part: &ProviderPolicyPart,
     settings: &Settings,
     protection: &Protection<'_>,
@@ -105,7 +105,7 @@ pub(super) fn changed_measurement(
     }
 }
 
-pub(super) fn consume(
+pub fn consume(
     index: &ProviderPolicyIndex<'_>,
     settings: &Settings,
     carrier: bool,

@@ -1,5 +1,6 @@
 //! Provider records on the store's fenced connection. The older observation lane
 //! uses a normalized compatibility codec; host hooks use the incremental API.
+#[cfg(test)]
 use crate::provider_legacy;
 pub use crate::provider_log::*;
 use rusqlite::functions::FunctionFlags;
@@ -30,49 +31,14 @@ pub(crate) fn register_migration_functions(conn: &rusqlite::Connection) -> rusql
     )
 }
 
-use crate::{McStore, McStoreError, McTagRow};
+#[cfg(test)]
+use crate::McTagRow;
+use crate::{McStore, McStoreError};
 use rusqlite::{params, OptionalExtension};
 
 // The connection-local revision catches our own writes; data_version catches
 // other connections. Triggers cover every metadata writer without copying the
 // compatibility JSON (which contains the last, potentially large, served view).
-fn runner_token(
-    conn: &rusqlite::Connection,
-    key: &ProviderSessionKey,
-) -> rusqlite::Result<(u64, Option<u64>)> {
-    conn.execute_batch(
-        "CREATE TEMP TABLE IF NOT EXISTS mc_runner_record_revisions (
-            conv_key TEXT PRIMARY KEY, revision INTEGER NOT NULL);
-         CREATE TEMP TRIGGER IF NOT EXISTS mc_runner_record_insert
-         AFTER INSERT ON main.mc_provider_conversations_v2 BEGIN
-            INSERT INTO mc_runner_record_revisions VALUES (NEW.conv_key,1)
-            ON CONFLICT(conv_key) DO UPDATE SET revision=revision+1;
-         END;
-         CREATE TEMP TRIGGER IF NOT EXISTS mc_runner_record_update
-         AFTER UPDATE OF record_json ON main.mc_provider_conversations_v2 BEGIN
-            INSERT INTO mc_runner_record_revisions VALUES (NEW.conv_key,1)
-            ON CONFLICT(conv_key) DO UPDATE SET revision=revision+1;
-         END;
-         CREATE TEMP TRIGGER IF NOT EXISTS mc_runner_record_delete
-         AFTER DELETE ON main.mc_provider_conversations_v2 BEGIN
-            INSERT INTO mc_runner_record_revisions VALUES (OLD.conv_key,1)
-            ON CONFLICT(conv_key) DO UPDATE SET revision=revision+1;
-         END;",
-    )?;
-    let version = conn.query_row("PRAGMA data_version", [], |row| row.get(0))?;
-    let revision = conn
-        .query_row(
-            "SELECT COALESCE(r.revision,0) FROM mc_provider_conversations_v2 c
-         LEFT JOIN temp.mc_runner_record_revisions r ON r.conv_key=c.conv_key
-         WHERE c.conv_key=?1",
-            [key.conversation_key()],
-            |row| row.get(0),
-        )
-        .optional()?;
-    Ok((version, revision))
-}
-
-/// The route-bound project and the runner's session/caller-harness coordinates.
 #[derive(Clone, Debug)]
 pub struct ProviderSessionKey {
     pub project_root: String,
@@ -89,6 +55,29 @@ pub struct ProviderGeneration {
 }
 
 impl McStore {
+    /// Resolve tools to one stored conversation without hydrating legacy hook records.
+    pub fn provider_session_keys(
+        &self,
+        project_root: &str,
+        session: &str,
+    ) -> Result<Vec<ProviderSessionKey>, McStoreError> {
+        self.inner.with_conn(|conn| {
+            let mut statement = conn.prepare(
+                "SELECT harness FROM mc_provider_conversations_v2
+                 WHERE project_root = ?1 AND session = ?2 AND profile_generation = '' AND provider_generation = ''",
+            )?;
+            let rows = statement.query_map(params![project_root, session], |row| {
+                Ok(ProviderSessionKey {
+                    project_root: project_root.into(),
+                    session: session.into(),
+                    harness: row.get(0)?,
+                    generation: None,
+                })
+            })?.collect();
+            rows
+        }).map_err(McStoreError::from)
+    }
+
     /// Remove one provider conversation atomically. The caller holds its provider
     /// serial lock; project memories and the normal session/engine data are not owned here.
     pub fn delete_provider_conversation(
@@ -160,56 +149,8 @@ impl McStore {
         Ok(())
     }
 
-    /// Detect changes to a cached runner record using SQLite's external-write
-    /// counter and a connection-local metadata revision. Compaction's policy counters are not
-    /// included: a fold updates them without changing the runner's transcript.
-    pub fn provider_record_token(
-        &self,
-        key: &ProviderSessionKey,
-    ) -> Result<(u64, Option<u64>), McStoreError> {
-        Ok(self.inner.with_conn(|conn| runner_token(conn, key))?)
-    }
-
-    /// Append transcript rows while replacing runner metadata. The caller holds
-    /// its conversation lock. Refuse the write if the supplied token no longer
-    /// matches the database, so a stale cache cannot overwrite another writer.
-    pub fn save_provider_record_delta(
-        &self,
-        key: &ProviderSessionKey,
-        record_json: &str,
-        engine_session: &str,
-        tags: &[McTagRow],
-        views: &[crate::ProviderViewRecipe],
-        expected: &(u64, Option<u64>),
-    ) -> Result<(), McStoreError> {
-        self.inner.with_conn_fenced(|tx| {
-            if &runner_token(tx, key)? != expected {
-                return Err(rusqlite::Error::InvalidQuery);
-            }
-            crate::provider_legacy::save_tx(tx, key, record_json, engine_session, tags, views)?;
-            Ok(())
-        })?;
-        Ok(())
-    }
-
-    /// An assistant hook only appends an answer: it cannot allocate or burn tags,
-    /// change cadence counters, or replace a compaction view.
-    pub fn append_provider_runner_answer(
-        &self,
-        key: &ProviderSessionKey,
-        index: usize,
-        answer: &serde_json::Value,
-        expected: &(u64, Option<u64>),
-    ) -> Result<(), McStoreError> {
-        self.inner.with_conn_fenced(|tx| {
-            if &runner_token(tx, key)? != expected {
-                return Err(rusqlite::Error::InvalidQuery);
-            }
-            provider_legacy::hook_answer_tx(tx, &key.conversation_key(), index, answer)
-        })?;
-        Ok(())
-    }
-
+    /// Read historical runner fixtures while verifying schema upgrades.
+    #[cfg(test)]
     pub fn load_provider_record(
         &self,
         key: &ProviderSessionKey,
@@ -223,6 +164,7 @@ impl McStore {
     /// Allocated but unobserved tags belong only in the opaque record, not mc_tags.
     /// The record names its views by version; `views` holds recipes for
     /// referenced versions not yet stored, committed in the same transaction.
+    #[cfg(test)]
     pub fn save_provider_record(
         &self,
         key: &ProviderSessionKey,
@@ -235,21 +177,6 @@ impl McStore {
             provider_legacy::save_tx(tx, key, record_json, engine_session, tags, views)
         })?;
         Ok(())
-    }
-
-    pub fn provider_records_for_session(
-        &self,
-        project_root: &str,
-        session: &str,
-    ) -> Result<Vec<(String, String)>, McStoreError> {
-        Ok(self.inner.with_conn(|conn| {
-            let mut query = conn.prepare("SELECT harness FROM mc_provider_conversations_v2 WHERE project_root=?1 AND session=?2 AND profile_generation='' AND provider_generation=''")?;
-            let harnesses = query.query_map(params![project_root,session], |r|r.get::<_,String>(0))?.collect::<rusqlite::Result<Vec<_>>>()?;
-            harnesses.into_iter().map(|harness| {
-                let key=ProviderSessionKey {project_root:project_root.into(),session:session.into(),harness:harness.clone(),generation:None};
-                Ok((harness,provider_legacy::load_tx(conn,&key)?.unwrap()))
-            }).collect()
-        })?)
     }
 
     pub fn load_provider_catalog(
@@ -329,89 +256,6 @@ mod tests {
             created_at_ms: 10,
             source_bytes: b"payload".as_slice().into(),
         }
-    }
-
-    #[test]
-    fn runner_revision_fences_metadata_catalog_external_writes_and_recreation() {
-        let dir = tempfile::tempdir().unwrap();
-        let store = McStore::open_for_test(&descriptor(dir.path())).unwrap();
-        let key = key("/project", "runner", "broca");
-        assert_eq!(store.provider_record_token(&key).unwrap().1, None);
-        let raw = r#"{"hook":{"answers":[],"live":{},"burned":[]},"last_answer":null}"#;
-        store
-            .save_provider_record(&key, raw, "engine", &[], &[])
-            .unwrap();
-        let initial = store.provider_record_token(&key).unwrap();
-        store
-            .save_provider_catalog("/project", "runner", r#"{"tools":[]}"#)
-            .unwrap();
-        let catalog = store.provider_record_token(&key).unwrap();
-        assert_ne!(initial, catalog);
-        assert!(store
-            .save_provider_record_delta(&key, raw, "engine", &[], &[], &initial)
-            .is_err());
-        // Rolling back metadata changes also rolls back the runner token revision.
-        let rollback: Result<(), _> = store.inner.with_conn_fenced(|tx| {
-            tx.execute(
-                "UPDATE mc_provider_conversations_v2 SET record_json='{}' WHERE conv_key=?1",
-                [key.conversation_key()],
-            )?;
-            Err(rusqlite::Error::InvalidQuery)
-        });
-        assert!(rollback.is_err());
-        assert_eq!(catalog, store.provider_record_token(&key).unwrap());
-        let external = rusqlite::Connection::open(dir.path().join("store.db")).unwrap();
-        external
-            .execute(
-                "UPDATE mc_provider_conversations_v2 SET record_json='{}' WHERE conv_key=?1",
-                [key.conversation_key()],
-            )
-            .unwrap();
-        assert_ne!(catalog, store.provider_record_token(&key).unwrap());
-        store
-            .inner
-            .with_conn(|conn| {
-                conn.execute(
-                    "DELETE FROM mc_provider_conversations_v2 WHERE conv_key=?1",
-                    [key.conversation_key()],
-                )?;
-                Ok(())
-            })
-            .unwrap();
-        assert_eq!(store.provider_record_token(&key).unwrap().1, None);
-        store
-            .save_provider_record(&key, raw, "engine", &[], &[])
-            .unwrap();
-        assert_ne!(initial, store.provider_record_token(&key).unwrap());
-    }
-
-    #[test]
-    fn runner_answer_append_preserves_record_views_and_reopens_identically() {
-        let dir = tempfile::tempdir().unwrap();
-        let store = McStore::open_for_test(&descriptor(dir.path())).unwrap();
-        let key = key("/project", "runner", "broca");
-        let raw = serde_json::json!({"hook":{"high_water":9,"answers":[],"live":{},"burned":[]},
-            "messages":{},"last_answer":{"large_view":"x".repeat(1_000_000)}});
-        store
-            .save_provider_record(&key, &raw.to_string(), "engine", &[], &[])
-            .unwrap();
-        let token = store.provider_record_token(&key).unwrap();
-        let answer = serde_json::json!({"subject":"subject","lineage":"L","answer":{"answer":"pass"},
-            "rendered":["assistant text"],"tags":[],"cadence":false,"observed":false,"tool_call_id":null});
-        store
-            .append_provider_runner_answer(&key, 0, &answer, &token)
-            .unwrap();
-        assert_eq!(token, store.provider_record_token(&key).unwrap());
-        let mut expected = raw;
-        expected["hook"]["answers"] = serde_json::json!([answer]);
-        let loaded: serde_json::Value =
-            serde_json::from_str(&store.load_provider_record(&key).unwrap().unwrap()).unwrap();
-        assert_eq!(loaded, expected);
-        drop(store);
-        let reopened = McStore::open_for_test(&descriptor(dir.path())).unwrap();
-        let loaded: serde_json::Value =
-            serde_json::from_str(&reopened.load_provider_record(&key).unwrap().unwrap()).unwrap();
-        assert_eq!(loaded, expected);
     }
 
     #[test]
@@ -554,66 +398,6 @@ mod tests {
                 Ok(())
             })
             .unwrap();
-    }
-
-    #[test]
-    fn provider_answer_and_observed_tags_roll_back_together() {
-        let dir = tempfile::tempdir().unwrap();
-        let store = McStore::open_for_test(&descriptor(dir.path())).unwrap();
-        let key = key("/project", "session", "broca");
-        store.inner.with_conn(|conn|conn.execute_batch("CREATE TEMP TRIGGER abort_provider_tag BEFORE INSERT ON mc_tags
-            WHEN NEW.session_id='engine' BEGIN SELECT RAISE(ABORT,'provider tag write failed'); END;")).unwrap();
-        assert!(store
-            .save_provider_record(
-                &key,
-                r#"{"allocated_version":17,"tag_high_water":23}"#,
-                "engine",
-                &[tag(23, "m2#0")],
-                &[]
-            )
-            .is_err());
-        assert!(store.load_provider_record(&key).unwrap().is_none());
-        assert!(store.load_tags_for_session("engine").unwrap().is_empty());
-        store
-            .inner
-            .with_conn(|conn| conn.execute_batch("DROP TRIGGER abort_provider_tag;"))
-            .unwrap();
-        store
-            .save_provider_record(
-                &key,
-                r#"{"allocated_version":17,"tag_high_water":23}"#,
-                "engine",
-                &[tag(23, "m2#0")],
-                &[],
-            )
-            .unwrap();
-        assert!(store.load_provider_record(&key).unwrap().is_some());
-        assert_eq!(store.load_tags_for_session("engine").unwrap().len(), 1);
-    }
-
-    #[test]
-    fn catalog_admission_and_its_session_copy_roll_back_together() {
-        let dir = tempfile::tempdir().unwrap();
-        let store = McStore::open_for_test(&descriptor(dir.path())).unwrap();
-        let key = key("/project", "session", "broca");
-        let before = r#"{"catalog":null,"allocated_version":17}"#;
-        store
-            .save_provider_record(&key, before, "engine", &[], &[])
-            .unwrap();
-        assert!(store
-            .save_provider_catalog("/project", "session", "not JSON")
-            .is_err());
-        assert!(store
-            .load_provider_catalog("/project", "session")
-            .unwrap()
-            .is_none());
-        assert_eq!(
-            serde_json::from_str::<serde_json::Value>(
-                &store.load_provider_record(&key).unwrap().unwrap()
-            )
-            .unwrap(),
-            serde_json::from_str::<serde_json::Value>(before).unwrap()
-        );
     }
 }
 

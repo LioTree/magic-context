@@ -2680,11 +2680,11 @@ pub mod compaction {
         run(store, template, ctx, status, state, false, None)
     }
 
-    pub(crate) trait AppliedComparison {
+    pub trait AppliedComparison {
         fn matches(&self, candidate: &View, raw: &[CkIngressMessage]) -> bool;
     }
 
-    pub(crate) fn step_native(
+    pub fn step_native(
         store: &McStore,
         template: &TransformRequest,
         ctx: &ProducerContext<'_>,
@@ -12882,7 +12882,7 @@ pub(crate) fn provider_engine_settings(meta: &ModuleMeta) -> Value {
             "channel1_last_fire_level":meta.channel1_last_fire_level,"channel1_last_fire_ordinal":meta.channel1_last_fire_ordinal}})
 }
 
-pub(crate) struct Channel1PolicyInputs {
+pub struct Channel1PolicyInputs {
     pub baseline: mc_store::TailHygieneBaseline,
     pub users: u64,
     pub tool_outputs: usize,

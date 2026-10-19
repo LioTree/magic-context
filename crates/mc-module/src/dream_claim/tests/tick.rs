@@ -127,8 +127,6 @@ impl Project {
         });
         handler.dream_runs.use_resolver(resolver.clone());
         let plugin = SessionBinding {
-            connection_incarnation: 1,
-            native_generation: None,
             principal: None,
             scope: None,
             project_root: directory.clone(),

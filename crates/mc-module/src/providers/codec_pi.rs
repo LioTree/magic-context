@@ -1,7 +1,7 @@
 //! Pi provider ingress shares the journal codec with full native transforms.
 use super::*;
 
-pub(super) fn decode_messages(
+pub fn decode_messages(
     messages: &[codec::InboundMessage],
 ) -> Result<crate::codec::DecodedHarnessMessages, HandlerOutcome> {
     for message in messages {
@@ -44,7 +44,7 @@ pub(super) fn decode_messages(
     Ok(decoded)
 }
 
-pub(super) fn encode_view(
+pub fn encode_view(
     view: &transform::compaction::View,
     request: &TransformRequest,
 ) -> Result<codec::OutboundMessage, HandlerOutcome> {
@@ -56,7 +56,6 @@ pub(super) fn encode_view(
         .iter()
         .zip(&request.messages)
         .map(|(message, ingress)| codec::InboundMessage {
-            raw_message: None,
             mid: ingress.mid.clone(),
             ordinal: ingress.ordinal,
             message: message.clone(),
@@ -66,7 +65,7 @@ pub(super) fn encode_view(
     Ok(codec::OutboundMessage::new(
         &view.compaction_id,
         view.version,
-        compact::answer::Range::new(view.range.from, view.range.to),
+        codec::MessageRange::new(view.range.from, view.range.to),
         crate::codec::encode_pi(&view.replacement, &sidecar),
     ))
 }
@@ -74,7 +73,7 @@ pub(super) fn encode_view(
 /// Pi stores tool results separately from their assistant's calls. Read the
 /// actual preceding assistant and intervening results (at most 64 prior rows)
 /// so tool-pair validation never invents a missing call.
-pub(super) fn decode_hook_messages(
+pub fn decode_hook_messages(
     store: &McStore,
     key: &Key,
     lineage: &str,
@@ -103,7 +102,6 @@ pub(super) fn decode_hook_messages(
                 entries.clear();
             }
             entries.push(codec::InboundMessage {
-                raw_message: None,
                 mid: source.mid,
                 ordinal: source.ordinal,
                 message,
@@ -121,7 +119,7 @@ mod tests {
     #[test]
     fn journal_identity_beats_repeated_timestamp_and_response_aliases() {
         let entries: Vec<_> = ["entry-a", "entry-b"].into_iter().enumerate().map(|(i, id)| codec::InboundMessage {
-            raw_message: None, mid: id.into(), ordinal: 41 + i as u64,
+            mid: id.into(), ordinal: 41 + i as u64,
             message: json!({"id":id,"type":"message","parentId":null,"message":{"role":"assistant","timestamp":1,"responseId":"same-response","content":[{"type":"text","text":id,"textSignature":"sig"}]}}),
         }).collect();
         let decoded = decode_messages(&entries).unwrap();
@@ -147,7 +145,6 @@ mod tests {
             json!({"role":"user","content":"text"}),
         ] {
             assert!(decode_messages(&[codec::InboundMessage {
-                raw_message: None,
                 mid: "expected".into(),
                 ordinal: 1,
                 message: native

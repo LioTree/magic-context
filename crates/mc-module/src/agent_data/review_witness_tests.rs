@@ -124,10 +124,7 @@ fn manifest_before_participant(
     .trust_tier(Some(TrustTier::FirstParty))
     .protocol_ver(subc_protocol::PROTOCOL_VERSION)
     .capabilities(Some(subc_protocol::manifest::CapabilityDeclarations {
-        provides: vec![
-            cortexkit_role_compaction_provider::PROVIDES.to_string(),
-            cortexkit_role_step_transform_provider::PROVIDES.to_string(),
-        ],
+        provides: vec![cortexkit_role_compaction_provider::PROVIDES.to_string()],
         requires: vec![],
         must_never_reach: vec![],
     }))

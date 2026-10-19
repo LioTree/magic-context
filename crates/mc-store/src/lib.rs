@@ -49,6 +49,7 @@ pub mod parity_schema_manifest;
 pub mod private_permissions;
 #[cfg(test)]
 mod provider_delete_tests;
+#[cfg(test)]
 mod provider_legacy;
 mod provider_log;
 mod provider_policy_overlay;

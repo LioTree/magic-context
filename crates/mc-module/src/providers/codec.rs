@@ -4,30 +4,26 @@ use serde::Deserialize;
 
 /// A transcript message held by the compaction engine, independent of its transport.
 #[derive(Clone, Debug, PartialEq, Deserialize, Serialize)]
-pub(crate) struct InboundMessage {
+pub struct InboundMessage {
     pub ordinal: u64,
     pub mid: String,
     pub message: Value,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub raw_message: Option<String>,
 }
 
 /// The engine's rendered replacement and the transcript range it covers.
 #[derive(Clone, Debug, PartialEq, Deserialize, Serialize)]
-pub(crate) struct OutboundMessage {
+pub struct OutboundMessage {
     pub compaction_id: String,
     pub version: u64,
-    pub range: compact::answer::Range,
+    pub range: MessageRange,
     pub replacement: Vec<Value>,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub raw_view: Option<Box<compact::view::FrozenView>>,
 }
 
 impl OutboundMessage {
     pub fn new(
         compaction_id: impl Into<String>,
         version: u64,
-        range: compact::answer::Range,
+        range: MessageRange,
         replacement: Vec<Value>,
     ) -> Self {
         Self {
@@ -35,38 +31,20 @@ impl OutboundMessage {
             version,
             range,
             replacement,
-            raw_view: None,
-        }
-    }
-
-    #[cfg(test)]
-    pub fn with_raw_view(mut self, view: compact::view::FrozenView) -> Self {
-        self.raw_view = Some(Box::new(view));
-        self
-    }
-}
-
-impl From<compact::status::StatusMessage> for InboundMessage {
-    fn from(message: compact::status::StatusMessage) -> Self {
-        Self {
-            ordinal: message.ordinal,
-            mid: message.mid,
-            message: message.message,
-            raw_message: message.raw_message,
         }
     }
 }
 
-impl From<OutboundMessage> for compact::answer::CompactionMessage {
-    fn from(message: OutboundMessage) -> Self {
-        let mut wire = Self::new(
-            message.compaction_id,
-            message.version,
-            message.range,
-            message.replacement,
-        );
-        wire.raw_view = message.raw_view;
-        wire
+/// Half-open transcript ordinals covered by a rendered replacement.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Deserialize, Serialize)]
+pub struct MessageRange {
+    pub from: u64,
+    pub to: u64,
+}
+
+impl MessageRange {
+    pub fn new(from: u64, to: u64) -> Self {
+        Self { from, to }
     }
 }
 
@@ -74,15 +52,12 @@ impl From<OutboundMessage> for compact::answer::CompactionMessage {
 /// Only profiles with a provider transcript codec are admitted here; accepting
 /// another engine profile would silently decode the runner's wrong schema.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
-#[allow(dead_code)] // Provider handlers adopt this dispatch as their host lanes are wired.
-pub(super) enum Codec {
+pub enum Codec {
     OwnedBroca,
     OpencodeAiSdk,
     Pi,
-    ClaudeCodeAnthropic,
 }
 
-#[allow(dead_code)]
 impl Codec {
     /// Takes the plan item's opaque `params`, not the operation envelope.
     pub fn from_params(params: &Value) -> Result<Self, HandlerOutcome> {
@@ -91,9 +66,6 @@ impl Codec {
             Some(Value::String(profile)) if profile == "owned-broca" => Ok(Self::OwnedBroca),
             Some(Value::String(profile)) if profile == "opencode-aisdk" => Ok(Self::OpencodeAiSdk),
             Some(Value::String(profile)) if profile == "pi" => Ok(Self::Pi),
-            Some(Value::String(profile)) if profile == "claude-code-anthropic" => {
-                Ok(Self::ClaudeCodeAnthropic)
-            }
             _ => Err(HandlerOutcome::ErrorWithDetail {
                 code: "invalid_params".into(),
                 message: "unknown provider serializer profile".into(),
@@ -107,7 +79,6 @@ impl Codec {
             Self::OwnedBroca => SerializerProfile::OwnedBroca,
             Self::OpencodeAiSdk => SerializerProfile::OpencodeAiSdk,
             Self::Pi => SerializerProfile::Pi,
-            Self::ClaudeCodeAnthropic => SerializerProfile::ClaudeCodeAnthropic,
         }
     }
 
@@ -124,7 +95,6 @@ impl Codec {
                     .next()
                     .expect("one Pi message"),
             ),
-            Self::ClaudeCodeAnthropic => super::codec_claude_code::decode_message(message),
             Self::OpencodeAiSdk => {
                 let decoded =
                     super::codec_opencode::decode_messages(std::slice::from_ref(message))?;
@@ -147,13 +117,6 @@ impl Codec {
         let (ingress, native) = match self {
             Self::Pi => (
                 super::codec_pi::decode_messages(messages)?.messages,
-                Some(messages.iter().map(|m| m.message.clone()).collect()),
-            ),
-            Self::ClaudeCodeAnthropic => (
-                messages
-                    .iter()
-                    .map(super::codec_claude_code::decode_message)
-                    .collect::<Result<Vec<_>, _>>()?,
                 Some(messages.iter().map(|m| m.message.clone()).collect()),
             ),
             Self::OwnedBroca => (
@@ -192,9 +155,6 @@ impl Codec {
         match self {
             Self::OwnedBroca => encode_view(view),
             Self::Pi => super::codec_pi::encode_view(view, request),
-            Self::ClaudeCodeAnthropic => {
-                super::codec_claude_code::encode_view(view, request, None).map(|v| v.0)
-            }
             Self::OpencodeAiSdk => super::codec_opencode::encode_view(view, request, context),
         }
     }
@@ -347,7 +307,7 @@ pub fn decode_message(
     })
 }
 
-pub(super) fn encode_message(message: &ck_wire::CkWireMessage) -> Result<Value, HandlerOutcome> {
+pub fn encode_message(message: &ck_wire::CkWireMessage) -> Result<Value, HandlerOutcome> {
     use ck_wire::{CkKind, CkOutputKind};
     let mut content = Vec::new();
     for block in &message.content {
@@ -467,113 +427,9 @@ pub fn encode_view(
     Ok(codec::OutboundMessage::new(
         &view.compaction_id,
         view.version,
-        compact::answer::Range::new(view.range.from, view.range.to),
+        MessageRange::new(view.range.from, view.range.to),
         replacement,
     ))
-}
-
-pub(super) fn validate_replacement(
-    view: &codec::OutboundMessage,
-    record: &Record,
-    lineage: &str,
-) -> Result<(), HandlerOutcome> {
-    validate_replacement_with(view, record, lineage, |message| {
-        record
-            .messages
-            .get(lineage)
-            .is_some_and(|entries| entries.values().any(|entry| entry.message == *message))
-    })
-}
-
-pub(super) fn validate_replacement_with(
-    view: &codec::OutboundMessage,
-    record: &Record,
-    lineage: &str,
-    is_carried: impl Fn(&Value) -> bool,
-) -> Result<(), HandlerOutcome> {
-    let originals = record.messages.get(lineage);
-    for message in &view.replacement {
-        let parsed = native(message)?;
-        let carried = is_carried(message);
-        if parsed.role == "system" {
-            return Err(error("history_unreadable", "replacement_system_message"));
-        }
-        if !carried && parsed.cache_prefix_blocks.is_some() {
-            return Err(error("history_unreadable", "authored_cache_prefix_blocks"));
-        }
-        if !carried && parsed.origin.is_some() {
-            return Err(error("history_unreadable", "authored_origin"));
-        }
-        if !carried
-            && parsed.content.iter().any(|b| {
-                matches!(
-                    b,
-                    NativeBlock::Reasoning {
-                        signature: Some(_),
-                        ..
-                    } | NativeBlock::RedactedReasoning { .. }
-                )
-            })
-        {
-            return Err(error("history_unreadable", "authored_signed_reasoning"));
-        }
-    }
-    let mut conversation = view.replacement.clone();
-    if let Some(originals) = originals {
-        conversation.extend(
-            originals
-                .range(view.range.to..)
-                .map(|(_, entry)| entry.message.clone()),
-        );
-    }
-    let mut pending = BTreeSet::new();
-    let mut seen = BTreeSet::new();
-    for message in &conversation {
-        let parsed = native(message)?;
-        if parsed.role == "system" {
-            continue;
-        }
-        if matches!(parsed.role.as_str(), "assistant" | "user") && !pending.is_empty() {
-            return Err(error("history_unreadable", "turn_before_tool_result"));
-        }
-        if parsed.role == "tool" && pending.is_empty() {
-            return Err(error("history_unreadable", "orphan_tool_result"));
-        }
-        let mut results = 0;
-        for block in parsed.content {
-            match block {
-                NativeBlock::ToolCall { tool_call_id, .. } => {
-                    if parsed.role != "assistant" || !seen.insert(tool_call_id.clone()) {
-                        return Err(error("history_unreadable", "invalid_tool_call"));
-                    }
-                    pending.insert(tool_call_id);
-                }
-                NativeBlock::ToolResult { tool_call_id, .. } => {
-                    if parsed.role != "tool" || !pending.remove(&tool_call_id) {
-                        return Err(error("history_unreadable", "orphan_tool_result"));
-                    }
-                    results += 1;
-                }
-                _ => {}
-            }
-        }
-        if parsed.role == "tool" && results == 0 {
-            return Err(error("history_unreadable", "tool_message_without_result"));
-        }
-    }
-    if !pending.is_empty() {
-        return Err(error("history_unreadable", "missing_tool_result"));
-    }
-    Ok(())
-}
-
-pub(super) fn checked_view(
-    view: &transform::compaction::View,
-    record: &Record,
-) -> Result<codec::OutboundMessage, HandlerOutcome> {
-    let answer = encode_view(view)?;
-    validate_replacement(&answer, record, &view.range.lineage_id)?;
-    Ok(answer)
 }
 
 #[cfg(test)]
@@ -598,7 +454,6 @@ mod dispatch_tests {
                 );
             }
             let invalid_entry = codec::InboundMessage {
-                raw_message: None,
                 mid: "m".into(),
                 ordinal: 1,
                 message: json!({"role":"user","content":[{"type":"future","text":"a"}]}),

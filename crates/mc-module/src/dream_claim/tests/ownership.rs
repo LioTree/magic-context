@@ -74,8 +74,6 @@ fn route(plugin_harness: &str, claimant: &str, activated: bool, wiring: Option<W
     handler.fixed_dream_settings = Some(vector()["settings"]["with_models"].clone());
     handler.dream_wiring = wiring;
     let plugin = SessionBinding {
-        connection_incarnation: 1,
-        native_generation: None,
         principal: None,
         scope: None,
         project_root: directory,
