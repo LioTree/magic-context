@@ -148,9 +148,18 @@ impl Codec {
         request: &mut TransformRequest,
         messages: &[codec::InboundMessage],
     ) -> Result<(), HandlerOutcome> {
+        self.prepare_request_from(request, messages, messages.first().map_or(0, |m| m.ordinal))
+    }
+
+    pub fn prepare_request_from(
+        self,
+        request: &mut TransformRequest,
+        messages: &[codec::InboundMessage],
+        source_from: u64,
+    ) -> Result<(), HandlerOutcome> {
         let (ingress, native) = match self {
             Self::Pi => (
-                super::codec_pi::decode_messages(messages)?.messages,
+                super::codec_pi::decode_messages_from(messages, source_from)?.messages,
                 Some(messages.iter().map(|m| m.message.clone()).collect()),
             ),
             Self::OwnedBroca => (
@@ -261,7 +270,7 @@ impl Codec {
         let mut request: TransformRequest = decode(&json!({"v":2,"kind":"compaction.step",
             "serializer_profile":self.serializer_profile().wire_id(),"session_id":session,
             "render_config":"","messages":[],"tool_present":false,"auto_search_enabled":false}))?;
-        self.prepare_request(&mut request, entries)?;
+        self.prepare_request_from(&mut request, entries, view.range.from)?;
         let tags = BTreeMap::new();
         self.encode_view(
             view,

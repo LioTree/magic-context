@@ -8,6 +8,71 @@
 use super::*;
 use cortexkit_bus_inmemory::{InMemoryBus, InMemoryConfig};
 
+pub(super) mod view_work {
+    use super::*;
+
+    #[derive(Clone, Copy, Debug, Default)]
+    pub struct Work {
+        pub decoded_entries: usize,
+        pub engine_input: usize,
+        pub renderer_input: usize,
+    }
+    static WORK: Mutex<BTreeMap<String, Work>> = Mutex::new(BTreeMap::new());
+
+    pub fn engine(reference: &str, count: usize) {
+        let mut work = WORK.lock().unwrap();
+        let work = work.entry(reference.into()).or_default();
+        work.decoded_entries += count;
+        work.engine_input += count;
+    }
+    pub fn renderer(reference: &str, count: usize) {
+        let mut work = WORK.lock().unwrap();
+        let work = work.entry(reference.into()).or_default();
+        work.decoded_entries += count;
+        work.renderer_input += count;
+    }
+    pub fn take(reference: &str) -> Work {
+        WORK.lock().unwrap().remove(reference).unwrap_or_default()
+    }
+}
+
+#[tokio::test]
+async fn covered_view_work_tracks_tail_not_session() {
+    for size in [80, 800] {
+        let dir = tempfile::tempdir().unwrap();
+        let mut rig = Rig::new(dir.path()).await;
+        rig.append(size);
+        rig.history(size - 13, "completed covered prefix");
+        rig.notice(1_000, None).await;
+        let version = rig.newest_view();
+        rig.notice(1_000, version).await;
+        assert!(rig.state().logical_prefix.is_some());
+        view_work::take(&rig.reference);
+        rig.history(size - 12, "new completed prefix for the ride");
+        let answer = rig
+            .op(
+                "compaction.ride",
+                json!({"session_ref":rig.reference,"cause":"ceiling","deadline_ms":300_000}),
+            )
+            .await;
+        assert_eq!(answer["answer"], "view", "{answer}");
+        let work = view_work::take(&rig.reference);
+        assert!(work.engine_input > 0 && work.renderer_input > 0, "{work:?}");
+        assert!(
+            work.engine_input <= 14 && work.renderer_input <= 14 && work.decoded_entries <= 28,
+            "size={size}, tail=12: {work:?}"
+        );
+        rig.history(size - 10, "later fold");
+        rig.notice(1_000, answer["view"]["view_version"].as_u64())
+            .await;
+        let work = view_work::take(&rig.reference);
+        assert!(
+            work.engine_input > 0 && work.engine_input <= 14,
+            "size={size}: {work:?}"
+        );
+    }
+}
+
 /// Wall and thread-CPU time spent in `AsyncRecord::save` (and, separately,
 /// in a full `load`), per conversation. Saves run on whichever worker thread
 /// holds the conversation, so the meter is keyed by session reference rather

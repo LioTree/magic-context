@@ -146,6 +146,11 @@ pub(crate) struct AsyncRecord {
     engine: transform::compaction::State,
     #[serde(default)]
     engine_baselines: EngineBaselines,
+    /// Certificate recording which earlier source input the last permitted
+    /// rebuild covered. Produced and applied views remain separate; a runner
+    /// acknowledgement never advances this certificate.
+    #[serde(default)]
+    logical_prefix: Option<Arc<transform::compaction::LogicalPrefix>>,
     /// Engine forms of this generation's retained published views, stored
     /// beside each view in `mc_async_compaction_views.engine_json`.
     #[serde(skip)]
@@ -163,6 +168,9 @@ pub(crate) struct AsyncRecord {
     /// `mc_async_compaction_entries`.
     #[serde(skip)]
     entries: BTreeMap<u64, Arc<HeldEntry>>,
+    /// Source identity lookup rebuilt from entry headers, never decoded history.
+    #[serde(skip)]
+    mid_index: BTreeMap<String, u64>,
     /// Running totals over the held entries' decoded facts; see
     /// `fold_entries`.
     #[serde(skip)]
@@ -707,6 +715,9 @@ impl State {
     /// Drop held entries after `through`, or all of them for `None`, with
     /// their tag addresses; the next save deletes the stored rows.
     fn truncate_entries(&mut self, through: Option<u64>) {
+        self.logical_prefix = None;
+        self.mid_index
+            .retain(|_, ordinal| through.is_some_and(|end| *ordinal <= end));
         match through {
             Some(through) => {
                 self.entries.retain(|ordinal, _| *ordinal <= through);
@@ -809,7 +820,11 @@ impl State {
         // A tag address: map node, tag, mid, part key and a 64-byte digest.
         const TAG_ADDRESS: usize = 288;
         let cache_state = self.cache_state.as_ref().map_or(0, |cached| cached.bytes);
-        bytes + entries + self.tag_index.len() * TAG_ADDRESS + cache_state
+        bytes
+            + entries
+            + self.tag_index.len() * TAG_ADDRESS
+            + self.mid_index.len() * 96
+            + cache_state
     }
 
     fn reset(&mut self, store: &McStore) -> Result<(), HandlerOutcome> {
@@ -957,6 +972,7 @@ fn load(store: &McStore, reference: &str) -> Result<Option<State>, HandlerOutcom
     let mut state: State = serde_json::from_str(&rows.state).map_err(transient)?;
     for (ordinal, entry, index) in rows.entries {
         let entry = HeldEntry::from_stored(entry)?;
+        state.mid_index.entry(entry.mid.clone()).or_insert(ordinal);
         let index: Vec<[String; 3]> = serde_json::from_str(&index).map_err(transient)?;
         for [tag, part, digest] in index {
             state.tag_index.insert(
@@ -1210,6 +1226,7 @@ impl McHandler {
             last_transferred_drops: 0,
             tag_index: BTreeMap::new(),
             engine_baselines: EngineBaselines::default(),
+            logical_prefix: None,
             journal: Journal::new_record(),
             usage_policy: None,
             todo_scan: None,
@@ -1235,6 +1252,7 @@ impl McHandler {
             applied_view: None,
             lineage: request.lineage_id.clone(),
             entries: BTreeMap::new(),
+            mid_index: BTreeMap::new(),
             aggregates: Default::default(),
             entry_bytes: Default::default(),
             cache_state: None,
@@ -1278,7 +1296,7 @@ impl McHandler {
         let transform::compaction::Answer::Replacement(initial) = &output.answer else {
             return Err(transient("async setup returned no initial view"));
         };
-        let wire = rendered_view(codec, initial, &state)?;
+        let wire = rendered_view(codec, initial, &state, self.async_oracle())?;
         state.adopt_engine(engine)?;
         // `serializer_profile` is a ck-mc extension member: the profile this
         // Setup accepted, so the runner can confirm ck-mc reads its schema.
@@ -1319,8 +1337,69 @@ impl McHandler {
         )?;
         #[cfg(test)]
         resident::counters::engine_pass();
-        let messages = inbound_messages(state.entries.values())?;
-        codec.prepare_request(&mut template, &messages)?;
+        // The oracle deliberately never consults prefix selection or its proof.
+        let mut prefix = if self.async_oracle() {
+            None
+        } else if let Some(prefix) = &state.logical_prefix {
+            let loaded = store
+                .load_logical_transform_snapshot(&state.namespace(), &[])
+                .map_err(transient)?
+                .loaded;
+            let compartments = store
+                .load_compartments(&state.namespace())
+                .map_err(transient)?;
+            prefix
+                .matches(&status.lineage_id, state.generation, &loaded, &compartments)
+                .then_some(prefix.clone())
+        } else {
+            None
+        };
+        if let Some(prefix) = &mut prefix {
+            let prefix = Arc::make_mut(prefix);
+            for pending in store
+                .load_pending_agent_drops(&state.namespace())
+                .map_err(transient)?
+            {
+                if let Some((mid, _)) = ck_wire::split_block_id(&pending.target_id) {
+                    if let Some(ordinal) =
+                        state.mid_index.get(mid).filter(|n| **n < prefix.tail_from)
+                    {
+                        if let Some(entry) = state.entries.get(ordinal) {
+                            prefix
+                                .prove_membership(&decoded_entry(codec, &entry.inbound()?)?)
+                                .map_err(engine_error)?;
+                        }
+                    }
+                }
+            }
+        }
+        let messages = if let Some(prefix) = &prefix {
+            let context = prefix
+                .context_ordinals
+                .iter()
+                .filter_map(|ordinal| state.entries.get(ordinal));
+            inbound_messages(
+                context.chain(
+                    state
+                        .entries
+                        .range(prefix.tail_from..)
+                        .map(|(_, entry)| entry),
+                ),
+            )?
+        } else {
+            inbound_messages(state.entries.values())?
+        };
+        #[cfg(test)]
+        scaling_tests::view_work::engine(&state.reference(), messages.len());
+        codec.prepare_request_from(
+            &mut template,
+            &messages,
+            state
+                .entries
+                .first_key_value()
+                .map_or(0, |(ordinal, _)| *ordinal),
+        )?;
+        template.logical_prefix = prefix;
         template.native_tail_section = true;
         if let Some(policy) = &state.usage_policy {
             template.emergency_recovery_armed = policy.emergency_recovery_armed;
@@ -1330,22 +1409,46 @@ impl McHandler {
             }
         }
         let work = self.provider_work(channel, store, binding.clone(), state.key.clone())?;
-        let mut context = compaction::producer_context(
-            &work,
-            template.model_key.as_deref().unwrap_or(&state.setup.model),
-            status.context_window,
-            false,
-        );
+        let engine_model = template
+            .model_key
+            .clone()
+            .unwrap_or_else(|| state.setup.model.clone());
+        let mut context =
+            compaction::producer_context(&work, &engine_model, status.context_window, false);
         context.cache_ttl = "never".into();
         // On this lane the runner owns the model provider's companion edit:
         // views never remove the signed reasoning they invalidate.
         let signed = transform::compaction::SignedReasoning::RunnerCompanion;
+        let previous_engine = engine.clone();
         let output = if engine.last_applied.is_none() {
             transform::compaction::setup_with(store, &template, &context, status, engine, signed)
         } else {
             transform::compaction::step_with(store, &template, &context, status, engine, signed)
-        }
-        .map_err(engine_error)?;
+        };
+        let output = match output {
+            Ok(output) => output,
+            Err(_) if template.logical_prefix.is_some() => {
+                // A stale certificate or an exceptional codec/arc shape is a
+                // recovery read, never permission to infer missing source bytes.
+                *engine = previous_engine;
+                let messages = inbound_messages(state.entries.values())?;
+                #[cfg(test)]
+                scaling_tests::view_work::engine(&state.reference(), messages.len());
+                codec.prepare_request(&mut template, &messages)?;
+                template.logical_prefix = None;
+                if engine.last_applied.is_none() {
+                    transform::compaction::setup_with(
+                        store, &template, &context, status, engine, signed,
+                    )
+                } else {
+                    transform::compaction::step_with(
+                        store, &template, &context, status, engine, signed,
+                    )
+                }
+                .map_err(engine_error)?
+            }
+            Err(error) => return Err(engine_error(error)),
+        };
         Ok((template, output))
     }
 }
@@ -1390,8 +1493,27 @@ fn rendered_view(
     codec: codec::Codec,
     view: &transform::compaction::View,
     state: &State,
+    full_lineage: bool,
 ) -> Result<OutboundMessage, HandlerOutcome> {
-    let entries = inbound_messages(state.entries.values())?;
+    let entries = if full_lineage {
+        inbound_messages(state.entries.values())?
+    } else {
+        // Only output sources need native sidecars. Synthetic head frames have
+        // no source, and covered sources cannot affect tail-native rendering.
+        let ordinals = view
+            .replacement
+            .iter()
+            .filter(|m| !m.meta.synthetic)
+            .filter_map(|m| m.meta.ordinal)
+            .collect::<BTreeSet<_>>();
+        inbound_messages(
+            ordinals
+                .iter()
+                .filter_map(|ordinal| state.entries.get(ordinal)),
+        )?
+    };
+    #[cfg(test)]
+    scaling_tests::view_work::renderer(&state.reference(), entries.len());
     codec.render_view(view, &state.key.session, &entries)
 }
 
@@ -1559,9 +1681,17 @@ fn ranges(
         .and_then(Value::as_bool)
         == Some(true);
     // The first held entry with each mid, as an ordinal-order search finds it.
-    let mut by_mid = HashMap::with_capacity(state.entries.len());
-    for (ordinal, entry) in &state.entries {
-        by_mid.entry(entry.mid.as_str()).or_insert(*ordinal);
+    let mut by_mid = HashMap::with_capacity(engine.replacement.len());
+    for ordinal in engine
+        .replacement
+        .iter()
+        .filter(|m| !m.meta.synthetic)
+        .filter_map(|m| m.meta.ordinal)
+    {
+        let Some(entry) = state.entries.get(&ordinal) else {
+            continue;
+        };
+        by_mid.entry(entry.mid.as_str()).or_insert(ordinal);
     }
     for (position, message) in wire.replacement.iter().enumerate() {
         let mid = message
@@ -2409,8 +2539,29 @@ impl McHandler {
             last_not_applied: None,
         };
         let mut engine = state.engine_with_baselines()?;
-        let (_template, output) =
+        let (template, output) =
             self.async_engine(channel, &binding, state, codec, &status, &mut engine)?;
+        if output.prefix_bust_permitted
+            && !self.async_oracle()
+            && engine.preset == transform::compaction::Preset::Head
+        {
+            let snapshot = store
+                .load_logical_transform_snapshot(&state.namespace(), &[])
+                .map_err(transient)?;
+            let compartments = store
+                .load_compartments(&state.namespace())
+                .map_err(transient)?;
+            state.logical_prefix = transform::compaction::LogicalPrefix::certify(
+                store,
+                &template,
+                &output.engine.projection,
+                &snapshot.loaded,
+                &compartments,
+                &status.lineage_id,
+                state.generation,
+            )
+            .map(Arc::new);
+        }
         let transform::compaction::Answer::Replacement(mut candidate) = output.answer else {
             state.adopt_engine(engine)?;
             return Ok(None);
@@ -2419,7 +2570,7 @@ impl McHandler {
             state.adopt_engine(engine)?;
             return Ok(None);
         }
-        let wire = rendered_view(codec, &candidate, state)?;
+        let wire = rendered_view(codec, &candidate, state, self.async_oracle())?;
         let coverage = store
             .load_meta(&state.namespace())
             .map_err(transient)?
@@ -2999,6 +3150,9 @@ impl AsyncRecord {
             .map(|(_, entry)| entry)
         {
             let entry = entry.read()?;
+            self.mid_index
+                .entry(entry.mid.clone())
+                .or_insert(entry.ordinal);
             let native = parts(&entry.message)?;
             if native.len() != entry.tags.len() {
                 return Err(invalid_field(
@@ -3056,6 +3210,11 @@ impl McHandler {
     #[cfg(test)]
     pub(super) fn async_oracle(&self) -> bool {
         self.resident_cache().oracle
+    }
+
+    #[cfg(not(test))]
+    fn async_oracle(&self) -> bool {
+        false
     }
 
     /// Take a conversation for one operation. Call only under its provider

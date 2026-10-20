@@ -4,6 +4,13 @@ use super::*;
 pub fn decode_messages(
     messages: &[codec::InboundMessage],
 ) -> Result<crate::codec::DecodedHarnessMessages, HandlerOutcome> {
+    decode_messages_from(messages, messages.first().map_or(0, |m| m.ordinal))
+}
+
+pub fn decode_messages_from(
+    messages: &[codec::InboundMessage],
+    source_from: u64,
+) -> Result<crate::codec::DecodedHarnessMessages, HandlerOutcome> {
     for message in messages {
         if message.message.get("id").and_then(Value::as_str) != Some(message.mid.as_str())
             || !matches!(
@@ -28,7 +35,12 @@ pub fn decode_messages(
         pins.mid_pins
             .insert(message.mid.clone(), message.mid.clone());
     }
-    let mut decoded = crate::codec::decode_pi_with_sidecar(&native, Some(&pins));
+    let ordinals = messages
+        .iter()
+        .map(|m| m.ordinal.saturating_sub(source_from).saturating_add(1))
+        .collect::<Vec<_>>();
+    let mut decoded =
+        crate::codec::pi::decode_pi_with_sidecar_and_ordinals(&native, Some(&pins), &ordinals);
     if decoded.messages.len() != messages.len() {
         return Err(error(
             "history_unreadable",
@@ -61,7 +73,7 @@ pub fn encode_view(
             message: message.clone(),
         })
         .collect::<Vec<_>>();
-    let sidecar = decode_messages(&source)?.sidecar;
+    let sidecar = decode_messages_from(&source, view.range.from)?.sidecar;
     Ok(codec::OutboundMessage::new(
         &view.compaction_id,
         view.version,

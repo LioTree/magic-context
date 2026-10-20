@@ -171,6 +171,34 @@ fn message(profile: Profile, n: u64, salt: u64) -> ReadMessage {
         },
     };
     let mut entry = ReadMessage::new(n, format!("m{n}"), message).with_tags(rows);
+    if profile == Profile::Pi && n % 16 == 1 {
+        entry.message["message"]["content"][1]
+            .as_object_mut()
+            .unwrap()
+            .remove("id");
+    } else if profile == Profile::Pi && n % 16 == 2 {
+        let call = self::message(profile, n - 1, salt);
+        let decoded =
+            crate::codec::pi::decode_pi_with_sidecar_and_ordinals(&[call.message], None, &[n]);
+        let id = decoded.messages[0]
+            .ck
+            .content
+            .iter()
+            .find_map(|block| {
+                if let ck_wire::CkKind::ToolCall { id, .. } = &block.kind {
+                    Some(id.clone())
+                } else {
+                    None
+                }
+            })
+            .unwrap();
+        entry.message["message"]["toolCallId"] = json!(id);
+    }
+    // Broca admits source system rows. Pi and Anthropic deliberately reject
+    // that role at their native ingress, so their fixtures retain native roles.
+    if profile == Profile::Broca && n > 0 && n.is_multiple_of(48) {
+        entry.message["role"] = json!("system");
+    }
     entry.written_at = Some(1_000_000 + n * 7_000);
     entry
 }
@@ -466,6 +494,7 @@ struct Pair {
     /// the diagnostic replay of a diverging seed, never for the comparison.
     record_only: bool,
     mismatches: Vec<String>,
+    immutable_views: std::cell::RefCell<BTreeMap<(bool, u64), String>>,
     _project: tempfile::TempDir,
 }
 
@@ -519,6 +548,7 @@ impl Pair {
             engine_drift: None,
             record_only: false,
             mismatches: Vec::new(),
+            immutable_views: Default::default(),
             _project: project,
         };
         let mut setup = json!({"method":"compaction.setup","params":{"session":"s","harness":profile.harness(),"request_id":"setup","model":"fixture","context_window":100_000,"composition":{"render_tags":true},"params":{"serializer_profile":profile.wire()},"now":1}});
@@ -635,6 +665,33 @@ impl Pair {
             self.log
         );
         for ((version, left), (_, right)) in resident.iter().zip(&oracle) {
+            let left_view: view::CompactionView = serde_json::from_str(left).unwrap();
+            let right_view: view::CompactionView = serde_json::from_str(right).unwrap();
+            let left_model: Vec<Value> =
+                serde_json::from_slice(&self.model_bytes(&left_view)).unwrap();
+            let right_model: Vec<Value> =
+                serde_json::from_slice(&self.model_bytes(&right_view)).unwrap();
+            if left_model != right_model {
+                let first = left_model
+                    .iter()
+                    .zip(&right_model)
+                    .position(|(a, b)| a != b)
+                    .unwrap_or(left_model.len().min(right_model.len()));
+                panic!("{:?} served bytes after {label}, first={first}, left={:?}, right={:?}, steps={:?}, first_drift={:?}, drift={:?}",
+                    self.profile, left_model.get(first), right_model.get(first), self.log, self.engine_drift, self.engine_state_drift());
+            }
+            for (oracle, bytes) in [(false, left), (true, right)] {
+                if let Some(previous) = self
+                    .immutable_views
+                    .borrow_mut()
+                    .insert((oracle, *version), bytes.clone())
+                {
+                    assert_eq!(
+                        previous, *bytes,
+                        "view.get version {version} changed after {label}"
+                    );
+                }
+            }
             assert!(
                 left == right,
                 "{:?} view {version} bytes diverged after {label}; steps: {:?}",
@@ -657,6 +714,71 @@ impl Pair {
             self.profile,
             self.log
         );
+    }
+
+    /// Assemble the runner's native source rows and addressed edits, independently
+    /// of engine input selection. Keep ranges read the original transcript, not
+    /// the optimized engine's retained suffix or its output message metadata.
+    fn model_bytes(&self, view: &view::CompactionView) -> Vec<u8> {
+        let entries = self.transcript.entries.lock().unwrap();
+        let mut assembled = Vec::new();
+        let source = |entry: &ReadMessage, edits: &[view::PartEdit]| {
+            let mut message = entry.message.clone();
+            let before = parts(&message).unwrap();
+            let mut after = Vec::new();
+            for (part, tag) in before.iter().zip(&entry.tags) {
+                let edit = edits.iter().find(|edit| {
+                    edit.ordinal == entry.ordinal && edit.mid == entry.mid && edit.part == tag.part
+                });
+                if let Some(edit) = edit {
+                    if let Some(bytes) = &edit.bytes {
+                        after.push(serde_json::from_str(bytes).unwrap());
+                    }
+                } else {
+                    after.push(render_part(part, tag.tag.as_deref(), true));
+                }
+            }
+            drop(before);
+            if message.get("parts").is_some() {
+                message["parts"] = json!(after);
+            } else if message.get("message").is_some() {
+                message["message"]["content"] = json!(after);
+            } else {
+                message["content"] = json!(after);
+            }
+            message
+        };
+        for range in &view.ranges {
+            match range {
+                view::ViewRange::Replace { bytes, .. } => {
+                    assembled.extend(serde_json::from_str::<Vec<Value>>(bytes).unwrap());
+                }
+                view::ViewRange::Keep { from, to, edits } => {
+                    assembled.extend(
+                        entries
+                            .iter()
+                            .filter(|e| e.ordinal >= *from && e.ordinal < *to)
+                            .map(|entry| source(entry, edits)),
+                    );
+                }
+                _ => panic!("unrecognized runner range"),
+            }
+        }
+        assembled.extend(
+            entries
+                .iter()
+                .filter(|e| e.ordinal > view.covers_through.ordinal)
+                .map(|entry| source(entry, &[])),
+        );
+        // Pi's journal envelope is storage metadata, not a model message.
+        if self.profile == Profile::Pi {
+            for message in &mut assembled {
+                if let Some(body) = message.get("message") {
+                    *message = body.clone();
+                }
+            }
+        }
+        serde_json::to_vec(&assembled).unwrap()
     }
 
     fn newest_versions(&self) -> Vec<u64> {
@@ -964,7 +1086,21 @@ async fn session(profile: Profile, seed: u64, steps: u64) -> usize {
     let setup_lineage = (!rng.chance(25)).then_some("L");
     let inject_docs = rng.chance(30);
     let mut pair = Pair::open(profile, tiny_budget, setup_lineage, inject_docs).await;
-    pair.append(16 + rng.below(40));
+    let mostly_covered = rng.chance(50);
+    pair.append(if mostly_covered {
+        192 + rng.below(40)
+    } else {
+        16 + rng.below(40)
+    });
+    if mostly_covered {
+        let end = pair.transcript.entries.lock().unwrap().len() as u64 - 12;
+        let reference = pair.reference.clone();
+        pair.both("initial mostly-covered history", |side| {
+            let reference = reference.clone();
+            Box::pin(async move { publish_history(side, &reference, end) })
+        })
+        .await;
+    }
     pair.notice(&mut rng, None).await;
     for _ in 0..steps {
         pair.step(&mut rng).await;
@@ -988,6 +1124,114 @@ async fn run(sessions: u64, steps: u64, first_seed: u64) {
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn resident_matches_the_full_recompute_oracle() {
     run(8, 14, 1).await;
+}
+
+#[tokio::test]
+async fn prefix_matches_full_lineage_with_crossing_native_arcs() {
+    for profile in PROFILES {
+        let mut pair = Pair::new(profile, false).await;
+        pair.append(160);
+        let reference = pair.reference.clone();
+        pair.both("covered prefix with crossing arc", |side| {
+            let reference = reference.clone();
+            Box::pin(async move { publish_history(side, &reference, 149) })
+        })
+        .await;
+        let mut rng = Rng(91);
+        let outcome = pair.notice(&mut rng, None).await;
+        assert_eq!(outcome, "ok", "{profile:?}: {outcome}");
+        let request = json!({"method":"compaction.ride","params":{"session_ref":pair.reference,"cause":"ceiling","deadline_ms":300_000}});
+        pair.both("crossing arc ride", |side| {
+            Box::pin(side.dispatch(request.clone()))
+        })
+        .await;
+        let head = load(pair.resident.store(), &pair.reference)
+            .unwrap()
+            .unwrap();
+        assert!(
+            head.logical_prefix.is_some(),
+            "{profile:?}: no certificate; failed={:?}, coverage={:?}, log={:?}",
+            head.failure,
+            pair.resident
+                .store()
+                .load(&head.namespace())
+                .unwrap()
+                .meta
+                .coverage_ordinal,
+            pair.log
+        );
+        if profile != Profile::OpenCode {
+            assert_eq!(head.logical_prefix.as_ref().unwrap().tail_from, 149);
+        }
+        pair.append(4);
+        let reference = pair.reference.clone();
+        pair.both("later coverage fold", |side| {
+            let reference = reference.clone();
+            Box::pin(async move { publish_history(side, &reference, 155) })
+        })
+        .await;
+        pair.both("later native ride", |side| {
+            Box::pin(side.dispatch(request.clone()))
+        })
+        .await;
+    }
+}
+
+#[tokio::test]
+async fn defer_preserves_prefix_certificate_and_served_model_bytes() {
+    let mut pair = Pair::new(Profile::Broca, false).await;
+    pair.append(160);
+    let reference = pair.reference.clone();
+    pair.both("mostly covered prefix", |side| {
+        let reference = reference.clone();
+        Box::pin(async move { publish_history(side, &reference, 147) })
+    })
+    .await;
+    let mut rng = Rng(12);
+    pair.notice(&mut rng, None).await;
+    let ride = json!({"method":"compaction.ride","params":{"session_ref":pair.reference,"cause":"ceiling","deadline_ms":300_000}});
+    pair.both("freeze prefix", |side| {
+        Box::pin(side.dispatch(ride.clone()))
+    })
+    .await;
+    let before = load(pair.resident.store(), &pair.reference)
+        .unwrap()
+        .unwrap();
+    let proof = serde_json::to_value(&before.logical_prefix).unwrap();
+    assert!(!proof.is_null());
+    pair.append(4);
+    let reference = pair.reference.clone();
+    pair.both("direct low-pressure defer", |side| {
+        let reference = reference.clone();
+        Box::pin(async move {
+            let mut state = side.h.checkout(side.store(), &reference).unwrap().unwrap();
+            let from = *state.entries.last_key_value().unwrap().0;
+            side.h
+                .read_async(&mut state, from, Duration::from_secs(10))
+                .await
+                .unwrap();
+            let answer = side
+                .h
+                .publish_async(0, &mut state, codec::Codec::OwnedBroca, false)
+                .unwrap();
+            state.save(side.store(), &[]).unwrap();
+            side.h.checkin(state);
+            serde_json::to_string(&answer).unwrap()
+        })
+    })
+    .await;
+    let after = load(pair.resident.store(), &pair.reference)
+        .unwrap()
+        .unwrap();
+    assert_eq!(
+        proof,
+        serde_json::to_value(&after.logical_prefix).unwrap(),
+        "Defer advanced the prefix certificate"
+    );
+    assert_eq!(
+        before.produced_view.as_ref().map(|v| &v.json),
+        after.produced_view.as_ref().map(|v| &v.json)
+    );
 }
 
 /// The full differential: `MC_ASYNC_DIFFERENTIAL_SESSIONS` sessions (default

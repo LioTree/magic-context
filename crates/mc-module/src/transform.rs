@@ -793,6 +793,10 @@ fn raw_replay_rebuild_core(
 /// back to CK messages at egress.
 #[derive(Debug, Clone, Serialize)]
 pub struct TransformRequest {
+    /// Internal proof for an async input with a covered logical prefix omitted.
+    /// Wire requests cannot assert coverage or bypass complete-lineage validation.
+    #[serde(skip)]
+    pub(crate) logical_prefix: Option<Arc<compaction::LogicalPrefix>>,
     /// Set only by the native provider handler, never by a wire request.
     #[serde(skip)]
     pub native_tail_section: bool,
@@ -1301,6 +1305,7 @@ impl<'de> Deserialize<'de> for TransformRequest {
             .unwrap_or_else(default_protected_tags);
         Ok(Self {
             native_tail_section: false,
+            logical_prefix: None,
             native_fold_prefix: None,
             native_fold_sidecar: None,
             native_compartment_source_revision: None,
@@ -2417,12 +2422,15 @@ pub fn transform_with_projection(
 }
 
 /// The append-only runner seam. Transport handlers supply a complete, durably ingested
-/// lineage as `TransformRequest.messages`, not the byte-capped suffix of a status page.
+/// lineage as `TransformRequest.messages`, or an internally certified logical prefix
+/// plus its complete tail, never the byte-capped suffix of a status page.
 /// They persist this state together with their answer before sending it. In particular,
 /// the version high-water must survive an allocated-but-unsent answer.
 /// The caller resolves `template.session_id` from (project_root, session, harness);
 /// this engine seam neither resolves handles nor calls a gateway.
 pub mod compaction {
+    mod logical_prefix;
+    pub(crate) use logical_prefix::LogicalPrefix;
     #[cfg(test)]
     thread_local! {
         // Observe the exact request passed to the real engine, not a separate
@@ -2784,7 +2792,11 @@ pub mod compaction {
                 "compaction setup missing".to_string(),
             ));
         }
-        let mut range = working_range(status, &template.messages)?;
+        let mut range = if let Some(prefix) = &template.logical_prefix {
+            prefix.working_range(status, &template.messages)?
+        } else {
+            working_range(status, &template.messages)?
+        };
         if template.native_fold_prefix.is_some() {
             // status.last_applied_version acknowledges the last produced view.
             // Use that view's original range before updating last_applied below;
@@ -4878,12 +4890,19 @@ fn apply_once(
     profile_end!(perf_ingress_validation);
     let seed_or_sync_started_at = Instant::now();
     profile_start!(perf_seed, "seed_or_sync");
-    let transform_snapshot = if let Some(snapshot) =
-        req.native_fold_snapshot.as_ref().filter(|snapshot| {
-            store
-                .load_meta(&req.session_id)
-                .is_ok_and(|meta| meta.row_version == snapshot.loaded.row_version)
-        }) {
+    let transform_snapshot = if req.logical_prefix.is_some() {
+        store.load_logical_transform_snapshot(
+            &req.session_id,
+            &req.messages
+                .iter()
+                .map(|message| message.mid.as_str())
+                .collect::<Vec<_>>(),
+        )?
+    } else if let Some(snapshot) = req.native_fold_snapshot.as_ref().filter(|snapshot| {
+        store
+            .load_meta(&req.session_id)
+            .is_ok_and(|meta| meta.row_version == snapshot.loaded.row_version)
+    }) {
         (**snapshot).clone()
     } else if let Some(prefix) = &req.native_fold_prefix {
         store.load_native_transform_snapshot(
@@ -4902,7 +4921,7 @@ fn apply_once(
     timings.store_cache_state = transform_snapshot.timings.cache_state_ms;
     profile_start!(perf_tags, "store_tags");
     let tag_hydration_started_at = Instant::now();
-    let mut tag_rows = if req.native_fold_prefix.is_some() {
+    let mut tag_rows = if req.native_fold_prefix.is_some() || req.logical_prefix.is_some() {
         Arc::new(
             store.load_tags_for_blocks(
                 &req.session_id,
@@ -4925,6 +4944,14 @@ fn apply_once(
     timings.store_channel1 = transform_snapshot.timings.channel1_ms;
     timings.store_overlay_frontier = transform_snapshot.timings.overlay_frontier_ms;
     let loaded = transform_snapshot.loaded;
+    if let Some(prefix) = &req.logical_prefix {
+        let compartments = store.load_compartments(&req.session_id)?;
+        if !prefix.matches(&prefix.lineage, prefix.generation, &loaded, &compartments) {
+            return Err(TransformError::LineageProtocol(
+                "logical prefix certificate invalid".into(),
+            ));
+        }
+    }
     let overlay_frontier = transform_snapshot.overlay_frontier;
     // A stored frozen chunk or cache section that failed its digest (or its shape checks)
     // decoded as empty. The prefix may have been built against the lost value, so the pass
@@ -6217,8 +6244,28 @@ fn apply_once(
         let protected_tokens_floor = floor_resolution.effective;
         // Pending same-pass mints are not persisted rows yet. Every consumer view below is projected
         // from this one walk over the hydrated mc_tags baseline, independent of the served array.
+        let logical_protection = if let Some(prefix) = &req.logical_prefix {
+            Some(
+                prefix
+                    .protection_rows(
+                        store,
+                        &req.session_id,
+                        protected_tokens_floor,
+                        active_calibration.tools_ratio,
+                    )?
+                    .ok_or_else(|| {
+                        TransformError::LineageProtocol(
+                            "logical prefix protection certificate invalid".into(),
+                        )
+                    })?,
+            )
+        } else {
+            None
+        };
         let protection_window = ProtectionWindow::from_persisted_rows_calibrated(
-            &tag_rows[..hydrated_tag_count],
+            logical_protection
+                .as_deref()
+                .unwrap_or(&tag_rows[..hydrated_tag_count]),
             protected_tokens_floor,
             active_calibration.tools_ratio,
         );
@@ -7796,6 +7843,9 @@ fn apply_once(
                         // bloat — and a later re-decide of that target with different bytes
                         // would false-fire the monotonicity conflict guard.
                         prune_covered_red_units(&mut core, &live, meta.coverage_ordinal);
+                        if let Some(prefix) = &req.logical_prefix {
+                            prefix.prune_covered_units(&mut core);
+                        }
                         prune_covered_caveman_units(&mut core, &live, meta.coverage_ordinal);
                     } else if compartment_seq_changed_since_meta {
                         meta.coverage_compartment_seq = Some(m1_signal.max_compartment_seq);
@@ -8626,6 +8676,11 @@ fn apply_once(
         &projection,
         meta.coverage_ordinal,
     );
+    if let Some(prefix) = &req.logical_prefix {
+        consumed_drop_ids.extend(pending_agent_drops.iter()
+            .filter(|drop| prefix.covers_target(&drop.target_id) && !consumed_drop_ids.contains(&drop.id))
+            .map(|drop| drop.id).collect::<Vec<_>>());
+    }
     if let Some(prefix) = req
         .native_fold_prefix
         .as_ref()
@@ -8806,7 +8861,13 @@ fn apply_once(
                 },
             }
         });
-        store.commit_transform_with_provider_policy(
+        let commit = if req.logical_prefix.is_some() {
+            McStore::commit_logical_transform_with_provider_policy
+        } else {
+            McStore::commit_transform_with_provider_policy
+        };
+        commit(
+            store,
             &req.session_id,
             TransformCommit {
                 expected: commit_expected,
@@ -23130,6 +23191,7 @@ pub(crate) mod tests {
     ) -> TransformRequest {
         TransformRequest {
             native_tail_section: false,
+            logical_prefix: None,
             native_fold_prefix: None,
             native_fold_sidecar: None,
             native_compartment_source_revision: None,

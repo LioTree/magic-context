@@ -9458,6 +9458,17 @@ impl McStore {
         self.load_transform_snapshot_with_hook(session_id, || {})
     }
 
+    /// Read identities only for the supplied live context. The caller must hold
+    /// a validated logical-prefix certificate; omitted identities remain in rows
+    /// and are not deleted by a transform commit using this scoped snapshot.
+    pub fn load_logical_transform_snapshot(
+        &self,
+        session_id: &str,
+        mids: &[&str],
+    ) -> Result<TransformSnapshot, McStoreError> {
+        self.load_transform_snapshot_scoped(session_id, None, Some(mids), || {})
+    }
+
     /// Internal native execution reads only identities in its validated live
     /// tail. Public full loads continue to reconstruct the entire baseline.
     pub fn load_native_transform_snapshot(
@@ -9466,7 +9477,8 @@ impl McStore {
         prefix: &provider_log::ProviderNativePrefix,
         mids: &[&str],
     ) -> Result<TransformSnapshot, McStoreError> {
-        let result = self.load_transform_snapshot_scoped(session_id, Some((prefix, mids)), || {});
+        let result =
+            self.load_transform_snapshot_scoped(session_id, Some((prefix, mids)), None, || {});
         if let Err(McStoreError::NativeSnapshotUnavailable(reason)) = &result {
             let mut logged = self
                 .native_snapshot_fallbacks
@@ -9501,13 +9513,14 @@ impl McStore {
         session_id: &str,
         after_state_read: impl FnOnce(),
     ) -> Result<TransformSnapshot, McStoreError> {
-        self.load_transform_snapshot_scoped(session_id, None, after_state_read)
+        self.load_transform_snapshot_scoped(session_id, None, None, after_state_read)
     }
 
     fn load_transform_snapshot_scoped(
         &self,
         session_id: &str,
         native: Option<(&provider_log::ProviderNativePrefix, &[&str])>,
+        logical_mids: Option<&[&str]>,
         after_state_read: impl FnOnce(),
     ) -> Result<TransformSnapshot, McStoreError> {
         let snapshot = self.inner.with_conn(|conn| {
@@ -9530,7 +9543,7 @@ impl McStore {
                         sections,
                     } = decoded;
                     log_discarded_sections(session_id, &sections);
-                    if let Some((_, mids)) = native {
+                    if let Some(mids) = native.map(|(_, mids)| mids).or(logical_mids) {
                         let mids=serde_json::to_string(mids).map_err(serde_to_sql_error)?;
                         let mut query=transaction.prepare_cached("SELECT mid,identities FROM mc_block_identities WHERE session_id=?1 AND mid IN (SELECT value FROM json_each(?2))")?;
                         for row in query.query_map(params![session_id,mids],|row|Ok((row.get::<_,String>(0)?,row.get::<_,String>(1)?)))? {
@@ -11489,6 +11502,27 @@ impl McStore {
         request: TransformCommit<'_>,
         provider_policy: Option<&provider_records::ProviderEnginePolicy>,
     ) -> Result<u64, McStoreError> {
+        self.commit_transform_scoped(session_id, request, provider_policy, false)
+    }
+
+    /// A certified logical-prefix pass read only its live identities. Preserve
+    /// the covered identity rows it omitted instead of treating them as deleted.
+    pub fn commit_logical_transform_with_provider_policy(
+        &self,
+        session_id: &str,
+        request: TransformCommit<'_>,
+        provider_policy: Option<&provider_records::ProviderEnginePolicy>,
+    ) -> Result<u64, McStoreError> {
+        self.commit_transform_scoped(session_id, request, provider_policy, true)
+    }
+
+    fn commit_transform_scoped(
+        &self,
+        session_id: &str,
+        request: TransformCommit<'_>,
+        provider_policy: Option<&provider_records::ProviderEnginePolicy>,
+        partial_identities: bool,
+    ) -> Result<u64, McStoreError> {
         let TransformCommit {
             expected,
             core,
@@ -11665,12 +11699,12 @@ impl McStore {
             // WHICH entries differ means reading every stored row, so a pass that changed
             // none of them proves that from its fingerprint and skips the comparison
             // entirely; that is the common case and it must not cost a walk of the session.
-            let row_state_unchanged = native_prefix.is_none()
+            let row_state_unchanged = native_prefix.is_none() && !partial_identities
                 && row_state_digest_matches_tx(tx, session_id, current, &fingerprint)?;
             let row_state_writes = if row_state_unchanged {
                 0
             } else {
-                (if native_prefix.is_some() {
+                (if native_prefix.is_some() || partial_identities {
                     sync_native_block_identities_tx(tx, session_id, &meta.block_identity_by_mid)?
                 } else {
                     sync_block_identities_tx(tx, session_id, &meta.block_identity_by_mid)?

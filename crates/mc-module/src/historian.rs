@@ -4744,6 +4744,7 @@ mod tests {
     fn req(messages: Vec<CkIngressMessage>) -> TransformRequest {
         TransformRequest {
             native_tail_section: false,
+            logical_prefix: None,
             native_fold_prefix: None,
             native_fold_sidecar: None,
             native_compartment_source_revision: None,

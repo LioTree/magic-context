@@ -1,0 +1,307 @@
+//! A covered logical prefix omits source rows only after a successful rebuild
+//! certifies them as covered. It retains the live boundary,
+//! system sources, and an arc-safe consecutive suffix with original ordinals.
+use super::*;
+
+#[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
+struct Coverage {
+    sequence: i64,
+    from: i64,
+    to: i64,
+    boundary: String,
+}
+
+impl From<&StoredCompartment> for Coverage {
+    fn from(c: &StoredCompartment) -> Self {
+        Self {
+            sequence: c.sequence,
+            from: c.start_message,
+            to: c.end_message,
+            boundary: c.end_message_id.clone(),
+        }
+    }
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize)]
+pub(crate) struct LogicalPrefix {
+    pub(crate) lineage: String,
+    pub(crate) generation: u64,
+    pub(crate) from: u64,
+    pub(crate) tail_from: u64,
+    /// Source extent observed when this rebuild certified the omitted prefix.
+    certified_through: u64,
+    coverage: u64,
+    boundary: String,
+    sequence: i64,
+    revert_epoch: u64,
+    compartments: Vec<Coverage>,
+    /// Original system sources, not hashes: a later HARD must render them again.
+    pub(crate) context_ordinals: BTreeSet<u64>,
+    /// A frozen target can be absent because its source is covered; that absence
+    /// alone does not mean a revert removed it from the transcript.
+    covered_targets: BTreeSet<String>,
+    /// Source invocation and result ordinals for arcs crossing coverage. The
+    /// suffix begins before their invocations, so native blocks stay intact.
+    crossing_arcs: Vec<(u64, u64)>,
+    tag_summary: (u64, usize, i64),
+    protection_floor: u64,
+    protection_ratio: f64,
+    /// Global newest tool-tag suffix, including protected tags whose sources
+    /// are no longer live. Protection is based on persisted tags, not messages.
+    protection_tags: Vec<(i64, String, String, i64, i64)>,
+}
+
+impl LogicalPrefix {
+    pub(crate) fn matches(
+        &self,
+        lineage: &str,
+        generation: u64,
+        loaded: &mc_store::LoadedState,
+        compartments: &[StoredCompartment],
+    ) -> bool {
+        self.lineage == lineage
+            && self.generation == generation
+            && loaded.core.boundary_id == self.boundary
+            && loaded.meta.coverage_ordinal == Some(self.coverage)
+            && meta_coverage_compartment_seq(&loaded.meta) == self.sequence
+            && loaded.meta.revert_epoch == self.revert_epoch
+            && self.from < self.tail_from
+            && self.tail_from <= self.coverage
+            && self.compartments.iter().all(|old| {
+                // A newer summary may extend or merge old ranges. The source
+                // certificate still proves those old sources were covered; it
+                // is usable only while today's ranges cover that entire span.
+                let mut next = old.from;
+                let mut ranges = compartments.iter().collect::<Vec<_>>();
+                ranges.sort_by_key(|c| c.start_message);
+                for c in ranges {
+                    if c.start_message <= next && c.end_message >= next {
+                        next = c.end_message.saturating_add(1);
+                    }
+                }
+                next > old.to
+            })
+            && self.crossing_arcs.iter().all(|(call, result)| {
+                *call >= self.tail_from && *call <= self.coverage && *result > self.coverage
+            })
+    }
+
+    /// Mint only after Hard, MigrateHard or Soft passed the live coverage and
+    /// identity guards. Defer cannot authorize omitting more source input.
+    pub(crate) fn certify(
+        store: &McStore,
+        req: &TransformRequest,
+        projection: &FlatProjection,
+        loaded: &mc_store::LoadedState,
+        compartments: &[StoredCompartment],
+        lineage: &str,
+        generation: u64,
+    ) -> Option<Self> {
+        let coverage = loaded.meta.coverage_ordinal?;
+        let protection_floor = loaded.meta.protected_tokens_effective.unwrap_or(0);
+        let protection_ratio =
+            crate::decision_calibration::DecisionCalibration::for_model(req.model_key.as_deref())
+                .tools_ratio;
+        let rows = if let Some(prefix) = &req.logical_prefix {
+            prefix
+                .protection_rows(store, &req.session_id, protection_floor, protection_ratio)
+                .ok()??
+        } else {
+            load_cached_tags(store, &req.session_id)
+                .ok()?
+                .as_ref()
+                .clone()
+        };
+        let protection = crate::protection_window::ProtectionWindow::from_persisted_rows_calibrated(
+            &rows,
+            protection_floor,
+            protection_ratio,
+        );
+        let summary = store.tag_cache_summary(&req.session_id).ok()?;
+        let from = req.logical_prefix.as_ref().map_or_else(
+            || req.messages.first().map_or(0, |m| m.ordinal),
+            |prefix| prefix.from,
+        );
+        let mut tail_from = coverage;
+        // Move the cut backwards until no completed tool arc crosses it. This
+        // retains entire native invocations, including signed reasoning siblings.
+        loop {
+            let moved = split_coverage_tool_arcs(projection, tail_from.checked_sub(1))
+                .iter()
+                .filter_map(|arc| req.messages.iter().find(|m| m.mid == arc.invocation_mid))
+                .map(|m| m.ordinal)
+                .min()
+                .unwrap_or(tail_from);
+            if moved == tail_from {
+                break;
+            }
+            tail_from = moved;
+        }
+        // Exceptional arcs cannot turn the optimization into another full walk.
+        // Leave the raw rows authoritative and use the full path for this shape.
+        if tail_from <= from || coverage.saturating_sub(tail_from) > 256 {
+            return None;
+        }
+        let anchor = loaded
+            .meta
+            .anchor_block_id
+            .as_deref()
+            .and_then(split_block_id);
+        let context_ordinals = req
+            .messages
+            .iter()
+            .filter(|m| {
+                m.ordinal < tail_from
+                    && (m.ck.role == "system" || anchor.is_some_and(|(mid, _)| mid == m.mid))
+            })
+            .map(|m| m.ordinal)
+            .collect();
+        let covered_targets = projection
+            .blocks
+            .iter()
+            .filter(|b| b.ordinal < tail_from)
+            .filter(|b| {
+                loaded.core.frozen_units.iter().any(|u| {
+                    u.key.strip_prefix("red:") == Some(b.id.as_str())
+                        || u.key.strip_prefix(CAV_KEY_PREFIX) == Some(b.id.as_str())
+                })
+            })
+            .map(|b| b.id.clone())
+            .chain(
+                req.logical_prefix
+                    .iter()
+                    .flat_map(|p| p.covered_targets.iter().cloned()),
+            )
+            .collect();
+        let crossing_arcs = split_coverage_tool_arcs(projection, Some(coverage))
+            .iter()
+            .filter_map(|arc| {
+                req.messages
+                    .iter()
+                    .find(|m| m.mid == arc.invocation_mid)
+                    .map(|m| (m.ordinal, arc.result_ordinal))
+            })
+            .collect();
+        Some(Self {
+            lineage: lineage.into(),
+            generation,
+            from,
+            tail_from,
+            certified_through: req.messages.last()?.ordinal,
+            coverage,
+            boundary: loaded.core.boundary_id.clone(),
+            sequence: meta_coverage_compartment_seq(&loaded.meta),
+            revert_epoch: loaded.meta.revert_epoch,
+            compartments: compartments.iter().map(Coverage::from).collect(),
+            context_ordinals,
+            covered_targets,
+            crossing_arcs,
+            tag_summary: (summary.generation, summary.count, summary.max_tag_number),
+            protection_floor,
+            protection_ratio,
+            protection_tags: protection
+                .member_rows
+                .into_iter()
+                .map(|row| {
+                    (
+                        row.tag_number,
+                        row.block_id,
+                        row.kind,
+                        row.token_count,
+                        row.created_at_ms,
+                    )
+                })
+                .collect(),
+        })
+    }
+
+    pub(crate) fn protection_rows(
+        &self,
+        store: &McStore,
+        session: &str,
+        floor: u64,
+        ratio: f64,
+    ) -> Result<Option<Vec<mc_store::McTagRow>>, TransformError> {
+        let summary = store.tag_cache_summary(session)?;
+        let (generation, count, max) = self.tag_summary;
+        if floor > self.protection_floor
+            || ratio < self.protection_ratio
+            || summary.count < count
+            || summary.max_tag_number < max
+            || summary.generation.saturating_sub(generation)
+                != summary.count.saturating_sub(count) as u64
+        {
+            return Ok(None);
+        }
+        let mut rows = self
+            .protection_tags
+            .iter()
+            .map(|(number, id, kind, tokens, created)| mc_store::McTagRow {
+                tag_number: *number,
+                block_id: id.clone(),
+                kind: kind.clone(),
+                token_count: *tokens,
+                created_at_ms: *created,
+                source_bytes: Arc::from([]),
+            })
+            .collect::<Vec<_>>();
+        if summary.generation != generation {
+            rows.extend(store.load_tags_after(session, max)?);
+        }
+        Ok(Some(rows))
+    }
+
+    pub(super) fn working_range(
+        &self,
+        status: &Status,
+        messages: &[CkIngressMessage],
+    ) -> Result<Range, TransformError> {
+        if self.lineage != status.lineage_id
+            || status
+                .newest_ordinal
+                .is_none_or(|newest| newest < self.certified_through)
+            || messages
+                .iter()
+                .filter(|m| m.ordinal < self.tail_from)
+                .any(|m| !self.context_ordinals.contains(&m.ordinal))
+        {
+            return Err(TransformError::OrdinalViolation);
+        }
+        let start = messages.partition_point(|m| m.ordinal < self.tail_from);
+        if messages.get(start).map(|m| m.ordinal) != Some(self.tail_from) {
+            return Err(TransformError::OrdinalViolation);
+        }
+        let mut range = super::working_range(status, &messages[start..])?;
+        range.from = self.from;
+        Ok(range)
+    }
+
+    pub(crate) fn prune_covered_units(&self, core: &mut CoreState) {
+        core.frozen_units.retain(|unit| {
+            !unit
+                .key
+                .strip_prefix("red:")
+                .or_else(|| unit.key.strip_prefix(CAV_KEY_PREFIX))
+                .is_some_and(|target| self.covered_targets.contains(target))
+        });
+    }
+
+    pub(crate) fn prove_membership(
+        &mut self,
+        source: &CkIngressMessage,
+    ) -> Result<(), TransformError> {
+        if source.ordinal < self.tail_from {
+            self.covered_targets.extend(
+                project_messages(std::slice::from_ref(source))?
+                    .blocks
+                    .into_iter()
+                    .map(|b| b.id),
+            );
+        }
+        Ok(())
+    }
+
+    pub(crate) fn covers_target(&self, target: &str) -> bool {
+        self.covered_targets.contains(target)
+    }
+}
