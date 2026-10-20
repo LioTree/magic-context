@@ -57,7 +57,7 @@ impl HeldEntry {
         &self.raw
     }
 
-    /// The whole runner message.
+    /// The complete runner message, parsed from its stored JSON.
     pub(super) fn read(&self) -> Result<ReadMessage, HandlerOutcome> {
         #[cfg(test)]
         counters::parsed(1);
@@ -170,7 +170,9 @@ impl Aggregates {
             self.real_users += 1;
             self.last_user = Some((ordinal, mid.to_owned()));
         }
-        // The same arc check `working_range` makes over the whole range.
+        // Track tool calls without a result, and results without an earlier
+        // call, as the engine's `working_range` checks them over the whole
+        // transcript.
         for block in &message.ck.content {
             match &block.kind {
                 ck_wire::CkKind::ToolCall {

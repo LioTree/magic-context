@@ -818,7 +818,9 @@ impl Pair {
                 self.notice(rng, None).await;
             }
             84..=87 => {
-                // A verified fork descent from an earlier message.
+                // A fork: the runner cuts the transcript after an earlier
+                // message, continues under a new lineage and names the cut
+                // (`descends_from`) so the provider keeps what precedes it.
                 let (parent, through, digest) = {
                     let mut entries = self.transcript.entries.lock().unwrap();
                     let len = entries.len() as u64;
@@ -860,7 +862,8 @@ impl Pair {
                 }
             }
             91..=95 => {
-                // A ck-mc restart: nothing stays resident.
+                // A provider process restart: the resident copy is gone and
+                // the next operation rebuilds the conversation from rows.
                 self.resident
                     .h
                     .provider_store

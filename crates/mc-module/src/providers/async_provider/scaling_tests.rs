@@ -527,7 +527,7 @@ async fn ordinary_notice_write_set_does_not_grow_with_the_session() {
     );
 }
 
-/// The transcript work one notice that publishes nothing does in a
+/// Measure the transcript work of one notice that publishes nothing, in a
 /// conversation of `size` messages: entries parsed from JSON, messages
 /// decoded by the codec, engine passes and engine views parsed. Also returns
 /// why the engine last ran on this thread.

@@ -678,7 +678,8 @@ impl State {
             &self.published_engine,
         )?;
         match engine.last_applied.take() {
-            // Setup's initial view is both baselines: keep one serialized copy.
+            // Setup's initial view is both the produced and the applied
+            // engine baseline: keep one serialized copy for the two.
             Some(applied)
                 if self
                     .produced_view
@@ -910,8 +911,9 @@ impl State {
             });
         }
         self.resync = true;
-        // The runner's own recovery from a broken lineage is a new one
-        // (contract §5.3); a resync starts the conversation over.
+        // A runner that lost its state continues under a new lineage
+        // (contract §5.3), which reaches here as a resync: the conversation
+        // starts over, so an earlier protocol failure no longer applies.
         self.failure = None;
         self.restored_no_new_content = false;
         self.restored_head = None;
@@ -1691,7 +1693,8 @@ fn append_view_gap(
 }
 
 /// The tag hints a reduce reminder names: the oldest reclaimable tool outputs
-/// in the unsummarized tail and the channel-2 selection. Reads every held
+/// in the unsummarized tail, and the separate pressure-reminder (channel 2)
+/// selection of unqueued tool outputs of at least 100 tokens. Reads every held
 /// message and every tag row, so it runs only when a reminder is sent.
 fn async_reminder_hints(
     store: &McStore,
@@ -2708,8 +2711,9 @@ impl McHandler {
             .map_err(transient)?;
         }
         let mut parsed: TransformRequest = decode(&request)?;
-        // The evaluation reads the whole transcript; it runs off the notice's
-        // path, from this snapshot of the held entries (shared, not copied).
+        // The evaluation reads the whole transcript. It runs on a blocking
+        // thread after the notice returns, from this snapshot of the held
+        // entries (reference-counted, so taking it copies no message).
         let snapshot = state.entries.values().cloned().collect::<Vec<_>>();
         let store = Arc::clone(
             self.store
@@ -3084,7 +3088,8 @@ impl McHandler {
             let _ = reason;
             return Ok(false);
         }
-        // The same producer context `async_engine` gives the engine.
+        // Build the producer context exactly as `async_engine` does for its
+        // engine pass, so the preflight sees the inputs the pass would.
         let work = self.provider_work(0, store, binding.clone(), state.key.clone())?;
         let mut context = compaction::producer_context(&work, model, window, false);
         context.cache_ttl = "never".into();
