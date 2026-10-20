@@ -25,6 +25,7 @@ use cortexkit_bus_trait::{
 };
 use subc_client_rs::{CallError, CallOptions, ConsumerIdentity, ConsumerOptions, SubcConsumer};
 use subc_protocol::BindIdentity;
+use tokio::sync::watch;
 use tokio::time::Instant as Clock;
 
 #[cfg(test)]
@@ -336,6 +337,8 @@ impl HeldCredential {
 pub(crate) enum LinkState {
     /// No bootstrap has finished yet.
     Starting,
+    /// Fetching a credential, connecting, or attaching the durable reader.
+    Attaching,
     /// Connected, with a credential not yet due for renewal or renewed in time.
     Connected,
     /// Due for renewal, and renewal attempts are failing; the connection still
@@ -353,6 +356,7 @@ impl LinkState {
     pub(crate) fn name(self) -> &'static str {
         match self {
             Self::Starting => "starting",
+            Self::Attaching => "attaching",
             Self::Connected => "connected",
             Self::Renewing => "renewing",
             Self::CredentialExpired => "credential_expired",
@@ -371,39 +375,65 @@ struct LinkReport {
 
 /// The bus link's current [`LinkState`], how long it has held, how many
 /// attempts it has seen, and the last error.
-pub(crate) struct LinkStatus(Mutex<LinkReport>);
+pub(crate) struct LinkStatus {
+    report: Mutex<LinkReport>,
+    changed: watch::Sender<LinkState>,
+}
 
 impl Default for LinkStatus {
     fn default() -> Self {
-        Self(Mutex::new(LinkReport {
-            state: LinkState::Starting,
-            since: Clock::now(),
-            attempts: 0,
-            last_error: None,
-        }))
+        let (changed, _) = watch::channel(LinkState::Starting);
+        Self {
+            report: Mutex::new(LinkReport {
+                state: LinkState::Starting,
+                since: Clock::now(),
+                attempts: 0,
+                last_error: None,
+            }),
+            changed,
+        }
     }
 }
 
 impl LinkStatus {
     pub(crate) fn set(&self, state: LinkState, attempts: u32, last_error: Option<String>) {
-        let mut report = self.0.lock().expect("bus link status");
+        let mut report = self.report.lock().expect("bus link status");
         if report.state != state {
             report.state = state;
             report.since = Clock::now();
         }
         report.attempts = attempts;
         report.last_error = last_error;
+        self.changed.send_replace(state);
+    }
+
+    /// Wait only while an authenticated attach is actively making progress.
+    /// Failed attempts are already on the supervisor's backoff and must not
+    /// make every Setup wait through another retry interval.
+    pub(crate) async fn wait_for_attach(&self, limit: Duration) {
+        let mut changed = self.changed.subscribe();
+        if *changed.borrow_and_update() != LinkState::Attaching {
+            return;
+        }
+        let _ = tokio::time::timeout(limit, async {
+            while changed.changed().await.is_ok() {
+                if *changed.borrow_and_update() != LinkState::Attaching {
+                    break;
+                }
+            }
+        })
+        .await;
     }
 
     #[cfg(test)]
     pub(crate) fn state(&self) -> LinkState {
-        self.0.lock().expect("bus link status").state
+        self.report.lock().expect("bus link status").state
     }
 
     /// One readable line, e.g. `ckbus_unreachable for 95s after 6 attempts:
     /// ck-bus unreachable: ...`.
     pub(crate) fn describe(&self) -> String {
-        let report = self.0.lock().expect("bus link status");
+        let report = self.report.lock().expect("bus link status");
         let mut line = format!(
             "{} for {}s",
             report.state.name(),
@@ -668,11 +698,13 @@ where
     let mut retry = BOOTSTRAP_RETRY_FIRST;
     loop {
         attempt += 1;
+        status.set(LinkState::Attaching, attempt, None);
         let (stable, error) = match attach().await {
-            Ok(served) => (
-                served >= STABLE_LINK,
-                format!("the bus reader stopped after {}s", served.as_secs()),
-            ),
+            Ok(served) => {
+                let error = format!("the bus reader stopped after {}s", served.as_secs());
+                status.set(LinkState::CkbusUnreachable, attempt, Some(error.clone()));
+                (served >= STABLE_LINK, error)
+            }
             Err(error) => {
                 status.set(LinkState::CkbusUnreachable, attempt, Some(error.clone()));
                 (false, error)
@@ -711,6 +743,7 @@ impl McHandler {
             return;
         }
         let status = runtime.bus_link.clone();
+        status.set(LinkState::Attaching, 1, None);
         let handler = self.provider_historian_worker();
         tokio::spawn(supervise(status.clone(), move || {
             let connection = connection.clone();

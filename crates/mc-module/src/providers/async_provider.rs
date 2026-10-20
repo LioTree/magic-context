@@ -14,6 +14,11 @@ mod scaling_tests;
 mod tests;
 use resident::{EngineView, HeldEntry};
 
+/// Bound Setup's wait to the existing five-second issuer-call or NATS-connect
+/// timeout; the retrying attach continues in the background, and no global lock
+/// is held while Setup awaits it.
+const ASYNC_BUS_SETUP_WAIT: Duration = Duration::from_secs(5);
+
 fn bus_id(reference: &str, kind: &str, sequence: u64) -> String {
     format!("{reference}:{kind}:{sequence}")
 }
@@ -1197,14 +1202,12 @@ impl McHandler {
             .store
             .get()
             .ok_or_else(|| transient("store unavailable"))?;
-        if self
-            .provider_store
-            .async_runtime
-            .publisher
-            .lock()
-            .expect("async publisher")
-            .is_none()
-        {
+        let runtime = &self.provider_store.async_runtime;
+        let publisher_ready = || runtime.publisher.lock().expect("async publisher").is_some();
+        if !publisher_ready() {
+            runtime.bus_link.wait_for_attach(ASYNC_BUS_SETUP_WAIT).await;
+        }
+        if !publisher_ready() {
             self.provider_store
                 .async_runtime
                 .unconfigured_logged
