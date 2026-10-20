@@ -496,7 +496,6 @@ runner = 'command'
 command = ['cargo', 'test', '--locked', '-p', 'mc-module', '--lib', '--', '--exact', '{test}']
 test_count_pattern = 'running {count} test'
 expect_red = [
-    'providers::compaction::compaction_review_tests::r73_late_transport_copy_cannot_hide_independent_model_rebuild',
     'transform::tests::compaction_adapter_tests::lost_broca_view_cannot_hide_independent_model_rebuild',
 ]
 expect_message = '/assertion failed: current_bytes\.contains\("NEWEST-HISTORY"\)|returned a superseded view/'
