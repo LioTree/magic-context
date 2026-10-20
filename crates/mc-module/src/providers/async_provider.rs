@@ -1391,6 +1391,7 @@ impl McHandler {
         } else {
             None
         };
+        let mut membership_unavailable = false;
         if let Some(prefix) = &mut prefix {
             let prefix = Arc::make_mut(prefix);
             for pending in store
@@ -1402,11 +1403,17 @@ impl McHandler {
                         state.mid_index.get(mid).filter(|n| **n < prefix.tail_from)
                     {
                         if let Some(entry) = state.entries.get(ordinal) {
-                            prefix.prove_membership(&decoded_entry(codec, &entry.inbound()?)?);
+                            if !prefix.prove_membership(&decoded_entry(codec, &entry.inbound()?)?) {
+                                membership_unavailable = true;
+                                break;
+                            }
                         }
                     }
                 }
             }
+        }
+        if membership_unavailable {
+            prefix = None;
         }
         let messages = if let Some(prefix) = &prefix {
             let mut messages = prefix.context_sources.values().cloned().collect::<Vec<_>>();
@@ -3395,11 +3402,8 @@ impl McHandler {
         self.resident_cache().put(state);
     }
 
-    /// True when this notice's engine pass could not publish, so it can be
-    /// skipped: no usage threshold, pending engine work or classifier input
-    /// asks for a prefix rewrite. A skipped pass would have answered no-op and
-    /// left the record unchanged. Ported from the host lane's resident step,
-    /// which skipped the same passes on the same inputs.
+    /// Skip only when neither prefix work nor durable command bookkeeping
+    /// needs an engine pass. A no-op can still retire an already-satisfied drop.
     fn async_engine_can_skip(
         &self,
         state: &State,
@@ -3494,6 +3498,39 @@ impl McHandler {
             resident::counters::engine_reason(reason);
             let _ = reason;
             return Ok(false);
+        }
+        let pending = store
+            .load_pending_agent_drops(&namespace)
+            .map_err(transient)?;
+        if !pending.is_empty() {
+            let covered = pending.iter().any(|drop| {
+                ck_wire::split_block_id(&drop.target_id)
+                    .and_then(|(mid, _)| state.mid_index.get(mid))
+                    .is_some_and(|ordinal| meta.coverage_ordinal.is_some_and(|end| *ordinal <= end))
+            });
+            let targets = pending
+                .iter()
+                .map(|drop| drop.target_id.as_str())
+                .collect::<std::collections::HashSet<_>>();
+            let frozen = !covered
+                && store
+                    .load_compaction_trigger_core(&namespace)
+                    .map_err(transient)?
+                    .is_some_and(|core| {
+                        core.frozen_units.iter().any(|unit| {
+                            unit.key
+                                .strip_prefix("red:")
+                                .is_some_and(|target| targets.contains(target))
+                        })
+                    });
+            // Retirement changes the durable command queue even when no view
+            // can publish. Leaving a covered/satisfied command queued can
+            // incorrectly apply it after a later coverage rewind or restore.
+            if covered || frozen {
+                #[cfg(test)]
+                resident::counters::engine_reason("retire_satisfied_drop");
+                return Ok(false);
+            }
         }
         // Build the producer context exactly as `async_engine` does for its
         // engine pass, so the preflight sees the inputs the pass would.

@@ -358,7 +358,19 @@ impl LogicalPrefix {
         });
     }
 
-    pub(crate) fn prove_membership(&mut self, source: &CkIngressMessage) {
+    pub(crate) fn prove_membership(&mut self, source: &CkIngressMessage) -> bool {
+        // Synthetic rows are normalized before projection. Their raw block
+        // positions are not a coverage proof; validate them with full input.
+        if source.ck.meta.synthetic
+            || source.ck.content.iter().any(|block| match &block.kind {
+                ck_wire::CkKind::ToolCall { id, .. } | ck_wire::CkKind::ToolResult { id, .. } => {
+                    is_synthetic_todo_id(id)
+                }
+                _ => false,
+            })
+        {
+            return false;
+        }
         if source.ordinal < self.tail_from {
             self.covered_targets.extend(
                 source
@@ -369,6 +381,7 @@ impl LogicalPrefix {
                     .map(|(index, _)| format!("{}#{index}", source.mid)),
             );
         }
+        true
     }
 
     pub(crate) fn covers_target(&self, target: &str) -> bool {
