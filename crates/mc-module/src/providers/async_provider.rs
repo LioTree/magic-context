@@ -2763,9 +2763,15 @@ impl McHandler {
         }
         let mut parsed: TransformRequest = decode(&request)?;
         // The evaluation reads the whole transcript. It runs on a blocking
-        // thread after the notice returns, from this snapshot of the held
-        // entries (reference-counted, so taking it copies no message).
-        let snapshot = state.entries.values().cloned().collect::<Vec<_>>();
+        // thread after the notice returns and reads the held entries from
+        // their stored rows, through the newest one held now: every held
+        // entry is stored before a historian evaluation is scheduled.
+        let through = state.entries.last_key_value().map(|(ordinal, _)| *ordinal);
+        if through.is_some_and(|through| state.journal.persisted_through != Some(through)) {
+            return Err(transient(
+                "async historian scheduled before its entries were stored",
+            ));
+        }
         let store = Arc::clone(
             self.store
                 .get()
@@ -2779,6 +2785,7 @@ impl McHandler {
             serial: Arc::clone(&self.provider_serial),
         });
         let reference = state.reference();
+        let reference_for_rows = reference.clone();
         let namespace = state.namespace();
         let generation = state.generation;
         let cadence = state.historian_cadence.clone();
@@ -2809,8 +2816,16 @@ impl McHandler {
             parsed.historian_model_limits = configured.model_limits;
             let prepare = worker.clone();
             let result = tokio::task::spawn_blocking(move || {
-                let messages = inbound_messages(snapshot.iter())?;
-                drop(snapshot);
+                let rows = match through {
+                    Some(through) => store
+                        .load_async_compaction_entries(&reference_for_rows, through)
+                        .map_err(transient)?,
+                    None => Vec::new(),
+                };
+                let messages = rows
+                    .into_iter()
+                    .map(|(_, raw)| HeldEntry::from_stored(raw)?.inbound())
+                    .collect::<Result<Vec<_>, _>>()?;
                 codec.prepare_request(&mut parsed, &messages)?;
                 drop(messages);
                 let projection = ck_wire::project_messages(&parsed.messages).map_err(transient)?;

@@ -369,7 +369,13 @@ pub async fn send_due_reminders(
     }
 
     let mut next = state.meta.clone();
-    next.tail_hygiene_baseline = conditions.baseline.cloned();
+    // The cadence decisions read only the baseline's scalars. Its per-part
+    // measurements (one per tail part) are read once, for the count of
+    // reclaimable tool outputs, straight from `conditions`, so neither copy
+    // below carries them.
+    next.tail_hygiene_baseline = conditions
+        .baseline
+        .map(mc_store::TailHygieneBaseline::clone_without_parts);
     let mut baseline = next.tail_hygiene_baseline.clone();
     transform::apply_channel1_compliance_grace(&mut next, &mut baseline, conditions.drops_applied);
     let decision =
@@ -401,7 +407,7 @@ pub async fn send_due_reminders(
                 transform::Channel1Level::Urgent => "urgent",
             }
         };
-        let count = transform::reclaimable_tool_output_count(baseline.as_ref());
+        let count = transform::reclaimable_tool_output_count(conditions.baseline);
         let use_ = reduce_use(
             kind,
             decision.reclaimable_tokens,
@@ -468,7 +474,7 @@ pub async fn send_due_reminders(
         let use_ = reduce_use(
             "channel2",
             u,
-            transform::reclaimable_tool_output_count(baseline.as_ref()),
+            transform::reclaimable_tool_output_count(conditions.baseline),
             &selected.channel2,
         );
         if issue(

@@ -252,6 +252,24 @@ impl McStore {
             .map_err(Into::into)
     }
 
+    /// The stored entries of a conversation through `through` (inclusive),
+    /// `(ordinal, entry_json)` in ordinal order, read from a reader
+    /// connection: for background work that needs the whole held transcript
+    /// without the in-memory copy.
+    pub fn load_async_compaction_entries(
+        &self,
+        session_ref: &str,
+        through: u64,
+    ) -> Result<Vec<(u64, String)>, McStoreError> {
+        self.inner
+            .with_read(|conn| {
+                conn.prepare("SELECT ordinal,entry_json FROM mc_async_compaction_entries WHERE session_ref=?1 AND ordinal<=?2 ORDER BY ordinal")?
+                    .query_map(params![session_ref, through], |row| Ok((row.get(0)?, row.get(1)?)))?
+                    .collect::<rusqlite::Result<_>>()
+            })
+            .map_err(Into::into)
+    }
+
     /// Reserve before building a view. A crash skips the reservation, never reuses it.
     pub fn reserve_async_compaction_version(
         &self,
