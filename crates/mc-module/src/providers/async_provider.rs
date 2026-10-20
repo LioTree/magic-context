@@ -3298,10 +3298,11 @@ impl McHandler {
         self.resident_cache().put(state);
     }
 
-    /// Retain the legacy skip classifier until a covered input is available.
-    /// Once input is bounded, replay the tail even on a no-op: the engine can
-    /// freeze first-serve Channel-1 appends for a later published view without
-    /// requesting a prefix rewrite on the current notice.
+    /// True when this notice's engine pass could not publish, so it can be
+    /// skipped: no usage threshold, pending engine work or classifier input
+    /// asks for a prefix rewrite. A skipped pass would have answered no-op and
+    /// left the record unchanged. Ported from the host lane's resident step,
+    /// which skipped the same passes on the same inputs.
     fn async_engine_can_skip(
         &self,
         state: &State,
@@ -3313,11 +3314,6 @@ impl McHandler {
         }
         if state.resync || state.entries.is_empty() {
             return Ok(true);
-        }
-        if state.logical_prefix.is_some() {
-            #[cfg(test)]
-            resident::counters::engine_reason("logical_prefix_tail");
-            return Ok(false);
         }
         let store = self
             .store
