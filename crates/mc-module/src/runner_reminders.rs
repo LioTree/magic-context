@@ -10,6 +10,39 @@ use std::{collections::BTreeMap, path::Path, time::Duration};
 
 use crate::{session_resolver::ProviderRunner, transform};
 
+/// CPU attribution for the single-threaded reminder scaling benchmark.
+#[cfg(test)]
+pub(crate) mod phase_meter {
+    use std::{cell::RefCell, collections::BTreeMap};
+
+    thread_local! {
+        static TOTALS: RefCell<BTreeMap<&'static str, (u64, u128)>> = RefCell::default();
+    }
+
+    pub struct Timer(&'static str, std::time::Duration);
+
+    pub fn start(phase: &'static str) -> Timer {
+        Timer(phase, cpu_time::ThreadTime::now().as_duration())
+    }
+
+    impl Drop for Timer {
+        fn drop(&mut self) {
+            TOTALS.with_borrow_mut(|totals| {
+                let total = totals.entry(self.0).or_default();
+                total.0 += 1;
+                total.1 += cpu_time::ThreadTime::now()
+                    .as_duration()
+                    .saturating_sub(self.1)
+                    .as_nanos();
+            });
+        }
+    }
+
+    pub fn snapshot() -> BTreeMap<&'static str, (u64, u128)> {
+        TOTALS.with_borrow(Clone::clone)
+    }
+}
+
 const MAX: i64 = 100_000;
 const DELIVERY: [Mode; 3] = [Mode::TurnSystem, Mode::ToolResult, Mode::Steer];
 const SEARCH_DELIVERY: [Mode; 2] = [Mode::ToolResult, Mode::Steer];
@@ -339,6 +372,79 @@ pub async fn send_due_reminders(
     state: &mut ReminderState,
     conditions: &ReminderConditions<'_>,
 ) -> ReminderOutcome {
+    send_due_reminders_impl::<false>(runner, project_root, session, state, conditions).await
+}
+
+/// Retain the pre-optimization metadata copy and commit for differential tests.
+#[cfg(test)]
+pub(crate) async fn send_due_reminders_oracle(
+    runner: &dyn ProviderRunner,
+    project_root: &Path,
+    session: &str,
+    state: &mut ReminderState,
+    conditions: &ReminderConditions<'_>,
+) -> ReminderOutcome {
+    send_due_reminders_impl::<true>(runner, project_root, session, state, conditions).await
+}
+
+/// Only these fields participate in a speculative channel-1 transition. In particular,
+/// block identities and served fingerprints belong to the engine, not the cadence.
+fn cadence_meta(meta: &mc_store::ModuleMeta) -> mc_store::ModuleMeta {
+    mc_store::ModuleMeta {
+        channel1_reduce_suppressed: meta.channel1_reduce_suppressed,
+        channel1_last_nudge_undropped: meta.channel1_last_nudge_undropped,
+        channel1_last_nudge_level: meta.channel1_last_nudge_level.clone(),
+        channel1_last_fire_level: meta.channel1_last_fire_level.clone(),
+        channel1_last_fire_ordinal: meta.channel1_last_fire_ordinal,
+        ..Default::default()
+    }
+}
+
+#[cfg(test)]
+fn oracle_meta(meta: &mut mc_store::ModuleMeta) -> mc_store::ModuleMeta {
+    // Split the original full clone into the identity map and everything else
+    // to attribute its historical cost without changing the copied metadata.
+    let identities = std::mem::take(&mut meta.block_identity_by_mid);
+    let mut next = meta.clone();
+    meta.block_identity_by_mid = identities;
+    let _meter = phase_meter::start("identity_clone");
+    next.block_identity_by_mid = meta.block_identity_by_mid.clone();
+    next
+}
+
+fn commit_meta<const FULL_META: bool>(state: &mut ReminderState, next: mc_store::ModuleMeta) {
+    #[cfg(test)]
+    let _meter = phase_meter::start("meta_commit");
+    if FULL_META {
+        #[cfg(test)]
+        {
+            let mut old = std::mem::replace(&mut state.meta, next);
+            let _meter = phase_meter::start("identity_drop");
+            drop(std::mem::take(&mut old.block_identity_by_mid));
+        }
+        #[cfg(not(test))]
+        {
+            state.meta = next;
+        }
+    } else {
+        state.meta.channel1_reduce_suppressed = next.channel1_reduce_suppressed;
+        state.meta.channel1_last_nudge_undropped = next.channel1_last_nudge_undropped;
+        state.meta.channel1_last_nudge_level = next.channel1_last_nudge_level;
+        state.meta.channel1_last_fire_level = next.channel1_last_fire_level;
+        state.meta.channel1_last_fire_ordinal = next.channel1_last_fire_ordinal;
+        state.meta.tail_hygiene_baseline = next.tail_hygiene_baseline;
+    }
+}
+
+async fn send_due_reminders_impl<const FULL_META: bool>(
+    runner: &dyn ProviderRunner,
+    project_root: &Path,
+    session: &str,
+    state: &mut ReminderState,
+    conditions: &ReminderConditions<'_>,
+) -> ReminderOutcome {
+    #[cfg(test)]
+    let _total = phase_meter::start("total");
     let mut outcome = ReminderOutcome::default();
     // Older runners may ignore unknown fields and start an unwanted run. Never
     // send until discovery explicitly promises ordered, non-starting delivery.
@@ -368,24 +474,53 @@ pub async fn send_due_reminders(
         return outcome;
     }
 
-    let mut next = state.meta.clone();
+    #[cfg(test)]
+    let meter = phase_meter::start("meta_clone");
+    let mut next = if FULL_META {
+        #[cfg(test)]
+        {
+            oracle_meta(&mut state.meta)
+        }
+        #[cfg(not(test))]
+        {
+            state.meta.clone()
+        }
+    } else {
+        cadence_meta(&state.meta)
+    };
+    #[cfg(test)]
+    drop(meter);
     // The cadence decisions read only the baseline's scalars. Its per-part
     // measurements (one per tail part) are read once, for the count of
     // reclaimable tool outputs, straight from `conditions`, so neither copy
     // below carries them.
+    #[cfg(test)]
+    let meter = phase_meter::start("baseline_without_parts");
     next.tail_hygiene_baseline = conditions
         .baseline
         .map(mc_store::TailHygieneBaseline::clone_without_parts);
+    #[cfg(test)]
+    drop(meter);
+    #[cfg(test)]
+    let meter = phase_meter::start("baseline_clone");
     let mut baseline = next.tail_hygiene_baseline.clone();
+    #[cfg(test)]
+    drop(meter);
+    #[cfg(test)]
+    let meter = phase_meter::start("grace_decide");
     transform::apply_channel1_compliance_grace(&mut next, &mut baseline, conditions.drops_applied);
     let decision =
         transform::decide_channel1(baseline.as_ref(), &next, conditions.real_user_turn_count);
+    #[cfg(test)]
+    drop(meter);
     let carrier = conditions
         .newest_tool_tag
         .filter(|tag| Some(*tag) != state.last_tool_tag);
     let mut hints: Option<ReminderHints> = None;
     let mut hints = || -> Result<ReminderHints, String> {
         if hints.is_none() {
+            #[cfg(test)]
+            let _meter = phase_meter::start("hints");
             hints = Some((conditions.hints)()?);
         }
         Ok(hints.clone().expect("hints computed"))
@@ -432,13 +567,13 @@ pub async fn send_due_reminders(
                 &[],
             );
             state.last_tool_tag = carrier;
-            state.meta = next;
+            commit_meta::<FULL_META>(state, next);
         }
     } else {
         if !decision.fire && !conditions.drops_applied {
             transform::apply_channel1_decision_state(&mut next, &decision);
         }
-        state.meta = next;
+        commit_meta::<FULL_META>(state, next);
         outcome.not_due.push("ctx_reduce_cadence_or_carrier");
     }
 

@@ -5504,6 +5504,11 @@ pub struct McTagRow {
     pub source_bytes: std::sync::Arc<[u8]>,
 }
 
+const NEWEST_TOOL_TAGS_SQL: &str = "SELECT tag_number, block_id, kind, token_count, created_at_ms
+     FROM mc_tags WHERE session_id=?1 AND tag_number<=?2
+       AND kind IN ('tool', 'tool_call', 'tool_result')
+     ORDER BY tag_number DESC LIMIT ?3";
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct TagNumberRow {
     pub block_id: String,
@@ -9278,6 +9283,42 @@ impl McStore {
         Ok((snapshot, identity))
     }
 
+    /// Read hint policy and the stored frozen-section content identity from one
+    /// small row. Bookkeeping-only writes do not change this identity. Legacy
+    /// unhashed sections have no reusable identity and must be loaded in full.
+    pub fn load_meta_with_frozen_identity(
+        &self,
+        session_id: &str,
+    ) -> Result<(MetaSnapshot, Option<String>), McStoreError> {
+        let row = self
+            .inner
+            .with_conn(|conn| cache_codec::read_small_row(conn, session_id))?;
+        let Some(row) = row else {
+            return Ok((
+                MetaSnapshot {
+                    row_version: None,
+                    meta: ModuleMeta::default(),
+                },
+                None,
+            ));
+        };
+        let identity = cache_codec::SectionIndex::parse(&row.section_index)
+            .filter(|index| index.sv > 0 && index.f.as_ref().is_some_and(|f| f.h.is_some()))
+            .map(|index| serde_json::json!([index.sv, index.f]).to_string());
+        let mut meta = cache_codec::decode_small_meta(&row.meta)
+            .map_err(|error| McStoreError::Serde(error.to_string()))?;
+        if self.has_context_domain() {
+            meta.user_profile_version = self.user_profile_version()?;
+        }
+        Ok((
+            MetaSnapshot {
+                row_version: Some(row.row_version),
+                meta,
+            },
+            identity,
+        ))
+    }
+
     /// Read the committed boundary from the small cache header without hydrating
     /// frozen units or covered-message policy. Native endpoint validation needs
     /// only this coordinate, not the history represented by the boundary.
@@ -10360,6 +10401,38 @@ impl McStore {
                 out.push(row?);
             }
             Ok(out)
+        })?)
+    }
+
+    /// Read up to `limit` persisted tool rows newest-first, at or below `through`,
+    /// using the existing `(session_id, tag_number)` primary key. The reminder's
+    /// protection window needs token counts, so source payloads are omitted.
+    pub fn load_newest_tool_tags(
+        &self,
+        session_id: &str,
+        through: i64,
+        limit: usize,
+    ) -> Result<Vec<McTagRow>, McStoreError> {
+        Ok(self.inner.with_conn(|conn| {
+            let mut statement = conn.prepare_cached(NEWEST_TOOL_TAGS_SQL)?;
+            let rows = statement.query_map(
+                params![
+                    session_id,
+                    through,
+                    i64::try_from(limit).unwrap_or(i64::MAX)
+                ],
+                |row| {
+                    Ok(McTagRow {
+                        tag_number: row.get(0)?,
+                        block_id: row.get(1)?,
+                        kind: row.get(2)?,
+                        token_count: row.get(3)?,
+                        created_at_ms: row.get(4)?,
+                        source_bytes: Default::default(),
+                    })
+                },
+            )?;
+            rows.collect()
         })?)
     }
 
@@ -19158,6 +19231,61 @@ mod tests {
             )
             .unwrap();
         assert_eq!(enabled, 1);
+    }
+
+    #[test]
+    fn newest_tool_tag_pages_are_exact_and_use_the_existing_primary_key() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = McStore::open_for_test(&descriptor(dir.path())).unwrap();
+        store
+            .execute_tag_sql_for_test(
+                "INSERT INTO mc_tags(session_id,tag_number,block_id,kind,token_count) VALUES
+             ('s',90,'stale','tool_result',0),
+             ('s',10,'newer-message','tool_result',300),
+             ('s',80,'prose','message',1000),
+             ('s',30,'old-call','tool_call',-10),
+             ('other',100,'other','tool_result',9000);",
+            )
+            .unwrap();
+        let first = store.load_newest_tool_tags("s", i64::MAX, 2).unwrap();
+        assert_eq!(
+            first.iter().map(|row| row.tag_number).collect::<Vec<_>>(),
+            [90, 30]
+        );
+        assert_eq!(first[0].token_count, 0);
+        assert_eq!(first[1].token_count, -10);
+        assert!(first.iter().all(|row| row.source_bytes.is_empty()));
+        let second = store.load_newest_tool_tags("s", 29, 2).unwrap();
+        assert_eq!(
+            second.iter().map(|row| row.tag_number).collect::<Vec<_>>(),
+            [10]
+        );
+        assert!(store.load_newest_tool_tags("s", 9, 2).unwrap().is_empty());
+        assert!(store
+            .load_newest_tool_tags("s", i64::MAX, 0)
+            .unwrap()
+            .is_empty());
+        let plan = store
+            .inner
+            .with_conn(|conn| {
+                conn.prepare(&format!("EXPLAIN QUERY PLAN {NEWEST_TOOL_TAGS_SQL}"))?
+                    .query_map(params!["s", i64::MAX, 32], |row| row.get::<_, String>(3))?
+                    .collect::<rusqlite::Result<Vec<_>>>()
+            })
+            .unwrap();
+        eprintln!("newest-tool-tags query plan: {plan:?}");
+        assert!(
+            plan.iter().any(|detail| detail
+                .contains("SEARCH mc_tags USING INDEX sqlite_autoindex_mc_tags_1")
+                && detail.contains("session_id=? AND tag_number<?")),
+            "{plan:?}"
+        );
+        assert!(
+            !plan
+                .iter()
+                .any(|detail| detail.contains("SCAN") || detail.contains("TEMP B-TREE")),
+            "{plan:?}"
+        );
     }
 
     fn descriptor(dir: &std::path::Path) -> StorageDescriptor {
