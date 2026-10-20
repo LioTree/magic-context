@@ -10391,8 +10391,9 @@ impl McStore {
         })?)
     }
 
-    /// Read a reverse page of persisted tool accounting through the existing
-    /// `(session_id, tag_number)` primary key. Protection needs counts, not payloads.
+    /// Read up to `limit` persisted tool rows newest-first, at or below `through`,
+    /// using the existing `(session_id, tag_number)` primary key. The reminder's
+    /// protection window needs token counts, so source payloads are omitted.
     pub fn load_newest_tool_tags(
         &self,
         session_id: &str,
