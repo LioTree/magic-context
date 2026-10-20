@@ -175,6 +175,29 @@ fn message(profile: Profile, n: u64, salt: u64) -> ReadMessage {
     entry
 }
 
+/// A tool result naming a call no earlier message made: a transcript the
+/// engine refuses ("starts inside a tool arc") however often it is retried.
+/// OpenCode carries a call and its result in one part, so it has none.
+fn orphan(profile: Profile, n: u64) -> Option<ReadMessage> {
+    let call = format!("ghost{n}");
+    let message = match profile {
+        Profile::OpenCode => return None,
+        Profile::Broca => {
+            json!({"role":"tool","content":[{"type":"tool_result","tool_call_id":call,"output":{"kind":"text","text":output(n, 7)},"is_error":false}]})
+        }
+        Profile::Pi => {
+            json!({"type":"message","id":format!("m{n}"),"parentId":format!("m{}", n.saturating_sub(1)),"timestamp":"2026-05-01T16:52:33.700Z","message":{"role":"toolResult","toolCallId":call,"toolName":"read","content":[{"type":"text","text":output(n, 7)}],"isError":false}})
+        }
+        Profile::Anthropic => {
+            json!({"role":"user","content":[{"type":"tool_result","tool_use_id":call,"content":output(n, 7)}]})
+        }
+    };
+    Some(
+        ReadMessage::new(n, format!("m{n}"), message)
+            .with_tags(vec![tags::PartTag::tagged("0", tag(n, 0))]),
+    )
+}
+
 /// The runner both providers read: one shared transcript and lineage.
 #[derive(Default)]
 struct Transcript {
@@ -285,7 +308,12 @@ impl Drop for Side {
 }
 
 impl Side {
-    async fn new(project: &Path, transcript: &Arc<Transcript>, oracle: bool) -> Self {
+    async fn new(
+        project: &Path,
+        transcript: &Arc<Transcript>,
+        oracle: bool,
+        inject_docs: bool,
+    ) -> Self {
         let dir = tempfile::tempdir().unwrap();
         let db = dir.path().join("store.db");
         let descriptor = StorageDescriptor {
@@ -305,7 +333,7 @@ impl Side {
         h.store.set(store).ok().unwrap();
         h.provider_runner = runner.clone();
         let config = McModuleConfig {
-            inject_docs: false,
+            inject_docs,
             protected_tokens_user: Some(0),
             protected_tools: BTreeMap::new(),
             ..Default::default()
@@ -435,13 +463,31 @@ struct Pair {
 
 impl Pair {
     async fn new(profile: Profile, tiny_budget: bool) -> Self {
+        Self::open(profile, tiny_budget, Some("L"), false).await
+    }
+
+    /// A pair whose Setup names `setup_lineage` (none when the runner has no
+    /// lineage yet) and, with `inject_docs`, renders the project's docs.
+    async fn open(
+        profile: Profile,
+        tiny_budget: bool,
+        setup_lineage: Option<&str>,
+        inject_docs: bool,
+    ) -> Self {
         let project = tempfile::tempdir().unwrap();
         let transcript = Arc::new(Transcript {
             lineage: Mutex::new("L".into()),
             ..Default::default()
         });
-        let resident = Side::new(project.path(), &transcript, false).await;
-        let oracle = Side::new(project.path(), &transcript, true).await;
+        if inject_docs {
+            std::fs::write(
+                project.path().join("AGENTS.md"),
+                "# Project rules\n\nKeep changes small and run the tests.\n",
+            )
+            .unwrap();
+        }
+        let resident = Side::new(project.path(), &transcript, false, inject_docs).await;
+        let oracle = Side::new(project.path(), &transcript, true, inject_docs).await;
         if tiny_budget {
             resident
                 .h
@@ -464,7 +510,10 @@ impl Pair {
             log: Vec::new(),
             _project: project,
         };
-        let setup = json!({"method":"compaction.setup","params":{"session":"s","harness":profile.harness(),"request_id":"setup","model":"fixture","context_window":100_000,"composition":{"render_tags":true},"params":{"serializer_profile":profile.wire()},"lineage_id":"L","now":1}});
+        let mut setup = json!({"method":"compaction.setup","params":{"session":"s","harness":profile.harness(),"request_id":"setup","model":"fixture","context_window":100_000,"composition":{"render_tags":true},"params":{"serializer_profile":profile.wire()},"now":1}});
+        if let Some(lineage) = setup_lineage {
+            setup["params"]["lineage_id"] = json!(lineage);
+        }
         pair.both("setup", |side| Box::pin(side.dispatch(setup.clone())))
             .await;
         pair
@@ -482,8 +531,9 @@ impl Pair {
         entries.extend((next..next + count).map(|n| message(self.profile, n, salt)));
     }
 
-    /// Run `op` on both sides and require identical answers and stores.
-    async fn both<F>(&mut self, label: &str, op: F)
+    /// Run `op` on both sides, require identical answers and stores, and
+    /// return the answer.
+    async fn both<F>(&mut self, label: &str, op: F) -> String
     where
         F: for<'a> Fn(&'a Side) -> Answer<'a>,
     {
@@ -501,6 +551,7 @@ impl Pair {
             self.log
         );
         self.compare(label);
+        resident
     }
 
     fn compare(&self, label: &str) {
@@ -547,8 +598,38 @@ impl Pair {
             .collect()
     }
 
-    async fn notice(&mut self, rng: &mut Rng, descent: Option<String>) {
+    async fn notice(&mut self, rng: &mut Rng, descent: Option<String>) -> String {
         self.seq += 1;
+        let message = self.notice_message(rng, descent);
+        self.deliver(message).await
+    }
+
+    /// Deliver `message` to both providers straight, as the bus loop does.
+    async fn deliver(&mut self, message: cortexkit_bus_trait::Message) -> String {
+        let label = format!(
+            "notice {} est={} model={}",
+            message.headers["seq"],
+            message.headers.get("est_tokens").map_or("", String::as_str),
+            self.model
+        );
+        self.both(&label, |side| {
+            let message = message.clone();
+            Box::pin(async move {
+                match side.h.advance_compaction("fixture", &message).await {
+                    Ok(()) => "ok".to_owned(),
+                    Err(error) => format!("{error:?}"),
+                }
+            })
+        })
+        .await
+    }
+
+    /// The next notice: random usage, model, acknowledgement and events.
+    fn notice_message(
+        &mut self,
+        rng: &mut Rng,
+        descent: Option<String>,
+    ) -> cortexkit_bus_trait::Message {
         let seq = self.seq;
         let (last_ordinal, digest) = {
             let entries = self.transcript.entries.lock().unwrap();
@@ -622,23 +703,12 @@ impl Pair {
             headers.insert("descends_from".into(), descent);
         }
         let notice = notice::AdvanceNotice::from_headers(&headers).unwrap();
-        let message = cortexkit_bus_trait::Message {
+        cortexkit_bus_trait::Message {
             subject: notice::event_subject("fixture", "thalamus-harness", notice::ADVANCED_EVENT),
             id: bus_id(&self.reference, "advanced", seq),
             digest: notice.digest().parse().unwrap(),
             headers,
-        };
-        let label = format!("notice {seq} est={est} model={}", self.model);
-        self.both(&label, |side| {
-            let message = message.clone();
-            Box::pin(async move {
-                match side.h.advance_compaction("fixture", &message).await {
-                    Ok(()) => "ok".to_owned(),
-                    Err(error) => format!("{error:?}"),
-                }
-            })
-        })
-        .await;
+        }
     }
 
     fn tags(&self) -> Vec<u64> {
@@ -684,31 +754,7 @@ impl Pair {
                 let reference = self.reference.clone();
                 self.both("historian publish", |side| {
                     let reference = reference.clone();
-                    Box::pin(async move {
-                        let store = side.store();
-                        let Some(head) = load_head(store, &reference).unwrap() else {
-                            return "no conversation".into();
-                        };
-                        let namespace = head.namespace();
-                        store
-                            .replace_compartments(
-                                &namespace,
-                                &[mc_store::StoredCompartment {
-                                    sequence: 1,
-                                    start_message: 0,
-                                    end_message: end as i64,
-                                    end_message_id: format!("m{end}#0"),
-                                    title: "history".into(),
-                                    content: format!("summary through {end}"),
-                                    p1: Some(format!("summary through {end}")),
-                                    importance: 50,
-                                    ..Default::default()
-                                }],
-                            )
-                            .unwrap();
-                        store.arm_soft_refresh(&namespace).unwrap();
-                        "published".into()
-                    })
+                    Box::pin(async move { publish_history(side, &reference, end) })
                 })
                 .await;
                 self.append(1 + rng.below(3));
@@ -801,6 +847,18 @@ impl Pair {
                 self.append_salted(1 + rng.below(3), 9_000 + self.seq);
                 self.notice(rng, None).await;
             }
+            91..=92 if self.profile != Profile::OpenCode => {
+                // A transcript the engine refuses: the conversation fails
+                // after a bounded number of attempts on both sides.
+                {
+                    let mut entries = self.transcript.entries.lock().unwrap();
+                    let next = entries.last().map_or(0, |entry| entry.ordinal + 1);
+                    entries.extend(orphan(self.profile, next));
+                }
+                for _ in 0..MAX_PROTOCOL_ATTEMPTS {
+                    self.notice(rng, None).await;
+                }
+            }
             91..=95 => {
                 // A ck-mc restart: nothing stays resident.
                 self.resident
@@ -829,7 +887,11 @@ impl Pair {
 
 async fn session(profile: Profile, seed: u64, steps: u64) -> usize {
     let mut rng = Rng(seed.wrapping_mul(0x9E37_79B9_7F4A_7C15) | 1);
-    let mut pair = Pair::new(profile, rng.chance(10)).await;
+    let tiny_budget = rng.chance(10);
+    // A runner with no lineage yet sends Setup without one.
+    let setup_lineage = (!rng.chance(25)).then_some("L");
+    let inject_docs = rng.chance(30);
+    let mut pair = Pair::open(profile, tiny_budget, setup_lineage, inject_docs).await;
     pair.append(16 + rng.below(40));
     pair.notice(&mut rng, None).await;
     for _ in 0..steps {
@@ -880,4 +942,135 @@ async fn resident_matches_the_full_recompute_oracle_over_many_sessions() {
         task.await.unwrap();
     }
     eprintln!("differential: {sessions} sessions, {steps} steps each");
+}
+
+/// A Setup without a lineage, then notices naming the runner's lineage: the
+/// first lineage is adopted, not refused, and a view publishes.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn setup_without_a_lineage_adopts_the_first_one_and_publishes() {
+    let mut rng = Rng(7);
+    let mut pair = Pair::open(Profile::OpenCode, false, None, false).await;
+    *pair.transcript.lineage.lock().unwrap() = "runner-lineage".into();
+    pair.append(30);
+    assert_eq!(pair.notice(&mut rng, None).await, "ok");
+    let reference = pair.reference.clone();
+    pair.both("historian publish", |side| {
+        let reference = reference.clone();
+        Box::pin(async move { publish_history(side, &reference, 12) })
+    })
+    .await;
+    pair.append(2);
+    assert_eq!(pair.notice(&mut rng, None).await, "ok");
+    let (views, _) = pair.oracle.views(&pair.reference);
+    let (_, newest) = views.last().expect("a view publishes");
+    let view: view::CompactionView = serde_json::from_str(newest).unwrap();
+    assert_eq!(view.lineage_id, "runner-lineage");
+    assert_eq!(
+        pair.oracle.decisions(&pair.reference).unwrap(),
+        pair.resident.decisions(&pair.reference).unwrap()
+    );
+}
+
+/// A lineage change without a fork descent is a resync (contract §5.2), not
+/// an error: the provider re-reads the new lineage and publishes a view at a
+/// higher version.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_lineage_change_without_descent_resyncs_and_publishes() {
+    let mut rng = Rng(11);
+    let mut pair = Pair::new(Profile::Anthropic, false).await;
+    pair.append(24);
+    assert_eq!(pair.notice(&mut rng, None).await, "ok");
+    let before = pair.newest_versions().last().copied().unwrap_or(0);
+    *pair.transcript.lineage.lock().unwrap() = "L-restored".into();
+    pair.append(4);
+    assert_eq!(pair.notice(&mut rng, None).await, "ok");
+    let (views, _) = pair.oracle.views(&pair.reference);
+    let (version, newest) = views.last().expect("the resync publishes a view");
+    assert!(
+        *version > before,
+        "the resync view is newer: {version} vs {before}"
+    );
+    let view: view::CompactionView = serde_json::from_str(newest).unwrap();
+    assert_eq!(view.lineage_id, "L-restored");
+}
+
+/// A notice the engine refuses on protocol grounds is retried a bounded
+/// number of times, then the conversation is in the named `failed` state:
+/// readable in its record and in a ride's error, with later notices
+/// acknowledged without work.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_protocol_error_fails_the_conversation_after_bounded_attempts() {
+    let mut rng = Rng(13);
+    let mut pair = Pair::new(Profile::Broca, false).await;
+    pair.append(9);
+    assert_eq!(pair.notice(&mut rng, None).await, "ok");
+    {
+        let mut entries = pair.transcript.entries.lock().unwrap();
+        let next = entries.last().unwrap().ordinal + 1;
+        entries.extend(orphan(Profile::Broca, next));
+    }
+    pair.seq += 1;
+    let message = pair.notice_message(&mut rng, None);
+    let mut answers = Vec::new();
+    for _ in 0..MAX_PROTOCOL_ATTEMPTS {
+        answers.push(pair.deliver(message.clone()).await);
+    }
+    assert!(
+        answers[..answers.len() - 1]
+            .iter()
+            .all(|answer| answer.contains("transient") && answer.contains(PROTOCOL_ERROR)),
+        "{answers:?}"
+    );
+    assert_eq!(
+        answers.last().unwrap(),
+        "ok",
+        "the bound acknowledges the notice"
+    );
+    for side in [&pair.resident, &pair.oracle] {
+        let state = load_head(side.store(), &pair.reference).unwrap().unwrap();
+        let failure = state.failure.expect("a named failure state");
+        assert_eq!(failure.state, FailureState::Failed);
+        assert_eq!(failure.code, PROTOCOL_ERROR);
+        assert_eq!(failure.attempts, MAX_PROTOCOL_ATTEMPTS);
+        assert!(failure.reason.contains("tool arc"), "{}", failure.reason);
+    }
+    pair.append(1);
+    assert_eq!(
+        pair.notice(&mut rng, None).await,
+        "ok",
+        "a failed conversation acknowledges"
+    );
+    let request = json!({"method":"compaction.ride","params":{"session_ref":pair.reference,"cause":"ceiling","deadline_ms":10_000}});
+    let ride = pair
+        .both("ride", |side| Box::pin(side.dispatch(request.clone())))
+        .await;
+    assert!(ride.contains(FAILED_ERROR), "{ride}");
+}
+
+/// A finished historian summary through `end`, as a historian publication
+/// leaves it: the compartment and an armed refresh.
+fn publish_history(side: &Side, reference: &str, end: u64) -> String {
+    let store = side.store();
+    let Some(head) = load_head(store, reference).unwrap() else {
+        return "no conversation".into();
+    };
+    let namespace = head.namespace();
+    store
+        .replace_compartments(
+            &namespace,
+            &[mc_store::StoredCompartment {
+                sequence: 1,
+                start_message: 0,
+                end_message: end as i64,
+                end_message_id: format!("m{end}#0"),
+                title: "history".into(),
+                content: format!("summary through {end}"),
+                p1: Some(format!("summary through {end}")),
+                importance: 50,
+                ..Default::default()
+            }],
+        )
+        .unwrap();
+    store.arm_soft_refresh(&namespace).unwrap();
+    "published".into()
 }

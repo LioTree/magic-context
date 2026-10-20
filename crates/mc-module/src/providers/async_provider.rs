@@ -101,6 +101,10 @@ pub(crate) struct AsyncRecord {
     resync_sources: Option<ResyncSources>,
     #[serde(default)]
     restored_head: Option<RestoredHead>,
+    /// A protocol error met while advancing this conversation; see
+    /// `record_protocol_failure`. Absent while the conversation is healthy.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub(crate) failure: Option<AsyncFailure>,
     #[serde(default)]
     last_discarded_drops: usize,
     #[serde(default)]
@@ -177,6 +181,63 @@ pub(crate) struct AsyncRecord {
     generation: u64,
 }
 type State = AsyncRecord;
+
+/// The error code of an engine refusal that retrying the same input cannot
+/// clear: the conversation's state or transcript breaks the engine's
+/// protocol. A notice that meets one is retried at most
+/// `MAX_PROTOCOL_ATTEMPTS` times in a row, then the conversation fails.
+const PROTOCOL_ERROR: &str = "compaction_protocol";
+const MAX_PROTOCOL_ATTEMPTS: u32 = 3;
+/// The error code a ride answers for a failed conversation. The contract
+/// reads a ride `ERROR` as `nothing`, so the runner keeps its current view
+/// while the failure stays readable in the answer.
+const FAILED_ERROR: &str = "compaction_failed";
+
+/// A conversation's protocol failure, stored in its record.
+#[derive(Serialize, Deserialize, Clone, Debug, PartialEq, Eq)]
+pub(crate) struct AsyncFailure {
+    /// `retrying` until the attempt bound, then `failed`: notices are then
+    /// acknowledged without work and rides refused with `compaction_failed`,
+    /// until the runner moves the conversation to a new lineage.
+    pub state: FailureState,
+    pub code: String,
+    pub reason: String,
+    /// The notice whose processing failed last.
+    pub seq: u64,
+    /// Consecutive failed attempts.
+    pub attempts: u32,
+}
+
+#[derive(Serialize, Deserialize, Clone, Copy, Debug, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub(crate) enum FailureState {
+    Retrying,
+    Failed,
+}
+
+impl AsyncRecord {
+    fn failed(&self) -> bool {
+        self.failure
+            .as_ref()
+            .is_some_and(|failure| failure.state == FailureState::Failed)
+    }
+}
+
+/// Classify an engine error. A range that ends inside a tool arc clears once
+/// the runner writes the tool's result, so it stays retryable; every other
+/// lineage or ordinal refusal is a protocol error.
+fn engine_error(failure: transform::TransformError) -> HandlerOutcome {
+    match &failure {
+        transform::TransformError::LineageProtocol(reason)
+            if reason.contains("ends inside a tool arc") =>
+        {
+            transient(failure)
+        }
+        transform::TransformError::LineageProtocol(_)
+        | transform::TransformError::OrdinalViolation => error(PROTOCOL_ERROR, failure),
+        _ => transient(failure),
+    }
+}
 
 /// Where an engine baseline (`last_produced` / `last_applied`) is stored.
 /// A baseline that is one of the retained published views is only named by
@@ -539,6 +600,31 @@ impl State {
         })
     }
 
+    /// Take the first lineage the runner names after a Setup that carried
+    /// none. Setup's initial view was built for no lineage; the first
+    /// lineage is its first assignment, not a change, so the view's range
+    /// takes it on. A held conversation already bound to a lineage, or one
+    /// a resync emptied, has nothing to rebind.
+    fn adopt_first_lineage(&mut self, lineage: &str) -> Result<(), HandlerOutcome> {
+        let unbound = |view: &Option<EngineView>| {
+            view.as_ref()
+                .is_some_and(|view| view.identity.1.lineage_id.is_empty())
+        };
+        if !unbound(&self.produced_view) && !unbound(&self.applied_view) {
+            return Ok(());
+        }
+        let mut engine = self.engine_with_baselines()?;
+        for view in [&mut engine.last_produced, &mut engine.last_applied]
+            .into_iter()
+            .flatten()
+        {
+            if view.range.lineage_id.is_empty() {
+                view.range.lineage_id = lineage.into();
+            }
+        }
+        self.adopt_engine(engine)
+    }
+
     /// The engine state with its baselines parsed, for one engine pass or a
     /// descent. Hand the result back with `adopt_engine`.
     fn engine_with_baselines(&self) -> Result<transform::compaction::State, HandlerOutcome> {
@@ -824,6 +910,9 @@ impl State {
             });
         }
         self.resync = true;
+        // The runner's own recovery from a broken lineage is a new one
+        // (contract §5.3); a resync starts the conversation over.
+        self.failure = None;
         self.restored_no_new_content = false;
         self.restored_head = None;
         self.truncate_entries(None);
@@ -1107,6 +1196,7 @@ impl McHandler {
             restored_no_new_content: false,
             resync_sources: None,
             restored_head: None,
+            failure: None,
             last_discarded_drops: 0,
             last_transferred_drops: 0,
             tag_index: BTreeMap::new(),
@@ -1246,7 +1336,7 @@ impl McHandler {
         } else {
             transform::compaction::step_with(store, &template, &context, status, engine, signed)
         }
-        .map_err(transient)?;
+        .map_err(engine_error)?;
         Ok((template, output))
     }
 }
@@ -1686,7 +1776,70 @@ impl McHandler {
         Ok(())
     }
 
+    /// Advance a conversation on one notice. A protocol error is counted on
+    /// the conversation and retried a bounded number of times; see
+    /// `record_protocol_failure`.
     pub(super) async fn advance_compaction(
+        &self,
+        account: &str,
+        message: &cortexkit_bus_trait::Message,
+    ) -> Result<(), HandlerOutcome> {
+        match self.advance_compaction_once(account, message).await {
+            Err(HandlerOutcome::Error {
+                code,
+                message: reason,
+            }) if code == PROTOCOL_ERROR => self.record_protocol_failure(message, &reason).await,
+            other => other,
+        }
+    }
+
+    /// Count a protocol error against the conversation a notice names. Below
+    /// the bound the notice is retried (a transient error); at the bound the
+    /// conversation enters the `failed` state, readable in its record and in
+    /// every ride answer, and the notice is acknowledged.
+    async fn record_protocol_failure(
+        &self,
+        message: &cortexkit_bus_trait::Message,
+        reason: &str,
+    ) -> Result<(), HandlerOutcome> {
+        let notice = notice::AdvanceNotice::from_headers(&message.headers)
+            .map_err(|e| invalid_field("notice", e.name()))?;
+        let store = self
+            .store
+            .get()
+            .ok_or_else(|| transient("store unavailable"))?;
+        let Some(head) = load_head(store, &notice.session_ref)? else {
+            return Ok(());
+        };
+        let _serial = self.provider_serial.lock_for(&head.key).await;
+        let Some(mut state) = self.checkout(store, &notice.session_ref)? else {
+            return Ok(());
+        };
+        let failure = state.failure.get_or_insert_with(|| AsyncFailure {
+            state: FailureState::Retrying,
+            code: PROTOCOL_ERROR.into(),
+            reason: String::new(),
+            seq: notice.seq,
+            attempts: 0,
+        });
+        failure.attempts = failure.attempts.saturating_add(1);
+        failure.reason = reason.into();
+        failure.seq = notice.seq;
+        let failed = failure.attempts >= MAX_PROTOCOL_ATTEMPTS;
+        if failed {
+            failure.state = FailureState::Failed;
+            tracing::error!(session_ref=%notice.session_ref, code=PROTOCOL_ERROR, reason, attempts=failure.attempts, "async compaction conversation failed");
+        }
+        state.save(store, &[])?;
+        self.checkin(state);
+        if failed {
+            Ok(())
+        } else {
+            Err(transient(format!("{PROTOCOL_ERROR}: {reason}")))
+        }
+    }
+
+    async fn advance_compaction_once(
         &self,
         account: &str,
         message: &cortexkit_bus_trait::Message,
@@ -1717,6 +1870,16 @@ impl McHandler {
         state = self
             .checkout(store, &notice.session_ref)?
             .ok_or_else(|| transient("async session disappeared"))?;
+        let moves_lineage = message
+            .headers
+            .get("lineage_id")
+            .is_some_and(|new| state.lineage.as_ref().is_some_and(|old| old != new));
+        if state.failed() && !moves_lineage {
+            // A failed conversation does no work until the runner moves it
+            // to a new lineage; the notice is acknowledged.
+            self.checkin(state);
+            return Ok(());
+        }
         let duplicate = notice.seq <= state.seq;
         let mut descended = false;
         if let Some(lineage) = message
@@ -1734,10 +1897,11 @@ impl McHandler {
                 let mut engine = state.engine_with_baselines()?;
                 engine
                     .descend(lineage, &parent, through)
-                    .map_err(transient)?;
+                    .map_err(engine_error)?;
                 engine.last_applied = None;
                 state.adopt_engine(engine)?;
                 state.lineage = Some(lineage.clone());
+                state.failure = None;
                 let retained = store
                     .load_compartments(&state.namespace())
                     .map_err(transient)?
@@ -1853,6 +2017,9 @@ impl McHandler {
         #[cfg(test)]
         let phase = scaling_tests::save_meter::start_kind(&notice.session_ref, "phase:cadence");
         let historian_due = self.advance_async_historian_cadence(&mut state, codec)?;
+        // This notice went through: earlier protocol errors were transient
+        // after all.
+        state.failure = None;
         state.save(store, &[])?;
         #[cfg(test)]
         drop(phase);
@@ -1896,6 +2063,9 @@ impl McHandler {
                 .ok_or_else(|| transient("async read has no lineage"))?;
             if state.lineage.as_deref().is_some_and(|held| held != lineage) {
                 return Err(transient("async lineage changed"));
+            }
+            if state.lineage.is_none() {
+                state.adopt_first_lineage(lineage)?;
             }
             state.lineage = Some(lineage.into());
             let entries: Vec<ReadMessage> = decode(&page["messages"])?;
@@ -2351,6 +2521,13 @@ impl McHandler {
                 return bytes(&ride::RideAnswer::nothing());
             };
             self.authorize_async(binding, &state)?;
+            if let Some(failure) = state.failure.as_ref().filter(|_| state.failed()) {
+                return Err(HandlerOutcome::ErrorWithDetail {
+                    code: FAILED_ERROR.into(),
+                    message: format!("async compaction failed: {}", failure.reason),
+                    detail: serde_json::to_value(failure).map_err(transient)?,
+                });
+            }
             let _serial = self.provider_serial.lock_for(&state.key).await;
             state = self
                 .checkout(store, &request.session_ref)?
