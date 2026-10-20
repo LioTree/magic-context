@@ -232,5 +232,10 @@ mod tests {
                 .unwrap_err();
             assert!(error.to_string().contains("output_fills_window"), "{error}");
         }
+        let mut unknown = BTreeMap::new();
+        limits
+            .fit_limits(&["p/m".into()], &mut unknown, None, 32_000)
+            .unwrap();
+        assert_eq!(unknown["p/m"].input, Some(96_000));
     }
 }

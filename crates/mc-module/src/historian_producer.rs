@@ -4052,10 +4052,17 @@ pub(crate) mod tests {
     async fn missing_follow_groups_are_named_before_any_send() {
         for missing in ["run_ops", "run_status"] {
             let server = fake_server(json!({"run_id":"run-1"}), vec![]).await;
-            let groups: Vec<_> = ["run_ops", "run_status", "streaming"]
-                .into_iter()
-                .filter(|group| *group != missing)
-                .collect();
+            let groups: Vec<_> = [
+                "run_ops",
+                "run_status",
+                "streaming",
+                "no_tools",
+                "max_steps",
+                "max_output_tokens",
+            ]
+            .into_iter()
+            .filter(|group| *group != missing)
+            .collect();
             server.answers.lock().await.describe = Some(json!({"capabilities":groups}));
             let mut producer = client(&server).await;
             let error = producer
