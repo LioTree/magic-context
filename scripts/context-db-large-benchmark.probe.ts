@@ -1,4 +1,6 @@
 import { Database } from "bun:sqlite";
+import { foregroundMeter, summarizeForeground } from "./context-db-foreground-meter";
+import { spyOn } from "bun:test";
 
 type Owner = { name: string; pagetype: string };
 type Sample = { bytes: Buffer; owners: Map<number, Owner>; meta: Record<string, unknown> };
@@ -65,6 +67,9 @@ const flag=(key:string,fallback:string)=>process.argv.includes(key)?process.argv
 const root=resolve(flag('--root','local-ignore/large-benchmark'));
 const tree=resolve(flag('--tree','.'));
 const passes=Number(flag('--passes','50'));
+const foreground=flag('--foreground','0')==='1';
+const host=flag('--host','pi');
+if(!['pi','oc1'].includes(host))throw new Error('unsupported benchmark host');
 let now=1_900_000_000_000;
 const RealDate=Date;
 globalThis.Date=class extends RealDate {constructor(...args:any[]){if(args.length)super(...args as [any]);else super(now);}static now(){return now;}} as DateConstructor;
@@ -73,6 +78,7 @@ process.env.OPENCODE_DB=join(root,'opencode.db');
 const core=(path:string)=>import(join(tree,'packages/plugin/src',path));
 const pi=(path:string)=>import(join(tree,'packages/pi-plugin/src',path));
 const utils=await pi('test-utils.test.ts');
+const {setHarness}=await core('shared/harness.ts');setHarness(host==='pi'?'pi':'opencode');
 const {registerPiContextHandler}=await pi('context-handler.ts');
 const {insertMemory}=await core('features/magic-context/memory/storage-memory.ts');
 const {resolveProjectIdentityForSession}=await core('features/magic-context/memory/project-identity.ts');
@@ -86,11 +92,13 @@ const {createCtxReduceTools}=await core('tools/ctx-reduce/tools.ts');
 const {executeFlush}=await core('hooks/magic-context/execute-flush.ts');
 const lkg=await core('hooks/magic-context/lkg-persist.ts');
 const {checkLkgDurability}=await core('hooks/magic-context/lkg-served-marker.ts');
+const {providerVisibleMessage}=await core('hooks/magic-context/provider-visible-parts.ts');
 const {setMuralCue,computeCueContentHash}=await core('features/magic-context/mural/storage-mural-cues.ts');
 const {refreshModelLimitsFromApi}=await core('shared/models-dev-cache.ts');
 await refreshModelLimitsFromApi({config:{providers:async()=>({data:{providers:[{id:'anthropic',models:{'claude-sonnet-4-5':{input:['text','image'],limit:{context:2000000,output:10000}}}}]}})}});
-const db=utils.createTestDb(join(root,'context.db'));
-const m=meter(db);
+const db=host==='pi'?utils.createTestDb(join(root,'context.db')):(await core('features/magic-context/storage.ts')).openDatabase(join(root,'context.db'));
+const foregroundTiming=foreground?foregroundMeter(db):undefined;
+const m=foreground?{changes:[] as Change[],start:(_:number)=>{},stop:()=>{}}:meter(db);
 const sessionId='large-retained-history';
 const directory=join(root,'project');mkdirSync(directory,{recursive:true});
 const projectPath=resolveProjectIdentityForSession(directory,true);
@@ -102,7 +110,7 @@ for(let i=0;i<500;i++) {
 }
 replaceAllCompartments(db,sessionId,[{sequence:0,startMessage:1,endMessage:2,startMessageId:'entry-0',endMessageId:'entry-1',title:'Opening work',content:'Validated the request schema and cross-checked the deployment configuration. '.repeat(1000)}]);
 const fake=utils.createFakePi();Object.assign(fake.pi,{getAllTools:()=>[]});
-registerPiContextHandler(fake.pi,{db,signedThinkingHold:'on',scheduler:{executeThresholdPercentage:80},heuristics:{keepReasoningTokens:1000,clearReasoningAge:2,protectedTools:{Read:0}},injection:{memoryEnabled:true,injectionBudgetTokens:30000,injectDocs:false,temporalAwareness:false,muralEnabled:true}});
+if(host==='pi')registerPiContextHandler(fake.pi,{db,signedThinkingHold:'on',scheduler:{executeThresholdPercentage:80},heuristics:{keepReasoningTokens:1000,clearReasoningAge:2,protectedTools:{Read:0}},injection:{memoryEnabled:true,injectionBudgetTokens:30000,injectDocs:false,temporalAwareness:false,muralEnabled:true}});
 const reduce=createCtxReduceTools({db,protectedSet:new Set(),protectedTools:{Read:0},getSessionTokens:()=>50000}).ctx_reduce;
 const model={provider:'anthropic',id:'claude-sonnet-4-5',api:'anthropic-messages',contextWindow:2000000,maxTokens:10000};
 const raw:any[]=[utils.userMessage('Opening work',1),utils.assistantMessage('Opening reply',2,{api:model.api,provider:model.provider,model:model.id})];
@@ -111,6 +119,50 @@ const cacheColumns=['cached_m0_bytes','cached_m1_bytes','cached_m0_mural_data_ur
 const inline=new Set((db.prepare('PRAGMA table_info(session_meta)').all() as {name:string}[]).map(r=>r.name));
 const modernCollections=inline.has('trailing_blank_decisions')?undefined:await core('features/magic-context/storage-session-collections.ts');
 const modernCache=inline.has('cached_m0_bytes')?undefined:await core('features/magic-context/storage-session-cache.ts');
+if(foregroundTiming && modernCollections) {
+ const layout=await core('features/magic-context/session-meta-chunk-layout.ts');
+ const original=layout.layoutSessionMetaBytes;
+ spyOn(layout,'layoutSessionMetaBytes').mockImplementation((bytes:Uint8Array)=>foregroundTiming.layout(()=>original(bytes)));
+}
+let ocHandler:any,ocDb:any;
+const usageMap=new Map<string,any>();
+if(host==='oc1') {
+ const {createTagger}=await core('features/magic-context/tagger.ts');
+ const {createTransform}=await core('hooks/magic-context/transform.ts');
+ const {createMessagesTransformHandler}=await core('plugin/messages-transform.ts');
+ const {Database:HostDatabase}=await core('shared/sqlite.ts');
+ const {OPENCODE1_MESSAGE_PART_SCHEMA}=await core('features/magic-context/__tests__/opencode1-query-fixture.ts');
+ ocDb=new HostDatabase(process.env.OPENCODE_DB!);ocDb.exec(OPENCODE1_MESSAGE_PART_SCHEMA);
+ const transform=createTransform({db,directory,projectPath,tagger:createTagger(),signedThinkingHold:'on',scheduler:{shouldExecute:()=> 'defer'},contextUsageMap:usageMap,historyRefreshSessions:new Set(),pendingMaterializationSessions:new Set(),lastHeuristicsTurnId:new Map(),historianRunnable:false,protectedTokens:0,protectedTools:{Read:0},clearReasoningAge:2,memoryConfig:{enabled:true,injectionBudgetTokens:30000,autoPromote:false},injectDocs:false,muralEnabled:true,liveModelBySession:new Map([[sessionId,{providerID:model.provider,modelID:model.id}]])});
+ ocHandler=createMessagesTransformHandler({magicContext:{'experimental.chat.messages.transform':transform}});
+}
+let storedMessages=0;
+function ocMessages() {
+ const messages:any[]=[];
+ for(let i=0;i<raw.length;i++) {
+  const message=raw[i];if(message.role==='toolResult')continue;
+  const id=`entry-${i}`,parts:any[]=[];
+  for(const part of typeof message.content==='string'?[{type:'text',text:message.content}]:message.content) {
+   if(part.type==='text')parts.push({type:'text',text:part.text});
+   if(part.type==='thinking')parts.push({type:'reasoning',text:part.thinking,metadata:{anthropic:{signature:part.thinkingSignature}}});
+   if(part.type==='toolCall') {
+    const result=raw.slice(i+1).find((value:any)=>value.role==='toolResult'&&value.toolCallId===part.id);
+    const output=result?(typeof result.content==='string'?result.content:result.content.filter((p:any)=>p.type==='text').map((p:any)=>p.text).join('\n')):'';
+    parts.push({type:'tool',tool:part.name,callID:part.id,state:{status:'completed',input:part.arguments,output,title:part.name,time:{start:i+1,end:i+2}}});
+   }
+  }
+  parts.forEach((part,index)=>Object.assign(part,{id:`${id}-part-${index}`,messageID:id,sessionID:sessionId}));
+  messages.push({info:{id,sessionID:sessionId,role:message.role,time:{created:i+1,completed:i+2},model:{providerID:model.provider,modelID:model.id},providerID:model.provider,modelID:model.id,finish:'stop'},parts});
+ }
+ ocDb.transaction(()=>{
+  for(const message of messages.slice(storedMessages)) {
+   const {id,sessionID:_session,...data}=message.info;
+   ocDb.prepare('INSERT INTO message VALUES (?,?,?,?,?)').run(id,sessionId,data.time.created,data.time.completed,JSON.stringify(data));
+   for(const part of message.parts) {const {id:partId,messageID:_m,sessionID:_s,...body}=part;ocDb.prepare('INSERT INTO part VALUES (?,?,?,?,?,?)').run(partId,id,sessionId,data.time.created,data.time.completed,JSON.stringify(body));}
+  }
+ }).immediate();
+ storedMessages=messages.length;return messages;
+}
 function read(column:string):Buffer|null {
  const sql=inline.has(column)?column:collections.includes(column)?modernCollections.sessionMetaCollectionValueSql(column):modernCache.sessionRenderCacheValueSql(column);
  const row=db.prepare(`SELECT CAST(${sql} AS BLOB) AS raw FROM session_meta WHERE session_id=?`).get(sessionId) as {raw:Uint8Array|null};
@@ -181,22 +233,28 @@ for(let pass=0;pass<=passes;pass++) {
    raw.push(a,utils.toolResultMessage(call,`Result ${pass}/${j}: `+'const stableName = validateBoundary(input);\n'.repeat(90),raw.length+2));
   }
   raw.push(utils.assistantMessage(`Completed ${pass}.`,raw.length+1,{api:model.api,provider:model.provider,model:model.id}));
+  if(host==='oc1')raw.push(utils.userMessage(`Continue after completed task ${pass}.`,raw.length+1));
  }
- const before=pass>0?Object.fromEntries(collections.map(column=>[column,read(column)])):{};
- if(pass>0)m.start(pass);
+  const before=pass>0&&!foreground?Object.fromEntries(collections.map(column=>[column,read(column)])):{};
+  if(pass>0)m.start(pass);
+  if(pass>0)foregroundTiming?.start(pass);
  if(pass>0&&pass%10===0)executeFlush(db,sessionId);
  if(pass>0&&pass%3===0) {
   const tags=db.prepare("SELECT tag_number FROM tags WHERE session_id=? AND type='tool' AND status='active' ORDER BY tag_number LIMIT 6").all(sessionId) as {tag_number:number}[];
   if(tags.length) {const reply=await reduce.execute({drop:tags.map(row=>String(row.tag_number)).join(',')},{sessionID:sessionId});if(String(reply).includes('Error:'))throw new Error(String(reply));reductions++;}
  }
- const messages=structuredClone(raw),entryIds=messages.map((_:unknown,i:number)=>`entry-${i}`);
+ const messages=host==='pi'?structuredClone(raw):ocMessages(),entryIds=messages.map((_:unknown,i:number)=>`entry-${i}`);
  const usage=50000+pass*4000;
- const served=await fake.handlers.get('context')({messages},{...utils.fakeContext(sessionId,directory,entryIds,messages),getSystemPrompt:()=> 'Page write measurement system.',getContextUsage:()=>({tokens:usage,percent:usage/2000000*100,contextWindow:2000000}),model}) as {messages:unknown[]};
+ usageMap.set(sessionId,{usage:{percentage:usage/2000000*100,inputTokens:usage},updatedAt:now});
+ const started=pass>0?foregroundTiming?.handlerStart():undefined;
+ const served=host==='pi'?await fake.handlers.get('context')({messages},{...utils.fakeContext(sessionId,directory,entryIds,messages),getSystemPrompt:()=> 'Page write measurement system.',getContextUsage:()=>({tokens:usage,percent:usage/2000000*100,contextWindow:2000000}),model}) as {messages:unknown[]} : await (async()=>{const output={messages};await ocHandler({},output);return output;})();
+ if(started)foregroundTiming?.handlerEnd(started);
  await new Promise<void>(done=>setTimeout(done,10));
- m.stop();
+  m.stop();
+  if(pass>0)foregroundTiming?.stop();
  if(pass===0)seed=seedLarge();
  heads.push(Object.fromEntries(cacheColumns.map(column=>[column,fingerprint(read(column))])));
- if(pass>0)for(const column of collections) {
+  if(pass>0&&!foreground)for(const column of collections) {
   const after=read(column),kind=classify(before[column]??null,after);
   if(kind!=='same') {
    let servedAdded=0;
@@ -206,16 +264,16 @@ for(let pass=0;pass<=passes;pass++) {
  }
  const slot=lkg.loadPersistedLkgSlot(db,sessionId,true);
  if(!slot)throw new Error('no durable LKG slot after pass '+pass);
- const equal=slot.jsonPrefix===JSON.stringify(served.messages);
+ const equal=slot.jsonPrefix===JSON.stringify(host==='pi'?served.messages:served.messages.map(providerVisibleMessage));
  if(equal)fullPairs++;
   const certificate=checkLkgDurability(db,sessionId);
-  if(!certificate.durable || certificate.servedCaptureId===null)throw new Error('served request lacks a durable bound certificate on pass '+pass);
+   if(host==='pi' && (!certificate.durable || certificate.servedCaptureId===null))throw new Error('served request lacks a durable bound certificate on pass '+pass);
  if(slot.fullCoverage!==false&&!equal)throw new Error('durable full-coverage copy differs from the served request');
  certificates.push({pass,equal,fullCoverage:slot.fullCoverage,certificate});
  if(pass%10===0)console.log('PASS',pass,'messages',raw.length,'head',JSON.stringify(heads.at(-1)));
 }
 if(new Set(heads.map(head=>JSON.stringify(head))).size!==1)throw new Error('ordinary passes changed cached m0/m1/mural bytes');
-if(changes.filter(change=>change.column==='trailing_blank_decisions'&&change.servedAdded>0).length<passes-2)throw new Error('ordinary passes did not actually grow the replay envelope');
+if(host==='pi' && (foreground ? (read('trailing_blank_decisions')?.length??0)<=seed.sizes.trailing_blank_decisions : changes.filter(change=>change.column==='trailing_blank_decisions'&&change.servedAdded>0).length<passes-2))throw new Error('ordinary passes did not actually grow the replay envelope');
 const totals:Record<string,number>={},ordinary:Record<string,number>={},byStatement:Record<string,Record<string,number>>={};
 for(const change of m.changes) {
  for(const [owner,pages] of Object.entries(change.pages)) {totals[owner]=(totals[owner]??0)+pages;if(change.pass%10!==0)ordinary[owner]=(ordinary[owner]??0)+pages;}
@@ -225,4 +283,10 @@ const kinds:Record<string,Record<string,number>>={};for(const change of changes)
 const summary={tool:`Bun ${Bun.version}`,passes,ordinaryPasses:Array.from({length:passes},(_,i)=>i+1).filter(pass=>pass%10!==0).length,seed,totals,ordinary,byStatement,mutationKinds:kinds,reductions,fullPairs,uniqueHeads:new Set(heads.map(head=>JSON.stringify(head))).size,head:heads[0]};
 writeFileSync(join(root,'pages.json'),JSON.stringify({summary,changes,statements:m.changes,heads,certificates},null,2));
 console.log('BENCHMARK_SUMMARY',JSON.stringify(summary));
+if(foregroundTiming) {
+ const result={host,summary:summarizeForeground(foregroundTiming),records:foregroundTiming.records,sql:foregroundTiming.sqlText};
+ writeFileSync(join(root,'foreground.json'),JSON.stringify(result));
+ console.log('FOREGROUND_SUMMARY',JSON.stringify({host,...result.summary}));
+}
+ocDb?.close();
 db.close();
