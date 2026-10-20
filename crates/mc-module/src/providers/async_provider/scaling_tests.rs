@@ -268,14 +268,14 @@ impl Rig {
     }
 
     async fn op(&self, method: &str, params: Value) -> Value {
-        let HandlerOutcome::Response(bytes) = self
+        match self
             .h
             .dispatch_value(7, json!({"method":method,"params":params}))
             .await
-        else {
-            panic!("{method} failed")
-        };
-        serde_json::from_slice(&bytes).unwrap()
+        {
+            HandlerOutcome::Response(bytes) => serde_json::from_slice(&bytes).unwrap(),
+            other => panic!("{method} failed: {other:?}"),
+        }
     }
 
     fn store(&self) -> &McStore {
