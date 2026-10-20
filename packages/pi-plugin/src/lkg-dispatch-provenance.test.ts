@@ -363,7 +363,7 @@ test("a session's long deferred-save run certifies only retained dispatch receip
 	const f = fixture();
 	const evicted: Array<{ id: number; receipt: object }> = [];
 	let newest = f.publish("deferred request 0");
-	for (let index = 0; index < 1_003; index++) {
+	for (let index = 0; index < 19; index++) {
 		if (index > 0) newest = f.publish(`deferred request ${index}`);
 		const id = getSlot(f.sessionId)?.servedCaptureId;
 		const receipt = preparedLkgDispatchReceipt(f.db, f.sessionId, id);
@@ -407,7 +407,7 @@ test("a session's long deferred-save run certifies only retained dispatch receip
 		expect(repairLkgDurability(f.db, f.sessionId)).toEqual(certified);
 	}
 	const { restarted } = f.restart();
-	expect(getSlot(f.sessionId)?.jsonPrefix).toContain("deferred request 1002");
+	expect(getSlot(f.sessionId)?.jsonPrefix).toContain("deferred request 18");
 	expect(getSlot(f.sessionId)?.dispatchUnconfirmed).toBeUndefined();
 	expect(restarted.replay(f.begin(restarted, true)).ok).toBe(true);
 });

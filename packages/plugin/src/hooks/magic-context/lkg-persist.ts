@@ -321,7 +321,8 @@ interface PreparedLkgCertificate extends BoundLkgCertificate {
     /** The marker's stored value while the id is unbound (its pending token, or legacy NULL). */
     unboundValue: string | null;
 }
-const PREPARED_CERTIFICATE_MAX_CAPTURES_PER_SESSION = 1000;
+// A session normally has one or two receipts outstanding between save and dispatch, so 16 bounds memory without evicting live ones.
+const PREPARED_CERTIFICATE_MAX_CAPTURES_PER_SESSION = 16;
 const preparedCertificates = new WeakMap<
     Database,
     Map<string, Map<number, PreparedLkgCertificate>>
