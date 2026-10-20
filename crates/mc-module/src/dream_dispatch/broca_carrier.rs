@@ -25,7 +25,7 @@ use cortexkit_role_tool_provider::errors as tool_errors;
 use mc_store::dream_scheduler::budget::{BudgetAction, TokenBudget};
 use mc_store::dream_scheduler::SqliteDreamScheduler;
 use serde_json::{json, Map, Value};
-use std::collections::{HashMap, HashSet};
+use std::collections::HashMap;
 use std::io::Read;
 use std::path::Path;
 use std::sync::{Arc, Mutex};
@@ -87,7 +87,7 @@ pub struct PortError {
 /// never a request field, names the session an op acts on.
 #[allow(async_fn_in_trait)]
 pub trait BrocaPort {
-    /// One unary op (`role.describe`, `session.send`, `run.result`, `run.cancel`,
+    /// One unary op (`role.describe`, `session.send`, `run.status`, `run.result`, `run.cancel`,
     /// `session.retract`) with its role params; answers the reply body.
     async fn call(&mut self, session: &str, op: &str, params: Value) -> Result<Value, PortError>;
     /// The next unit of the session's `session.subscribe` stream from its start,
@@ -390,48 +390,6 @@ fn body(answer: &Value) -> &Value {
         .unwrap_or(answer)
 }
 
-fn unit_of(event: &Value) -> Option<&Value> {
-    if event.get("kind").and_then(Value::as_str) == Some("display") {
-        return None;
-    }
-    Some(event.get("unit").unwrap_or(event))
-}
-
-fn unit_type(unit: &Value) -> String {
-    unit.get("type")
-        .or_else(|| unit.get("kind"))
-        .and_then(Value::as_str)
-        .unwrap_or_default()
-        .to_ascii_lowercase()
-}
-
-/// Assistant text of one message unit, without reasoning blocks.
-fn unit_text(unit: &Value) -> Option<String> {
-    if let Some(blocks) = unit
-        .get("message")
-        .and_then(|m| m.get("content"))
-        .and_then(Value::as_array)
-    {
-        return Some(
-            blocks
-                .iter()
-                .filter(|b| b.get("type").and_then(Value::as_str) == Some("text"))
-                .filter_map(|b| b.get("text").and_then(Value::as_str))
-                .collect(),
-        );
-    }
-    unit.get("text")
-        .or_else(|| unit.get("message").and_then(|m| m.get("text")))
-        .and_then(Value::as_str)
-        .map(str::to_string)
-}
-
-fn length_capped(unit: &Value) -> bool {
-    unit.get("finish_reason")
-        .and_then(Value::as_str)
-        .is_some_and(|r| matches!(r, "length" | "max_tokens" | "max_output_tokens"))
-}
-
 struct Attempt {
     session: String,
     send: Value,
@@ -446,11 +404,9 @@ struct Attempt {
     terminal: Option<RunResult>,
     cancel_sent: bool,
     stop_reason: Option<String>,
-    steps: u32,
-    messages: usize,
     total: Usage,
-    length_capped: bool,
-    seen: HashSet<String>,
+    final_observed: bool,
+    reports_usage: bool,
 }
 
 /// One dream attempt per open, each in a fresh Broca session whose id is minted
@@ -557,7 +513,19 @@ impl<P: BrocaPort> BrocaCarrier<P> {
         request: &ChildRequest,
         budget: Option<u64>,
     ) -> Result<(u64, Option<u64>, Option<&'static str>), CarrierError> {
-        let mut required = vec![caps::QUEUE, caps::RUN_OPS, caps::STREAMING, caps::RETENTION];
+        // Every dream child has a mandatory step bound; usage cancellation cannot
+        // replace the runner sealing pending calls at that exact model response.
+        let mut required = vec![
+            caps::QUEUE,
+            caps::RUN_OPS,
+            caps::RUN_STATUS,
+            caps::STREAMING,
+            caps::RETENTION,
+            caps::MAX_STEPS,
+        ];
+        if request.allowed_tools.is_empty() {
+            required.push(caps::NO_TOOLS);
+        }
         if !request.allowed_tools.is_empty() {
             required.push(caps::PLANS);
         }
@@ -586,7 +554,7 @@ impl<P: BrocaPort> BrocaCarrier<P> {
         if budget.is_some() && !advertised && self.policy.require_hard_cap {
             return Err(error("unavailable: input_token_cap"));
         }
-        // Without the capability the budget is enforced only from streamed usage:
+        // Without the capability the budget is enforced from cumulative run usage:
         // the run can overshoot by the step in flight before the cancel lands.
         let cap = budget.filter(|_| advertised);
         let cancel_at = if !describe.declares(caps::RUN_CANCEL) {
@@ -628,16 +596,19 @@ impl<P: BrocaPort> BrocaCarrier<P> {
         if !request.system.is_empty() {
             params.insert("system".into(), json!(request.system));
         }
-        // No inline tools: every admitted tool comes from a plan provider item,
-        // and the runner freezes that allowlist when it admits the session.
-        params.insert("tools".into(), json!([]));
-        params.insert("stop_when".into(), json!({"max_steps": request.max_steps}));
+        // A plan freezes the non-empty tool allowlist at admission. Even an empty
+        // override would suppress those tools on a no_tools runner, and later
+        // sends into a plan-admitted session must not carry a tools override.
         if let Some(parent) = self.port.session_runner_parent() {
             params.insert("parent".into(), json!(parent));
         }
         let mut send = SendRequest::new(request.prompt.clone(), session)
             .with_runner_params(params)
+            .with_max_steps(u64::from(request.max_steps))
             .with_retention(retention);
+        if request.allowed_tools.is_empty() {
+            send = send.with_no_tools();
+        }
         let (memory, files): (Vec<&str>, Vec<&str>) = request
             .allowed_tools
             .iter()
@@ -662,120 +633,104 @@ impl<P: BrocaPort> BrocaCarrier<P> {
         serde_json::to_value(send).map_err(|e| error(e.to_string()))
     }
 
-    /// Account one streamed unit. Usage is charged to the task ledger and the
-    /// attempt budget; messages reach the observer with the real session id.
-    fn unit(&mut self, event: &Value) -> Result<(), CarrierError> {
-        let Some(attempt) = self.attempt.as_mut() else {
+    /// Charge only deltas of the role's cumulative run usage. Replayed wake
+    /// events cannot duplicate a charge; subscription-event bodies supply no spend.
+    fn record_usage(
+        &mut self,
+        measured: &cortexkit_role_llm_runner::usage::RunUsage,
+    ) -> Result<(), CarrierError> {
+        let Some(total) = crate::historian_producer::ProducerUsage::from_contract_usage(measured)
+        else {
             return Ok(());
         };
-        let Some(unit) = unit_of(event) else {
-            return Ok(());
+        let attempt = self.attempt.as_mut().ok_or_else(|| error("not_opened"))?;
+        let delta = Usage {
+            input: total
+                .input
+                .checked_sub(attempt.total.input)
+                .ok_or_else(|| error("run_usage_regressed"))?,
+            output: total
+                .output
+                .checked_sub(attempt.total.output)
+                .ok_or_else(|| error("run_usage_regressed"))?,
+            cache_read: total
+                .cache_read
+                .checked_sub(attempt.total.cache_read)
+                .ok_or_else(|| error("run_usage_regressed"))?,
+            cache_write: total
+                .cache_write
+                .checked_sub(attempt.total.cache_write)
+                .ok_or_else(|| error("run_usage_regressed"))?,
         };
-        let run = unit.get("run_id").and_then(Value::as_str);
-        if run.is_some() && run != attempt.run_id.as_deref() {
+        if delta == Usage::default() {
             return Ok(());
         }
+        attempt.total = Usage {
+            input: total.input,
+            output: total.output,
+            cache_read: total.cache_read,
+            cache_write: total.cache_write,
+        };
         let session = attempt.session.clone();
-        attempt.length_capped |= length_capped(unit);
-        match unit_type(unit).as_str() {
-            "assistant_message" => {
-                attempt.messages += 1;
-                let id = unit
-                    .get("mid")
-                    .or_else(|| unit.get("message_id"))
-                    .and_then(Value::as_str)
-                    .map_or_else(|| format!("message-{}", attempt.messages), str::to_string);
-                if attempt.seen.insert(format!("m:{id}")) {
-                    let text = unit_text(unit).unwrap_or_default();
-                    self.observer
-                        .observe(
-                            &session,
-                            ChildEvent::Message {
-                                message_id: id,
-                                role: "assistant".into(),
-                                text,
-                            },
-                        )
-                        .map_err(|e| error(format!("observer_failed: {e:?}")))?;
-                }
-            }
-            "step_finished" => {
-                attempt.steps += 1;
-                let id = unit
-                    .get("mid")
-                    .and_then(Value::as_str)
-                    .map_or_else(|| format!("step-{}", attempt.steps), str::to_string);
-                if !attempt.seen.insert(format!("u:{id}")) {
-                    return Ok(());
-                }
-                let Some(u) = unit.get("usage").and_then(Value::as_object) else {
-                    return Ok(());
-                };
-                let meter = |k: &str| u.get(k).and_then(Value::as_u64).unwrap_or(0);
-                let usage = Usage {
-                    input: meter("input_tokens"),
-                    output: meter("output_tokens"),
-                    cache_read: meter("cached_input_tokens"),
-                    cache_write: meter("cache_write_tokens"),
-                };
-                attempt.total.input += usage.input;
-                attempt.total.output += usage.output;
-                attempt.total.cache_read += usage.cache_read;
-                attempt.total.cache_write += usage.cache_write;
-                let task = self
-                    .context
-                    .control
-                    .charge_usage(&format!("{session}:{id}"), &usage, false, true)
-                    .map_err(|e| error(format!("{e:?}")))?;
-                let local = self
-                    .routes
-                    .update(&session, |e| {
-                        e.budget.as_mut().map(|b| {
-                            b.charge(
-                                usage.input,
-                                usage.cache_read,
-                                usage.cache_write,
-                                false,
-                                true,
-                            )
-                        })
-                    })
-                    .flatten()
-                    .transpose()
-                    .map_err(error)?;
-                if task == BudgetAction::Stop || local == Some(BudgetAction::Stop) {
-                    attempt
-                        .stop_reason
-                        .get_or_insert_with(|| "token_budget".into());
-                }
-                self.observer
-                    .observe(
-                        &session,
-                        ChildEvent::Usage {
-                            message_id: id,
-                            usage,
-                        },
+        let id = format!(
+            "usage-{}-{}-{}-{}-{}",
+            measured.steps, total.input, total.output, total.cache_read, total.cache_write
+        );
+        let task = self
+            .context
+            .control
+            .charge_usage(&format!("{session}:{id}"), &delta, false, true)
+            .map_err(|e| error(format!("{e:?}")))?;
+        let local = self
+            .routes
+            .update(&session, |entry| {
+                entry.budget.as_mut().map(|budget| {
+                    budget.charge(
+                        delta.input,
+                        delta.cache_read,
+                        delta.cache_write,
+                        false,
+                        true,
                     )
-                    .map_err(|e| error(format!("observer_failed: {e:?}")))?;
-            }
-            _ => {}
+                })
+            })
+            .flatten()
+            .transpose()
+            .map_err(error)?;
+        if task == BudgetAction::Stop || local == Some(BudgetAction::Stop) {
+            attempt
+                .stop_reason
+                .get_or_insert_with(|| "token_budget".into());
         }
+        self.observer
+            .observe(
+                &session,
+                ChildEvent::Usage {
+                    message_id: id,
+                    usage: delta,
+                },
+            )
+            .map_err(|e| error(format!("observer_failed: {e:?}")))?;
         Ok(())
     }
 
-    async fn drain(&mut self, session: &str) -> Result<(), CarrierError> {
-        while let Some(unit) = self
+    async fn drain(&mut self, session: &str) -> Result<bool, CarrierError> {
+        // Stop at the first control wake. In particular, do not interpret a
+        // runner's assistant-message, usage or terminal event schema.
+        while let Some(event) = self
             .port
             .next_unit(session)
             .await
             .map_err(|e| port_error("session.subscribe", e))?
         {
-            self.unit(&unit)?;
+            if crate::runner_follow::control_wake(&event) {
+                return Ok(true);
+            }
             if self.must_stop() {
                 break;
             }
         }
-        Ok(())
+        Ok(false)
     }
 
     /// Latch a stop for cancellation, deadline, lease loss or an exhausted budget.
@@ -801,15 +756,42 @@ impl<P: BrocaPort> BrocaCarrier<P> {
         };
         let answer = self
             .port
+            .call(session, ops::RUN_STATUS, json!({"run_id": run}))
+            .await
+            .map_err(|e| port_error(ops::RUN_STATUS, e))?;
+        let status: cortexkit_role_llm_runner::run::RunStatus =
+            serde_json::from_value(body(&answer).clone()).map_err(|e| error(e.to_string()))?;
+        if let Some(usage) = status
+            .usage
+            .as_ref()
+            .filter(|_| self.attempt.as_ref().is_some_and(|a| a.reports_usage))
+        {
+            self.record_usage(usage)?;
+        }
+        if !status.run_state().is_terminal() {
+            return Ok(None);
+        }
+        let answer = self
+            .port
             .call(session, ops::RUN_RESULT, json!({"run_id": run}))
             .await
             .map_err(|e| port_error(ops::RUN_RESULT, e))?;
         let result: RunResult =
             serde_json::from_value(body(&answer).clone()).map_err(|e| error(e.to_string()))?;
-        if result.run_id != run || !result.final_message_consistent() {
+        if result.run_id != run
+            || result.state != status.state
+            || !result.final_message_consistent()
+        {
             return Err(error("run_result_malformed"));
         }
-        Ok(result.run_state().is_terminal().then_some(result))
+        if let Some(usage) = result
+            .usage
+            .as_ref()
+            .filter(|_| self.attempt.as_ref().is_some_and(|a| a.reports_usage))
+        {
+            self.record_usage(usage)?;
+        }
+        Ok(Some(result))
     }
 
     async fn cancel(&mut self, session: &str) -> Result<(), CarrierError> {
@@ -910,12 +892,27 @@ impl<P: BrocaPort> BrocaCarrier<P> {
             .update(session, |e| e.calls.len())
             .unwrap_or_default();
         let attempt = self.attempt.as_mut().ok_or_else(|| error("not_opened"))?;
+        if !attempt.final_observed {
+            if let Some(message) = &result.final_message {
+                self.observer
+                    .observe(
+                        session,
+                        ChildEvent::Message {
+                            message_id: message.mid.clone(),
+                            role: "assistant".into(),
+                            text: message.text.clone(),
+                        },
+                    )
+                    .map_err(|e| error(format!("observer_failed: {e:?}")))?;
+                attempt.final_observed = true;
+            }
+        }
         attempt.terminal = Some(result.clone());
         let state = result.run_state();
         match state {
             RunState::Completed => Ok(Completion {
                 text: result.final_message.map(|m| m.text).unwrap_or_default(),
-                length_capped: attempt.length_capped,
+                length_capped: false,
                 usage: attempt.total.clone(),
             }),
             // An interrupted run may hold an indeterminate tool call. The runner
@@ -950,7 +947,7 @@ impl<P: BrocaPort> BrocaCarrier<P> {
         }
     }
 
-    /// Wait for a terminal state, draining the stream so late usage is charged.
+    /// Wait for a terminal status and account any final run.result usage.
     async fn quiesce(&mut self, session: &str) -> Result<(), CarrierError> {
         let cleanup = async {
             let attempt = self.attempt.as_ref().ok_or_else(|| error("not_opened"))?;
@@ -990,7 +987,7 @@ impl<P: BrocaPort> BrocaCarrier<P> {
                     }
                     return Ok(());
                 }
-                tokio::time::sleep(Duration::from_millis(POLL_MS)).await;
+                tokio::time::sleep(crate::runner_follow::POLL_INTERVAL).await;
             }
         };
         tokio::time::timeout(Duration::from_millis(CLEANUP_MS), cleanup)
@@ -1081,11 +1078,9 @@ impl<P: BrocaPort> DreamCarrier for BrocaCarrier<P> {
             terminal: None,
             cancel_sent: false,
             stop_reason: None,
-            steps: 0,
-            messages: 0,
             total: Usage::default(),
-            length_capped: false,
-            seen: HashSet::new(),
+            final_observed: false,
+            reports_usage: describe.declares(caps::RUN_USAGE),
         });
         Ok(session)
     }
@@ -1102,10 +1097,17 @@ impl<P: BrocaPort> DreamCarrier for BrocaCarrier<P> {
         if attempt.run_id.is_none() {
             self.start(child).await?;
         }
+        let mut last_probe: Option<std::time::Instant> = None;
         loop {
-            self.drain(child).await?;
-            if let Some(result) = self.result(child).await? {
-                return self.finish(child, result);
+            let wake = self.drain(child).await?;
+            if wake
+                || last_probe
+                    .is_none_or(|last| last.elapsed() >= crate::runner_follow::POLL_INTERVAL)
+            {
+                if let Some(result) = self.result(child).await? {
+                    return self.finish(child, result);
+                }
+                last_probe = Some(std::time::Instant::now());
             }
             if self.must_stop() {
                 self.cancel(child).await?;
