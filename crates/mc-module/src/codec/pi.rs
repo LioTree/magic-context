@@ -25,6 +25,17 @@ pub fn decode_pi_with_sidecar(
     entries: &[PiSessionEntryJson],
     prior: Option<&DecodeSidecar>,
 ) -> DecodedHarnessMessages {
+    decode_pi_with_sidecar_and_base(entries, prior, 0)
+}
+
+/// Decode a message-only suffix at its original zero-based ordinal origin.
+/// Fallback tool IDs and sidecar ordinals must not restart at one when callers
+/// omit an already covered prefix. Full-journal callers keep the zero base.
+pub fn decode_pi_with_sidecar_and_base(
+    entries: &[PiSessionEntryJson],
+    prior: Option<&DecodeSidecar>,
+    ordinal_base: u64,
+) -> DecodedHarnessMessages {
     let mut sidecar = DecodeSidecar::new(HARNESS);
     if let Some(prior) = prior {
         sidecar.mid_pins = prior.mid_pins.clone();
@@ -35,7 +46,10 @@ pub fn decode_pi_with_sidecar(
 
     for (entry_index, raw_entry) in entries.iter().enumerate() {
         if raw_entry.get("type").and_then(Value::as_str) == Some("compaction") {
-            boundary = Some(pi_boundary(raw_entry, (entry_index + 1) as u64));
+            boundary = Some(pi_boundary(
+                raw_entry,
+                ordinal_base.saturating_add((entry_index + 1) as u64),
+            ));
             continue;
         }
 
@@ -43,20 +57,24 @@ pub fn decode_pi_with_sidecar(
             if is_pi_opaque_entry(raw_entry) {
                 decoded.push(decode_opaque_entry(
                     raw_entry,
-                    (decoded.len() + 1) as u64,
+                    ordinal_base.saturating_add((decoded.len() + 1) as u64),
                     &mut sidecar,
                 ));
             }
             continue;
         };
 
-        let ordinal = (decoded.len() + 1) as u64;
+        let ordinal = ordinal_base.saturating_add((decoded.len() + 1) as u64);
         let role = message
             .get("role")
             .and_then(Value::as_str)
             .unwrap_or("unknown")
             .to_string();
-        let stable_key = pi_stable_key(raw_entry, message, entry_index);
+        let stable_key = pi_stable_key(
+            raw_entry,
+            message,
+            entry_index.saturating_add(ordinal_base as usize),
+        );
         let mid = sidecar
             .inherit_pin(&stable_key)
             .unwrap_or_else(|| first_sight_pi_mid(raw_entry, message, &stable_key));

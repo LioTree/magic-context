@@ -4,6 +4,15 @@ use super::*;
 pub fn decode_messages(
     messages: &[codec::InboundMessage],
 ) -> Result<crate::codec::DecodedHarnessMessages, HandlerOutcome> {
+    decode_messages_with_base(messages, 0)
+}
+
+/// Decode a suffix at its original ordinal origin, so tool calls without
+/// native IDs keep the same generated IDs and metadata as a full decode.
+pub fn decode_messages_with_base(
+    messages: &[codec::InboundMessage],
+    ordinal_base: u64,
+) -> Result<crate::codec::DecodedHarnessMessages, HandlerOutcome> {
     for message in messages {
         if message.message.get("id").and_then(Value::as_str) != Some(message.mid.as_str())
             || !matches!(
@@ -28,7 +37,8 @@ pub fn decode_messages(
         pins.mid_pins
             .insert(message.mid.clone(), message.mid.clone());
     }
-    let mut decoded = crate::codec::decode_pi_with_sidecar(&native, Some(&pins));
+    let mut decoded =
+        crate::codec::pi::decode_pi_with_sidecar_and_base(&native, Some(&pins), ordinal_base);
     if decoded.messages.len() != messages.len() {
         return Err(error(
             "history_unreadable",
@@ -115,6 +125,42 @@ pub fn decode_hook_messages(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn suffix_decode_preserves_full_bytes_and_fallback_tool_ids() {
+        let messages = (0..5)
+            .map(|n| codec::InboundMessage {
+                ordinal: n,
+                mid: format!("m{n}"),
+                message: json!({
+                    "type":"message", "id":format!("m{n}"), "timestamp":"2026-01-01T00:00:00Z",
+                    "message":{"role":"assistant","content":[
+                        {"type":"toolCall","name":"read","arguments":{"path":format!("file{n}")}}
+                    ]}
+                }),
+            })
+            .collect::<Vec<_>>();
+        let full = decode_messages(&messages).unwrap();
+        let suffix = decode_messages_with_base(&messages[3..], 3).unwrap();
+        assert_eq!(
+            serde_json::to_vec(&suffix.messages).unwrap(),
+            serde_json::to_vec(&full.messages[3..]).unwrap()
+        );
+        for message in &suffix.messages {
+            assert_eq!(
+                serde_json::to_vec(suffix.sidecar.message_by_mid(&message.mid).unwrap()).unwrap(),
+                serde_json::to_vec(full.sidecar.message_by_mid(&message.mid).unwrap()).unwrap()
+            );
+            assert!(
+                matches!(&message.ck.content[0].kind, ck_wire::CkKind::ToolCall { id, .. } if !id.is_empty())
+            );
+        }
+        assert_ne!(
+            suffix.messages,
+            decode_messages(&messages[3..]).unwrap().messages,
+            "the fixture must exercise position-dependent fallback IDs"
+        );
+    }
 
     #[test]
     fn journal_identity_beats_repeated_timestamp_and_response_aliases() {
