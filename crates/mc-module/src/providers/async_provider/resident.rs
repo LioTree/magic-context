@@ -176,6 +176,7 @@ pub(super) struct Aggregates {
     /// notice must then run it rather than skip it.
     pub open_calls: BTreeSet<String>,
     pub orphan_result: bool,
+    pub historian_input: historian_tail::InputIndex,
 }
 
 impl Aggregates {
@@ -186,6 +187,7 @@ impl Aggregates {
         facts: EntryFacts,
         message: &ck_wire::CkIngressMessage,
     ) {
+        self.historian_input.add(message);
         self.through = Some(ordinal);
         self.tool_results += facts.tool_results;
         if facts.real_user {

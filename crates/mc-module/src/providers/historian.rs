@@ -762,6 +762,7 @@ impl McHandler {
                             serial: Arc::clone(&worker.provider_serial),
                         })),
                         tag_snapshot: None,
+                        async_coverage: None,
                         reclaim_ride_available,
                         runner_lane: true,
                         timings: &mut timings,

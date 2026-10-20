@@ -7,6 +7,7 @@ use cortexkit_role_llm_runner::{read::ReadMessage, session_ref, tags};
 use serde::Deserialize;
 #[cfg(test)]
 mod differential_tests;
+mod historian_tail;
 mod resident;
 #[cfg(test)]
 mod scaling_tests;
@@ -860,6 +861,7 @@ impl State {
                 .saved_json
                 .as_ref()
                 .map_or(0, |json| json.len())
+            + self.aggregates.historian_input.retained_bytes()
     }
 
     fn reset(&mut self, store: &McStore) -> Result<(), HandlerOutcome> {
@@ -3124,10 +3126,16 @@ impl McHandler {
             .map_err(transient)?;
         }
         let mut parsed: TransformRequest = decode(&request)?;
-        // The evaluation reads the whole transcript. It runs on a blocking
-        // thread after the notice returns and reads the held entries from
-        // their stored rows, through the newest one held now: every held
-        // entry is stored before a historian evaluation is scheduled.
+        // Use ModuleMeta's baseline coverage: a newly stored compartment may
+        // not have been folded into that baseline yet. Start early enough to
+        // pair tool results after coverage with their original tool calls.
+        let (coverage, from) = historian_tail::applied_window(
+            self.store
+                .get()
+                .ok_or_else(|| transient("store unavailable"))?,
+            &state.namespace(),
+            &state.aggregates.historian_input,
+        )?;
         let through = state.entries.last_key_value().map(|(ordinal, _)| *ordinal);
         if through.is_some_and(|through| state.journal.persisted_through != Some(through)) {
             return Err(transient(
@@ -3178,19 +3186,14 @@ impl McHandler {
             parsed.historian_model_limits = configured.model_limits;
             let prepare = worker.clone();
             let result = tokio::task::spawn_blocking(move || {
-                let rows = match through {
-                    Some(through) => store
-                        .load_async_compaction_entries(&reference_for_rows, through)
-                        .map_err(transient)?,
-                    None => Vec::new(),
-                };
-                let messages = rows
-                    .into_iter()
-                    .map(|(_, raw)| HeldEntry::from_stored(raw)?.inbound())
-                    .collect::<Result<Vec<_>, _>>()?;
-                codec.prepare_request(&mut parsed, &messages)?;
-                drop(messages);
-                let projection = ck_wire::project_messages(&parsed.messages).map_err(transient)?;
+                let projection = historian_tail::prepare_input(
+                    &store,
+                    &reference_for_rows,
+                    from,
+                    through,
+                    codec,
+                    &mut parsed,
+                )?;
                 let mut timings = HistorianTriggerTimings::default();
                 Ok::<_, HandlerOutcome>(prepare.prepare_historian_fire(
                     store,
@@ -3204,6 +3207,7 @@ impl McHandler {
                         snapshot_generation: None,
                         publication_fence: Some(fence),
                         tag_snapshot: None,
+                        async_coverage: Some(coverage),
                         reclaim_ride_available: false,
                         runner_lane: true,
                         timings: &mut timings,

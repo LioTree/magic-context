@@ -181,6 +181,7 @@ fn assemble(
             memory_enabled: true,
             auto_promote: true,
             user_memory_collection_enabled: false,
+            user_observations_requested: false,
             extraction_free: false,
             in_emergency: false,
             force_keep_last_compartment: false,

@@ -50,6 +50,7 @@ fn prepare(
             snapshot_generation: None,
             publication_fence: None,
             tag_snapshot: None,
+            async_coverage: None,
             reclaim_ride_available: false,
             runner_lane: true,
             timings: &mut timings,
