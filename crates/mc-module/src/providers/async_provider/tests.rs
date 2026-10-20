@@ -1597,3 +1597,174 @@ async fn setup_echoes_the_accepted_serializer_profile_and_refuses_an_unknown_one
     let other = session_ref("claude-code", &dir.path().to_string_lossy(), "other");
     assert!(load(rig.h.store.get().unwrap(), &other).unwrap().is_none());
 }
+
+fn setup_request(session: &str, request_id: &str) -> Value {
+    json!({
+        "session":session,
+        "harness":"opencode",
+        "request_id":request_id,
+        "model":"fixture",
+        "context_window":100_000,
+        "composition":{"render_tags":true},
+        "params":{"serializer_profile":"opencode-aisdk"},
+        "lineage_id":"L",
+        "now":1
+    })
+}
+
+fn pause_bus_for_attach(rig: &Rig) -> Arc<dyn Publisher> {
+    let runtime = &rig.h.provider_store.async_runtime;
+    let publisher = runtime
+        .publisher
+        .lock()
+        .unwrap()
+        .take()
+        .expect("test bus publisher");
+    runtime
+        .bus_link
+        .set(super::super::async_bus::LinkState::Attaching, 1, None);
+    publisher
+}
+
+fn finish_bus_attach(handler: &McHandler, publisher: Arc<dyn Publisher>) {
+    let runtime = &handler.provider_store.async_runtime;
+    *runtime.publisher.lock().unwrap() = Some(publisher);
+    runtime
+        .bus_link
+        .set(super::super::async_bus::LinkState::Connected, 1, None);
+}
+
+/// The fixture delays publisher installation to model credential fetch, nonce
+/// signing, NATS connect, and durable-reader attach as one active bootstrap.
+#[tokio::test]
+async fn setup_waits_for_initial_async_bus_attach() {
+    let dir = tempfile::tempdir().unwrap();
+    let rig = Rig::new(dir.path()).await;
+    let publisher = pause_bus_for_attach(&rig);
+    let handler = rig.h.clone();
+    let waiting = tokio::spawn(async move {
+        handler
+            .dispatch_value(
+                7,
+                json!({"method":"compaction.setup","params":setup_request("first-attach", "first")}),
+            )
+            .await
+    });
+
+    tokio::task::yield_now().await;
+    assert!(
+        !waiting.is_finished(),
+        "Setup must wait while attach is active"
+    );
+
+    const MEASURED_ATTACH_DELAY: Duration = Duration::from_millis(50);
+    let attach_started = tokio::time::Instant::now();
+    tokio::time::sleep(MEASURED_ATTACH_DELAY).await;
+    let measured_attach = attach_started.elapsed();
+    finish_bus_attach(&rig.h, publisher);
+
+    let answer = response(waiting.await.unwrap());
+    assert_eq!(answer["answer"], "ready", "{answer}");
+    assert!(measured_attach >= MEASURED_ATTACH_DELAY);
+    assert!(measured_attach < ASYNC_BUS_SETUP_WAIT);
+}
+
+#[tokio::test(start_paused = true)]
+async fn setup_that_outlives_attach_wait_refuses_bus_not_ready() {
+    let dir = tempfile::tempdir().unwrap();
+    let rig = Rig::new(dir.path()).await;
+    let _publisher = pause_bus_for_attach(&rig);
+    let handler = rig.h.clone();
+    let started = tokio::time::Instant::now();
+    let waiting = tokio::spawn(async move {
+        handler
+            .dispatch_value(
+                7,
+                json!({"method":"compaction.setup","params":setup_request("never-ready", "timeout")}),
+            )
+            .await
+    });
+    tokio::task::yield_now().await;
+    assert!(!waiting.is_finished(), "Setup should be waiting on attach");
+
+    tokio::time::advance(ASYNC_BUS_SETUP_WAIT).await;
+    let answer = response(waiting.await.unwrap());
+    assert_eq!(answer["answer"], "refuse", "{answer}");
+    assert_eq!(answer["provider_code"], "bus_not_ready", "{answer}");
+    assert_eq!(
+        tokio::time::Instant::now() - started,
+        ASYNC_BUS_SETUP_WAIT,
+        "Setup must stop waiting at the configured bound"
+    );
+}
+
+#[tokio::test]
+async fn setup_during_bus_backoff_refuses_without_waiting_for_another_retry() {
+    let dir = tempfile::tempdir().unwrap();
+    let rig = Rig::new(dir.path()).await;
+    let _publisher = pause_bus_for_attach(&rig);
+    rig.h.provider_store.async_runtime.bus_link.set(
+        super::super::async_bus::LinkState::CkbusUnreachable,
+        1,
+        Some("credential request failed".into()),
+    );
+
+    let started = tokio::time::Instant::now();
+    let answer = tokio::time::timeout(
+        Duration::from_secs(1),
+        rig.op("compaction.setup", setup_request("backoff", "backoff")),
+    )
+    .await
+    .expect("backoff refusal must not wait for the next attach");
+    assert_eq!(answer["answer"], "refuse", "{answer}");
+    assert_eq!(answer["provider_code"], "bus_not_ready", "{answer}");
+    assert!(started.elapsed() < Duration::from_secs(1));
+}
+
+#[tokio::test]
+async fn concurrent_setup_for_another_conversation_completes_with_attach() {
+    let dir = tempfile::tempdir().unwrap();
+    let rig = Rig::new(dir.path()).await;
+    let publisher = pause_bus_for_attach(&rig);
+    let first_handler = rig.h.clone();
+    let second_handler = rig.h.clone();
+    let started = tokio::time::Instant::now();
+    let first = tokio::spawn(async move {
+        first_handler
+            .dispatch_value(
+                7,
+                json!({"method":"compaction.setup","params":setup_request("concurrent-a", "a")}),
+            )
+            .await
+    });
+    let second = tokio::spawn(async move {
+        second_handler
+            .dispatch_value(
+                7,
+                json!({"method":"compaction.setup","params":setup_request("concurrent-b", "b")}),
+            )
+            .await
+    });
+    tokio::task::yield_now().await;
+    tokio::task::yield_now().await;
+    assert!(
+        !first.is_finished(),
+        "first Setup should be waiting on attach"
+    );
+    assert!(
+        !second.is_finished(),
+        "second Setup should be waiting on attach"
+    );
+
+    tokio::time::sleep(Duration::from_millis(50)).await;
+    finish_bus_attach(&rig.h, publisher);
+    let (first, second) =
+        tokio::time::timeout(ASYNC_BUS_SETUP_WAIT, async { tokio::join!(first, second) })
+            .await
+            .expect("both conversations must be released by the same attach");
+    let first = response(first.unwrap());
+    let second = response(second.unwrap());
+    assert_eq!(first["answer"], "ready", "{first}");
+    assert_eq!(second["answer"], "ready", "{second}");
+    assert!(started.elapsed() < ASYNC_BUS_SETUP_WAIT);
+}
