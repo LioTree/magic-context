@@ -557,7 +557,18 @@ impl<P: BrocaPort> BrocaCarrier<P> {
         request: &ChildRequest,
         budget: Option<u64>,
     ) -> Result<(u64, Option<u64>, Option<&'static str>), CarrierError> {
-        let mut required = vec![caps::QUEUE, caps::RUN_OPS, caps::STREAMING, caps::RETENTION];
+        // Every dream child has a mandatory step bound; usage cancellation cannot
+        // replace the runner sealing pending calls at that exact model response.
+        let mut required = vec![
+            caps::QUEUE,
+            caps::RUN_OPS,
+            caps::STREAMING,
+            caps::RETENTION,
+            "max_steps",
+        ];
+        if request.allowed_tools.is_empty() {
+            required.push("no_tools");
+        }
         if !request.allowed_tools.is_empty() {
             required.push(caps::PLANS);
         }
@@ -628,9 +639,12 @@ impl<P: BrocaPort> BrocaCarrier<P> {
         if !request.system.is_empty() {
             params.insert("system".into(), json!(request.system));
         }
-        // No inline tools: every admitted tool comes from a plan provider item,
-        // and the runner freezes that allowlist when it admits the session.
-        params.insert("tools".into(), json!([]));
+        // A plan freezes the non-empty tool allowlist at admission. Even an empty
+        // override would suppress those tools on a no_tools runner, and later
+        // sends into a plan-admitted session must not carry a tools override.
+        if request.allowed_tools.is_empty() {
+            params.insert("tools".into(), json!([]));
+        }
         params.insert("stop_when".into(), json!({"max_steps": request.max_steps}));
         if let Some(parent) = self.port.session_runner_parent() {
             params.insert("parent".into(), json!(parent));

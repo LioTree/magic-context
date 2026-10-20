@@ -1,10 +1,17 @@
 import { expect, test } from "bun:test";
+import zenModels from "../../../../crates/mc-module/testdata/historian-zen-models.json";
 import {
     needsBlockedRead,
     rememberV1HiddenRun,
     shapeV1HiddenMessage,
     withBlockedReadInstruction,
 } from "./hidden-zen-read";
+
+test("historian Zen model eligibility matches the Rust shared fixture", () => {
+    for (const { model, blockedRead } of zenModels) {
+        expect(needsBlockedRead("historian", model.split("/")[0])).toBe(blockedRead);
+    }
+});
 
 for (const [agent, task, sentence] of [
     [

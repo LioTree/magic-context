@@ -12,6 +12,7 @@ use std::{
     time::Duration,
 };
 
+use crate::runner_limits::RunnerLimits;
 use serde::Serialize;
 use serde_json::{json, Value};
 use subc_control::{ClientControlRequest, ClientControlResponse, ConsumerIdentity};
@@ -35,7 +36,8 @@ const HISTORIAN_SESSION_RETENTION_SECONDS: u64 = 86_400;
 
 #[derive(Serialize)]
 struct GenerationRequest {
-    max_output_tokens: u32,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    max_output_tokens: Option<u32>,
     #[serde(skip_serializing_if = "Option::is_none")]
     temperature: Option<f64>,
 }
@@ -95,14 +97,27 @@ pub(crate) struct SendRequest<'a> {
 impl<'a> SendRequest<'a> {
     /// Address this send to a session runner: name the parent session the hidden
     /// child runs under and limit the child to one step. `None` leaves the send as is.
-    pub(crate) fn for_session_runner(mut self, route: Option<&'a SessionRunnerRoute>) -> Self {
+    pub(crate) fn for_session_runner(
+        mut self,
+        route: Option<&'a SessionRunnerRoute>,
+        limits: RunnerLimits,
+    ) -> Result<Self, HistorianProducerError> {
         if let Some(route) = route {
+            limits.require_historian()?;
+            if self.params.model.provider == "opencode" {
+                return Err(crate::runner_limits::refusal(
+                    "historian_zen_no_tools: OpenCode Zen requires an offered tool".into(),
+                ));
+            }
             self.params.parent = Some(route.parent_session());
             self.params.stop_when = Some(StopWhen {
                 max_steps: HISTORIAN_SESSION_RUNNER_MAX_STEPS,
             });
+            if !limits.max_output_tokens {
+                self.params.generation.max_output_tokens = None;
+            }
         }
-        self
+        Ok(self)
     }
 }
 
@@ -138,7 +153,7 @@ pub(crate) fn session_send_request<'a>(
             retention,
             tools: &[],
             generation: GenerationRequest {
-                max_output_tokens,
+                max_output_tokens: Some(max_output_tokens),
                 temperature,
             },
             system,
@@ -901,6 +916,7 @@ pub struct HistorianProducer {
     /// `None` means this route has not been queried; `Some(None)` means it declared no
     /// usable retention group. This cache belongs to a route and is cleared on close.
     route_retention: Option<Option<u64>>,
+    route_limits: RunnerLimits,
     /// Freeze the first send's policy for this session. In particular, a session that
     /// began without retention must not opt in on a later send.
     session_retention: Option<Option<u64>>,
@@ -949,6 +965,7 @@ impl HistorianProducer {
         // does not record a retention. Giving stage sessions a retention would first require
         // persisting it in that stage request. Stage sends happen only while
         // `historian_stage::RUST_LIFECYCLE_ENABLED` is on, which it is not in production.
+        self.retention_for_route(route).await;
         let request = serde_json::to_value(
             session_send_request(
                 stage_key,
@@ -960,7 +977,7 @@ impl HistorianProducer {
                 temperature,
                 None,
             )?
-            .for_session_runner(self.session_runner.as_ref()),
+            .for_session_runner(self.session_runner.as_ref(), self.route_limits)?,
         )?;
         match self.unary_json(route, &request).await {
             Ok(response) => match send_outcome(&response) {
@@ -1060,6 +1077,7 @@ impl HistorianProducer {
             command_route: None,
             subscribe_route: None,
             route_retention: None,
+            route_limits: RunnerLimits::default(),
             session_retention: None,
             session_runner: None,
         })
@@ -1176,7 +1194,7 @@ impl HistorianProducer {
             temperature,
             retention,
         )?
-        .for_session_runner(session_runner.as_ref());
+        .for_session_runner(session_runner.as_ref(), self.route_limits)?;
         let response = self.unary_json(route, body).await?;
         match send_outcome(&response) {
             SendOutcome::Active(run_id) => Ok(RunHandle { run_id }),
@@ -1299,6 +1317,7 @@ impl HistorianProducer {
             let _ = self.send_goodbye(route).await;
         }
         self.route_retention = None;
+        self.route_limits = RunnerLimits::default();
     }
 
     async fn retention_for_route(&mut self, route: OpenedRoute) -> Option<u64> {
@@ -1310,7 +1329,10 @@ impl HistorianProducer {
             .unary_json(route, json!({ "method": "role.describe", "params": {} }))
             .await;
         let retention = match described {
-            Ok(answer) => retention_from_role_describe(&answer),
+            Ok(answer) => {
+                self.route_limits = RunnerLimits::from_describe(&answer);
+                retention_from_role_describe(&answer)
+            }
             Err(_) => None,
         };
         if retention.is_none() {
@@ -1321,6 +1343,21 @@ impl HistorianProducer {
         }
         self.route_retention = Some(retention);
         retention
+    }
+
+    /// Reuse the route-local describe cache before assembling a background prompt.
+    /// The discovery route is bound to the next child, never the foreground session.
+    pub(crate) async fn session_runner_limits(
+        &mut self,
+        child: &str,
+    ) -> Result<Option<RunnerLimits>, HistorianProducerError> {
+        if self.session_runner.is_none() {
+            return Ok(None);
+        }
+        self.bind_session(child.to_string());
+        let route = self.ensure_command_route().await?;
+        self.retention_for_route(route).await;
+        Ok(Some(self.route_limits))
     }
 
     async fn subscribe_from_start(
@@ -3157,7 +3194,7 @@ mod tests {
         let server = fake_server_with_role_describe(
             json!({"state":"active","run_id":"run-1"}),
             Vec::new(),
-            json!({"capabilities":["retention"],"retention":{"max_seconds":2_592_000,"delete_within_ms":3_600_000}}),
+            json!({"capabilities":["retention","no_tools","max_steps","max_output_tokens"],"retention":{"max_seconds":2_592_000,"delete_within_ms":3_600_000}}),
             false,
         )
         .await;
@@ -3189,6 +3226,105 @@ mod tests {
         assert_eq!(send["stop_when"], json!({"max_steps": 1}));
         assert_eq!(send["retention"], 86_400);
         assert!(send.get("budget").is_none(), "{send}");
+    }
+
+    #[tokio::test]
+    async fn session_runner_limit_combinations_gate_every_historian_member() {
+        for mask in 0..8 {
+            let groups: Vec<_> = ["max_steps", "max_output_tokens", "no_tools"]
+                .into_iter()
+                .enumerate()
+                .filter_map(|(bit, group)| (mask & (1 << bit) != 0).then_some(group))
+                .collect();
+            let server = fake_server_with_role_describe(
+                json!({"state":"active","run_id":"run-1"}),
+                vec![],
+                json!({"capabilities":groups}),
+                false,
+            )
+            .await;
+            let mut producer = session_runner_client(&server).await;
+            let limits = producer
+                .session_runner_limits("child")
+                .await
+                .unwrap()
+                .unwrap();
+            assert_eq!(limits.max_output_tokens, mask & 2 != 0);
+            let result = producer
+                .start("child", "system", "prompt", "provider/model")
+                .await;
+            let log = server.log.lock().await;
+            assert_eq!(log.role_describes.len(), 1, "fit and send share discovery");
+            if mask & 5 == 5 {
+                result.unwrap();
+                assert_eq!(log.sends.len(), 1);
+                let send = &log.sends[0];
+                assert_eq!(send["tools"], json!([]));
+                assert_eq!(send["stop_when"], json!({"max_steps":1}));
+                assert_eq!(
+                    send["generation"].get("max_output_tokens").is_some(),
+                    mask & 2 != 0,
+                    "mask={mask}: {send}"
+                );
+                if mask == 7 {
+                    let route = producer.session_runner.as_ref();
+                    let bytes = serde_json::to_string(
+                        &session_send_request(
+                            "child",
+                            "system",
+                            "prompt",
+                            "provider/model",
+                            None,
+                            32_000,
+                            None,
+                            None,
+                        )
+                        .unwrap()
+                        .for_session_runner(route, limits)
+                        .unwrap(),
+                    )
+                    .unwrap();
+                    assert_eq!(
+                        bytes,
+                        r#"{"method":"session.send","params":{"prompt":"prompt","send_id":"child","model":{"provider":"provider","model":"model"},"tools":[],"generation":{"max_output_tokens":32000},"system":"system","parent":"ses-parent","stop_when":{"max_steps":1}}}"#
+                    );
+                    assert_eq!(
+                        send,
+                        &json!({"prompt":"prompt","send_id":"child","model":{"provider":"provider","model":"model"},"tools":[],"generation":{"max_output_tokens":32000},"system":"system","parent":"ses-parent","stop_when":{"max_steps":1}})
+                    );
+                }
+            } else {
+                let error = result.unwrap_err().to_string();
+                assert!(error.contains("historian_runner_missing_groups"), "{error}");
+                for (bit, name) in [(1, "max_steps"), (4, "no_tools")] {
+                    if mask & bit == 0 {
+                        assert!(error.contains(name), "{error}");
+                    }
+                }
+                assert!(
+                    log.sends.is_empty(),
+                    "no unsafe raw-request fallback: mask={mask}"
+                );
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn session_runner_never_sends_a_tool_free_zen_request() {
+        let server = fake_server_with_role_describe(
+            json!({"state":"active","run_id":"run-1"}),
+            vec![],
+            json!({"capabilities":["no_tools","max_steps","max_output_tokens"]}),
+            false,
+        )
+        .await;
+        let mut producer = session_runner_client(&server).await;
+        let error = producer
+            .start("child", "", "prompt", "opencode/paid-model")
+            .await
+            .unwrap_err();
+        assert!(error.to_string().contains("historian_zen_no_tools"));
+        assert!(server.log.lock().await.sends.is_empty());
     }
 
     /// The configured-runner producer keeps its send bytes: no parent and no step

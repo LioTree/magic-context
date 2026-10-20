@@ -77,7 +77,10 @@ async fn a_session_runner_child_names_its_parent_and_keeps_the_carrier_limits() 
     let sent = f.sent();
     assert_eq!(sent.len(), 1);
     assert_eq!(sent[0]["parent"], "parent");
-    assert_eq!(sent[0]["tools"], json!([]));
+    assert!(
+        sent[0].get("tools").is_none(),
+        "plan tools are frozen at admission"
+    );
     assert_eq!(sent[0]["stop_when"], json!({"max_steps": 3}));
     assert_eq!(sent[0]["retention"], ORDINARY_RETENTION_SECONDS);
     assert_eq!(
@@ -110,4 +113,62 @@ async fn the_configured_port_still_requires_a_configured_broca() {
         .unwrap_err();
     assert_eq!(refused.message, "unavailable: broca_not_configured");
     assert!(f.broca.state().log.is_empty());
+}
+
+#[tokio::test]
+async fn session_runner_dream_limit_combinations_preserve_plan_tools_and_require_steps() {
+    for mask in 0..8 {
+        for tools in [&["ctx_search"][..], &[][..]] {
+            let mut groups: Vec<_> = BASE
+                .iter()
+                .copied()
+                .filter(|group| !["max_steps", "max_output_tokens", "no_tools"].contains(group))
+                .collect();
+            groups.extend(
+                ["max_steps", "max_output_tokens", "no_tools"]
+                    .into_iter()
+                    .enumerate()
+                    .filter_map(|(bit, group)| (mask & (1 << bit) != 0).then_some(group)),
+            );
+            let f = Fixture::new(&groups);
+            f.script(vec![answer("done")]);
+            let mut carrier = session_carrier(&f, "parent");
+            let request = harness_default(&f, tools);
+            let opened = carrier.open(&request).await;
+            let permitted = mask & 1 != 0 && (!tools.is_empty() || mask & 4 != 0);
+            if !permitted {
+                let error = opened.unwrap_err();
+                assert!(
+                    error.message.contains(if mask & 1 == 0 {
+                        "max_steps"
+                    } else {
+                        "no_tools"
+                    }),
+                    "{error:?}"
+                );
+                assert!(f.sent().is_empty());
+                continue;
+            }
+            let child = opened.unwrap();
+            carrier.complete(&child, &request).await.unwrap();
+            carrier.close(&child, true).await.unwrap();
+            let sent = f.sent();
+            assert_eq!(sent.len(), 1);
+            assert_eq!(sent[0]["stop_when"], json!({"max_steps":3}));
+            // This carrier has never requested an output cap. Discovery alone must
+            // not introduce one, or change the read-only plan's tool bytes.
+            assert!(sent[0].pointer("/generation/max_output_tokens").is_none());
+            if tools.is_empty() {
+                assert_eq!(sent[0]["tools"], json!([]));
+                assert!(sent[0].get("plan").is_none());
+            } else {
+                assert!(sent[0].get("tools").is_none());
+                assert_eq!(
+                    sent[0]["plan"]["items"],
+                    json!([{"provider":"magic-context","item":"tools","params":{"tools":["ctx_search"]}}])
+                );
+                assert_eq!(f.broca.state().run.as_ref().unwrap().allow, ["ctx_search"]);
+            }
+        }
+    }
 }

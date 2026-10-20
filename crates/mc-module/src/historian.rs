@@ -1343,6 +1343,14 @@ impl From<McStoreError> for HistorianDriveError {
 
 #[subc_client_rs::async_trait]
 pub trait HistorianProducerDriver: Send {
+    /// Host/configured transports keep their existing sizing and send behavior.
+    /// Session-runner transports return limits from the same discovery as sends.
+    async fn session_runner_limits(
+        &mut self,
+        _child: &str,
+    ) -> Result<Option<crate::runner_limits::RunnerLimits>, HistorianProducerError> {
+        Ok(None)
+    }
     async fn bind_session(&mut self, session_id: &str) -> Result<(), HistorianProducerError>;
     async fn start(
         &mut self,
@@ -1432,6 +1440,12 @@ pub trait HistorianProducerDriver: Send {
 
 #[subc_client_rs::async_trait]
 impl HistorianProducerDriver for HistorianProducer {
+    async fn session_runner_limits(
+        &mut self,
+        child: &str,
+    ) -> Result<Option<crate::runner_limits::RunnerLimits>, HistorianProducerError> {
+        HistorianProducer::session_runner_limits(self, child).await
+    }
     async fn bind_session(&mut self, session_id: &str) -> Result<(), HistorianProducerError> {
         HistorianProducer::bind_session(self, session_id.to_string());
         Ok(())
@@ -2720,6 +2734,26 @@ where
             request.chunk_fingerprint,
             request.observed_chunk_fingerprint,
         )?;
+        let next = request.store.load_meta(request.session_id)?;
+        let child = historian_producer_session_id(
+            request.project_slug,
+            request.session_id,
+            next.meta.historian.firing_seq.saturating_add(1),
+        );
+        let mut attempt_limits = request.model_limits.clone();
+        if let Some(limits) = producer.session_runner_limits(&child).await? {
+            let admitted = limits.require_historian().and_then(|()| {
+                limits.fit_limits(
+                    std::slice::from_ref(model),
+                    &mut attempt_limits,
+                    request.historian_context_limit_tokens,
+                )
+            });
+            if let Err(error) = admitted {
+                record_admission_refusal(&request, &error.to_string())?;
+                return Err(HistorianDriveError::Producer(error));
+            }
+        }
         let seed = crate::decision_calibration::DecisionCalibration::for_model(Some(model));
         let full_tokens = seed.provider_mass(
             crate::decision_calibration::LocalMass {
@@ -2736,7 +2770,7 @@ where
         };
         let fit_limit = attempt_producer_input_limit(
             model,
-            &request.model_limits,
+            &attempt_limits,
             legacy_window,
             request.historian_context_limit_tokens,
             request.max_output_tokens,

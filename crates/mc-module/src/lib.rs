@@ -350,6 +350,7 @@ mod reply_pages;
 mod retained_size;
 pub mod retrieval;
 mod retrieval_store;
+pub mod runner_limits;
 mod transport_handler;
 pub use transport_handler::McTransportHandler;
 pub mod edit_admission;
@@ -4899,6 +4900,14 @@ impl historian::HistorianPublicationFence for ReattachSnapshotPublicationFence {
     }
 }
 
+type HistorianRunnerRefit = Box<
+    dyn FnOnce(
+            &McStore,
+            runner_limits::RunnerLimits,
+        ) -> Result<AssembledHistorianFiring, HistorianProducerError>
+        + Send,
+>;
+
 struct HistorianFiringTask {
     rust_background_enabled: bool,
     store: Arc<McStore>,
@@ -4912,6 +4921,9 @@ struct HistorianFiringTask {
     project_root: PathBuf,
     project_slug: String,
     firing: AssembledHistorianFiring,
+    /// Rebuild from the same source snapshot only if runner discovery changes
+    /// model eligibility or the output reserve. Discovery stays off the transform path.
+    runner_refit: Option<HistorianRunnerRefit>,
     /// Which side runs the completion for this firing, resolved from config at
     /// the moment the firing was prepared so a config edit mid-run cannot move a
     /// firing already in flight to a different lane.
@@ -7648,37 +7660,65 @@ impl McHandler {
         } else {
             assemble_historian_firing
         };
+        let assembler_config = HistorianAssemblerConfig {
+            expand_tools: cfg.historian_expand_tools.clone(),
+            session_id: parsed.session_id.clone(),
+            project_path: project_path.to_string(),
+            project_slug: project_slug.clone(),
+            model_chain: model_chain.to_vec(),
+            model_limits: parsed.historian_model_limits.clone(),
+            model_variants: parsed.historian_model_variants.clone(),
+            token_budget: derive_historian_chunk_tokens(cfg.historian_context_limit_tokens),
+            historian_context_limit_tokens: cfg
+                .historian_context_limit_known
+                .then_some(cfg.historian_context_limit_tokens),
+            max_output_tokens: parsed
+                .historian_max_output_tokens
+                .unwrap_or(historian_producer::HISTORIAN_MAX_OUTPUT_TOKENS),
+            boundary,
+            memory_enabled: cfg.memory_enabled,
+            auto_promote: cfg.auto_promote,
+            user_memory_collection_enabled: cfg.user_memory_collection_enabled,
+            extraction_free: false,
+            in_emergency: parsed.emergency_recovery_armed,
+            force_keep_last_compartment: false,
+            fold_is_only_reclaim,
+            failure_backoff_at_ms: now + HISTORIAN_FAILURE_BACKOFF_MS,
+            min_chunk_tokens: DEFAULT_HISTORIAN_MIN_CHUNK_TOKENS,
+        };
+        let runner_refit: Option<HistorianRunnerRefit> = session_runner.as_ref().map(|_| {
+            let messages = parsed.messages.clone();
+            let identities = projection.identity_by_mid.clone();
+            let live = live.clone();
+            let mut config = assembler_config.clone();
+            Box::new(
+                move |store: &McStore, limits: runner_limits::RunnerLimits| {
+                    limits.historian_chain(&config.session_id, &mut config.model_chain)?;
+                    limits.fit_limits(
+                        &config.model_chain,
+                        &mut config.model_limits,
+                        config.historian_context_limit_tokens,
+                    )?;
+                    match assembler(store, &messages, &live, &identities, config, now) {
+                        Ok(AssembleHistorianFiringOutcome::Fire(firing)) => Ok(*firing),
+                        Ok(AssembleHistorianFiringOutcome::NoFire(reason)) => {
+                            Err(runner_limits::refusal(format!(
+                                "historian_runner_fit_refused: {reason:?}"
+                            )))
+                        }
+                        Err(error) => Err(runner_limits::refusal(format!(
+                            "historian_runner_fit_failed: {error}"
+                        ))),
+                    }
+                },
+            ) as HistorianRunnerRefit
+        });
         let assemble = assembler(
             &store,
             &parsed.messages,
             &live,
             &projection.identity_by_mid,
-            HistorianAssemblerConfig {
-                expand_tools: cfg.historian_expand_tools.clone(),
-                session_id: parsed.session_id.clone(),
-                project_path: project_path.to_string(),
-                project_slug: project_slug.clone(),
-                model_chain: model_chain.to_vec(),
-                model_limits: parsed.historian_model_limits.clone(),
-                model_variants: parsed.historian_model_variants.clone(),
-                token_budget: derive_historian_chunk_tokens(cfg.historian_context_limit_tokens),
-                historian_context_limit_tokens: cfg
-                    .historian_context_limit_known
-                    .then_some(cfg.historian_context_limit_tokens),
-                max_output_tokens: parsed
-                    .historian_max_output_tokens
-                    .unwrap_or(historian_producer::HISTORIAN_MAX_OUTPUT_TOKENS),
-                boundary,
-                memory_enabled: cfg.memory_enabled,
-                auto_promote: cfg.auto_promote,
-                user_memory_collection_enabled: cfg.user_memory_collection_enabled,
-                extraction_free: false,
-                in_emergency: parsed.emergency_recovery_armed,
-                force_keep_last_compartment: false,
-                fold_is_only_reclaim,
-                failure_backoff_at_ms: now + HISTORIAN_FAILURE_BACKOFF_MS,
-                min_chunk_tokens: DEFAULT_HISTORIAN_MIN_CHUNK_TOKENS,
-            },
+            assembler_config,
             now,
         );
         let mut firing = match assemble {
@@ -7801,6 +7841,7 @@ impl McHandler {
                 project_root: binding.project_root.clone(),
                 project_slug,
                 firing,
+                runner_refit,
                 runner: self.record_historian_runner(&parsed.session_id, &cfg, &binding.harness),
                 host_runs: Arc::clone(&self.host_runs),
                 session_runner,
@@ -7966,6 +8007,7 @@ impl McHandler {
             project_root: binding.project_root.clone(),
             project_slug,
             firing,
+            runner_refit: None,
             runner: self.record_historian_runner(
                 &parsed.session_id,
                 &binding.config,
@@ -8075,7 +8117,8 @@ impl McHandler {
             project_path,
             project_slug,
             project_root,
-            firing,
+            mut firing,
+            runner_refit,
             runner,
             host_runs,
             session_runner,
@@ -8136,6 +8179,48 @@ impl McHandler {
         let connected = match &session_runner {
             Some(route) => factory.connect_session_runner(&project_root, route).await,
             None => factory.connect(&project_root).await,
+        };
+        let connected = match connected {
+            Ok(mut producer) if session_runner.is_some() => {
+                let prepared = async {
+                    let state = store.load_meta(&session_id).map_err(|error| {
+                        runner_limits::refusal(format!("historian_runner_discovery: {error}"))
+                    })?;
+                    let child = historian::historian_producer_session_id(
+                        &project_slug,
+                        &session_id,
+                        state.meta.historian.firing_seq.saturating_add(1),
+                    );
+                    let limits = producer
+                        .session_runner_limits(&child)
+                        .await?
+                        .ok_or_else(|| {
+                            runner_limits::refusal(
+                                "historian_runner_missing_groups: no_tools,max_steps (describe unavailable)".into(),
+                            )
+                        })?;
+                    limits.require_historian()?;
+                    let skips_zen = firing.model_chain.iter().any(|model| runner_limits::is_zen_model(model));
+                    if !limits.max_output_tokens || skips_zen {
+                        let refit = runner_refit.ok_or_else(|| {
+                            runner_limits::refusal("historian_runner_fit_unavailable".into())
+                        })?;
+                        let recent_decision = firing.recent_decision.clone();
+                        firing = refit(&store, limits)?;
+                        firing.recent_decision = recent_decision;
+                    }
+                    Ok::<(), HistorianProducerError>(())
+                }
+                .await;
+                match prepared {
+                    Ok(()) => Ok(producer),
+                    Err(error) => {
+                        producer.close().await;
+                        Err(error)
+                    }
+                }
+            }
+            other => other,
         };
         let result = match connected {
             Ok(mut producer) => {
@@ -25570,8 +25655,12 @@ mod tests {
         ));
     }
 
+    #[path = "background_run_limits.rs"]
+    mod background_run_limits;
+
     #[derive(Default)]
     struct ProducerState {
+        runner_limits: Mutex<Option<runner_limits::RunnerLimits>>,
         connects: AtomicUsize,
         starts: AtomicUsize,
         start_errors: Mutex<VecDeque<Result<RunHandle, HistorianProducerError>>>,
@@ -25620,6 +25709,14 @@ mod tests {
                 state: Arc::clone(&self.state),
             }))
         }
+
+        async fn connect_session_runner(
+            &self,
+            project: &Path,
+            _route: &SessionRunnerRoute,
+        ) -> Result<Box<dyn HistorianProducerDriver + Send>, HistorianProducerError> {
+            self.connect(project).await
+        }
     }
 
     struct TestProducer {
@@ -25628,6 +25725,12 @@ mod tests {
 
     #[async_trait]
     impl HistorianProducerDriver for TestProducer {
+        async fn session_runner_limits(
+            &mut self,
+            _child: &str,
+        ) -> Result<Option<runner_limits::RunnerLimits>, HistorianProducerError> {
+            Ok(*self.state.runner_limits.lock().unwrap())
+        }
         async fn bind_session(&mut self, _session_id: &str) -> Result<(), HistorianProducerError> {
             self.state.binds.fetch_add(1, Ordering::SeqCst);
             Ok(())

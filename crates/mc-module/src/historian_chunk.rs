@@ -2904,6 +2904,48 @@ mod tests {
     }
 
     #[test]
+    fn undeclared_output_cap_reserves_the_full_model_maximum_and_declared_cap_keeps_chunk_bytes() {
+        let model = "provider/historian";
+        let messages = long_narrative_session(240);
+        let mut catalog = chain_limits(&[(model, 200_000)]);
+        catalog.get_mut(model).unwrap().output = Some(128_000);
+        let baseline = assemble_for_chain(&messages, &[model], catalog.clone(), 400_000);
+        let all = crate::runner_limits::RunnerLimits {
+            max_steps: true,
+            max_output_tokens: true,
+            no_tools: true,
+        };
+        let mut declared = catalog.clone();
+        all.fit_limits(&[model.into()], &mut declared, None)
+            .unwrap();
+        let same = assemble_for_chain(&messages, &[model], declared, 400_000);
+        assert_eq!(same.prompt.as_bytes(), baseline.prompt.as_bytes());
+        assert_eq!(same.chunk.text.as_bytes(), baseline.chunk.text.as_bytes());
+        assert_eq!(
+            same.raw_chunk_messages.as_bytes(),
+            baseline.raw_chunk_messages.as_bytes()
+        );
+        assert_eq!(same.chunk_fingerprint, baseline.chunk_fingerprint);
+        let mut uncapped = catalog;
+        crate::runner_limits::RunnerLimits {
+            max_output_tokens: false,
+            ..all
+        }
+        .fit_limits(&[model.into()], &mut uncapped, None)
+        .unwrap();
+        let smaller = assemble_for_chain(&messages, &[model], uncapped, 400_000);
+        assert!(smaller.to_ordinal < baseline.to_ordinal);
+        assert_ne!(smaller.prompt.as_bytes(), baseline.prompt.as_bytes());
+        let (tokens, limit) = attempt_admission(&smaller, 0);
+        assert_eq!(
+            limit, 69_840,
+            "(200000 - 128000) * 0.97, not the quarter-window reserve"
+        );
+        assert!(tokens <= limit as f64);
+        assert!(tokens + 128_000.0 <= 200_000.0);
+    }
+
+    #[test]
     fn large_primary_chunk_is_also_sized_for_a_smaller_fallback() {
         let messages = long_narrative_session(400);
         let firing = assemble_for_chain(

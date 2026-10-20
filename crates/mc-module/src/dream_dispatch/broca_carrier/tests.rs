@@ -187,6 +187,10 @@ fn child_runner_describe() -> Value {
             .unwrap()
             .retain(|op| op != "compaction.ready");
     }
+    describe["capabilities"]
+        .as_array_mut()
+        .unwrap()
+        .extend(["max_steps", "max_output_tokens", "no_tools"].map(|group| json!(group)));
     describe
 }
 const GOLDEN_DESCRIBE_SHA256: &str =
@@ -233,6 +237,15 @@ impl FakeBroca {
             };
         }
         let describe: RoleDescribe = serde_json::from_value(s.describe.clone()).unwrap();
+        for (group, path) in [
+            ("max_steps", "/stop_when/max_steps"),
+            ("max_output_tokens", "/generation/max_output_tokens"),
+            ("no_tools", "/tools"),
+        ] {
+            if params.pointer(path).is_some() && !describe.declares(group) {
+                return Err(refused("invalid_params", json!({"field": path})));
+            }
+        }
         let advertised = describe.declares(caps::INPUT_TOKEN_CAP);
         let budget = request
             .budget()
@@ -281,6 +294,9 @@ impl FakeBroca {
                 files = Some((std::path::PathBuf::from(root), tools.clone()));
             }
             allow.extend(tools);
+        }
+        if params.get("tools") == Some(&json!([])) {
+            allow.clear();
         }
         s.run = Some(Run {
             id: "run-1".into(),
@@ -672,6 +688,9 @@ const BASE: &[&str] = &[
     "plans",
     "run_cancel",
     "retract",
+    "max_steps",
+    "max_output_tokens",
+    "no_tools",
 ];
 
 struct Fixture {
@@ -1173,7 +1192,15 @@ async fn broca_child_sends_retention_and_private_dreams_use_the_shortest() {
         .await
         .unwrap_err();
     assert_eq!(refused.message, "unavailable: retention_deletion_too_slow");
-    let none = Fixture::new(&["queue", "run_ops", "streaming", "run_cancel", "retract"]);
+    let none = Fixture::new(&[
+        "queue",
+        "run_ops",
+        "streaming",
+        "run_cancel",
+        "retract",
+        "max_steps",
+        "no_tools",
+    ]);
     let refused = bounded(none.carrier(policy()).open(&none.request(&[], 3)))
         .await
         .unwrap_err();
