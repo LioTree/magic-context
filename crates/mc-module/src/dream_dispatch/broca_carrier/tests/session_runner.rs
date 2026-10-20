@@ -154,15 +154,17 @@ async fn session_runner_dream_limit_combinations_preserve_plan_tools_and_require
             carrier.close(&child, true).await.unwrap();
             let sent = f.sent();
             assert_eq!(sent.len(), 1);
-            assert_eq!(sent[0]["stop_when"], json!({"max_steps":3}));
+            let typed: SendRequest = serde_json::from_value(sent[0].clone()).unwrap();
+            assert_eq!(typed.max_steps().unwrap(), Some(3));
             // This carrier has never requested an output cap. Discovery alone must
             // not introduce one, or change the read-only plan's tool bytes.
-            assert!(sent[0].pointer("/generation/max_output_tokens").is_none());
+            assert_eq!(typed.max_output_tokens().unwrap(), None);
             if tools.is_empty() {
-                assert_eq!(sent[0]["tools"], json!([]));
+                assert_eq!(typed.no_tools().unwrap(), Some(true));
                 assert!(sent[0].get("plan").is_none());
             } else {
                 assert!(sent[0].get("tools").is_none());
+                assert_eq!(typed.no_tools().unwrap(), None);
                 assert_eq!(
                     sent[0]["plan"]["items"],
                     json!([{"provider":"magic-context","item":"tools","params":{"tools":["ctx_search"]}}])

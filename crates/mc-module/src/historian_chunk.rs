@@ -2916,7 +2916,7 @@ mod tests {
             no_tools: true,
         };
         let mut declared = catalog.clone();
-        all.fit_limits(&[model.into()], &mut declared, None)
+        all.fit_limits(&[model.into()], &mut declared, None, 32_000)
             .unwrap();
         let same = assemble_for_chain(&messages, &[model], declared, 400_000);
         assert_eq!(same.prompt.as_bytes(), baseline.prompt.as_bytes());
@@ -2931,7 +2931,7 @@ mod tests {
             max_output_tokens: false,
             ..all
         }
-        .fit_limits(&[model.into()], &mut uncapped, None)
+        .fit_limits(&[model.into()], &mut uncapped, None, 32_000)
         .unwrap();
         let smaller = assemble_for_chain(&messages, &[model], uncapped, 400_000);
         assert!(smaller.to_ordinal < baseline.to_ordinal);
@@ -2943,6 +2943,73 @@ mod tests {
         );
         assert!(tokens <= limit as f64);
         assert!(tokens + 128_000.0 <= 200_000.0);
+    }
+
+    #[test]
+    fn installation_catalog_limits_compare_old_and_uncapped_chunk_sizes() {
+        // Installation-provided models.dev facts. Runtime-only Antigravity
+        // aliases stay unknown; borrowing the canonical model's limits would
+        // hide the fallback policy this fixture needs to exercise.
+        let models = [
+            ("google/antigravity-gemini-3.8-flash", None, None),
+            ("google/antigravity-claude-opus-4-6-thinking", None, None),
+            ("google/gemini-3.8-flash", Some(1_048_576), Some(65_536)),
+            (
+                "anthropic/claude-sonnet-5-5",
+                Some(1_000_000),
+                Some(128_000),
+            ),
+            (
+                "openrouter/meta/muse-spark-1.3-contributor",
+                Some(1_048_576),
+                Some(943_718),
+            ),
+            (
+                "openrouter/google/gemini-3.8-flash",
+                Some(1_048_576),
+                Some(65_536),
+            ),
+        ];
+        let messages = long_narrative_session(400);
+        let broca = crate::runner_limits::RunnerLimits {
+            max_steps: true,
+            no_tools: true,
+            max_output_tokens: false,
+        };
+        assert!(crate::runner_limits::is_zen_model(
+            "opencode/muse-spark-1.3-contributor-free"
+        ));
+        for budget in [
+            crate::config::derive_historian_chunk_tokens(128_000),
+            50_000,
+        ] {
+            for (model, context, output) in models {
+                let old_limits = BTreeMap::from([(
+                    model.into(),
+                    crate::historian::HistorianModelLimits {
+                        context,
+                        output,
+                        input: None,
+                    },
+                )]);
+                let old = assemble_for_chain(&messages, &[model], old_limits.clone(), budget);
+                let mut new_limits = old_limits;
+                broca
+                    .fit_limits(&[model.into()], &mut new_limits, None, 32_000)
+                    .unwrap();
+                let new = assemble_for_chain(&messages, &[model], new_limits, budget);
+                println!("model_fit model={model} requested={budget} old_chunk_bytes={} new_chunk_bytes={} old_end={} new_end={} input_limit={:?}", old.chunk.text.len(), new.chunk.text.len(), old.to_ordinal, new.to_ordinal, crate::historian::attempt_producer_input_limit(model, &new.model_limits, None, None, 32_000));
+                assert!(
+                    new.chunk.text.len() <= old.chunk.text.len(),
+                    "{model}, budget={budget}"
+                );
+                let (calibrated, limit) = attempt_admission(&new, 0);
+                assert!(
+                    calibrated <= limit as f64,
+                    "{model}: {calibrated} > {limit}"
+                );
+            }
+        }
     }
 
     #[test]

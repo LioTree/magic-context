@@ -46,7 +46,7 @@ rusqlite = { workspace = true }
 cortexkit-role-tool-provider = "=0.5.0"
 cortexkit-role-agent-data = "0.1"
 # Runner-owned tags and context-ceiling details for async compaction.
-cortexkit-role-llm-runner = "=0.3.0"
+cortexkit-role-llm-runner = "=0.3.4"
 cortexkit-role-compaction-provider = "=0.3.1"
 # RFC 8785 (JCS) canonical JSON for tool.catalog's answer bytes and digests: the
 # same canonicaliser the role crate uses, so floats and non-ASCII keys in a

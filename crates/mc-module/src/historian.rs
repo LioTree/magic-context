@@ -2747,6 +2747,7 @@ where
                     std::slice::from_ref(model),
                     &mut attempt_limits,
                     request.historian_context_limit_tokens,
+                    request.max_output_tokens,
                 )
             });
             if let Err(error) = admitted {
@@ -9747,6 +9748,42 @@ mod tests {
             )
             .unwrap();
         assert_eq!(linked, invocations[0].id);
+    }
+
+    #[tokio::test]
+    async fn open_control_runner_and_broca_publish_identical_historian_bytes_from_run_result() {
+        let output = historian_xml("one authoritative result, two event schemas");
+        let chunk = historian_chunk();
+        let prior = prior_ranges();
+        let models = vec!["prov/model-a".to_string()];
+        let mut published = Vec::new();
+        for open_controls in [false, true] {
+            let dir = tempfile::tempdir().unwrap();
+            let store = store(dir.path());
+            seed_prior_compartment(&store);
+            let (mut producer, server) =
+                crate::historian_producer::tests::publication_follower(&output, open_controls)
+                    .await;
+            let mut request = fire_request(&store, "prompt", &models, &chunk, &prior);
+            request.model_limits.insert(
+                "prov/model-a".into(),
+                HistorianModelLimits {
+                    context: Some(200_000),
+                    input: None,
+                    output: Some(128_000),
+                },
+            );
+            request.await_timeout = Duration::from_secs(2);
+            let outcome = run_historian_firing(&mut producer, request).await.unwrap();
+            assert!(matches!(outcome, HistorianDriveOutcome::Completed(_)));
+            assert_eq!(
+                server.follow_counts().await,
+                (2, 1),
+                "one initial status, one control wake, then one result"
+            );
+            published.push(serde_json::to_vec(&store.load_compartments("ses").unwrap()).unwrap());
+        }
+        assert_eq!(published[0], published[1]);
     }
 
     #[tokio::test(flavor = "current_thread")]

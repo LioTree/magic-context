@@ -101,36 +101,42 @@ async fn missing_required_groups_are_durable_named_failures_without_a_send() {
 
 #[tokio::test]
 async fn uncapped_runner_reassembles_before_send_while_all_groups_keep_prompt_bytes() {
-    let mut lengths = Vec::new();
-    for max_output_tokens in [true, false] {
-        let producer = Arc::new(ProducerState::default());
-        stop_after_send(&producer);
-        *producer.runner_limits.lock().unwrap() = Some(RunnerLimits {
-            max_output_tokens,
-            ..ALL
-        });
-        let (handler, store, _dir, project) =
-            handler_with_store(producer.clone(), default_test_config());
-        let task = prepare(&handler, store, &project, &["provider/model"]);
-        let original = task.firing.prompt.clone();
-        let error =
-            McHandler::execute_historian_firing_task(handler.producer_factory.clone(), task)
-                .await
-                .unwrap_err();
-        assert!(
-            error.to_string().contains("fixture stops after send"),
-            "{error}"
-        );
-        let prompts = producer.prompts.lock().unwrap();
-        assert_eq!(prompts.len(), 1);
-        if max_output_tokens {
-            assert_eq!(prompts[0].as_bytes(), original.as_bytes());
-        } else {
-            assert_ne!(prompts[0].as_bytes(), original.as_bytes());
+    for configured in [false, true] {
+        let mut lengths = Vec::new();
+        for max_output_tokens in [true, false] {
+            let producer = Arc::new(ProducerState::default());
+            stop_after_send(&producer);
+            *producer.runner_limits.lock().unwrap() = Some(RunnerLimits {
+                max_output_tokens,
+                ..ALL
+            });
+            let mut config = default_test_config();
+            if configured {
+                config.historian_runner = Some(HistorianRunnerKind::Broca);
+            }
+            let (handler, store, _dir, project) = handler_with_store(producer.clone(), config);
+            let task = prepare(&handler, store, &project, &["provider/model"]);
+            assert_eq!(task.session_runner.is_none(), configured);
+            let original = task.firing.prompt.clone();
+            let error =
+                McHandler::execute_historian_firing_task(handler.producer_factory.clone(), task)
+                    .await
+                    .unwrap_err();
+            assert!(
+                error.to_string().contains("fixture stops after send"),
+                "{error}"
+            );
+            let prompts = producer.prompts.lock().unwrap();
+            assert_eq!(prompts.len(), 1);
+            if max_output_tokens {
+                assert_eq!(prompts[0].as_bytes(), original.as_bytes());
+            } else {
+                assert_ne!(prompts[0].as_bytes(), original.as_bytes());
+            }
+            lengths.push(prompts[0].len());
         }
-        lengths.push(prompts[0].len());
+        assert!(lengths[1] < lengths[0], "{lengths:?}");
     }
-    assert!(lengths[1] < lengths[0], "{lengths:?}");
 }
 
 #[tokio::test]
@@ -170,4 +176,64 @@ async fn zen_models_are_skipped_before_send_and_all_zen_failure_is_durable() {
             );
         }
     }
+}
+
+#[tokio::test]
+async fn configured_broca_wrapup_refits_its_captured_source_without_an_output_cap() {
+    let producer = Arc::new(ProducerState::default());
+    stop_after_send(&producer);
+    *producer.runner_limits.lock().unwrap() = Some(RunnerLimits {
+        max_output_tokens: false,
+        ..ALL
+    });
+    let mut config = default_test_config();
+    config.historian_runner = Some(HistorianRunnerKind::Broca);
+    config.rust_background_enabled = true;
+    let (handler, store, _dir, project) = handler_with_store(producer.clone(), config.clone());
+    let mut binding = binding(project.to_str().unwrap(), "ses");
+    binding.config = config;
+    let mut raw = request(wrapup_messages(240, 800));
+    raw["historian_model_chain"] = json!(["provider/model"]);
+    raw["historian_model_limits"] = json!({"provider/model":{"context":200_000,"output":160_000}});
+    let parsed: TransformRequest = serde_json::from_value(raw).unwrap();
+    let projection = crate::ck_wire::project_messages(&parsed.messages).unwrap();
+    let boundary = boundary::BoundaryResolution {
+        protected_start_ordinal: 241,
+        eligible_head: 1..241,
+        n_tokens: 0.0,
+        floored_by_live_prompt: false,
+        fenced_by_open_arc: false,
+        true_raw_eligible_tokens: 190_000.0,
+        oversize_atomic_unit: false,
+        raw_message_count: 240,
+        boundary_reason: "test".into(),
+    };
+    let prepared = handler.prepare_wrapup_fire(
+        store,
+        &parsed,
+        &binding,
+        &projection,
+        &boundary,
+        WrapupPrepareContext {
+            now: now_ms(),
+            project_path: project.to_string_lossy().into_owned(),
+            allow_unknown_module_retry: false,
+        },
+    );
+    let PreparedWrapupAction::FireReady(task) = prepared else {
+        panic!("expected wrapup firing");
+    };
+    assert!(task.session_runner.is_none());
+    assert!(task.runner_refit.is_some());
+    let original = task.firing.prompt.len();
+    let error = McHandler::execute_historian_firing_task(handler.producer_factory.clone(), *task)
+        .await
+        .unwrap_err();
+    assert!(
+        error.to_string().contains("fixture stops after send"),
+        "{error}"
+    );
+    let prompts = producer.prompts.lock().unwrap();
+    assert_eq!(prompts.len(), 1);
+    assert!(prompts[0].len() < original);
 }

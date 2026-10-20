@@ -2,6 +2,7 @@
 
 use crate::historian::HistorianModelLimits;
 use crate::historian_producer::{HistorianProducerError, ProducerErrorBody};
+use cortexkit_role_llm_runner::capabilities as caps;
 use serde_json::Value;
 use std::collections::BTreeMap;
 
@@ -21,17 +22,20 @@ impl RunnerLimits {
                 .is_some_and(|groups| groups.iter().any(|group| group.as_str() == Some(name)))
         };
         Self {
-            max_steps: declares("max_steps"),
-            max_output_tokens: declares("max_output_tokens"),
-            no_tools: declares("no_tools"),
+            max_steps: declares(caps::MAX_STEPS),
+            max_output_tokens: declares(caps::MAX_OUTPUT_TOKENS),
+            no_tools: declares(caps::NO_TOOLS),
         }
     }
 
     pub(crate) fn require_historian(self) -> Result<(), HistorianProducerError> {
-        let missing: Vec<_> = [("no_tools", self.no_tools), ("max_steps", self.max_steps)]
-            .into_iter()
-            .filter_map(|(name, declared)| (!declared).then_some(name))
-            .collect();
+        let missing: Vec<_> = [
+            (caps::NO_TOOLS, self.no_tools),
+            (caps::MAX_STEPS, self.max_steps),
+        ]
+        .into_iter()
+        .filter_map(|(name, declared)| (!declared).then_some(name))
+        .collect();
         if missing.is_empty() {
             Ok(())
         } else {
@@ -80,11 +84,15 @@ impl RunnerLimits {
     /// Tighten the existing model-limit input path rather than changing the legacy
     /// capped estimator. Without a runner-enforced output cap, the model can use
     /// its entire catalog maximum, even when that exceeds a quarter of the window.
+    /// Missing catalog maxima use the configured output cap or 32,000-token
+    /// default as an estimate, not an enforceable bound. Missing context uses
+    /// the configured window or the historian's 128,000-token default.
     pub(crate) fn fit_limits(
         self,
         chain: &[String],
         limits: &mut BTreeMap<String, HistorianModelLimits>,
         legacy_window: Option<usize>,
+        fallback_output_tokens: u32,
     ) -> Result<(), HistorianProducerError> {
         if self.max_output_tokens {
             return Ok(());
@@ -94,19 +102,23 @@ impl RunnerLimits {
             let output = entry
                 .output
                 .filter(|output| *output > 0)
-                .ok_or_else(|| refusal(format!("historian_model_output_limit_unknown: {model}")))?;
-            let window = entry.context.or(legacy_window).map(|window| {
-                if entry.input.is_some() {
-                    window
-                } else {
-                    legacy_window.map_or(window, |cap| window.min(cap))
-                }
-            });
-            let input = window
-                .map(|window| window.saturating_sub(output as usize))
-                .ok_or_else(|| {
-                    refusal(format!("historian_model_context_limit_unknown: {model}"))
-                })?;
+                .unwrap_or_else(|| {
+                    static WARNED: std::sync::OnceLock<std::sync::Mutex<std::collections::HashSet<String>>> = std::sync::OnceLock::new();
+                    if WARNED.get_or_init(Default::default).lock().expect("output reserve log").insert(model.clone()) {
+                        tracing::warn!(model, reserve = fallback_output_tokens, "historian_model_output_limit_unknown: reserving the configured output cap or default 32000 tokens; the runner cannot enforce it");
+                    }
+                    fallback_output_tokens
+                });
+            let window = entry
+                .context
+                .or(legacy_window)
+                .unwrap_or(crate::config::DEFAULT_HISTORIAN_CONTEXT_LIMIT_TOKENS);
+            let window = if entry.input.is_some() {
+                window
+            } else {
+                legacy_window.map_or(window, |cap| window.min(cap))
+            };
+            let input = window.saturating_sub(output as usize);
             let input = entry.input.map_or(input, |cap| cap.min(input));
             if input == 0 {
                 return Err(refusal(format!(
@@ -173,17 +185,40 @@ mod tests {
     }
 
     #[test]
-    fn uncapped_fit_refuses_unknown_or_window_filling_output_instead_of_sending_raw() {
+    fn uncapped_fit_uses_configured_or_default_reserve_for_unknown_maximum() {
         let limits = RunnerLimits {
             max_steps: true,
             no_tools: true,
             max_output_tokens: false,
         };
-        for (output, input, expected) in [
-            (None, None, "output_limit_unknown"),
-            (Some(200), None, "output_fills_window"),
-            (Some(50), Some(0), "output_fills_window"),
-        ] {
+        for fallback in [32_000, 6_000] {
+            let mut models = BTreeMap::from([(
+                "p/m".into(),
+                HistorianModelLimits {
+                    context: Some(200_000),
+                    input: None,
+                    output: None,
+                },
+            )]);
+            limits
+                .fit_limits(&["p/m".into()], &mut models, None, fallback)
+                .unwrap();
+            assert_eq!(models["p/m"].input, Some(200_000 - fallback as usize));
+            let mut unknown_context = BTreeMap::new();
+            limits
+                .fit_limits(
+                    &["p/m".into()],
+                    &mut unknown_context,
+                    Some(200_000),
+                    fallback,
+                )
+                .unwrap();
+            assert_eq!(
+                unknown_context["p/m"].input,
+                Some(200_000 - fallback as usize)
+            );
+        }
+        for (output, input) in [(Some(200), None), (Some(50), Some(0))] {
             let mut models = BTreeMap::from([(
                 "p/m".into(),
                 HistorianModelLimits {
@@ -193,9 +228,9 @@ mod tests {
                 },
             )]);
             let error = limits
-                .fit_limits(&["p/m".into()], &mut models, None)
+                .fit_limits(&["p/m".into()], &mut models, None, 32_000)
                 .unwrap_err();
-            assert!(error.to_string().contains(expected), "{error}");
+            assert!(error.to_string().contains("output_fills_window"), "{error}");
         }
     }
 }
