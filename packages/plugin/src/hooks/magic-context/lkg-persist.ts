@@ -316,13 +316,16 @@ function rememberBoundCertificate(
  * connection so only the writer that saved the bytes can bind them.
  */
 interface PreparedLkgCertificate extends BoundLkgCertificate {
-    sessionId: string;
     receipt: object;
     prefixHash: string;
     /** The marker's stored value while the id is unbound (its pending token, or legacy NULL). */
     unboundValue: string | null;
 }
-const preparedCertificates = new WeakMap<Database, Map<string, PreparedLkgCertificate>>();
+const PREPARED_CERTIFICATE_MAX_CAPTURES_PER_SESSION = 1000;
+const preparedCertificates = new WeakMap<
+    Database,
+    Map<string, Map<number, PreparedLkgCertificate>>
+>();
 /** Opaque identity of this connection's deferred save, distinct even when an id is reused. */
 export function preparedLkgDispatchReceipt(
     db: Database,
@@ -331,38 +334,52 @@ export function preparedLkgDispatchReceipt(
 ): object | undefined {
     return servedCaptureId === undefined
         ? undefined
-        : preparedCertificates.get(db)?.get(preparedKey(sessionId, servedCaptureId))?.receipt;
-}
-function preparedKey(sessionId: string, servedCaptureId: number): string {
-    return JSON.stringify([sessionId, servedCaptureId]);
+        : preparedCertificates.get(db)?.get(sessionId)?.get(servedCaptureId)?.receipt;
 }
 function clearPreparedCertificates(db: Database, sessionId: string): void {
-    const prepared = preparedCertificates.get(db);
-    if (!prepared) return;
-    for (const [key, certificate] of prepared) {
-        if (certificate.sessionId === sessionId) prepared.delete(key);
-    }
+    preparedCertificates.get(db)?.delete(sessionId);
 }
 /** Marker slot state of a request saved before dispatch whose pass was then refused. */
 const UNDISPATCHED_SLOT_STATE = "undispatched";
 
-function rememberPreparedCertificate(
+function prepareCertificateSession(
     db: Database,
     sessionId: string,
-    certificate: Omit<PreparedLkgCertificate, "sessionId" | "receipt">,
-): void {
-    let prepared = preparedCertificates.get(db);
-    if (!prepared) {
-        prepared = new Map();
-        preparedCertificates.set(db, prepared);
+): Map<number, PreparedLkgCertificate> {
+    let sessions = preparedCertificates.get(db);
+    if (!sessions) {
+        sessions = new Map();
+        preparedCertificates.set(db, sessions);
     }
-    const key = preparedKey(sessionId, certificate.servedCaptureId);
-    prepared.delete(key);
-    if (prepared.size >= PERSISTED_FINGERPRINT_MAX_SESSIONS) {
+    let prepared = sessions.get(sessionId);
+    if (!prepared) {
+        if (sessions.size >= PERSISTED_FINGERPRINT_MAX_SESSIONS) {
+            for (const [id, captures] of sessions) {
+                if (captures.size === 0) sessions.delete(id);
+            }
+            // Refuse a new deferred save before writing its bytes rather than discard
+            // another session's receipt for a request that has not been dispatched.
+            if (sessions.size >= PERSISTED_FINGERPRINT_MAX_SESSIONS)
+                throw new Error("LKG prepared certificate session capacity reached");
+        }
+        prepared = new Map();
+        sessions.set(sessionId, prepared);
+    }
+    return prepared;
+}
+
+function rememberPreparedCertificate(
+    prepared: Map<number, PreparedLkgCertificate>,
+    certificate: Omit<PreparedLkgCertificate, "receipt">,
+): void {
+    // Only this session's receipts share a capture limit. The current marker
+    // already names the newest capture, so repair cannot bind an older id.
+    prepared.delete(certificate.servedCaptureId);
+    if (prepared.size >= PREPARED_CERTIFICATE_MAX_CAPTURES_PER_SESSION) {
         const oldest = prepared.keys().next().value;
         if (oldest !== undefined) prepared.delete(oldest);
     }
-    prepared.set(key, { ...certificate, sessionId, receipt: {} });
+    prepared.set(certificate.servedCaptureId, { ...certificate, receipt: {} });
 }
 
 /**
@@ -382,10 +399,10 @@ export function refuseUndispatchedLkgSlot(
     servedCaptureId: number,
     receipt?: object,
 ): boolean {
-    const key = preparedKey(sessionId, servedCaptureId);
-    const prepared = preparedCertificates.get(db)?.get(key);
+    const captures = preparedCertificates.get(db)?.get(sessionId);
+    const prepared = captures?.get(servedCaptureId);
     if (!prepared || (receipt !== undefined && prepared.receipt !== receipt)) return false;
-    preparedCertificates.get(db)?.delete(key);
+    captures?.delete(servedCaptureId);
     try {
         // A refused pass is often refused because it ran past its deadline, and a
         // pass's write guard then blocks its writes. Recording that its request was
@@ -414,7 +431,7 @@ export function isPreparedUndispatchedLkgSlot(
 ): boolean {
     return (
         servedCaptureId !== undefined &&
-        preparedCertificates.get(db)?.has(preparedKey(sessionId, servedCaptureId)) === true
+        preparedCertificates.get(db)?.get(sessionId)?.has(servedCaptureId) === true
     );
 }
 
@@ -432,10 +449,10 @@ export function certifyDispatchedLkgSlot(
     servedCaptureId: number,
     receipt?: object,
 ): boolean {
-    const key = preparedKey(sessionId, servedCaptureId);
-    const prepared = preparedCertificates.get(db)?.get(key);
+    const captures = preparedCertificates.get(db)?.get(sessionId);
+    const prepared = captures?.get(servedCaptureId);
     if (!prepared || (receipt !== undefined && prepared.receipt !== receipt)) return false;
-    preparedCertificates.get(db)?.delete(key);
+    captures?.delete(servedCaptureId);
     // The dispatch ticket proves this request was sent even if a newer allocation
     // prevents binding the session's current marker. It does not certify that marker.
     rememberBoundCertificate(db, sessionId, prepared);
@@ -555,6 +572,7 @@ function persistLkgSlot(
         // Set when the marker still names this id unbound after a deferred-certificate
         // save; the later dispatch binds it from this value.
         let unboundValue: string | null | undefined;
+        let prepared: Map<number, PreparedLkgCertificate> | undefined;
         db.transaction(() => {
             // Historical migration fixtures also save pre-marker slots. When the
             // columns exist, an uncertified overwrite must clear their old ids.
@@ -580,8 +598,10 @@ function persistLkgSlot(
                 // id.
                 if (marker.servedDigest !== null && marker.servedDigest !== certificateDigest)
                     throw new Error("LKG capture id is bound to different bytes");
-                if (deferCertificate && marker.servedDigest === null)
+                if (deferCertificate && marker.servedDigest === null) {
+                    prepared = prepareCertificateSession(db, sessionId);
                     unboundValue = pendingServedDigest(marker);
+                }
             }
             const storedHashes = new Map<unknown, unknown>();
             for (const row of db
@@ -656,8 +676,8 @@ function persistLkgSlot(
                 digest: certificateDigest,
                 jsonPrefix: slot.jsonPrefix,
             };
-            if (unboundValue !== undefined)
-                rememberPreparedCertificate(db, sessionId, {
+            if (unboundValue !== undefined && prepared)
+                rememberPreparedCertificate(prepared, {
                     ...certificate,
                     prefixHash: layout.hash,
                     unboundValue,

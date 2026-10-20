@@ -2,12 +2,17 @@ import { afterEach, expect, test } from "bun:test";
 import { join } from "node:path";
 import {
 	boundLkgCertificate,
+	certifyDispatchedLkgSlot,
 	createDbLkgPersistence,
 	isPreparedUndispatchedLkgSlot,
 	loadPersistedLkgSlot,
+	preparedLkgDispatchReceipt,
+	refuseUndispatchedLkgSlot,
+	saveLkgSlotToDb,
 } from "@magic-context/core/hooks/magic-context/lkg-persist";
 import { replayLkg } from "@magic-context/core/hooks/magic-context/lkg-replay";
 import {
+	checkLkgDurability,
 	readServedMarker,
 	recordServedCapture,
 	repairLkgDurability,
@@ -352,4 +357,113 @@ test("an old ticket cannot settle or refuse a newer save that reused its numeric
 		).toBeUndefined();
 		f.restart();
 	}
+});
+
+test("a session's long deferred-save run certifies only retained dispatch receipts", () => {
+	const f = fixture();
+	const evicted: Array<{ id: number; receipt: object }> = [];
+	let newest = f.publish("deferred request 0");
+	for (let index = 0; index < 1_003; index++) {
+		if (index > 0) newest = f.publish(`deferred request ${index}`);
+		const id = getSlot(f.sessionId)?.servedCaptureId;
+		const receipt = preparedLkgDispatchReceipt(f.db, f.sessionId, id);
+		expect(id).toBe(index + 1);
+		expect(receipt).toBeDefined();
+		if (id === undefined || !receipt)
+			throw new Error("deferred save has no receipt");
+		if (index < 3) evicted.push({ id, receipt });
+	}
+	const newestId = getSlot(f.sessionId)?.servedCaptureId;
+	const uncertified = {
+		durable: true,
+		servedCaptureId: null,
+		certified: false,
+	};
+	expect(repairLkgDurability(f.db, f.sessionId)).toEqual(uncertified);
+	for (const { id, receipt } of evicted) {
+		expect(preparedLkgDispatchReceipt(f.db, f.sessionId, id)).toBeUndefined();
+		expect(certifyDispatchedLkgSlot(f.db, f.sessionId, id, receipt)).toBe(
+			false,
+		);
+		expect(refuseUndispatchedLkgSlot(f.db, f.sessionId, id, receipt)).toBe(
+			false,
+		);
+		expect(boundLkgCertificate(f.db, f.sessionId)).toBeUndefined();
+		expect(checkLkgDurability(f.db, f.sessionId)).toEqual(uncertified);
+	}
+	f.coordinator.certifyDispatched(newest);
+	const certified = { durable: true, servedCaptureId: newestId };
+	expect(checkLkgDurability(f.db, f.sessionId)).toEqual(certified);
+	for (const { id, receipt } of evicted) {
+		expect(certifyDispatchedLkgSlot(f.db, f.sessionId, id, receipt)).toBe(
+			false,
+		);
+		expect(refuseUndispatchedLkgSlot(f.db, f.sessionId, id, receipt)).toBe(
+			false,
+		);
+		expect(boundLkgCertificate(f.db, f.sessionId)?.servedCaptureId).toBe(
+			newestId,
+		);
+		expect(repairLkgDurability(f.db, f.sessionId)).toEqual(certified);
+	}
+	const { restarted } = f.restart();
+	expect(getSlot(f.sessionId)?.jsonPrefix).toContain("deferred request 1002");
+	expect(getSlot(f.sessionId)?.dispatchUnconfirmed).toBeUndefined();
+	expect(restarted.replay(f.begin(restarted, true)).ok).toBe(true);
+});
+
+test("the prepared session limit refuses a new save without evicting outstanding receipts", () => {
+	const f = fixture();
+	const first = f.publish();
+	const pending = getSlot(f.sessionId);
+	if (!pending) throw new Error("pending capture was not installed");
+	for (let index = 0; index < 999; index++) {
+		const sessionId = `prepared-capacity-${index}`;
+		const servedCaptureId = recordServedCapture(f.db, sessionId, true);
+		expect(servedCaptureId).toBeDefined();
+		expect(
+			saveLkgSlotToDb(
+				f.db,
+				sessionId,
+				{ ...pending, servedCaptureId },
+				{
+					deferCertificate: true,
+				},
+			),
+		).toBe(true);
+	}
+	const overflow = "prepared-capacity-overflow";
+	const servedCaptureId = recordServedCapture(f.db, overflow, true);
+	expect(servedCaptureId).toBeDefined();
+	const saveOverflow = () =>
+		saveLkgSlotToDb(
+			f.db,
+			overflow,
+			{ ...pending, servedCaptureId },
+			{
+				deferCertificate: true,
+			},
+		);
+	expect(saveOverflow()).toBe(false);
+	expect(loadPersistedLkgSlot(f.db, overflow)).toBeUndefined();
+	expect(
+		f.db
+			.prepare("SELECT count(*) AS n FROM lkg_slot_chunks WHERE session_id = ?")
+			.get(overflow),
+	).toEqual({ n: 0 });
+	expect(
+		isPreparedUndispatchedLkgSlot(f.db, f.sessionId, pending.servedCaptureId),
+	).toBe(true);
+	expect(repairLkgDurability(f.db, f.sessionId)).toEqual({
+		durable: true,
+		servedCaptureId: null,
+		certified: false,
+	});
+	f.coordinator.certifyDispatched(first);
+	expect(checkLkgDurability(f.db, f.sessionId)).toEqual({
+		durable: true,
+		servedCaptureId: pending.servedCaptureId,
+	});
+	expect(saveOverflow()).toBe(true);
+	f.restart();
 });
