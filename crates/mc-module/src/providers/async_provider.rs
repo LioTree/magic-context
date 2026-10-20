@@ -1314,7 +1314,12 @@ impl McHandler {
         let transform::compaction::Answer::Replacement(initial) = &output.answer else {
             return Err(transient("async setup returned no initial view"));
         };
-        let wire = rendered_view(codec, initial, &state, self.async_oracle())?;
+        let wire = rendered_view(
+            codec,
+            initial,
+            &state,
+            self.async_oracle() || state.logical_prefix.is_none(),
+        )?;
         state.adopt_engine(engine)?;
         // `serializer_profile` is a ck-mc extension member: the profile this
         // Setup accepted, so the runner can confirm ck-mc reads its schema.
@@ -1715,17 +1720,25 @@ fn ranges(
         .and_then(Value::as_bool)
         == Some(true);
     // The first held entry with each mid, as an ordinal-order search finds it.
-    let mut by_mid = HashMap::with_capacity(engine.replacement.len());
-    for ordinal in engine
-        .replacement
-        .iter()
-        .filter(|m| !m.meta.synthetic)
-        .filter_map(|m| m.meta.ordinal)
-    {
-        let Some(entry) = state.entries.get(&ordinal) else {
-            continue;
-        };
-        by_mid.entry(entry.mid.as_str()).or_insert(ordinal);
+    let mut by_mid = HashMap::new();
+    if state.logical_prefix.is_none() {
+        // Recovery and the full-lineage oracle use the original source index,
+        // independently of the optimized view's ordinal-based source selection.
+        for (ordinal, entry) in &state.entries {
+            by_mid.entry(entry.mid.as_str()).or_insert(*ordinal);
+        }
+    } else {
+        for ordinal in engine
+            .replacement
+            .iter()
+            .filter(|m| !m.meta.synthetic)
+            .filter_map(|m| m.meta.ordinal)
+        {
+            let Some(entry) = state.entries.get(&ordinal) else {
+                continue;
+            };
+            by_mid.entry(entry.mid.as_str()).or_insert(ordinal);
+        }
     }
     for (position, message) in wire.replacement.iter().enumerate() {
         let mid = message
@@ -2615,7 +2628,12 @@ impl McHandler {
             state.adopt_engine(engine)?;
             return Ok(None);
         }
-        let wire = rendered_view(codec, &candidate, state, self.async_oracle())?;
+        let wire = rendered_view(
+            codec,
+            &candidate,
+            state,
+            self.async_oracle() || state.logical_prefix.is_none(),
+        )?;
         let coverage = store
             .load_meta(&state.namespace())
             .map_err(transient)?
