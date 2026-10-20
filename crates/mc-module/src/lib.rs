@@ -14959,6 +14959,7 @@ impl McHandler {
         arguments: Option<&Map<String, Value>>,
         authority_domain: &str,
         _bind_for_write: bool,
+        allow_async_resync: bool,
     ) -> Result<FacadeScope, HandlerOutcome> {
         let binding = self
             .facade_binding(channel)
@@ -14985,7 +14986,7 @@ impl McHandler {
         let async_key = if binding.harness == session_resolver::RUNNER_BIND_HARNESS
             || self.store.get().is_some()
         {
-            self.async_compaction_namespace(&binding)?
+            self.async_compaction_namespace(&binding, allow_async_resync)?
         } else {
             None
         };
@@ -15066,7 +15067,9 @@ impl McHandler {
             }
         };
         let facade_scope = match self
-            .resolve_facade_scope(channel, Some(&args), "memories", false)
+            // Reduction reports unchecked tags as retryable during resync;
+            // other facade tools still refuse until the transcript is ready.
+            .resolve_facade_scope(channel, Some(&args), "memories", false, true)
             .await
         {
             Ok(scope) => scope,
@@ -15292,7 +15295,7 @@ impl McHandler {
             Vec::new()
         };
         let facade_scope = match self
-            .resolve_facade_scope(channel, Some(args), "memories", is_mutation)
+            .resolve_facade_scope(channel, Some(args), "memories", is_mutation, false)
             .await
         {
             Ok(scope) => scope,
@@ -15798,7 +15801,7 @@ impl McHandler {
         }
         let sources = facade_search_sources(args);
         let facade_scope = match self
-            .resolve_facade_scope(channel, Some(args), "memories", false)
+            .resolve_facade_scope(channel, Some(args), "memories", false, false)
             .await
         {
             Ok(scope) => scope,
@@ -15888,7 +15891,7 @@ impl McHandler {
         };
         let args = &args;
         let facade_scope = match self
-            .resolve_facade_scope(channel, Some(args), "memories", false)
+            .resolve_facade_scope(channel, Some(args), "memories", false, false)
             .await
         {
             Ok(scope) => scope,
@@ -16031,7 +16034,7 @@ impl McHandler {
             };
         };
         let scope = match self
-            .resolve_facade_scope(channel, None, "notes", false)
+            .resolve_facade_scope(channel, None, "notes", false, false)
             .await
         {
             Ok(scope) => scope,
@@ -16151,7 +16154,7 @@ impl McHandler {
         }
         let is_mutation = matches!(action, "write" | "update" | "dismiss");
         let facade_scope = match self
-            .resolve_facade_scope(channel, Some(args), "notes", is_mutation)
+            .resolve_facade_scope(channel, Some(args), "notes", is_mutation, false)
             .await
         {
             Ok(scope) => scope,
