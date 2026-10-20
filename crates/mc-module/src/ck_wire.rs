@@ -62,7 +62,9 @@ pub struct CkIngressMessage {
 pub struct FlatBlock {
     /// User text read from a runner uses a delivery record instead of guessing
     /// whether reminder-shaped words were written by the user.
+    #[serde(skip)]
     pub(crate) runner_lane: bool,
+    #[serde(skip)]
     pub(crate) runner_accounting_text: Option<Arc<str>>,
     pub id: String,
     pub mid: String,
