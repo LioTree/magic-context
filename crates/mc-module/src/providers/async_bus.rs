@@ -48,6 +48,9 @@ const RENEWAL_DEAD_ENDS: [&str; 3] = [
 
 /// Renew once this share (in tenths) of the JWT's remaining lifetime has passed.
 const RENEW_AFTER_TENTHS: u32 = 7;
+/// A renewal must move expiry at least this far forward to count. ck-bus's
+/// renewals move it by minutes; `exp` itself is in whole seconds.
+const RENEWAL_MIN_EXTENSION: Duration = Duration::from_millis(500);
 /// Backoff between failed renewal attempts.
 const RENEW_RETRY_FIRST: Duration = Duration::from_secs(1);
 const RENEW_RETRY_MAX: Duration = Duration::from_secs(30);
@@ -453,6 +456,14 @@ pub(crate) async fn renew_until_retired(
                         IssuerError::Unreachable("renewal answer missing jwt".into())
                     })?;
                     let exp = answer_exp(&answer).map_err(IssuerError::Unreachable)?;
+                    // A renewal that does not move `exp` forward leaves the next
+                    // renewal due at once; retrying it without backoff would be
+                    // a tight loop against ck-bus.
+                    if deadline(exp) < credential.expires() + RENEWAL_MIN_EXTENSION {
+                        return Err(IssuerError::Unreachable(format!(
+                            "renewal answered exp {exp}, no later than the held credential's"
+                        )));
+                    }
                     Ok((jwt, exp))
                 });
             match answer {

@@ -56,6 +56,12 @@ impl Issuer for FakeIssuer {
             calls.push((method.to_string(), params.clone(), Clock::now()));
             calls.iter().filter(|(m, ..)| m == method).count()
         };
+        // A loop calling ck-bus without waiting keeps the paused clock from
+        // ever advancing; stop it here so the test fails instead of hanging.
+        assert!(
+            n <= 200,
+            "{n} {method} calls without the clock moving: a tight loop"
+        );
         match method {
             NONCE_SIGN_OP => Ok(json!({"signature_b64":STANDARD.encode(b"signed")})),
             CREDENTIAL_RENEW_OP => {
@@ -430,4 +436,37 @@ async fn a_link_that_served_long_enough_starts_the_backoff_over() {
         .collect();
     // Fails at 0, 1, 3; serves from 7 to 67; retried 1 s later, then 2 s.
     assert_eq!(at, vec![0, 1, 3, 7, 68, 70, 74]);
+}
+
+#[tokio::test(flavor = "current_thread", start_paused = true)]
+async fn a_renewal_that_does_not_extend_exp_backs_off_like_a_failure() {
+    let start = Clock::now();
+    let exp = unix_now() + 100;
+    // The same expiry instant as the held JWT. The paused clock moves while
+    // the wall clock does not, so "the same instant" is `exp` less the
+    // paused time elapsed.
+    let issuer = Arc::new(FakeIssuer::new(move |n| {
+        let same = exp - (Clock::now() - start).as_secs_f64().ceil() as i64;
+        Ok(json!({"jwt":format!("same-exp-{n}"),"exp":same,"credential_public":"UKEY"}))
+    }));
+    let credential = Arc::new(HeldCredential::new("UKEY".into(), "issued".into(), exp));
+    let status = Arc::new(LinkStatus::default());
+    let renewal = tokio::spawn(renew_until_retired(
+        credential.clone(),
+        issuer.clone(),
+        status.clone(),
+    ));
+    advance_to(start, Duration::from_secs(101)).await;
+    assert!(renewal.is_finished());
+    assert_eq!(
+        issuer.calls(CREDENTIAL_RENEW_OP).len(),
+        6,
+        "backed off, not retried at once"
+    );
+    assert_eq!(
+        credential.jwt(),
+        "issued",
+        "a non-extending JWT is not adopted"
+    );
+    assert_eq!(status.state(), LinkState::CredentialExpired);
 }

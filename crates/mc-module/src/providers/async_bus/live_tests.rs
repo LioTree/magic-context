@@ -218,6 +218,8 @@ impl LiveIssuer {
 #[async_trait]
 impl Issuer for LiveIssuer {
     async fn op(&self, method: &str, params: Value) -> Result<Value, IssuerError> {
+        // A real ck-bus call yields to the runtime; so does this one.
+        tokio::task::yield_now().await;
         match method {
             CREDENTIAL_OP => {
                 let (jwt, exp) = self.fresh();
@@ -386,4 +388,8 @@ async fn an_expired_credential_does_not_reconnect_in_a_tight_loop() {
         "ck-bus signed a connect for an expired JWT"
     );
     assert!(attempts <= 8, "{attempts} reconnect attempts in 8 s");
+    // Every connect since the first, counted over the whole test: a client that
+    // retried without delay would spend its 60 attempts at once.
+    let total = link.credential.auth_attempts.load(Ordering::Relaxed);
+    assert!(total <= 12, "{total} connects in all");
 }
