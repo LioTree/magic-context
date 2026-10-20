@@ -837,6 +837,19 @@ impl Rig {
     /// CPU and process CPU in milliseconds, and the process CPU the
     /// historian evaluation it started took afterwards.
     async fn timed_notice(&mut self, count: u64, applied: Option<u64>) -> ((f64, f64, f64), f64) {
+        let (sample, historian, outcome) = self.try_timed_notice(count, applied, 1_000).await;
+        outcome.unwrap();
+        let head = load_head(self.store(), &self.reference).unwrap().unwrap();
+        assert_eq!(head.completed_seq, self.seq);
+        (sample, historian)
+    }
+
+    async fn try_timed_notice(
+        &mut self,
+        count: u64,
+        applied: Option<u64>,
+        est_tokens: u64,
+    ) -> ((f64, f64, f64), f64, Result<(), HandlerOutcome>) {
         self.append(count);
         self.seq += 1;
         let seq = self.seq;
@@ -854,7 +867,7 @@ impl Rig {
             "L",
             last_ordinal,
             digest,
-            1_000,
+            est_tokens,
             "fixture",
         )
         .with_window(100_000);
@@ -872,10 +885,7 @@ impl Rig {
         let wall = Instant::now();
         let thread = cpu_time::ThreadTime::now();
         let process = cpu_time::ProcessTime::now();
-        self.h
-            .advance_compaction("fixture", &message)
-            .await
-            .unwrap();
+        let outcome = self.h.advance_compaction("fixture", &message).await;
         let sample = (
             wall.elapsed().as_secs_f64() * 1e3,
             thread.elapsed().as_secs_f64() * 1e3,
@@ -884,9 +894,7 @@ impl Rig {
         let background = cpu_time::ProcessTime::now();
         self.settle().await;
         let historian = background.elapsed().as_secs_f64() * 1e3;
-        let head = load_head(self.store(), &self.reference).unwrap().unwrap();
-        assert_eq!(head.completed_seq, seq);
-        (sample, historian)
+        (sample, historian, outcome)
     }
 
     async fn settle(&self) {
@@ -1060,5 +1068,195 @@ async fn resident_latency_benchmark() {
             peak as f64 / 1e9
         );
         drop(rig);
+    }
+}
+
+/// Select a suffix by message count and by Claude BPE tokens in the serialized
+/// native messages. Counting schema fields as well as content is conservative:
+/// the model's content-only tail is no larger than the selected token budget.
+fn covered_suffix(
+    entries: &[(ReadMessage, usize)],
+    max_messages: usize,
+    max_tokens: usize,
+) -> (usize, usize) {
+    let mut count = 0;
+    let mut tokens = 0;
+    for (entry, _) in entries.iter().rev().take(max_messages) {
+        let measured =
+            mc_tokenizer::estimate_tokens(&serde_json::to_string(&entry.message).unwrap());
+        if max_tokens != 0 && tokens + measured > max_tokens {
+            break;
+        }
+        count += 1;
+        tokens += measured;
+    }
+    (count, tokens)
+}
+
+#[test]
+fn covered_benchmark_suffix_respects_both_budgets() {
+    let entries = (0..100).map(message).collect::<Vec<_>>();
+    let (by_count, _) = covered_suffix(&entries, 3, 0);
+    assert_eq!(by_count, 3);
+    let (by_tokens, tokens) = covered_suffix(&entries, 100, 4_000);
+    assert!(by_tokens > 0 && by_tokens < 100);
+    assert!(tokens <= 4_000);
+    let next = &entries[entries.len() - by_tokens - 1].0.message;
+    assert!(tokens + mc_tokenizer::estimate_tokens(&serde_json::to_string(next).unwrap()) > 4_000);
+}
+
+/// A covered-prefix variant of the resident benchmark. Set the token cap to
+/// zero and the message cap to 20,000 to model a summarizer outage. Refusals are
+/// reported as outcomes, not successful view samples, so oversized views cannot
+/// silently disappear from the latency table. `MC_ASYNC_EST_TOKENS` sets the
+/// runner's next-request estimate (default 1,000 of the 100,000-token window).
+/// Use 95,000 to exercise emergency pressure rather than the quiet-notice band.
+#[tokio::test]
+#[ignore = "covered-prefix latency benchmark; run explicitly with --ignored --nocapture"]
+async fn covered_tail_latency_benchmark() {
+    let env = |name: &str, default: &str| std::env::var(name).unwrap_or_else(|_| default.into());
+    let sizes = env("MC_ASYNC_SCALING_SIZES", "50000,150000");
+    let quiet = env("MC_ASYNC_NOTICES", "10").parse::<usize>().unwrap();
+    let views = env("MC_ASYNC_VIEWS", "5").parse::<usize>().unwrap();
+    let max_messages = env("MC_ASYNC_TAIL_MESSAGES", "3000")
+        .parse::<usize>()
+        .unwrap();
+    let max_tokens = env("MC_ASYNC_TAIL_TOKENS", "40000")
+        .parse::<usize>()
+        .unwrap();
+    let est_tokens = env("MC_ASYNC_EST_TOKENS", "1000").parse::<u64>().unwrap();
+    for size in sizes
+        .split(',')
+        .map(|size| size.trim().parse::<u64>().unwrap())
+    {
+        let dir = tempfile::tempdir().unwrap();
+        let mut rig = Rig::new(dir.path()).await;
+        rig.append(size);
+        let (tail, tokens) = covered_suffix(
+            &rig.runner.entries.lock().unwrap(),
+            max_messages,
+            max_tokens,
+        );
+        assert!(tail > 0 && (tail as u64) < size);
+        let covered = size - tail as u64 - 1;
+        rig.history(covered, "completed history covering the old prefix");
+        let bootstrap = rig.try_timed_notice(0, None, est_tokens).await;
+        eprintln!("shape total={size} uncovered={tail} serialized_tail_tokens={tokens} compartment_end={covered} bootstrap={:?} elapsed_ms={:.1}", bootstrap.2, bootstrap.0.0);
+        if bootstrap.2.is_err() {
+            eprintln!("Bootstrap failed; retrying before ordinary-notice sampling.");
+        }
+        let mut version = rig.newest_view();
+        if bootstrap.2.is_err() {
+            let retry = rig.try_timed_notice(0, version, est_tokens).await;
+            eprintln!(
+                "bootstrap retry outcome={:?} elapsed_ms={:.1}",
+                retry.2, retry.0 .0
+            );
+            retry.2.unwrap();
+            version = rig.newest_view();
+        }
+        let ack = rig.try_timed_notice(0, version, est_tokens).await;
+        ack.2.unwrap();
+        eprintln!("initial acknowledged version={version:?}");
+        let phases_before = phase_stats(&rig.reference);
+        let mut notices = Vec::new();
+        let mut historian = Vec::new();
+        let mut notice_errors = 0;
+        let mut evaluations = 0;
+        for _ in 0..quiet {
+            let before = rig
+                .h
+                .provider_store
+                .async_runtime
+                .historian_evaluations
+                .load(std::sync::atomic::Ordering::Relaxed);
+            let (sample, background, outcome) = rig.try_timed_notice(4, version, est_tokens).await;
+            notices.push(sample);
+            if let Err(error) = outcome {
+                notice_errors += 1;
+                eprintln!("quiet notice failed: {error:?}");
+            }
+            let after = rig
+                .h
+                .provider_store
+                .async_runtime
+                .historian_evaluations
+                .load(std::sync::atomic::Ordering::Relaxed);
+            if after > before {
+                evaluations += after - before;
+                historian.push((background, background, background));
+            }
+        }
+        percentiles("quiet notice (+4 msgs)", size, &mut notices);
+        if !historian.is_empty() {
+            percentiles(
+                "historian evaluation (process CPU after notice)",
+                size,
+                &mut historian,
+            );
+        }
+        eprintln!("quiet errors={notice_errors}/{quiet}, scheduled evaluations={evaluations}");
+        eprintln!(
+            "quiet phase totals: {}",
+            phases(&rig.reference, &phases_before)
+        );
+        eprintln!("engine reasons: {:?}", resident::counters::engine_reasons());
+        let namespace = rig.state().namespace();
+        let actual = rig.store().max_compartment_end_ordinal(&namespace).unwrap();
+        assert_eq!(actual, covered as i64);
+        let (peak, current) = rss();
+        eprintln!("after quiet notices RSS_bytes={current} peak_RSS_bytes={peak} compartment_end={actual} uncovered_messages={}", tail + quiet * 4);
+        let mut rides = Vec::new();
+        let mut publishes = Vec::new();
+        let mut ride_errors = 0;
+        let mut publish_errors = 0;
+        for index in 0..views {
+            rig.history(covered + 1 + index as u64 * 2, "a newer completed summary");
+            let wall = Instant::now();
+            let thread = cpu_time::ThreadTime::now();
+            let process = cpu_time::ProcessTime::now();
+            let answer = rig
+                .op(
+                    "compaction.ride",
+                    json!({"session_ref":rig.reference,"cause":"ceiling","deadline_ms":300_000}),
+                )
+                .await;
+            rides.push((
+                wall.elapsed().as_secs_f64() * 1e3,
+                thread.elapsed().as_secs_f64() * 1e3,
+                process.elapsed().as_secs_f64() * 1e3,
+            ));
+            if answer["answer"] == "view" {
+                version = answer["view"]["view_version"].as_u64();
+                eprintln!(
+                    "view total={size} bytes={} ranges={}",
+                    serde_json::to_vec(&answer["view"]).unwrap().len(),
+                    answer["view"]["ranges"].as_array().unwrap().len()
+                );
+            } else {
+                ride_errors += 1;
+                eprintln!("ride failed: {answer}");
+            }
+            let ack = rig.try_timed_notice(0, version, est_tokens).await;
+            eprintln!("acknowledging notice outcome={:?}", ack.2);
+            rig.history(covered + 2 + index as u64 * 2, "another completed summary");
+            let (sample, _, outcome) = rig.try_timed_notice(0, version, est_tokens).await;
+            publishes.push(sample);
+            if let Err(error) = outcome {
+                publish_errors += 1;
+                eprintln!("publishing notice failed: {error:?}");
+            }
+            version = rig.newest_view();
+        }
+        percentiles("ride attempt", size, &mut rides);
+        percentiles("publishing notice attempt", size, &mut publishes);
+        eprintln!(
+            "ride errors={ride_errors}/{views}, publishing notice errors={publish_errors}/{views}"
+        );
+        let namespace = rig.state().namespace();
+        let meta = rig.store().load_meta(&namespace).unwrap().meta;
+        let compartment_end = rig.store().max_compartment_end_ordinal(&namespace).unwrap();
+        let (peak, current) = rss();
+        eprintln!("memory total={size} RSS_bytes={current} peak_RSS_bytes={peak} persisted_compartment_end={compartment_end} applied_coverage={:?}", meta.coverage_ordinal);
     }
 }
