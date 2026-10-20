@@ -8677,9 +8677,15 @@ fn apply_once(
         meta.coverage_ordinal,
     );
     if let Some(prefix) = &req.logical_prefix {
-        consumed_drop_ids.extend(pending_agent_drops.iter()
-            .filter(|drop| prefix.covers_target(&drop.target_id) && !consumed_drop_ids.contains(&drop.id))
-            .map(|drop| drop.id).collect::<Vec<_>>());
+        consumed_drop_ids.extend(
+            pending_agent_drops
+                .iter()
+                .filter(|drop| {
+                    prefix.covers_target(&drop.target_id) && !consumed_drop_ids.contains(&drop.id)
+                })
+                .map(|drop| drop.id)
+                .collect::<Vec<_>>(),
+        );
     }
     if let Some(prefix) = req
         .native_fold_prefix
