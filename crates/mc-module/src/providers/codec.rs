@@ -271,10 +271,42 @@ impl Codec {
             "serializer_profile":self.serializer_profile().wire_id(),"session_id":session,
             "render_config":"","messages":[],"tool_present":false,"auto_search_enabled":false}))?;
         self.prepare_request_from(&mut request, entries, view.range.from)?;
+        self.encode_prepared_view(view, &request)
+    }
+
+    /// Reuse ingress that the engine already decoded. Recreate only renderer
+    /// settings, so engine-only flags and the engine namespace cannot change
+    /// native rendering or the session id on synthetic OpenCode messages.
+    pub(crate) fn render_prepared_view(
+        self,
+        view: &transform::compaction::View,
+        session: &str,
+        source: &TransformRequest,
+    ) -> Result<OutboundMessage, HandlerOutcome> {
+        if self == Self::OwnedBroca {
+            return encode_view(view);
+        }
+        let mut request: TransformRequest = decode(&json!({"v":2,"kind":"compaction.step",
+            "serializer_profile":self.serializer_profile().wire_id(),"session_id":session,
+            "render_config":"","messages":[],"tool_present":false,"auto_search_enabled":false}))?;
+        request.messages = source.messages.clone();
+        request.native_messages = source.native_messages.clone();
+        request.serve_native = self == Self::OpencodeAiSdk;
+        if self == Self::AnthropicMessages {
+            request.provider_id = Some("anthropic".into());
+        }
+        self.encode_prepared_view(view, &request)
+    }
+
+    fn encode_prepared_view(
+        self,
+        view: &transform::compaction::View,
+        request: &TransformRequest,
+    ) -> Result<OutboundMessage, HandlerOutcome> {
         let tags = BTreeMap::new();
         self.encode_view(
             view,
-            &request,
+            request,
             &super::codec_opencode::NativeRenderContext {
                 reasoning_clear_units: &[],
                 tag_numbers: &tags,

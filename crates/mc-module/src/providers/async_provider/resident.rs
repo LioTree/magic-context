@@ -30,6 +30,8 @@ pub(crate) struct HeldEntry {
     /// `serde_json` of the runner's `ReadMessage`, byte-identical to the
     /// stored `mc_async_compaction_entries.entry_json`.
     raw: Box<str>,
+    #[cfg(test)]
+    reference: Option<String>,
 }
 
 impl HeldEntry {
@@ -37,6 +39,8 @@ impl HeldEntry {
         Ok(Self {
             mid: entry.mid.clone(),
             raw: serde_json::to_string(entry).map_err(transient)?.into(),
+            #[cfg(test)]
+            reference: None,
         })
     }
 
@@ -50,6 +54,8 @@ impl HeldEntry {
         Ok(Self {
             mid: head.mid,
             raw: raw.into_boxed_str(),
+            #[cfg(test)]
+            reference: None,
         })
     }
 
@@ -61,7 +67,17 @@ impl HeldEntry {
     pub(super) fn read(&self) -> Result<ReadMessage, HandlerOutcome> {
         #[cfg(test)]
         counters::parsed(1);
+        #[cfg(test)]
+        if let Some(reference) = &self.reference {
+            super::scaling_tests::view_work::decoded(reference, 1);
+        }
         serde_json::from_str(&self.raw).map_err(transient)
+    }
+
+    #[cfg(test)]
+    pub(super) fn counted_as(mut self, reference: String) -> Self {
+        self.reference = Some(reference);
+        self
     }
 
     pub(super) fn inbound(&self) -> Result<InboundMessage, HandlerOutcome> {

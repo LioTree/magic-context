@@ -16,8 +16,15 @@ fn logical_snapshot_commit_preserves_omitted_prefix_identities() {
     let store = open_store(dir.path());
     let loaded = store.load(SESSION).unwrap();
     let mut meta = loaded.meta.clone();
-    meta.block_identity_by_mid.insert("covered".into(), vec![]);
-    meta.block_identity_by_mid.insert("tail".into(), vec![]);
+    for mid in ["covered", "tail"] {
+        meta.block_identity_by_mid.insert(
+            mid.into(),
+            vec![crate::BlockIdentity {
+                kind_tag: "text".into(),
+                byte_fingerprint: mid.into(),
+            }],
+        );
+    }
     commit_over(
         &store,
         &loaded,
@@ -26,60 +33,60 @@ fn logical_snapshot_commit_preserves_omitted_prefix_identities() {
         crate::FrozenClear::Explicit,
     )
     .unwrap();
-    let scoped = store
-        .load_logical_transform_snapshot(SESSION, &["tail"])
-        .unwrap();
-    assert_eq!(
-        scoped
-            .loaded
-            .meta
-            .block_identity_by_mid
-            .keys()
-            .collect::<Vec<_>>(),
-        [&"tail".to_string()]
-    );
-    let mut meta = scoped.loaded.meta.clone();
-    meta.tail_identity_re_adopt_count += 1;
-    store
-        .commit_logical_transform_with_provider_policy(
-            SESSION,
-            TransformCommit {
-                expected: scoped.loaded.row_version,
-                core: &scoped.loaded.core,
-                meta: &meta,
-                sections: SectionsCommit {
-                    base: scoped.loaded.sections.as_ref(),
-                    meta_only_steps: 0,
-                    frozen_clear: crate::FrozenClear::Explicit,
-                },
-                consumed_drop_ids: &[],
-                first_applied_command_ids: &[],
-                memory_revision: None,
-                compartment_max_seq: None,
-                project_root: None,
-                first_divergence: None,
-                scheduler_observation: None,
-                scheduler_request_observed_at_ms: None,
-                scheduler_full_array_fingerprint: None,
-                scheduler_eligible_supersession_count: None,
-                scheduler_withheld_by_tag_window: None,
-                scheduler_withheld_by_exempt_message: None,
-                scheduler_applied_supersession_count: None,
-                scheduler_applied_reductions: false,
-                overlays: crate::TransformOverlayBatch::default(),
-            },
-            None,
-        )
-        .unwrap();
-    assert_eq!(
+    for mids in [&["tail"][..], &[][..]] {
+        let scoped = store
+            .load_logical_transform_snapshot(SESSION, mids)
+            .unwrap();
+        assert_eq!(scoped.loaded.meta.block_identity_by_mid.len(), mids.len());
+        let mut meta = scoped.loaded.meta.clone();
+        meta.tail_identity_re_adopt_count += 1;
+        if let Some(tail) = meta.block_identity_by_mid.get_mut("tail") {
+            tail[0].byte_fingerprint = "refreshed".into();
+        }
         store
-            .load(SESSION)
-            .unwrap()
-            .meta
-            .block_identity_by_mid
-            .len(),
-        2
-    );
+            .commit_logical_transform_with_provider_policy(
+                SESSION,
+                TransformCommit {
+                    expected: scoped.loaded.row_version,
+                    core: &scoped.loaded.core,
+                    meta: &meta,
+                    sections: SectionsCommit {
+                        base: scoped.loaded.sections.as_ref(),
+                        meta_only_steps: 0,
+                        frozen_clear: crate::FrozenClear::Explicit,
+                    },
+                    consumed_drop_ids: &[],
+                    first_applied_command_ids: &[],
+                    memory_revision: None,
+                    compartment_max_seq: None,
+                    project_root: None,
+                    first_divergence: None,
+                    scheduler_observation: None,
+                    scheduler_request_observed_at_ms: None,
+                    scheduler_full_array_fingerprint: None,
+                    scheduler_eligible_supersession_count: None,
+                    scheduler_withheld_by_tag_window: None,
+                    scheduler_withheld_by_exempt_message: None,
+                    scheduler_applied_supersession_count: None,
+                    scheduler_applied_reductions: false,
+                    overlays: crate::TransformOverlayBatch::default(),
+                },
+                None,
+            )
+            .unwrap();
+        assert_eq!(
+            store
+                .load(SESSION)
+                .unwrap()
+                .meta
+                .block_identity_by_mid
+                .len(),
+            2
+        );
+        let identities = store.load(SESSION).unwrap().meta.block_identity_by_mid;
+        assert_eq!(identities["covered"][0].byte_fingerprint, "covered");
+        assert_eq!(identities["tail"][0].byte_fingerprint, "refreshed");
+    }
 }
 
 fn open_store(dir: &std::path::Path) -> McStore {

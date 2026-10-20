@@ -11669,7 +11669,8 @@ impl McStore {
             // snapshot shows up as a changed head on the next pass.
 
             // Refuse before the diff runs rather than treating an unhydrated meta as a
-            // request to delete the session's identity history.
+            // request to delete the session's identity history. Scoped identity
+            // commits only upsert, so an empty scoped map cannot delete history.
             if let Some(prefix) = native_prefix {
                 let decoded = cache_codec::read_native_decoded(tx, session_id, prefix)
                     .map_err(|error| rusqlite::Error::ToSqlConversionFailure(Box::new(error)))?
@@ -11678,8 +11679,10 @@ impl McStore {
                     || decoded.sections.any_discarded() {
                     return Err(rusqlite::Error::InvalidQuery);
                 }
-            } else if let Some(stored) = refuse_unhydrated_block_identities_tx(tx, session_id, meta)? {
-                return Ok(CommitOutcome::UnhydratedBlockIdentities(stored));
+            } else if !partial_identities {
+                if let Some(stored) = refuse_unhydrated_block_identities_tx(tx, session_id, meta)? {
+                    return Ok(CommitOutcome::UnhydratedBlockIdentities(stored));
+                }
             }
             let stored_units = stored_index
                 .as_ref()

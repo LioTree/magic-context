@@ -990,6 +990,8 @@ fn load(store: &McStore, reference: &str) -> Result<Option<State>, HandlerOutcom
     let mut state: State = serde_json::from_str(&rows.state).map_err(transient)?;
     for (ordinal, entry, index) in rows.entries {
         let entry = HeldEntry::from_stored(entry)?;
+        #[cfg(test)]
+        let entry = entry.counted_as(reference.to_owned());
         state.mid_index.entry(entry.mid.clone()).or_insert(ordinal);
         let index: Vec<[String; 3]> = serde_json::from_str(&index).map_err(transient)?;
         for [tag, part, digest] in index {
@@ -1555,6 +1557,69 @@ fn rendered_view(
         }
         Err(error) => Err(error),
     }
+}
+
+fn compact_prefix_hygiene(
+    store: &McStore,
+    state: &State,
+    prefix: &transform::compaction::LogicalPrefix,
+    loaded: &mut mc_store::LoadedState,
+) -> Result<(), mc_store::McStoreError> {
+    let Some(baseline) = &mut loaded.meta.tail_hygiene_baseline else {
+        return Ok(());
+    };
+    let before = baseline.baseline_parts.len();
+    // Covered excluded parts contribute no token mass. Their source membership
+    // is certified by the prefix, so keep only context and uncovered parts,
+    // without changing the frozen totals, generation, or reminder cadence.
+    baseline.baseline_parts.retain(|part| {
+        if part.kind != mc_store::TailHygienePartKind::Excluded
+            || part.tokens != 0
+            || part.u_tokens != 0
+        {
+            return true;
+        }
+        let block = part.key.split('\0').next().unwrap_or(&part.key);
+        let Some((mid, _)) = ck_wire::split_block_id(block) else {
+            return true;
+        };
+        state.mid_index.get(mid).is_none_or(|ordinal| {
+            *ordinal >= prefix.tail_from || prefix.context_ordinals.contains(ordinal)
+        })
+    });
+    if baseline.baseline_parts.len() == before {
+        return Ok(());
+    }
+    store.commit_logical_transform_with_provider_policy(
+        &state.namespace(),
+        mc_store::TransformCommit {
+            expected: loaded.row_version,
+            core: &loaded.core,
+            meta: &loaded.meta,
+            sections: mc_store::SectionsCommit {
+                base: loaded.sections.as_ref(),
+                meta_only_steps: 0,
+                frozen_clear: mc_store::FrozenClear::Explicit,
+            },
+            consumed_drop_ids: &[],
+            first_applied_command_ids: &[],
+            memory_revision: None,
+            compartment_max_seq: None,
+            project_root: None,
+            first_divergence: None,
+            scheduler_observation: None,
+            scheduler_request_observed_at_ms: None,
+            scheduler_full_array_fingerprint: None,
+            scheduler_eligible_supersession_count: None,
+            scheduler_withheld_by_tag_window: None,
+            scheduler_withheld_by_exempt_message: None,
+            scheduler_applied_supersession_count: None,
+            scheduler_applied_reductions: false,
+            overlays: mc_store::TransformOverlayBatch::default(),
+        },
+        None,
+    )?;
+    Ok(())
 }
 
 fn render_part(part: &Value, tag: Option<&str>, render: bool) -> Value {
@@ -2299,9 +2364,10 @@ impl McHandler {
                         return Err(transient("async entry changed on re-read"));
                     }
                 } else {
-                    state
-                        .entries
-                        .insert(entry.ordinal, Arc::new(HeldEntry::from_read(&entry)?));
+                    let held = HeldEntry::from_read(&entry)?;
+                    #[cfg(test)]
+                    let held = held.counted_as(state.reference());
+                    state.entries.insert(entry.ordinal, Arc::new(held));
                 }
             }
             let Some(next) = page["next_from_ordinal"].as_u64() else {
@@ -2593,7 +2659,7 @@ impl McHandler {
             && !self.async_oracle()
             && engine.preset == transform::compaction::Preset::Head
         {
-            let snapshot = store
+            let mut snapshot = store
                 .load_logical_transform_snapshot(&state.namespace(), &[])
                 .map_err(transient)?;
             let compartments = store
@@ -2619,6 +2685,14 @@ impl McHandler {
                 .map(|source| (source.ordinal, source))
                 .collect();
             }
+            if let Some(candidate) = &prefix {
+                if let Err(error) =
+                    compact_prefix_hygiene(store, state, candidate, &mut snapshot.loaded)
+                {
+                    tracing::debug!(session_ref=%state.reference(), %error, reason="prefix_hygiene_snapshot", "using full-lineage recovery input");
+                    prefix = None;
+                }
+            }
             state.logical_prefix = prefix.map(Arc::new);
         }
         let transform::compaction::Answer::Replacement(mut candidate) = output.answer else {
@@ -2629,12 +2703,16 @@ impl McHandler {
             state.adopt_engine(engine)?;
             return Ok(None);
         }
-        let wire = rendered_view(
-            codec,
-            &candidate,
-            state,
-            self.async_oracle() || state.logical_prefix.is_none(),
-        )?;
+        let wire = if self.async_oracle() || state.logical_prefix.is_none() {
+            rendered_view(codec, &candidate, state, true)?
+        } else {
+            #[cfg(test)]
+            scaling_tests::view_work::renderer(&state.reference(), template.messages.len());
+            match codec.render_prepared_view(&candidate, &state.key.session, &template) {
+                Ok(wire) => wire,
+                Err(_) => rendered_view(codec, &candidate, state, true)?,
+            }
+        };
         let coverage = store
             .load_meta(&state.namespace())
             .map_err(transient)?

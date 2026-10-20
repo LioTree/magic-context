@@ -14721,7 +14721,7 @@ pub(crate) fn commit_channel1_fire(
 
 fn in_band_channel1_enabled(req: &TransformRequest) -> bool {
     // Async runners render ctx_reduce reminders from session.send deliveries.
-    // Do not deliver a second copy through new or persisted engine appends.
+    // Suppress generated appends and replay of stored appends to avoid duplicate delivery.
     !req.runner_owned_reminders
 }
 

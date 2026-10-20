@@ -727,11 +727,12 @@ impl Pair {
             let mut baseline = meta["tail_hygiene_baseline"].clone();
             if let Some(fields) = baseline.as_object_mut() {
                 fields.remove("parts");
+                fields.remove("baseline_parts");
                 fields.remove("content_signature");
             }
             json!({"baseline":baseline,"coverage":meta["coverage_ordinal"],
                 "last_level":meta["channel1_last_fire_level"],"last_ordinal":meta["channel1_last_fire_ordinal"],
-                "channel1_units":loaded.core.frozen_units.iter().filter(|u|u.kind == "channel1").map(|u|&u.key).collect::<Vec<_>>()})
+                "channel1_units":loaded.core.frozen_units.iter().filter(|u|u.kind == "channel1_append").map(|u|&u.key).collect::<Vec<_>>()})
         };
         (side(&self.resident), side(&self.oracle))
     }

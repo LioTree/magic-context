@@ -22,14 +22,19 @@ pub(super) mod view_work {
     pub fn engine(reference: &str, count: usize) {
         let mut work = WORK.lock().unwrap();
         let work = work.entry(reference.into()).or_default();
-        work.decoded_entries += count;
         work.engine_input += count;
     }
     pub fn renderer(reference: &str, count: usize) {
         let mut work = WORK.lock().unwrap();
         let work = work.entry(reference.into()).or_default();
-        work.decoded_entries += count;
         work.renderer_input += count;
+    }
+    pub fn decoded(reference: &str, count: usize) {
+        WORK.lock()
+            .unwrap()
+            .entry(reference.into())
+            .or_default()
+            .decoded_entries += count;
     }
     pub fn take(reference: &str) -> Work {
         WORK.lock().unwrap().remove(reference).unwrap_or_default()
@@ -44,6 +49,18 @@ async fn covered_view_work_tracks_tail_not_session() {
         rig.append(size);
         rig.history(size - 13, "completed covered prefix");
         rig.notice(1_000, None).await;
+        assert!(
+            rig.store()
+                .load(&rig.state().namespace())
+                .unwrap()
+                .meta
+                .tail_hygiene_baseline
+                .unwrap()
+                .baseline_parts
+                .len()
+                <= 56,
+            "covered excluded measurements must not remain an unbounded engine input"
+        );
         let version = rig.newest_view();
         rig.notice(1_000, version).await;
         assert!(rig.state().logical_prefix.is_some());
@@ -57,7 +74,11 @@ async fn covered_view_work_tracks_tail_not_session() {
             .await;
         assert_eq!(answer["answer"], "view", "{answer}");
         let work = view_work::take(&rig.reference);
-        assert!(work.engine_input > 0 && work.renderer_input > 0, "{work:?}");
+        assert!(
+            work.engine_input > 0 && work.renderer_input > 0 && work.decoded_entries > 0,
+            "{work:?}"
+        );
+        eprintln!("covered ride total={size} tail=12 work={work:?}");
         assert!(
             work.engine_input <= 14 && work.renderer_input <= 14 && work.decoded_entries <= 28,
             "size={size}, tail=12: {work:?}"

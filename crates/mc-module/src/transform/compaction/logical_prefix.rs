@@ -210,22 +210,28 @@ impl LogicalPrefix {
                     .collect::<HashSet<_>>()
                     .len() as u64,
             );
+        let required_targets = loaded
+            .core
+            .frozen_units
+            .iter()
+            .filter_map(|unit| {
+                unit.key
+                    .strip_prefix("red:")
+                    .or_else(|| unit.key.strip_prefix(CAV_KEY_PREFIX))
+            })
+            .collect::<HashSet<_>>();
         let covered_targets = projection
             .blocks
             .iter()
             .filter(|b| b.ordinal < tail_from)
-            .filter(|b| {
-                loaded.core.frozen_units.iter().any(|u| {
-                    u.key.strip_prefix("red:") == Some(b.id.as_str())
-                        || u.key.strip_prefix(CAV_KEY_PREFIX) == Some(b.id.as_str())
-                })
-            })
+            .filter(|b| required_targets.contains(b.id.as_str()))
             .map(|b| b.id.clone())
-            .chain(
-                req.logical_prefix
+            .chain(req.logical_prefix.iter().flat_map(|p| {
+                p.covered_targets
                     .iter()
-                    .flat_map(|p| p.covered_targets.iter().cloned()),
-            )
+                    .filter(|id| required_targets.contains(id.as_str()))
+                    .cloned()
+            }))
             .collect();
         let crossing_arcs = split_coverage_tool_arcs(projection, Some(coverage))
             .iter()
