@@ -703,6 +703,26 @@ impl Pair {
             );
         }
         assert_eq!(resident_high, oracle_high, "{label}: version high-water");
+        let pending = |side: &Side| {
+            let head = load_head(side.store(), &self.reference).unwrap().unwrap();
+            let mut targets = side
+                .store()
+                .load_pending_agent_drops(&head.namespace())
+                .unwrap()
+                .into_iter()
+                .map(|drop| drop.target_id)
+                .collect::<Vec<_>>();
+            targets.sort();
+            targets
+        };
+        assert_eq!(
+            pending(&self.resident),
+            pending(&self.oracle),
+            "{:?} pending target identities diverged after {label}; steps={:?}; state={:?}",
+            self.profile,
+            self.log,
+            self.hygiene_state()
+        );
         assert_eq!(
             self.resident.decisions(&self.reference),
             self.oracle.decisions(&self.reference),
@@ -731,6 +751,8 @@ impl Pair {
                 fields.remove("content_signature");
             }
             json!({"baseline":baseline,"coverage":meta["coverage_ordinal"],
+                "generation":head.generation,"prefix_from":head.logical_prefix.as_ref().map(|p|p.tail_from),
+                "reductions":loaded.core.frozen_units.iter().filter(|u|u.key.starts_with("red:")).map(|u|&u.key).collect::<Vec<_>>(),
                 "last_level":meta["channel1_last_fire_level"],"last_ordinal":meta["channel1_last_fire_ordinal"],
                 "channel1_units":loaded.core.frozen_units.iter().filter(|u|u.kind == "channel1_append").map(|u|&u.key).collect::<Vec<_>>()})
         };
@@ -1308,6 +1330,16 @@ async fn covered_tool_result_drop_uses_prefix_membership_without_projecting_an_o
 #[tokio::test]
 async fn prefix_replays_channel1_session_1101() {
     session(Profile::OpenCode, 1101, 24).await;
+}
+
+#[tokio::test]
+async fn prefix_replays_reduction_session_1181() {
+    session(Profile::OpenCode, 1181, 24).await;
+}
+
+#[tokio::test]
+async fn prefix_replays_reduction_session_1233() {
+    session(Profile::OpenCode, 1233, 24).await;
 }
 
 #[tokio::test]
