@@ -93,7 +93,7 @@ fn message(profile: Profile, n: u64, salt: u64) -> ReadMessage {
     let call = format!("call{}", n - n % 4 + 1);
     let (message, rows) = match profile {
         Profile::OpenCode => {
-            if n % 5 == 0 {
+            if n.is_multiple_of(5) {
                 (
                     json!({"info":{"id":format!("m{n}"),"role":"user","time":{"created":1}},"parts":[{"id":format!("p{n}a"),"type":"text","text":text("user")}]}),
                     vec![tagged(0)],
@@ -1012,7 +1012,7 @@ async fn resident_matches_the_full_recompute_oracle_over_many_sessions() {
     let mut failures = Vec::new();
     let mut tasks = Vec::new();
     let settle = |tasks: &mut Vec<(u64, Profile, tokio::task::JoinHandle<usize>)>| {
-        let drained = tasks.drain(..).collect::<Vec<_>>();
+        let drained = std::mem::take(tasks);
         async move {
             let mut failed = Vec::new();
             for (seed, profile, task) in drained {
