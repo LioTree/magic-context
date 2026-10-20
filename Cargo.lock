@@ -1008,6 +1008,7 @@ dependencies = [
  "mc-store",
  "mc-tokenizer",
  "nix",
+ "nkeys",
  "proc-macro2",
  "quote",
  "regex",

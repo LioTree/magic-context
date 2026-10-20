@@ -21492,6 +21492,8 @@ mod tests {
     // The per-harness default runner, driven through real passes.
     mod default_runner;
     mod retrieval_parity;
+    // Prompt and response pairs for a scripted historian in model-less rigs.
+    mod scripted_historian_pairs;
 
     mod i4_roots {
         use super::*;
