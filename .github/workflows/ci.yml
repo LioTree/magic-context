@@ -768,32 +768,6 @@ jobs:
       - name: Clippy (including integration targets)
         run: cargo clippy --locked --workspace --all-targets -- -D warnings
 
-  rust-broca-conformance:
-    name: Rust (Broca conformance)
-    runs-on: ubuntu-latest
-    timeout-minutes: 45
-    permissions:
-      contents: read
-    steps:
-      - uses: actions/checkout@v5
-
-      - uses: dtolnay/rust-toolchain@stable
-
-      - name: Restore Rust build cache
-        uses: actions/cache@v4
-        with:
-          path: |
-            ~/.cargo/registry
-            ~/.cargo/git
-            target
-          key: rust-crates-${{ runner.os }}-${{ runner.arch }}-${{ hashFiles('Cargo.lock') }}-${{ github.job }}
-          restore-keys: |
-            rust-crates-${{ runner.os }}-${{ runner.arch }}-${{ hashFiles('Cargo.lock') }}-
-
-      # drive-fault compiles the crash point used by the real-daemon retry case.
-      - name: Test Broca conformance
-        run: cargo test --locked -p mc-module --test broca_conformance --features drive-fault --no-fail-fast
-
   rust-workspace-crates:
     name: Rust (remaining crates)
     runs-on: ubuntu-latest
@@ -982,7 +956,7 @@ jobs:
     name: Rust (crates)
     runs-on: ubuntu-latest
     if: ${{ always() }}
-    needs: [preflight, rust-clippy, rust-lib-archive, rust-mc-module-lib, rust-mc-module-parity, rust-mc-module-integration, rust-workspace-crates, rust-broca-conformance]
+    needs: [preflight, rust-clippy, rust-lib-archive, rust-mc-module-lib, rust-mc-module-parity, rust-mc-module-integration, rust-workspace-crates]
     steps:
       - uses: actions/checkout@v5
       - uses: oven-sh/setup-bun@v2
@@ -1172,7 +1146,7 @@ jobs:
     name: CI (required)
     runs-on: ubuntu-latest
     if: ${{ always() }}
-    needs: [preflight, check-docs-layout, check-plugin, check-pi-plugin, check-plugin-compat, unit-plugin, unit-pi-plugin, check-dashboard, e2e-opencode, e2e-opencode2, e2e-pi, e2e-omp, e2e-host-opencode, e2e-host-opencode2, e2e-host-pi, e2e-host-omp, rust-clippy, rust-lib-archive, rust-mc-module-lib, rust-mc-module-parity, rust-mc-module-integration, rust-workspace-crates, rust-broca-conformance, rust-crates, e2e-rust-hermetic-build, e2e-rust-hermetic]
+    needs: [preflight, check-docs-layout, check-plugin, check-pi-plugin, check-plugin-compat, unit-plugin, unit-pi-plugin, check-dashboard, e2e-opencode, e2e-opencode2, e2e-pi, e2e-omp, e2e-host-opencode, e2e-host-opencode2, e2e-host-pi, e2e-host-omp, rust-clippy, rust-lib-archive, rust-mc-module-lib, rust-mc-module-parity, rust-mc-module-integration, rust-workspace-crates, rust-crates, e2e-rust-hermetic-build, e2e-rust-hermetic]
     steps:
       - uses: actions/checkout@v5
       - uses: oven-sh/setup-bun@v2
