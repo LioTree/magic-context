@@ -359,8 +359,9 @@ impl LogicalPrefix {
     }
 
     pub(crate) fn prove_membership(&mut self, source: &CkIngressMessage) -> bool {
-        // Synthetic rows are normalized before projection. Their raw block
-        // positions are not a coverage proof; validate them with full input.
+        // Normalization can remove synthetic rows from the live projection.
+        // Their raw block ids cannot prove live coverage; recover membership
+        // from the complete transcript instead.
         if source.ck.meta.synthetic
             || source.ck.content.iter().any(|block| match &block.kind {
                 ck_wire::CkKind::ToolCall { id, .. } | ck_wire::CkKind::ToolResult { id, .. } => {

@@ -3512,16 +3512,20 @@ impl McHandler {
                 .iter()
                 .map(|drop| drop.target_id.as_str())
                 .collect::<std::collections::HashSet<_>>();
+            // The trigger's shape summary names unit classes, not target ids.
+            // Retirement requires the validated frozen target keys themselves.
             let frozen = !covered
                 && store
-                    .load_compaction_trigger_core(&namespace)
+                    .load_logical_transform_snapshot(&namespace, &[])
                     .map_err(transient)?
-                    .is_some_and(|core| {
-                        core.frozen_units.iter().any(|unit| {
-                            unit.key
-                                .strip_prefix("red:")
-                                .is_some_and(|target| targets.contains(target))
-                        })
+                    .loaded
+                    .core
+                    .frozen_units
+                    .iter()
+                    .any(|unit| {
+                        unit.key
+                            .strip_prefix("red:")
+                            .is_some_and(|target| targets.contains(target))
                     });
             // Retirement changes the durable command queue even when no view
             // can publish. Leaving a covered/satisfied command queued can
