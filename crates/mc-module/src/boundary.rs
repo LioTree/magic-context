@@ -762,6 +762,22 @@ pub(crate) fn check_compartment_trigger_with_token_estimator(
     check_compartment_trigger_with_index(messages, ctx, &index, token_estimator)
 }
 
+/// A historian suffix retains projection restart context at/before applied
+/// coverage. Tokens before the eligibility floor cannot contribute to a chunk:
+/// when the size walk exhausts this suffix, the runtime floor wins instead.
+/// Keep that logical floor even when system-only rows have been filtered out.
+pub(crate) fn check_compartment_trigger_tail_with_token_estimator(
+    messages: &[BoundaryMsg],
+    ctx: &TriggerContext,
+    token_estimator: &mut dyn FnMut(&str) -> usize,
+) -> TriggerDecision {
+    let mut index = TokenIndex::calibrated(messages, ctx.boundary.calibration);
+    if let Some(covered) = ctx.boundary.last_compartment_end_ordinal {
+        index.first_ordinal = index.first_ordinal.min(covered.saturating_add(1));
+    }
+    check_compartment_trigger_with_index(messages, ctx, &index, token_estimator)
+}
+
 #[cfg(test)]
 pub(crate) fn check_compartment_trigger_retokenized_reference(
     messages: &[BoundaryMsg],
@@ -1081,6 +1097,8 @@ impl TokenIndex {
         messages: &[BoundaryMsg],
         mut block_tokens: impl FnMut(&BoundaryBlock) -> f64,
     ) -> Self {
+        #[cfg(test)]
+        TOKEN_INDEX_ROWS.with(|count| count.set(count.get() + messages.len()));
         let mut totals_by_ordinal = BTreeMap::new();
         for message in messages {
             let total = message.blocks.iter().map(&mut block_tokens).sum::<f64>();
@@ -1251,6 +1269,11 @@ impl TokenIndex {
         }
         self.exclusive_end_for_prefix_index(best_index).min(end)
     }
+}
+
+#[cfg(test)]
+thread_local! {
+    pub(crate) static TOKEN_INDEX_ROWS: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
 }
 
 #[derive(Debug, Clone)]

@@ -261,10 +261,20 @@ impl McStore {
         session_ref: &str,
         through: u64,
     ) -> Result<Vec<(u64, String)>, McStoreError> {
+        self.load_async_compaction_entries_range(session_ref, 0, through)
+    }
+
+    /// Read an inclusive ordinal window without loading covered entry payloads.
+    pub fn load_async_compaction_entries_range(
+        &self,
+        session_ref: &str,
+        from: u64,
+        through: u64,
+    ) -> Result<Vec<(u64, String)>, McStoreError> {
         self.inner
             .with_read(|conn| {
-                conn.prepare("SELECT ordinal,entry_json FROM mc_async_compaction_entries WHERE session_ref=?1 AND ordinal<=?2 ORDER BY ordinal")?
-                    .query_map(params![session_ref, through], |row| Ok((row.get(0)?, row.get(1)?)))?
+                conn.prepare("SELECT ordinal,entry_json FROM mc_async_compaction_entries WHERE session_ref=?1 AND ordinal>=?2 AND ordinal<=?3 ORDER BY ordinal")?
+                    .query_map(params![session_ref, from, through], |row| Ok((row.get(0)?, row.get(1)?)))?
                     .collect::<rusqlite::Result<_>>()
             })
             .map_err(Into::into)

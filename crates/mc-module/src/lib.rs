@@ -4597,6 +4597,9 @@ struct HistorianPrepareContext<'a> {
     /// Final immutable tag rows validated by the transform's generation/count/max identity.
     /// Early pass-through paths leave this absent and retain the legacy store fallback.
     tag_snapshot: Option<Arc<Vec<McTagRow>>>,
+    /// An async evaluation's captured applied coverage, including an empty prefix.
+    /// Other lanes continue resolving their coverage from the stored compartments.
+    async_coverage: Option<Option<u64>>,
     reclaim_ride_available: bool,
     /// Whether the conversation is on a runner lane: its firings and restart
     /// reattach run on its own runner. Only the provider (runner-lane) path sets it.
@@ -7172,6 +7175,7 @@ impl McHandler {
             snapshot_generation,
             publication_fence,
             tag_snapshot,
+            async_coverage,
             reclaim_ride_available,
             runner_lane,
             timings,
@@ -7298,7 +7302,17 @@ impl McHandler {
                 .prime_from_persisted_tags(&parsed.session_id, tags.as_slice());
         } else {
             profile_start!(_perf_fallback, "rt19_fallback_tag_load");
-            if let Ok(tags) = store.load_tags_for_session(&parsed.session_id) {
+            let tags = if async_coverage.is_some() {
+                let blocks = projection
+                    .blocks
+                    .iter()
+                    .map(|block| block.id.as_str())
+                    .collect::<Vec<_>>();
+                store.load_tags_for_blocks(&parsed.session_id, &blocks)
+            } else {
+                store.load_tags_for_session(&parsed.session_id)
+            };
+            if let Ok(tags) = tags {
                 // Malformed-lineage and compaction-off paths return before normal tag hydration.
                 // Preserve their fail-open tokenization behavior rather than treating absence as empty.
                 self.boundary_tokens
@@ -7324,42 +7338,54 @@ impl McHandler {
             .timings
             .tokenized_blocks
             .saturating_add(tokenized_blocks);
-        let compartment_end_result = store.max_compartment_end_ordinal(&parsed.session_id);
-        let last_compartment_end_ordinal = match compartment_end_result {
-            Ok(ordinal) if ordinal > 0 => Some(ordinal as u64),
-            Ok(_) | Err(_) if loaded.meta.ordinal_continuation_base.is_some() => {
-                let detail = "continued_ordinal_offset_missing";
-                tracing::info!(
-                    "mc-module: aborting historian trigger for {}: {detail}",
-                    parsed.session_id
-                );
-                let diagnostics = historian_no_fire_diagnostics(NoFireDiagnosticsInput {
-                    no_fire: detail.into(),
-                    detail_kind: detail,
-                    cause: HistorianNoFireCause::ContinuedOrdinalOffsetMissing,
-                    extra: None,
-                    reason: None,
-                    state,
-                    progress: None,
-                    last_failure,
-                });
-                self.record_no_fire(
-                    &store,
-                    &parsed.session_id,
-                    &loaded,
-                    &diagnostics,
-                    &decision_context,
-                );
-                return PreparedHistorianAction::Complete(diagnostics);
+        let compartment_end_result = if async_coverage.is_none() {
+            store.max_compartment_end_ordinal(&parsed.session_id)
+        } else {
+            Ok(0)
+        };
+        let last_compartment_end_ordinal = if let Some(coverage) = async_coverage {
+            coverage
+        } else {
+            match compartment_end_result {
+                Ok(ordinal) if ordinal > 0 => Some(ordinal as u64),
+                Ok(_) | Err(_) if loaded.meta.ordinal_continuation_base.is_some() => {
+                    let detail = "continued_ordinal_offset_missing";
+                    tracing::info!(
+                        "mc-module: aborting historian trigger for {}: {detail}",
+                        parsed.session_id
+                    );
+                    let diagnostics = historian_no_fire_diagnostics(NoFireDiagnosticsInput {
+                        no_fire: detail.into(),
+                        detail_kind: detail,
+                        cause: HistorianNoFireCause::ContinuedOrdinalOffsetMissing,
+                        extra: None,
+                        reason: None,
+                        state,
+                        progress: None,
+                        last_failure,
+                    });
+                    self.record_no_fire(
+                        &store,
+                        &parsed.session_id,
+                        &loaded,
+                        &diagnostics,
+                        &decision_context,
+                    );
+                    return PreparedHistorianAction::Complete(diagnostics);
+                }
+                Ok(_) | Err(_) => None,
             }
-            Ok(_) | Err(_) => None,
         };
         let serializer_profile = SerializerProfile::parse(&parsed.serializer_profile)
             .expect("serializer_profile validated upstream");
         let fold_is_only_reclaim = !tail_reclaim(serializer_profile);
-        let pending_drops = store
-            .load_pending_agent_drops(&parsed.session_id)
-            .unwrap_or_default();
+        let pending_drops = if async_coverage.is_some() && !reclaim_ride_available {
+            Vec::new()
+        } else {
+            store
+                .load_pending_agent_drops(&parsed.session_id)
+                .unwrap_or_default()
+        };
         // The projection reads frozen `red:` units only when agent drops are pending, which is
         // rare; only then is the frozen list loaded.
         let pending_frozen_units = if pending_drops.is_empty() {
@@ -7382,7 +7408,12 @@ impl McHandler {
         let trigger = {
             let mut formatted_token_estimator =
                 |bytes: &str| token_cache_snapshot.formatted_token_count(bytes);
-            boundary::check_compartment_trigger_with_token_estimator(
+            let check = if async_coverage.is_some() {
+                boundary::check_compartment_trigger_tail_with_token_estimator
+            } else {
+                boundary::check_compartment_trigger_with_token_estimator
+            };
+            check(
                 &boundary_messages,
                 &TriggerContext {
                     boundary: BoundaryContext {
@@ -12378,6 +12409,7 @@ impl McHandler {
                     snapshot_generation: Some(snapshot_generation),
                     publication_fence: None,
                     tag_snapshot: result.historian_tags.clone(),
+                    async_coverage: None,
                     reclaim_ride_available: result.reclaim_ride_available,
                     runner_lane: false,
                     timings: &mut trigger_timings,
@@ -12413,6 +12445,7 @@ impl McHandler {
                                 snapshot_generation: Some(snapshot_generation),
                                 publication_fence: None,
                                 tag_snapshot: result.historian_tags.clone(),
+                                async_coverage: None,
                                 reclaim_ride_available: result.reclaim_ride_available,
                                 runner_lane: false,
                                 timings: &mut trigger_timings,
@@ -12489,6 +12522,7 @@ impl McHandler {
                     snapshot_generation: Some(snapshot_generation),
                     publication_fence: None,
                     tag_snapshot: result.historian_tags.clone(),
+                    async_coverage: None,
                     reclaim_ride_available: result.reclaim_ride_available,
                     runner_lane: false,
                     timings: &mut trigger_timings,
