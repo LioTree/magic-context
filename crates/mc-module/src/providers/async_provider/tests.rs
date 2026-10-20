@@ -9,6 +9,15 @@ struct Runner {
     lineage: Mutex<String>,
     read_delay_ms: std::sync::atomic::AtomicU64,
     routed_reads: std::sync::atomic::AtomicU64,
+    read_unavailable: std::sync::atomic::AtomicBool,
+    read_gate: Mutex<Option<Arc<ReadGate>>>,
+    reads: Mutex<Vec<Value>>,
+}
+
+#[derive(Default)]
+struct ReadGate {
+    entered: tokio::sync::Notify,
+    resume: tokio::sync::Notify,
 }
 
 #[async_trait]
@@ -47,6 +56,18 @@ impl session_resolver::ProviderRunner for Runner {
             );
         }
         assert_eq!(method, "session.read");
+        self.reads.lock().unwrap().push(params.clone());
+        if self
+            .read_unavailable
+            .load(std::sync::atomic::Ordering::Relaxed)
+        {
+            return Err(SessionResolveError::Transport("runner unreachable".into()));
+        }
+        let gate = self.read_gate.lock().unwrap().take();
+        if let Some(gate) = gate {
+            gate.entered.notify_one();
+            gate.resume.notified().await;
+        }
         let delay = self
             .read_delay_ms
             .load(std::sync::atomic::Ordering::Relaxed);
@@ -215,6 +236,17 @@ impl Rig {
         load(self.h.store.get().unwrap(), &self.reference)
             .unwrap()
             .unwrap()
+    }
+    fn pending_targets(&self) -> Vec<String> {
+        self.h
+            .store
+            .get()
+            .unwrap()
+            .load_pending_agent_drops(&self.state().namespace())
+            .unwrap()
+            .into_iter()
+            .map(|drop| drop.target_id)
+            .collect()
     }
     async fn queue(&self, numbers: &[u64]) {
         let drop = numbers
@@ -870,6 +902,247 @@ async fn ordinary_execute_with_only_drops_defers_but_m1_refresh_publishes() {
 }
 
 #[tokio::test]
+async fn reduce_catches_up_unread_runner_tag_before_queuing() {
+    let dir = tempfile::tempdir().unwrap();
+    let rig = Rig::new(dir.path()).await;
+    rig.fill(10);
+    assert!(rig.state().entries.is_empty());
+
+    let answer = rig.tool(7, "ctx_reduce", json!({"drop":"127"})).await;
+    assert_ne!(answer["isError"], true, "{answer}");
+    assert_eq!(answer["content"][0]["text"], "1 tag stamped. ");
+    let state = rig.state();
+    assert_eq!(state.entries.len(), 10);
+    assert_eq!(state.tag_index.len(), 10);
+    assert_eq!(state.tag_index["§127§"].part, "0");
+    assert_eq!(
+        state.entries[&9].read().unwrap().message["parts"][0]["id"],
+        "p9"
+    );
+    let codec = codec::Codec::from_params(&Value::Object(state.setup.params.clone())).unwrap();
+    assert_eq!(
+        rig.pending_targets(),
+        vec![tag_row(&state, codec, 127).unwrap().unwrap().block_id]
+    );
+    let reads = rig.runner.reads.lock().unwrap();
+    assert_eq!(reads.len(), 2, "catch-up must finish paging");
+    assert_eq!(reads[0]["from_ordinal"], 0);
+    assert_eq!(reads[1]["from_ordinal"], 7);
+    assert!(reads.iter().all(|read| read["lineage_id"] == "L"));
+}
+
+#[tokio::test]
+async fn reduce_refuses_missing_tag_only_after_successful_catch_up() {
+    let dir = tempfile::tempdir().unwrap();
+    let rig = Rig::new(dir.path()).await;
+    rig.fill(2);
+
+    let answer = rig.tool(7, "ctx_reduce", json!({"drop":"999"})).await;
+    assert_eq!(answer["isError"], true, "{answer}");
+    assert_eq!(
+        answer["content"][0]["text"],
+        "Refused: no valid tags to queue. tags 999 not found"
+    );
+    assert_eq!(rig.state().entries.len(), 2);
+    assert_eq!(rig.runner.reads.lock().unwrap().len(), 1);
+    assert!(rig.pending_targets().is_empty());
+}
+
+#[tokio::test]
+async fn reduce_unreachable_runner_is_retryable_not_not_found() {
+    let dir = tempfile::tempdir().unwrap();
+    let rig = Rig::new(dir.path()).await;
+    rig.fill(2);
+    rig.runner
+        .read_unavailable
+        .store(true, std::sync::atomic::Ordering::Relaxed);
+
+    let answer = rig.tool(7, "ctx_reduce", json!({"drop":"103"})).await;
+    assert_eq!(answer["isError"], true, "{answer}");
+    let text = answer["content"][0]["text"].as_str().unwrap();
+    assert!(text.contains("Retry ctx_reduce for tags 103"), "{text}");
+    assert!(!text.contains("not found"), "{text}");
+    assert!(rig.pending_targets().is_empty());
+    assert!(rig.state().entries.is_empty());
+
+    rig.runner
+        .read_unavailable
+        .store(false, std::sync::atomic::Ordering::Relaxed);
+    rig.queue(&[103]).await;
+}
+
+#[tokio::test]
+async fn reduce_mixed_request_queues_known_and_reports_only_checked_missing_tags() {
+    for unavailable in [false, true] {
+        let dir = tempfile::tempdir().unwrap();
+        let rig = Rig::new(dir.path()).await;
+        rig.fill(1);
+        rig.notice(1, 1_000, None).await;
+        rig.fill(2);
+        rig.runner
+            .read_unavailable
+            .store(unavailable, std::sync::atomic::Ordering::Relaxed);
+
+        let answer = rig
+            .tool(7, "ctx_reduce", json!({"drop":"100,103,999"}))
+            .await;
+        assert_ne!(answer["isError"], true, "{answer}");
+        let text = answer["content"][0]["text"].as_str().unwrap();
+        let state = rig.state();
+        let codec = codec::Codec::from_params(&Value::Object(state.setup.params.clone())).unwrap();
+        let mut expected = vec![tag_row(&state, codec, 100).unwrap().unwrap().block_id];
+        if unavailable {
+            assert!(text.starts_with("1 tag stamped."), "{text}");
+            assert!(
+                text.contains("Retry ctx_reduce for tags 103, 999"),
+                "{text}"
+            );
+            assert!(!text.contains("not found"), "{text}");
+            assert_eq!(state.entries.len(), 1);
+        } else {
+            assert_eq!(text, "2 tags stamped. tags 999 not found");
+            expected.push(tag_row(&state, codec, 103).unwrap().unwrap().block_id);
+            assert_eq!(state.entries.len(), 2);
+        }
+        let mut actual = rig.pending_targets();
+        actual.sort();
+        expected.sort();
+        assert_eq!(actual, expected);
+    }
+}
+
+#[tokio::test]
+async fn reduce_catch_up_and_concurrent_notice_share_the_saved_cursor() {
+    let dir = tempfile::tempdir().unwrap();
+    let rig = Rig::new(dir.path()).await;
+    rig.fill(3);
+    rig.notice(1, 1_000, None).await;
+    rig.fill(12);
+    rig.runner.reads.lock().unwrap().clear();
+    let gate = Arc::new(ReadGate::default());
+    *rig.runner.read_gate.lock().unwrap() = Some(gate.clone());
+    let last = rig.runner.entries.lock().unwrap().last().unwrap().clone();
+    let notice = notice::AdvanceNotice::new(
+        &rig.reference,
+        2,
+        "L",
+        last.ordinal,
+        contract::digest::content_digest(&last.message),
+        1_000,
+        "fixture",
+    )
+    .with_window(100_000);
+    let message = cortexkit_bus_trait::Message {
+        subject: notice::event_subject("fixture", &rig.module, notice::ADVANCED_EVENT),
+        id: bus_id(&rig.reference, "advanced", 2),
+        digest: notice.digest().parse().unwrap(),
+        headers: notice.to_headers(),
+    };
+
+    let (answer, ()) = tokio::time::timeout(Duration::from_secs(5), async {
+        tokio::join!(rig.tool(7, "ctx_reduce", json!({"drop":"133"})), async {
+            gate.entered.notified().await;
+            let advance = rig.h.advance_compaction("fixture", &message);
+            tokio::pin!(advance);
+            // Poll the notice until it waits on the serial held by the
+            // paused catch-up. It must not read or save the older cursor.
+            std::future::poll_fn(|cx| {
+                assert!(std::future::Future::poll(advance.as_mut(), cx).is_pending());
+                std::task::Poll::Ready(())
+            })
+            .await;
+            assert_eq!(rig.runner.reads.lock().unwrap().len(), 1);
+            assert_eq!(rig.state().entries.len(), 3);
+            gate.resume.notify_one();
+            advance.await.unwrap();
+        })
+    })
+    .await
+    .expect("catch-up and notice complete without deadlocking");
+    assert_ne!(answer["isError"], true, "{answer}");
+    assert_eq!(answer["content"][0]["text"], "1 tag stamped. ");
+    let state = rig.state();
+    assert_eq!(state.completed_seq, 2);
+    assert_eq!(
+        state.entries.keys().copied().collect::<Vec<_>>(),
+        (0..12).collect::<Vec<_>>()
+    );
+    assert_eq!(state.tag_index.len(), 12);
+    assert_eq!(state.journal.persisted_through, Some(11));
+    for (ordinal, entry) in &state.entries {
+        assert_eq!(
+            entry.read().unwrap().message,
+            rig.runner.entries.lock().unwrap()[*ordinal as usize].message
+        );
+    }
+    assert_eq!(
+        rig.runner
+            .reads
+            .lock()
+            .unwrap()
+            .iter()
+            .map(|read| read["from_ordinal"].as_u64().unwrap())
+            .collect::<Vec<_>>(),
+        vec![2, 9, 11],
+        "the notice re-reads only the tail saved by the catch-up"
+    );
+}
+
+#[tokio::test]
+async fn reduce_incomplete_catch_up_is_retryable_and_preserves_known_tags() {
+    for reason in ["timeout", "lineage", "resync", "invalid_parts"] {
+        let dir = tempfile::tempdir().unwrap();
+        let rig = Rig::new(dir.path()).await;
+        rig.fill(1);
+        rig.notice(1, 1_000, None).await;
+        rig.fill(10);
+        match reason {
+            "timeout" => rig
+                .runner
+                .read_delay_ms
+                .store(5_000, std::sync::atomic::Ordering::Relaxed),
+            "lineage" => *rig.runner.lineage.lock().unwrap() = "new-lineage".into(),
+            "resync" => {
+                let mut state = rig.state();
+                state.resync = true;
+                state.save(rig.h.store.get().unwrap(), &[]).unwrap();
+            }
+            "invalid_parts" => rig.runner.entries.lock().unwrap()[9].tags[0].part = String::new(),
+            _ => unreachable!(),
+        }
+        let started = Instant::now();
+        let answer = rig.tool(7, "ctx_reduce", json!({"drop":"100,127"})).await;
+        assert!(started.elapsed() < Duration::from_secs(4), "{reason}");
+        assert_ne!(answer["isError"], true, "{reason}: {answer}");
+        let text = answer["content"][0]["text"]
+            .as_str()
+            .unwrap_or_else(|| panic!("{reason}: {answer}"));
+        assert!(text.starts_with("1 tag stamped."), "{reason}: {text}");
+        assert!(
+            text.contains("Retry ctx_reduce for tags 127"),
+            "{reason}: {text}"
+        );
+        assert!(!text.contains("not found"), "{reason}: {text}");
+        assert_eq!(rig.pending_targets().len(), 1, "{reason}");
+        assert_eq!(
+            rig.state().entries.len(),
+            1,
+            "incomplete reads must not be saved: {reason}"
+        );
+        if reason != "resync" {
+            rig.runner
+                .read_delay_ms
+                .store(0, std::sync::atomic::Ordering::Relaxed);
+            *rig.runner.lineage.lock().unwrap() = "L".into();
+            rig.fill(10);
+            rig.queue(&[127]).await;
+            assert_eq!(rig.state().entries.len(), 10, "{reason}");
+            assert_eq!(rig.pending_targets().len(), 2, "{reason}");
+        }
+    }
+}
+
+#[tokio::test]
 async fn ride_deadline_returns_nothing_without_waiting_for_slow_runner() {
     let dir = tempfile::tempdir().unwrap();
     let rig = Rig::new(dir.path()).await;
@@ -1474,7 +1747,7 @@ async fn any_bind_harness_resolves_the_async_conversation_first() {
     for channel in [7, 8] {
         let scope = rig
             .h
-            .resolve_facade_scope(channel, None, "memories", false)
+            .resolve_facade_scope(channel, None, "memories", false, false)
             .await
             .unwrap_or_else(|e| panic!("channel {channel}: {e:?}"));
         assert!(scope.async_conversation, "channel {channel}");

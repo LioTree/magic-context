@@ -459,6 +459,16 @@ impl State {
     fn namespace(&self) -> String {
         format!("{}:async:{}", self.key.engine_key(), self.generation)
     }
+
+    /// Validate and persist a completed transcript read while its provider
+    /// serial is held, before returning the record to the resident cache.
+    fn ingest_read(&mut self, store: &McStore, codec: codec::Codec) -> Result<(), HandlerOutcome> {
+        self.reindex()?;
+        self.restore_sources(store, codec)?;
+        let rows = self.unsaved_tag_rows(codec)?;
+        self.save(store, &rows)
+    }
+
     /// Persist this record in one transaction: the small record plus only
     /// what changed since it was loaded or last saved (new held entries, a
     /// transcript cut, changed baselines, view retention). `tag_rows` are the
@@ -2251,10 +2261,7 @@ impl McHandler {
         drop(phase);
         #[cfg(test)]
         let phase = scaling_tests::save_meter::start_kind(&notice.session_ref, "phase:index");
-        state.reindex()?;
-        state.restore_sources(store, codec)?;
-        let rows = state.unsaved_tag_rows(codec)?;
-        state.save(store, &rows)?;
+        state.ingest_read(store, codec)?;
         #[cfg(test)]
         drop(phase);
         #[cfg(test)]
@@ -2980,50 +2987,75 @@ impl McHandler {
         }
         let state: State = serde_json::from_str(&rows[0]).map_err(transient)?;
         let _serial = self.provider_serial.lock_for(&state.key).await;
-        let state = self
+        let mut state = self
             .checkout(store, &state.reference())?
             .ok_or_else(|| transient("async session disappeared"))?;
-        if state.resync {
-            self.checkin(state);
-            return Err(transient("async transcript resync in progress"));
-        }
         let codec = codec::Codec::from_params(&Value::Object(state.setup.params.clone()))?;
-        let mut targets = Vec::new();
-        let mut unknown = Vec::new();
-        for number in requested {
-            #[cfg(test)]
-            let row = if self.async_oracle() {
-                tag_rows(&state, codec)?
-                    .into_iter()
-                    .find(|row| u64::try_from(row.tag_number).ok() == Some(*number))
-            } else {
-                tag_row(&state, codec, *number)?
-            };
-            #[cfg(not(test))]
-            let row = tag_row(&state, codec, *number)?;
-            match row {
-                Some(row) => targets.push(row.block_id),
-                None => unknown.push(*number),
+        let resolve = |state: &State| -> Result<_, HandlerOutcome> {
+            let mut targets = Vec::new();
+            let mut unknown = Vec::new();
+            for number in requested {
+                #[cfg(test)]
+                let row = if self.async_oracle() {
+                    tag_rows(state, codec)?
+                        .into_iter()
+                        .find(|row| u64::try_from(row.tag_number).ok() == Some(*number))
+                } else {
+                    tag_row(state, codec, *number)?
+                };
+                #[cfg(not(test))]
+                let row = tag_row(state, codec, *number)?;
+                match row {
+                    Some(row) => targets.push(row.block_id),
+                    None => unknown.push(*number),
+                }
+            }
+            Ok((targets, unknown))
+        };
+        let (mut targets, mut unknown) = resolve(&state)?;
+        let mut catch_up_failed = false;
+        if !unknown.is_empty() {
+            // A tag can reach the model before its change notice reaches us.
+            // Re-read the inclusive tail under the same serial as notices so
+            // the cursor, lineage checks and persisted indexes move together.
+            let from = state.entries.last_key_value().map_or(0, |(n, _)| *n);
+            let budget = Duration::from_secs(2);
+            catch_up_failed = state.resync
+                || !matches!(
+                    tokio::time::timeout(budget, self.read_async(&mut state, from, budget)).await,
+                    Ok(Ok(()))
+                )
+                || state.ingest_read(store, codec).is_err();
+            if !catch_up_failed {
+                (targets, unknown) = resolve(&state)?;
             }
         }
         let namespace = state.namespace();
-        // Queuing a drop changes no part of the record.
-        self.checkin(state);
+        if !catch_up_failed {
+            self.checkin(state);
+        }
+        // A failed read may have added an incomplete page. Discard that
+        // resident copy; the next notice or tool call reloads the saved cursor.
+        let details = if catch_up_failed {
+            format!(
+                "Retry ctx_reduce for tags {}: transcript catch-up could not complete; these tags could not be checked yet.",
+                format_plain_tag_numbers(&unknown)
+            )
+        } else {
+            ctx_reduce_ack_details(&unknown)
+        };
         if targets.is_empty() {
-            return Ok(tool_error_result(format!(
-                "Refused: no valid tags to queue. {}",
-                ctx_reduce_ack_details(&unknown)
-            )));
+            return Ok(tool_error_result(if catch_up_failed {
+                details
+            } else {
+                format!("Refused: no valid tags to queue. {details}")
+            }));
         }
         store
             .append_pending_agent_drops_with_command(&namespace, None, &targets, now_ms(), false)
             .map_err(transient)?;
         Ok(mcp_text_result(
-            format!(
-                "{} {}",
-                ctx_reduce_reply(targets.len(), 0),
-                ctx_reduce_ack_details(&unknown)
-            ),
+            format!("{} {}", ctx_reduce_reply(targets.len(), 0), details),
             false,
         ))
     }
@@ -3648,6 +3680,7 @@ impl McHandler {
     pub(crate) fn async_compaction_namespace(
         &self,
         binding: &SessionBinding,
+        allow_resync: bool,
     ) -> Result<Option<String>, HandlerOutcome> {
         let store = self
             .store
@@ -3660,7 +3693,7 @@ impl McHandler {
             [] => Ok(None),
             [raw] => {
                 let state: State = serde_json::from_str(raw).map_err(transient)?;
-                if state.resync {
+                if state.resync && !allow_resync {
                     return Err(transient("async transcript resync in progress"));
                 }
                 Ok(Some(state.namespace()))
