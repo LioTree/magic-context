@@ -12,7 +12,10 @@ import {
 // fixtures, so a change on either side that is not mirrored fails here or there.
 function fixture<T>(name: string): T {
     return JSON.parse(
-        readFileSync(resolve(import.meta.dir, `../../../../crates/mc-module/testdata/${name}`), "utf8"),
+        readFileSync(
+            resolve(import.meta.dir, `../../../../crates/mc-module/testdata/${name}`),
+            "utf8",
+        ),
     ) as T;
 }
 
@@ -46,7 +49,11 @@ describe("runner-lane policy fixtures shared with ck-mc", () => {
             expected_state_json: string;
             transcript: Array<{
                 message: {
-                    content: Array<{ type: string; tool_name?: string; input?: { todos?: unknown } }>;
+                    content: Array<{
+                        type: string;
+                        tool_name?: string;
+                        input?: { todos?: unknown };
+                    }>;
                 };
             }>;
         }>("runner-todo-transcript.json");

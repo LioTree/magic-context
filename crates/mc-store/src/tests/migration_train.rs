@@ -1593,6 +1593,40 @@ fn populated_increment(previous: u32) {
     assert_eq!(store_snapshot(&reopened), after_probes);
 }
 
+#[test]
+fn released_63_to_74_preserves_data_and_fences_the_old_binary() {
+    let dir = tempfile::tempdir().unwrap();
+    let descriptor = descriptor(dir.path());
+    // Build the released schema from its DDL, without creating any later tables.
+    let before = seed(&descriptor, 63);
+    assert!(!before.tables.contains_key("mc_async_compaction"));
+    let upgraded = McStore::open(&descriptor).unwrap();
+    assert_eq!(LATEST_MIGRATION_VERSION, 74);
+    assert_eq!(crate::move_inventory::CONTEXT_SCHEMA_VERSION, 102);
+    assert_metadata_and_inventory(&upgraded, 74);
+    let after = store_snapshot(&upgraded);
+    for table in ["mc_tags", "pending_agent_drops"] {
+        assert_eq!(after.tables[table], before.tables[table], "{table}");
+    }
+    assert_eq!(
+        upgraded.load("legacy").unwrap().core.frozen_units[0].frozen_payload,
+        core().frozen_units[0].frozen_payload
+    );
+    drop(upgraded);
+    let bytes = database_bytes(dir.path());
+    let Err(error) = McStore::open_with_migrations(&descriptor, false, &chain(63)) else {
+        panic!("a version 63 binary accepted version 74");
+    };
+    assert!(matches!(
+        error,
+        McStoreError::StoreAheadOfBinary {
+            db_version: 74,
+            binary_max: 63
+        }
+    ));
+    assert_eq!(database_bytes(dir.path()), bytes);
+}
+
 macro_rules! increment {
     ($name:ident, $version:literal) => {
         #[test]

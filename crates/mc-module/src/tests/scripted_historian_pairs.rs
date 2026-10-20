@@ -181,7 +181,8 @@ fn assemble(
             memory_enabled: true,
             auto_promote: true,
             user_memory_collection_enabled: false,
-            user_observations_requested: false,
+            // These recorded prompts assume a running user-memory reviewer.
+            user_observations_requested: true,
             extraction_free: false,
             in_emergency: false,
             force_keep_last_compartment: false,

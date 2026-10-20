@@ -1304,6 +1304,10 @@ fn rewind_to_62(store: &McStore) {
          DROP TABLE mc_pass_trace_history;
          DROP TABLE mc_cache_frozen_chunks;
          DROP TABLE mc_cache_sections;
+         DROP TABLE mc_async_compaction_entries;
+         DROP TABLE mc_async_compaction_views;
+         DROP TABLE mc_async_compaction_baselines;
+         DROP TABLE mc_async_compaction;
           DROP TABLE mc_provider_view_overrides_v1;
           DROP TABLE mc_provider_views_v2;
           DROP TABLE mc_provider_policy_overrides_v1;

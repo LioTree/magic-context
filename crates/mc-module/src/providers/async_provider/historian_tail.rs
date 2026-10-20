@@ -191,7 +191,9 @@ mod tests {
             .map(|(_, raw)| HeldEntry::from_stored(raw).unwrap().inbound().unwrap())
             .collect::<Vec<_>>();
         let mut parsed = request();
-        codec.prepare_request(&mut parsed, &messages).unwrap();
+        reminder_echoes::ReminderEchoes::default()
+            .prepare(codec, &mut parsed, &messages, true)
+            .unwrap();
         let projection = ck_wire::project_messages(&parsed.messages).unwrap();
         (parsed, projection)
     }

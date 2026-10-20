@@ -351,6 +351,13 @@ impl ReminderEchoes {
                 continue;
             };
             for (ordinal, entry) in entries.range(*from..*to) {
+                if !self
+                    .blocks
+                    .iter()
+                    .any(|echo| echo.ordinal == *ordinal && echo.mid == entry.mid)
+                {
+                    continue;
+                }
                 let entry = entry.read()?;
                 let before = parts(&entry.message)?;
                 for (index, row) in entry.tags.iter().enumerate() {
