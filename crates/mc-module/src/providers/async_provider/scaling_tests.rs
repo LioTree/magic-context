@@ -781,3 +781,252 @@ async fn storage_scaling_benchmark() {
     println!();
     println!("{}", sizes_table.join("\n"));
 }
+
+/// Peak and current resident set size of this process, in bytes (Linux).
+fn rss() -> (u64, u64) {
+    let status = std::fs::read_to_string("/proc/self/status").unwrap_or_default();
+    let field = |name: &str| {
+        status
+            .lines()
+            .find(|line| line.starts_with(name))
+            .and_then(|line| line.split_whitespace().nth(1))
+            .and_then(|kb| kb.parse::<u64>().ok())
+            .map_or(0, |kb| kb * 1024)
+    };
+    (field("VmHWM:"), field("VmRSS:"))
+}
+
+fn percentiles(label: &str, size: u64, samples: &mut [(f64, f64, f64)]) {
+    let pick = |samples: &[(f64, f64, f64)], at: f64, key: fn(&(f64, f64, f64)) -> f64| {
+        let mut values = samples.iter().map(key).collect::<Vec<_>>();
+        values.sort_by(f64::total_cmp);
+        let index = ((values.len() as f64 * at).ceil() as usize).clamp(1, values.len()) - 1;
+        values[index]
+    };
+    let row = |name: &str, key: fn(&(f64, f64, f64)) -> f64| {
+        format!(
+            "{name} p50 {:.1} / p90 {:.1} / p99 {:.1}",
+            pick(samples, 0.50, key),
+            pick(samples, 0.90, key),
+            pick(samples, 0.99, key)
+        )
+    };
+    eprintln!(
+        "| {label} | {size} | {} | {} | {} | {} |",
+        samples.len(),
+        row("wall ms", |s| s.0),
+        row("thread CPU ms", |s| s.1),
+        row("process CPU ms", |s| s.2)
+    );
+}
+
+impl Rig {
+    /// Deliver a notice adding `count` messages; returns wall, this thread's
+    /// CPU and process CPU in milliseconds, and the process CPU the
+    /// historian evaluation it started took afterwards.
+    async fn timed_notice(&mut self, count: u64, applied: Option<u64>) -> ((f64, f64, f64), f64) {
+        self.append(count);
+        self.seq += 1;
+        let seq = self.seq;
+        let (last_ordinal, digest) = {
+            let entries = self.runner.entries.lock().unwrap();
+            let (last, _) = entries.last().unwrap();
+            (
+                last.ordinal,
+                contract::digest::content_digest(&last.message),
+            )
+        };
+        let mut notice = notice::AdvanceNotice::new(
+            &self.reference,
+            seq,
+            "L",
+            last_ordinal,
+            digest,
+            1_000,
+            "fixture",
+        )
+        .with_window(100_000);
+        if let Some(version) = applied {
+            notice = notice.with_applied_view_version(version);
+        }
+        let mut headers = notice.to_headers();
+        headers.insert("lineage_id".into(), "L".into());
+        let message = cortexkit_bus_trait::Message {
+            subject: notice::event_subject("fixture", "thalamus-harness", notice::ADVANCED_EVENT),
+            id: bus_id(&self.reference, "advanced", seq),
+            digest: notice.digest().parse().unwrap(),
+            headers,
+        };
+        let wall = Instant::now();
+        let thread = cpu_time::ThreadTime::now();
+        let process = cpu_time::ProcessTime::now();
+        self.h
+            .advance_compaction("fixture", &message)
+            .await
+            .unwrap();
+        let sample = (
+            wall.elapsed().as_secs_f64() * 1e3,
+            thread.elapsed().as_secs_f64() * 1e3,
+            process.elapsed().as_secs_f64() * 1e3,
+        );
+        let background = cpu_time::ProcessTime::now();
+        self.settle().await;
+        let historian = background.elapsed().as_secs_f64() * 1e3;
+        let head = load_head(self.store(), &self.reference).unwrap().unwrap();
+        assert_eq!(head.completed_seq, seq);
+        (sample, historian)
+    }
+
+    async fn settle(&self) {
+        while self
+            .h
+            .provider_store
+            .async_runtime
+            .historian_inflight
+            .load(std::sync::atomic::Ordering::SeqCst)
+            > 0
+        {
+            tokio::time::sleep(Duration::from_millis(1)).await;
+        }
+    }
+
+    fn newest_view(&self) -> Option<u64> {
+        self.sql()
+            .query_row(
+                "SELECT max(version) FROM mc_async_compaction_views WHERE session_ref=?1",
+                [&self.reference],
+                |row| row.get::<_, Option<i64>>(0),
+            )
+            .unwrap()
+            .map(|version| version as u64)
+    }
+}
+
+/// Notice and view latency percentiles, cold start and memory at each size
+/// in `MC_ASYNC_SCALING_SIZES`. `MC_ASYNC_NOTICES` quiet notices (default
+/// 200) and `MC_ASYNC_VIEWS` view builds of each kind (default 20) per size.
+/// Set `MC_ASYNC_ORACLE=1` to measure the full-recompute path instead.
+/// Runs on one thread so a notice's own CPU is this thread's CPU; rides and
+/// historian evaluations run on blocking threads and count in process CPU.
+#[tokio::test]
+#[ignore = "latency benchmark; run explicitly with --ignored --nocapture"]
+async fn resident_latency_benchmark() {
+    let env = |name: &str, default: &str| std::env::var(name).unwrap_or_else(|_| default.into());
+    let sizes = env("MC_ASYNC_SCALING_SIZES", "1000,10000,50000,150000")
+        .split(',')
+        .map(|size| size.trim().parse::<u64>().unwrap())
+        .collect::<Vec<_>>();
+    let quiet = env("MC_ASYNC_NOTICES", "200").parse::<usize>().unwrap();
+    let views = env("MC_ASYNC_VIEWS", "20").parse::<usize>().unwrap();
+    let oracle = env("MC_ASYNC_ORACLE", "0") == "1";
+    eprintln!("| operation | messages | samples | wall | this thread's CPU | process CPU |");
+    eprintln!("|---|---:|---:|---|---|---|");
+    for size in sizes {
+        let dir = tempfile::tempdir().unwrap();
+        let started = Instant::now();
+        let mut rig = Rig::new(dir.path()).await;
+        rig.h
+            .provider_store
+            .async_runtime
+            .resident
+            .lock()
+            .unwrap()
+            .oracle = oracle;
+        rig.append(size);
+        rig.timed_notice(0, None).await;
+        rig.history(size / 2, "first completed historian summary");
+        rig.timed_notice(0, None).await;
+        let mut version = rig.newest_view().expect("history publishes a view");
+        rig.timed_notice(4, Some(version)).await;
+        eprintln!(
+            "bootstrapped {size} messages in {:.1}s",
+            started.elapsed().as_secs_f64()
+        );
+        let transcript = rig
+            .runner
+            .entries
+            .lock()
+            .unwrap()
+            .iter()
+            .map(|(_, bytes)| *bytes as u64)
+            .sum::<u64>();
+        let mut notices = Vec::new();
+        let mut historian = Vec::new();
+        for _ in 0..quiet {
+            let (sample, background) = rig.timed_notice(4, Some(version)).await;
+            notices.push(sample);
+            historian.push((background, background, background));
+        }
+        assert_eq!(
+            rig.newest_view(),
+            Some(version),
+            "quiet notices publish nothing"
+        );
+        percentiles("quiet notice (+4 msgs)", size, &mut notices);
+        percentiles(
+            "historian evaluation after it (process CPU)",
+            size,
+            &mut historian,
+        );
+        let mut rides = Vec::new();
+        let mut publishes = Vec::new();
+        let mut acknowledging = Vec::new();
+        for index in 0..views {
+            rig.history(size / 2 + 2 + index as u64 * 2, "a newer historian summary");
+            let reference = rig.reference.clone();
+            let wall = Instant::now();
+            let thread = cpu_time::ThreadTime::now();
+            let process = cpu_time::ProcessTime::now();
+            let answer = rig
+                .op(
+                    "compaction.ride",
+                    json!({"session_ref":reference,"cause":"ceiling","deadline_ms":300_000}),
+                )
+                .await;
+            rides.push((
+                wall.elapsed().as_secs_f64() * 1e3,
+                thread.elapsed().as_secs_f64() * 1e3,
+                process.elapsed().as_secs_f64() * 1e3,
+            ));
+            assert_eq!(answer["answer"], "view", "{answer}");
+            version = answer["view"]["view_version"].as_u64().unwrap();
+            acknowledging.push(rig.timed_notice(4, Some(version)).await.0);
+            rig.history(size / 2 + 3 + index as u64 * 2, "a newer historian summary");
+            publishes.push(rig.timed_notice(4, Some(version)).await.0);
+            version = rig.newest_view().unwrap();
+            rig.timed_notice(4, Some(version)).await;
+        }
+        percentiles("ride building a view", size, &mut rides);
+        percentiles("notice publishing a view", size, &mut publishes);
+        percentiles("notice acknowledging a ride view", size, &mut acknowledging);
+        let held = rig
+            .h
+            .provider_store
+            .async_runtime
+            .resident
+            .lock()
+            .unwrap()
+            .held_bytes(&rig.reference)
+            .unwrap_or(0);
+        let mut cold = Vec::new();
+        for _ in 0..3 {
+            rig.h
+                .provider_store
+                .async_runtime
+                .resident
+                .lock()
+                .unwrap()
+                .forget(&rig.reference);
+            cold.push(rig.timed_notice(4, Some(version)).await.0);
+        }
+        percentiles("cold start (first notice after restart)", size, &mut cold);
+        let (peak, current) = rss();
+        eprintln!(
+            "memory at {size}: transcript {transcript} B, resident record {held} B ({:.2}x), process RSS {:.2} GB (peak {:.2} GB)",
+            held as f64 / transcript.max(1) as f64,
+            current as f64 / 1e9,
+            peak as f64 / 1e9
+        );
+        drop(rig);
+    }
+}
