@@ -149,7 +149,7 @@ pub(crate) struct AsyncRecord {
     /// Certificate recording which earlier source input the last permitted
     /// rebuild covered. Produced and applied views remain separate; a runner
     /// acknowledgement never advances this certificate.
-    #[serde(default)]
+    #[serde(default, deserialize_with = "deserialize_logical_prefix")]
     logical_prefix: Option<Arc<transform::compaction::LogicalPrefix>>,
     /// Engine forms of this generation's retained published views, stored
     /// beside each view in `mc_async_compaction_views.engine_json`.
@@ -193,6 +193,15 @@ pub(crate) struct AsyncRecord {
     conditions: Option<BTreeMap<String, String>>,
     resync: bool,
     generation: u64,
+}
+
+fn deserialize_logical_prefix<'de, D: serde::Deserializer<'de>>(
+    deserializer: D,
+) -> Result<Option<Arc<transform::compaction::LogicalPrefix>>, D::Error> {
+    let value = Value::deserialize(deserializer)?;
+    // Prefix data is a disposable index. Unreadable cache data must recover
+    // from entry rows rather than making the entire conversation unreadable.
+    Ok(serde_json::from_value(value).ok().map(Arc::new))
 }
 type State = AsyncRecord;
 
@@ -1350,7 +1359,19 @@ impl McHandler {
                 .map_err(transient)?;
             prefix
                 .matches(&status.lineage_id, state.generation, &loaded, &compartments)
-                .then_some(prefix.clone())
+                .then_some(())
+                .filter(|_| {
+                    state.entries.first_key_value().map(|(ordinal, _)| *ordinal)
+                        == Some(prefix.from)
+                })
+                .filter(|_| {
+                    prefix.context_sources.iter().all(|(ordinal, source)| {
+                        state.entries.get(ordinal).is_some_and(|entry| {
+                            entry.mid == source.mid && source.ordinal == *ordinal
+                        })
+                    })
+                })
+                .map(|_| prefix.clone())
         } else {
             None
         };
@@ -1365,27 +1386,21 @@ impl McHandler {
                         state.mid_index.get(mid).filter(|n| **n < prefix.tail_from)
                     {
                         if let Some(entry) = state.entries.get(ordinal) {
-                            prefix
-                                .prove_membership(&decoded_entry(codec, &entry.inbound()?)?)
-                                .map_err(engine_error)?;
+                            prefix.prove_membership(&decoded_entry(codec, &entry.inbound()?)?);
                         }
                     }
                 }
             }
         }
         let messages = if let Some(prefix) = &prefix {
-            let context = prefix
-                .context_ordinals
-                .iter()
-                .filter_map(|ordinal| state.entries.get(ordinal));
-            inbound_messages(
-                context.chain(
-                    state
-                        .entries
-                        .range(prefix.tail_from..)
-                        .map(|(_, entry)| entry),
-                ),
-            )?
+            let mut messages = prefix.context_sources.values().cloned().collect::<Vec<_>>();
+            messages.extend(inbound_messages(
+                state
+                    .entries
+                    .range(prefix.tail_from..)
+                    .map(|(_, entry)| entry),
+            )?);
+            messages
         } else {
             inbound_messages(state.entries.values())?
         };
@@ -1428,8 +1443,8 @@ impl McHandler {
         let output = match output {
             Ok(output) => output,
             Err(_) if template.logical_prefix.is_some() => {
-                // A stale certificate or an exceptional codec/arc shape is a
-                // recovery read, never permission to infer missing source bytes.
+                // If a prefix-based pass fails, retry with every held inbound
+                // message; do not guess at the omitted source bytes.
                 *engine = previous_engine;
                 let messages = inbound_messages(state.entries.values())?;
                 #[cfg(test)]
@@ -1514,7 +1529,17 @@ fn rendered_view(
     };
     #[cfg(test)]
     scaling_tests::view_work::renderer(&state.reference(), entries.len());
-    codec.render_view(view, &state.key.session, &entries)
+    match codec.render_view(view, &state.key.session, &entries) {
+        Ok(output) => Ok(output),
+        Err(_) if !full_lineage => {
+            tracing::debug!(session_ref=%state.reference(), reason="native_render_context", "rendering with full-lineage sources");
+            let entries = inbound_messages(state.entries.values())?;
+            #[cfg(test)]
+            scaling_tests::view_work::renderer(&state.reference(), entries.len());
+            codec.render_view(view, &state.key.session, &entries)
+        }
+        Err(error) => Err(error),
+    }
 }
 
 fn render_part(part: &Value, tag: Option<&str>, render: bool) -> Value {
@@ -2551,7 +2576,7 @@ impl McHandler {
             let compartments = store
                 .load_compartments(&state.namespace())
                 .map_err(transient)?;
-            state.logical_prefix = transform::compaction::LogicalPrefix::certify(
+            let mut prefix = transform::compaction::LogicalPrefix::certify(
                 store,
                 &template,
                 &output.engine.projection,
@@ -2559,8 +2584,19 @@ impl McHandler {
                 &compartments,
                 &status.lineage_id,
                 state.generation,
-            )
-            .map(Arc::new);
+            );
+            if let Some(prefix) = &mut prefix {
+                prefix.context_sources = inbound_messages(
+                    prefix
+                        .context_ordinals
+                        .iter()
+                        .filter_map(|ordinal| state.entries.get(ordinal)),
+                )?
+                .into_iter()
+                .map(|source| (source.ordinal, source))
+                .collect();
+            }
+            state.logical_prefix = prefix.map(Arc::new);
         }
         let transform::compaction::Answer::Replacement(mut candidate) = output.answer else {
             state.adopt_engine(engine)?;

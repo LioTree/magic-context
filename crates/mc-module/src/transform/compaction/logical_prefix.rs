@@ -35,8 +35,11 @@ pub(crate) struct LogicalPrefix {
     sequence: i64,
     revert_epoch: u64,
     compartments: Vec<Coverage>,
-    /// Original system sources, not hashes: a later HARD must render them again.
+    /// Ordinal index for original systems and the durable lineage anchor.
     pub(crate) context_ordinals: BTreeSet<u64>,
+    /// Native source bytes, not just identities: a later HARD must be able to
+    /// render the covered system content again without decoding covered rows.
+    pub(crate) context_sources: BTreeMap<u64, crate::providers::codec::InboundMessage>,
     /// A frozen target can be absent because its source is covered; that absence
     /// alone does not mean a revert removed it from the transcript.
     covered_targets: BTreeSet<String>,
@@ -67,6 +70,7 @@ impl LogicalPrefix {
             && loaded.meta.revert_epoch == self.revert_epoch
             && self.from < self.tail_from
             && self.tail_from <= self.coverage
+            && self.context_sources.keys().eq(self.context_ordinals.iter())
             && self.compartments.iter().all(|old| {
                 // A newer summary may extend or merge old ranges. The source
                 // certificate still proves those old sources were covered; it
@@ -140,6 +144,7 @@ impl LogicalPrefix {
         // Exceptional arcs cannot turn the optimization into another full walk.
         // Leave the raw rows authoritative and use the full path for this shape.
         if tail_from <= from || coverage.saturating_sub(tail_from) > 256 {
+            tracing::debug!(session_id=%req.session_id, tail_from, coverage, reason="arc_safe_cut_span", "using full-lineage input");
             return None;
         }
         let anchor = loaded
@@ -181,7 +186,11 @@ impl LogicalPrefix {
                     .find(|m| m.mid == arc.invocation_mid)
                     .map(|m| (m.ordinal, arc.result_ordinal))
             })
-            .collect();
+            .collect::<Vec<_>>();
+        if crossing_arcs.len() > 64 || protection.member_rows.len() > 4096 {
+            tracing::debug!(session_id=%req.session_id, reason="prefix_exception_limit", "using full-lineage input");
+            return None;
+        }
         Some(Self {
             lineage: lineage.into(),
             generation,
@@ -194,6 +203,7 @@ impl LogicalPrefix {
             revert_epoch: loaded.meta.revert_epoch,
             compartments: compartments.iter().map(Coverage::from).collect(),
             context_ordinals,
+            context_sources: BTreeMap::new(),
             covered_targets,
             crossing_arcs,
             tag_summary: (summary.generation, summary.count, summary.max_tag_number),
@@ -226,6 +236,7 @@ impl LogicalPrefix {
         let (generation, count, max) = self.tag_summary;
         if floor > self.protection_floor
             || ratio < self.protection_ratio
+            || summary.generation < generation
             || summary.count < count
             || summary.max_tag_number < max
             || summary.generation.saturating_sub(generation)
@@ -268,7 +279,12 @@ impl LogicalPrefix {
             return Err(TransformError::OrdinalViolation);
         }
         let start = messages.partition_point(|m| m.ordinal < self.tail_from);
-        if messages.get(start).map(|m| m.ordinal) != Some(self.tail_from) {
+        if messages.get(start).map(|m| m.ordinal) != Some(self.tail_from)
+            || !messages[..start]
+                .iter()
+                .map(|m| &m.ordinal)
+                .eq(self.context_ordinals.iter())
+        {
             return Err(TransformError::OrdinalViolation);
         }
         let mut range = super::working_range(status, &messages[start..])?;
@@ -286,19 +302,17 @@ impl LogicalPrefix {
         });
     }
 
-    pub(crate) fn prove_membership(
-        &mut self,
-        source: &CkIngressMessage,
-    ) -> Result<(), TransformError> {
+    pub(crate) fn prove_membership(&mut self, source: &CkIngressMessage) {
         if source.ordinal < self.tail_from {
             self.covered_targets.extend(
-                project_messages(std::slice::from_ref(source))?
-                    .blocks
-                    .into_iter()
-                    .map(|b| b.id),
+                source
+                    .ck
+                    .content
+                    .iter()
+                    .enumerate()
+                    .map(|(index, _)| format!("{}#{index}", source.mid)),
             );
         }
-        Ok(())
     }
 
     pub(crate) fn covers_target(&self, target: &str) -> bool {

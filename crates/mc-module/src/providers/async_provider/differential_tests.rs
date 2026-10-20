@@ -194,10 +194,13 @@ fn message(profile: Profile, n: u64, salt: u64) -> ReadMessage {
             .unwrap();
         entry.message["message"]["toolCallId"] = json!(id);
     }
-    // Broca admits source system rows. Pi and Anthropic deliberately reject
-    // that role at their native ingress, so their fixtures retain native roles.
+    // Broca and OpenCode admit source system rows. Pi and Anthropic reject
+    // that role at native provider ingress, so their fixtures retain native roles.
     if profile == Profile::Broca && n > 0 && n.is_multiple_of(48) {
         entry.message["role"] = json!("system");
+    } else if profile == Profile::OpenCode && n > 0 && n.is_multiple_of(48) {
+        entry.message = json!({"info":{"id":format!("m{n}"),"role":"system","time":{"created":1}},"parts":[{"id":format!("p{n}a"),"type":"text","text":format!("system source {n}.{salt}")}]});
+        entry.tags = vec![tags::PartTag::untagged("0")];
     }
     entry.written_at = Some(1_000_000 + n * 7_000);
     entry
@@ -1163,6 +1166,14 @@ async fn prefix_matches_full_lineage_with_crossing_native_arcs() {
         if profile != Profile::OpenCode {
             assert_eq!(head.logical_prefix.as_ref().unwrap().tail_from, 149);
         }
+        if matches!(profile, Profile::Broca | Profile::OpenCode) {
+            assert!(!head
+                .logical_prefix
+                .as_ref()
+                .unwrap()
+                .context_sources
+                .is_empty());
+        }
         pair.append(4);
         let reference = pair.reference.clone();
         pair.both("later coverage fold", |side| {
@@ -1232,6 +1243,35 @@ async fn defer_preserves_prefix_certificate_and_served_model_bytes() {
         before.produced_view.as_ref().map(|v| &v.json),
         after.produced_view.as_ref().map(|v| &v.json)
     );
+}
+
+#[tokio::test]
+async fn covered_tool_result_drop_uses_prefix_membership_without_projecting_an_orphan() {
+    let mut pair = Pair::new(Profile::Broca, false).await;
+    pair.append(160);
+    let reference = pair.reference.clone();
+    pair.both("covered tool history", |side| {
+        let reference = reference.clone();
+        Box::pin(async move { publish_history(side, &reference, 147) })
+    })
+    .await;
+    let mut rng = Rng(12);
+    assert_eq!(pair.notice(&mut rng, None).await, "ok");
+    let request = json!({"name":"ctx_reduce","arguments":{"drop":(100 + 6 * 4).to_string()}});
+    pair.both("covered result drop", |side| {
+        Box::pin(side.dispatch(request.clone()))
+    })
+    .await;
+    assert_eq!(pair.notice(&mut rng, None).await, "ok");
+    let head = load(pair.resident.store(), &pair.reference)
+        .unwrap()
+        .unwrap();
+    assert!(pair
+        .resident
+        .store()
+        .load_pending_agent_drops(&head.namespace())
+        .unwrap()
+        .is_empty());
 }
 
 /// The full differential: `MC_ASYNC_DIFFERENTIAL_SESSIONS` sessions (default
