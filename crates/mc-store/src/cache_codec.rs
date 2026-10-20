@@ -448,6 +448,23 @@ pub(crate) fn read_small_row(
     .optional()
 }
 
+/// An identity of the tail hygiene baseline a full decode of `row` would
+/// produce: the sections version, the tail section's index entry (with its
+/// digest) and the native-tail reference in the small meta. Equal identities
+/// decode to equal baselines. `None` when the row cannot be read this way.
+pub(crate) fn tail_baseline_identity(row: &StoredRow) -> Option<String> {
+    let index = SectionIndex::parse(&row.section_index)?;
+    let native = native_tail::reference(&row.meta).ok()?;
+    Some(
+        serde_json::json!([
+            index.sv,
+            index.t,
+            native.map(|native| (native.cut_id, native.prefix_count))
+        ])
+        .to_string(),
+    )
+}
+
 /// Read one section body, without touching the small row's blobs.
 pub(crate) fn read_section_body(
     conn: &rusqlite::Connection,
