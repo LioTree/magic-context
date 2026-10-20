@@ -187,6 +187,7 @@ export interface LkgCaptureInput {
 }
 
 export type LkgValidationFailure =
+    | "lkg_dispatch_unconfirmed"
     | "lkg_model_mismatch"
     | "lkg_invalidated_reshape"
     | "lkg_content_mismatch"
@@ -654,6 +655,15 @@ export function replayLkg(args: {
         return { ok: false, reason: "lkg_model_mismatch" };
     }
     const entry = args.entry ?? noteEntry(args.sessionId, args.messages);
+    // When dispatch status is unknown, replay saved bytes only for the exact
+    // input they were saved for, never as the prefix of a newer request.
+    if (
+        slot.dispatchUnconfirmed &&
+        entry &&
+        (entry.entryInputIds.length !== slot.inputIdSeq.length ||
+            !slot.inputIdSeq.every((id, index) => id === entry.entryInputIds[index]))
+    )
+        return { ok: false, reason: "lkg_dispatch_unconfirmed" };
     if (
         !entry ||
         entry.anchorIndex !== slot.inputIdSeq.length - 1 ||

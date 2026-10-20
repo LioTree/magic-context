@@ -2,6 +2,7 @@ import {
 	certifyDispatchedLkgSlot,
 	createDbLkgPersistence,
 	loadPersistedLkgSlot,
+	preparedLkgDispatchReceipt,
 	refuseUndispatchedLkgSlot,
 	saveLkgSlotToDb,
 } from "@magic-context/core/hooks/magic-context/lkg-persist";
@@ -139,6 +140,7 @@ interface PiLkgSessionState {
 		 */
 		ticket: PiLkgDispatchTicket;
 		servedCaptureId?: number;
+		receipt?: object;
 		/** The capture this pass installed in memory. */
 		capture: Pick<LkgSlot, "capturedAt" | "jsonPrefix">;
 		/** The in-memory capture served before it, restored if this pass is refused. */
@@ -865,6 +867,13 @@ export function createPiLkgCoordinator(
 	onCaptureTiming?: (sample: PiLkgCaptureTiming) => void,
 ): PiLkgCoordinator {
 	registerLkgPersistence(createDbLkgPersistence(db));
+	// A newer pass may replace session state before an earlier handler reports
+	// dispatch or refusal. Keep each request's pending slot on its ticket until
+	// that request reports whether it was sent.
+	const pendingByTicket = new WeakMap<
+		PiLkgDispatchTicket,
+		NonNullable<PiLkgSessionState["pendingDispatch"]>
+	>();
 	const stateFor = (sessionId: string): PiLkgSessionState => {
 		let state = piLkgSessionStates.get(sessionId);
 		if (!state) {
@@ -1261,11 +1270,17 @@ export function createPiLkgCoordinator(
 	const certifyDispatchTicket = (ticket: PiLkgDispatchTicket): void => {
 		try {
 			const state = piLkgSessionStates.get(ticket.sessionId);
-			const pending = state?.pendingDispatch;
-			if (!state || pending?.ticket !== ticket) return;
-			state.pendingDispatch = undefined;
-			if (pending.servedCaptureId !== undefined)
-				certifyDispatchedLkgSlot(db, ticket.sessionId, pending.servedCaptureId);
+			const pending = pendingByTicket.get(ticket);
+			if (!pending) return;
+			pendingByTicket.delete(ticket);
+			if (state?.pendingDispatch === pending) state.pendingDispatch = undefined;
+			if (pending.servedCaptureId !== undefined && pending.receipt)
+				certifyDispatchedLkgSlot(
+					db,
+					ticket.sessionId,
+					pending.servedCaptureId,
+					pending.receipt,
+				);
 		} catch (error) {
 			// Certification is optional; a dispatched request stays servable.
 			sessionLog(
@@ -1279,13 +1294,15 @@ export function createPiLkgCoordinator(
 	const refuseDispatchTicket = (ticket: PiLkgDispatchTicket): void => {
 		try {
 			const state = piLkgSessionStates.get(ticket.sessionId);
-			const pending = state?.pendingDispatch;
-			if (!state || pending?.ticket !== ticket) return;
-			state.pendingDispatch = undefined;
+			const pending = pendingByTicket.get(ticket);
+			if (!pending) return;
+			pendingByTicket.delete(ticket);
+			if (state?.pendingDispatch === pending) state.pendingDispatch = undefined;
 			// The refused request was never sent: replay and the next pass must
 			// work from the last request that was, so undo this pass's in-memory
 			// capture and the replay state it advanced.
 			if (
+				state &&
 				restoreRefusedCapture(ticket.sessionId, pending.capture, pending.prior)
 			) {
 				state.acceptedInputs = null;
@@ -1293,11 +1310,12 @@ export function createPiLkgCoordinator(
 				state.acceptedRecoverySlotKey = undefined;
 				state.recoveryPrefix = pending.priorRecoveryPrefix;
 			}
-			if (pending.servedCaptureId !== undefined)
+			if (pending.servedCaptureId !== undefined && pending.receipt)
 				refuseUndispatchedLkgSlot(
 					db,
 					ticket.sessionId,
 					pending.servedCaptureId,
+					pending.receipt,
 				);
 		} catch (error) {
 			sessionLog(ticket.sessionId, "LKG dispatch refusal not recorded:", error);
@@ -1662,10 +1680,16 @@ export function createPiLkgCoordinator(
 					state.pendingDispatch = {
 						ticket,
 						servedCaptureId: plan.servedCaptureId,
+						receipt: preparedLkgDispatchReceipt(
+							db,
+							plan.sessionId,
+							plan.servedCaptureId,
+						),
 						capture: slot,
 						prior: args.cacheBusting && !unchanged ? undefined : livePrior,
 						priorRecoveryPrefix: state.recoveryPrefix,
 					};
+					pendingByTicket.set(ticket, state.pendingDispatch);
 					// SQLite can return after the outcome deadline. The request and identities
 					// are durable, but the handler must refuse rather than dispatch a late result.
 					// A pass past its deadline, cancelled or superseded is never dispatched, so
@@ -1673,12 +1697,15 @@ export function createPiLkgCoordinator(
 					try {
 						args.assertCurrentPass?.();
 					} catch (error) {
+						pendingByTicket.delete(ticket);
+						const receipt = state.pendingDispatch?.receipt;
 						state.pendingDispatch = undefined;
-						if (plan.servedCaptureId !== undefined)
+						if (plan.servedCaptureId !== undefined && receipt)
 							refuseUndispatchedLkgSlot(
 								db,
 								plan.sessionId,
 								plan.servedCaptureId,
+								receipt,
 							);
 						throw error;
 					}

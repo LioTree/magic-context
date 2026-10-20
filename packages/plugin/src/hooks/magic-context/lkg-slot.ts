@@ -36,10 +36,9 @@ export interface LkgSlot {
      */
     servedCaptureWithheld?: boolean;
     /**
-     * Set on a slot loaded from storage whose request was saved before dispatch
-     * and whose dispatch was never confirmed (the process stopped in between). It
-     * certifies nothing and may replay only for exactly the input it was built
-     * from, where replaying it equals rebuilding the same request.
+     * Set on a slot loaded from storage without positive evidence that its request
+     * was dispatched. It certifies nothing and may replay only for exactly the
+     * input it was built from, subject to the host's live dispatch checks.
      */
     dispatchUnconfirmed?: boolean;
     /** RFC 8785 message digests for the portable hostCut frontier. */
@@ -71,10 +70,11 @@ const LKG_TOTAL_BYTES = 160 * 1024 * 1024;
 const LKG_METADATA_BYTES = 256;
 
 class MagicContextLkgHeapHolder {
-    readonly entries = new Map<string, { slot: LkgSlot; bytes: number }>();
+    readonly entries = new Map<string, { slot: LkgSlot; bytes: number; hydrated: boolean }>();
 }
 
 const lkgHeapHolder = new MagicContextLkgHeapHolder();
+const hydratedReads = new WeakSet<LkgSlot>();
 let totalBytes = 0;
 const hydrationPassBySession = new BoundedSessionMap<number>(1_000);
 const hydrationAttemptBySession = new BoundedSessionMap<number>(1_000);
@@ -602,7 +602,10 @@ export function lkgContentDigest(message: MessageLike): string | null {
     return fields ? lkgContentDigestFromFields(fields) : null;
 }
 
-function touch(sessionId: string, entry: { slot: LkgSlot; bytes: number }): void {
+function touch(
+    sessionId: string,
+    entry: { slot: LkgSlot; bytes: number; hydrated: boolean },
+): void {
     lkgHeapHolder.entries.delete(sessionId);
     lkgHeapHolder.entries.set(sessionId, entry);
 }
@@ -661,6 +664,9 @@ export function captureSlot(sessionId: string, slot: LkgSlot): boolean {
         return false;
     }
     const entry = {
+        hydrated:
+            hydratedReads.has(slot) ||
+            (prior?.hydrated === true && prior.slot.jsonPrefix === slot.jsonPrefix),
         slot: {
             ...slot,
             ...(slot.piOutputEntryIds ? { piOutputEntryIds: [...slot.piOutputEntryIds] } : {}),
@@ -702,6 +708,7 @@ function installHydratedSlot(sessionId: string, slot: LkgSlot): boolean {
         return false;
     }
     const entry = {
+        hydrated: true,
         slot: {
             ...slot,
             ...(slot.piOutputEntryIds ? { piOutputEntryIds: [...slot.piOutputEntryIds] } : {}),
@@ -736,11 +743,11 @@ function hydrateSlotFromPersistence(sessionId: string): LkgSlot | undefined {
     if (!installHydratedSlot(sessionId, loaded)) return undefined;
     sessionLog(sessionId, "lkg_hydrated_from_disk");
     const entry = lkgHeapHolder.entries.get(sessionId);
-    return entry ? copySlotForRead(entry.slot) : undefined;
+    return entry ? copySlotForRead(entry.slot, entry.hydrated) : undefined;
 }
 
-function copySlotForRead(slot: LkgSlot): LkgSlot {
-    return {
+function copySlotForRead(slot: LkgSlot, hydrated: boolean): LkgSlot {
+    const copy = {
         ...slot,
         ...(slot.piOutputEntryIds ? { piOutputEntryIds: [...slot.piOutputEntryIds] } : {}),
         inputIdSeq: [...slot.inputIdSeq],
@@ -750,11 +757,18 @@ function copySlotForRead(slot: LkgSlot): LkgSlot {
             ? [...slot.inputContentSignatures]
             : undefined,
     };
+    if (hydrated) hydratedReads.add(copy);
+    return copy;
 }
 
 export function getInMemorySlot(sessionId: string): LkgSlot | undefined {
     const entry = lkgHeapHolder.entries.get(sessionId);
-    return entry ? copySlotForRead(entry.slot) : undefined;
+    return entry ? copySlotForRead(entry.slot, entry.hydrated) : undefined;
+}
+
+/** Hydration is storage evidence, not evidence that this process handed bytes to its host. */
+export function isHydratedLkgSlot(sessionId: string): boolean {
+    return lkgHeapHolder.entries.get(sessionId)?.hydrated === true;
 }
 
 export function getSlot(sessionId: string): LkgSlot | undefined {
@@ -769,7 +783,7 @@ export function getSlot(sessionId: string): LkgSlot | undefined {
         return hydrateSlotFromPersistence(sessionId);
     }
     touch(sessionId, entry);
-    return copySlotForRead(entry.slot);
+    return copySlotForRead(entry.slot, entry.hydrated);
 }
 
 /**
