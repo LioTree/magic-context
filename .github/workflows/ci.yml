@@ -24,8 +24,10 @@ permissions:
 
 env:
   FORCE_JAVASCRIPT_ACTIONS_TO_NODE24: true
-  # Separate differential parity cases by name; when absent, lib shards cover the entire library.
-  MC_PARITY_FILTER: 'test(/^providers::step_transform::parity_tests::r2_review_720_pass_differential_with_new_seeds_and_real_reduce::seed_/)'
+  # The long randomized async-lane differential (300 sessions over all four
+  # message formats, against the full-recompute oracle) runs in its own job;
+  # the lib shards cover the rest of the library.
+  MC_PARITY_FILTER: 'test(=providers::async_provider::differential_tests::resident_matches_the_full_recompute_oracle_over_many_sessions)'
 
 # Pipeline shape on every push to master/main:
 #
@@ -939,9 +941,10 @@ jobs:
           sha256sum --check ci-rust-lib/archive.sha256
           rustc -vV | diff - ci-rust-lib/rustc.txt
       - name: Run parity groups from the shared lib archive
-        # The randomized differential runs once per seed. Selecting no tests means
-        # MC_PARITY_FILTER no longer matches their names and must fail this job.
-        run: cargo nextest run --archive-file ci-rust-lib/archive.tar.zst --workspace-remap "$GITHUB_WORKSPACE" --profile ci --no-fail-fast --failure-output immediate-final -E "$MC_PARITY_FILTER"
+        # The differential is #[ignore]d for local runs, so it is selected with
+        # --run-ignored. Selecting no tests means MC_PARITY_FILTER no longer
+        # matches its name and must fail this job.
+        run: cargo nextest run --archive-file ci-rust-lib/archive.tar.zst --workspace-remap "$GITHUB_WORKSPACE" --profile ci --no-fail-fast --failure-output immediate-final --run-ignored all -E "$MC_PARITY_FILTER"
       - name: Check every selected parity test executed
         if: ${{ !cancelled() }}
         run: python3 scripts/check-nextest-inventory.py --junit ci-rust-lib parity target/nextest/ci/junit.xml
