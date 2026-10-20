@@ -88,13 +88,18 @@ function setup(root: string) {
 		if (!handler) throw new Error(`missing ${name} handler`);
 		return handler(payload as never, ctx as never);
 	};
-	const serve = () =>
-		event("context", { messages: structuredClone(raw) }) as Promise<{
-			messages: unknown[];
-		}>;
+	event("agent_start");
+	let providerMessages: unknown[] = structuredClone(raw);
+	const serve = async () => {
+		const served = (await event("context", {
+			messages: structuredClone(raw),
+		})) as { messages: unknown[] };
+		providerMessages = served.messages;
+		return served;
+	};
 	const dispatch = () => {
 		const before = aborts;
-		event("before_provider_request");
+		event("before_provider_request", { payload: { messages: providerMessages } });
 		if (aborts === before) dispatches++;
 	};
 	return {
