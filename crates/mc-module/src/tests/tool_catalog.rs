@@ -290,6 +290,83 @@ fn every_role_and_compaction_cell_serves_its_exact_tools_and_text() {
 }
 
 #[test]
+fn compacting_preflight_param_returns_tools_and_text_for_the_composed_request() {
+    let config = example_catalog_config();
+    let request = json!({
+        "preset": "head",
+        "params": {
+            "compacting": true,
+            "model": "anthropic/claude-haiku-4-5"
+        },
+        "system_text": {
+            "preset": "head",
+            "params": {
+                "compacting": true,
+                "model": "anthropic/claude-haiku-4-5"
+            }
+        }
+    });
+    let preflight = tool_catalog::catalog_answer(&request, &config).unwrap();
+    let names: Vec<&str> = preflight["tools"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|tool| tool["name"].as_str().unwrap())
+        .collect();
+    assert_eq!(
+        names,
+        [
+            "ctx_reduce",
+            "ctx_expand",
+            "ctx_note",
+            "ctx_memory",
+            "ctx_search"
+        ]
+    );
+    assert!(preflight.get("composition_digest").is_none());
+    assert!(preflight["system_text"].get("composition_digest").is_none());
+
+    let mut different_text_mode = request.clone();
+    different_text_mode["system_text"]["params"]["compacting"] = json!(false);
+    let different_text_answer =
+        tool_catalog::catalog_answer(&different_text_mode, &config).unwrap();
+    assert_ne!(
+        preflight["system_text"]["preflight_digest"],
+        different_text_answer["system_text"]["preflight_digest"]
+    );
+
+    let tools: Vec<Value> = preflight["tools"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|tool| json!({"name": tool["name"]}))
+        .collect();
+    let mut composed_request = request.clone();
+    composed_request["composition"] = json!({
+        "compaction": {"provider": "magic-context"},
+        "providers": [{"provider": "magic-context", "tools": tools}]
+    });
+    let composed = tool_catalog::catalog_answer(&composed_request, &config).unwrap();
+    assert_eq!(
+        preflight["system_text"]["text"]
+            .as_str()
+            .unwrap()
+            .as_bytes(),
+        composed["system_text"]["text"].as_str().unwrap().as_bytes()
+    );
+}
+
+#[test]
+fn plain_preflight_answer_bytes_stay_pinned() {
+    let request = json!({"preset": "head", "params": {}});
+    let expected = std::fs::read(examples_dir().join("preflight.answer.jcs")).unwrap();
+    let actual = tool_catalog::catalog_answer_bytes(&request, &example_catalog_config()).unwrap();
+    assert_eq!(actual, expected);
+    let answer: Value = serde_json::from_slice(&actual).unwrap();
+    assert_eq!(answer["catalog_digest"], answer["generation"]);
+}
+
+#[test]
 fn aliases_resolve_from_one_table_without_selecting_compaction() {
     for (alias, role) in [
         ("primary", "head"),
@@ -350,6 +427,13 @@ fn compaction_must_be_an_object_with_a_provider_and_never_null() {
             matches!(tool_catalog::catalog_answer(&request, &example_catalog_config()), Err(CatalogError::Invalid { field, .. }) if field == "composition.compaction")
         );
     }
+}
+
+#[test]
+fn role_describe_advertises_compacting_preflight() {
+    let answer: Value =
+        serde_json::from_slice(&tool_catalog::role_describe_bytes().unwrap()).unwrap();
+    assert_eq!(answer["capabilities"], json!(["compacting-preflight/v1"]));
 }
 
 #[test]
@@ -552,6 +636,22 @@ fn refusals_name_the_offending_field() {
         ),
         (json!({"params": {"verbosity": "high"}}), "params.verbosity"),
         (json!({"params": {"scope": "everything"}}), "params.scope"),
+        (
+            json!({"params": {"compacting": "yes"}}),
+            "params.compacting",
+        ),
+        (
+            json!({"params": {}, "system_text": {"preset": "head", "params": {"compacting": 1}}}),
+            "system_text.params.compacting",
+        ),
+        (
+            json!({"params": {"compacting": false}, "composition": {"compaction": {"provider": "magic-context"}}}),
+            "params.compacting",
+        ),
+        (
+            json!({"params": {}, "composition": {"compaction": {"provider": "magic-context"}}, "system_text": {"preset": "head", "params": {"compacting": false}}}),
+            "params.compacting",
+        ),
         (
             json!({"params": {"exclude": ["ctx_memory_list"]}}),
             "params.exclude",
