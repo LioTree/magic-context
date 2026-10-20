@@ -130,7 +130,7 @@ function deletedBridgedSessionId(event: unknown): string | undefined {
  * identity). The bridge enrolls sessions that already exist, so their
  * `session.created` can reach Magic Context before the enrollment does (a
  * session enrolled earlier has its `session.created` stood down and owns no
- * rows here). Every hook after enrollment stands down, including normal
+ * rows here). After enrollment every hook skips the session, including normal
  * `session.deleted` cleanup. Remove that metadata, its separately stored payloads,
  * and the project row. Other writers may own further rows for the same session;
  * cleaning those up remains the bridge's job.

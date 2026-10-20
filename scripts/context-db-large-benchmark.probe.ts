@@ -8,6 +8,7 @@ const targets = new Set(["session_meta", "lkg_slots", "lkg_slot_chunks", "sessio
 // Compare actual database page bytes, not dbstat's payload lengths: equal lengths
 // do not mean an UPDATE preserved the overflow chain.
 export function meter(db: Database) {
+  const pageSize = (db.query("PRAGMA page_size").get() as {page_size: number}).page_size;
   const query = db.query.bind(db);
   let active = false;
   let reading = false;
@@ -37,8 +38,8 @@ export function meter(db: Database) {
         const pages: Record<string, number> = {};
         const overflow: Record<string, number> = {};
         for (const n of new Set([...before.owners.keys(), ...after.owners.keys()])) {
-          const start = (n - 1) * 4096;
-          if (before.bytes.subarray(start, start + 4096).equals(after.bytes.subarray(start, start + 4096))) continue;
+          const start = (n - 1) * pageSize;
+          if (before.bytes.subarray(start, start + pageSize).equals(after.bytes.subarray(start, start + pageSize))) continue;
           const owner = after.owners.get(n) ?? before.owners.get(n)!;
           pages[owner.name] = (pages[owner.name] ?? 0) + 1;
           if (owner.pagetype === "overflow") overflow[owner.name] = (overflow[owner.name] ?? 0) + 1;
@@ -64,6 +65,9 @@ const flag=(key:string,fallback:string)=>process.argv.includes(key)?process.argv
 const root=resolve(flag('--root','local-ignore/large-benchmark'));
 const tree=resolve(flag('--tree','.'));
 const passes=Number(flag('--passes','50'));
+let now=1_900_000_000_000;
+const RealDate=Date;
+globalThis.Date=class extends RealDate {constructor(...args:any[]){if(args.length)super(...args as [any]);else super(now);}static now(){return now;}} as DateConstructor;
 for(const [key,name] of [['HOME','home'],['XDG_DATA_HOME','data'],['XDG_CONFIG_HOME','config'],['XDG_STATE_HOME','state'],['XDG_RUNTIME_DIR','run'],['MAGIC_CONTEXT_STORAGE_DIR','mc']]) {const dir=join(root,name!);mkdirSync(dir,{recursive:true});process.env[key!]=dir;}
 process.env.OPENCODE_DB=join(root,'opencode.db');
 const core=(path:string)=>import(join(tree,'packages/plugin/src',path));
@@ -167,6 +171,7 @@ function seedLarge() {
 const heads:any[]=[],changes:any[]=[],certificates:any[]=[];
 let seed:any,reductions=0,fullPairs=0;
 for(let pass=0;pass<=passes;pass++) {
+  now+=1000;
  if(pass>0) {
   raw.push(utils.userMessage(`Investigate task ${pass}.`,raw.length+1));
   for(let j=0;j<3;j++) {
@@ -203,7 +208,8 @@ for(let pass=0;pass<=passes;pass++) {
  if(!slot)throw new Error('no durable LKG slot after pass '+pass);
  const equal=slot.jsonPrefix===JSON.stringify(served.messages);
  if(equal)fullPairs++;
- const certificate=checkLkgDurability(db,sessionId);
+  const certificate=checkLkgDurability(db,sessionId);
+  if(!certificate.durable || certificate.servedCaptureId===null)throw new Error('served request lacks a durable bound certificate on pass '+pass);
  if(slot.fullCoverage!==false&&!equal)throw new Error('durable full-coverage copy differs from the served request');
  certificates.push({pass,equal,fullCoverage:slot.fullCoverage,certificate});
  if(pass%10===0)console.log('PASS',pass,'messages',raw.length,'head',JSON.stringify(heads.at(-1)));

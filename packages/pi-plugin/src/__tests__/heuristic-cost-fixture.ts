@@ -7,6 +7,7 @@ import {
 	getNativeReplayState,
 	saveNativeToolInputs,
 } from "@magic-context/core/features/magic-context/storage-native-replay";
+import { sessionMetaCollectionSelect } from "@magic-context/core/features/magic-context/storage-session-collections";
 import { createTagger } from "@magic-context/core/features/magic-context/tagger";
 import { tagTranscript } from "@magic-context/core/shared/tag-transcript";
 import { applyPiHeuristicCleanup } from "../heuristic-cleanup-pi";
@@ -130,6 +131,11 @@ export function runHeuristicCostFixture() {
 		};
 		db.prepare = ((sql: string) => {
 			const statement = prepare(sql);
+			// One raw-value CAS is one logical replay update, even when it writes several chunks.
+			const replayUpdate =
+				/^SELECT 1 FROM session_meta WHERE session_id=\? AND/.test(sql) &&
+				sql.includes("column_name='trailing_blank_decisions'") &&
+				sql.endsWith(" IS ?");
 			return new Proxy(statement, {
 				get(target, key) {
 					const method = Reflect.get(target, key);
@@ -140,15 +146,15 @@ export function runHeuristicCostFixture() {
 							isTransaction?: boolean;
 						};
 						if (
-							/UPDATE session_meta SET trailing_blank_decisions/.test(sql) &&
-							key === "run" &&
+							replayUpdate &&
+							key === "get" &&
 							!connection.inTransaction &&
 							!connection.isTransaction
 						)
 							autocommitDocumentWrites++;
 						const name = /FROM tags/.test(sql)
 							? "tagQueries"
-							: /UPDATE session_meta SET trailing_blank_decisions/.test(sql)
+							: replayUpdate
 								? "nativeDocumentWrites"
 								: /UPDATE tags/.test(sql)
 									? "tagWrites"
@@ -210,7 +216,7 @@ export function runHeuristicCostFixture() {
 		const replayDocument = (
 			db
 				.prepare(
-					"SELECT trailing_blank_decisions AS doc FROM session_meta WHERE session_id = ?",
+					`SELECT ${sessionMetaCollectionSelect("trailing_blank_decisions", "doc", db)} FROM session_meta WHERE session_id = ?`,
 				)
 				.get(sessionId) as { doc: string }
 		).doc;

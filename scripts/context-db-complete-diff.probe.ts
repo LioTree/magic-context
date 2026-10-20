@@ -31,6 +31,7 @@ const {refreshModelLimitsFromApi}=await core('shared/models-dev-cache.ts');
 await refreshModelLimitsFromApi({config:{providers:async()=>({data:{providers:[{id:'anthropic',models:{'claude-opus-5-5':{input:['text','image'],limit:{context:2000000,output:10000}}}}]}})}});
 for(let i=0;i<12;i++)insertMemory(db,{projectPath,category:'NAMING',content:`Baseline ${i}: preserve useful names and exact request bytes.`,sourceType:'historian'});
 const logs=await core('features/magic-context/transform-decision-log.ts');
+const replay=await core('features/magic-context/storage-replay-document.ts');
 let policy:any=null;
 const policyKeys=['decision','materialized','materializeReason','lkgFrozenReleaseReason','bustedThisPass','emergency','systemHashPrev','systemHashNew','m0ModelKeyPrev','m0ModelKeyNew','m0ToolSetHashPrev','m0ToolSetHashNew'];
 function findPolicy(value:any,depth=0):any {
@@ -153,8 +154,8 @@ for(let index=0;index<passes;index++) {
   session=sessions[0]!;if(!session.hidden)throw new Error('missing revert snapshot');session.raw=session.hidden.raw;session.ids=session.hidden.ids;delete session.hidden;coverage.unreverts++;action='unrevert';
  } else if([95,195].includes(index)) {session=fork(sessions[0]!);action='fork';}
  else if(index>0 && !session.hidden && random()<0.65) {
-  if(random()<0.45||session.raw.length===2)add(session,'user',false,false);
-  const tool=random()<0.75,signed=random()<0.8;add(session,'assistant',tool,signed);
+   const tool=random()<0.75,signed=random()<0.8;add(session,'assistant',tool,signed);
+   if(!tool || random()<0.45)add(session,'user',false,false);
   if(tool)coverage.tools++;if(signed)coverage.signed++;action=tool?'tool-turn':'answer';
  }
  store(session);
@@ -177,8 +178,8 @@ for(let index=0;index<passes;index++) {
    const adapted=adapt(draft);await handler({},adapted);adapted.commit();output=draft;
   } else {output={messages:structuredClone(session.raw)};await handler({},output);}
  }
- } catch(error) {
-  refused=true;coverage.refused++;
+  } catch(error) {
+   refused=true;coverage.refused++;
   const chain:any[]=[];for(let item:any=error;item&&chain.length<6;item=item.cause)chain.push({name:item.name,code:item.code??null,site:item.site??null});
   output={refused:chain};
  }
@@ -190,10 +191,12 @@ for(let index=0;index<passes;index++) {
  }
  if(policy)coverage.policyRecords++;
  const bytes=JSON.stringify(output);
- records.push({index,session:session.id,action,refused,bytes,sha256:createHash('sha256').update(bytes).digest('hex'),policy});coverage.passes++;
+  // Pi's LKG fast path emits no policy log; compare the full persisted replay choices on every pass too.
+  const replayDecisions=replay.serializeReplayDocument(replay.readReplayDocument(db,session.id));
+  records.push({index,session:session.id,action,refused,bytes,sha256:createHash('sha256').update(bytes).digest('hex'),policy,replayDecisions});coverage.passes++;
 }
 for(const spy of spies)spy.mockRestore();
-if(passes>=240 && (coverage.reverts!==2||coverage.unreverts!==2||coverage.forks!==2||coverage.served<200||coverage.tools<50||coverage.signed<50||coverage.reductions<10||coverage.policyRecords<100))throw new Error('insufficient differential coverage: '+JSON.stringify(coverage));
+if(passes>=240 && (coverage.reverts!==2||coverage.unreverts!==2||coverage.forks!==2||coverage.served<200||coverage.tools<50||coverage.signed<50||coverage.reductions<10||coverage.policyRecords<(host==='pi'?10:100)))throw new Error('insufficient differential coverage: '+JSON.stringify(coverage));
 const dropped=(db.prepare("SELECT COUNT(*) AS n FROM tags WHERE status='dropped'").get() as {n:number}).n;
 if(passes>=240&&dropped===0)throw new Error('ctx_reduce never applied a real drop');
 const result={host,seed,tool:`Bun ${Bun.version}`,coverage,forkProofs,dropped,records};writeFileSync(join(root,'complete-diff.json'),JSON.stringify(result));console.log('COMPLETE_DIFF',JSON.stringify({host,seed,coverage}));

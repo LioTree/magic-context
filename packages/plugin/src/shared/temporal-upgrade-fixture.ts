@@ -31,11 +31,17 @@ export function seedTemporalUpgradeFixture(
                         ? Buffer.from(value.base64, "base64")
                         : value,
                 );
-                if(table==="session_meta") {
-                    seedSessionMeta(db,Object.fromEntries(columns.map((column,index)=>[column,values[index]])) as Parameters<typeof seedSessionMeta>[1]);
-                } else db.prepare(
-                    `INSERT INTO ${table} (${columns.join(",")}) VALUES (${columns.map(() => "?").join(",")})`,
-                ).run(...values);
+                if (table === "session_meta") {
+                    seedSessionMeta(
+                        db,
+                        Object.fromEntries(
+                            columns.map((column, index) => [column, values[index]]),
+                        ) as Parameters<typeof seedSessionMeta>[1],
+                    );
+                } else
+                    db.prepare(
+                        `INSERT INTO ${table} (${columns.join(",")}) VALUES (${columns.map(() => "?").join(",")})`,
+                    ).run(...values);
             }
         }
         // Advance only the cache clock: timestamp-derived marker bytes and

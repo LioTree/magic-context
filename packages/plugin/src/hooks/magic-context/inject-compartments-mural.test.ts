@@ -409,9 +409,14 @@ describe("m[0] mural image fold (on-demand render → wire)", () => {
             });
 
             const siblingDataUrl = "data:image/png;base64,c2libGluZy1tdXJhbA==";
-            db.transaction(()=>{
-                patchSessionMeta(db,SESSION_ID,{cached_m0_mural_data_url:siblingDataUrl,cached_m0_mural_hash:"sibling-hash"});
-                db.prepare("UPDATE session_meta SET cached_m0_materialized_at=cached_m0_materialized_at+1 WHERE session_id=?").run(SESSION_ID);
+            db.transaction(() => {
+                patchSessionMeta(db, SESSION_ID, {
+                    cached_m0_mural_data_url: siblingDataUrl,
+                    cached_m0_mural_hash: "sibling-hash",
+                });
+                db.prepare(
+                    "UPDATE session_meta SET cached_m0_materialized_at=cached_m0_materialized_at+1 WHERE session_id=?",
+                ).run(SESSION_ID);
             }).immediate();
 
             const messages: MessageLike[] = [];

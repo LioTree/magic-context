@@ -81,7 +81,7 @@ describe("migration v26 — memory mutation log and m[1] cache", () => {
             `);
 
             MIGRATIONS.find((step) => step.version === 26)!.up(db);
-            // The operation marker is additive lifecycle metadata; exercise it without later payload relocation.
+            // v99 groups rows from one multi-row change with operation_id; apply it without later payload relocation.
             MIGRATIONS.find((step) => step.version === 99)!.up(db);
 
             expect(tableExists(db, "memory_mutation_log")).toBe(true);

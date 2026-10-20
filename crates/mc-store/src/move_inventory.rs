@@ -4331,7 +4331,13 @@ mod tests {
             .unwrap();
         assert_bun_succeeded(&output);
         let session_tables: Vec<String> = serde_json::from_slice(&output.stdout).unwrap();
-        assert_eq!(session_tables.len(), 46);
+        assert_eq!(session_tables.len(), 48);
+        assert!(session_tables
+            .iter()
+            .any(|table| table == "session_render_cache"));
+        assert!(session_tables
+            .iter()
+            .any(|table| table == "session_meta_chunks"));
         for table in session_tables {
             assert!(matches!(
                 entry(Store::Context, &table).unwrap().class,

@@ -112,8 +112,16 @@ export function writeSessionMetaCollectionBytes(
     bytes: Buffer | Uint8Array | null,
     storageType: string = "text",
 ): void {
-    if (storageType === "text" && bytes !== null && Buffer.from(bytes.buffer, bytes.byteOffset, bytes.byteLength).equals(Buffer.from(SESSION_META_COLLECTION_DEFAULTS[column]))) {
-        db.prepare("DELETE FROM session_meta_chunks WHERE session_id=? AND column_name=? AND EXISTS (SELECT 1 FROM session_meta WHERE session_id=?)").run(sessionId,column,sessionId);
+    if (
+        storageType === "text" &&
+        bytes !== null &&
+        Buffer.from(bytes.buffer, bytes.byteOffset, bytes.byteLength).equals(
+            Buffer.from(SESSION_META_COLLECTION_DEFAULTS[column]),
+        )
+    ) {
+        db.prepare(
+            "DELETE FROM session_meta_chunks WHERE session_id=? AND column_name=? AND EXISTS (SELECT 1 FROM session_meta WHERE session_id=?)",
+        ).run(sessionId, column, sessionId);
         return;
     }
     const chunks = bytes === null ? new Map<string, Uint8Array>() : layoutSessionMetaBytes(bytes);

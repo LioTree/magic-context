@@ -455,9 +455,7 @@ describe("Pi render-to-commit concurrency", () => {
 						? "Concurrent Pi refresh memory"
 						: "Concurrent Pi refresh history",
 				);
-				expect(sessionMetaFixtureRow(db, state.sessionId)).not.toEqual(
-					before,
-				);
+				expect(sessionMetaFixtureRow(db, state.sessionId)).not.toEqual(before);
 			} finally {
 				closeQuietly(sibling);
 				closeQuietly(db);

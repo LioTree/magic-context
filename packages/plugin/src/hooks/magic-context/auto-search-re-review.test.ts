@@ -15,7 +15,10 @@ import {
     getAutoSearchHintDecisions,
 } from "../../features/magic-context/storage-meta-persisted";
 import { getOrCreateSessionMeta } from "../../features/magic-context/storage-meta-session";
-import { readSessionMetaCollection, sessionMetaCollectionSelect } from "../../features/magic-context/storage-session-collections";
+import {
+    readSessionMetaCollection,
+    sessionMetaCollectionSelect,
+} from "../../features/magic-context/storage-session-collections";
 import { _resetHarnessForTesting, setHarness } from "../../shared/harness";
 import { Database } from "../../shared/sqlite";
 import { createTestTempDirFromPath } from "../../shared/test-temp-dir";
@@ -87,14 +90,25 @@ function olderGetter() {
         db: Database,
         sessionId: string,
     ) => AutoSearchHintDecision[];
-    return (db:Database,sessionId:string) => {
+    return (db: Database, sessionId: string) => {
         // The historical accessor owns an inline schema; feed it the exact reconstructed JSON.
-        const legacy=new Database(":memory:");
+        const legacy = new Database(":memory:");
         try {
-            legacy.exec("CREATE TABLE session_meta(session_id TEXT PRIMARY KEY,auto_search_hint_decisions TEXT)");
-            seedSessionMeta(legacy,{session_id:sessionId,auto_search_hint_decisions:readSessionMetaCollection(db,sessionId,"auto_search_hint_decisions") as string|null});
-            return historical(legacy,sessionId);
-        } finally {legacy.close();}
+            legacy.exec(
+                "CREATE TABLE session_meta(session_id TEXT PRIMARY KEY,auto_search_hint_decisions TEXT)",
+            );
+            seedSessionMeta(legacy, {
+                session_id: sessionId,
+                auto_search_hint_decisions: readSessionMetaCollection(
+                    db,
+                    sessionId,
+                    "auto_search_hint_decisions",
+                ) as string | null,
+            });
+            return historical(legacy, sessionId);
+        } finally {
+            legacy.close();
+        }
     };
 }
 

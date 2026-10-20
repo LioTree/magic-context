@@ -274,10 +274,10 @@ async function runTurn(entry: ReturnType<typeof opencodeEntry>, sessionId: strin
     return { messages, system, toolOutput };
 }
 
-const CREATED_ROWS = { session_meta: 1, session_projects: 1 };
+const CREATED_ROWS = { session_meta: 1, session_projects: 1, session_meta_chunks: 12 };
 
 describe("a session enrolled after its session.created", () => {
-    test("keeps only session.created's two rows, writes nothing for its turns and indexes nothing", async () => {
+    test("keeps only session.created's metadata and payloads, writes nothing for its turns and indexes nothing", async () => {
         const home = useTempDataHome("bridged-late-enroll-");
         const project = join(home, "project");
         mkdirSync(project, { recursive: true });
@@ -290,9 +290,8 @@ describe("a session enrolled after its session.created", () => {
         const entry = opencodeEntry(project);
         const settled = reconciliationSettled(["ses-late", "ses-control"]);
 
-        // Both sessions are created while unenrolled. Exactly what OpenCode 1's
-        // session.created writes today for a session: one session_meta row and
-        // one session_projects row.
+        // Both sessions are created while unenrolled. OpenCode 1's session.created
+        // writes metadata, a project row and the normalized cache-TTL replay policy.
         await entry.event("session.created", created("ses-late", project));
         await entry.event("session.created", created("ses-control", project));
         expect(rowsByTable("ses-late")).toEqual(CREATED_ROWS);
@@ -321,7 +320,7 @@ describe("a session enrolled after its session.created", () => {
         expect(controlRows.tags ?? 0).toBeGreaterThan(0);
     });
 
-    test("its session.deleted removes exactly session.created's two rows and nothing else", async () => {
+    test("its session.deleted removes exactly session.created's metadata and payloads and nothing else", async () => {
         const home = useTempDataHome("bridged-late-delete-");
         const project = join(home, "project");
         mkdirSync(project, { recursive: true });
@@ -340,7 +339,7 @@ describe("a session enrolled after its session.created", () => {
         db.prepare(
             "INSERT INTO session_projects (session_id, harness, project_path, updated_at) VALUES ('ses-late', 'pi', 'dir:/elsewhere', 1)",
         ).run();
-        expect(rowsByTable("ses-late")).toEqual({ session_meta: 1, session_projects: 2, tags: 1 });
+        expect(rowsByTable("ses-late")).toEqual({ ...CREATED_ROWS, session_projects: 2, tags: 1 });
         const controlBefore = rowsByTable("ses-control");
 
         await entry.event("session.deleted", { info: { id: "ses-late" } });
@@ -373,7 +372,7 @@ describe("hidden historian children the bridge creates", () => {
         expect(rowsByTable("ses-child")).toEqual({});
     });
 
-    test("a child created first and enrolled before its first prompt keeps only the two rows", async () => {
+    test("a child created first and enrolled before its first prompt keeps only the created metadata and payloads", async () => {
         const home = useTempDataHome("bridged-child-late-");
         const project = join(home, "project");
         mkdirSync(project, { recursive: true });

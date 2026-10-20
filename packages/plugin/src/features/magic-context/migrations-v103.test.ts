@@ -327,18 +327,35 @@ describe("migration 103 session render payload isolation", () => {
 
 describe("lossless session metadata chunks", () => {
     test("default collection values create no rows and clear back to their exact defaults", () => {
-        const db=current();
+        const db = current();
         try {
-            updateSessionMeta(db,"defaults",{counter:1});
-            for(const [column,value] of Object.entries(SESSION_META_COLLECTION_DEFAULTS)) {
-                writeSessionMetaCollection(db,"defaults",column as keyof typeof SESSION_META_COLLECTION_DEFAULTS,value);
-                expect(readSessionMetaCollection(db,"defaults",column as keyof typeof SESSION_META_COLLECTION_DEFAULTS)).toBe(value);
+            updateSessionMeta(db, "defaults", { counter: 1 });
+            for (const [column, value] of Object.entries(SESSION_META_COLLECTION_DEFAULTS)) {
+                writeSessionMetaCollection(
+                    db,
+                    "defaults",
+                    column as keyof typeof SESSION_META_COLLECTION_DEFAULTS,
+                    value,
+                );
+                expect(
+                    readSessionMetaCollection(
+                        db,
+                        "defaults",
+                        column as keyof typeof SESSION_META_COLLECTION_DEFAULTS,
+                    ),
+                ).toBe(value);
             }
-            expect(db.prepare("SELECT COUNT(*) AS n FROM session_meta_chunks").get()).toEqual({n:0});
-            writeSessionMetaCollection(db,"defaults","note_nudge_anchors",'["retained"]');
-            writeSessionMetaCollection(db,"defaults","note_nudge_anchors","[]");
-            expect(db.prepare("SELECT COUNT(*) AS n FROM session_meta_chunks").get()).toEqual({n:0});
-        } finally {db.close();}
+            expect(db.prepare("SELECT COUNT(*) AS n FROM session_meta_chunks").get()).toEqual({
+                n: 0,
+            });
+            writeSessionMetaCollection(db, "defaults", "note_nudge_anchors", '["retained"]');
+            writeSessionMetaCollection(db, "defaults", "note_nudge_anchors", "[]");
+            expect(db.prepare("SELECT COUNT(*) AS n FROM session_meta_chunks").get()).toEqual({
+                n: 0,
+            });
+        } finally {
+            db.close();
+        }
     });
 
     test("collection round trips preserve serialization, Unicode boundaries, nulls and in-place edits", () => {

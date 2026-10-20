@@ -26,9 +26,15 @@ function separated(db: Database, key: string): boolean {
 /** Seed a logical metadata fixture while keeping render payloads in their physical rows. */
 export function seedSessionMeta(db: Database, row: Record<string, Value>, replace = false): void {
     db.transaction(() => {
-        if(replace) {
-            if(db.prepare("SELECT 1 FROM sqlite_master WHERE name='session_render_cache'").get()) db.prepare("DELETE FROM session_render_cache WHERE session_id=?").run(row.session_id);
-            if(db.prepare("SELECT 1 FROM sqlite_master WHERE name='session_meta_chunks'").get()) db.prepare("DELETE FROM session_meta_chunks WHERE session_id=?").run(row.session_id);
+        if (replace) {
+            if (db.prepare("SELECT 1 FROM sqlite_master WHERE name='session_render_cache'").get())
+                db.prepare("DELETE FROM session_render_cache WHERE session_id=?").run(
+                    row.session_id,
+                );
+            if (db.prepare("SELECT 1 FROM sqlite_master WHERE name='session_meta_chunks'").get())
+                db.prepare("DELETE FROM session_meta_chunks WHERE session_id=?").run(
+                    row.session_id,
+                );
         }
         const metadata = Object.entries(row).filter(([key]) => !separated(db, key));
         db.prepare(
@@ -110,6 +116,9 @@ export function editCachedUpgradeFixture(
     writeSessionRenderCache(db, sessionId, "cached_m0_upgrade_state", change(value));
 }
 
-export function sessionMetaFixtureRow(db: Database, sessionId?: string): Record<string,unknown> | null {
-    return sessionMetaFixtureRows(db,sessionId)[0]??null;
+export function sessionMetaFixtureRow(
+    db: Database,
+    sessionId?: string,
+): Record<string, unknown> | null {
+    return sessionMetaFixtureRows(db, sessionId)[0] ?? null;
 }
