@@ -2137,7 +2137,13 @@ impl McHandler {
             .get()
             .ok_or_else(|| transient("store unavailable"))?;
         let namespace = state.namespace();
+        #[cfg(test)]
+        let meter = scaling_tests::save_meter::start_kind(&notice.session_ref, "rem:base");
         let base = self.reminder_base(store, state)?;
+        #[cfg(test)]
+        drop(meter);
+        #[cfg(test)]
+        let meter = scaling_tests::save_meter::start_kind(&notice.session_ref, "rem:last");
         let config = self.effective_config(&state.key.project);
         // Only the newest one or two entries are read here. The running
         // totals cover the rest; the tag hints, which need the whole tail,
@@ -2189,6 +2195,8 @@ impl McHandler {
             }
             None => None,
         };
+        #[cfg(test)]
+        drop(meter);
         let user = last
             .as_ref()
             .filter(|message| message.ck.role == "user" && !carries_result(message));
@@ -2248,6 +2256,8 @@ impl McHandler {
             runner: self.provider_runner.as_ref(),
             route: held.runner()?,
         };
+        #[cfg(test)]
+        let meter = scaling_tests::save_meter::start_kind(&notice.session_ref, "rem:send");
         let outcome = crate::runner_reminders::send_due_reminders(
             &runner,
             &held.key.project,
@@ -2256,6 +2266,8 @@ impl McHandler {
             &conditions,
         )
         .await;
+        #[cfg(test)]
+        drop(meter);
         if let Some(error) = outcome.hints_failed {
             return Err(transient(error));
         }

@@ -654,8 +654,11 @@ fn row(label: &str, size: u64, sample: &Sample) -> String {
     line
 }
 
-const PHASES: [&str; 14] = [
+const PHASES: [&str; 17] = [
     "load",
+    "rem:base",
+    "rem:last",
+    "rem:send",
     "phase:checkout",
     "phase:read",
     "phase:index",
@@ -803,6 +806,9 @@ fn rss() -> (u64, u64) {
 }
 
 fn percentiles(label: &str, size: u64, samples: &mut [(f64, f64, f64)]) {
+    if samples.is_empty() {
+        return;
+    }
     let pick = |samples: &[(f64, f64, f64)], at: f64, key: fn(&(f64, f64, f64)) -> f64| {
         let mut values = samples.iter().map(key).collect::<Vec<_>>();
         values.sort_by(f64::total_cmp);
@@ -983,6 +989,12 @@ async fn resident_latency_benchmark() {
             "historian evaluation after it (process CPU)",
             size,
             &mut historian,
+        );
+        let (peak, current) = rss();
+        eprintln!(
+            "memory after quiet notices at {size}: process RSS {:.2} GB (peak so far {:.2} GB)",
+            current as f64 / 1e9,
+            peak as f64 / 1e9
         );
         let mut rides = Vec::new();
         let mut publishes = Vec::new();
