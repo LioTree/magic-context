@@ -1870,9 +1870,13 @@ impl McHandler {
             ));
         }
         let _serial = self.provider_serial.lock_for(&state.key).await;
+        #[cfg(test)]
+        let phase = scaling_tests::save_meter::start_kind(&notice.session_ref, "phase:checkout");
         state = self
             .checkout(store, &notice.session_ref)?
             .ok_or_else(|| transient("async session disappeared"))?;
+        #[cfg(test)]
+        drop(phase);
         let moves_lineage = message
             .headers
             .get("lineage_id")
@@ -1998,9 +2002,13 @@ impl McHandler {
             .load_pending_agent_drops(&state.namespace())
             .map_err(transient)?
             .len();
-        if (state.completed_seq < notice.seq || resynced)
-            && (resynced || !self.async_engine_can_skip(&state, &notice)?)
-        {
+        #[cfg(test)]
+        let skip_phase = scaling_tests::save_meter::start_kind(&notice.session_ref, "phase:skip");
+        let run_engine = (state.completed_seq < notice.seq || resynced)
+            && (resynced || !self.async_engine_can_skip(&state, &notice)?);
+        #[cfg(test)]
+        drop(skip_phase);
+        if run_engine {
             self.publish_async(0, &mut state, codec, resynced)?;
         }
         state.completed_seq = state.seq;
@@ -2031,6 +2039,10 @@ impl McHandler {
         if historian_due {
             self.schedule_async_historian(&state)?;
         }
+        #[cfg(test)]
+        drop(phase);
+        #[cfg(test)]
+        let phase = scaling_tests::save_meter::start_kind(&notice.session_ref, "phase:checkin");
         self.checkin(state);
         drop(_serial);
         #[cfg(test)]
@@ -2125,7 +2137,7 @@ impl McHandler {
             .get()
             .ok_or_else(|| transient("store unavailable"))?;
         let namespace = state.namespace();
-        let loaded = self.engine_cache_state(store, state)?;
+        let base = self.reminder_base(store, state)?;
         let config = self.effective_config(&state.key.project);
         // Only the newest one or two entries are read here. The running
         // totals cover the rest; the tag hints, which need the whole tail,
@@ -2187,38 +2199,46 @@ impl McHandler {
             .zip(prior)
             .and_then(|(written, prior)| i64::try_from(written).ok().zip(i64::try_from(prior).ok()))
             .map(|(written, prior)| written.saturating_sub(prior));
-        let loaded_generation = loaded
-            .meta
-            .tail_hygiene_baseline
-            .as_ref()
-            .map(|b| b.baseline_generation);
+        let loaded_generation = base.baseline.as_ref().map(|b| b.baseline_generation);
         let prior_generation = if state.reminder_cadence.is_some() {
             state.reminder_baseline_generation
         } else {
             loaded_generation
         };
-        let mut cadence = state.reminder_cadence.take().unwrap_or_else(|| {
-            let mut cadence = crate::runner_reminders::ReminderState::default();
-            cadence.meta = loaded.meta.clone();
-            cadence
-        });
+        let mut cadence = match state.reminder_cadence.take() {
+            Some(cadence) => cadence,
+            None => {
+                let mut cadence = crate::runner_reminders::ReminderState::default();
+                cadence.meta = base
+                    .full
+                    .as_ref()
+                    .expect("a first reminder pass loads the full state")
+                    .meta
+                    .clone();
+                cadence
+            }
+        };
         let window = notice.window.or(state.setup.context_window).unwrap_or(0);
         let held: &State = state;
+        let full = base.full.clone();
         let hints = || {
-            async_reminder_hints(store, held, codec, loaded.as_ref(), &config, window)
+            let loaded = match &full {
+                Some(loaded) => Arc::clone(loaded),
+                None => Arc::new(store.load(&held.namespace()).map_err(|e| e.to_string())?),
+            };
+            async_reminder_hints(store, held, codec, &loaded, &config, window)
                 .map_err(|error| format!("{error:?}"))
         };
         let conditions = crate::runner_reminders::ReminderConditions {
             notice_id: &bus_id(&held.reference(), "advanced", notice.seq),
             now_ms: now_ms().max(0) as u64,
             real_user_turn_count: users,
-            baseline: loaded.meta.tail_hygiene_baseline.as_ref(),
+            baseline: base.baseline.as_deref(),
             newest_tool_tag: carrier,
             hints: &hints,
             drops_applied,
             baseline_refreshed: prior_generation != loaded_generation,
-            hard_fold_coverage_advanced: loaded.meta.coverage_ordinal
-                > cadence.meta.coverage_ordinal,
+            hard_fold_coverage_advanced: base.coverage_ordinal > cadence.meta.coverage_ordinal,
             user_message_id: user.map(|message| message.mid.as_str()),
             temporal_enabled: config.temporal_awareness,
             gap_ms,
@@ -2239,7 +2259,7 @@ impl McHandler {
         if let Some(error) = outcome.hints_failed {
             return Err(transient(error));
         }
-        cadence.meta.coverage_ordinal = loaded.meta.coverage_ordinal;
+        cadence.meta.coverage_ordinal = base.coverage_ordinal;
         state.reminder_baseline_generation = cadence
             .meta
             .tail_hygiene_baseline
@@ -2252,45 +2272,64 @@ impl McHandler {
         Ok(())
     }
 
-    /// The engine's cache state (core and meta) for the reminder pass. The
-    /// full load reads every tail hygiene measurement, so the resident record
-    /// keeps the last one and reuses it while the small row's version is
-    /// unchanged. The first reminder pass of a generation always loads it,
-    /// because it copies the whole meta into the reminder cadence.
-    fn engine_cache_state(
+    /// What the reminder pass reads from the engine's cache state: the tail
+    /// hygiene baseline and the coverage ordinal. The baseline holds one
+    /// measurement per tail part, so the resident record keeps the last one
+    /// decoded and reuses it while its stored identity (see
+    /// `McStore::load_meta_with_tail_identity`) is unchanged; the coverage
+    /// comes from the small row. The first pass of a generation loads the
+    /// whole state, because it copies the whole meta into the reminder
+    /// cadence.
+    fn reminder_base(
         &self,
         store: &McStore,
         state: &mut State,
-    ) -> Result<Arc<mc_store::LoadedState>, HandlerOutcome> {
+    ) -> Result<resident::ReminderBase, HandlerOutcome> {
         let namespace = state.namespace();
+        let full = |loaded: mc_store::LoadedState| resident::ReminderBase {
+            baseline: loaded.meta.tail_hygiene_baseline.clone().map(Arc::new),
+            coverage_ordinal: loaded.meta.coverage_ordinal,
+            full: Some(Arc::new(loaded)),
+        };
         #[cfg(test)]
         if self.async_oracle() {
-            return Ok(Arc::new(store.load(&namespace).map_err(transient)?));
+            return Ok(full(store.load(&namespace).map_err(transient)?));
         }
+        let (small, identity) = store
+            .load_meta_with_tail_identity(&namespace)
+            .map_err(transient)?;
         if state.reminder_cadence.is_some() {
-            let small = store.load_meta(&namespace).map_err(transient)?;
             if let Some(cached) = state.cache_state.as_ref().filter(|cached| {
-                cached.namespace == namespace
-                    && small.row_version == Some(cached.row_version)
-                    && small.meta.user_profile_version == cached.user_profile_version
+                cached.namespace == namespace && Some(&cached.identity) == identity.as_ref()
             }) {
-                return Ok(Arc::clone(&cached.loaded));
+                return Ok(resident::ReminderBase {
+                    baseline: cached.baseline.clone(),
+                    coverage_ordinal: small.meta.coverage_ordinal,
+                    full: None,
+                });
             }
         }
-        let loaded = Arc::new(store.load(&namespace).map_err(transient)?);
-        state.cache_state = loaded.row_version.map(|row_version| {
-            let bytes = serde_json::to_vec(&loaded.meta).map_or(0, |bytes| bytes.len())
-                + serde_json::to_vec(&loaded.core).map_or(0, |bytes| bytes.len());
-            resident::CachedEngineState {
+        #[cfg(test)]
+        let _phase =
+            scaling_tests::save_meter::start_kind(&state.reference(), "phase:cache_state_load");
+        let base = full(store.load(&namespace).map_err(transient)?);
+        // Cache only a baseline read at the identity just seen; a write in
+        // between makes the next pass load again.
+        let (_, again) = store
+            .load_meta_with_tail_identity(&namespace)
+            .map_err(transient)?;
+        state.cache_state = identity
+            .filter(|identity| again.as_ref() == Some(identity))
+            .map(|identity| resident::CachedEngineState {
                 namespace,
-                row_version,
-                user_profile_version: loaded.meta.user_profile_version,
-                // Parsed structures take more than their JSON.
-                bytes: bytes * 2,
-                loaded: Arc::clone(&loaded),
-            }
-        });
-        Ok(loaded)
+                identity,
+                bytes: base.baseline.as_ref().map_or(0, |baseline| {
+                    // Parsed structures take more than their JSON.
+                    serde_json::to_vec(&**baseline).map_or(0, |bytes| bytes.len() * 2)
+                }),
+                baseline: base.baseline.clone(),
+            });
+        Ok(base)
     }
 
     fn async_binding(&self, state: &State) -> SessionBinding {
@@ -3082,6 +3121,9 @@ impl McHandler {
                 "open_tool_arc",
             ),
         ];
+        #[cfg(test)]
+        let _facts_phase =
+            scaling_tests::save_meter::start_kind(&state.reference(), "phase:skip_meta");
         if let Some((_, reason)) = blockers.iter().find(|(blocks, _)| *blocks) {
             #[cfg(test)]
             resident::counters::engine_reason(reason);

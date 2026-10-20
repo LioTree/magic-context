@@ -9237,6 +9237,60 @@ impl McStore {
         }
     }
 
+    /// [`McStore::load_meta`] plus, read in the same transaction, an identity
+    /// of the tail hygiene baseline a full [`McStore::load`] would decode: the
+    /// sections version, the tail section's index entry (its digest) and the
+    /// native-tail reference kept in the small meta. Two equal identities mean
+    /// the same baseline, so a caller can keep a decoded baseline (one
+    /// measurement per tail part) and skip the full load while it holds.
+    /// `None` identity when the session has no row.
+    pub fn load_meta_with_tail_identity(
+        &self,
+        session_id: &str,
+    ) -> Result<(MetaSnapshot, Option<String>), McStoreError> {
+        let (row, identity) = self.inner.with_conn(|conn| {
+            let transaction = conn.unchecked_transaction()?;
+            let row = cache_codec::read_small_row(&transaction, session_id)?;
+            let identity = transaction
+                .query_row(
+                    "SELECT json_array(
+                        CASE WHEN json_valid(section_index) THEN json_extract(section_index, '$.sv') END,
+                        CASE WHEN json_valid(section_index) THEN json_extract(section_index, '$.t') END,
+                        CASE WHEN json_valid(meta) THEN json_extract(meta, '$.tail_hygiene_baseline') END)
+                       FROM mc_cache_state WHERE session_id = ?1",
+                    params![session_id],
+                    |row| row.get::<_, String>(0),
+                )
+                .optional()?;
+            transaction.commit()?;
+            Ok::<_, rusqlite::Error>((row, identity))
+        })?;
+        let user_profile_version = if self.has_context_domain() {
+            self.user_profile_version()?
+        } else {
+            0
+        };
+        let snapshot = match row {
+            None => MetaSnapshot {
+                row_version: None,
+                meta: ModuleMeta {
+                    user_profile_version,
+                    ..ModuleMeta::default()
+                },
+            },
+            Some(row) => {
+                let mut meta = cache_codec::decode_small_meta(&row.meta)
+                    .map_err(|error| McStoreError::Serde(error.to_string()))?;
+                meta.user_profile_version = user_profile_version;
+                MetaSnapshot {
+                    row_version: Some(row.row_version),
+                    meta,
+                }
+            }
+        };
+        Ok((snapshot, identity))
+    }
+
     /// Read the committed boundary from the small cache header without hydrating
     /// frozen units or covered-message policy. Native endpoint validation needs
     /// only this coordinate, not the history represented by the boundary.

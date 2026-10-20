@@ -128,16 +128,22 @@ impl EngineView {
     }
 }
 
-/// The engine's cache state for one namespace, as fully loaded at a row
-/// version. Every write to that state advances the row version, so an equal
-/// version (and user-profile version, which the load fills in from the host)
-/// means an equal state.
+/// A decoded tail hygiene baseline and the stored identity it was read at
+/// (`McStore::load_meta_with_tail_identity`): an equal identity means an
+/// equal baseline.
 pub(super) struct CachedEngineState {
     pub namespace: String,
-    pub row_version: u64,
-    pub user_profile_version: u64,
+    pub identity: String,
     pub bytes: usize,
-    pub loaded: Arc<mc_store::LoadedState>,
+    pub baseline: Option<Arc<mc_store::TailHygieneBaseline>>,
+}
+
+/// The reminder pass's inputs from the engine's cache state; `full` is the
+/// whole state when this pass had to load it.
+pub(super) struct ReminderBase {
+    pub baseline: Option<Arc<mc_store::TailHygieneBaseline>>,
+    pub coverage_ordinal: Option<u64>,
+    pub full: Option<Arc<mc_store::LoadedState>>,
 }
 
 /// Running aggregates over the held entries' facts.
@@ -314,6 +320,7 @@ pub(crate) mod counters {
 
     thread_local! {
         static REASON: std::cell::RefCell<String> = const { std::cell::RefCell::new(String::new()) };
+        static REASONS: std::cell::RefCell<std::collections::BTreeMap<String, u64>> = const { std::cell::RefCell::new(std::collections::BTreeMap::new()) };
         static PARSED: Cell<u64> = const { Cell::new(0) };
         static DECODED: Cell<u64> = const { Cell::new(0) };
         static ENGINE: Cell<u64> = const { Cell::new(0) };
@@ -340,6 +347,16 @@ pub(crate) mod counters {
     /// Why the last notice on this thread ran the engine.
     pub fn engine_reason(reason: &str) {
         REASON.with(|cell| *cell.borrow_mut() = reason.to_owned());
+        let short = reason
+            .split_whitespace()
+            .next()
+            .unwrap_or_default()
+            .to_owned();
+        REASONS.with(|cell| *cell.borrow_mut().entry(short).or_default() += 1);
+    }
+    /// How often each reason made a notice on this thread run the engine.
+    pub fn engine_reasons() -> std::collections::BTreeMap<String, u64> {
+        REASONS.with(|cell| cell.borrow().clone())
     }
     pub fn last_engine_reason() -> String {
         REASON.with(|cell| cell.borrow().clone())

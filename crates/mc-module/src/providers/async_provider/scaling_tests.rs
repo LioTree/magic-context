@@ -654,15 +654,21 @@ fn row(label: &str, size: u64, sample: &Sample) -> String {
     line
 }
 
-const PHASES: [&str; 8] = [
+const PHASES: [&str; 14] = [
     "load",
+    "phase:checkout",
     "phase:read",
     "phase:index",
     "phase:policy",
+    "phase:skip",
+    "phase:skip_meta",
     "phase:publish",
     "phase:reminders",
+    "phase:cache_state_load",
     "phase:cadence",
     "phase:historian",
+    "phase:checkin",
+    "save",
 ];
 
 fn phase_stats(reference: &str) -> Vec<save_meter::SaveStats> {
@@ -952,6 +958,8 @@ async fn resident_latency_benchmark() {
             .sum::<u64>();
         let mut notices = Vec::new();
         let mut historian = Vec::new();
+        let phases_before = phase_stats(&rig.reference);
+        let reasons_before = resident::counters::engine_reasons();
         for _ in 0..quiet {
             let (sample, background) = rig.timed_notice(4, Some(version)).await;
             notices.push(sample);
@@ -963,6 +971,14 @@ async fn resident_latency_benchmark() {
             "quiet notices publish nothing"
         );
         percentiles("quiet notice (+4 msgs)", size, &mut notices);
+        eprintln!(
+            "phases over {quiet} quiet notices at {size}: {}",
+            phases(&rig.reference, &phases_before)
+        );
+        eprintln!(
+            "engine ran on quiet notices at {size}: before {reasons_before:?} after {:?}",
+            resident::counters::engine_reasons()
+        );
         percentiles(
             "historian evaluation after it (process CPU)",
             size,
@@ -999,6 +1015,10 @@ async fn resident_latency_benchmark() {
         percentiles("ride building a view", size, &mut rides);
         percentiles("notice publishing a view", size, &mut publishes);
         percentiles("notice acknowledging a ride view", size, &mut acknowledging);
+        eprintln!(
+            "engine reasons after the view builds at {size}: {:?}",
+            resident::counters::engine_reasons()
+        );
         let held = rig
             .h
             .provider_store
