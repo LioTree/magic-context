@@ -13,6 +13,7 @@ import {
     pendingServedDigest,
     readServedMarkerRow,
     recordServedSlotState,
+    type ServedMarkerRow,
 } from "./lkg-served-marker";
 import type { LkgPersistenceBackend, LkgSlot } from "./lkg-slot";
 
@@ -315,47 +316,76 @@ function rememberBoundCertificate(
  * connection so only the writer that saved the bytes can bind them.
  */
 interface PreparedLkgCertificate extends BoundLkgCertificate {
+    sessionId: string;
+    receipt: object;
     prefixHash: string;
     /** The marker's stored value while the id is unbound (its pending token, or legacy NULL). */
     unboundValue: string | null;
 }
 const preparedCertificates = new WeakMap<Database, Map<string, PreparedLkgCertificate>>();
+/** Opaque identity of this connection's deferred save, distinct even when an id is reused. */
+export function preparedLkgDispatchReceipt(
+    db: Database,
+    sessionId: string,
+    servedCaptureId: number | undefined,
+): object | undefined {
+    return servedCaptureId === undefined
+        ? undefined
+        : preparedCertificates.get(db)?.get(preparedKey(sessionId, servedCaptureId))?.receipt;
+}
+function preparedKey(sessionId: string, servedCaptureId: number): string {
+    return JSON.stringify([sessionId, servedCaptureId]);
+}
+function clearPreparedCertificates(db: Database, sessionId: string): void {
+    const prepared = preparedCertificates.get(db);
+    if (!prepared) return;
+    for (const [key, certificate] of prepared) {
+        if (certificate.sessionId === sessionId) prepared.delete(key);
+    }
+}
 /** Marker slot state of a request saved before dispatch whose pass was then refused. */
 const UNDISPATCHED_SLOT_STATE = "undispatched";
 
 function rememberPreparedCertificate(
     db: Database,
     sessionId: string,
-    certificate: PreparedLkgCertificate,
+    certificate: Omit<PreparedLkgCertificate, "sessionId" | "receipt">,
 ): void {
     let prepared = preparedCertificates.get(db);
     if (!prepared) {
         prepared = new Map();
         preparedCertificates.set(db, prepared);
     }
-    prepared.delete(sessionId);
+    const key = preparedKey(sessionId, certificate.servedCaptureId);
+    prepared.delete(key);
     if (prepared.size >= PERSISTED_FINGERPRINT_MAX_SESSIONS) {
         const oldest = prepared.keys().next().value;
         if (oldest !== undefined) prepared.delete(oldest);
     }
-    prepared.set(sessionId, certificate);
+    prepared.set(key, { ...certificate, sessionId, receipt: {} });
 }
 
 /**
  * Record that a request saved with `deferCertificate` will never be dispatched:
  * its pass was refused after the save committed. The bytes stay durable, but the
- * marker's slot state becomes `undispatched`, so the id never certifies and a
- * restarted process does not hydrate them. Only the writer that saved them can
- * mark them. Never throws.
+ * marker's slot state becomes `undispatched`. A restarted process does not hydrate
+ * these bytes while the marker still identifies this capture as undispatched.
+ * If another writer replaces the marker,
+ * replay these bytes only when the current input exactly matches the input they
+ * were saved from. Only the database handle
+ * that saved the deferred certificate can mark this capture as undispatched.
+ * Never throws.
  */
 export function refuseUndispatchedLkgSlot(
     db: Database,
     sessionId: string,
     servedCaptureId: number,
+    receipt?: object,
 ): boolean {
-    const prepared = preparedCertificates.get(db)?.get(sessionId);
-    if (!prepared || prepared.servedCaptureId !== servedCaptureId) return false;
-    preparedCertificates.get(db)?.delete(sessionId);
+    const key = preparedKey(sessionId, servedCaptureId);
+    const prepared = preparedCertificates.get(db)?.get(key);
+    if (!prepared || (receipt !== undefined && prepared.receipt !== receipt)) return false;
+    preparedCertificates.get(db)?.delete(key);
     try {
         // A refused pass is often refused because it ran past its deadline, and a
         // pass's write guard then blocks its writes. Recording that its request was
@@ -384,7 +414,7 @@ export function isPreparedUndispatchedLkgSlot(
 ): boolean {
     return (
         servedCaptureId !== undefined &&
-        preparedCertificates.get(db)?.get(sessionId)?.servedCaptureId === servedCaptureId
+        preparedCertificates.get(db)?.has(preparedKey(sessionId, servedCaptureId)) === true
     );
 }
 
@@ -392,17 +422,23 @@ export function isPreparedUndispatchedLkgSlot(
  * Bind the certificate of a slot saved with `deferCertificate`, once its request
  * was actually dispatched. Binds only while the marker still names that id
  * unbound and storage still holds those bytes under it. Returns whether the id
- * now certifies those bytes. Never throws: a missed bind leaves the slot
- * durable but uncertified, and a restarted process will not replay it.
+ * now certifies those bytes. Never throws: a missed bind leaves the slot durable
+ * but uncertified. A restarted process with no record that this request was sent
+ * may replay these bytes only for the exact input they were saved with.
  */
 export function certifyDispatchedLkgSlot(
     db: Database,
     sessionId: string,
     servedCaptureId: number,
+    receipt?: object,
 ): boolean {
-    const prepared = preparedCertificates.get(db)?.get(sessionId);
-    if (!prepared || prepared.servedCaptureId !== servedCaptureId) return false;
-    preparedCertificates.get(db)?.delete(sessionId);
+    const key = preparedKey(sessionId, servedCaptureId);
+    const prepared = preparedCertificates.get(db)?.get(key);
+    if (!prepared || (receipt !== undefined && prepared.receipt !== receipt)) return false;
+    preparedCertificates.get(db)?.delete(key);
+    // The dispatch ticket proves this request was sent even if a newer allocation
+    // prevents binding the session's current marker. It does not certify that marker.
+    rememberBoundCertificate(db, sessionId, prepared);
     try {
         const { changes } = db
             .prepare(
@@ -702,13 +738,14 @@ export function clearPersistedLkgSlotStrict(
     );
     persistedFingerprints.get(db)?.delete(sessionId);
     boundCertificates.get(db)?.delete(sessionId);
-    preparedCertificates.get(db)?.delete(sessionId);
+    clearPreparedCertificates(db, sessionId);
 }
 
 export function loadPersistedLkgSlot(
     db: Database,
     sessionId: string,
     forPublication = false,
+    confirmDispatch = false,
 ): LkgSlot | undefined {
     // Publication verifies the row just committed, even while a history cut is
     // fenced. Ordinary readers still cannot hydrate that row for replay.
@@ -717,6 +754,8 @@ export function loadPersistedLkgSlot(
     type ChunkRow = { chunk?: unknown; hash?: unknown; body?: unknown };
     let row: Record<string, unknown> | undefined;
     let chunkRows: ChunkRow[];
+    let marker: ServedMarkerRow | undefined;
+    let markerReadFailed = false;
     try {
         // One read transaction, so the row and its slices come from the same
         // snapshot even while another connection is saving this slot.
@@ -731,6 +770,14 @@ export function loadPersistedLkgSlot(
                         "SELECT chunk, hash, body FROM lkg_slot_chunks WHERE session_id = ? ORDER BY chunk",
                     )
                     .all(sessionId) as ChunkRow[];
+                if (confirmDispatch) {
+                    try {
+                        marker = readServedMarkerRow(db, sessionId);
+                    } catch (error) {
+                        markerReadFailed = true;
+                        sessionLog(sessionId, "LKG durable dispatch check failed:", error);
+                    }
+                }
                 return { row: slotRow, chunkRows: slices };
             })
             .deferred());
@@ -760,6 +807,14 @@ export function loadPersistedLkgSlot(
     }
     // Size admission is enforced by the slot store's own bound when the loaded
     // slot is installed; an oversized row simply declines to hydrate.
+    if (confirmDispatch) {
+        const state = markerReadFailed ? "unconfirmed" : dispatchState(db, sessionId, slot, marker);
+        if (state === "refused") {
+            sessionLog(sessionId, "LKG durable slot was refused before dispatch; not hydrated");
+            return undefined;
+        }
+        if (state === "unconfirmed") return { ...slot, dispatchUnconfirmed: true };
+    }
     return slot;
 }
 
@@ -812,7 +867,7 @@ function pruneStaleLkgSlotsBatch(db: Database, now: number): { slots: number; ch
         if (changes.slots && slot) {
             persistedFingerprints.get(db)?.delete(slot.session_id);
             boundCertificates.get(db)?.delete(slot.session_id);
-            preparedCertificates.get(db)?.delete(slot.session_id);
+            clearPreparedCertificates(db, slot.session_id);
         }
         return changes;
     } finally {
@@ -842,55 +897,32 @@ export async function drainStaleLkgSlots(
 }
 
 /**
- * How a stored slot saved with its certificate deferred relates to dispatch, from
- * its marker: `refused` when its pass was refused after the save (the bytes were
- * never sent), `unconfirmed` when the marker still names it as a pending allocation
- * (the process may have died before or after sending it), else `settled`. An
- * ordinary save binds its id in the same transaction as the bytes, so only a
- * deferred-certificate save leaves the first two states.
+ * Only positive evidence bound to this capture proves dispatch. A newer marker
+ * says nothing about older bytes, and legacy NULL digests are not certificates.
  */
 function dispatchState(
     db: Database,
     sessionId: string,
     slot: LkgSlot,
+    marker: ServedMarkerRow | undefined,
 ): "refused" | "unconfirmed" | "settled" {
-    if (slot.servedCaptureId === undefined) return "settled";
-    const marker = readServedMarkerRow(db, sessionId);
-    if (marker?.servedCaptureId !== slot.servedCaptureId) return "settled";
+    if (slot.servedCaptureId === undefined) return "unconfirmed";
+    const digest = lkgSlotCertificateDigest(slot);
+    const bound = boundLkgCertificate(db, sessionId);
+    if (bound?.servedCaptureId === slot.servedCaptureId && bound.digest === digest)
+        return "settled";
+    if (marker?.servedCaptureId !== slot.servedCaptureId) return "unconfirmed";
     if (marker.slotState === UNDISPATCHED_SLOT_STATE) return "refused";
-    return marker.pendingToken !== null && marker.slotState === "captured"
-        ? "unconfirmed"
-        : "settled";
+    if (marker.servedDigest === null) return "unconfirmed";
+    return marker.slotState === "captured" && marker.servedDigest === digest
+        ? "settled"
+        : "unconfirmed";
 }
 
 /** Backend bound to one database handle, for registration with the slot store. */
 export function createDbLkgPersistence(db: Database): LkgPersistenceBackend {
     return {
-        load: (sessionId) => {
-            const slot = loadPersistedLkgSlot(db, sessionId);
-            if (!slot) return undefined;
-            try {
-                const state = dispatchState(db, sessionId, slot);
-                // Replay serves the last request sent. A request whose pass was
-                // refused after saving it stays durable, but was never sent.
-                if (state === "refused") {
-                    sessionLog(
-                        sessionId,
-                        "LKG durable slot was refused before dispatch; not hydrated",
-                    );
-                    return undefined;
-                }
-                // A request saved just before the process died has an unknown
-                // outcome, but it was valid for its input: it loads uncertified and
-                // may replay only for that exact input.
-                if (state === "unconfirmed") return { ...slot, dispatchUnconfirmed: true };
-            } catch (error) {
-                // Without a readable marker there is no certificate to consult; keep
-                // hydrating as before certificates were bound to dispatch.
-                sessionLog(sessionId, "LKG durable dispatch check failed:", error);
-            }
-            return slot;
-        },
+        load: (sessionId) => loadPersistedLkgSlot(db, sessionId, false, true),
         clear: (sessionId, reason) => clearPersistedLkgSlot(db, sessionId, reason),
     };
 }

@@ -10,7 +10,7 @@ import {
     lkgSlotCertificateDigest,
     saveLkgSlotToDb,
 } from "./lkg-persist";
-import { captureSlot, getInMemorySlot, type LkgSlot } from "./lkg-slot";
+import { captureSlot, getInMemorySlot, isHydratedLkgSlot, type LkgSlot } from "./lkg-slot";
 
 export interface ServedMarker {
     servedCaptureId: number;
@@ -419,6 +419,7 @@ export function repairLkgDurability(db: Database, sessionId: string): LkgDurabil
     const status = checkLkgDurability(db, sessionId);
     const slot = getInMemorySlot(sessionId);
     if (!slot || isRustMarkerAdmissionFenced(db, sessionId)) return status;
+    if (isHydratedLkgSlot(sessionId)) return status;
     // The pass that captured this slot never returned it to the host, so these
     // bytes were never served and must not be certified.
     if (slot.servedCaptureWithheld) return uncertified;
