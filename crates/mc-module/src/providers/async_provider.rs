@@ -73,6 +73,8 @@ pub(crate) struct Runtime {
     historian_evaluations: std::sync::atomic::AtomicU64,
     pub(crate) connection_file: Mutex<Option<PathBuf>>,
     pub(crate) bootstrapped: OnceLock<()>,
+    /// The bus link's named state, which a `bus_not_ready` refusal reports.
+    pub(crate) bus_link: Arc<super::async_bus::LinkStatus>,
     publisher: Mutex<Option<Arc<dyn Publisher>>>,
     unconfigured_logged: OnceLock<()>,
 }
@@ -492,8 +494,12 @@ impl McHandler {
                 .async_runtime
                 .unconfigured_logged
                 .get_or_init(|| tracing::warn!("async compaction bus not configured"));
+            let reason = format!(
+                "Async compaction bus not ready ({})",
+                self.provider_store.async_runtime.bus_link.describe()
+            );
             return bytes(
-                &json!({"answer":"refuse","request_id":request.request_id,"code":"provider_busy","provider_code":"bus_not_ready","reason":"Async compaction bus not ready"}),
+                &json!({"answer":"refuse","request_id":request.request_id,"code":"provider_busy","provider_code":"bus_not_ready","reason":reason}),
             );
         }
         let reference = session_ref(&key.harness, &key.project.to_string_lossy(), &key.session);
