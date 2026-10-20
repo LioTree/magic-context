@@ -1808,7 +1808,7 @@ fn text_parts(message: &FlatMessage<'_>) -> Vec<String> {
         .filter_map(|block| match &block.wire_shape().kind {
             CkKind::Text { .. } => {
                 let text = block.scalar_text().expect("text payload");
-                let cleaned = if message.role == "user" {
+                let cleaned = if message.role == "user" && !block.runner_lane {
                     clean_user_text(&text)
                 } else {
                     text.trim().to_string()

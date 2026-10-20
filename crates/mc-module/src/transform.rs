@@ -803,6 +803,9 @@ pub struct TransformRequest {
     /// Set only by the native provider handler, never by a wire request.
     #[serde(skip)]
     pub native_tail_section: bool,
+    /// Pending async reminder stripping does not, by itself, authorize a rebuild.
+    #[serde(skip)]
+    pub(crate) native_reminder_strip_pending: bool,
     #[serde(skip)]
     pub(crate) native_fold_prefix: Option<crate::providers::fold_prefix::FoldPrefix>,
     #[serde(skip)]
@@ -1310,6 +1313,7 @@ impl<'de> Deserialize<'de> for TransformRequest {
             native_tail_section: false,
             runner_owned_reminders: false,
             logical_prefix: None,
+            native_reminder_strip_pending: false,
             native_fold_prefix: None,
             native_fold_sidecar: None,
             native_compartment_source_revision: None,
@@ -2946,6 +2950,7 @@ pub mod compaction {
             if !structural_repeat
                 && (rejected.is_some_and(|r| !r.structural)
                     || initial
+                    || template.native_reminder_strip_pending
                     || !comparison.map_or_else(
                         || matches_served(&candidate, state.last_applied.as_ref(), &req.messages),
                         |comparison| comparison.matches(&candidate, &req.messages),
@@ -13669,6 +13674,12 @@ fn is_system_reminder_transport_message(message: &CkIngressMessage) -> bool {
 }
 
 fn is_authored_user_message(message: &CkIngressMessage) -> bool {
+    if crate::providers::runner_origin(&message.ck, 0).0 {
+        return message.ck.role == "user" && message.ck.content.iter().enumerate().any(|(index, block)| {
+            !crate::providers::runner_origin(&message.ck, index).1
+                && matches!(&block.kind, ck_wire::CkKind::Text { text } if !text.trim().is_empty())
+        });
+    }
     message.ck.role == "user"
         && !message.ck.meta.synthetic
         && message
@@ -14880,7 +14891,11 @@ pub(crate) fn active_tags_for_nudge(
             out.push(ActiveTagForNudge {
                 tag_number: row.tag_number,
                 kind: row.kind.clone(),
-                token_count: row.token_count.max(0),
+                token_count: block
+                    .runner_accounting_text
+                    .as_deref()
+                    .map(|text| mc_tokenizer::estimate_tokens(text) as i64)
+                    .unwrap_or(row.token_count.max(0)),
                 tool_name: match &block.wire_shape().kind {
                     ck_wire::CkKind::ToolResult { tool_name, .. } => tool_name.clone(),
                     _ => String::new(),
@@ -16548,6 +16563,9 @@ fn new_frozen_strip_units(
                 // passes look up the block id and replay these exact bytes without re-running the
                 // marker parser, so tail growth cannot trickle additional cache changes.
                 for (block_index, block) in blocks.iter().enumerate() {
+                    if crate::providers::runner_origin(&message.ck, block_index).0 {
+                        continue;
+                    }
                     let ck_wire::CkKind::Text { text } = &block.kind else {
                         continue;
                     };
@@ -23260,6 +23278,7 @@ pub(crate) mod tests {
             native_tail_section: false,
             runner_owned_reminders: false,
             logical_prefix: None,
+            native_reminder_strip_pending: false,
             native_fold_prefix: None,
             native_fold_sidecar: None,
             native_compartment_source_revision: None,

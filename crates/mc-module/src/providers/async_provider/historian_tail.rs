@@ -26,7 +26,11 @@ impl InputIndex {
     pub(super) fn window(&self, applied: Option<u64>) -> InputWindow {
         applied
             .and_then(|cut| self.starts.range(..=cut).next_back())
-            .map(|(&from, &ordinal_base)| InputWindow { from, ordinal_base })
+            .map(|(&from, &ordinal_base)| InputWindow {
+                from,
+                ordinal_base,
+                through: None,
+            })
             .unwrap_or_default()
     }
 
@@ -39,6 +43,13 @@ impl InputIndex {
 pub(super) struct InputWindow {
     from: u64,
     ordinal_base: u64,
+    through: Option<u64>,
+}
+
+impl InputWindow {
+    pub(super) fn through(self, through: Option<u64>) -> Self {
+        Self { through, ..self }
+    }
 }
 
 pub(super) fn applied_window(
@@ -58,11 +69,11 @@ pub(super) fn prepare_input(
     store: &McStore,
     reference: &str,
     window: InputWindow,
-    through: Option<u64>,
     codec: codec::Codec,
     parsed: &mut TransformRequest,
+    echoes: &reminder_echoes::ReminderEchoes,
 ) -> Result<ck_wire::FlatProjection, HandlerOutcome> {
-    let rows = match through {
+    let rows = match window.through {
         Some(through) => store
             .load_async_compaction_entries_range(reference, window.from, through)
             .map_err(transient)?,
@@ -74,14 +85,18 @@ pub(super) fn prepare_input(
         .into_iter()
         .map(|(_, raw)| HeldEntry::from_stored(raw)?.inbound())
         .collect::<Result<Vec<_>, _>>()?;
-    codec.prepare_request(parsed, &messages)?;
-    if codec == codec::Codec::Pi {
-        let ordinals = (0..messages.len())
-            .map(|index| window.ordinal_base.saturating_add(index as u64 + 1))
-            .collect::<Vec<_>>();
-        parsed.messages =
-            super::super::codec_pi::decode_messages_with_ordinals(&messages, &ordinals)?.messages;
-    }
+    echoes.prepare_with(codec, parsed, &messages, true, |parsed, messages| {
+        codec.prepare_request(parsed, messages)?;
+        if codec == codec::Codec::Pi {
+            let ordinals = (0..messages.len())
+                .map(|index| window.ordinal_base.saturating_add(index as u64 + 1))
+                .collect::<Vec<_>>();
+            parsed.messages =
+                super::super::codec_pi::decode_messages_with_ordinals(messages, &ordinals)?
+                    .messages;
+        }
+        Ok(())
+    })?;
     ck_wire::project_messages(&parsed.messages).map_err(transient)
 }
 
@@ -369,9 +384,15 @@ mod tests {
             assert_eq!(captured, applied);
             let (full, full_projection) = full_input(store, codec);
             let mut tail = request();
-            let projection =
-                prepare_input(store, "tail-ref", window, Some(count - 1), codec, &mut tail)
-                    .unwrap();
+            let projection = prepare_input(
+                store,
+                "tail-ref",
+                window.through(Some(count - 1)),
+                codec,
+                &mut tail,
+                &Default::default(),
+            )
+            .unwrap();
             assert_eq!(
                 serde_json::to_vec(&tail.messages).unwrap(),
                 serde_json::to_vec(
@@ -460,10 +481,10 @@ mod tests {
             let projection = prepare_input(
                 &fixture.store,
                 "tail-ref",
-                index.window(applied),
-                Some(size - 1),
+                index.window(applied).through(Some(size - 1)),
                 codec::Codec::AnthropicMessages,
                 &mut parsed,
+                &Default::default(),
             )
             .unwrap();
             evaluate(

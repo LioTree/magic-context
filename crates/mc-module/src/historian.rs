@@ -4781,6 +4781,7 @@ mod tests {
             native_tail_section: false,
             runner_owned_reminders: false,
             logical_prefix: None,
+            native_reminder_strip_pending: false,
             native_fold_prefix: None,
             native_fold_sidecar: None,
             native_compartment_source_revision: None,
