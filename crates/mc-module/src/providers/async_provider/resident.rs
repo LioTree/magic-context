@@ -365,6 +365,17 @@ pub(crate) mod counters {
         VIEWS.with(|cell| cell.set(cell.get() + 1));
     }
 
+    static SKIPPED: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+
+    /// Engine passes skipped by any provider in this process, so a
+    /// differential can show its resident side really skipped them.
+    pub fn engine_pass_skipped() {
+        SKIPPED.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+    }
+    pub fn skipped_engine_passes() -> u64 {
+        SKIPPED.load(std::sync::atomic::Ordering::Relaxed)
+    }
+
     pub fn read() -> Work {
         Work {
             parsed: PARSED.with(Cell::get),

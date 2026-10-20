@@ -3170,6 +3170,10 @@ impl McHandler {
             .as_ref()
             .is_some_and(transform::compaction::can_skip_classified);
         #[cfg(test)]
+        if skip {
+            resident::counters::engine_pass_skipped();
+        }
+        #[cfg(test)]
         if !skip {
             let units = store
                 .load_compaction_trigger_core(&namespace)

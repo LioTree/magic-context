@@ -458,6 +458,10 @@ struct Pair {
     seq: u64,
     model: String,
     log: Vec<String>,
+    /// Where the two providers' engine cache states first differed (a
+    /// skipped engine pass leaves its writes out), for a failure message.
+    /// It is a diagnostic, not part of the comparison.
+    engine_drift: Option<String>,
     _project: tempfile::TempDir,
 }
 
@@ -508,6 +512,7 @@ impl Pair {
             seq: 0,
             model: "fixture".into(),
             log: Vec::new(),
+            engine_drift: None,
             _project: project,
         };
         let mut setup = json!({"method":"compaction.setup","params":{"session":"s","harness":profile.harness(),"request_id":"setup","model":"fixture","context_window":100_000,"composition":{"render_tags":true},"params":{"serializer_profile":profile.wire()},"now":1}});
@@ -542,16 +547,66 @@ impl Pair {
         let oracle = op(&self.oracle).await;
         self.oracle.settle().await;
         self.log.push(label.to_owned());
+        if self.engine_drift.is_none() {
+            self.engine_drift = self.engine_state_drift();
+        }
         assert_eq!(
             resident,
             oracle,
-            "{:?} answer diverged at step {} ({label}); steps: {:?}",
+            "{:?} answer diverged at step {} ({label}); engine state drift: {:?}; steps: {:?}",
             self.profile,
             self.log.len(),
+            self.engine_drift,
             self.log
         );
         self.compare(label);
         resident
+    }
+
+    /// The engine cache-state fields (meta members, frozen unit keys) that
+    /// differ between the two providers now, with the step, if any do.
+    fn engine_state_drift(&self) -> Option<String> {
+        let side = |side: &Side| {
+            let head = load_head(side.store(), &self.reference).ok()??;
+            let loaded = side.store().load(&head.namespace()).ok()?;
+            let mut meta = serde_json::to_value(&loaded.meta).ok()?;
+            meta["frozen_unit_keys"] = json!(loaded
+                .core
+                .frozen_units
+                .iter()
+                .map(|unit| unit.key.clone())
+                .collect::<Vec<_>>());
+            meta["boundary_id"] = json!(loaded.core.boundary_id);
+            // Clock readings differ between the two runs by construction.
+            if let Some(baseline) = meta.get_mut("tail_hygiene_baseline") {
+                if let Some(baseline) = baseline.as_object_mut() {
+                    baseline.remove("computed_at_ms");
+                }
+            }
+            if let Value::Object(fields) = &mut meta {
+                fields.retain(|key, _| !key.ends_with("_at_ms") && key != "expiry_cutoff_ms");
+            }
+            Some(meta)
+        };
+        let (Some(Value::Object(resident)), Some(Value::Object(oracle))) =
+            (side(&self.resident), side(&self.oracle))
+        else {
+            return None;
+        };
+        let differing = resident
+            .keys()
+            .chain(oracle.keys())
+            .filter(|key| resident.get(*key) != oracle.get(*key))
+            .cloned()
+            .collect::<BTreeSet<_>>();
+        (!differing.is_empty()).then(|| {
+            format!(
+                "after step {} ({}): {:?}",
+                self.log.len(),
+                self.log.last().map_or("", String::as_str),
+                differing
+            )
+        })
     }
 
     fn compare(&self, label: &str) {
@@ -909,7 +964,10 @@ async fn run(sessions: u64, steps: u64, first_seed: u64) {
         let profile = PROFILES[(index % 4) as usize];
         published += session(profile, first_seed + index, steps).await;
     }
-    eprintln!("differential: {sessions} sessions, {steps} steps each, {published} views retained at the end");
+    eprintln!(
+        "differential: {sessions} sessions, {steps} steps each, {published} views retained at the end; the resident side skipped {} engine passes",
+        resident::counters::skipped_engine_passes()
+    );
 }
 
 /// Two sessions per schema in the default suite.
@@ -931,20 +989,57 @@ async fn resident_matches_the_full_recompute_oracle_over_many_sessions() {
         .ok()
         .and_then(|value| value.parse().ok())
         .unwrap_or(24u64);
+    let first = std::env::var("MC_ASYNC_DIFFERENTIAL_FIRST_SEED")
+        .ok()
+        .and_then(|value| value.parse().ok())
+        .unwrap_or(1_000u64);
+    // Every session runs to its end or its first divergence; all divergences
+    // are listed together, so one does not hide the others.
+    let mut failures = Vec::new();
     let mut tasks = Vec::new();
+    let settle = |tasks: &mut Vec<(u64, Profile, tokio::task::JoinHandle<usize>)>| {
+        let drained = tasks.drain(..).collect::<Vec<_>>();
+        async move {
+            let mut failed = Vec::new();
+            for (seed, profile, task) in drained {
+                if let Err(error) = task.await {
+                    let message = error
+                        .try_into_panic()
+                        .ok()
+                        .and_then(|panic| {
+                            panic
+                                .downcast_ref::<String>()
+                                .cloned()
+                                .or_else(|| panic.downcast_ref::<&str>().map(|s| s.to_string()))
+                        })
+                        .unwrap_or_default();
+                    failed.push(format!(
+                        "seed {seed} {profile:?}: {}",
+                        message.chars().take(1_500).collect::<String>()
+                    ));
+                }
+            }
+            failed
+        }
+    };
     for index in 0..sessions {
         let profile = PROFILES[(index % 4) as usize];
-        tasks.push(tokio::spawn(session(profile, 1_000 + index, steps)));
+        let seed = first + index;
+        tasks.push((seed, profile, tokio::spawn(session(profile, seed, steps))));
         if tasks.len() == 8 {
-            for task in tasks.drain(..) {
-                task.await.unwrap();
-            }
+            failures.extend(settle(&mut tasks).await);
         }
     }
-    for task in tasks {
-        task.await.unwrap();
+    failures.extend(settle(&mut tasks).await);
+    eprintln!(
+        "differential: {sessions} sessions, {steps} steps each, {} diverged; the resident side skipped {} engine passes",
+        failures.len(),
+        resident::counters::skipped_engine_passes()
+    );
+    for failure in &failures {
+        eprintln!("DIVERGENCE {failure}");
     }
-    eprintln!("differential: {sessions} sessions, {steps} steps each");
+    assert!(failures.is_empty(), "{} sessions diverged", failures.len());
 }
 
 /// A Setup without a lineage, then notices naming the runner's lineage: the
