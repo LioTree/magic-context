@@ -4,6 +4,7 @@ import {
     resetSessionMetaCollectionSchema,
     SESSION_META_CHUNKS_DDL,
     SESSION_META_COLLECTION_DEFAULTS,
+    SESSION_META_COLLECTION_REVISIONS_DDL,
     type SessionMetaCollection,
     writeSessionMetaCollectionBytes,
 } from "./storage-session-collections";
@@ -12,6 +13,7 @@ import {
 export function splitSessionMetaPayloads(db: Database): void {
     db.exec(SESSION_RENDER_CACHE_DDL);
     db.exec(SESSION_META_CHUNKS_DDL);
+    db.exec(SESSION_META_COLLECTION_REVISIONS_DDL);
     const columns = new Set(
         (db.prepare("PRAGMA table_info(session_meta)").all() as { name: string }[]).map(
             (column) => column.name,

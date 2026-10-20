@@ -1,4 +1,4 @@
-import { sessionMetaCollectionSelect } from "../../plugin/src/features/magic-context/storage-session-collections";
+import { readSessionMetaCollection } from "../../plugin/src/features/magic-context/storage-session-collections";
 /**
  * Pi-side `<session-history>` injection — mirrors OpenCode's
  * `prepareCompartmentInjection` + `renderCompartmentInjection`
@@ -2558,8 +2558,10 @@ function readCachedPiM0M1Row(
 	sessionId: string,
 ): CachedPiM0M1Row | null {
 	return db
-		.prepare(
-			`SELECT ${sessionRenderCacheSelect("cached_m0_bytes")},
+		.transaction(() => {
+			const row = db
+				.prepare(
+					`SELECT ${sessionRenderCacheSelect("cached_m0_bytes")},
 			    cached_m0_score_selection_watermark,
 			    ${sessionRenderCacheSelect("cached_m0_mural_data_url")},
 			    cached_m0_mural_hash,
@@ -2578,12 +2580,23 @@ function readCachedPiM0M1Row(
 			    cached_m0_system_hash,
 			    cached_m0_model_key,
 			    cached_m0_project_identity,
-			    cached_m0_last_baseline_end_message_id,
-			    ${sessionMetaCollectionSelect("memory_block_ids", "memory_block_ids", db)}
+			    cached_m0_last_baseline_end_message_id
 			FROM session_meta
 			  WHERE session_id = ?`,
-		)
-		.get(sessionId) as CachedPiM0M1Row | null;
+				)
+				.get(sessionId) as CachedPiM0M1Row | null;
+			return row
+				? {
+						...row,
+						memory_block_ids: readSessionMetaCollection(
+							db,
+							sessionId,
+							"memory_block_ids",
+						) as string | null,
+					}
+				: null;
+		})
+		.deferred();
 }
 
 export interface PiM0M1PassSnapshot {
@@ -3480,11 +3493,13 @@ export function injectM0M1Pi(
 	// SOFT and defer passes that must not read them.
 	const memoryCount = parseMemoryBlockIds(
 		(
-			db
-				.prepare(
-					`SELECT ${sessionMetaCollectionSelect("memory_block_ids", "memory_block_ids", db)} FROM session_meta WHERE session_id = ?`,
-				)
-				.get(state.sessionId) as { memory_block_ids: string | null } | null
+			{
+				memory_block_ids: readSessionMetaCollection(
+					db,
+					state.sessionId,
+					"memory_block_ids",
+				),
+			} as { memory_block_ids: string | null } | null
 		)?.memory_block_ids ?? null,
 	).length;
 	const result: PiM0M1InjectionResult = {

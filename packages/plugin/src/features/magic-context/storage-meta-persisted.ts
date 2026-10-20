@@ -26,7 +26,7 @@ import {
     updateTrailingBlankDecisions,
 } from "./storage-replay-document";
 import {
-    sessionMetaCollectionSelect,
+    readSessionMetaCollection,
     updateSessionMetaCollection,
 } from "./storage-session-collections";
 
@@ -1642,11 +1642,9 @@ export function clearPersistedNoteNudge(db: Database, sessionId: string): void {
 }
 
 export function getNoteNudgeAnchors(db: Database, sessionId: string): NoteNudgeAnchor[] {
-    const row = db
-        .prepare(
-            `SELECT ${sessionMetaCollectionSelect("note_nudge_anchors", "note_nudge_anchors", db)} FROM session_meta WHERE session_id = ?`,
-        )
-        .get(sessionId) as { note_nudge_anchors?: string | null } | undefined;
+    const row = {
+        note_nudge_anchors: readSessionMetaCollection(db, sessionId, "note_nudge_anchors"),
+    } as { note_nudge_anchors?: string | null } | undefined;
     return parseJsonArray(row?.note_nudge_anchors, isValidNoteNudgeAnchor);
 }
 
@@ -1654,11 +1652,13 @@ export function getAutoSearchHintDecisions(
     db: Database,
     sessionId: string,
 ): AutoSearchHintDecision[] {
-    const row = db
-        .prepare(
-            `SELECT ${sessionMetaCollectionSelect("auto_search_hint_decisions", "auto_search_hint_decisions", db)} FROM session_meta WHERE session_id = ?`,
-        )
-        .get(sessionId) as { auto_search_hint_decisions?: string | null } | undefined;
+    const row = {
+        auto_search_hint_decisions: readSessionMetaCollection(
+            db,
+            sessionId,
+            "auto_search_hint_decisions",
+        ),
+    } as { auto_search_hint_decisions?: string | null } | undefined;
     return parseJsonArray(row?.auto_search_hint_decisions, isValidAutoSearchHintDecision);
 }
 
@@ -1684,11 +1684,9 @@ function casUpdateJsonArrayColumn<T>(
         ensureSessionMetaRow(db, sessionId);
     }
     for (let attempt = 0; attempt < CAS_RETRY_LIMIT; attempt += 1) {
-        const row = db
-            .prepare(
-                `SELECT ${sessionMetaCollectionSelect(column, column, db)} FROM session_meta WHERE session_id = ?`,
-            )
-            .get(sessionId) as Record<string, string | null> | undefined;
+        const row = { [column]: readSessionMetaCollection(db, sessionId, column) } as
+            | Record<string, string | null>
+            | undefined;
         // Preserve the RAW stored value (may be SQL NULL on a legacy row written
         // before the NOT-NULL default / v17 heal). The CAS predicate below uses
         // `IS ?` so it matches NULL too — a `= ?` predicate with the coalesced
@@ -2590,20 +2588,24 @@ export function serializeStrippedPlaceholderState(state: StrippedPlaceholderStat
 }
 
 export function getStrippedPlaceholderIds(db: Database, sessionId: string): Set<string> {
-    const row = db
-        .prepare(
-            `SELECT ${sessionMetaCollectionSelect("stripped_placeholder_ids", "stripped_placeholder_ids", db)} FROM session_meta WHERE session_id = ?`,
-        )
-        .get(sessionId) as { stripped_placeholder_ids?: string } | null;
+    const row = {
+        stripped_placeholder_ids: readSessionMetaCollection(
+            db,
+            sessionId,
+            "stripped_placeholder_ids",
+        ),
+    } as { stripped_placeholder_ids?: string } | null;
     return new Set(parseStrippedPlaceholderState(row?.stripped_placeholder_ids).ids);
 }
 
 export function getHiddenSeamPlaceholderIds(db: Database, sessionId: string): Set<string> {
-    const row = db
-        .prepare(
-            `SELECT ${sessionMetaCollectionSelect("stripped_placeholder_ids", "stripped_placeholder_ids", db)} FROM session_meta WHERE session_id = ?`,
-        )
-        .get(sessionId) as { stripped_placeholder_ids?: string } | null;
+    const row = {
+        stripped_placeholder_ids: readSessionMetaCollection(
+            db,
+            sessionId,
+            "stripped_placeholder_ids",
+        ),
+    } as { stripped_placeholder_ids?: string } | null;
     return new Set(parseStrippedPlaceholderState(row?.stripped_placeholder_ids).hiddenSeamIds);
 }
 
@@ -2635,11 +2637,13 @@ export function applyStrippedPlaceholderDelta(
     ensureSessionMetaRow(db, sessionId);
 
     for (let attempt = 0; attempt < CAS_RETRY_LIMIT; attempt += 1) {
-        const row = db
-            .prepare(
-                `SELECT ${sessionMetaCollectionSelect("stripped_placeholder_ids", "stripped_placeholder_ids", db)} FROM session_meta WHERE session_id = ?`,
-            )
-            .get(sessionId) as { stripped_placeholder_ids?: string | null } | undefined;
+        const row = {
+            stripped_placeholder_ids: readSessionMetaCollection(
+                db,
+                sessionId,
+                "stripped_placeholder_ids",
+            ),
+        } as { stripped_placeholder_ids?: string | null } | undefined;
         const rawStored = row ? (row.stripped_placeholder_ids ?? null) : null;
         const parsed = parseStrippedPlaceholderState(rawStored);
         const current = new Set(parsed.ids);
@@ -2769,11 +2773,13 @@ export function clearThinkingBindingRecoveryIf(
  * the applied set never shrinks while the session exists.
  */
 export function getMergedReasoningStrippedIds(db: Database, sessionId: string): Set<string> {
-    const row = db
-        .prepare(
-            `SELECT ${sessionMetaCollectionSelect("merged_reasoning_stripped_ids", "merged_reasoning_stripped_ids", db)} FROM session_meta WHERE session_id = ?`,
-        )
-        .get(sessionId) as { merged_reasoning_stripped_ids?: string } | null;
+    const row = {
+        merged_reasoning_stripped_ids: readSessionMetaCollection(
+            db,
+            sessionId,
+            "merged_reasoning_stripped_ids",
+        ),
+    } as { merged_reasoning_stripped_ids?: string } | null;
     return new Set(parseStrippedBlob(row?.merged_reasoning_stripped_ids));
 }
 
@@ -2792,11 +2798,13 @@ export function addMergedReasoningStrippedIds(
     ensureSessionMetaRow(db, sessionId);
 
     for (let attempt = 0; attempt < CAS_RETRY_LIMIT; attempt += 1) {
-        const row = db
-            .prepare(
-                `SELECT ${sessionMetaCollectionSelect("merged_reasoning_stripped_ids", "merged_reasoning_stripped_ids", db)} FROM session_meta WHERE session_id = ?`,
-            )
-            .get(sessionId) as { merged_reasoning_stripped_ids?: string | null } | undefined;
+        const row = {
+            merged_reasoning_stripped_ids: readSessionMetaCollection(
+                db,
+                sessionId,
+                "merged_reasoning_stripped_ids",
+            ),
+        } as { merged_reasoning_stripped_ids?: string | null } | undefined;
         const rawStored = row ? (row.merged_reasoning_stripped_ids ?? null) : null;
         const current = new Set<string>(parseStrippedBlob(rawStored));
         const frozenParts = readFrozenMergedReasoningParts(current);
@@ -2939,11 +2947,13 @@ export function demoteTrailingBlankKeepDecisions(
  * mid-prefix on a defer pass (which busts the Anthropic prompt cache).
  */
 export function getStaleReduceStrippedIds(db: Database, sessionId: string): Set<string> {
-    const row = db
-        .prepare(
-            `SELECT ${sessionMetaCollectionSelect("stale_reduce_stripped_ids", "stale_reduce_stripped_ids", db)} FROM session_meta WHERE session_id = ?`,
-        )
-        .get(sessionId) as { stale_reduce_stripped_ids?: string } | null;
+    const row = {
+        stale_reduce_stripped_ids: readSessionMetaCollection(
+            db,
+            sessionId,
+            "stale_reduce_stripped_ids",
+        ),
+    } as { stale_reduce_stripped_ids?: string } | null;
     return new Set(parseStrippedBlob(row?.stale_reduce_stripped_ids));
 }
 
@@ -2963,11 +2973,13 @@ export function addStaleReduceStrippedIds(
     ensureSessionMetaRow(db, sessionId);
 
     for (let attempt = 0; attempt < CAS_RETRY_LIMIT; attempt += 1) {
-        const row = db
-            .prepare(
-                `SELECT ${sessionMetaCollectionSelect("stale_reduce_stripped_ids", "stale_reduce_stripped_ids", db)} FROM session_meta WHERE session_id = ?`,
-            )
-            .get(sessionId) as { stale_reduce_stripped_ids?: string | null } | undefined;
+        const row = {
+            stale_reduce_stripped_ids: readSessionMetaCollection(
+                db,
+                sessionId,
+                "stale_reduce_stripped_ids",
+            ),
+        } as { stale_reduce_stripped_ids?: string | null } | undefined;
         const rawStored = row ? (row.stale_reduce_stripped_ids ?? null) : null;
         const current = new Set<string>(parseStrippedBlob(rawStored));
         let changed = false;
@@ -3039,11 +3051,13 @@ export function getProcessedImageMarkers(
     db: Database,
     sessionId: string,
 ): Map<string, ProcessedImageMarker> {
-    const row = db
-        .prepare(
-            `SELECT ${sessionMetaCollectionSelect("processed_image_stripped_ids", "processed_image_stripped_ids", db)} FROM session_meta WHERE session_id = ?`,
-        )
-        .get(sessionId) as { processed_image_stripped_ids?: string } | null;
+    const row = {
+        processed_image_stripped_ids: readSessionMetaCollection(
+            db,
+            sessionId,
+            "processed_image_stripped_ids",
+        ),
+    } as { processed_image_stripped_ids?: string } | null;
     return parseProcessedImageMarkers(row?.processed_image_stripped_ids);
 }
 
@@ -3064,11 +3078,13 @@ export function addProcessedImageStrippedIds(
     ensureSessionMetaRow(db, sessionId);
 
     for (let attempt = 0; attempt < CAS_RETRY_LIMIT; attempt += 1) {
-        const row = db
-            .prepare(
-                `SELECT ${sessionMetaCollectionSelect("processed_image_stripped_ids", "processed_image_stripped_ids", db)} FROM session_meta WHERE session_id = ?`,
-            )
-            .get(sessionId) as { processed_image_stripped_ids?: string | null } | undefined;
+        const row = {
+            processed_image_stripped_ids: readSessionMetaCollection(
+                db,
+                sessionId,
+                "processed_image_stripped_ids",
+            ),
+        } as { processed_image_stripped_ids?: string | null } | undefined;
         const rawStored = row ? (row.processed_image_stripped_ids ?? null) : null;
         const current = parseProcessedImageMarkers(rawStored);
         let changed = false;
@@ -3227,25 +3243,34 @@ export function loadPostprocessReplaySnapshot(
     sessionId: string,
 ): PostprocessReplaySnapshot {
     const row = db
-        .prepare(
-            `SELECT ${sessionMetaCollectionSelect("stale_reduce_stripped_ids", "stale_reduce_stripped_ids", db)},
-                ${sessionMetaCollectionSelect("processed_image_stripped_ids", "processed_image_stripped_ids", db)},
-                ${sessionMetaCollectionSelect("stripped_placeholder_ids", "stripped_placeholder_ids", db)},
-                ${sessionMetaCollectionSelect("note_nudge_anchors", "note_nudge_anchors", db)},
-                ${sessionMetaCollectionSelect("auto_search_hint_decisions", "auto_search_hint_decisions", db)},
-                todo_permission_denied,
-                todo_synthetic_call_id,
-                todo_synthetic_anchor_message_id,
-                todo_synthetic_state_json,
-                pending_compaction_marker_state,
-                compaction_marker_state,
-                compaction_marker_target_end_message_id,
-                ${sessionMetaCollectionSelect("merged_reasoning_stripped_ids", "merged_reasoning_stripped_ids", db)},
-                thinking_binding_recovery_target,
-                ${sessionMetaCollectionSelect("trailing_blank_decisions", "trailing_blank_decisions", db)}
-            FROM session_meta WHERE session_id = ?`,
-        )
-        .get(sessionId) as
+        .transaction(() => {
+            const header = db
+                .prepare(`SELECT todo_permission_denied,todo_synthetic_call_id,todo_synthetic_anchor_message_id,
+            todo_synthetic_state_json,pending_compaction_marker_state,compaction_marker_state,
+            compaction_marker_target_end_message_id,thinking_binding_recovery_target
+            FROM session_meta WHERE session_id=?`)
+                .get(sessionId) as Record<string, unknown> | undefined;
+            if (!header) return undefined;
+            const collections = [
+                "stale_reduce_stripped_ids",
+                "processed_image_stripped_ids",
+                "stripped_placeholder_ids",
+                "note_nudge_anchors",
+                "auto_search_hint_decisions",
+                "merged_reasoning_stripped_ids",
+                "trailing_blank_decisions",
+            ] as const;
+            return {
+                ...header,
+                ...Object.fromEntries(
+                    collections.map((column) => [
+                        column,
+                        readSessionMetaCollection(db, sessionId, column),
+                    ]),
+                ),
+            };
+        })
+        .deferred() as
         | {
               stale_reduce_stripped_ids?: string | null;
               processed_image_stripped_ids?: string | null;

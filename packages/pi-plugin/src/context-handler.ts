@@ -1,4 +1,4 @@
-import { sessionMetaCollectionSelect } from "../../plugin/src/features/magic-context/storage-session-collections";
+import { readSessionMetaCollection } from "../../plugin/src/features/magic-context/storage-session-collections";
 /**
  * Pi `context` event handler — the per-LLM-call transform pipeline.
  *
@@ -441,6 +441,7 @@ import {
 import {
 	notePiPublicationIssue,
 	PiServedEnvelopeUnavailable,
+	preparePiServedNumbers,
 	publishPiServedNumbers,
 	readPiCommittedServedNumbers,
 } from "./pi-served-identities";
@@ -6818,6 +6819,11 @@ export function registerPiContextHandler(
 								...getPiServedTagNumbers(sessionId),
 								...(result.servedTagNumbers ?? []),
 							]),
+						prepareServedNumbers: () =>
+							preparePiServedNumbers(options.db, sessionId, [
+								...getPiServedTagNumbers(sessionId),
+								...(result.servedTagNumbers ?? []),
+							]),
 						assertCurrentPass: budget.assertOutcome,
 						hostEnvelopeSignature,
 						snapshot: lkgPassSnapshot,
@@ -12675,14 +12681,29 @@ function loadPiPostTransformSnapshot(
 	sessionId: string,
 ): PiPostTransformSnapshot {
 	const row = db
-		.prepare(
-			`SELECT ${sessionMetaCollectionSelect("note_nudge_anchors", "note_nudge_anchors", db)},
-			    ${sessionMetaCollectionSelect("auto_search_hint_decisions", "auto_search_hint_decisions", db)},
-			    note_nudge_trigger_pending
-			FROM session_meta
-			  WHERE session_id = ?`,
-		)
-		.get(sessionId) as
+		.transaction(() => {
+			const header = db
+				.prepare(
+					"SELECT note_nudge_trigger_pending FROM session_meta WHERE session_id=?",
+				)
+				.get(sessionId) as { note_nudge_trigger_pending?: unknown } | undefined;
+			return header
+				? {
+						...header,
+						note_nudge_anchors: readSessionMetaCollection(
+							db,
+							sessionId,
+							"note_nudge_anchors",
+						),
+						auto_search_hint_decisions: readSessionMetaCollection(
+							db,
+							sessionId,
+							"auto_search_hint_decisions",
+						),
+					}
+				: undefined;
+		})
+		.deferred() as
 		| {
 				note_nudge_anchors?: unknown;
 				auto_search_hint_decisions?: unknown;

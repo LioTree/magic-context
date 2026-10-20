@@ -36,6 +36,7 @@ function previous() {
         db.exec(`ALTER TABLE session_meta ADD COLUMN ${column} TEXT DEFAULT '${fallback}'`);
     }
     db.exec("DROP TABLE session_meta_chunks");
+    db.exec("DROP TABLE session_meta_collection_revisions");
     return db;
 }
 

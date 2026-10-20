@@ -22,14 +22,16 @@ test("foreground meter observes payload reads, outer writer hold and nested save
         const start = performance.now();
         while (performance.now() - start < 20) {}
     }).immediate();
-    select.get("one");
+    meter.collectionAccess(()=>select.get("one"));
     expect(db.prepare("WITH source AS (SELECT 1 AS value) SELECT value FROM source").get()).toEqual(
         { value: 1 },
     );
     meter.handlerEnd(timer);
     meter.stop();
     const record = meter.records[0];
-    expect(record.timing.payloadRead.calls).toBe(2);
+    expect(record.timing.payloadRead.calls).toBe(1);
+    expect(record.timing.collectionSql.calls).toBe(1);
+    expect(record.timing.collectionAccess.calls).toBe(1);
     expect(record.timing.payloadRead.cpuMs).toBeGreaterThanOrEqual(0);
     expect(record.timing.payloadRead.wallMs).toBeGreaterThan(0);
     expect(record.transactions).toHaveLength(1);

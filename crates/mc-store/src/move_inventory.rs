@@ -1914,6 +1914,18 @@ pub const TABLES: &[TableInventory] = &[
         Some(KeyPolicy::Preserve),
         None
     ),
+    // Chunk imports rebuild local revision identities through SQLite triggers.
+    table!(
+        Context,
+        "session_meta_collection_revisions",
+        LocalReset,
+        RowSelector::Predicate("session_id = ?1"),
+        &["id"],
+        &["id", "session_id", "column_name", "revision"],
+        &[],
+        None,
+        None
+    ),
     table!(
         Context,
         "session_projects",
@@ -4331,7 +4343,7 @@ mod tests {
             .unwrap();
         assert_bun_succeeded(&output);
         let session_tables: Vec<String> = serde_json::from_slice(&output.stdout).unwrap();
-        assert_eq!(session_tables.len(), 48);
+        assert_eq!(session_tables.len(), 49);
         assert!(session_tables
             .iter()
             .any(|table| table == "session_render_cache"));

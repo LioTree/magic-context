@@ -309,6 +309,17 @@ const TAG_COLUMNS_OUTSIDE_IDENTITY = new Set([
 ]);
 
 let tagIdentityWriteGeneration = 0;
+const rollbackStateKey = Symbol.for("magic-context.sqlite.rollback-generation.v1");
+
+/** Invalidate observations of uncommitted values when a transaction or savepoint rolls back. */
+export function getSqliteRollbackGeneration(db: BetterSqlite3.Database): number | undefined {
+    return (db as unknown as Record<symbol, { generation: number }>)[rollbackStateKey]?.generation;
+}
+
+function noteSqliteRollback(db: BetterSqlite3.Database): void {
+    const state = (db as unknown as Record<symbol, { generation: number }>)[rollbackStateKey];
+    if (state) state.generation++;
+}
 
 /**
  * Whether a write statement may change an existing `tags` row's identity
@@ -400,7 +411,20 @@ export function getTagIdentityWriteGeneration(): number {
  * default to IMMEDIATE; explicit deferred calls and readonly handles keep read
  * snapshots without acquiring the writer lock. */
 function installTransactionRouting(db: BetterSqlite3.Database, readonly: boolean): void {
-    const nativeExec = db.exec.bind(db);
+    // Transparent connection proxies must observe the same rollback lifetime as the underlying handle.
+    Object.defineProperty(db, rollbackStateKey, { value: { generation: 0 } });
+    const executeNative = db.exec.bind(db);
+    const nativeExec = (sql: string) => {
+        const wasInTransaction = isInTransaction(db);
+        try {
+            return executeNative(sql);
+        } catch (error) {
+            if (wasInTransaction && !isInTransaction(db)) noteSqliteRollback(db);
+            throw error;
+        } finally {
+            if (/^\s*ROLLBACK\b/i.test(sql)) noteSqliteRollback(db);
+        }
+    };
     Object.defineProperty(db, "exec", {
         configurable: true,
         writable: true,
@@ -452,16 +476,25 @@ function installTransactionRouting(db: BetterSqlite3.Database, readonly: boolean
             const statement = nativePrepare(sql);
             // SELECT/EXPLAIN cannot acquire a writer. Treat CTEs conservatively:
             // WITH can introduce INSERT/UPDATE/DELETE as well as a read query.
-            if (!readonly && !/^\s*(?:SELECT|EXPLAIN|PRAGMA)\b/i.test(sql)) {
-                const changesTagIdentity = mayChangeTagIdentity(sql);
+            {
+                const writes = !readonly && !/^\s*(?:SELECT|EXPLAIN|PRAGMA)\b/i.test(sql);
+                const changesTagIdentity = writes && mayChangeTagIdentity(sql);
                 for (const method of ["run", "get", "all"] as const) {
                     const execute = statement[method].bind(statement);
                     Object.defineProperty(statement, method, {
                         configurable: true,
                         // biome-ignore lint/suspicious/noExplicitAny: retain SQLite's native binding overloads.
                         value: (...args: any[]) => {
+                            const wasInTransaction = isInTransaction(db);
                             try {
-                                return withAutocommitTimeout(db, () => execute(...args));
+                                return writes
+                                    ? withAutocommitTimeout(db, () => execute(...args))
+                                    : execute(...args);
+                            } catch (error) {
+                                // SQLite can roll back a transaction automatically, without an explicit ROLLBACK.
+                                if (wasInTransaction && !isInTransaction(db))
+                                    noteSqliteRollback(db);
+                                throw error;
                             } finally {
                                 if (changesTagIdentity) tagIdentityWriteGeneration += 1;
                             }

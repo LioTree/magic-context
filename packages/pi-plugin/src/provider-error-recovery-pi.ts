@@ -29,7 +29,7 @@ import { isAnthropicFamilyRoute } from "@magic-context/core/hooks/magic-context/
 import { getHarness } from "@magic-context/core/shared/harness";
 import { log } from "@magic-context/core/shared/logger";
 import {
-	sessionMetaCollectionSelect,
+	readSessionMetaCollection,
 	updateSessionMetaCollection,
 } from "../../plugin/src/features/magic-context/storage-session-collections";
 import { resetPiUpperEstimateReclaim } from "./pi-fit-reclaim";
@@ -525,13 +525,13 @@ export function preparePiThinkingStripWrite(
 				"Cannot persist thinking omission without a stable entry id",
 			);
 		};
-	const row = db
-		.prepare(
-			`SELECT ${sessionMetaCollectionSelect("merged_reasoning_stripped_ids", "merged_reasoning_stripped_ids", db)} FROM session_meta WHERE session_id = ?`,
-		)
-		.get(sessionId) as
-		| { merged_reasoning_stripped_ids: string | null }
-		| undefined;
+	const row = {
+		merged_reasoning_stripped_ids: readSessionMetaCollection(
+			db,
+			sessionId,
+			"merged_reasoning_stripped_ids",
+		),
+	} as { merged_reasoning_stripped_ids: string | null } | undefined;
 	const raw = row?.merged_reasoning_stripped_ids ?? null;
 	let stored: unknown;
 	try {
@@ -633,11 +633,13 @@ function readPiOmissionLedger(
 	db: ContextDatabase,
 	sessionId: string,
 ): PiOmissionLedger {
-	const row = db
-		.prepare(
-			`SELECT ${sessionMetaCollectionSelect("merged_reasoning_stripped_ids", "merged_reasoning_stripped_ids", db)} FROM session_meta WHERE session_id = ?`,
-		)
-		.get(sessionId) as { merged_reasoning_stripped_ids?: string | null } | null;
+	const row = {
+		merged_reasoning_stripped_ids: readSessionMetaCollection(
+			db,
+			sessionId,
+			"merged_reasoning_stripped_ids",
+		),
+	} as { merged_reasoning_stripped_ids?: string | null } | null;
 	const raw = row?.merged_reasoning_stripped_ids ?? null;
 	let views = omissionLedgers.get(db);
 	if (!views) {

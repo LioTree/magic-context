@@ -459,6 +459,7 @@ export interface PiLkgCoordinator {
 	captureAppliedPass(args: {
 		/** Publish served identities inside the synchronous last-good request transaction. */
 		publishServedNumbers?: () => void;
+		prepareServedNumbers?: () => () => boolean;
 		assertCurrentPass?: () => void;
 		snapshot: PiLkgPassSnapshot;
 		outputMessages: readonly unknown[];
@@ -1638,6 +1639,7 @@ export function createPiLkgCoordinator(
 							// served numbers, but bind its certificate only at dispatch.
 							{
 								publishMetadata: args.publishServedNumbers,
+								prepareMetadata: args.prepareServedNumbers,
 								deferCertificate: true,
 							},
 							{

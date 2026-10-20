@@ -1,7 +1,7 @@
 import type { Database } from "../../shared/sqlite";
 import { ensureSessionMetaRow } from "./storage-meta-shared";
 import {
-    sessionMetaCollectionSelect,
+    readSessionMetaCollection,
     updateSessionMetaCollection,
 } from "./storage-session-collections";
 
@@ -58,11 +58,9 @@ function readEntries(raw: string | null): string[] {
 }
 
 export function getPiContentDecisions(db: Database, sessionId: string): Set<string> {
-    const row = db
-        .prepare(
-            `SELECT ${sessionMetaCollectionSelect("merged_reasoning_stripped_ids", "decisions", db)} FROM session_meta WHERE session_id = ?`,
-        )
-        .get(sessionId) as { decisions: string | null } | undefined;
+    const row = {
+        decisions: readSessionMetaCollection(db, sessionId, "merged_reasoning_stripped_ids"),
+    } as { decisions: string | null } | undefined;
     return new Set(
         readEntries(row?.decisions ?? null).filter(
             (value) => decodePiContentDecision(value) !== null,
@@ -83,11 +81,13 @@ export function freezePiContentDecision(
         return db
             .transaction(() => {
                 for (let attempt = 0; attempt < 5; attempt++) {
-                    const row = db
-                        .prepare(
-                            `SELECT ${sessionMetaCollectionSelect("merged_reasoning_stripped_ids", "decisions", db)} FROM session_meta WHERE session_id = ?`,
-                        )
-                        .get(sessionId) as { decisions: string | null };
+                    const row = {
+                        decisions: readSessionMetaCollection(
+                            db,
+                            sessionId,
+                            "merged_reasoning_stripped_ids",
+                        ),
+                    } as { decisions: string | null };
                     const current = readEntries(row.decisions);
                     if (current.includes(entry)) return true;
                     // Tags survive compartment projection; only actual deletion invalidates a choice.
@@ -155,11 +155,13 @@ export function withdrawPiContentDecision(
     return db
         .transaction(() => {
             for (let attempt = 0; attempt < 5; attempt++) {
-                const row = db
-                    .prepare(
-                        `SELECT ${sessionMetaCollectionSelect("merged_reasoning_stripped_ids", "decisions", db)} FROM session_meta WHERE session_id = ?`,
-                    )
-                    .get(sessionId) as { decisions: string | null } | undefined;
+                const row = {
+                    decisions: readSessionMetaCollection(
+                        db,
+                        sessionId,
+                        "merged_reasoning_stripped_ids",
+                    ),
+                } as { decisions: string | null } | undefined;
                 if (!row) return true;
                 const current = readEntries(row.decisions);
                 if (!current.includes(entry)) return true;

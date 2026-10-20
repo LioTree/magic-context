@@ -3,8 +3,12 @@ import { sessionLog } from "../../shared/logger";
 import { isRecord } from "../../shared/record-type-guard";
 import type { Database } from "../../shared/sqlite";
 import { ensureSessionMetaRow } from "./storage-meta-shared";
+import { collectionStateMatches } from "./storage-session-collection-state";
 import {
-    sessionMetaCollectionSelect,
+    applySessionMetaCollectionWrite,
+    isSessionMetaCollectionInline,
+    prepareSessionMetaCollectionWrite,
+    readSessionMetaCollection,
     sessionMetaCollectionValueSql,
     updateSessionMetaCollection,
 } from "./storage-session-collections";
@@ -282,14 +286,14 @@ function readRawReplayDocument(
     const snapshot = replaySnapshots.getStore();
     const reusable =
         !fresh && snapshot?.active && snapshot.db === db && snapshot.sessionId === sessionId;
-    if (reusable && snapshot.loaded) return snapshot.raw;
+    if (
+        reusable &&
+        snapshot.loaded &&
+        isSessionMetaCollectionInline(db, "trailing_blank_decisions")
+    )
+        return snapshot.raw;
     try {
-        const row = db
-            .prepare(
-                `SELECT ${sessionMetaCollectionSelect("trailing_blank_decisions", "trailing_blank_decisions", db)} FROM session_meta WHERE session_id = ?`,
-            )
-            .get(sessionId) as { trailing_blank_decisions?: unknown } | undefined;
-        const raw = row?.trailing_blank_decisions;
+        const raw = readSessionMetaCollection(db, sessionId, "trailing_blank_decisions");
         if (raw === null || raw === undefined || typeof raw === "string") {
             if (reusable) {
                 snapshot.raw = raw;
@@ -652,4 +656,41 @@ export function writeReplayDocument(db: Database, sessionId: string, doc: Replay
         "INSERT INTO session_replay_decisions (session_id, message_id, decision) VALUES (?, ?, ?)",
     );
     for (const [id, decision] of Object.entries(decisions)) insert.run(sessionId, id, decision);
+}
+
+/** Prepare the replay-document edit before the caller opens a transaction; apply the returned publisher inside it. */
+export function prepareReplayDocumentUpdate(
+    db: Database,
+    sessionId: string,
+    mutate: (doc: ReplayDocument) => boolean,
+): (() => boolean) | null {
+    if (isSessionMetaCollectionInline(db, "trailing_blank_decisions"))
+        return () => updateReplayDocument(db, sessionId, mutate);
+    invalidateReplayEnvelopeSnapshot(db, sessionId);
+    ensureSessionMetaRow(db, sessionId);
+    for (let attempt = 0; attempt < CAS_RETRY_LIMIT; attempt++) {
+        const raw = readRawReplayDocument(db, sessionId, true);
+        if (raw === MISSING_REPLAY_DOCUMENT_COLUMN) return null;
+        let doc: ReplayDocument;
+        try {
+            doc = parseReplayDocument(raw);
+        } catch (error) {
+            if (error instanceof ReplayDocumentError) return null;
+            throw error;
+        }
+        const next = mutate(doc) ? serializeReplayDocument(doc) : (raw ?? null);
+        const plan = prepareSessionMetaCollectionWrite(
+            db,
+            sessionId,
+            "trailing_blank_decisions",
+            next,
+        );
+        if (!collectionStateMatches(db, plan.previous, raw ?? null)) continue;
+        return () => {
+            const applied = applySessionMetaCollectionWrite(db, plan);
+            if (applied) invalidateReplayEnvelopeSnapshot(db, sessionId);
+            return applied;
+        };
+    }
+    return null;
 }

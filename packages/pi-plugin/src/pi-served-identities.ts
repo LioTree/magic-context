@@ -1,4 +1,5 @@
 import {
+	prepareReplayDocumentUpdate,
 	ReplayDocumentError,
 	readReplayEnvelope,
 	updateReplayDocument,
@@ -36,6 +37,27 @@ export function notePiPublicationIssue(
 		sessionId,
 		`Pi publication ${status} reason=${reason}; serving managed context`,
 	);
+}
+
+/** Prepare the served-number union and its chunk-write delta before the LKG publisher opens a transaction. */
+export function preparePiServedNumbers(
+	db: Database,
+	sessionId: string,
+	numbers: Iterable<number>,
+): () => boolean {
+	const delta = [...numbers];
+	parseNumbers(delta);
+	const publish = prepareReplayDocumentUpdate(db, sessionId, (doc) => {
+		const previous = parseNumbers(doc.piServedTagNumbers),
+			union = new Set(previous);
+		for (const number of delta) union.add(number);
+		if (union.size === previous.length) return false;
+		doc.version = 2;
+		doc.piServedTagNumbers = [...union];
+		return true;
+	});
+	if (!publish) throw new Error("Pi served-identity publication failed");
+	return publish;
 }
 
 function parseNumbers(value: unknown): number[] {

@@ -78,7 +78,10 @@ import { installCompartmentHistoryVersions } from "./storage-compartment-history
 import { installHostRunnerSchema } from "./storage-host-runner";
 import { ensureColumn, healAllNullColumns } from "./storage-schema-helpers";
 import { SESSION_RENDER_CACHE_DDL } from "./storage-session-cache";
-import { SESSION_META_CHUNKS_DDL } from "./storage-session-collections";
+import {
+    SESSION_META_CHUNKS_DDL,
+    SESSION_META_COLLECTION_REVISIONS_DDL,
+} from "./storage-session-collections";
 import { installTagIdentityRevisionTrigger } from "./storage-tag-identity-revision";
 import { StoreVersionMismatchError } from "./store-version-mismatch";
 import {
@@ -2405,6 +2408,7 @@ CREATE INDEX IF NOT EXISTS idx_dream_queue_pending ON dream_queue(started_at, en
         ensureColumn(db, "session_meta", "cached_m0_mural_data_url", "TEXT");
     db.exec(SESSION_RENDER_CACHE_DDL);
     db.exec(SESSION_META_CHUNKS_DDL);
+    db.exec(SESSION_META_COLLECTION_REVISIONS_DDL);
     ensureColumn(db, "session_meta", "cached_m0_mural_hash", "TEXT");
     // v88 (issue 492). The OpenCode host store exists in two projections and a
     // user can move between them in both directions, which renumbers the

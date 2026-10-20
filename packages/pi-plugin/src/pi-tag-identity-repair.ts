@@ -7,7 +7,7 @@ import {
 import { sessionLog } from "@magic-context/core/shared/logger";
 import type { Database } from "@magic-context/core/shared/sqlite";
 import {
-	sessionMetaCollectionSelect,
+	readSessionMetaCollection,
 	updateSessionMetaCollection,
 } from "../../plugin/src/features/magic-context/storage-session-collections";
 
@@ -240,11 +240,13 @@ export function acknowledgePiIdentityRebuilds(
 ): void {
 	try {
 		db.transaction(() => {
-			const row = db
-				.prepare(
-					`SELECT ${sessionMetaCollectionSelect("merged_reasoning_stripped_ids", "entries", db)} FROM session_meta WHERE session_id = ?`,
-				)
-				.get(sessionId) as { entries: string | null } | undefined;
+			const row = {
+				entries: readSessionMetaCollection(
+					db,
+					sessionId,
+					"merged_reasoning_stripped_ids",
+				),
+			} as { entries: string | null } | undefined;
 			if (!row?.entries) return;
 			const entries: unknown = JSON.parse(row.entries);
 			if (

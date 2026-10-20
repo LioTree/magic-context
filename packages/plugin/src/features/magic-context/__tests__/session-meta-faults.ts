@@ -51,6 +51,7 @@ function install(db: Database, rule: Rule): void {
         const write = collections.writeSessionMetaCollection;
         const writeCache = cache.writeSessionRenderCache;
         const clearCache = cache.clearSessionRenderCache;
+        const apply = collections.applySessionMetaCollectionWrite;
         let updateDepth = 0;
         const updateSpy = spyOn(collections, "updateSessionMetaCollection").mockImplementation(
             (connection, id, column, value, expected) => {
@@ -113,6 +114,34 @@ function install(db: Database, rule: Rule): void {
                 }
             },
         );
+        const applySpy = spyOn(collections, "applySessionMetaCollectionWrite").mockImplementation(
+            (connection, plan) => {
+                const rule =
+                    updateDepth === 0
+                        ? matching(connection, plan.sessionId, plan.column, plan.next.value)
+                        : undefined;
+                if (rule?.ignore) return false;
+                if (rule) fail(rule);
+                if (rule?.before) {
+                    rule.active = true;
+                    try {
+                        rule.before(plan.sessionId, plan.next.value);
+                    } finally {
+                        rule.active = false;
+                    }
+                }
+                const result = apply(connection, plan);
+                if (rule?.after && result) {
+                    rule.active = true;
+                    try {
+                        rule.after(plan.sessionId, plan.next.value, plan.previous.value);
+                    } finally {
+                        rule.active = false;
+                    }
+                }
+                return result;
+            },
+        );
         const cacheSpy = spyOn(cache, "writeSessionRenderCache").mockImplementation(
             (connection, id, column, value) => {
                 const rule = rules
@@ -153,6 +182,7 @@ function install(db: Database, rule: Rule): void {
             writeSpy.mockRestore();
             cacheSpy.mockRestore();
             clearSpy.mockRestore();
+            applySpy.mockRestore();
             restoreSpies = undefined;
         };
     }

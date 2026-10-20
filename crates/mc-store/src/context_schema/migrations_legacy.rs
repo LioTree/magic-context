@@ -531,11 +531,18 @@ fn stringify_js(raw: &RawValue) -> String {
 
 /// Preserve SQLite storage classes and raw bytes; replay documents are never parsed or reserialized.
 fn split_session_meta(db: &Connection, step: &Step) -> Result<(), UpgradeError> {
-    for name in ["session_render_cache", "session_meta_chunks"] {
+    for name in [
+        "session_render_cache",
+        "session_meta_chunks",
+        "session_meta_collection_revisions",
+    ] {
         let ddl = step
             .sql
             .iter()
-            .find(|sql| sql.starts_with(&format!("CREATE TABLE IF NOT EXISTS {name} (")))
+            .find(|sql| {
+                sql.trim_start()
+                    .starts_with(&format!("CREATE TABLE IF NOT EXISTS {name} ("))
+            })
             .ok_or_else(|| UpgradeError::InvalidAsset(format!("missing {name} DDL")))?;
         db.execute_batch(ddl)?;
     }
@@ -572,20 +579,24 @@ fn split_session_meta(db: &Connection, step: &Step) -> Result<(), UpgradeError> 
         if !column_exists(db, "session_meta", column)? {
             continue;
         }
-        db.execute(&format!("INSERT INTO session_meta_chunks(session_id,column_name,chunk,body)
-            SELECT session_id,'{column}',-1,CASE typeof({column}) WHEN 'null' THEN NULL WHEN 'text' THEN X'' WHEN 'blob' THEN 'blob' ELSE {column} END
-            FROM session_meta WHERE {column} IS NULL OR {column} != ?1
-            ON CONFLICT(session_id,column_name,chunk) DO UPDATE SET body=excluded.body WHERE body IS NOT excluded.body"), [fallback])?;
-        let rows: Vec<(String, Option<Vec<u8>>)> = {
-            let mut statement = db.prepare(&format!("SELECT session_id,CAST({column} AS BLOB) FROM session_meta WHERE {column} IS NULL OR {column} != ?1"))?;
-            let rows = statement.query_map([fallback], |row| Ok((row.get(0)?, row.get(1)?)))?;
+        let rows: Vec<(String, String, Option<Vec<u8>>)> = {
+            let mut statement = db.prepare(&format!("SELECT session_id,typeof({column}),CAST({column} AS BLOB) FROM session_meta WHERE {column} IS NULL OR {column} != ?1"))?;
+            let rows = statement.query_map([fallback], |row| {
+                Ok((row.get(0)?, row.get(1)?, row.get(2)?))
+            })?;
             rows.collect::<Result<_, _>>()?
         };
         {
             let mut upsert = db.prepare("INSERT INTO session_meta_chunks(session_id,column_name,chunk,body) VALUES (?1,?2,?3,?4)
                 ON CONFLICT(session_id,column_name,chunk) DO UPDATE SET body=excluded.body WHERE body IS NOT excluded.body")?;
             let mut trim = db.prepare("DELETE FROM session_meta_chunks WHERE session_id=?1 AND column_name=?2 AND chunk=?3")?;
-            for (session, bytes) in rows {
+            for (session, storage_type, bytes) in rows {
+                let marker = match storage_type.as_str() {
+                    "null" => rusqlite::types::Value::Null,
+                    "text" => rusqlite::types::Value::Blob(Vec::new()),
+                    value => rusqlite::types::Value::Text(value.into()),
+                };
+                upsert.execute(params![session, column, "-1", marker])?;
                 let pieces = bytes
                     .as_deref()
                     .map(layout_session_meta_bytes)
@@ -605,6 +616,9 @@ fn split_session_meta(db: &Connection, step: &Step) -> Result<(), UpgradeError> 
                     if !kept.contains(&key) {
                         trim.execute(params![session, column, key])?;
                     }
+                }
+                if storage_type == "integer" || storage_type == "real" {
+                    db.execute(&format!("UPDATE session_meta_chunks SET body=(SELECT {column} FROM session_meta WHERE session_id=?1) WHERE session_id=?1 AND column_name=?2 AND chunk='-1'"),params![session,column])?;
                 }
             }
         }

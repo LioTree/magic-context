@@ -17,6 +17,9 @@ export function deleteSessionMetaWithPayloads(
             if (removed.changes > 0) {
                 db.prepare("DELETE FROM session_render_cache WHERE session_id=?").run(sessionId);
                 db.prepare("DELETE FROM session_meta_chunks WHERE session_id=?").run(sessionId);
+                db.prepare("DELETE FROM session_meta_collection_revisions WHERE session_id=?").run(
+                    sessionId,
+                );
             }
             return removed.changes;
         })

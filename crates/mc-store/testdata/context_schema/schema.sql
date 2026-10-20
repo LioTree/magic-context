@@ -1001,6 +1001,35 @@ CREATE TABLE session_meta_chunks (
     PRIMARY KEY (session_id, column_name, chunk)
 ) WITHOUT ROWID;
 
+CREATE TABLE session_meta_collection_revisions (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    session_id TEXT NOT NULL,
+    column_name TEXT NOT NULL,
+    revision INTEGER NOT NULL CHECK(typeof(revision)='integer' AND revision > 0),
+    UNIQUE(session_id,column_name)
+);
+
+CREATE TRIGGER session_meta_chunks_revision_ai AFTER INSERT ON session_meta_chunks BEGIN
+    INSERT INTO session_meta_collection_revisions(session_id,column_name,revision)
+    SELECT NEW.session_id,NEW.column_name,1 WHERE 1
+    ON CONFLICT(session_id,column_name) DO UPDATE SET revision=revision+1;
+END;
+
+CREATE TRIGGER session_meta_chunks_revision_au AFTER UPDATE ON session_meta_chunks BEGIN
+    INSERT INTO session_meta_collection_revisions(session_id,column_name,revision)
+    SELECT OLD.session_id,OLD.column_name,1 WHERE OLD.session_id IS NOT NEW.session_id OR OLD.column_name IS NOT NEW.column_name
+    ON CONFLICT(session_id,column_name) DO UPDATE SET revision=revision+1;
+    INSERT INTO session_meta_collection_revisions(session_id,column_name,revision)
+    SELECT NEW.session_id,NEW.column_name,1 WHERE 1
+    ON CONFLICT(session_id,column_name) DO UPDATE SET revision=revision+1;
+END;
+
+CREATE TRIGGER session_meta_chunks_revision_ad AFTER DELETE ON session_meta_chunks BEGIN
+    INSERT INTO session_meta_collection_revisions(session_id,column_name,revision)
+    SELECT OLD.session_id,OLD.column_name,1 WHERE 1
+    ON CONFLICT(session_id,column_name) DO UPDATE SET revision=revision+1;
+END;
+
 CREATE TABLE identity_merge_log (
          id INTEGER PRIMARY KEY AUTOINCREMENT,
          from_identity TEXT NOT NULL,

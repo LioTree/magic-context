@@ -64,6 +64,7 @@ function outerVerb(sql: string): string {
 export function foregroundMeter(db: any) {
     let current: any = null;
     let phase = "handler";
+    let collectionDepth = 0;
     let sequence = 0;
     let transaction: (Transaction & { startWall: number; startCpu: number }) | null = null;
     const records: any[] = [];
@@ -131,7 +132,7 @@ export function foregroundMeter(db: any) {
         wrapped.add(statement);
         const id = idFor(sql);
         const names = moved.filter((name) => sql.includes(name));
-        const payloadTable = /\b(?:session_meta_chunks|session_render_cache)\b/.test(sql);
+        const payloadTable = /\b(?:session_meta_chunks|session_render_cache|session_meta_collection_revisions)\b/.test(sql);
         const hasPayload =
             payloadTable ||
             (/\bsession_meta\b/.test(sql) &&
@@ -169,7 +170,7 @@ export function foregroundMeter(db: any) {
                     } finally {
                         const usedCpu = cpu() - thread,
                             elapsed = performance.now() - wall;
-                        record(kind, id, usedCpu, elapsed);
+                        record(collectionDepth > 0 && read ? "collectionSql" : kind, id, usedCpu, elapsed);
                         if (active) {
                             active.statements[id] = (active.statements[id] ?? 0) + 1;
                             if (write) active.writes++;
@@ -233,6 +234,16 @@ export function foregroundMeter(db: any) {
             current.totalCpuMs = cpu() - start.cpu;
             phase = "drain";
         },
+        collectionAccess<T>(operation: () => T): T {
+            if (!current || collectionDepth > 0) return operation();
+            const wall=performance.now(),thread=cpu();
+            collectionDepth++;
+            try {return operation();}
+            finally {
+                collectionDepth--;
+                record("collectionAccess","readSessionMetaCollection",cpu()-thread,performance.now()-wall);
+            }
+        },
         layout<T>(operation: () => T): T {
             if (!current) return operation();
             const wall = performance.now(),
@@ -276,7 +287,7 @@ export function summarizeForeground(meter: ReturnType<typeof foregroundMeter>) {
         movedReadCpuMs: distribution(
             passes.map((pass) =>
                 sum(
-                    ["handler:payloadRead", "handler:casRead", "handler:chunkRows"].map(
+                    ["handler:payloadRead", "handler:casRead", "handler:chunkRows", "handler:collectionAccess"].map(
                         (key) => pass.timing[key]?.cpuMs ?? 0,
                     ),
                 ),
@@ -285,7 +296,7 @@ export function summarizeForeground(meter: ReturnType<typeof foregroundMeter>) {
         movedReadWallMs: distribution(
             passes.map((pass) =>
                 sum(
-                    ["handler:payloadRead", "handler:casRead", "handler:chunkRows"].map(
+                    ["handler:payloadRead", "handler:casRead", "handler:chunkRows", "handler:collectionAccess"].map(
                         (key) => pass.timing[key]?.wallMs ?? 0,
                     ),
                 ),
@@ -319,7 +330,7 @@ export function summarizeForeground(meter: ReturnType<typeof foregroundMeter>) {
                     Object.entries(pass.timing)
                         .filter(
                             ([key]) =>
-                                !key.includes(":") && key !== "payloadPrepare" && key !== "layout",
+                                !key.includes(":") && key !== "payloadPrepare" && key !== "layout" && key !== "collectionAccess",
                         )
                         .map(([, entry]: [string, any]) => entry.calls),
                 ),

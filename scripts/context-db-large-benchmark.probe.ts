@@ -5,7 +5,7 @@ import { spyOn } from "bun:test";
 type Owner = { name: string; pagetype: string };
 type Sample = { bytes: Buffer; owners: Map<number, Owner>; meta: Record<string, unknown> };
 export type Change = { pass: number; sql: string; pages: Record<string, number>; overflow: Record<string, number>; columns: Record<string, unknown[]>; };
-const targets = new Set(["session_meta", "lkg_slots", "lkg_slot_chunks", "session_render_cache", "session_meta_chunks", "tags"]);
+const targets = new Set(["session_meta", "lkg_slots", "lkg_slot_chunks", "session_render_cache", "session_meta_chunks", "session_meta_collection_revisions", "tags"]);
 
 // Compare actual database page bytes, not dbstat's payload lengths: equal lengths
 // do not mean an UPDATE preserved the overflow chain.
@@ -21,7 +21,7 @@ export function meter(db: Database) {
     reading = true;
     try {
       const owners = new Map<number, Owner>();
-      for (const row of query("SELECT name,pageno,pagetype FROM dbstat WHERE name IN ('session_meta','lkg_slots','lkg_slot_chunks','session_render_cache','session_meta_chunks')").all() as (Owner & { pageno: number })[]) owners.set(row.pageno, row);
+      for (const row of query("SELECT name,pageno,pagetype FROM dbstat WHERE name IN ('session_meta','lkg_slots','lkg_slot_chunks','session_render_cache','session_meta_chunks','session_meta_collection_revisions','sqlite_autoindex_session_meta_collection_revisions_1','sqlite_sequence')").all() as (Owner & { pageno: number })[]) owners.set(row.pageno, row);
       const row = query("SELECT * FROM session_meta LIMIT 1").get() as Record<string, unknown>;
       const meta = Object.fromEntries(Object.entries(row ?? {}).map(([k,v]) => [k, typeof v === 'string' || v instanceof Uint8Array ? [Buffer.byteLength(v), Bun.hash(v).toString()] : v]));
       return { owners, bytes: db.serialize(), meta };
@@ -119,6 +119,13 @@ const cacheColumns=['cached_m0_bytes','cached_m1_bytes','cached_m0_mural_data_ur
 const inline=new Set((db.prepare('PRAGMA table_info(session_meta)').all() as {name:string}[]).map(r=>r.name));
 const modernCollections=inline.has('trailing_blank_decisions')?undefined:await core('features/magic-context/storage-session-collections.ts');
 const modernCache=inline.has('cached_m0_bytes')?undefined:await core('features/magic-context/storage-session-cache.ts');
+const revisionCache=!!db.prepare("SELECT 1 FROM sqlite_master WHERE name='session_meta_collection_revisions'").get();
+if(foregroundTiming && modernCollections && revisionCache) {
+ const state=await core('features/magic-context/storage-session-collection-state.ts');
+ const originalState=state.readCollectionState,originalRead=modernCollections.readSessionMetaCollection;
+ spyOn(state,'readCollectionState').mockImplementation((...args:any[])=>foregroundTiming.collectionAccess(()=>originalState(...args)));
+ spyOn(modernCollections,'readSessionMetaCollection').mockImplementation((...args:any[])=>foregroundTiming.collectionAccess(()=>originalRead(...args)));
+}
 if(foregroundTiming && modernCollections) {
  const layout=await core('features/magic-context/session-meta-chunk-layout.ts');
  const original=layout.layoutSessionMetaBytes;
@@ -284,6 +291,7 @@ const summary={tool:`Bun ${Bun.version}`,passes,ordinaryPasses:Array.from({lengt
 writeFileSync(join(root,'pages.json'),JSON.stringify({summary,changes,statements:m.changes,heads,certificates},null,2));
 console.log('BENCHMARK_SUMMARY',JSON.stringify(summary));
 if(foregroundTiming) {
+ if(revisionCache && !foregroundTiming.records.some(record=>(record.timing['handler:collectionAccess']?.calls??0)>0))throw new Error('revision-cache read scopes were not observed');
  const result={host,summary:summarizeForeground(foregroundTiming),records:foregroundTiming.records,sql:foregroundTiming.sqlText};
  writeFileSync(join(root,'foreground.json'),JSON.stringify(result));
  console.log('FOREGROUND_SUMMARY',JSON.stringify({host,...result.summary}));

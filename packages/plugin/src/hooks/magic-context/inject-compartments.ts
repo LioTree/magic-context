@@ -68,7 +68,7 @@ import {
     writeSessionRenderCache,
 } from "../../features/magic-context/storage-session-cache";
 import {
-    sessionMetaCollectionSelect,
+    readSessionMetaCollection,
     writeSessionMetaCollection,
 } from "../../features/magic-context/storage-session-collections";
 import {
@@ -271,17 +271,31 @@ export function getVisibleMemoryIds(db: Database, sessionId: string): Set<number
         const projected = readFullyVisibleMemoryIds(db, sessionId);
         if (projected !== undefined) return projected.size > 0 ? projected : null;
         const row = db
-            .prepare(
-                `SELECT ${sessionMetaCollectionSelect("memory_block_ids", "memory_block_ids", db)},
-                    ${sessionRenderCacheSelect("cached_m0_bytes")},
+            .transaction(() => {
+                const header = db
+                    .prepare(
+                        `SELECT ${sessionRenderCacheSelect("cached_m0_bytes")},
                     ${sessionRenderCacheSelect("cached_m1_bytes")}
                 FROM session_meta WHERE session_id = ?`,
-            )
-            .get(sessionId) as {
-            memory_block_ids: string | null;
-            cached_m0_bytes: Buffer | Uint8Array | null;
-            cached_m1_bytes: Buffer | Uint8Array | null;
-        } | null;
+                    )
+                    .get(sessionId) as
+                    | {
+                          cached_m0_bytes: Buffer | Uint8Array | null;
+                          cached_m1_bytes: Buffer | Uint8Array | null;
+                      }
+                    | undefined;
+                return header
+                    ? {
+                          ...header,
+                          memory_block_ids: readSessionMetaCollection(
+                              db,
+                              sessionId,
+                              "memory_block_ids",
+                          ) as string | null,
+                      }
+                    : null;
+            })
+            .deferred();
         if (!row?.memory_block_ids) return null;
         const parsed = JSON.parse(row.memory_block_ids) as unknown;
         if (!Array.isArray(parsed)) return null;
@@ -3686,8 +3700,10 @@ export function hydrateCachedM0Mural(db: Database, sessionId: string, state: M0M
 
 function readCachedM0M1Row(db: Database, sessionId: string): CachedM0M1Row | null {
     return db
-        .prepare(
-            `SELECT ${sessionRenderCacheSelect("cached_m0_bytes")},
+        .transaction(() => {
+            const row = db
+                .prepare(
+                    `SELECT ${sessionRenderCacheSelect("cached_m0_bytes")},
                 cached_m0_score_selection_watermark,
                 ${sessionRenderCacheSelect("cached_m0_mural_data_url")},
                 cached_m0_mural_hash,
@@ -3707,12 +3723,23 @@ function readCachedM0M1Row(db: Database, sessionId: string): CachedM0M1Row | nul
                 cached_m0_tool_set_hash,
                 cached_m0_model_key,
                 cached_m0_project_identity,
-                cached_m0_last_baseline_end_message_id,
-                ${sessionMetaCollectionSelect("memory_block_ids", "memory_block_ids", db)}
+                cached_m0_last_baseline_end_message_id
             FROM session_meta
               WHERE session_id = ?`,
-        )
-        .get(sessionId) as CachedM0M1Row | null;
+                )
+                .get(sessionId) as CachedM0M1Row | null;
+            return row
+                ? {
+                      ...row,
+                      memory_block_ids: readSessionMetaCollection(
+                          db,
+                          sessionId,
+                          "memory_block_ids",
+                      ) as string | null,
+                  }
+                : null;
+        })
+        .deferred();
 }
 
 function markersFromCachedRow(row: CachedM0M1Row): M0SnapshotMarkers | null {
