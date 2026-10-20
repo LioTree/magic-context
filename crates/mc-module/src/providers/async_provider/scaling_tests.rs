@@ -58,6 +58,44 @@ pub(super) mod view_work {
     }
 }
 
+pub(super) mod hygiene_interleaving {
+    use super::*;
+    use std::collections::VecDeque;
+
+    pub type Hook = Box<dyn FnOnce() + Send>;
+    static HOOKS: Mutex<BTreeMap<String, VecDeque<Hook>>> = Mutex::new(BTreeMap::new());
+
+    pub struct Guard(String);
+    impl Drop for Guard {
+        fn drop(&mut self) {
+            HOOKS.lock().unwrap().remove(&self.0);
+        }
+    }
+    impl Guard {
+        pub(super) fn remaining(&self) -> usize {
+            HOOKS.lock().unwrap().get(&self.0).unwrap().len()
+        }
+    }
+    pub(super) fn install(reference: &str, hooks: Vec<Hook>) -> Guard {
+        assert!(HOOKS
+            .lock()
+            .unwrap()
+            .insert(reference.into(), hooks.into())
+            .is_none());
+        Guard(reference.into())
+    }
+    pub fn run(reference: &str) {
+        let hook = HOOKS
+            .lock()
+            .unwrap()
+            .get_mut(reference)
+            .and_then(VecDeque::pop_front);
+        if let Some(hook) = hook {
+            hook();
+        }
+    }
+}
+
 #[tokio::test]
 async fn covered_view_work_tracks_tail_not_session() {
     for size in [80, 800] {
@@ -109,6 +147,146 @@ async fn covered_view_work_tracks_tail_not_session() {
             "size={size}: {work:?}"
         );
     }
+}
+
+#[tokio::test]
+async fn covered_ride_keeps_prefix_during_historian_meta_write() {
+    // One conflict exercises the fresh-snapshot retry; two exhaust the retry
+    // budget and must still use the valid certificate for rendering.
+    for writes in [1, 2] {
+        let dir = tempfile::tempdir().unwrap();
+        let mut rig = Rig::new(dir.path()).await;
+        rig.append(800);
+        rig.history(787, "completed covered prefix");
+        rig.notice(1_000, None).await;
+        let version = rig.newest_view();
+        rig.notice(1_000, version).await;
+        rig.settle().await;
+        view_work::take(&rig.reference);
+        rig.history(788, "new completed prefix for the ride");
+        let hooks = (0..writes)
+            .map(|write| {
+                let h = rig.h.clone();
+                let namespace = rig.state().namespace();
+                Box::new(move || {
+                    // Historian no-fire metadata writes do not take the provider
+                    // lock. Force one after the ride reads its hygiene snapshot
+                    // and before the hygiene CAS.
+                    std::thread::spawn(move || {
+                        let store = h.store.get().unwrap();
+                        let loaded = store.load_meta(&namespace).unwrap();
+                        let diagnostics = crate::HistorianDiagnostics {
+                            fired: false,
+                            reason: None,
+                            no_fire: Some("BelowProactiveFloor".into()),
+                            no_fire_detail: Some(format!("interleaved no-fire decision {write}")),
+                            canonical_cause: Some("below_proactive_floor".into()),
+                            state: "idle".into(),
+                            progress: None,
+                            last_failure: None,
+                        };
+                        let context = crate::HistorianDecisionContext {
+                            at_ms: write + 1,
+                            request_observed_at_ms: write + 1,
+                            pressure_pct: 1,
+                            drain_latch: false,
+                            chunk_range: None,
+                            eligible_tokens: Some(0),
+                            bar_tokens: Some(15_000),
+                        };
+                        h.record_no_fire(store, &namespace, &loaded, &diagnostics, &context);
+                        assert_eq!(
+                            store.load_meta(&namespace).unwrap().row_version,
+                            loaded.row_version.map(|v| v + 1),
+                            "the historian write must commit before the hygiene CAS"
+                        );
+                    })
+                    .join()
+                    .unwrap();
+                }) as hygiene_interleaving::Hook
+            })
+            .collect();
+        let interleaving = hygiene_interleaving::install(&rig.reference, hooks);
+        let answer = rig
+            .op(
+                "compaction.ride",
+                json!({"session_ref":rig.reference,"cause":"ceiling","deadline_ms":300_000}),
+            )
+            .await;
+        assert_eq!(answer["answer"], "view", "{answer}");
+        assert_eq!(interleaving.remaining(), 0, "every conflict must execute");
+        let work = view_work::take(&rig.reference);
+        assert!(
+            work.engine_input > 0
+                && work.engine_input <= 14
+                && work.renderer_input > 0
+                && work.renderer_input <= 14
+                && work.decoded_entries > 0
+                && work.decoded_entries <= 28,
+            "writes={writes}: {work:?}"
+        );
+        let state = rig.state();
+        assert!(state.logical_prefix.is_some());
+        let loaded = rig.store().load(&state.namespace()).unwrap();
+        assert_eq!(
+            loaded.meta.historian.last_no_fire.as_deref(),
+            Some(format!("interleaved no-fire decision {}", writes - 1).as_str()),
+            "rebasing hygiene must preserve the historian's newer metadata"
+        );
+        if writes == 1 {
+            assert!(
+                loaded
+                    .meta
+                    .tail_hygiene_baseline
+                    .unwrap()
+                    .baseline_parts
+                    .len()
+                    <= 56
+            );
+        }
+        eprintln!("forced historian writes={writes} covered ride work={work:?}");
+    }
+}
+
+#[tokio::test]
+async fn covered_ride_rejects_prefix_when_hygiene_conflict_changes_certificate() {
+    let dir = tempfile::tempdir().unwrap();
+    let mut rig = Rig::new(dir.path()).await;
+    rig.append(80);
+    rig.history(67, "completed covered prefix");
+    rig.notice(1_000, None).await;
+    let version = rig.newest_view();
+    rig.notice(1_000, version).await;
+    rig.settle().await;
+    view_work::take(&rig.reference);
+    rig.history(68, "new completed prefix for the ride");
+    let store = rig.h.store.get().unwrap().clone();
+    let namespace = rig.state().namespace();
+    let interleaving = hygiene_interleaving::install(
+        &rig.reference,
+        vec![Box::new(move || {
+            let mut loaded = store.load_meta(&namespace).unwrap();
+            loaded.meta.revert_epoch += 1;
+            store
+                .commit_meta(&namespace, loaded.row_version, &loaded.meta)
+                .unwrap();
+        })],
+    );
+    let answer = rig
+        .op(
+            "compaction.ride",
+            json!({"session_ref":rig.reference,"cause":"ceiling","deadline_ms":300_000}),
+        )
+        .await;
+    assert_eq!(answer["answer"], "view", "{answer}");
+    assert_eq!(interleaving.remaining(), 0);
+    let work = view_work::take(&rig.reference);
+    assert_eq!(work.engine_input, 13);
+    assert_eq!(
+        work.renderer_input, 80,
+        "an invalid certificate must fall back"
+    );
+    assert!(rig.state().logical_prefix.is_none());
 }
 
 #[tokio::test]
