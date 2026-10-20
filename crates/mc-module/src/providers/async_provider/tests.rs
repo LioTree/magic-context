@@ -2,6 +2,7 @@ use super::*;
 use cortexkit_bus_inmemory::{InMemoryBus, InMemoryConfig};
 mod reminder_replay;
 mod reminders;
+mod wrapup;
 
 #[derive(Default)]
 struct Runner {
@@ -164,6 +165,16 @@ impl Rig {
     /// A rig whose route is admitted under runner module `module` and whose
     /// conversation is set up for `harness` with plan `params`.
     async fn open(dir: &Path, module: &str, harness: &str, params: Value) -> Self {
+        Self::configured(dir, module, harness, params, |_| {}).await
+    }
+
+    async fn configured(
+        dir: &Path,
+        module: &str,
+        harness: &str,
+        params: Value,
+        configure: impl FnOnce(&mut McHandler),
+    ) -> Self {
         let descriptor = StorageDescriptor {
             module_id: DEFAULT_MODULE_ID.into(),
             storage_namespace: "mc_cache".into(),
@@ -205,6 +216,7 @@ impl Rig {
                 history_budget_tokens: 4_000.0,
             },
         );
+        configure(&mut h);
         let h = Arc::new(h);
         let bus = Arc::new(InMemoryBus::new(
             InMemoryConfig::default().with_durable(DurableOwner::Module(DEFAULT_MODULE_ID)),

@@ -5774,7 +5774,7 @@ fn apply_once(
     // prefix merely because a historian finished. Legacy whole-prompt transforms
     // retain their eager first-fold behavior.
     let first_fold_due = if loaded.core.boundary_id.is_empty()
-        && (req.kind != compaction::PASS_KIND
+        && (!(req.kind == compaction::PASS_KIND || compaction::host_pass(req))
             || scheduler_outcome.pass != scheduler::PassDecision::Defer)
     {
         match has_compartments_cache {

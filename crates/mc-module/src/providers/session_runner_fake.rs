@@ -33,6 +33,7 @@ pub(crate) struct FakeSend {
     pub route: SessionRunnerRoute,
     pub send_id: String,
     pub model: String,
+    pub system: String,
     pub prompt: String,
     pub run_id: String,
 }
@@ -168,6 +169,17 @@ struct FakeSessionRunnerDriver {
 
 #[async_trait]
 impl HistorianProducerDriver for FakeSessionRunnerDriver {
+    async fn session_runner_limits(
+        &mut self,
+        _child: &str,
+    ) -> Result<Option<crate::runner_limits::RunnerLimits>, HistorianProducerError> {
+        Ok(Some(crate::runner_limits::RunnerLimits {
+            max_steps: true,
+            no_tools: true,
+            max_output_tokens: false,
+        }))
+    }
+
     async fn bind_session(&mut self, _session_id: &str) -> Result<(), HistorianProducerError> {
         Ok(())
     }
@@ -175,7 +187,7 @@ impl HistorianProducerDriver for FakeSessionRunnerDriver {
     async fn start(
         &mut self,
         session_id: &str,
-        _system: &str,
+        system: &str,
         prompt: &str,
         model: &str,
     ) -> Result<RunHandle, HistorianProducerError> {
@@ -190,6 +202,7 @@ impl HistorianProducerDriver for FakeSessionRunnerDriver {
             route: self.route.clone(),
             send_id: session_id.to_string(),
             model: model.to_string(),
+            system: system.to_string(),
             prompt: prompt.to_string(),
             run_id: run_id.clone(),
         });
