@@ -57,7 +57,16 @@ beforeAll(async () => {
     const load = spyOn(configLoader, "loadPluginConfigDetailed").mockReturnValue({
         config,
     } as ReturnType<typeof configLoader.loadPluginConfigDetailed>);
-    const probe = spyOn(storageGate, "probeV2StorageAtBoot").mockResolvedValue(db);
+    // Hand the storage gate this throwaway store. Stubbing only the boot probe left
+    // the gate itself empty, so the first turn below made the gate open the
+    // default store from scratch (schema migration on a worker thread, host
+    // process discovery). When that cold open failed, as it can on a loaded CI
+    // runner, the turn refused before the provider and setup failed with
+    // "interrupt arrived after the turn became idle".
+    const createGate = storageGate.createV2StorageGate;
+    const probe = spyOn(storageGate, "createV2StorageGate").mockImplementation((options) =>
+        createGate({ ...options, open: async () => db }),
+    );
     const contextLimit = spyOn(budgets, "resolveKnownHistorianContextLimit").mockReturnValue(
         123456,
     );
