@@ -793,6 +793,9 @@ fn raw_replay_rebuild_core(
 /// back to CK messages at egress.
 #[derive(Debug, Clone, Serialize)]
 pub struct TransformRequest {
+    /// Internal delivery ownership, set only by the async runner adapter.
+    #[serde(skip)]
+    pub(crate) runner_owned_reminders: bool,
     /// Internal proof for an async input with a covered logical prefix omitted.
     /// Wire requests cannot assert coverage or bypass complete-lineage validation.
     #[serde(skip)]
@@ -1305,6 +1308,7 @@ impl<'de> Deserialize<'de> for TransformRequest {
             .unwrap_or_else(default_protected_tags);
         Ok(Self {
             native_tail_section: false,
+            runner_owned_reminders: false,
             logical_prefix: None,
             native_fold_prefix: None,
             native_fold_sidecar: None,
@@ -5123,7 +5127,11 @@ fn apply_once(
     } else {
         Vec::new()
     };
-    let channel1_appends = channel1_append_rows(&loaded.core, &legacy_channel1_appends);
+    let channel1_appends = channel1_append_rows(
+        &loaded.core,
+        &legacy_channel1_appends,
+        in_band_channel1_enabled(req),
+    );
     let auto_search_active = !req.is_subagent && req.auto_search_enabled;
     let mut user_hints = if tagging_active || auto_search_active {
         transform_snapshot.user_hints
@@ -7999,7 +8007,11 @@ fn apply_once(
 
     profile_start!(perf_channel1, "evolution_channel1");
     prune_channel1_units(&mut core, &projection, meta.coverage_ordinal);
-    let mut channel1_appends = channel1_append_rows(&core, &legacy_channel1_appends);
+    let mut channel1_appends = channel1_append_rows(
+        &core,
+        &legacy_channel1_appends,
+        in_band_channel1_enabled(req),
+    );
     profile_end!(perf_channel1);
     let result_action = action_str(&plan, &core);
 
@@ -8181,7 +8193,7 @@ fn apply_once(
     // after reductions and their compliance grace. Provider inputs omit the
     // hook-reminder Appends; separately saved engine units retain any earlier
     // reminder's exact bytes, so no hook text enters as a second copy.
-    if tagging_active {
+    if tagging_active && in_band_channel1_enabled(req) {
         if let Some((row, unit)) = maybe_append_channel1_nudge(
             Channel1NudgeInputs {
                 covered_users: req
@@ -14707,10 +14719,20 @@ pub(crate) fn commit_channel1_fire(
     reminder
 }
 
+fn in_band_channel1_enabled(req: &TransformRequest) -> bool {
+    // Async runners render ctx_reduce reminders from session.send deliveries.
+    // Do not deliver a second copy through new or persisted engine appends.
+    !req.runner_owned_reminders
+}
+
 fn channel1_append_rows(
     core: &CoreState,
     legacy_rows: &[Channel1AppendRow],
+    enabled: bool,
 ) -> Vec<Channel1AppendRow> {
+    if !enabled {
+        return Vec::new();
+    }
     let mut by_block = legacy_rows
         .iter()
         .cloned()
@@ -20098,6 +20120,40 @@ fn action_str(plan: &PassPlan, _core: &CoreState) -> String {
 
 #[cfg(test)]
 pub(crate) mod tests {
+    #[test]
+    fn runner_owned_reminders_do_not_replay_legacy_rows_or_units() {
+        let mut request = req("runner-delivery", "cfg", vec![]);
+        request.serializer_profile = "owned-broca".into();
+        let core = CoreState {
+            frozen_units: vec![FrozenUnit {
+                key: format!("{CHANNEL1_KEY_PREFIX}unit#0"),
+                kind: "channel1_append".into(),
+                frozen_payload: "old reminder".into(),
+                durability_class: mc_core::DurabilityClass::Lineage,
+                reset_rule: "unit#0".into(),
+            }],
+            ..CoreState::default()
+        };
+        let rows = [Channel1AppendRow {
+            block_id: "legacy#0".into(),
+            reminder_text: "legacy reminder".into(),
+            fired_at_ms: 1,
+        }];
+        assert_eq!(
+            channel1_append_rows(&core, &rows, in_band_channel1_enabled(&request)).len(),
+            2
+        );
+        request.runner_owned_reminders = true;
+        assert!(channel1_append_rows(&core, &rows, in_band_channel1_enabled(&request)).is_empty());
+        let mut wire = serde_json::to_value(&request).unwrap();
+        assert!(wire.get("runner_owned_reminders").is_none());
+        wire["runner_owned_reminders"] = serde_json::json!(true);
+        assert!(
+            !serde_json::from_value::<TransformRequest>(wire)
+                .unwrap()
+                .runner_owned_reminders
+        );
+    }
     mod memory_cache_review {
         use super::*;
         include!("transform_memory_cache_review_tests.rs");
@@ -23202,6 +23258,7 @@ pub(crate) mod tests {
     ) -> TransformRequest {
         TransformRequest {
             native_tail_section: false,
+            runner_owned_reminders: false,
             logical_prefix: None,
             native_fold_prefix: None,
             native_fold_sidecar: None,

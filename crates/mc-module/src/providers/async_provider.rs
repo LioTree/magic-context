@@ -1429,6 +1429,7 @@ impl McHandler {
                 .map_or(0, |(ordinal, _)| *ordinal),
         )?;
         template.logical_prefix = prefix;
+        template.runner_owned_reminders = true;
         template.native_tail_section = true;
         if let Some(policy) = &state.usage_policy {
             template.emergency_recovery_armed = policy.emergency_recovery_armed;

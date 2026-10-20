@@ -1100,6 +1100,13 @@ impl Pair {
 }
 
 async fn session(profile: Profile, seed: u64, steps: u64) -> usize {
+    session_pair(profile, seed, steps)
+        .await
+        .newest_versions()
+        .len()
+}
+
+async fn session_pair(profile: Profile, seed: u64, steps: u64) -> Pair {
     let mut rng = Rng(seed.wrapping_mul(0x9E37_79B9_7F4A_7C15) | 1);
     let tiny_budget = rng.chance(10);
     // A runner with no lineage yet sends Setup without one.
@@ -1125,7 +1132,7 @@ async fn session(profile: Profile, seed: u64, steps: u64) -> usize {
     for _ in 0..steps {
         pair.step(&mut rng).await;
     }
-    pair.newest_versions().len()
+    pair
 }
 
 async fn run(sessions: u64, steps: u64, first_seed: u64) {
@@ -1300,6 +1307,37 @@ async fn covered_tool_result_drop_uses_prefix_membership_without_projecting_an_o
 #[tokio::test]
 async fn prefix_replays_channel1_session_1101() {
     session(Profile::OpenCode, 1101, 24).await;
+}
+
+#[tokio::test]
+async fn async_conversations_deliver_ctx_reduce_only_out_of_band() {
+    for profile in PROFILES {
+        let pair = session_pair(profile, 1101, 24).await;
+        for side in [&pair.resident, &pair.oracle] {
+            let head = load_head(side.store(), &pair.reference).unwrap().unwrap();
+            let loaded = side.store().load(&head.namespace()).unwrap();
+            assert!(
+                !loaded
+                    .core
+                    .frozen_units
+                    .iter()
+                    .any(|unit| unit.kind == "channel1_append"),
+                "{profile:?}: async engine created an in-band ctx_reduce reminder"
+            );
+            for (_, bytes) in side.views(&pair.reference).0 {
+                assert!(
+                    !bytes.contains("spent tool outputs") && !bytes.contains("Still unstamped:"),
+                    "{profile:?}: published an in-band ctx_reduce reminder"
+                );
+            }
+        }
+        if profile == Profile::OpenCode {
+            assert!(
+                !pair.oracle.runner.sends.lock().unwrap().is_empty(),
+                "the reminder must still be delivered through session.send"
+            );
+        }
+    }
 }
 
 /// The full differential: `MC_ASYNC_DIFFERENTIAL_SESSIONS` sessions (default
