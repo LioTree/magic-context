@@ -6,6 +6,23 @@
 //! the conversation already holds. The ignored benchmark prints the timing and
 //! size table reported in the storage-scaling investigation.
 use super::*;
+
+#[path = "reminder_tests.rs"]
+mod reminder_tests;
+
+/// Tag rows hydrated by reminder hints, independent of other provider phases.
+pub(super) mod reminder_work {
+    use std::cell::Cell;
+    thread_local! {
+        static TAGS: Cell<usize> = const { Cell::new(0) };
+    }
+    pub fn loaded(count: usize) {
+        TAGS.set(TAGS.get() + count);
+    }
+    pub fn tags() -> usize {
+        TAGS.get()
+    }
+}
 use cortexkit_bus_inmemory::{InMemoryBus, InMemoryConfig};
 
 /// Wall and thread-CPU time spent in `AsyncRecord::save` (and, separately,
@@ -688,8 +705,9 @@ fn phases(reference: &str, before: &[save_meter::SaveStats]) -> String {
         .zip(phase_stats(reference).iter().zip(before))
         .map(|(kind, (now, then))| {
             format!(
-                "{kind}={:.1}ms/{}",
+                "{kind}={:.1}cpu-ms/{:.1}wall-ms/{}",
                 (now.cpu_nanos - then.cpu_nanos) as f64 / 1e6,
+                (now.wall_nanos - then.wall_nanos) as f64 / 1e6,
                 now.saves - then.saves
             )
         })
@@ -1159,6 +1177,7 @@ async fn covered_tail_latency_benchmark() {
         ack.2.unwrap();
         eprintln!("initial acknowledged version={version:?}");
         let phases_before = phase_stats(&rig.reference);
+        let reminder_phases_before = crate::runner_reminders::phase_meter::snapshot();
         let mut notices = Vec::new();
         let mut historian = Vec::new();
         let mut notice_errors = 0;
@@ -1170,7 +1189,16 @@ async fn covered_tail_latency_benchmark() {
                 .async_runtime
                 .historian_evaluations
                 .load(std::sync::atomic::Ordering::Relaxed);
+            let sample_phases = phase_stats(&rig.reference);
             let (sample, background, outcome) = rig.try_timed_notice(4, version, est_tokens).await;
+            if sample.0 >= 20.0 {
+                eprintln!(
+                    "quiet notice above 20ms: wall={:.3}ms own-cpu={:.3}ms phases: {}",
+                    sample.0,
+                    sample.1,
+                    phases(&rig.reference, &sample_phases)
+                );
+            }
             notices.push(sample);
             if let Err(error) = outcome {
                 notice_errors += 1;
@@ -1196,6 +1224,17 @@ async fn covered_tail_latency_benchmark() {
             );
         }
         eprintln!("quiet errors={notice_errors}/{quiet}, scheduled evaluations={evaluations}");
+        for (phase, (calls, nanos)) in crate::runner_reminders::phase_meter::snapshot() {
+            let (before_calls, before_nanos) = reminder_phases_before
+                .get(phase)
+                .copied()
+                .unwrap_or_default();
+            eprintln!(
+                "reminder phase {phase}: {:.3}ms/{}",
+                (nanos - before_nanos) as f64 / 1e6,
+                calls - before_calls
+            );
+        }
         eprintln!(
             "quiet phase totals: {}",
             phases(&rig.reference, &phases_before)

@@ -13,6 +13,8 @@ mod scaling_tests;
 #[cfg(test)]
 mod tests;
 use resident::{EngineView, HeldEntry};
+#[cfg(test)]
+use scaling_tests::reminder_work;
 
 fn bus_id(reference: &str, kind: &str, sequence: u64) -> String {
     format!("{reference}:{kind}:{sequence}")
@@ -119,6 +121,9 @@ pub(crate) struct AsyncRecord {
     /// `mc_async_compaction_entries.index_json`, not in this record.
     #[serde(skip)]
     tag_index: BTreeMap<String, PartAddress>,
+    /// Reuse hint facts while their frozen section, coverage and protected IDs agree.
+    #[serde(skip)]
+    reminder_hint_state: Option<ReminderHintState>,
     #[serde(default)]
     pub(crate) usage_policy: Option<super::usage_policy::UsagePolicyState>,
     #[serde(default)]
@@ -809,7 +814,14 @@ impl State {
         // A tag address: map node, tag, mid, part key and a 64-byte digest.
         const TAG_ADDRESS: usize = 288;
         let cache_state = self.cache_state.as_ref().map_or(0, |cached| cached.bytes);
-        bytes + entries + self.tag_index.len() * TAG_ADDRESS + cache_state
+        bytes
+            + entries
+            + self.tag_index.len() * TAG_ADDRESS
+            + cache_state
+            + self
+                .reminder_hint_state
+                .as_ref()
+                .map_or(0, |cached| cached.bytes)
     }
 
     fn reset(&mut self, store: &McStore) -> Result<(), HandlerOutcome> {
@@ -1216,6 +1228,7 @@ impl McHandler {
             runner_route: None,
             dream_target: None,
             reminder_cadence: None,
+            reminder_hint_state: None,
             reminder_baseline_generation: None,
             key,
             runner_module: match &binding.principal {
@@ -1699,11 +1712,241 @@ fn append_view_gap(
     Ok(())
 }
 
+#[derive(Clone)]
+struct ReminderHintState {
+    namespace: String,
+    frozen_identity: Option<String>,
+    coverage_ordinal: Option<u64>,
+    protected: BTreeSet<String>,
+    frozen: HashSet<String>,
+    bytes: usize,
+}
+
+impl ReminderHintState {
+    fn of(
+        namespace: String,
+        loaded: &mc_store::LoadedState,
+        frozen_identity: Option<String>,
+    ) -> Self {
+        let protected = loaded.meta.protected_tool_block_ids.clone();
+        let frozen = loaded
+            .core
+            .frozen_units
+            .iter()
+            .filter_map(|unit| unit.key.strip_prefix("red:").map(str::to_owned))
+            .collect::<HashSet<_>>();
+        let bytes = namespace.len()
+            + frozen_identity.as_ref().map_or(0, String::len)
+            + protected
+                .iter()
+                .chain(&frozen)
+                .map(|id| id.len() + 64)
+                .sum::<usize>();
+        Self {
+            namespace,
+            frozen_identity,
+            coverage_ordinal: loaded.meta.coverage_ordinal,
+            protected,
+            frozen,
+            bytes,
+        }
+    }
+}
+
+fn load_reminder_hint_state<'a>(
+    store: &McStore,
+    namespace: &str,
+    full: Option<&Arc<mc_store::LoadedState>>,
+    cached: &'a mut Option<ReminderHintState>,
+) -> Result<&'a ReminderHintState, String> {
+    let (small, identity) = store
+        .load_meta_with_frozen_identity(namespace)
+        .map_err(|e| e.to_string())?;
+    let unchanged = identity.is_some()
+        && cached.as_ref().is_some_and(|cached| {
+            cached.namespace == namespace
+                && cached.frozen_identity == identity
+                && cached.coverage_ordinal == small.meta.coverage_ordinal
+                && cached.protected == small.meta.protected_tool_block_ids
+        });
+    if !unchanged {
+        let loaded = match full {
+            Some(loaded) if loaded.row_version == small.row_version => Arc::clone(loaded),
+            _ => Arc::new(store.load(namespace).map_err(|e| e.to_string())?),
+        };
+        // A concurrent writer can change the section after the header read. Do
+        // not bless that snapshot with an identity belonging to an older row.
+        let identity = (loaded.row_version == small.row_version)
+            .then_some(identity)
+            .flatten();
+        *cached = Some(ReminderHintState::of(
+            namespace.to_owned(),
+            &loaded,
+            identity,
+        ));
+    }
+    Ok(cached.as_ref().expect("hint state loaded"))
+}
+
+/// Only a newest suffix is needed to establish the persisted protection cutoff.
+/// If the floor cannot be established, retain the canonical full-read fallback.
+fn reminder_protection(
+    store: &McStore,
+    namespace: &str,
+    floor: u64,
+) -> Result<crate::protection_window::ProtectionWindow, HandlerOutcome> {
+    const PAGE: usize = 32;
+    let mut rows = Vec::new();
+    let mut through = i64::MAX;
+    let mut mass = 0u64;
+    loop {
+        let page = store
+            .load_newest_tool_tags(namespace, through, PAGE)
+            .map_err(transient)?;
+        #[cfg(test)]
+        reminder_work::loaded(page.len());
+        mass = page.iter().fold(mass, |sum, row| {
+            sum.saturating_add(crate::protection_window::row_mass(row))
+        });
+        let count = page.len();
+        let next = page.last().and_then(|row| row.tag_number.checked_sub(1));
+        rows.extend(page);
+        // Persisted tag numbers are unique, so each row is a complete tie group.
+        if rows.len() >= 3 && mass >= floor {
+            break;
+        }
+        if count < PAGE || next.is_none() {
+            rows = store.load_tags_for_session(namespace).map_err(transient)?;
+            #[cfg(test)]
+            reminder_work::loaded(rows.len());
+            break;
+        }
+        through = next.expect("a full page has a predecessor");
+    }
+    Ok(crate::protection_window::ProtectionWindow::from_persisted_rows(&rows, floor))
+}
+
+/// Hint membership needs live block identity and tool names, not tool-arc projection.
+/// Decode only uncovered entries; covered invocations need not be reconstructed for
+/// a tool result whose call crossed the coverage boundary.
+fn async_reminder_hints(
+    store: &McStore,
+    state: &State,
+    codec: codec::Codec,
+    loaded: &ReminderHintState,
+    config: &McModuleConfig,
+    window: u64,
+) -> Result<crate::runner_reminders::ReminderHints, HandlerOutcome> {
+    let namespace = state.namespace();
+    let from = loaded
+        .coverage_ordinal
+        .map_or(std::ops::Bound::Unbounded, std::ops::Bound::Excluded);
+    let messages = state
+        .entries
+        .range((from, std::ops::Bound::Unbounded))
+        .map(|(_, entry)| decoded_entry(codec, &entry.inbound()?))
+        .collect::<Result<Vec<_>, _>>()?;
+    let mut names = BTreeMap::new();
+    for message in &messages {
+        if loaded
+            .coverage_ordinal
+            .is_some_and(|end| message.ordinal <= end)
+            || message.ck.meta.synthetic
+            || message.ck.role == "system"
+        {
+            continue;
+        }
+        for (index, block) in message.ck.content.iter().enumerate() {
+            use ck_wire::{CkKind, CkOutputKind, ResultBlockKind};
+            let name = match &block.kind {
+                CkKind::ToolResult {
+                    tool_name, output, ..
+                } => {
+                    let taggable = match &output.kind {
+                        CkOutputKind::Text { .. } | CkOutputKind::ErrorText { .. } => true,
+                        CkOutputKind::Content { blocks }
+                        | CkOutputKind::ErrorContent { blocks } => blocks
+                            .iter()
+                            .any(|block| matches!(block.kind, ResultBlockKind::Text { .. })),
+                        _ => false,
+                    };
+                    if !taggable {
+                        continue;
+                    }
+                    tool_name.as_str()
+                }
+                CkKind::Text { text }
+                    if message.ck.role == "user"
+                        || (message.ck.role == "assistant" && !text.trim().is_empty()) =>
+                {
+                    ""
+                }
+                _ => continue,
+            };
+            let id = ck_wire::block_id(&message.mid, index);
+            if !loaded.protected.contains(&id) && !loaded.frozen.contains(&id) {
+                names.insert(id, name);
+            }
+        }
+    }
+    let blocks = names.keys().map(String::as_str).collect::<Vec<_>>();
+    let rows = store
+        .load_tags_for_blocks(&namespace, &blocks)
+        .map_err(transient)?;
+    #[cfg(test)]
+    reminder_work::loaded(rows.len());
+    let active = rows
+        .iter()
+        .filter(|row| row.kind == "tool_result")
+        .map(|row| transform::ActiveTagForNudge {
+            tag_number: row.tag_number,
+            kind: row.kind.clone(),
+            token_count: row.token_count.max(0),
+            tool_name: names[&row.block_id].to_owned(),
+        })
+        .collect::<Vec<_>>();
+    if active.is_empty() {
+        return Ok(crate::runner_reminders::ReminderHints::default());
+    }
+    let protection = reminder_protection(
+        store,
+        &namespace,
+        config.resolve_protected_tokens(window).floor,
+    )?;
+    let pending = store
+        .load_pending_agent_drops(&namespace)
+        .map_err(transient)?;
+    let queued_ids = pending
+        .iter()
+        .map(|drop| drop.target_id.as_str())
+        .collect::<HashSet<_>>();
+    let queued = rows
+        .iter()
+        .filter(|row| queued_ids.contains(row.block_id.as_str()))
+        .map(|row| row.tag_number)
+        .collect::<HashSet<_>>();
+    Ok(crate::runner_reminders::ReminderHints {
+        oldest_reclaimable: transform::oldest_reclaimable_hint(
+            &active,
+            &protection.cutoff,
+            &queued,
+        )
+        .into_iter()
+        .filter_map(|(number, _)| u64::try_from(number).ok())
+        .collect(),
+        channel2: transform::oldest_channel2_hint(&active, &protection.cutoff, &queued)
+            .into_iter()
+            .filter_map(|(number, _)| u64::try_from(number).ok())
+            .collect(),
+    })
+}
+
 /// The tag hints a reduce reminder names: the oldest reclaimable tool outputs
 /// in the unsummarized tail, and the separate pressure-reminder (channel 2)
 /// selection of unqueued tool outputs of at least 100 tokens. Reads every held
 /// message and every tag row, so it runs only when a reminder is sent.
-fn async_reminder_hints(
+#[cfg(test)]
+fn async_reminder_hints_oracle(
     store: &McStore,
     state: &State,
     codec: codec::Codec,
@@ -1713,6 +1956,7 @@ fn async_reminder_hints(
 ) -> Result<crate::runner_reminders::ReminderHints, HandlerOutcome> {
     let namespace = state.namespace();
     let rows = store.load_tags_for_session(&namespace).map_err(transient)?;
+    reminder_work::loaded(rows.len());
     let messages = state
         .entries
         .values()
@@ -2158,7 +2402,7 @@ impl McHandler {
         let meter = scaling_tests::save_meter::start_kind(&notice.session_ref, "rem:last");
         let config = self.effective_config(&state.key.project);
         // Only the newest one or two entries are read here. The running
-        // totals cover the rest; the tag hints, which need the whole tail,
+        // totals cover the rest; the tag hints, which need the uncovered tail,
         // are computed only if a reminder is actually sent.
         let mut newest = state.entries.values().rev();
         let last_entry = newest.next().map(|entry| entry.read()).transpose()?;
@@ -2239,14 +2483,25 @@ impl McHandler {
             }
         };
         let window = notice.window.or(state.setup.context_window).unwrap_or(0);
+        let hint_state = Mutex::new(state.reminder_hint_state.take());
+        #[cfg(test)]
+        let oracle = self.async_oracle() || std::env::var_os("MC_ASYNC_REMINDER_ORACLE").is_some();
         let held: &State = state;
         let full = base.full.clone();
         let hints = || {
-            let loaded = match &full {
-                Some(loaded) => Arc::clone(loaded),
-                None => Arc::new(store.load(&held.namespace()).map_err(|e| e.to_string())?),
-            };
-            async_reminder_hints(store, held, codec, &loaded, &config, window)
+            #[cfg(test)]
+            if oracle {
+                let loaded = match &full {
+                    Some(loaded) => Arc::clone(loaded),
+                    None => Arc::new(store.load(&held.namespace()).map_err(|e| e.to_string())?),
+                };
+                return async_reminder_hints_oracle(store, held, codec, &loaded, &config, window)
+                    .map_err(|error| format!("{error:?}"));
+            }
+            let mut cached = hint_state.lock().unwrap_or_else(|p| p.into_inner());
+            let loaded =
+                load_reminder_hint_state(store, &held.namespace(), full.as_ref(), &mut cached)?;
+            async_reminder_hints(store, held, codec, loaded, &config, window)
                 .map_err(|error| format!("{error:?}"))
         };
         let conditions = crate::runner_reminders::ReminderConditions {
@@ -2270,6 +2525,27 @@ impl McHandler {
         };
         #[cfg(test)]
         let meter = scaling_tests::save_meter::start_kind(&notice.session_ref, "rem:send");
+        #[cfg(test)]
+        let outcome = if oracle {
+            crate::runner_reminders::send_due_reminders_oracle(
+                &runner,
+                &held.key.project,
+                &held.key.session,
+                &mut cadence,
+                &conditions,
+            )
+            .await
+        } else {
+            crate::runner_reminders::send_due_reminders(
+                &runner,
+                &held.key.project,
+                &held.key.session,
+                &mut cadence,
+                &conditions,
+            )
+            .await
+        };
+        #[cfg(not(test))]
         let outcome = crate::runner_reminders::send_due_reminders(
             &runner,
             &held.key.project,
@@ -2280,6 +2556,7 @@ impl McHandler {
         .await;
         #[cfg(test)]
         drop(meter);
+        state.reminder_hint_state = hint_state.into_inner().unwrap_or_else(|p| p.into_inner());
         if let Some(error) = outcome.hints_failed {
             return Err(transient(error));
         }
