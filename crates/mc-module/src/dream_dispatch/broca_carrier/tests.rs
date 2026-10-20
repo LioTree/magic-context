@@ -15,6 +15,7 @@ use crate::historian_runner::ResolvedRunner;
 use crate::{McModuleConfig, SessionBinding};
 use cortexkit_role_llm_runner::describe::Major;
 use cortexkit_role_llm_runner::run::{BudgetExhaustedDetail, FinalMessage, RunStatus};
+use cortexkit_role_llm_runner::usage::{RunUsage, StepUsage};
 use mc_store::dream_domain::DreamDomainLease;
 use mc_store::dream_scheduler::schedules::{TaskConfig, TaskName};
 use mc_store::parity_schema_manifest::*;
@@ -122,6 +123,7 @@ struct Run {
     max_steps: Option<u64>,
     cap: Option<u64>,
     spent: u64,
+    usage: RunUsage,
     done: usize,
     units: VecDeque<Value>,
     terminal: Option<RunResult>,
@@ -134,6 +136,9 @@ struct Run {
 #[derive(Default)]
 struct State {
     describe: Value,
+    open_controls: bool,
+    quiet_stream: bool,
+    quiet_active_probes: usize,
     gate: Option<Arc<tokio::sync::Notify>>,
     log: Vec<(String, String, Value)>,
     lose_send_replies: usize,
@@ -187,6 +192,10 @@ fn child_runner_describe() -> Value {
             .unwrap()
             .retain(|op| op != "compaction.ready");
     }
+    describe["capabilities"]
+        .as_array_mut()
+        .unwrap()
+        .extend(["max_steps", "no_tools", "run_usage"].map(|group| json!(group)));
     describe
 }
 const GOLDEN_DESCRIBE_SHA256: &str =
@@ -233,6 +242,24 @@ impl FakeBroca {
             };
         }
         let describe: RoleDescribe = serde_json::from_value(s.describe.clone()).unwrap();
+        let max_steps = request
+            .max_steps()
+            .map_err(|field| refused("invalid_params", json!({"field":field})))?;
+        let max_output_tokens = request
+            .max_output_tokens()
+            .map_err(|field| refused("invalid_params", json!({"field":field})))?;
+        let no_tools = request
+            .no_tools()
+            .map_err(|field| refused("invalid_params", json!({"field":field})))?;
+        for (group, offered) in [
+            (caps::MAX_STEPS, max_steps.is_some()),
+            (caps::MAX_OUTPUT_TOKENS, max_output_tokens.is_some()),
+            (caps::NO_TOOLS, no_tools == Some(true)),
+        ] {
+            if offered && !describe.declares(group) {
+                return Err(refused("invalid_params", json!({"field": group})));
+            }
+        }
         let advertised = describe.declares(caps::INPUT_TOKEN_CAP);
         let budget = request
             .budget()
@@ -282,15 +309,16 @@ impl FakeBroca {
             }
             allow.extend(tools);
         }
+        if no_tools == Some(true) {
+            allow.clear();
+        }
         s.run = Some(Run {
             id: "run-1".into(),
             allow,
-            max_steps: request
-                .runner_params
-                .get("stop_when")
-                .and_then(|s| s["max_steps"].as_u64()),
+            max_steps,
             cap: budget.and_then(|b| b.max_input_tokens),
             spent: 0,
+            usage: RunUsage::new(),
             done: 0,
             units: VecDeque::new(),
             terminal: None,
@@ -325,7 +353,7 @@ impl FakeBroca {
     }
 
     fn terminal(run: &mut Run, state: &str, detail: Option<BudgetExhaustedDetail>) {
-        let mut result = RunResult::new(run.id.clone(), state);
+        let mut result = RunResult::new(run.id.clone(), state).with_usage(run.usage.clone());
         if let Some(detail) = detail {
             result = result.with_detail(detail);
         }
@@ -367,6 +395,17 @@ impl FakeBroca {
             return None;
         }
         run.done += 1;
+        let measured_usage = if step.unreported {
+            StepUsage::unreported()
+        } else {
+            StepUsage::unreported()
+                .with_input_tokens(step.input)
+                .with_cached_input_tokens(step.cache_read)
+                .with_cache_write_tokens(step.cache_write)
+                .with_output_tokens(500)
+        };
+        run.usage
+            .record_step("provider", "model", None, measured_usage);
         // The cap counts input, cache-read and cache-write tokens, never output.
         let measured = step.input + step.cache_read + step.cache_write;
         run.spent += measured;
@@ -477,11 +516,13 @@ impl FakeBroca {
         if calls.is_empty() {
             if let Some(text) = composed.or(text.map(str::to_string)) {
                 run.terminal = Some(
-                    RunResult::new(run.id.clone(), "completed").with_final_message(FinalMessage {
-                        ordinal: run.done as u64,
-                        mid: format!("m{}", run.done),
-                        text,
-                    }),
+                    RunResult::new(run.id.clone(), "completed")
+                        .with_usage(run.usage.clone())
+                        .with_final_message(FinalMessage {
+                            ordinal: run.done as u64,
+                            mid: format!("m{}", run.done),
+                            text,
+                        }),
                 );
             }
         }
@@ -583,14 +624,28 @@ impl BrocaPort for FakeBroca {
                 Ok(json!("ack"))
             }
             "run.status" => {
+                let quiet = self.state().quiet_stream;
+                if quiet {
+                    let wait = {
+                        let mut state = self.state();
+                        let wait = state.quiet_active_probes > 0;
+                        state.quiet_active_probes = state.quiet_active_probes.saturating_sub(1);
+                        wait
+                    };
+                    if !wait {
+                        self.advance().await;
+                    }
+                }
                 let s = self.state();
                 let run = s
                     .run
                     .as_ref()
                     .ok_or_else(|| refused("unknown_run", Value::Null))?;
-                let mut status = RunStatus::new("active");
+                let mut status = RunStatus::new("active").with_usage(run.usage.clone());
                 if let Some(result) = &run.terminal {
-                    status = RunStatus::new(result.state.clone()).with_undelivered_steers(vec![]);
+                    status = RunStatus::new(result.state.clone())
+                        .with_usage(run.usage.clone())
+                        .with_undelivered_steers(vec![]);
                     if let Some(detail) = result.detail.clone() {
                         status = status.with_detail(detail);
                     }
@@ -603,14 +658,22 @@ impl BrocaPort for FakeBroca {
     }
 
     async fn next_unit(&mut self, _session: &str) -> Result<Option<Value>, PortError> {
+        if self.state().quiet_stream {
+            return Ok(None);
+        }
         loop {
             {
                 let mut s = self.state();
+                let open_controls = s.open_controls;
                 let Some(run) = s.run.as_mut() else {
                     return Ok(None);
                 };
                 if let Some(unit) = run.units.pop_front() {
-                    return Ok(Some(unit));
+                    return Ok(Some(if open_controls {
+                        json!({"kind":"control","event":{"vendor":"opaque","text":"not an answer","usage":"not measured here"}})
+                    } else {
+                        unit
+                    }));
                 }
                 if run.terminal.is_some() {
                     return Ok(None);
@@ -643,6 +706,7 @@ fn describe(capabilities: &[&str], max_seconds: u64, delete_within_ms: u64) -> V
         "session.send",
         "session.read",
         "run.result",
+        "run.status",
         "run.cancel",
         "session.retract",
         "session.subscribe",
@@ -667,11 +731,15 @@ fn describe(capabilities: &[&str], max_seconds: u64, delete_within_ms: u64) -> V
 const BASE: &[&str] = &[
     "queue",
     "run_ops",
+    "run_status",
+    "run_usage",
     "streaming",
     "retention",
     "plans",
     "run_cancel",
     "retract",
+    "max_steps",
+    "no_tools",
 ];
 
 struct Fixture {
@@ -1173,7 +1241,16 @@ async fn broca_child_sends_retention_and_private_dreams_use_the_shortest() {
         .await
         .unwrap_err();
     assert_eq!(refused.message, "unavailable: retention_deletion_too_slow");
-    let none = Fixture::new(&["queue", "run_ops", "streaming", "run_cancel", "retract"]);
+    let none = Fixture::new(&[
+        "queue",
+        "run_ops",
+        "streaming",
+        "run_cancel",
+        "retract",
+        "run_status",
+        "max_steps",
+        "no_tools",
+    ]);
     let refused = bounded(none.carrier(policy()).open(&none.request(&[], 3)))
         .await
         .unwrap_err();
@@ -1279,8 +1356,16 @@ async fn broca_child_budget_exhausted_is_the_task_budget_failure() {
     assert_eq!(report.attempts.len(), 1);
     assert_eq!(f.sent().len(), 1);
     assert_eq!(f.effects.executed().len(), 1);
+    let mut observed = status(&f).await;
+    let usage: RunUsage =
+        serde_json::from_value(observed.as_object_mut().unwrap().remove("usage").unwrap()).unwrap();
+    assert!(usage.consistent());
     assert_eq!(
-        status(&f).await,
+        (usage.steps, usage.input_tokens, usage.output_tokens),
+        (2, Some(100), Some(1000))
+    );
+    assert_eq!(
+        observed,
         json!({"state": "budget_exhausted", "detail": {"limit": 100, "spent": 100, "cause": "limit_reached"},
             "undelivered_steers": []})
     );
@@ -1401,8 +1486,11 @@ async fn broca_child_golden_runner_stops_at_exactly_the_cap() {
         (charged.input, charged.cache_read, charged.cache_write),
         (5, 2, 3)
     );
-    // The fake's run.status agrees with Broca's golden on every role field.
-    let golden: RunStatus = serde_json::from_slice(GOLDEN_EXHAUSTED).unwrap();
+    // This golden predates the role's cumulative run_usage shape. Keep comparing
+    // its state/detail fields; current usage is asserted independently.
+    let mut golden: Value = serde_json::from_slice(GOLDEN_EXHAUSTED).unwrap();
+    golden.as_object_mut().unwrap().remove("usage");
+    let golden: RunStatus = serde_json::from_value(golden).unwrap();
     let fake: RunStatus = serde_json::from_value(status(&f).await).unwrap();
     assert_eq!(fake.state, golden.state);
     assert_eq!(fake.detail, golden.detail);
@@ -1517,3 +1605,54 @@ async fn broca_child_conformance_cap_cases_hold_through_the_carrier() {
 mod executor;
 
 mod session_runner;
+
+#[tokio::test]
+async fn broca_child_open_controls_follow_status_and_result_without_parsing_bodies() {
+    let mut completions = Vec::new();
+    for open_controls in [false, true] {
+        let f = Fixture::new(BASE);
+        f.broca.state().open_controls = open_controls;
+        f.script(vec![answer("pinned final answer")]);
+        let request = f.request(&[], 3);
+        let (completion, _) = run(&f, &mut f.carrier(policy()), &request).await;
+        let completion = completion.unwrap();
+        assert_eq!(completion.text, "pinned final answer");
+        assert_eq!(f.broca.ops("run.status").len(), 1);
+        assert_eq!(f.broca.ops("run.result").len(), 1);
+        completions.push((completion.text, completion.usage));
+    }
+    assert_eq!(completions[0], completions[1]);
+}
+
+#[tokio::test]
+async fn broca_child_quiet_stream_polls_state_before_reading_one_terminal_result() {
+    let f = Fixture::new(BASE);
+    {
+        let mut state = f.broca.state();
+        state.quiet_stream = true;
+        state.quiet_active_probes = 2;
+    }
+    f.script(vec![answer("quiet final answer")]);
+    let request = f.request(&[], 3);
+    let (completion, _) = run(&f, &mut f.carrier(policy()), &request).await;
+    assert_eq!(completion.unwrap().text, "quiet final answer");
+    assert_eq!(f.broca.ops("run.status").len(), 3);
+    assert_eq!(f.broca.ops("run.result").len(), 1);
+}
+
+#[tokio::test]
+async fn broca_child_missing_follow_groups_are_refused_without_a_send() {
+    for missing in [caps::RUN_OPS, caps::RUN_STATUS] {
+        let groups: Vec<_> = BASE
+            .iter()
+            .copied()
+            .filter(|group| *group != missing)
+            .collect();
+        let f = Fixture::new(&groups);
+        let error = bounded(f.carrier(policy()).open(&f.request(&[], 3)))
+            .await
+            .unwrap_err();
+        assert!(error.message.contains(missing), "{error:?}");
+        assert!(f.sent().is_empty());
+    }
+}
