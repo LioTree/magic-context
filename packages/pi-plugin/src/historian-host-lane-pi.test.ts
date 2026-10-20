@@ -7,7 +7,7 @@ import {
 	writeFileSync,
 } from "node:fs";
 import { tmpdir } from "node:os";
-import { dirname, join, resolve } from "node:path";
+import { join } from "node:path";
 import { createTestTempDirFromPath } from "../../plugin/src/shared/test-temp-dir";
 import { loadPiConfig } from "./config/index";
 import { resolveHistorianFromConfig } from "./index";
@@ -15,9 +15,8 @@ import { resolveHistorianFromConfig } from "./index";
 /**
  * A standalone Pi extension still resolves its own subagent historian when the
  * shared config selects `historian.runner: "host"`. It must not queue jobs in a
- * Rust module with no external worker to execute them. Rust transforms belong
- * to the separately constructed createPiBridgeAdapter, never to the standalone
- * extension's imports.
+ * Rust module with no external worker to execute them. Rust transforms must not
+ * enter the standalone extension's imports.
  */
 
 const tempRoots: string[] = [];
@@ -89,8 +88,7 @@ describe("standalone Pi and the historian host lane", () => {
 		});
 		expect(offenders).toEqual([]);
 
-		// Only createPiBridgeAdapter may use the shared module-session kernel. The
-		// standalone index.ts import graph must not reach that adapter.
+		// The standalone extension must not import the Rust module-session kernel.
 		const kernelCallers = piSourceFiles().filter((path) => {
 			const source = readFileSync(path, "utf-8");
 			return (
@@ -98,26 +96,7 @@ describe("standalone Pi and the historian host lane", () => {
 				source.includes("createModuleSessionKernel")
 			);
 		});
-		const bridge = join(import.meta.dir, "bridge-adapter-pi.ts");
-		expect(kernelCallers).toEqual([bridge]);
-		const sources = new Set(piSourceFiles());
-		const reached = new Set<string>();
-		const scanner = new Bun.Transpiler({ loader: "ts" });
-		const visit = (path: string): void => {
-			if (reached.has(path)) return;
-			reached.add(path);
-			for (const dependency of scanner.scan(readFileSync(path, "utf8"))
-				.imports) {
-				if (!dependency.path.startsWith(".")) continue;
-				const base = resolve(dirname(path), dependency.path);
-				const target = [base, `${base}.ts`, join(base, "index.ts")].find(
-					(candidate) => sources.has(candidate),
-				);
-				if (target) visit(target);
-			}
-		};
-		visit(join(import.meta.dir, "index.ts"));
-		expect(reached.has(bridge)).toBe(false);
+		expect(kernelCallers).toEqual([]);
 	});
 
 	it("accepts historian.runner=host in shared config and resolves the Pi subagent historian anyway", () => {

@@ -22,7 +22,7 @@ import { clearModelsDevCache } from "./models-dev-cache";
  * The resolution is the one the plugin uses everywhere it hands the module a
  * chain: `resolveHistorianModel` (model-resolution.ts), the timeout default from
  * `sampleHistorian` (hooks/magic-context/hook.ts), `historian.maxTokens` as the
- * output cap (host-runner/bridge-deps.ts) and `rustWrapupHistorianFields`
+ * output cap and `rustWrapupHistorianFields`
  * (hooks/magic-context/module-session-kernel.ts) for the chain, variants and
  * limits. ck-mc has no model catalog, so the matrix is resolved with an empty
  * catalog: every per-model limit entry is then empty, as it is in ck-mc.
