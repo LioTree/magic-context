@@ -55,7 +55,7 @@ pub(crate) struct LogicalPrefix {
     /// Ordinals of original system messages and the source message containing
     /// the durable lineage anchor; all must remain available before the cut.
     pub(crate) context_ordinals: BTreeSet<u64>,
-    /// Native source bytes, not just identities: a later hard rebuild must
+    /// Native source messages with their content, not just identities: a hard rebuild must
     /// render the covered system content again without decoding covered rows.
     pub(crate) context_sources: BTreeMap<u64, crate::providers::codec::InboundMessage>,
     /// A frozen target can be absent because its source is covered; that absence
