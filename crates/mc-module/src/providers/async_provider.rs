@@ -105,6 +105,12 @@ pub(crate) struct AsyncRecord {
     /// `record_protocol_failure`. Absent while the conversation is healthy.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub(crate) failure: Option<AsyncFailure>,
+    /// The last engine pass for this conversation failed. Its next notice
+    /// runs the engine again rather than skipping it, as a notice did before
+    /// passes could be skipped: an engine refusal can depend on state a
+    /// skipped pass would not look at.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    engine_failed: bool,
     #[serde(default)]
     last_discarded_drops: usize,
     #[serde(default)]
@@ -1199,6 +1205,7 @@ impl McHandler {
             resync_sources: None,
             restored_head: None,
             failure: None,
+            engine_failed: false,
             last_discarded_drops: 0,
             last_transferred_drops: 0,
             tag_index: BTreeMap::new(),
@@ -2009,7 +2016,12 @@ impl McHandler {
         #[cfg(test)]
         drop(skip_phase);
         if run_engine {
-            self.publish_async(0, &mut state, codec, resynced)?;
+            if let Err(error) = self.publish_async(0, &mut state, codec, resynced) {
+                drop(state);
+                self.mark_engine_failed(store, &notice.session_ref)?;
+                return Err(error);
+            }
+            state.engine_failed = false;
         }
         state.completed_seq = state.seq;
         let drops_applied = store
@@ -2611,9 +2623,18 @@ impl McHandler {
             state.save(store, &rows)?;
             let worker = self.provider_historian_worker();
             let store = Arc::clone(store);
+            let reference = request.session_ref.clone();
             let view = tokio::task::spawn_blocking(move || {
                 let _serial = _serial;
-                let view = worker.publish_async(0, &mut state, codec, true)?;
+                let view = match worker.publish_async(0, &mut state, codec, true) {
+                    Ok(view) => view,
+                    Err(error) => {
+                        drop(state);
+                        worker.mark_engine_failed(&store, &reference)?;
+                        return Err(error);
+                    }
+                };
+                state.engine_failed = false;
                 state.save(&store, &[])?;
                 worker.checkin(state);
                 Ok::<_, HandlerOutcome>(view)
@@ -3052,6 +3073,21 @@ impl McHandler {
         load(store, reference)
     }
 
+    /// Record on the stored conversation that its engine pass failed, from
+    /// the stored record: the operation's own copy is part-way through and
+    /// is discarded. Call only under the conversation's provider lock.
+    fn mark_engine_failed(&self, store: &McStore, reference: &str) -> Result<(), HandlerOutcome> {
+        let Some(mut state) = self.checkout(store, reference)? else {
+            return Ok(());
+        };
+        if !state.engine_failed {
+            state.engine_failed = true;
+            state.save(store, &[])?;
+        }
+        self.checkin(state);
+        Ok(())
+    }
+
     /// Keep a conversation resident after an operation whose last save
     /// succeeded (or that changed nothing).
     fn checkin(&self, state: State) {
@@ -3132,6 +3168,7 @@ impl McHandler {
                 "reasoning_clear_uninitialized",
             ),
             (meta.last_model_key != model, "model_changed"),
+            (state.engine_failed, "previous_engine_pass_failed"),
             (state.restored_head.is_some(), "restored_head"),
             (
                 state.engine.preset != transform::compaction::Preset::Head,

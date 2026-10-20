@@ -462,6 +462,10 @@ struct Pair {
     /// skipped engine pass leaves its writes out), for a failure message.
     /// It is a diagnostic, not part of the comparison.
     engine_drift: Option<String>,
+    /// Record answer mismatches in `mismatches` instead of failing: only for
+    /// the diagnostic replay of a diverging seed, never for the comparison.
+    record_only: bool,
+    mismatches: Vec<String>,
     _project: tempfile::TempDir,
 }
 
@@ -513,6 +517,8 @@ impl Pair {
             model: "fixture".into(),
             log: Vec::new(),
             engine_drift: None,
+            record_only: false,
+            mismatches: Vec::new(),
             _project: project,
         };
         let mut setup = json!({"method":"compaction.setup","params":{"session":"s","harness":profile.harness(),"request_id":"setup","model":"fixture","context_window":100_000,"composition":{"render_tags":true},"params":{"serializer_profile":profile.wire()},"now":1}});
@@ -549,6 +555,15 @@ impl Pair {
         self.log.push(label.to_owned());
         if self.engine_drift.is_none() {
             self.engine_drift = self.engine_state_drift();
+        }
+        if self.record_only {
+            self.mismatches.push(format!(
+                "step {} {label}: resident {} | oracle {}",
+                self.log.len(),
+                resident.chars().take(160).collect::<String>(),
+                oracle.chars().take(160).collect::<String>()
+            ));
+            return resident;
         }
         assert_eq!(
             resident,
@@ -842,8 +857,7 @@ impl Pair {
                     ),
                     _ => ("ceiling", Some(json!({}))),
                 };
-                let mut params =
-                    json!({"session_ref":self.reference,"cause":cause,"deadline_ms":60_000});
+                let mut params = json!({"session_ref":self.reference,"cause":cause,"deadline_ms":if cause == "ceiling" { 60_000 } else { 10_000 }});
                 if let Some(overflow) = overflow {
                     params["overflow"] = overflow;
                 }
@@ -1171,4 +1185,50 @@ fn publish_history(side: &Side, reference: &str, end: u64) -> String {
         .unwrap();
     store.arm_soft_refresh(&namespace).unwrap();
     "published".into()
+}
+
+/// Replay one diverging seed (`MC_ASYNC_DIFFERENTIAL_FIRST_SEED`, profile
+/// from `MC_ASYNC_DIFFERENTIAL_PROFILE` index), printing both providers'
+/// answer at every step and then pushing both through engine-running
+/// notices, to see whether a divergence persists. Diagnostic only.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+#[ignore = "diagnostic replay of one differential seed"]
+async fn replay_one_seed() {
+    let seed = std::env::var("MC_ASYNC_DIFFERENTIAL_FIRST_SEED")
+        .ok()
+        .and_then(|value| value.parse().ok())
+        .unwrap_or(1_033u64);
+    let profile = PROFILES[std::env::var("MC_ASYNC_DIFFERENTIAL_PROFILE")
+        .ok()
+        .and_then(|value| value.parse::<usize>().ok())
+        .unwrap_or(1)];
+    let steps = 24;
+    let mut rng = Rng(seed.wrapping_mul(0x9E37_79B9_7F4A_7C15) | 1);
+    let tiny_budget = rng.chance(10);
+    let setup_lineage = (!rng.chance(25)).then_some("L");
+    let inject_docs = rng.chance(30);
+    let mut pair = Pair::open(profile, tiny_budget, setup_lineage, inject_docs).await;
+    pair.record_only = true;
+    pair.append(16 + rng.below(40));
+    pair.notice(&mut rng, None).await;
+    for _ in 0..steps {
+        pair.step(&mut rng).await;
+    }
+    // Retry the last notice as the bus would, then force engine passes.
+    for _ in 0..3 {
+        let message = pair.notice_message(&mut rng, None);
+        pair.deliver(message).await;
+    }
+    for _ in 0..3 {
+        pair.append(1);
+        pair.seq += 1;
+        let mut message = pair.notice_message(&mut rng, None);
+        message.headers.insert("est_tokens".into(), "96000".into());
+        let notice = notice::AdvanceNotice::from_headers(&message.headers).unwrap();
+        message.digest = notice.digest().parse().unwrap();
+        pair.deliver(message).await;
+    }
+    for line in &pair.mismatches {
+        eprintln!("REPLAY {line}");
+    }
 }
