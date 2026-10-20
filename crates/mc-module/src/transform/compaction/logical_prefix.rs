@@ -22,12 +22,29 @@ impl From<&StoredCompartment> for Coverage {
     }
 }
 
+fn coverage_preserved(old: &[Coverage], current: &[StoredCompartment]) -> bool {
+    let mut ranges = current.iter().collect::<Vec<_>>();
+    ranges.sort_by_key(|c| c.start_message);
+    old.iter().all(|old| {
+        let mut next = old.from;
+        for c in &ranges {
+            if c.start_message <= next && c.end_message >= next {
+                next = c.end_message.saturating_add(1);
+            }
+        }
+        next > old.to
+    })
+}
+
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub(crate) struct LogicalPrefix {
     pub(crate) lineage: String,
     pub(crate) generation: u64,
     pub(crate) from: u64,
     pub(crate) tail_from: u64,
+    /// Authored user turns omitted from the projection. Channel-1 cadence
+    /// counts the whole conversation even when its model input is bounded.
+    pub(crate) covered_user_turns: u64,
     /// Source extent observed when this rebuild certified the omitted prefix.
     certified_through: u64,
     coverage: u64,
@@ -35,9 +52,10 @@ pub(crate) struct LogicalPrefix {
     sequence: i64,
     revert_epoch: u64,
     compartments: Vec<Coverage>,
-    /// Ordinal index for original systems and the durable lineage anchor.
+    /// Ordinals of original system messages and the source message containing
+    /// the durable lineage anchor; all must remain available before the cut.
     pub(crate) context_ordinals: BTreeSet<u64>,
-    /// Native source bytes, not just identities: a later HARD must be able to
+    /// Native source bytes, not just identities: a later hard rebuild must
     /// render the covered system content again without decoding covered rows.
     pub(crate) context_sources: BTreeMap<u64, crate::providers::codec::InboundMessage>,
     /// A frozen target can be absent because its source is covered; that absence
@@ -71,20 +89,7 @@ impl LogicalPrefix {
             && self.from < self.tail_from
             && self.tail_from <= self.coverage
             && self.context_sources.keys().eq(self.context_ordinals.iter())
-            && self.compartments.iter().all(|old| {
-                // A newer summary may extend or merge old ranges. The source
-                // certificate still proves those old sources were covered; it
-                // is usable only while today's ranges cover that entire span.
-                let mut next = old.from;
-                let mut ranges = compartments.iter().collect::<Vec<_>>();
-                ranges.sort_by_key(|c| c.start_message);
-                for c in ranges {
-                    if c.start_message <= next && c.end_message >= next {
-                        next = c.end_message.saturating_add(1);
-                    }
-                }
-                next > old.to
-            })
+            && coverage_preserved(&self.compartments, compartments)
             && self.crossing_arcs.iter().all(|(call, result)| {
                 *call >= self.tail_from && *call <= self.coverage && *result > self.coverage
             })
@@ -102,6 +107,32 @@ impl LogicalPrefix {
         generation: u64,
     ) -> Option<Self> {
         let coverage = loaded.meta.coverage_ordinal?;
+        let sequence = meta_coverage_compartment_seq(&loaded.meta);
+        let applied = compartments
+            .iter()
+            .filter(|c| c.sequence <= sequence)
+            .cloned()
+            .collect::<Vec<_>>();
+        // A historian may publish between the engine commit and this read.
+        // Certify only the compartments that the engine actually adopted, not
+        // the newer catalog head or a replacement that rewound its coverage.
+        let boundary = applied.iter().find(|c| c.sequence == sequence)?;
+        if boundary.end_message != coverage as i64
+            || boundary.end_message_id != loaded.core.boundary_id
+            || req.logical_prefix.as_ref().is_some_and(|old| {
+                old.coverage > coverage || !coverage_preserved(&old.compartments, &applied)
+            })
+        {
+            return None;
+        }
+        let live = projection
+            .blocks
+            .iter()
+            .filter(|b| !b.synthetic)
+            .collect::<Vec<_>>();
+        if first_uncovered_live_block(&applied, &live, Some(coverage)).is_some() {
+            return None;
+        }
         let protection_floor = loaded.meta.protected_tokens_effective.unwrap_or(0);
         let protection_ratio =
             crate::decision_calibration::DecisionCalibration::for_model(req.model_key.as_deref())
@@ -152,7 +183,7 @@ impl LogicalPrefix {
             .anchor_block_id
             .as_deref()
             .and_then(split_block_id);
-        let context_ordinals = req
+        let context_ordinals: BTreeSet<u64> = req
             .messages
             .iter()
             .filter(|m| {
@@ -161,6 +192,24 @@ impl LogicalPrefix {
             })
             .map(|m| m.ordinal)
             .collect();
+        let covered_user_turns = req
+            .logical_prefix
+            .as_ref()
+            .map_or(0, |p| p.covered_user_turns)
+            .saturating_add(
+                projection
+                    .blocks
+                    .iter()
+                    .filter(|b| {
+                        b.ordinal < tail_from
+                            && !context_ordinals.contains(&b.ordinal)
+                            && b.role == "user"
+                            && !b.synthetic
+                    })
+                    .map(|b| b.mid.as_str())
+                    .collect::<HashSet<_>>()
+                    .len() as u64,
+            );
         let covered_targets = projection
             .blocks
             .iter()
@@ -196,12 +245,13 @@ impl LogicalPrefix {
             generation,
             from,
             tail_from,
+            covered_user_turns,
             certified_through: req.messages.last()?.ordinal,
             coverage,
             boundary: loaded.core.boundary_id.clone(),
-            sequence: meta_coverage_compartment_seq(&loaded.meta),
+            sequence,
             revert_epoch: loaded.meta.revert_epoch,
-            compartments: compartments.iter().map(Coverage::from).collect(),
+            compartments: applied.iter().map(Coverage::from).collect(),
             context_ordinals,
             context_sources: BTreeMap::new(),
             covered_targets,
@@ -317,5 +367,36 @@ impl LogicalPrefix {
 
     pub(crate) fn covers_target(&self, target: &str) -> bool {
         self.covered_targets.contains(target)
+    }
+
+    pub(crate) fn retained_bytes(&self) -> usize {
+        std::mem::size_of::<Self>()
+            + self.lineage.capacity()
+            + self.boundary.capacity()
+            + self
+                .context_sources
+                .values()
+                .map(|source| {
+                    128 + source.mid.capacity()
+                        + crate::retained_size::value_retained_bytes(&source.message)
+                })
+                .sum::<usize>()
+            + self.context_ordinals.len() * 40
+            + self
+                .covered_targets
+                .iter()
+                .map(|id| 64 + id.capacity())
+                .sum::<usize>()
+            + self
+                .compartments
+                .iter()
+                .map(|c| 64 + c.boundary.capacity())
+                .sum::<usize>()
+            + self.crossing_arcs.capacity() * 16
+            + self
+                .protection_tags
+                .iter()
+                .map(|(_, id, kind, _, _)| 64 + id.capacity() + kind.capacity())
+                .sum::<usize>()
     }
 }

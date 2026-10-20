@@ -8187,7 +8187,12 @@ fn apply_once(
                 covered_users: req
                     .native_fold_prefix
                     .as_ref()
-                    .map_or(0, |prefix| prefix.users),
+                    .map_or(0, |prefix| prefix.users)
+                    .saturating_add(
+                        req.logical_prefix
+                            .as_ref()
+                            .map_or(0, |prefix| prefix.covered_user_turns),
+                    ),
                 ctx,
                 core: &core,
                 projection: &projection,

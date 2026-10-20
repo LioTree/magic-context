@@ -834,6 +834,15 @@ impl State {
             + self.tag_index.len() * TAG_ADDRESS
             + self.mid_index.len() * 96
             + cache_state
+            + self
+                .logical_prefix
+                .as_ref()
+                .map_or(0, |prefix| prefix.retained_bytes())
+            + self
+                .journal
+                .saved_json
+                .as_ref()
+                .map_or(0, |json| json.len())
     }
 
     fn reset(&mut self, store: &McStore) -> Result<(), HandlerOutcome> {

@@ -680,8 +680,8 @@ impl Pair {
                     .zip(&right_model)
                     .position(|(a, b)| a != b)
                     .unwrap_or(left_model.len().min(right_model.len()));
-                panic!("{:?} served bytes after {label}, first={first}, left={:?}, right={:?}, steps={:?}, first_drift={:?}, drift={:?}",
-                    self.profile, left_model.get(first), right_model.get(first), self.log, self.engine_drift, self.engine_state_drift());
+                panic!("{:?} served bytes after {label}, first={first}, left={:?}, right={:?}, steps={:?}, first_drift={:?}, drift={:?}, hygiene={:?}",
+                    self.profile, left_model.get(first), right_model.get(first), self.log, self.engine_drift, self.engine_state_drift(), self.hygiene_state());
             }
             for (oracle, bytes) in [(false, left), (true, right)] {
                 if let Some(previous) = self
@@ -717,6 +717,23 @@ impl Pair {
             self.profile,
             self.log
         );
+    }
+
+    fn hygiene_state(&self) -> (Value, Value) {
+        let side = |side: &Side| {
+            let head = load_head(side.store(), &self.reference).unwrap().unwrap();
+            let loaded = side.store().load(&head.namespace()).unwrap();
+            let meta = serde_json::to_value(&loaded.meta).unwrap();
+            let mut baseline = meta["tail_hygiene_baseline"].clone();
+            if let Some(fields) = baseline.as_object_mut() {
+                fields.remove("parts");
+                fields.remove("content_signature");
+            }
+            json!({"baseline":baseline,"coverage":meta["coverage_ordinal"],
+                "last_level":meta["channel1_last_fire_level"],"last_ordinal":meta["channel1_last_fire_ordinal"],
+                "channel1_units":loaded.core.frozen_units.iter().filter(|u|u.kind == "channel1").map(|u|&u.key).collect::<Vec<_>>()})
+        };
+        (side(&self.resident), side(&self.oracle))
     }
 
     /// Assemble the runner's native source rows and addressed edits, independently
@@ -1165,6 +1182,12 @@ async fn prefix_matches_full_lineage_with_crossing_native_arcs() {
         );
         if profile != Profile::OpenCode {
             assert_eq!(head.logical_prefix.as_ref().unwrap().tail_from, 149);
+            let proof = serde_json::to_value(&head.logical_prefix).unwrap();
+            assert_eq!(
+                proof["crossing_arcs"],
+                json!([[149, 150]]),
+                "the certificate lost its cross-cut invocation/result ledger"
+            );
         }
         if matches!(profile, Profile::Broca | Profile::OpenCode) {
             assert!(!head
@@ -1272,6 +1295,11 @@ async fn covered_tool_result_drop_uses_prefix_membership_without_projecting_an_o
         .load_pending_agent_drops(&head.namespace())
         .unwrap()
         .is_empty());
+}
+
+#[tokio::test]
+async fn prefix_replays_channel1_session_1101() {
+    session(Profile::OpenCode, 1101, 24).await;
 }
 
 /// The full differential: `MC_ASYNC_DIFFERENTIAL_SESSIONS` sessions (default

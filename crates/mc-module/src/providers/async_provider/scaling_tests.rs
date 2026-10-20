@@ -73,6 +73,48 @@ async fn covered_view_work_tracks_tail_not_session() {
     }
 }
 
+#[tokio::test]
+async fn prefix_certificate_does_not_guess_after_catalog_rewind() {
+    let dir = tempfile::tempdir().unwrap();
+    let mut rig = Rig::new(dir.path()).await;
+    rig.append(80);
+    rig.history(67, "adopted coverage");
+    rig.notice(1_000, None).await;
+    let state = rig.state();
+    let mut request: TransformRequest = decode(&json!({"v":2,"kind":"compaction.step", "session_id":state.namespace(),"messages":[],"render_config":"","model_key":"fixture","tool_present":false})).unwrap();
+    codec::Codec::OpencodeAiSdk
+        .prepare_request(
+            &mut request,
+            &inbound_messages(state.entries.values()).unwrap(),
+        )
+        .unwrap();
+    let projection = ck_wire::project_messages(&request.messages).unwrap();
+    let loaded = rig.store().load(&state.namespace()).unwrap();
+    let mut compartments = rig.store().load_compartments(&state.namespace()).unwrap();
+    assert!(transform::compaction::LogicalPrefix::certify(
+        rig.store(),
+        &request,
+        &projection,
+        &loaded,
+        &compartments,
+        "L",
+        state.generation
+    )
+    .is_some());
+    compartments[0].end_message = 62;
+    compartments[0].end_message_id = "m62#0".into();
+    assert!(transform::compaction::LogicalPrefix::certify(
+        rig.store(),
+        &request,
+        &projection,
+        &loaded,
+        &compartments,
+        "L",
+        state.generation
+    )
+    .is_none());
+}
+
 /// Wall and thread-CPU time spent in `AsyncRecord::save` (and, separately,
 /// in a full `load`), per conversation. Saves run on whichever worker thread
 /// holds the conversation, so the meter is keyed by session reference rather
