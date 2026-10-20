@@ -62,6 +62,7 @@ import {
     setCompactionModeRecord,
     setPersistedCompactionMarkerState,
 } from "../../features/magic-context/storage-meta-persisted";
+import { writeSessionRenderCache } from "../../features/magic-context/storage-session-cache";
 import { sessionLog } from "../../shared/logger";
 import { MARKER_SUMMARY_TEXT } from "./compaction-marker-manager";
 
@@ -146,12 +147,19 @@ function clearCachedM0Baseline(
     db: import("../../shared/sqlite").Database,
     sessionId: string,
 ): boolean {
-    const result = db
-        .prepare(
-            "UPDATE session_meta SET cached_m0_bytes = NULL, cached_m1_bytes = NULL, cached_m0_mural_data_url = NULL WHERE session_id = ?",
-        )
-        .run(sessionId);
-    return (result.changes ?? 0) > 0;
+    return db
+        .transaction(() => {
+            const exists = !!db
+                .prepare("SELECT 1 FROM session_meta WHERE session_id = ?")
+                .get(sessionId);
+            if (exists) {
+                writeSessionRenderCache(db, sessionId, "cached_m0_bytes", null);
+                writeSessionRenderCache(db, sessionId, "cached_m1_bytes", null);
+                writeSessionRenderCache(db, sessionId, "cached_m0_mural_data_url", null);
+            }
+            return exists;
+        })
+        .immediate();
 }
 
 function cleanupOffMarkers(sessionId: string): McOwnedMarkerCleanupResult {

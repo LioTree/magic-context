@@ -2,10 +2,12 @@
 
 import { describe, expect, it } from "bun:test";
 import { Database } from "../../shared/sqlite";
+import { seedSessionMeta } from "./__tests__/session-meta-fixture";
 import { LATEST_MIGRATION_VERSION, MIGRATIONS, runMigrations } from "./migrations";
 import { enforceSchemaFence, initializeDatabase, LATEST_SUPPORTED_VERSION } from "./storage-db";
 import { clearCachedM0M1 } from "./storage-meta-shared";
 import { healAllNullColumns } from "./storage-schema-helpers";
+import { sessionRenderCacheSelect } from "./storage-session-cache";
 
 type ColumnInfo = { name: string; type: string; notnull: number; dflt_value: unknown };
 
@@ -157,19 +159,22 @@ describe("migration 100", () => {
         try {
             initializeDatabase(db);
             runMigrations(db);
-            db.prepare(
-                "INSERT INTO session_meta (session_id, cached_m0_bytes, cached_m1_bytes, served_prefix, held_release) VALUES ('held', ?, ?, ?, ?)",
-            ).run(
-                Buffer.from("head"),
-                Buffer.from("summary"),
-                '{"prefix":"original"}',
-                '{"reason":"flush"}',
-            );
+            seedSessionMeta(db, {
+                session_id: "held",
+                cached_m0_bytes: Buffer.from("head"),
+                cached_m1_bytes: Buffer.from("summary"),
+                served_prefix: '{"prefix":"original"}',
+                held_release: '{"reason":"flush"}',
+            });
             clearCachedM0M1(db, "held");
             expect(
                 db
                     .prepare(
-                        "SELECT cached_m0_bytes, cached_m1_bytes, served_prefix, held_release FROM session_meta WHERE session_id = 'held'",
+                        `SELECT ${sessionRenderCacheSelect("cached_m0_bytes", "cached_m0_bytes", db)},
+                            ${sessionRenderCacheSelect("cached_m1_bytes", "cached_m1_bytes", db)},
+                            served_prefix,
+                            held_release
+                        FROM session_meta WHERE session_id = 'held'`,
                     )
                     .get(),
             ).toEqual({

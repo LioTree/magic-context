@@ -31,6 +31,16 @@ export const SESSION_SCOPED_TABLES: readonly SessionScopedTableDefinition[] = [
     { table: "tags", harnessScoped: true },
     { table: "session_meta", harnessScoped: true },
     {
+        table: "session_render_cache",
+        extraPredicate:
+            "NOT EXISTS (SELECT 1 FROM session_meta AS remaining WHERE remaining.session_id = session_render_cache.session_id)",
+    },
+    {
+        table: "session_meta_chunks",
+        extraPredicate:
+            "NOT EXISTS (SELECT 1 FROM session_meta AS remaining WHERE remaining.session_id = session_meta_chunks.session_id)",
+    },
+    {
         table: "temporal_decisions",
         extraPredicate:
             "NOT EXISTS (SELECT 1 FROM session_meta AS remaining WHERE remaining.session_id = temporal_decisions.session_id)",

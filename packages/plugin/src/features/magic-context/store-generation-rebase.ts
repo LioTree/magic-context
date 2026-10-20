@@ -11,6 +11,10 @@ import {
     toMessageIndexSource,
 } from "./message-index";
 import { clearCachedM0M1, ensureSessionMetaRow } from "./storage-meta-shared";
+import {
+    sessionMetaCollectionSelect,
+    updateSessionMetaCollection,
+} from "./storage-session-collections";
 import { foldShrunkPartTags, type ShrunkPartMessage } from "./storage-tags";
 
 /**
@@ -619,12 +623,17 @@ function stampGeneration(
 function pruneShrunkPartEntries(
     db: Database,
     sessionId: string,
-    column: string,
+    column:
+        | "stripped_placeholder_ids"
+        | "merged_reasoning_stripped_ids"
+        | "trailing_blank_decisions",
     shrunk: readonly ShrunkPartMessage[],
 ): number {
     if (shrunk.length === 0) return 0;
     const row = db
-        .prepare(`SELECT ${column} AS value FROM session_meta WHERE session_id = ?`)
+        .prepare(
+            `SELECT ${sessionMetaCollectionSelect(column, "value", db)} FROM session_meta WHERE session_id = ?`,
+        )
         .get(sessionId) as { value?: unknown } | null | undefined;
     const raw = row?.value;
     if (typeof raw !== "string" || raw.length === 0) return 0;
@@ -676,10 +685,7 @@ function pruneShrunkPartEntries(
         return 0;
     }
     if (dropped === 0) return 0;
-    db.prepare(`UPDATE session_meta SET ${column} = ? WHERE session_id = ?`).run(
-        JSON.stringify(next),
-        sessionId,
-    );
+    updateSessionMetaCollection(db, sessionId, column, JSON.stringify(next));
     return dropped;
 }
 
@@ -970,7 +976,7 @@ function* rebaseSteps(
             "stripped_placeholder_ids",
             "merged_reasoning_stripped_ids",
             "trailing_blank_decisions",
-        ]) {
+        ] as const) {
             outcome.frozenPartEntriesDropped += pruneShrunkPartEntries(
                 db,
                 sessionId,

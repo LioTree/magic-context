@@ -4,6 +4,7 @@ import { afterEach, describe, expect, it } from "bun:test";
 import { rmSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
+import { patchSessionMeta } from "../features/magic-context/__tests__/session-meta-fixture";
 import { runMigrations } from "../features/magic-context/migrations";
 import { copySessionStateForClone } from "../features/magic-context/storage-clone";
 import { initializeDatabase } from "../features/magic-context/storage-db";
@@ -173,14 +174,7 @@ function seedParentState(db: Database): void {
     db.prepare(
         "INSERT INTO session_facts (session_id, category, content, created_at, updated_at) VALUES (?, 'decision', 'keep the module boundary', 1, 1)",
     ).run(PARENT);
-    db.prepare(
-        `INSERT INTO session_meta (session_id, harness, counter, last_input_tokens, last_context_percentage, stripped_placeholder_ids)
-         VALUES (?, 'opencode2', 8, 143180, 63.6, ?)
-         ON CONFLICT(session_id) DO UPDATE SET counter = excluded.counter,
-            last_input_tokens = excluded.last_input_tokens,
-            last_context_percentage = excluded.last_context_percentage,
-            stripped_placeholder_ids = excluded.stripped_placeholder_ids`,
-    ).run(PARENT, JSON.stringify([parentId(4), parentId(10)]));
+    patchSessionMeta(db,PARENT,{harness:"opencode2",counter:8,last_input_tokens:143180,last_context_percentage:63.6,stripped_placeholder_ids:JSON.stringify([parentId(4),parentId(10)])});
 }
 
 function forkRows<T>(db: Database, sql: string): T[] {

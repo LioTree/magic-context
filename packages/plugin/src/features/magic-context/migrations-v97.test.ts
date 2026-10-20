@@ -4,6 +4,7 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { Database } from "../../shared/sqlite";
 import { createTestTempDirFromPath } from "../../shared/test-temp-dir";
+import { sessionMetaFixtureRow } from "./__tests__/session-meta-fixture";
 import { LATEST_MIGRATION_VERSION, MIGRATIONS, runMigrations } from "./migrations";
 import {
     getSchemaFenceRejection,
@@ -47,11 +48,9 @@ describe("migration 97", () => {
             db.prepare(
                 "INSERT INTO session_meta(session_id, harness, counter) VALUES ('legacy', 'opencode', 42)",
             ).run();
-            const before = db.prepare("SELECT * FROM session_meta WHERE session_id='legacy'").get();
+            const before = sessionMetaFixtureRow(db, "legacy");
             runMigrations(db);
-            expect(
-                db.prepare("SELECT * FROM session_meta WHERE session_id='legacy'").get(),
-            ).toEqual(before);
+            expect(sessionMetaFixtureRow(db, "legacy")).toEqual(before);
             expect(LATEST_SUPPORTED_VERSION).toBe(LATEST_MIGRATION_VERSION);
             expect(LATEST_MIGRATION_VERSION).toBeGreaterThanOrEqual(97);
             initializeDatabase(fresh);

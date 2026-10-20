@@ -2,6 +2,7 @@
 
 import { afterEach, beforeEach, describe, expect, it } from "bun:test";
 import { Database } from "../../shared/sqlite";
+import { seedSessionMeta } from "./__tests__/session-meta-fixture";
 import { runMigrations } from "./migrations";
 import { initializeDatabase } from "./storage-db";
 import {
@@ -13,6 +14,7 @@ import {
 } from "./storage-meta-persisted";
 import { clearSession } from "./storage-meta-session";
 import { readReplayDocument } from "./storage-replay-document";
+import { sessionMetaCollectionSelect } from "./storage-session-collections";
 
 describe("merged_reasoning_stripped_ids", () => {
     let db: Database;
@@ -170,9 +172,7 @@ describe("trailing_blank_decisions", () => {
             },
             otherNamespace: { retained: ["one", "two"] },
         });
-        db.prepare(
-            "INSERT INTO session_meta (session_id, trailing_blank_decisions) VALUES (?, ?)",
-        ).run(sessionId, stored);
+        seedSessionMeta(db, { session_id: sessionId, trailing_blank_decisions: stored });
 
         expect(addTrailingBlankDecisions(db, sessionId, [["assistant-new", "keep:2"]])).toBe(true);
         expect(demoteTrailingBlankKeepDecisions(db, sessionId, ["assistant-keep"])).toEqual([
@@ -197,15 +197,15 @@ describe("trailing_blank_decisions", () => {
     it("serves no decisions and refuses to overwrite an unsupported envelope", () => {
         const stored =
             '{"version":7,"trailingBlank":{"assistant-keep":"keep"},"futureNamespace":{"v":1}}';
-        db.prepare(
-            "INSERT INTO session_meta (session_id, trailing_blank_decisions) VALUES (?, ?)",
-        ).run(sessionId, stored);
+        seedSessionMeta(db, { session_id: sessionId, trailing_blank_decisions: stored });
 
         expect(getTrailingBlankDecisions(db, sessionId)).toEqual(new Map());
         expect(addTrailingBlankDecisions(db, sessionId, [["assistant-new", "strip"]])).toBe(false);
         expect(demoteTrailingBlankKeepDecisions(db, sessionId, ["assistant-keep"])).toBeNull();
         const row = db
-            .prepare("SELECT trailing_blank_decisions FROM session_meta WHERE session_id = ?")
+            .prepare(
+                `SELECT ${sessionMetaCollectionSelect("trailing_blank_decisions", "trailing_blank_decisions", db)} FROM session_meta WHERE session_id = ?`,
+            )
             .get(sessionId) as { trailing_blank_decisions: string } | undefined;
         expect(row?.trailing_blank_decisions).toBe(stored);
     });
@@ -234,16 +234,16 @@ describe("trailing_blank_decisions", () => {
 
     it("retains valid legacy decisions on reads without overwriting malformed stored entries", () => {
         const stored = '{"assistant-keep":"keep","invalid-entry":42}';
-        db.prepare(
-            "INSERT INTO session_meta (session_id, trailing_blank_decisions) VALUES (?, ?)",
-        ).run(sessionId, stored);
+        seedSessionMeta(db, { session_id: sessionId, trailing_blank_decisions: stored });
         expect(getTrailingBlankDecisions(db, sessionId)).toEqual(
             new Map([["assistant-keep", "keep"]]),
         );
         expect(addTrailingBlankDecisions(db, sessionId, [["assistant-new", "strip"]])).toBe(false);
         expect(
             db
-                .prepare("SELECT trailing_blank_decisions FROM session_meta WHERE session_id = ?")
+                .prepare(
+                    `SELECT ${sessionMetaCollectionSelect("trailing_blank_decisions", "trailing_blank_decisions", db)} FROM session_meta WHERE session_id = ?`,
+                )
                 .get(sessionId),
         ).toEqual({ trailing_blank_decisions: stored });
     });

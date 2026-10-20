@@ -1,6 +1,7 @@
 /// <reference types="bun-types" />
 
 import { afterEach, beforeEach, describe, expect, it, mock } from "bun:test";
+import { patchSessionMeta } from "../../features/magic-context/__tests__/session-meta-fixture";
 import { CANONICAL_DREAM_TASKS } from "../../features/magic-context/dreamer/task-registry";
 import { runMigrations } from "../../features/magic-context/migrations";
 import { initializeDatabase } from "../../features/magic-context/storage-db";
@@ -169,20 +170,18 @@ function insertSessionMeta(
 
 function seedCachedM0(db: Database, sessionId: string): void {
     insertSessionMeta(db, sessionId);
-    db.prepare(
-        `UPDATE session_meta SET
-            cached_m0_bytes = ?,
-            cached_m0_project_memory_epoch = 7,
-            cached_m0_project_user_profile_version = 3,
-            cached_m0_max_compartment_seq = 42,
-            cached_m0_max_memory_id = 99,
-            cached_m0_max_mutation_id = 12,
-            cached_m0_project_docs_hash = 'docs-hash',
-            cached_m0_materialized_at = 123456,
-            cached_m0_session_facts_version = 5,
-            cached_m0_upgrade_state = 'pending'
-         WHERE session_id = ?`,
-    ).run(Buffer.from("cached m0"), sessionId);
+    patchSessionMeta(db, sessionId, {
+        cached_m0_bytes: Buffer.from("cached m0"),
+        cached_m0_project_memory_epoch: 7,
+        cached_m0_project_user_profile_version: 3,
+        cached_m0_max_compartment_seq: 42,
+        cached_m0_max_memory_id: 99,
+        cached_m0_max_mutation_id: 12,
+        cached_m0_project_docs_hash: "docs-hash",
+        cached_m0_materialized_at: 123456,
+        cached_m0_session_facts_version: 5,
+        cached_m0_upgrade_state: "pending",
+    });
 }
 
 function getCachedM0Row(db: Database, sessionId: string) {

@@ -38,6 +38,11 @@ import { renderMemoryBlockV2 } from "@magic-context/core/hooks/magic-context/inj
 import { withRawMessageProvider } from "@magic-context/core/hooks/magic-context/read-session-chunk";
 import { estimateTokens } from "@magic-context/core/hooks/magic-context/read-session-formatting";
 import { closeQuietly } from "@magic-context/core/shared/sqlite-helpers";
+import {
+	patchSessionMeta,
+	sessionMetaFixtureRow,
+} from "../../plugin/src/features/magic-context/__tests__/session-meta-fixture";
+import { sessionMetaCollectionSelect } from "../../plugin/src/features/magic-context/storage-session-collections";
 import { createTestTempDirFromPath } from "../../plugin/src/shared/test-temp-dir";
 import {
 	__test,
@@ -139,7 +144,7 @@ it("pi applied compaction bounds auto-search blob across 20000 user messages", (
 	let maxEntries = 0;
 	let maxBytes = 0;
 	const readBlob = db.prepare(
-		"SELECT auto_search_hint_decisions AS blob FROM session_meta WHERE session_id = ?",
+		`SELECT ${sessionMetaCollectionSelect("auto_search_hint_decisions", "blob", db)} FROM session_meta WHERE session_id = ?`,
 	);
 	try {
 		for (let number = 1; number <= total; number++) {
@@ -395,9 +400,7 @@ describe("Pi render-to-commit concurrency", () => {
 			};
 			try {
 				injectM0M1Pi(state, db, []);
-				const before = db
-					.prepare("SELECT * FROM session_meta WHERE session_id = ?")
-					.get(state.sessionId);
+				const before = sessionMetaFixtureRow(db, state.sessionId);
 				const m0Before = getOrCreateSessionMeta(
 					db,
 					state.sessionId,
@@ -452,11 +455,9 @@ describe("Pi render-to-commit concurrency", () => {
 						? "Concurrent Pi refresh memory"
 						: "Concurrent Pi refresh history",
 				);
-				expect(
-					db
-						.prepare("SELECT * FROM session_meta WHERE session_id = ?")
-						.get(state.sessionId),
-				).not.toEqual(before);
+				expect(sessionMetaFixtureRow(db, state.sessionId)).not.toEqual(
+					before,
+				);
 			} finally {
 				closeQuietly(sibling);
 				closeQuietly(db);
@@ -1318,13 +1319,12 @@ describe("injectM0M1Pi", () => {
 		try {
 			const state = piState("ses-pi-render-epoch", cwd);
 			injectM0M1Pi(state, db, [userMessage("first", 10)] as never);
-			db.prepare(
-				"UPDATE session_meta SET cached_m0_bytes = ?, cached_m0_upgrade_state = ? WHERE session_id = ?",
-			).run(
-				Buffer.from("<session-history>legacy renderer bytes</session-history>"),
-				"pi-m0m1-v2:ready",
-				state.sessionId,
-			);
+			patchSessionMeta(db, state.sessionId, {
+				cached_m0_bytes: Buffer.from(
+					"<session-history>legacy renderer bytes</session-history>",
+				),
+				cached_m0_upgrade_state: "pi-m0m1-v2:ready",
+			});
 
 			expect(mustMaterializePi(state, db)).toMatchObject({
 				value: true,
@@ -1407,19 +1407,16 @@ describe("injectM0M1Pi", () => {
 			const oldM0 = Buffer.from(
 				`<session-history></session-history>\n\n${renderMemoryBlockV2([oldMemory])}`,
 			);
-			db.prepare(
-				"UPDATE session_meta SET cached_m0_bytes = ?, cached_m0_upgrade_state = ? WHERE session_id = ?",
-			).run(
-				oldM0,
-				encodeCachedM0UpgradeIdentity(
+			patchSessionMeta(db, state.sessionId, {
+				cached_m0_bytes: oldM0,
+				cached_m0_upgrade_state: encodeCachedM0UpgradeIdentity(
 					"pi-m0m1-v2:ready",
 					COMPARTMENT_RENDER_EPOCH,
 					false,
 					`m${budget}-h60000`,
 					null,
 				),
-				state.sessionId,
-			);
+			});
 
 			expect(mustMaterializePi(state, db)).toEqual({
 				value: false,
@@ -2270,17 +2267,14 @@ describe("injectM0M1Pi", () => {
 			db.exec = ((sql: string) => {
 				if (sql === "BEGIN IMMEDIATE" && !injectedSibling) {
 					injectedSibling = true;
-					db.prepare(
-						"UPDATE session_meta SET cached_m0_bytes = ?, cached_m0_max_memory_id = ?, cached_m1_bytes = ? WHERE session_id = ?",
-					).run(
-						Buffer.from(
+					patchSessionMeta(db, state.sessionId, {
+						cached_m0_bytes: Buffer.from(
 							`<session-history>${"baseline ".repeat(300)}</session-history>`,
 							"utf8",
 						),
-						99,
-						Buffer.from("sibling cached m1", "utf8"),
-						state.sessionId,
-					);
+						cached_m0_max_memory_id: 99,
+						cached_m1_bytes: Buffer.from("sibling cached m1", "utf8"),
+					});
 				}
 				return originalExec(sql);
 			}) as typeof db.exec;
@@ -2320,13 +2314,13 @@ describe("injectM0M1Pi", () => {
 			db.exec = ((sql: string) => {
 				if (sql === "BEGIN IMMEDIATE" && !injectedSibling) {
 					injectedSibling = true;
-					db.prepare(
-						"UPDATE session_meta SET cached_m0_bytes = ?, cached_m1_bytes = ? WHERE session_id = ?",
-					).run(
-						siblingM0,
-						Buffer.from("sibling cached pi m1 byte mismatch", "utf8"),
-						state.sessionId,
-					);
+					patchSessionMeta(db, state.sessionId, {
+						cached_m0_bytes: siblingM0,
+						cached_m1_bytes: Buffer.from(
+							"sibling cached pi m1 byte mismatch",
+							"utf8",
+						),
+					});
 				}
 				return originalExec(sql);
 			}) as typeof db.exec;
@@ -3324,17 +3318,14 @@ describe("injectM0M1Pi m[1]-rendered coverage watermark (marker-drain liveness)"
 			db.exec = ((sql: string) => {
 				if (sql === "BEGIN IMMEDIATE" && !injectedSibling) {
 					injectedSibling = true;
-					db.prepare(
-						"UPDATE session_meta SET cached_m0_bytes = ?, cached_m0_max_memory_id = ?, cached_m1_bytes = ? WHERE session_id = ?",
-					).run(
-						Buffer.from(
+					patchSessionMeta(db, state.sessionId, {
+						cached_m0_bytes: Buffer.from(
 							`<session-history>${"baseline ".repeat(300)}</session-history>`,
 							"utf8",
 						),
-						99,
-						Buffer.from("sibling cached m1", "utf8"),
-						state.sessionId,
-					);
+						cached_m0_max_memory_id: 99,
+						cached_m1_bytes: Buffer.from("sibling cached m1", "utf8"),
+					});
 				}
 				return originalExec(sql);
 			}) as typeof db.exec;
@@ -3557,9 +3548,9 @@ it("Pi review: legacy replay survives restart and only a natural HARD records po
 			db,
 			legacy.sessionId,
 		).cachedM0UpgradeState?.split("|rendered-budgets:")[0];
-		db.prepare(
-			"UPDATE session_meta SET cached_m0_upgrade_state = ? WHERE session_id = ?",
-		).run(legacyIdentity, legacy.sessionId);
+		patchSessionMeta(db, legacy.sessionId, {
+			cached_m0_upgrade_state: legacyIdentity,
+		});
 		const before = getOrCreateSessionMeta(db, legacy.sessionId);
 		expect(before.cachedM0UpgradeState).toContain("-h12000");
 		for (let restart = 0; restart < 2; restart++) {

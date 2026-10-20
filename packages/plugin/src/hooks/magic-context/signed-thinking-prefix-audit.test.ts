@@ -1,3 +1,7 @@
+import {
+    clearSessionMetaFixtureFault,
+    rejectSessionMetaCollectionWrites,
+} from "../../features/magic-context/__tests__/session-meta-faults";
 /**
  * Signed-thinking prefix audit for the OpenCode transform: OpenCode 1 TS mode
  * (v1 store) and OpenCode 2 (v2 store) both run createTransform.
@@ -775,8 +779,11 @@ for (const generation of ["v1", "v2"] as const) {
                 await nextUserTurn(f, "pair-failure-turn");
                 const before = wire(f.served);
                 expect(thinkingBlocks(before)).not.toBe("[]");
-                f.db.exec(
-                    "CREATE TRIGGER reject_pair BEFORE UPDATE OF merged_reasoning_stripped_ids ON session_meta BEGIN SELECT RAISE(ABORT, 'reject companion'); END",
+                rejectSessionMetaCollectionWrites(
+                    f.db,
+                    "merged_reasoning_stripped_ids",
+                    "reject_pair",
+                    { error: "reject companion" },
                 );
                 armAndBust(f, "ctx_reduce drop (full removal)", false);
                 let failed = false;
@@ -788,7 +795,7 @@ for (const generation of ["v1", "v2"] as const) {
                 expect(failed).toBe(true);
                 expect(getPendingOps(f.db, f.sessionId).length).toBe(1);
                 expect(f.tagStatus("old-read-b")).toBe("active");
-                f.db.exec("DROP TRIGGER reject_pair");
+                clearSessionMetaFixtureFault(f.db, "reject_pair");
                 f.execute(false);
                 f.setUsage(20);
                 expect(wire((await f.pass()).messages)).toEqual(before);

@@ -1,6 +1,10 @@
 import { beforeAll, describe, expect, it, spyOn } from "bun:test";
 import { rmSync } from "node:fs";
 import { getNativeReplayState } from "@magic-context/core/features/magic-context/storage-native-replay";
+import {
+	clearSessionMetaFixtureFault,
+	rejectSessionMetaCollectionWrites,
+} from "../../plugin/src/features/magic-context/__tests__/session-meta-faults";
 import { runHeuristicCostFixture } from "./__tests__/heuristic-cost-fixture";
 import {
 	clearContextHandlerSession,
@@ -66,8 +70,11 @@ describe("heuristic cleanup cost", () => {
 				saved,
 				canApply: true,
 			};
-			db.exec(
-				"CREATE TRIGGER reject_native BEFORE UPDATE OF trailing_blank_decisions ON session_meta BEGIN SELECT RAISE(ABORT, 'rejected'); END",
+			rejectSessionMetaCollectionWrites(
+				db,
+				"trailing_blank_decisions",
+				"reject_native",
+				{ error: "rejected" },
 			);
 			preparePiToolRemovalMeasurements(args);
 			expect([...saved]).toEqual([]);
@@ -75,7 +82,7 @@ describe("heuristic cleanup cost", () => {
 				[],
 			);
 			expect(authorizePiToolRemoval({ ...args, callId: "a" })).toBe("defer");
-			db.exec("DROP TRIGGER reject_native");
+			clearSessionMetaFixtureFault(db, "reject_native");
 			preparePiToolRemovalMeasurements({ ...args, canApply: false });
 			expect([...saved]).toEqual([]);
 			preparePiToolRemovalMeasurements(args);

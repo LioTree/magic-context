@@ -6,6 +6,10 @@ import {
 } from "@magic-context/core/features/magic-context/pi-content-decisions";
 import { sessionLog } from "@magic-context/core/shared/logger";
 import type { Database } from "@magic-context/core/shared/sqlite";
+import {
+	sessionMetaCollectionSelect,
+	updateSessionMetaCollection,
+} from "../../plugin/src/features/magic-context/storage-session-collections";
 
 export const PI_TAG_IDENTITY_REPAIR_ONCE_GUARD = "pi-tag-identity-repair-once";
 export const PI_TAG_IDENTITY_REPAIR_REASON = "tag_identity_repair";
@@ -238,7 +242,7 @@ export function acknowledgePiIdentityRebuilds(
 		db.transaction(() => {
 			const row = db
 				.prepare(
-					"SELECT merged_reasoning_stripped_ids AS entries FROM session_meta WHERE session_id = ?",
+					`SELECT ${sessionMetaCollectionSelect("merged_reasoning_stripped_ids", "entries", db)} FROM session_meta WHERE session_id = ?`,
 				)
 				.get(sessionId) as { entries: string | null } | undefined;
 			if (!row?.entries) return;
@@ -253,9 +257,13 @@ export function acknowledgePiIdentityRebuilds(
 					decodePiContentDecision(entry)?.[0] !== "tag-identity-repair-pending",
 			);
 			if (kept.length === entries.length) return;
-			db.prepare(
-				"UPDATE session_meta SET merged_reasoning_stripped_ids = ? WHERE session_id = ? AND merged_reasoning_stripped_ids IS ?",
-			).run(JSON.stringify(kept), sessionId, row.entries);
+			updateSessionMetaCollection(
+				db,
+				sessionId,
+				"merged_reasoning_stripped_ids",
+				JSON.stringify(kept),
+				{ value: row.entries },
+			);
 		}).immediate();
 	} catch (error) {
 		sessionLog(

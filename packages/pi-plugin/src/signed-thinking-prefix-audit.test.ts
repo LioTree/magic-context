@@ -1,3 +1,8 @@
+import {
+	clearSessionMetaFixtureFault,
+	rejectSessionMetaCollectionWrites,
+	rejectSessionRenderCacheWrites,
+} from "../../plugin/src/features/magic-context/__tests__/session-meta-faults";
 /**
  * Signed-thinking prefix audit for the Pi context handler (Pi and OMP share
  * it). Same design as the OpenCode audit in
@@ -942,8 +947,14 @@ it(
 			const thinkingOmissions = await forceHeldRewrite(f);
 			const before = thinkingOmissions();
 			// The rewrite's own cache clear fails after its omissions were planned.
-			f.db.exec(
-				"CREATE TRIGGER reject_rewrite BEFORE UPDATE OF cached_m0_bytes ON session_meta WHEN NEW.cached_m0_bytes IS NULL AND OLD.cached_m0_bytes IS NOT NULL BEGIN SELECT RAISE(ABORT, 'reject rewrite'); END",
+			rejectSessionRenderCacheWrites(
+				f.db,
+				"cached_m0_bytes",
+				"reject_rewrite",
+				{
+					error: "reject rewrite",
+					when: (value, previous) => value === null && previous !== null,
+				},
 			);
 			let failed = false;
 			try {
@@ -1022,8 +1033,11 @@ it(
 			await nextUserTurn(f, "pair-failure-turn");
 			const before = wire(f.served);
 			expect(thinkingBlocks(before)).not.toBe("[]");
-			f.db.exec(
-				"CREATE TRIGGER reject_pair BEFORE UPDATE OF merged_reasoning_stripped_ids ON session_meta BEGIN SELECT RAISE(ABORT, 'reject companion'); END",
+			rejectSessionMetaCollectionWrites(
+				f.db,
+				"merged_reasoning_stripped_ids",
+				"reject_pair",
+				{ error: "reject companion" },
 			);
 			armAndBust(f, "ctx_reduce drop (full removal)", false);
 			let failed = false;
@@ -1035,7 +1049,7 @@ it(
 			expect(failed).toBe(true);
 			expect(getPendingOps(f.db, f.sessionId).length).toBe(1);
 			expect(f.tagStatus("old-read-b")).toBe("active");
-			f.db.exec("DROP TRIGGER reject_pair");
+			clearSessionMetaFixtureFault(f.db, "reject_pair");
 			f.setPercent(20);
 			expect(wire((await f.pass()).messages)).toEqual(before);
 		},

@@ -1,4 +1,5 @@
 /// <reference types="bun-types" />
+import { sessionRenderCacheValueSql } from "../../features/magic-context/storage-session-cache";
 import { createTestTempDirFromPath } from "../../shared/test-temp-dir";
 
 // Cache rule for a fold the Rust module writes straight into context.db.
@@ -131,7 +132,11 @@ function pass(projectDirectory: string, isCacheBustingPass: boolean) {
 function sessionMetaCache(): unknown {
     return db
         .prepare(
-            "SELECT quote(cached_m0_bytes) AS m0, quote(cached_m1_bytes) AS m1, cached_m0_system_hash AS sys, cached_m0_max_compartment_seq AS seq FROM session_meta WHERE session_id = ?",
+            `SELECT quote(${sessionRenderCacheValueSql("cached_m0_bytes", db)}) AS m0,
+                quote(${sessionRenderCacheValueSql("cached_m1_bytes", db)}) AS m1,
+                cached_m0_system_hash AS sys,
+                cached_m0_max_compartment_seq AS seq
+            FROM session_meta WHERE session_id = ?`,
         )
         .get(SESSION_ID);
 }

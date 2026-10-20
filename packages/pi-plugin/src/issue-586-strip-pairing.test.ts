@@ -18,6 +18,7 @@ import {
 	updateTagDropMode,
 	updateTagStatus,
 } from "@magic-context/core/features/magic-context/storage";
+import { updateSessionMetaCollection } from "../../plugin/src/features/magic-context/storage-session-collections";
 import {
 	clearContextHandlerSession,
 	recordPiLiveModel,
@@ -281,14 +282,12 @@ describe("issue 586: placeholder strip keeps tool calls and results together", (
 		const f = fixture("issue-586-unreadable");
 		try {
 			await f.dropAndDiscover();
-			f.db
-				.prepare(
-					"UPDATE session_meta SET trailing_blank_decisions = ? WHERE session_id = ?",
-				)
-				.run(
-					'{"version":2,"trailingBlank":{},"piNative":{"toolInputs":"{","reasoningIds":[]}}',
-					f.session,
-				);
+			updateSessionMetaCollection(
+				f.db,
+				f.session,
+				"trailing_blank_decisions",
+				'{"version":2,"trailingBlank":{},"piNative":{"toolInputs":"{","reasoningIds":[]}}',
+			);
 			const first = await f.pass(0);
 			expect(orphanToolResults(first)).toEqual([]);
 			const second = await f.pass(0);

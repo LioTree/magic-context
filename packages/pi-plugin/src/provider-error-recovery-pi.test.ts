@@ -8,6 +8,10 @@ import {
 	resetEmergencyRecoveryRegistryForTest,
 } from "@magic-context/core/features/magic-context/storage-meta-persisted";
 import { closeQuietly } from "@magic-context/core/shared/sqlite-helpers";
+import {
+	clearSessionMetaFixtureFault,
+	rejectSessionMetaCollectionWrites,
+} from "../../plugin/src/features/magic-context/__tests__/session-meta-faults";
 
 import { resolvePiUsableContextLimit } from "./pi-context-limit";
 import {
@@ -701,14 +705,17 @@ describe("Pi proactive strip of thinking on busting passes", () => {
 		const database = db();
 		const sessionId = "pi-proactive-persist-failure";
 		serve(database, sessionId, session(), false);
-		database.exec(
-			"CREATE TRIGGER refuse_freeze BEFORE UPDATE OF merged_reasoning_stripped_ids ON session_meta BEGIN SELECT RAISE(FAIL, 'transient freeze write failure'); END",
+		rejectSessionMetaCollectionWrites(
+			database,
+			"merged_reasoning_stripped_ids",
+			"refuse_freeze",
+			{ error: "transient freeze write failure" },
 		);
 		const failed = session("re-rendered first message");
 		const before = JSON.stringify(failed);
 		expect(serve(database, sessionId, failed, true)).toBeNull();
 		expect(JSON.stringify(failed)).toBe(before);
-		database.exec("DROP TRIGGER refuse_freeze");
+		clearSessionMetaFixtureFault(database, "refuse_freeze");
 		const defer = session("re-rendered first message");
 		expect(serve(database, sessionId, defer, false)).toBeNull();
 		expect(JSON.stringify(defer)).toBe(before);

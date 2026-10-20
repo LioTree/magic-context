@@ -9,6 +9,10 @@ import { encodePiContentDecision } from "./pi-content-decisions";
 import { type CloneSessionStateFilter, copySessionStateForClone } from "./storage-clone";
 import { initializeDatabase } from "./storage-db";
 import { applyStrippedPlaceholderDelta, getHiddenSeamPlaceholderIds } from "./storage-meta";
+import {
+    sessionMetaCollectionSelect,
+    updateSessionMetaCollection,
+} from "./storage-session-collections";
 import { freezeTemporalDecisions, getTemporalDecisions } from "./temporal-decisions";
 
 const SOURCE = "ses_source";
@@ -132,7 +136,9 @@ describe("copySessionStateForClone", () => {
         ).toBe(true);
         const sourceBlob = (
             db
-                .prepare("SELECT stripped_placeholder_ids FROM session_meta WHERE session_id = ?")
+                .prepare(
+                    `SELECT ${sessionMetaCollectionSelect("stripped_placeholder_ids", "stripped_placeholder_ids", db)} FROM session_meta WHERE session_id = ?`,
+                )
                 .get(SOURCE) as { stripped_placeholder_ids: string }
         ).stripped_placeholder_ids;
         expect(JSON.parse(sourceBlob)).toEqual({
@@ -149,7 +155,9 @@ describe("copySessionStateForClone", () => {
 
         const cloned = (
             db
-                .prepare("SELECT stripped_placeholder_ids FROM session_meta WHERE session_id = ?")
+                .prepare(
+                    `SELECT ${sessionMetaCollectionSelect("stripped_placeholder_ids", "stripped_placeholder_ids", db)} FROM session_meta WHERE session_id = ?`,
+                )
                 .get(DESTINATION) as { stripped_placeholder_ids: string }
         ).stripped_placeholder_ids;
         expect(JSON.parse(cloned)).toEqual({
@@ -217,9 +225,12 @@ describe("copySessionStateForClone", () => {
             "binding_mismatch:new_entry",
             "binding_mismatch_entry_order:end:new_entry",
         ];
-        db.prepare(
-            "UPDATE session_meta SET merged_reasoning_stripped_ids = ? WHERE session_id = ?",
-        ).run(JSON.stringify(ledger), SOURCE);
+        updateSessionMetaCollection(
+            db,
+            SOURCE,
+            "merged_reasoning_stripped_ids",
+            JSON.stringify(ledger),
+        );
         freezeTemporalDecisions(
             db,
             SOURCE,
@@ -242,7 +253,7 @@ describe("copySessionStateForClone", () => {
         const cloned = (
             db
                 .prepare(
-                    "SELECT merged_reasoning_stripped_ids FROM session_meta WHERE session_id = ?",
+                    `SELECT ${sessionMetaCollectionSelect("merged_reasoning_stripped_ids", "merged_reasoning_stripped_ids", db)} FROM session_meta WHERE session_id = ?`,
                 )
                 .get(DESTINATION) as { merged_reasoning_stripped_ids: string | null }
         ).merged_reasoning_stripped_ids;
@@ -263,9 +274,7 @@ describe("copySessionStateForClone", () => {
         const db = createDb();
         insertTag(db, SOURCE, "msg_a:p0", 1);
         seedSessionMeta(db, SOURCE);
-        db.prepare(
-            "UPDATE session_meta SET merged_reasoning_stripped_ids = ? WHERE session_id = ?",
-        ).run("[not json", SOURCE);
+        updateSessionMetaCollection(db, SOURCE, "merged_reasoning_stripped_ids", "[not json");
 
         const result = copySessionStateForClone(db, SOURCE, DESTINATION, identityFilter());
 

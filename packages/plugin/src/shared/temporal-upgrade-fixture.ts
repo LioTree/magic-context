@@ -1,4 +1,5 @@
 import fixture from "../../../../testdata/temporal-upgrade-projections.json";
+import { seedSessionMeta } from "../features/magic-context/__tests__/session-meta-fixture";
 import type { Database } from "./sqlite";
 
 export type TemporalFixtureRuntime = "Pi" | "OpenCode 1" | "OpenCode 2";
@@ -30,7 +31,9 @@ export function seedTemporalUpgradeFixture(
                         ? Buffer.from(value.base64, "base64")
                         : value,
                 );
-                db.prepare(
+                if(table==="session_meta") {
+                    seedSessionMeta(db,Object.fromEntries(columns.map((column,index)=>[column,values[index]])) as Parameters<typeof seedSessionMeta>[1]);
+                } else db.prepare(
                     `INSERT INTO ${table} (${columns.join(",")}) VALUES (${columns.map(() => "?").join(",")})`,
                 ).run(...values);
             }

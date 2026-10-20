@@ -1,7 +1,8 @@
 import { describe, expect, test } from "bun:test";
 import { Database } from "../../shared/sqlite";
 import { closeQuietly } from "../../shared/sqlite-helpers";
-import { runMigrations } from "./migrations";
+import { MIGRATIONS, runMigrations } from "./migrations";
+import { sessionMetaCollectionSelect } from "./storage-session-collections";
 
 function createPreV17Db(): Database {
     const db = new Database(":memory:");
@@ -36,7 +37,7 @@ describe("migration v17 — sticky-injection multi-anchor storage", () => {
 
         const row = db
             .prepare(
-                "SELECT note_nudge_anchors, auto_search_hint_decisions FROM session_meta WHERE session_id = ?",
+                `SELECT ${sessionMetaCollectionSelect("note_nudge_anchors", "note_nudge_anchors", db)}, ${sessionMetaCollectionSelect("auto_search_hint_decisions", "auto_search_hint_decisions", db)} FROM session_meta WHERE session_id = ?`,
             )
             .get("ses-sticky") as {
             note_nudge_anchors: string;
@@ -59,7 +60,7 @@ describe("migration v17 — sticky-injection multi-anchor storage", () => {
 
         const row = db
             .prepare(
-                "SELECT note_nudge_anchors, auto_search_hint_decisions FROM session_meta WHERE session_id = ?",
+                `SELECT ${sessionMetaCollectionSelect("note_nudge_anchors", "note_nudge_anchors", db)}, ${sessionMetaCollectionSelect("auto_search_hint_decisions", "auto_search_hint_decisions", db)} FROM session_meta WHERE session_id = ?`,
             )
             .get("ses-null") as {
             note_nudge_anchors: string;
@@ -81,7 +82,9 @@ describe("migration v17 — sticky-injection multi-anchor storage", () => {
         runMigrations(db);
 
         const row = db
-            .prepare("SELECT note_nudge_anchors FROM session_meta WHERE session_id = ?")
+            .prepare(
+                `SELECT ${sessionMetaCollectionSelect("note_nudge_anchors", "note_nudge_anchors", db)} FROM session_meta WHERE session_id = ?`,
+            )
             .get("ses-idempotent") as { note_nudge_anchors: string };
         expect(JSON.parse(row.note_nudge_anchors)).toEqual([
             { messageId: "msg-1", text: "nudge text" },
@@ -92,7 +95,7 @@ describe("migration v17 — sticky-injection multi-anchor storage", () => {
     test("column list includes sticky-injection columns", () => {
         const db = createPreV17Db();
 
-        runMigrations(db);
+        MIGRATIONS.find((step) => step.version === 17)!.up(db);
 
         const cols = db.prepare("PRAGMA table_info(session_meta)").all() as Array<{ name: string }>;
         expect(cols.map((col) => col.name)).toEqual(

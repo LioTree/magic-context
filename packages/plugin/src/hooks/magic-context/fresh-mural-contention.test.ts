@@ -8,6 +8,7 @@ import {
     type PiM0M1State,
     __test as piTest,
 } from "../../../../pi-plugin/src/inject-compartments-pi";
+import { sessionMetaFixtureRow } from "../../features/magic-context/__tests__/session-meta-fixture";
 import { insertMemory, setMemoryClassification } from "../../features/magic-context/memory";
 import { runMigrations } from "../../features/magic-context/migrations";
 import { getMural } from "../../features/magic-context/mural/storage-mural";
@@ -17,6 +18,7 @@ import {
 } from "../../features/magic-context/mural/storage-mural-cues";
 import { getOrCreateSessionMeta } from "../../features/magic-context/storage";
 import { initializeDatabase } from "../../features/magic-context/storage-db";
+import { deleteSessionMetaWithPayloads } from "../../features/magic-context/storage-session-payloads";
 import * as modelMetadata from "../../shared/models-dev-cache";
 import { Database } from "../../shared/sqlite";
 import { cleanupTestTempDir, createTestTempDirFromPath } from "../../shared/test-temp-dir";
@@ -167,7 +169,7 @@ function seedCues(db: Database) {
 }
 
 function persisted(db: Database) {
-    return db.prepare("SELECT * FROM session_meta WHERE session_id = ?").get(SESSION);
+    return sessionMetaFixtureRow(db, SESSION);
 }
 
 function totalChanges(db: Database): number {
@@ -311,7 +313,7 @@ describe("fresh mural contention issue", () => {
     it("Pi fresh snapshot and mural fallback do not create missing session meta", () => {
         const { db } = database();
         seedCues(db);
-        db.prepare("DELETE FROM session_meta WHERE session_id = ?").run(SESSION);
+        deleteSessionMetaWithPayloads(db, SESSION);
         const vision = spyOn(modelMetadata, "modelSupportsVision").mockReturnValue(true);
         try {
             const changes = totalChanges(db);

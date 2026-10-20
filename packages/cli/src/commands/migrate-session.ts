@@ -31,6 +31,7 @@ import {
     selectRelocatableMemoryIds,
 } from "@magic-context/core/features/magic-context/memory/relocate-memory";
 import { bumpProjectMemoryEpoch } from "@magic-context/core/features/magic-context/storage-project-state";
+import { writeSessionRenderCache } from "@magic-context/core/features/magic-context/storage-session-cache";
 import {
     getDefaultSubcConnectionFile,
     SubcModuleTransport,
@@ -386,11 +387,8 @@ export function applyMigrateSession(
         chunkEmbeddingsRestamped = chunkResult.changes ?? 0;
 
         // Force m[0]/m[1] re-materialization under the new project on next load.
-        deps.contextDb
-            .prepare(
-                "UPDATE session_meta SET cached_m0_bytes = NULL, cached_m1_bytes = NULL WHERE session_id = ?",
-            )
-            .run(plan.sessionId);
+        writeSessionRenderCache(deps.contextDb, plan.sessionId, "cached_m0_bytes", null);
+        writeSessionRenderCache(deps.contextDb, plan.sessionId, "cached_m1_bytes", null);
 
         // Memory action.
         if (

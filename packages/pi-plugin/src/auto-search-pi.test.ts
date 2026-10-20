@@ -17,6 +17,10 @@ import * as searchModule from "@magic-context/core/hooks/magic-context/auto-sear
 import { getUnpublishedAutoSearchNoHint } from "@magic-context/core/shared/auto-search-lifecycle";
 import { closeQuietly } from "@magic-context/core/shared/sqlite-helpers";
 import {
+	clearSessionMetaFixtureFault,
+	rejectSessionMetaCollectionWrites,
+} from "../../plugin/src/features/magic-context/__tests__/session-meta-faults";
+import {
 	clearAutoSearchForPiSession,
 	runAutoSearchHintForPi,
 } from "./auto-search-pi";
@@ -77,14 +81,17 @@ it("review exception CAS failure still freezes served omission pi", async () => 
 		return JSON.stringify(messages[0]);
 	};
 	try {
-		fixture.db.exec(
-			`CREATE TRIGGER review_fail_cas BEFORE UPDATE OF auto_search_hint_decisions ON session_meta BEGIN SELECT RAISE(IGNORE); END;`,
+		rejectSessionMetaCollectionWrites(
+			fixture.db,
+			"auto_search_hint_decisions",
+			"review_fail_cas",
+			{ ignore: true },
 		);
 		const first = await invoke();
 		expect(first).not.toContain("<ctx-search-hint>");
 		expect(getAutoSearchHintDecisions(fixture.db, sessionId)).toEqual([]);
 		clearAutoSearchForPiSession(sessionId);
-		fixture.db.exec("DROP TRIGGER review_fail_cas");
+		clearSessionMetaFixtureFault(fixture.db, "review_fail_cas");
 		fixture.reopen(true);
 		expect(await invoke()).toBe(first);
 		expect(search).toHaveBeenCalledTimes(1);
@@ -92,8 +99,11 @@ it("review exception CAS failure still freezes served omission pi", async () => 
 			{ messageId: "served", decision: "no-hint", reason: "error" },
 		]);
 		expect(getUnpublishedAutoSearchNoHint(sessionId, "served")).toBeUndefined();
-		fixture.db.exec(
-			`CREATE TRIGGER review_fail_cas BEFORE UPDATE OF auto_search_hint_decisions ON session_meta BEGIN SELECT RAISE(IGNORE); END;`,
+		rejectSessionMetaCollectionWrites(
+			fixture.db,
+			"auto_search_hint_decisions",
+			"review_fail_cas",
+			{ ignore: true },
 		);
 		const failedHintSave = await invoke(fixture.db, "hint-save-failed");
 		expect(failedHintSave).not.toContain("<ctx-search-hint>");
@@ -102,7 +112,7 @@ it("review exception CAS failure still freezes served omission pi", async () => 
 		expect(getUnpublishedAutoSearchNoHint(sessionId, "hint-save-failed")).toBe(
 			"error",
 		);
-		fixture.db.exec("DROP TRIGGER review_fail_cas");
+		clearSessionMetaFixtureFault(fixture.db, "review_fail_cas");
 		expect(await invoke(fixture.db, "hint-save-failed")).toBe(failedHintSave);
 		expect(
 			getUnpublishedAutoSearchNoHint(sessionId, "hint-save-failed"),

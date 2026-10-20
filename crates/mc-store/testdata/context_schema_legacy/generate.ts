@@ -99,7 +99,7 @@ if (process.argv[3] === "--assets") {
     writeFileSync(join(here, "lkg_chunks.sql"), LKG_SLOT_CHUNKS_DDL);
     writeFileSync(join(here, "lkg_slots.sql"), LKG_SLOTS_DDL.replaceAll("lkg_slots", "lkg_slots_v94").trimEnd() + "\n");
     assetDb.close();
-    console.log(`Captured ${steps.length} real TypeScript migration SQL plans (88-102)`);
+    console.log(`Captured ${steps.length} real TypeScript migration SQL plans (88-103)`);
     process.exit(0);
 }
 
@@ -161,7 +161,7 @@ function data(db: Db, startingVersion: number): unknown {
         });
 }
 
-for (let version = 87; version <= 102; version++) {
+for (let version = 87; version <= 103; version++) {
     const start = join(output, `v${version}.db`);
     copyFileSync(base, start);
     const fixture = new Database(start);
@@ -176,4 +176,4 @@ for (let version = 87; version <= 102; version++) {
     writeFileSync(join(output, `v${version}.json`), JSON.stringify({ now, snapshot: snapshot(reference), data: data(reference, version) }));
     reference.close();
 }
-console.log("TypeScript historical differential fixtures: 16 populated starting versions (87-102), 15 upgrade steps, fence 102");
+console.log("TypeScript historical differential fixtures: 17 populated starting versions (87-103), 16 upgrade steps, fence 103");

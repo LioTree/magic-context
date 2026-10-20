@@ -1,4 +1,5 @@
 import { describe, expect, it } from "bun:test";
+import { rejectSessionMetaCollectionWrites } from "../../features/magic-context/__tests__/session-meta-faults";
 import { getOrCreateSessionMeta } from "../../features/magic-context/storage";
 import { initializeDatabase } from "../../features/magic-context/storage-db";
 import { getMergedReasoningStrippedIds } from "../../features/magic-context/storage-meta-persisted";
@@ -37,8 +38,9 @@ describe("thinking companion precondition", () => {
         const db = new Database(":memory:");
         initializeDatabase(db);
         getOrCreateSessionMeta(db, "write-failure");
-        db.exec(`CREATE TRIGGER reject_companion BEFORE UPDATE OF merged_reasoning_stripped_ids ON session_meta
-            BEGIN SELECT RAISE(ABORT, 'companion write rejected'); END`);
+        rejectSessionMetaCollectionWrites(db, "merged_reasoning_stripped_ids", "reject_companion", {
+            error: "companion write rejected",
+        });
         try {
             const messages = [assistant("older")];
             const before = structuredClone(messages);

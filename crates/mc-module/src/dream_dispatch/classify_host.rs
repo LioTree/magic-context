@@ -419,7 +419,8 @@ mod tests {
                     tx.execute("INSERT INTO memories(id,project_path,category,content,normalized_hash,source_session_id,first_seen_at,created_at,updated_at,last_seen_at) VALUES (?1,?2,'PROJECT',?3,?4,'source-session',1,1,1,1)", params![id, project, content, mc_store::compute_normalized_memory_hash(&content)])?;
                     tx.execute("INSERT INTO memory_embeddings(memory_id,embedding,model_id) VALUES (?1,?2,'model')", params![id, vec![0_u8;8]])?;
                 }
-                tx.execute("INSERT INTO session_meta(session_id,served_prefix,cached_m0_bytes) VALUES ('session','frozen prefix',?1),('other-session','other prefix',?2)", params![b"frozen bytes", b"other bytes"])?;
+                tx.execute("INSERT INTO session_meta(session_id,served_prefix) VALUES ('session','frozen prefix'),('other-session','other prefix')", [])?;
+                tx.execute("INSERT INTO session_render_cache(session_id,cache_key,value) VALUES ('session','cached_m0_bytes',?1),('other-session','cached_m0_bytes',?2)", params![b"frozen bytes", b"other bytes"])?;
                 tx.execute("INSERT INTO project_state(project_path,project_memory_epoch) VALUES ('project',7),('foreign',9)", [])?;
                 Ok(())
             }).unwrap();
@@ -466,7 +467,7 @@ mod tests {
         for task in [TaskName::Classify, TaskName::Map] {
             let fixture = Fixture::new(task);
             let before = fixture.store.with_context_read(|db| {
-                db.prepare("SELECT session_id,served_prefix,cached_m0_bytes FROM session_meta ORDER BY session_id")?
+                db.prepare("SELECT session_id,served_prefix,(SELECT value FROM session_render_cache WHERE session_id=session_meta.session_id AND cache_key='cached_m0_bytes') FROM session_meta ORDER BY session_id")?
                     .query_map([], |row| Ok((row.get::<_,String>(0)?,row.get::<_,String>(1)?,row.get::<_,Vec<u8>>(2)?)))?.collect::<rusqlite::Result<Vec<_>>>()
             }).unwrap();
             let mut host = ClassifyHost::new(
@@ -510,7 +511,7 @@ mod tests {
                 9
             );
             let after = fixture.store.with_context_read(|db| {
-                db.prepare("SELECT session_id,served_prefix,cached_m0_bytes FROM session_meta ORDER BY session_id")?
+                db.prepare("SELECT session_id,served_prefix,(SELECT value FROM session_render_cache WHERE session_id=session_meta.session_id AND cache_key='cached_m0_bytes') FROM session_meta ORDER BY session_id")?
                     .query_map([], |row| Ok((row.get::<_,String>(0)?,row.get::<_,String>(1)?,row.get::<_,Vec<u8>>(2)?)))?.collect::<rusqlite::Result<Vec<_>>>()
             }).unwrap();
             assert_eq!(before, after);

@@ -9,6 +9,7 @@ import { join } from "node:path";
 import { loadPluginConfigDetailed } from "../config";
 import { pluginConfigReader } from "../config/live-run-config";
 import { MagicContextConfigSchema } from "../config/schema/magic-context";
+import { seedSessionMeta } from "../features/magic-context/__tests__/session-meta-fixture";
 import { replaceAllCompartmentState } from "../features/magic-context/compartment-storage";
 import { insertMemory } from "../features/magic-context/memory";
 import {
@@ -820,20 +821,19 @@ describe("buildSidebarSnapshot — compartments served in m[1]", () => {
             const m0History = "<session-history>\n</session-history>";
             const newCompartments =
                 "<new-compartments>\n## 11-14 · Continued runtime inspection\nRead production, gear and ABI record code before implementing the plan.\n</new-compartments>";
-            db.prepare(
-                `INSERT INTO session_meta (
-                    session_id, last_input_tokens, last_context_percentage,
-                    system_prompt_tokens, memory_block_cache, memory_block_count,
-                    cached_m0_bytes, cached_m1_bytes
-                ) VALUES (?, 50000, 25, 5000, '', 0, ?, ?)`,
-            ).run(
-                sessionId,
-                Buffer.from(m0History, "utf8"),
-                Buffer.from(
+            seedSessionMeta(db, {
+                session_id: sessionId,
+                last_input_tokens: 50000,
+                last_context_percentage: 25,
+                system_prompt_tokens: 5000,
+                memory_block_cache: "",
+                memory_block_count: 0,
+                cached_m0_bytes: Buffer.from(m0History, "utf8"),
+                cached_m1_bytes: Buffer.from(
                     `<session-history-since>\n${newCompartments}\n</session-history-since>`,
                     "utf8",
                 ),
-            );
+            });
 
             const snapshot = buildSidebarSnapshot(db, sessionId, process.cwd(), undefined, 4000);
             expect(snapshot.compartmentTokens).toBe(
@@ -876,12 +876,14 @@ describe("buildSidebarSnapshot — memory tokens fallback (bug #1)", () => {
             // Seed session_meta with the regression-trigger shape:
             //   memory_block_cache = ''  (cleared by historian/recomp/etc.)
             //   memory_block_count > 0  (preserved across cache busts)
-            db.prepare(
-                `INSERT INTO session_meta (
-                    session_id, last_input_tokens, last_context_percentage,
-                    system_prompt_tokens, memory_block_cache, memory_block_count
-                ) VALUES (?, 50000, 25, 5000, '', 2)`,
-            ).run(sessionId);
+            seedSessionMeta(db, {
+                session_id: sessionId,
+                last_input_tokens: 50000,
+                last_context_percentage: 25,
+                system_prompt_tokens: 5000,
+                memory_block_cache: "",
+                memory_block_count: 2,
+            });
 
             const snapshot = buildSidebarSnapshot(
                 db,
@@ -907,12 +909,14 @@ describe("buildSidebarSnapshot — memory tokens fallback (bug #1)", () => {
             const sessionId = "ses-test-2";
             const directory = process.cwd();
 
-            db.prepare(
-                `INSERT INTO session_meta (
-                    session_id, last_input_tokens, last_context_percentage,
-                    system_prompt_tokens, memory_block_cache, memory_block_count
-                ) VALUES (?, 0, 0, 0, '', 0)`,
-            ).run(sessionId);
+            seedSessionMeta(db, {
+                session_id: sessionId,
+                last_input_tokens: 0,
+                last_context_percentage: 0,
+                system_prompt_tokens: 0,
+                memory_block_cache: "",
+                memory_block_count: 0,
+            });
 
             const snapshot = buildSidebarSnapshot(db, sessionId, directory, undefined, 4000);
             expect(snapshot.memoryBlockCount).toBe(0);
@@ -927,12 +931,14 @@ describe("buildSidebarSnapshot — memory tokens fallback (bug #1)", () => {
         try {
             const sessionId = "ses-sidebar-no-fact-count";
             const directory = process.cwd();
-            db.prepare(
-                `INSERT INTO session_meta (
-                    session_id, last_input_tokens, last_context_percentage,
-                    system_prompt_tokens, memory_block_cache, memory_block_count
-                ) VALUES (?, 50000, 25, 5000, '', 0)`,
-            ).run(sessionId);
+            seedSessionMeta(db, {
+                session_id: sessionId,
+                last_input_tokens: 50000,
+                last_context_percentage: 25,
+                system_prompt_tokens: 5000,
+                memory_block_cache: "",
+                memory_block_count: 0,
+            });
 
             const snapshot = buildSidebarSnapshot(db, sessionId, directory, undefined, 4000);
             expect(Object.hasOwn(snapshot as object, "factCount")).toBe(false);
@@ -954,12 +960,15 @@ describe("buildSidebarSnapshot — memory tokens fallback (bug #1)", () => {
             // the token bucket now (it under-counts the real injected cost).
             const v1Cache = "<project-memory>\n- a durable architectural fact\n</project-memory>";
 
-            db.prepare(
-                `INSERT INTO session_meta (
-                    session_id, last_input_tokens, last_context_percentage,
-                    system_prompt_tokens, memory_block_cache, memory_block_count, cached_m0_bytes
-                ) VALUES (?, 50000, 25, 5000, ?, 1, ?)`,
-            ).run(sessionId, v1Cache, Buffer.from(m0, "utf8"));
+            seedSessionMeta(db, {
+                session_id: sessionId,
+                last_input_tokens: 50000,
+                last_context_percentage: 25,
+                system_prompt_tokens: 5000,
+                memory_block_cache: v1Cache,
+                memory_block_count: 1,
+                cached_m0_bytes: Buffer.from(m0, "utf8"),
+            });
 
             const snapshot = buildSidebarSnapshot(db, sessionId, directory, undefined, 4000);
             expect(snapshot.memoryBlockCount).toBe(1);
@@ -981,12 +990,14 @@ describe("buildSidebarSnapshot — context limit", () => {
         const db = createTestDb();
         try {
             const sessionId = "ses-sidebar-native-full-window";
-            db.prepare(
-                `INSERT INTO session_meta (
-                    session_id, last_input_tokens, last_context_percentage,
-                    system_prompt_tokens, memory_block_cache, memory_block_count
-                ) VALUES (?, 120000, 80, 0, '', 0)`,
-            ).run(sessionId);
+            seedSessionMeta(db, {
+                session_id: sessionId,
+                last_input_tokens: 120000,
+                last_context_percentage: 80,
+                system_prompt_tokens: 0,
+                memory_block_cache: "",
+                memory_block_count: 0,
+            });
             await refreshModelLimitsFromApi({
                 config: {
                     providers: async () => ({
@@ -1028,12 +1039,14 @@ describe("buildSidebarSnapshot — context limit", () => {
         try {
             const sessionId = "ses-sidebar-context-limit";
             const directory = process.cwd();
-            db.prepare(
-                `INSERT INTO session_meta (
-                    session_id, last_input_tokens, last_context_percentage,
-                    system_prompt_tokens, memory_block_cache, memory_block_count
-                ) VALUES (?, 80000, 40, 5000, '', 0)`,
-            ).run(sessionId);
+            seedSessionMeta(db, {
+                session_id: sessionId,
+                last_input_tokens: 80000,
+                last_context_percentage: 40,
+                system_prompt_tokens: 5000,
+                memory_block_cache: "",
+                memory_block_count: 0,
+            });
             await refreshModelLimitsFromApi({
                 config: {
                     providers: async () => ({

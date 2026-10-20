@@ -12,6 +12,7 @@ import {
     clearSession,
     getOrCreateSessionMeta,
 } from "../../features/magic-context/storage-meta-session";
+import { sessionMetaCollectionSelect } from "../../features/magic-context/storage-session-collections";
 import { Database } from "../../shared/sqlite";
 import { createTestTempDirFromPath } from "../../shared/test-temp-dir";
 import { clearAutoSearchForSession, runAutoSearchHint } from "./auto-search-runner";
@@ -90,7 +91,7 @@ test("owner-persisted hint has identical SOFT replay on two connections", async 
     expect(getAutoSearchHintDecisions(reader, sessionId)).toEqual([decision]);
     const raw = db
         .prepare(
-            "SELECT auto_search_hint_decisions AS decisions FROM session_meta WHERE session_id=?",
+            `SELECT ${sessionMetaCollectionSelect("auto_search_hint_decisions", "decisions", db)} FROM session_meta WHERE session_id=?`,
         )
         .get(sessionId) as { decisions: string };
     expect(JSON.parse(raw.decisions)).toEqual([decision]);

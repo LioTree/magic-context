@@ -4,6 +4,7 @@ import { resolveProjectIdentity } from "@magic-context/core/features/magic-conte
 import type { UnifiedSearchResult } from "@magic-context/core/features/magic-context/search";
 import * as searchModule from "@magic-context/core/features/magic-context/search";
 import { closeQuietly } from "@magic-context/core/shared/sqlite-helpers";
+import { seedSessionMeta } from "../../../plugin/src/features/magic-context/__tests__/session-meta-fixture";
 import { createTestDb, fakeContext } from "../test-utils.test";
 import { createCtxSearchTool } from "./ctx-search";
 
@@ -176,9 +177,10 @@ describe("createCtxSearchTool", () => {
 			category: "ARCHITECTURE",
 			content: "Visible Pi memory for direct lookup.",
 		});
-		db.prepare(
-			"INSERT INTO session_meta (session_id, memory_block_ids) VALUES (?, ?)",
-		).run("ses-visible", JSON.stringify([memory.id]));
+		seedSessionMeta(db, {
+			session_id: "ses-visible",
+			memory_block_ids: JSON.stringify([memory.id]),
+		});
 		try {
 			const tool = createCtxSearchTool({
 				db,

@@ -3,6 +3,7 @@
 pub mod bootstrap;
 pub mod fingerprints;
 pub mod migrations_legacy;
+mod session_payload_layout;
 
 pub use bootstrap::{BootstrapContextSchema, BOOTSTRAP, BOOTSTRAP_VERSION};
 

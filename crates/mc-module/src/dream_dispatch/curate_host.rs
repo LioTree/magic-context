@@ -558,7 +558,8 @@ mod tests {
                     db.execute("INSERT INTO memories(id,project_path,category,content,normalized_hash,source_session_id,first_seen_at,created_at,updated_at,last_seen_at,metadata_json) VALUES(?1,?2,'ARCHITECTURE',?3,?4,'source',1,1,1,1,'{}')", params![id,project,content,mc_store::compute_normalized_memory_hash(&content)])?;
                     db.execute("INSERT INTO memory_embeddings(memory_id,embedding,model_id) VALUES(?1,?2,'model')", params![id,vec![0_u8;8]])?;
                 }
-                db.execute("INSERT INTO session_meta(session_id,served_prefix,cached_m0_bytes) VALUES('session','frozen prefix',?1)", [b"frozen bytes"])?;
+                db.execute("INSERT INTO session_meta(session_id,served_prefix) VALUES ('session','frozen prefix')", [])?;
+                db.execute("INSERT INTO session_render_cache(session_id,cache_key,value) VALUES ('session','cached_m0_bytes',?1)", [b"frozen bytes"])?;
                 db.execute("INSERT INTO project_state(project_path,project_memory_epoch) VALUES('project',9)", [])?;
                 Ok(())
             }).unwrap();
@@ -670,7 +671,7 @@ mod tests {
             9
         );
         f.store.with_context_read(|db| {
-            let (prefix, bytes): (String, Vec<u8>) = db.query_row("SELECT served_prefix,cached_m0_bytes FROM session_meta WHERE session_id='session'", [], |r| Ok((r.get(0)?, r.get(1)?)))?;
+            let (prefix, bytes): (String, Vec<u8>) = db.query_row("SELECT served_prefix,(SELECT value FROM session_render_cache WHERE session_id=session_meta.session_id AND cache_key='cached_m0_bytes') FROM session_meta WHERE session_id='session'", [], |r| Ok((r.get(0)?, r.get(1)?)))?;
             assert_eq!(prefix, "frozen prefix"); assert_eq!(bytes, b"frozen bytes"); Ok(())
         }).unwrap();
         assert_eq!(f.state(), json!({"curate":{"cursor":2}}));

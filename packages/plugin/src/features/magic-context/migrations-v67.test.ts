@@ -3,7 +3,7 @@
 import { describe, expect, test } from "bun:test";
 import { Database } from "../../shared/sqlite";
 import { closeQuietly } from "../../shared/sqlite-helpers";
-import { LATEST_MIGRATION_VERSION, runMigrations } from "./migrations";
+import { LATEST_MIGRATION_VERSION, MIGRATIONS, runMigrations } from "./migrations";
 import { initializeDatabase, LATEST_SUPPORTED_VERSION } from "./storage-db";
 import { clearSession, getOrCreateSessionMeta } from "./storage-meta-session";
 import { clearCachedM0M1, persistCachedM0 } from "./storage-meta-shared";
@@ -39,7 +39,7 @@ describe("migration v67: cached m0 mural payload", () => {
             db.prepare("INSERT INTO session_meta (session_id) VALUES (?)").run("ses-legacy");
             seedAppliedVersion(db, 66);
 
-            runMigrations(db);
+            MIGRATIONS.find((step) => step.version === 67)!.up(db);
 
             expect(LATEST_SUPPORTED_VERSION).toBe(LATEST_MIGRATION_VERSION);
             const columns = columnNames(db, "session_meta");

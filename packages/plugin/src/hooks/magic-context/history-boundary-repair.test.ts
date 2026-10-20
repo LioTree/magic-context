@@ -1,6 +1,7 @@
 /// <reference types="bun-types" />
 
 import { afterEach, describe, expect, it } from "bun:test";
+import { patchSessionMeta } from "../../features/magic-context/__tests__/session-meta-fixture";
 import {
     acquireCompartmentLease,
     releaseCompartmentLease,
@@ -12,6 +13,7 @@ import {
 } from "../../features/magic-context/compartment-storage";
 import { getOrCreateSessionMeta } from "../../features/magic-context/storage";
 import { initializeDatabase } from "../../features/magic-context/storage-db";
+import { sessionRenderCacheSelect } from "../../features/magic-context/storage-session-cache";
 import { Database } from "../../shared/sqlite";
 import { closeQuietly } from "../../shared/sqlite-helpers";
 import { repairMissingHistoryBoundary } from "./history-boundary-repair";
@@ -49,16 +51,12 @@ function seed(options: { baseline?: string | null; latestEndId?: string } = {}):
             content: `Summary ${index}`,
         })),
     );
-    database
-        .prepare(
-            "UPDATE session_meta SET cached_m0_bytes = ?, cached_m1_bytes = ?, cached_m0_last_baseline_end_message_id = ? WHERE session_id = ?",
-        )
-        .run(
-            Buffer.from("m0"),
-            Buffer.from("m1"),
+    patchSessionMeta(database, SESSION, {
+        cached_m0_bytes: Buffer.from("m0"),
+        cached_m1_bytes: Buffer.from("m1"),
+        cached_m0_last_baseline_end_message_id:
             options.baseline === undefined ? "m-6" : options.baseline,
-            SESSION,
-        );
+    });
     for (const ordinal of [2, 4, 6])
         database
             .prepare(
@@ -78,7 +76,7 @@ function store(ids: string[]): (id: string) => boolean {
 function cachedPair(database: Database): { m0: unknown; boundary: string | null } {
     return database
         .prepare(
-            "SELECT cached_m0_bytes AS m0, cached_m0_last_baseline_end_message_id AS boundary FROM session_meta WHERE session_id = ?",
+            `SELECT ${sessionRenderCacheSelect("cached_m0_bytes", "m0", database)}, cached_m0_last_baseline_end_message_id AS boundary FROM session_meta WHERE session_id = ?`,
         )
         .get(SESSION) as { m0: unknown; boundary: string | null };
 }

@@ -1,5 +1,3 @@
-import { drainNotifications, registerNotificationSink } from "../../shared/rpc-notifications";
-import { createTestTempDirFromPath } from "../../shared/test-temp-dir";
 /// <reference types="bun-types" />
 
 import { afterEach, beforeEach, describe, expect, it, mock, spyOn } from "bun:test";
@@ -7,7 +5,6 @@ import { createHash } from "node:crypto";
 import { mkdirSync, rmSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { dirname, join } from "node:path";
-
 import {
     replaceAllCompartmentState,
     replaceAllCompartments,
@@ -57,6 +54,7 @@ import {
     setPersistedCompactionMarkerState,
 } from "../../features/magic-context/storage-meta-persisted";
 import { addNote } from "../../features/magic-context/storage-notes";
+import { sessionMetaCollectionSelect } from "../../features/magic-context/storage-session-collections";
 import { createTagger } from "../../features/magic-context/tagger";
 import { recordToolDefinition } from "../../features/magic-context/tool-definition-tokens";
 import {
@@ -68,8 +66,10 @@ import { buildSidebarSnapshot } from "../../plugin/rpc-handlers";
 import type { PluginContext } from "../../plugin/types";
 import * as loggerModule from "../../shared/logger";
 import { clearModelsDevCache, refreshModelLimitsFromApi } from "../../shared/models-dev-cache";
+import { drainNotifications, registerNotificationSink } from "../../shared/rpc-notifications";
 import { Database } from "../../shared/sqlite";
 import { closeQuietly } from "../../shared/sqlite-helpers";
+import { createTestTempDirFromPath } from "../../shared/test-temp-dir";
 import type { MarkerUpdateOutcome } from "./compaction-marker-manager";
 import { getActiveCompartmentRun, registerActiveCompartmentRun } from "./compartment-runner";
 import { createToolExecuteAfterHook } from "./hook-handlers";
@@ -363,7 +363,7 @@ describe("createTransform", () => {
                 (
                     db
                         .prepare(
-                            "SELECT merged_reasoning_stripped_ids AS ids FROM session_meta WHERE session_id = ?",
+                            `SELECT ${sessionMetaCollectionSelect("merged_reasoning_stripped_ids", "ids", db)} FROM session_meta WHERE session_id = ?`,
                         )
                         .get(sessionId) as { ids: string }
                 ).ids,
@@ -514,7 +514,7 @@ describe("createTransform", () => {
                 (
                     db
                         .prepare(
-                            "SELECT merged_reasoning_stripped_ids AS ids FROM session_meta WHERE session_id = ?",
+                            `SELECT ${sessionMetaCollectionSelect("merged_reasoning_stripped_ids", "ids", db)} FROM session_meta WHERE session_id = ?`,
                         )
                         .get(sessionId) as { ids: string }
                 ).ids,
@@ -1255,7 +1255,7 @@ describe("createTransform", () => {
             preparedSql.filter((sql) => sql.includes("SELECT historian_failure_count")).length,
         ).toBe(1);
         expect(
-            preparedSql.filter((sql) => sql.includes("SELECT stale_reduce_stripped_ids")).length,
+            preparedSql.filter((sql) => sql.includes(" AS stale_reduce_stripped_ids")).length,
         ).toBe(1);
         expect(preparedSql.some((sql) => sql.includes("SELECT last_response_time FROM"))).toBe(
             false,

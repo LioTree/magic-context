@@ -28,6 +28,10 @@ import { dropSlot } from "@magic-context/core/hooks/magic-context/lkg-slot";
 import { isAnthropicFamilyRoute } from "@magic-context/core/hooks/magic-context/sentinel";
 import { getHarness } from "@magic-context/core/shared/harness";
 import { log } from "@magic-context/core/shared/logger";
+import {
+	sessionMetaCollectionSelect,
+	updateSessionMetaCollection,
+} from "../../plugin/src/features/magic-context/storage-session-collections";
 import { resetPiUpperEstimateReclaim } from "./pi-fit-reclaim";
 import { clearPiLkgSessionState } from "./pi-lkg";
 import { piContentFallbackIds, resolvePiStableId } from "./read-session-pi";
@@ -523,7 +527,7 @@ export function preparePiThinkingStripWrite(
 		};
 	const row = db
 		.prepare(
-			"SELECT merged_reasoning_stripped_ids FROM session_meta WHERE session_id = ?",
+			`SELECT ${sessionMetaCollectionSelect("merged_reasoning_stripped_ids", "merged_reasoning_stripped_ids", db)} FROM session_meta WHERE session_id = ?`,
 		)
 		.get(sessionId) as
 		| { merged_reasoning_stripped_ids: string | null }
@@ -544,11 +548,13 @@ export function preparePiThinkingStripWrite(
 	for (const id of plan.entryIds) ids.add(piThinkingOmissionOrderId(id, "end"));
 	const next = JSON.stringify([...ids]);
 	return () => {
-		const result = db
-			.prepare(
-				"UPDATE session_meta SET merged_reasoning_stripped_ids = ? WHERE session_id = ? AND merged_reasoning_stripped_ids IS ?",
-			)
-			.run(next, sessionId, raw);
+		const result = updateSessionMetaCollection(
+			db,
+			sessionId,
+			"merged_reasoning_stripped_ids",
+			next,
+			{ value: raw },
+		);
 		// A peer changed the ledger after planning. Refuse this lane rather than
 		// overwrite the peer's choices or rerun a pipeline that allocated tags.
 		if (!(result.changes > 0))
@@ -629,7 +635,7 @@ function readPiOmissionLedger(
 ): PiOmissionLedger {
 	const row = db
 		.prepare(
-			"SELECT merged_reasoning_stripped_ids FROM session_meta WHERE session_id = ?",
+			`SELECT ${sessionMetaCollectionSelect("merged_reasoning_stripped_ids", "merged_reasoning_stripped_ids", db)} FROM session_meta WHERE session_id = ?`,
 		)
 		.get(sessionId) as { merged_reasoning_stripped_ids?: string | null } | null;
 	const raw = row?.merged_reasoning_stripped_ids ?? null;

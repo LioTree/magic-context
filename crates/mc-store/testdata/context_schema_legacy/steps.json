@@ -159,5 +159,31 @@
     "sql": [
       "ALTER TABLE lkg_served_markers ADD COLUMN served_digest TEXT"
     ]
+  },
+  {
+    "version": 103,
+    "description": "isolate session render payloads and chunk growing replay metadata",
+    "sql": [
+      "CREATE TABLE IF NOT EXISTS session_render_cache (\n    session_id TEXT NOT NULL,\n    cache_key TEXT NOT NULL,\n    value BLOB,\n    PRIMARY KEY (session_id, cache_key)\n) WITHOUT ROWID",
+      "CREATE TABLE IF NOT EXISTS session_meta_chunks (\n    session_id TEXT NOT NULL,\n    column_name TEXT NOT NULL,\n    chunk TEXT NOT NULL,\n    body BLOB,\n    PRIMARY KEY (session_id, column_name, chunk)\n) WITHOUT ROWID",
+      "INSERT INTO session_render_cache (session_id, cache_key, value)\n            SELECT session_id, 'cached_m0_bytes', cached_m0_bytes FROM session_meta\n            WHERE cached_m0_bytes IS NOT NULL\n            ON CONFLICT(session_id, cache_key) DO UPDATE SET value = excluded.value\n            WHERE value IS NOT excluded.value",
+      "ALTER TABLE session_meta DROP COLUMN cached_m0_bytes",
+      "INSERT INTO session_render_cache (session_id, cache_key, value)\n            SELECT session_id, 'cached_m1_bytes', cached_m1_bytes FROM session_meta\n            WHERE cached_m1_bytes IS NOT NULL\n            ON CONFLICT(session_id, cache_key) DO UPDATE SET value = excluded.value\n            WHERE value IS NOT excluded.value",
+      "ALTER TABLE session_meta DROP COLUMN cached_m1_bytes",
+      "INSERT INTO session_render_cache (session_id, cache_key, value)\n            SELECT session_id, 'cached_m0_mural_data_url', cached_m0_mural_data_url FROM session_meta\n            WHERE cached_m0_mural_data_url IS NOT NULL\n            ON CONFLICT(session_id, cache_key) DO UPDATE SET value = excluded.value\n            WHERE value IS NOT excluded.value",
+      "ALTER TABLE session_meta DROP COLUMN cached_m0_mural_data_url",
+      "INSERT INTO session_render_cache (session_id, cache_key, value)\n            SELECT session_id, 'memory_block_cache', memory_block_cache FROM session_meta\n            WHERE (memory_block_cache IS NULL OR memory_block_cache != '')\n            ON CONFLICT(session_id, cache_key) DO UPDATE SET value = excluded.value\n            WHERE value IS NOT excluded.value",
+      "ALTER TABLE session_meta DROP COLUMN memory_block_cache",
+      "INSERT INTO session_render_cache (session_id, cache_key, value)\n            SELECT session_id, 'cached_m0_upgrade_state', cached_m0_upgrade_state FROM session_meta\n            WHERE cached_m0_upgrade_state IS NOT NULL\n            ON CONFLICT(session_id, cache_key) DO UPDATE SET value = excluded.value\n            WHERE value IS NOT excluded.value",
+      "ALTER TABLE session_meta DROP COLUMN cached_m0_upgrade_state",
+      "ALTER TABLE session_meta DROP COLUMN trailing_blank_decisions",
+      "ALTER TABLE session_meta DROP COLUMN merged_reasoning_stripped_ids",
+      "ALTER TABLE session_meta DROP COLUMN note_nudge_anchors",
+      "ALTER TABLE session_meta DROP COLUMN auto_search_hint_decisions",
+      "ALTER TABLE session_meta DROP COLUMN stale_reduce_stripped_ids",
+      "ALTER TABLE session_meta DROP COLUMN stripped_placeholder_ids",
+      "ALTER TABLE session_meta DROP COLUMN processed_image_stripped_ids",
+      "ALTER TABLE session_meta DROP COLUMN memory_block_ids"
+    ]
   }
 ]

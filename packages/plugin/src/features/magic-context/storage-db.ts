@@ -77,6 +77,8 @@ import {
 import { installCompartmentHistoryVersions } from "./storage-compartment-history-version";
 import { installHostRunnerSchema } from "./storage-host-runner";
 import { ensureColumn, healAllNullColumns } from "./storage-schema-helpers";
+import { SESSION_RENDER_CACHE_DDL } from "./storage-session-cache";
+import { SESSION_META_CHUNKS_DDL } from "./storage-session-collections";
 import { installTagIdentityRevisionTrigger } from "./storage-tag-identity-revision";
 import { StoreVersionMismatchError } from "./store-version-mismatch";
 import {
@@ -167,7 +169,7 @@ export function __resetSchemaFenceStateForTests(): void {
     lastUnconfirmedMigrationHolders = null;
 }
 
-export const LATEST_SUPPORTED_VERSION = 102;
+export const LATEST_SUPPORTED_VERSION = 103;
 
 /**
  * Every runtime backend receives the same finite wait before the first schema
@@ -2130,8 +2132,15 @@ CREATE INDEX IF NOT EXISTS idx_dream_queue_pending ON dream_queue(started_at, en
     ensureColumn(db, "session_meta", "note_nudge_trigger_message_id", "TEXT DEFAULT ''");
     ensureColumn(db, "session_meta", "note_nudge_sticky_text", "TEXT DEFAULT ''");
     ensureColumn(db, "session_meta", "note_nudge_sticky_message_id", "TEXT DEFAULT ''");
-    ensureColumn(db, "session_meta", "note_nudge_anchors", "TEXT NOT NULL DEFAULT '[]'");
-    ensureColumn(db, "session_meta", "auto_search_hint_decisions", "TEXT NOT NULL DEFAULT '[]'");
+    if (getPersistedSchemaVersion(db) < 103)
+        ensureColumn(db, "session_meta", "note_nudge_anchors", "TEXT NOT NULL DEFAULT '[]'");
+    if (getPersistedSchemaVersion(db) < 103)
+        ensureColumn(
+            db,
+            "session_meta",
+            "auto_search_hint_decisions",
+            "TEXT NOT NULL DEFAULT '[]'",
+        );
     ensureColumn(db, "session_meta", "last_todo_state", "TEXT DEFAULT ''");
     ensureColumn(db, "session_meta", "todo_permission_denied", "INTEGER NOT NULL DEFAULT 2");
     ensureColumn(db, "session_meta", "todo_synthetic_call_id", "TEXT DEFAULT ''");
@@ -2161,29 +2170,36 @@ CREATE INDEX IF NOT EXISTS idx_dream_queue_pending ON dream_queue(started_at, en
     // the schema is always compilable before any migration runs.
     ensureColumn(db, "session_meta", "tags_version", "INTEGER NOT NULL DEFAULT 0");
     ensureColumn(db, "session_meta", "tool_reclaim_watermark", "INTEGER DEFAULT 0");
-    ensureColumn(db, "session_meta", "stripped_placeholder_ids", "TEXT DEFAULT ''");
+    if (getPersistedSchemaVersion(db) < 103)
+        ensureColumn(db, "session_meta", "stripped_placeholder_ids", "TEXT DEFAULT ''");
     // Frozen replay watermark for the stale-ctx_reduce strip: message ids whose
     // ctx_reduce parts have aged past the protected window. The set only grows on
     // cache-busting passes and is replayed verbatim on defer passes, so the strip
     // never recomputes a volatile messages.length boundary that would silently
     // strip newly-aged calls mid-prefix on a defer pass (Anthropic cache bust).
-    ensureColumn(db, "session_meta", "stale_reduce_stripped_ids", "TEXT DEFAULT ''");
-    ensureColumn(db, "session_meta", "processed_image_stripped_ids", "TEXT DEFAULT ''");
-    ensureColumn(db, "session_meta", "merged_reasoning_stripped_ids", "TEXT DEFAULT ''");
+    if (getPersistedSchemaVersion(db) < 103)
+        ensureColumn(db, "session_meta", "stale_reduce_stripped_ids", "TEXT DEFAULT ''");
+    if (getPersistedSchemaVersion(db) < 103)
+        ensureColumn(db, "session_meta", "processed_image_stripped_ids", "TEXT DEFAULT ''");
+    if (getPersistedSchemaVersion(db) < 103)
+        ensureColumn(db, "session_meta", "merged_reasoning_stripped_ids", "TEXT DEFAULT ''");
     ensureColumn(db, "session_meta", "thinking_binding_recovery_target", "TEXT DEFAULT ''");
-    ensureColumn(db, "session_meta", "trailing_blank_decisions", "TEXT DEFAULT ''");
+    if (getPersistedSchemaVersion(db) < 103)
+        ensureColumn(db, "session_meta", "trailing_blank_decisions", "TEXT DEFAULT ''");
     ensureColumn(db, "compartment_state_lease", "owner_pid", "INTEGER");
     ensureColumn(db, "compartments", "start_message_id", "TEXT DEFAULT ''");
     ensureColumn(db, "compartments", "end_message_id", "TEXT DEFAULT ''");
     ensureColumn(db, "memory_embeddings", "model_id", "TEXT");
-    ensureColumn(db, "session_meta", "memory_block_cache", "TEXT DEFAULT ''");
+    if (getPersistedSchemaVersion(db) < 103)
+        ensureColumn(db, "session_meta", "memory_block_cache", "TEXT DEFAULT ''");
     ensureColumn(db, "session_meta", "memory_block_count", "INTEGER DEFAULT 0");
     ensureColumn(db, "session_meta", "pi_stable_id_scheme", "INTEGER");
     // JSON array of memory ids currently rendered in the cached <session-history>
     // memory block. Used by ctx_search to hard-filter memories the agent can
     // already see in context — they're wasted tokens and crowd out high-signal
     // raw-history hits.
-    ensureColumn(db, "session_meta", "memory_block_ids", "TEXT DEFAULT ''");
+    if (getPersistedSchemaVersion(db) < 103)
+        ensureColumn(db, "session_meta", "memory_block_ids", "TEXT DEFAULT ''");
     ensureColumn(db, "dream_queue", "retry_count", "INTEGER DEFAULT 0");
     ensureColumn(db, "tags", "reasoning_byte_size", "INTEGER DEFAULT 0");
     ensureColumn(db, "tags", "drop_mode", "TEXT DEFAULT 'full'");
@@ -2321,7 +2337,8 @@ CREATE INDEX IF NOT EXISTS idx_dream_queue_pending ON dream_queue(started_at, en
     ensureColumn(db, "memories", "mural_cue_hash", "TEXT");
     ensureColumn(db, "memories", "mural_cue_at", "INTEGER");
     ensureColumn(db, "memory_verifications", "mapped_at", "INTEGER NOT NULL DEFAULT 0");
-    ensureColumn(db, "session_meta", "cached_m0_bytes", "BLOB");
+    if (getPersistedSchemaVersion(db) < 103)
+        ensureColumn(db, "session_meta", "cached_m0_bytes", "BLOB");
     ensureColumn(db, "session_meta", "cached_m0_project_memory_epoch", "INTEGER");
     ensureColumn(db, "session_meta", "cached_m0_workspace_fingerprint", "TEXT");
     ensureColumn(db, "session_meta", "cached_m0_project_user_profile_version", "INTEGER");
@@ -2330,7 +2347,8 @@ CREATE INDEX IF NOT EXISTS idx_dream_queue_pending ON dream_queue(started_at, en
     ensureColumn(db, "session_meta", "cached_m0_max_mutation_id", "INTEGER");
     ensureColumn(db, "session_meta", "cached_m0_max_memory_mutation_id", "INTEGER");
     ensureColumn(db, "session_meta", "cached_m0_project_docs_hash", "TEXT");
-    ensureColumn(db, "session_meta", "cached_m1_bytes", "BLOB");
+    if (getPersistedSchemaVersion(db) < 103)
+        ensureColumn(db, "session_meta", "cached_m1_bytes", "BLOB");
     ensureColumn(db, "session_meta", "last_observed_model_key", "TEXT");
     ensureColumn(db, "session_meta", "last_usage_context_limit", "INTEGER NOT NULL DEFAULT 0");
     ensureColumn(db, "session_meta", "prior_boundary_ordinal", "INTEGER NOT NULL DEFAULT 1");
@@ -2367,7 +2385,8 @@ CREATE INDEX IF NOT EXISTS idx_dream_queue_pending ON dream_queue(started_at, en
     ensureColumn(db, "session_meta", "compaction_mode_record", "TEXT");
     ensureColumn(db, "session_meta", "cached_m0_materialized_at", "INTEGER");
     ensureColumn(db, "session_meta", "cached_m0_session_facts_version", "INTEGER");
-    ensureColumn(db, "session_meta", "cached_m0_upgrade_state", "TEXT");
+    if (getPersistedSchemaVersion(db) < 103)
+        ensureColumn(db, "session_meta", "cached_m0_upgrade_state", "TEXT");
     ensureColumn(db, "session_meta", "cached_m0_system_hash", "TEXT");
     ensureColumn(db, "session_meta", "cached_m0_tool_set_hash", "TEXT");
     ensureColumn(db, "session_meta", "cached_m0_model_key", "TEXT");
@@ -2382,7 +2401,10 @@ CREATE INDEX IF NOT EXISTS idx_dream_queue_pending ON dream_queue(started_at, en
     // Keep migration order canonical: v66 reminder fields precede v67 mural cache fields.
     ensureColumn(db, "session_meta", "upgrade_reminder_last_sent_at", "INTEGER");
     ensureColumn(db, "session_meta", "upgrade_reminder_count", "INTEGER NOT NULL DEFAULT 0");
-    ensureColumn(db, "session_meta", "cached_m0_mural_data_url", "TEXT");
+    if (getPersistedSchemaVersion(db) < 103)
+        ensureColumn(db, "session_meta", "cached_m0_mural_data_url", "TEXT");
+    db.exec(SESSION_RENDER_CACHE_DDL);
+    db.exec(SESSION_META_CHUNKS_DDL);
     ensureColumn(db, "session_meta", "cached_m0_mural_hash", "TEXT");
     // v88 (issue 492). The OpenCode host store exists in two projections and a
     // user can move between them in both directions, which renumbers the

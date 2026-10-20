@@ -6,10 +6,12 @@ import { join } from "node:path";
 import { Database } from "../../shared/sqlite";
 import { closeQuietly } from "../../shared/sqlite-helpers";
 import { createTestTempDirFromPath } from "../../shared/test-temp-dir";
-import { runMigrations } from "./migrations";
+import { patchSessionMeta } from "./__tests__/session-meta-fixture";
+import { MIGRATIONS, runMigrations } from "./migrations";
 import { closeDatabase, initializeDatabase, openDatabase } from "./storage-db";
 import { getOrCreateSessionMeta } from "./storage-meta-session";
 import { clearCachedM0M1, persistCachedM0 } from "./storage-meta-shared";
+import { sessionMetaCollectionSelect } from "./storage-session-collections";
 
 function columnNames(db: Database, table: string): string[] {
     return (db.prepare(`PRAGMA table_info(${table})`).all() as Array<{ name: string }>).map(
@@ -117,7 +119,8 @@ describe("migration v22", () => {
         const db = new Database(":memory:");
         try {
             initializeDatabase(db);
-            runMigrations(db);
+            // Later migrations intentionally relocate payloads; this assertion is about v22's DDL.
+            MIGRATIONS.find((step) => step.version === 22)!.up(db);
 
             expect(hasTable(db, "project_state")).toBe(true);
             expect(hasTable(db, "m0_mutation_log")).toBe(true);
@@ -298,18 +301,26 @@ describe("migration v22", () => {
                 upgradeState: "pending",
             });
 
-            db.prepare(
-                "UPDATE session_meta SET cached_m1_bytes = ?, cached_m0_max_memory_mutation_id = ?, memory_block_cache = ?, memory_block_count = ?, memory_block_ids = ? WHERE session_id = ?",
-            ).run(Buffer.from("m1", "utf8"), 8, "stale", 2, "[1,2]", "ses-null");
+            patchSessionMeta(db, "ses-null", {
+                cached_m1_bytes: Buffer.from("m1", "utf8"),
+                cached_m0_max_memory_mutation_id: 8,
+                memory_block_cache: "stale",
+                memory_block_count: 2,
+                memory_block_ids: "[1,2]",
+            });
 
             clearCachedM0M1(db, "ses-null");
 
             const raw = db
                 .prepare(
-                    `SELECT cached_m0_bytes, cached_m1_bytes, cached_m0_max_memory_mutation_id,
-                            cached_m0_project_docs_hash, memory_block_cache, memory_block_count,
-                            memory_block_ids
-                       FROM session_meta
+                    `SELECT (SELECT value FROM session_render_cache WHERE session_id = session_meta.session_id AND cache_key = 'cached_m0_bytes') AS cached_m0_bytes,
+                        (SELECT value FROM session_render_cache WHERE session_id = session_meta.session_id AND cache_key = 'cached_m1_bytes') AS cached_m1_bytes,
+                        cached_m0_max_memory_mutation_id,
+                        cached_m0_project_docs_hash,
+                        COALESCE((SELECT value FROM session_render_cache WHERE session_id = session_meta.session_id AND cache_key = 'memory_block_cache'), '') AS memory_block_cache,
+                        memory_block_count,
+                        ${sessionMetaCollectionSelect("memory_block_ids", "memory_block_ids", db)}
+                    FROM session_meta
                       WHERE session_id = ?`,
                 )
                 .get("ses-null") as {

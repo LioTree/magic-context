@@ -20,8 +20,27 @@ import { initializeDatabase } from "./storage-db";
 import { getPersistedEpochFloor } from "./storage-meta-persisted";
 import { getOrCreateSessionMeta, updateSessionMeta } from "./storage-meta-session";
 import { addNote, getSmartNotes } from "./storage-notes";
+import { isSessionRenderCacheColumn, readSessionRenderCache } from "./storage-session-cache";
+import { isSessionMetaCollection, readSessionMetaCollection } from "./storage-session-collections";
 
 const PROJECT_PATH = "/armed-migration-replay";
+const V103_PAYLOAD_ID = "armed-v103-payloads";
+const V103_PAYLOADS = {
+    cached_m0_bytes: Buffer.from([0, 255, 109]),
+    cached_m1_bytes: Buffer.from("armed m1 é🙂"),
+    cached_m0_mural_data_url: "data:image/png;base64,YXJtZWQ=",
+    memory_block_cache: "<project-memory>armed</project-memory>",
+    cached_m0_upgrade_state: "ready|armed-v103",
+    trailing_blank_decisions: ' {"version":2,"trailingBlank":{},"opaque":"armed-v103"} ',
+    merged_reasoning_stripped_ids: '["armed-v103:p0"]',
+    note_nudge_anchors: '[{"messageId":"armed-v103","text":"keep"}]',
+    auto_search_hint_decisions:
+        '[{"messageId":"armed-v103","decision":"no-hint","reason":"empty"}]',
+    stale_reduce_stripped_ids: '["armed-v103-stale"]',
+    stripped_placeholder_ids: '["armed-v103:p1"]',
+    processed_image_stripped_ids: '["armed-v103:p2"]',
+    memory_block_ids: "[103,104]",
+} as const;
 const V84_SESSION_ID = "armed-replay-session-meta-v84";
 const V85_SESSION_ID = "armed-replay-v85-o2";
 const V85_TWIN_SESSION_ID = "armed-replay-v85-twin";
@@ -93,6 +112,24 @@ function applyExactlyOneMigration(db: DatabaseType, migration: (typeof MIGRATION
 // during construction). The claim is therefore per arm: each arm's rows carry
 // a distinctive column value, and each value must be present at walk end.
 const CLAIMED_ARM_SIGNATURES = [
+    {
+        arm: "v102 payloads survive v103",
+        table: "session_render_cache",
+        column: "session_id",
+        like: V103_PAYLOAD_ID,
+    },
+    {
+        arm: "v102 collections survive v103",
+        table: "session_meta_chunks",
+        column: "session_id",
+        like: V103_PAYLOAD_ID,
+    },
+    {
+        arm: "populateForVersion v103",
+        table: "notes",
+        column: "content",
+        like: "module note populated after v103",
+    },
     {
         arm: "populateForVersion v100 served prefix",
         table: "session_meta",
@@ -875,6 +912,25 @@ function populateForVersion(db: DatabaseType, version: number, state: ReplayStat
                 slot_state: "captured",
                 served_digest: null,
             });
+            db.prepare(
+                `INSERT INTO session_meta(session_id,${Object.keys(V103_PAYLOADS).join(",")}) VALUES (?,${Object.keys(
+                    V103_PAYLOADS,
+                )
+                    .map(() => "?")
+                    .join(",")})`,
+            ).run(V103_PAYLOAD_ID, ...Object.values(V103_PAYLOADS));
+            populateModuleOwnedRows(db, version, state);
+            return;
+        case 103:
+            if (!state.armed) throw new Error(`migration v${version} reached an unarmed store`);
+            for (const [column, expected] of Object.entries(V103_PAYLOADS)) {
+                const actual = isSessionRenderCacheColumn(column)
+                    ? readSessionRenderCache(db, V103_PAYLOAD_ID, column)
+                    : isSessionMetaCollection(column)
+                      ? readSessionMetaCollection(db, V103_PAYLOAD_ID, column)
+                      : undefined;
+                expect(actual, column).toEqual(expected);
+            }
             populateModuleOwnedRows(db, version, state);
             return;
         case 100:

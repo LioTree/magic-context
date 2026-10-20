@@ -855,6 +855,24 @@ fn apply_session(
         )?;
     }
 
+    if conn.query_row(
+        "SELECT EXISTS(SELECT 1 FROM main.sqlite_master WHERE name='session_render_cache')",
+        [],
+        |row| row.get::<_, bool>(0),
+    )? {
+        conn.execute(
+            "DELETE FROM main.session_render_cache WHERE session_id=?1",
+            [session],
+        )?;
+    }
+    if conn.query_row(
+        "SELECT EXISTS(SELECT 1 FROM main.sqlite_master WHERE name='session_meta_chunks')",
+        [],
+        |row| row.get::<_, bool>(0),
+    )? {
+        conn.execute("DELETE FROM main.session_meta_chunks WHERE session_id=?1 AND column_name='memory_block_ids'", [session])?;
+    }
+
     eprintln!("written in {:.2}s", step.elapsed().as_secs_f64());
     let step = std::time::Instant::now();
     let verified = verify_session(conn, work, columns, dangling_before);

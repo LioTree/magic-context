@@ -698,8 +698,6 @@ CREATE TABLE session_meta (
       note_nudge_trigger_message_id TEXT DEFAULT '',
       note_nudge_sticky_text TEXT DEFAULT '',
       note_nudge_sticky_message_id TEXT DEFAULT '',
-      note_nudge_anchors TEXT NOT NULL DEFAULT '[]',
-      auto_search_hint_decisions TEXT NOT NULL DEFAULT '[]',
       last_todo_state TEXT DEFAULT '',
       todo_permission_denied INTEGER NOT NULL DEFAULT 2,
       todo_synthetic_call_id TEXT DEFAULT '',
@@ -717,14 +715,7 @@ CREATE TABLE session_meta (
       historian_last_error TEXT DEFAULT NULL,
       historian_last_failure_at INTEGER DEFAULT NULL,
       system_prompt_hash TEXT DEFAULT '',
-      memory_block_cache TEXT DEFAULT '',
       memory_block_count INTEGER DEFAULT 0,
-      memory_block_ids TEXT DEFAULT '',
-      -- pending_compaction_marker_state: intentionally NULLABLE without a
-      -- default. Absence of a deferred marker is SQL NULL; presence is a
-      -- valid JSON blob written via setPendingCompactionMarkerState.
-      -- Excluded from the healAllNullColumns fallback list. Readers filter
-      -- IS NOT NULL AND != empty-string defensively. Plan v6 section 3.
       pending_compaction_marker_state TEXT,
       -- Target OpenCode message id used to inject the current compaction marker.
       -- Nullable for legacy persisted markers; repaired on the next marker move.
@@ -739,7 +730,6 @@ CREATE TABLE session_meta (
       -- Retired columns remain in place so existing databases keep the same schema:
       -- deferred_execute_state was used by the removed turn-boundary execute hold.
       deferred_execute_state TEXT,
-      cached_m0_bytes BLOB,
       served_prefix TEXT,
       held_release TEXT,
       cached_m0_score_selection_watermark INTEGER NOT NULL DEFAULT 0
@@ -752,7 +742,6 @@ CREATE TABLE session_meta (
       cached_m0_max_mutation_id INTEGER,
       cached_m0_max_memory_mutation_id INTEGER,
       cached_m0_project_docs_hash TEXT,
-      cached_m1_bytes BLOB,
       last_observed_model_key TEXT,
       last_usage_context_limit INTEGER NOT NULL DEFAULT 0,
       prior_boundary_ordinal INTEGER NOT NULL DEFAULT 1,
@@ -770,7 +759,6 @@ CREATE TABLE session_meta (
       compaction_mode_record TEXT,
       cached_m0_materialized_at INTEGER,
       cached_m0_session_facts_version INTEGER,
-      cached_m0_upgrade_state TEXT,
       cached_m0_system_hash TEXT,
       cached_m0_tool_set_hash TEXT,
       cached_m0_model_key TEXT,
@@ -779,7 +767,7 @@ CREATE TABLE session_meta (
        thinking_binding_recovery_target TEXT NOT NULL DEFAULT '',
        upgrade_reminded_at INTEGER,
        pi_stable_id_scheme INTEGER
-    , note_last_read_at INTEGER DEFAULT 0, cleared_reasoning_through_tag INTEGER DEFAULT 0, tool_reclaim_watermark INTEGER DEFAULT 0, stripped_placeholder_ids TEXT DEFAULT '', stale_reduce_stripped_ids TEXT DEFAULT '', processed_image_stripped_ids TEXT DEFAULT '', merged_reasoning_stripped_ids TEXT DEFAULT '', trailing_blank_decisions TEXT DEFAULT '', system_prompt_tokens INTEGER DEFAULT 0, compaction_marker_state TEXT DEFAULT '', key_files TEXT DEFAULT '', conversation_tokens INTEGER DEFAULT 0, tool_call_tokens INTEGER DEFAULT 0, recomp_partial_range_start INTEGER DEFAULT 0, recomp_partial_range_end INTEGER DEFAULT 0, detected_context_limit INTEGER DEFAULT 0, detected_context_limit_model_key TEXT, needs_emergency_recovery INTEGER DEFAULT 0, emergency_recovery_origin TEXT DEFAULT '', upgrade_reminder_last_sent_at INTEGER, upgrade_reminder_count INTEGER NOT NULL DEFAULT 0, cached_m0_mural_data_url TEXT, cached_m0_mural_hash TEXT, coordinate_generation TEXT, coordinate_rebase_notice TEXT);
+    , note_last_read_at INTEGER DEFAULT 0, cleared_reasoning_through_tag INTEGER DEFAULT 0, tool_reclaim_watermark INTEGER DEFAULT 0, system_prompt_tokens INTEGER DEFAULT 0, compaction_marker_state TEXT DEFAULT '', key_files TEXT DEFAULT '', conversation_tokens INTEGER DEFAULT 0, tool_call_tokens INTEGER DEFAULT 0, recomp_partial_range_start INTEGER DEFAULT 0, recomp_partial_range_end INTEGER DEFAULT 0, detected_context_limit INTEGER DEFAULT 0, detected_context_limit_model_key TEXT, needs_emergency_recovery INTEGER DEFAULT 0, emergency_recovery_origin TEXT DEFAULT '', upgrade_reminder_last_sent_at INTEGER, upgrade_reminder_count INTEGER NOT NULL DEFAULT 0, cached_m0_mural_hash TEXT, coordinate_generation TEXT, coordinate_rebase_notice TEXT);
 
 CREATE TABLE tool_owner_backfill_state (
       session_id TEXT PRIMARY KEY,
@@ -997,6 +985,21 @@ CREATE INDEX idx_tags_pi_adopt
 CREATE INDEX idx_tags_pi_fallback_tool_owner
             ON tags(session_id, tool_owner_message_id)
             WHERE type='tool';
+
+CREATE TABLE session_render_cache (
+    session_id TEXT NOT NULL,
+    cache_key TEXT NOT NULL,
+    value BLOB,
+    PRIMARY KEY (session_id, cache_key)
+) WITHOUT ROWID;
+
+CREATE TABLE session_meta_chunks (
+    session_id TEXT NOT NULL,
+    column_name TEXT NOT NULL,
+    chunk TEXT NOT NULL,
+    body BLOB,
+    PRIMARY KEY (session_id, column_name, chunk)
+) WITHOUT ROWID;
 
 CREATE TABLE identity_merge_log (
          id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -1940,7 +1943,8 @@ INSERT INTO schema_migrations (version, description, applied_at) VALUES
 (99, 'memory lifecycle evidence, attempts, receipts and applied snapshots', :applied_at),
 (100, 'durable served thinking prefix and held release request', :applied_at),
 (101, 'indexed trimmed-source tag retirement', :applied_at),
-(102, 'bind served capture markers to the digest of their certified bytes', :applied_at);
+(102, 'bind served capture markers to the digest of their certified bytes', :applied_at),
+(103, 'isolate session render payloads and chunk growing replay metadata', :applied_at);
 
 INSERT INTO "message_fts_rowid_map_backfill_state" ("completed", "id", "updated_at", "watermark_rowid") VALUES
 (0, 1, 0, 0);

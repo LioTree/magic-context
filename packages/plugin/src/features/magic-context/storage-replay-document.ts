@@ -3,6 +3,11 @@ import { sessionLog } from "../../shared/logger";
 import { isRecord } from "../../shared/record-type-guard";
 import type { Database } from "../../shared/sqlite";
 import { ensureSessionMetaRow } from "./storage-meta-shared";
+import {
+    sessionMetaCollectionSelect,
+    sessionMetaCollectionValueSql,
+    updateSessionMetaCollection,
+} from "./storage-session-collections";
 
 const CAS_RETRY_LIMIT = 5;
 const MISSING_REPLAY_DOCUMENT_COLUMN = Symbol("missing replay document column");
@@ -58,7 +63,7 @@ export function isRustMarkerAdmissionFenced(db: Database, sessionId: string): bo
     if (!fencedThisProcess.has(sessionId)) return false;
     const row = db
         .prepare(
-            "SELECT COALESCE(json_extract(NULLIF(trailing_blank_decisions, ''), '$.rustMarkerAdmissionFence'), 0) AS fenced FROM session_meta WHERE session_id=?",
+            `SELECT COALESCE(json_extract(NULLIF(${sessionMetaCollectionValueSql("trailing_blank_decisions", db)}, ''), '$.rustMarkerAdmissionFence'), 0) AS fenced FROM session_meta WHERE session_id=?`,
         )
         .get(sessionId) as { fenced?: number } | undefined;
     return row?.fenced === 1;
@@ -280,7 +285,9 @@ function readRawReplayDocument(
     if (reusable && snapshot.loaded) return snapshot.raw;
     try {
         const row = db
-            .prepare("SELECT trailing_blank_decisions FROM session_meta WHERE session_id = ?")
+            .prepare(
+                `SELECT ${sessionMetaCollectionSelect("trailing_blank_decisions", "trailing_blank_decisions", db)} FROM session_meta WHERE session_id = ?`,
+            )
             .get(sessionId) as { trailing_blank_decisions?: unknown } | undefined;
         const raw = row?.trailing_blank_decisions;
         if (raw === null || raw === undefined || typeof raw === "string") {
@@ -488,11 +495,13 @@ export function updateReplayDocument(
 
         const next = serializeReplayDocument(doc);
         if (next === raw) return true;
-        const result = db
-            .prepare(
-                "UPDATE session_meta SET trailing_blank_decisions = ? WHERE session_id = ? AND trailing_blank_decisions IS ?",
-            )
-            .run(next, sessionId, raw);
+        const result = updateSessionMetaCollection(
+            db,
+            sessionId,
+            "trailing_blank_decisions",
+            next,
+            { value: raw ?? null },
+        );
         if (result.changes > 0) return true;
     }
 
@@ -623,16 +632,20 @@ export function updateTrailingBlankDecisions(
 export function writeReplayDocument(db: Database, sessionId: string, doc: ReplayDocument): void {
     invalidateReplayEnvelopeSnapshot(db, sessionId);
     if (!hasReplayDecisionTable(db)) {
-        db.prepare("UPDATE session_meta SET trailing_blank_decisions = ? WHERE session_id = ?").run(
-            serializeReplayDocument(doc),
+        updateSessionMetaCollection(
+            db,
             sessionId,
+            "trailing_blank_decisions",
+            serializeReplayDocument(doc),
         );
         return;
     }
     const decisions = parseTrailingBlank(doc.trailingBlank, "strict");
-    db.prepare("UPDATE session_meta SET trailing_blank_decisions = ? WHERE session_id = ?").run(
-        doc.version === 1 ? "" : serializeReplayDocument({ ...doc, trailingBlank: {} }),
+    updateSessionMetaCollection(
+        db,
         sessionId,
+        "trailing_blank_decisions",
+        doc.version === 1 ? "" : serializeReplayDocument({ ...doc, trailingBlank: {} }),
     );
     db.prepare("DELETE FROM session_replay_decisions WHERE session_id = ?").run(sessionId);
     const insert = db.prepare(

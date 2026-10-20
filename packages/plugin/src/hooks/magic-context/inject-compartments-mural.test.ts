@@ -7,6 +7,7 @@ import {
     MEMORY_MURAL_BLOCK,
     MEMORY_MURAL_GUIDANCE,
 } from "../../agents/magic-context-prompt";
+import { patchSessionMeta } from "../../features/magic-context/__tests__/session-meta-fixture";
 import { runMigrations } from "../../features/magic-context/migrations";
 import { initializeDatabase } from "../../features/magic-context/storage-db";
 import { getOrCreateSessionMeta } from "../../features/magic-context/storage-meta-session";
@@ -114,10 +115,9 @@ describe("m[0] mural image fold (on-demand render → wire)", () => {
             const legacy = Buffer.from(
                 state.cachedM0Bytes!.toString("utf8").replace(`${MEMORY_MURAL_GUIDANCE}\n`, ""),
             );
-            db.prepare("UPDATE session_meta SET cached_m0_bytes = ? WHERE session_id = ?").run(
-                legacy,
-                SESSION_ID,
-            );
+            db.prepare(
+                "INSERT INTO session_render_cache (session_id,cache_key,value) VALUES (?2, 'cached_m0_bytes', ?1) ON CONFLICT(session_id,cache_key) DO UPDATE SET value=excluded.value",
+            ).run(legacy, SESSION_ID);
             state.cachedM0Bytes = legacy;
             const deferred = injectM0M1({ ...args, messages: [], isCacheBustingPass: false });
             expect(deferred.m0RematerializedThisPass).toBe(false);
@@ -409,12 +409,10 @@ describe("m[0] mural image fold (on-demand render → wire)", () => {
             });
 
             const siblingDataUrl = "data:image/png;base64,c2libGluZy1tdXJhbA==";
-            db.prepare(
-                `UPDATE session_meta
-                    SET cached_m0_mural_data_url = ?, cached_m0_mural_hash = ?,
-                        cached_m0_materialized_at = cached_m0_materialized_at + 1
-                  WHERE session_id = ?`,
-            ).run(siblingDataUrl, "sibling-hash", SESSION_ID);
+            db.transaction(()=>{
+                patchSessionMeta(db,SESSION_ID,{cached_m0_mural_data_url:siblingDataUrl,cached_m0_mural_hash:"sibling-hash"});
+                db.prepare("UPDATE session_meta SET cached_m0_materialized_at=cached_m0_materialized_at+1 WHERE session_id=?").run(SESSION_ID);
+            }).immediate();
 
             const messages: MessageLike[] = [];
             injectM0M1({
@@ -447,11 +445,10 @@ describe("m[0] mural image fold (on-demand render → wire)", () => {
                 mural: muralOption(),
             });
             const currentManifestUrl = replaceCurrentManifest(db);
-            db.prepare(
-                `UPDATE session_meta
-                    SET cached_m0_mural_data_url = NULL, cached_m0_mural_hash = NULL
-                  WHERE session_id = ?`,
-            ).run(SESSION_ID);
+            patchSessionMeta(db, SESSION_ID, {
+                cached_m0_mural_data_url: null,
+                cached_m0_mural_hash: null,
+            });
 
             const restartedState = getOrCreateSessionMeta(db, SESSION_ID) as unknown as M0M1State;
             const messages: MessageLike[] = [];

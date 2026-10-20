@@ -8,6 +8,10 @@ import {
     renderM0Pi,
 } from "../../../../pi-plugin/src/inject-compartments-pi";
 import { runPiHistorian } from "../../../../pi-plugin/src/pi-historian-runner";
+import {
+    patchSessionMeta,
+    sessionMetaFixtureRow,
+} from "../../features/magic-context/__tests__/session-meta-fixture";
 import { acquireCompartmentLease } from "../../features/magic-context/compartment-lease";
 import { getCompartments } from "../../features/magic-context/compartment-storage";
 import { computeRescoreSourceIdentity } from "../../features/magic-context/rescore-identity";
@@ -134,7 +138,7 @@ function effectiveScores(db: Database, selector: "latest" | number = "latest"): 
 
 function snapshot(db: Database): string {
     return JSON.stringify({
-        meta: db.prepare("SELECT * FROM session_meta WHERE session_id = ?").get(SESSION),
+        meta: sessionMetaFixtureRow(db, SESSION),
         rows: getCompartments(db, SESSION),
         history: db
             .prepare("SELECT * FROM compartment_history_versions WHERE session_id = ?")
@@ -292,9 +296,7 @@ for (const runtime of ["TS", "Pi"] as const) {
                 };
                 const time = getOrCreateSessionMeta(db, SESSION).cachedM0MaterializedAt ?? 0;
                 if (reason === "missing_cache") {
-                    db.prepare(
-                        "UPDATE session_meta SET cached_m0_bytes = NULL WHERE session_id = ?",
-                    ).run(SESSION);
+                    patchSessionMeta(db, SESSION, { cached_m0_bytes: null });
                     h.restart();
                 }
                 if (reason === "ttl_idle") {

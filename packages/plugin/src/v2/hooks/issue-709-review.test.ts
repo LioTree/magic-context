@@ -15,6 +15,7 @@ import {
 } from "../../features/magic-context/storage";
 import { getOrCreateSessionMeta } from "../../features/magic-context/storage-meta";
 import { getAutoSearchHintDecisions } from "../../features/magic-context/storage-meta-persisted";
+import { sessionRenderCacheSelect } from "../../features/magic-context/storage-session-cache";
 import { replayHint } from "../../hooks/magic-context/auto-search-replay.fixture";
 import { autoSearchTestSnapshot } from "../../hooks/magic-context/auto-search-snapshot.fixture";
 import * as search from "../../hooks/magic-context/auto-search-worker-client";
@@ -608,7 +609,7 @@ test("issue 709 review: features-on real OC2 hook replays defer bytes over 480 s
                 hintDecisions: f.decisions().length,
                 meta: f.db
                     .prepare(
-                        "SELECT cached_m0_upgrade_state, cached_m0_mural_hash FROM session_meta WHERE session_id = ?",
+                        `SELECT ${sessionRenderCacheSelect("cached_m0_upgrade_state", "cached_m0_upgrade_state", f.db)}, cached_m0_mural_hash FROM session_meta WHERE session_id = ?`,
                     )
                     .get(f.session),
             });

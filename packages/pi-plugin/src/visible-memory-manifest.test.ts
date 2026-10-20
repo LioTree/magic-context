@@ -23,6 +23,12 @@ import {
 } from "@magic-context/core/hooks/magic-context/inject-compartments";
 import { estimateTokens } from "@magic-context/core/hooks/magic-context/read-session-formatting";
 import { createTestTempDirFromPath } from "@magic-context/core/shared/test-temp-dir";
+import { rejectSessionMetaCollectionWrites } from "../../plugin/src/features/magic-context/__tests__/session-meta-faults";
+import {
+	editCachedUpgradeFixture,
+	patchSessionMeta,
+	sessionMetaFixtureRow,
+} from "../../plugin/src/features/magic-context/__tests__/session-meta-fixture";
 import {
 	injectM0M1Pi,
 	materializeM0Pi,
@@ -39,10 +45,7 @@ function fixture() {
 		projectDirectory: dir,
 		injectDocs: false,
 	};
-	const row = () =>
-		db
-			.prepare("SELECT * FROM session_meta WHERE session_id = ?")
-			.get(state.sessionId);
+	const row = () => sessionMetaFixtureRow(db, state.sessionId);
 	const manifest = () => {
 		const value = row() as {
 			memory_block_ids: string;
@@ -107,11 +110,11 @@ describe("Pi visible-memory manifest", () => {
 				getOrCreateSessionMeta(f.db, f.state.sessionId).cachedM0UpgradeState,
 			).toBe(withCachedM0MemoryIds(legacyIdentity, [baseline.id]));
 			// Previous Pi snapshots recorded only the m[0] ids even with an m[1] delta.
-			f.db
-				.prepare(
-					"UPDATE session_meta SET cached_m0_upgrade_state = ?, memory_block_ids = ?, memory_block_count = 1 WHERE session_id = ?",
-				)
-				.run(legacyIdentity, JSON.stringify([baseline.id]), f.state.sessionId);
+			patchSessionMeta(f.db, f.state.sessionId, {
+				cached_m0_upgrade_state: legacyIdentity,
+				memory_block_ids: JSON.stringify([baseline.id]),
+				memory_block_count: 1,
+			});
 			const row = f.row();
 			expect(mustMaterializePi(f.state, f.db).value).toBe(false);
 			const upgraded = f.serveWithResult();
@@ -145,21 +148,17 @@ describe("Pi visible-memory manifest", () => {
 				withCachedM0MemoryIds(legacyIdentity, [baseline.id]),
 				withCachedM0MemoryIds(legacyIdentity, []),
 			]) {
-				f.db
-					.prepare(
-						"UPDATE session_meta SET cached_m0_upgrade_state = ? WHERE session_id = ?",
-					)
-					.run(identity, f.state.sessionId);
+				patchSessionMeta(f.db, f.state.sessionId, {
+					cached_m0_upgrade_state: identity,
+				});
 				expect(mustMaterializePi(f.state, f.db).value).toBe(false);
 				const served = f.serveWithResult();
 				expect(served.result.m0Materialized).toBe(false);
 				expect(served.prefix).toEqual(before);
 			}
-			f.db
-				.prepare(
-					"UPDATE session_meta SET cached_m0_upgrade_state = ? WHERE session_id = ?",
-				)
-				.run(legacyIdentity, f.state.sessionId);
+			patchSessionMeta(f.db, f.state.sessionId, {
+				cached_m0_upgrade_state: legacyIdentity,
+			});
 			// A busting SOFT shows memory only through this session's agent
 			// fragments, so the refreshed delta comes from an agent save.
 			const delta = {
@@ -279,11 +278,11 @@ describe("Pi visible-memory manifest", () => {
 			const fold = materializeM0Pi(state, f.db);
 			expect(fold.renderedMemoryIds).toEqual([original.id]);
 			// Simulate a cached pair written before baseline selection metadata existed.
-			f.db
-				.prepare(
-					"UPDATE session_meta SET cached_m0_upgrade_state = substr(cached_m0_upgrade_state, 1, instr(cached_m0_upgrade_state, '|m0-memory-ids:') - 1) WHERE session_id = ?",
-				)
-				.run(state.sessionId);
+			editCachedUpgradeFixture(f.db, state.sessionId, (value) =>
+				value === null
+					? null
+					: value.slice(0, Math.max(0, value.indexOf("|m0-memory-ids:"))),
+			);
 			supersededMemory(f.db, original.id, replacement.id);
 			queueMemoryMutation(f.db, {
 				projectPath: state.projectIdentity,
@@ -323,8 +322,11 @@ describe("Pi visible-memory manifest", () => {
 				content: "new delta",
 			});
 			const before = f.row();
-			f.db.exec(
-				`CREATE TRIGGER reject_manifest BEFORE UPDATE OF memory_block_ids ON session_meta BEGIN SELECT RAISE(ABORT, 'manifest rejected'); END`,
+			rejectSessionMetaCollectionWrites(
+				f.db,
+				"memory_block_ids",
+				"reject_manifest",
+				{ error: "manifest rejected" },
 			);
 			expect(() => f.serve(true)).toThrow("manifest rejected");
 			expect(f.row()).toEqual(before);

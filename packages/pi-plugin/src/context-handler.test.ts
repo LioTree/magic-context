@@ -79,6 +79,7 @@ import { resolvePromptSurface } from "@magic-context/core/shared/prompt-surface"
 import { closeQuietly } from "@magic-context/core/shared/sqlite-helpers";
 import type { SubagentRunner } from "@magic-context/core/shared/subagent-runner";
 import { tagTranscript } from "@magic-context/core/shared/tag-transcript";
+import { patchSessionMeta } from "../../plugin/src/features/magic-context/__tests__/session-meta-fixture";
 import { isPrefixBoundThinkingModel } from "../../plugin/src/features/magic-context/overflow-detection";
 import * as decisionLogs from "../../plugin/src/features/magic-context/transform-decision-log";
 import { createTestTempDirFromPath } from "../../plugin/src/shared/test-temp-dir";
@@ -5872,19 +5873,13 @@ describe("registerPiContextHandler", () => {
 						if (args[2].length > 0) return injectM0M1Pi(...args);
 						if (competingWrites === 0) {
 							competingWrites += 1;
-							db.prepare(
-								`UPDATE session_meta
-								    SET cached_m0_bytes = ?,
-								        cached_m0_last_baseline_end_message_id = ?
-								  WHERE session_id = ?`,
-							).run(
-								Buffer.from(
+							patchSessionMeta(db, sessionId, {
+								cached_m0_bytes: Buffer.from(
 									"<session-history>PAIR_B</session-history>",
 									"utf8",
 								),
-								"entry-user",
-								sessionId,
-							);
+								cached_m0_last_baseline_end_message_id: "entry-user",
+							});
 						}
 						const exec = db.exec.bind(db);
 						const blocker = spyOn(db, "exec").mockImplementation((sql) => {
@@ -6055,7 +6050,7 @@ describe("registerPiContextHandler", () => {
 					).run(sessionId);
 				if (mode === "first")
 					db.prepare(
-						"UPDATE session_meta SET cached_m0_bytes = NULL, cached_m1_bytes = NULL WHERE session_id = ?",
+						"DELETE FROM session_render_cache WHERE cache_key IN ('cached_m0_bytes', 'cached_m1_bytes') AND session_id = ?",
 					).run(sessionId);
 				let sawFallback = false;
 				restoreInjection = contextHandlerInternals.setInjectM0M1PiForTests(

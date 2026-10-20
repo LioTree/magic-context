@@ -567,7 +567,8 @@ mod tests {
                 if task==TaskName::RefreshPrimers {
                     tx.execute("INSERT INTO primers(id,project_path,question,answer,total_support,last_observed_at,source_candidate_ids,source_candidate_provenance,created_at,updated_at) VALUES (1,'project','How does routing work?','',3,?1,'[1,2,3]',?2,1,1)",params![NOW-1,r#"[{"candidate_id":1,"project_path":"project","harness":"opencode","session_id":"source-1","source_compartment_start":1,"source_compartment_end":3,"source_start_message_id":"m1","source_end_message_id":"m1"}]"#])?;
                 }
-                tx.execute("INSERT INTO session_meta(session_id,served_prefix,cached_m0_bytes) VALUES ('session','frozen prefix',?1),('other-session','other prefix',?2)", params![b"frozen bytes",b"other bytes"])?;
+                tx.execute("INSERT INTO session_meta(session_id,served_prefix) VALUES ('session','frozen prefix'),('other-session','other prefix')", [])?;
+                tx.execute("INSERT INTO session_render_cache(session_id,cache_key,value) VALUES ('session','cached_m0_bytes',?1),('other-session','cached_m0_bytes',?2)", params![b"frozen bytes",b"other bytes"])?;
                 tx.execute("INSERT INTO project_state(project_path,project_memory_epoch) VALUES ('project',7),('foreign',9)", [])?;
                 Ok(())
             });
@@ -667,7 +668,7 @@ mod tests {
             fixture.store.load_dream_primers("project").unwrap().primers[0]["sourceProvenance"],
             provenance
         );
-        assert_eq!(fixture.scalar("SELECT COUNT(*) FROM session_meta WHERE (session_id='session' AND served_prefix='frozen prefix' AND cached_m0_bytes=X'66726F7A656E206279746573') OR (session_id='other-session' AND served_prefix='other prefix' AND cached_m0_bytes=X'6F74686572206279746573')"),2);
+        assert_eq!(fixture.scalar("SELECT COUNT(*) FROM session_meta WHERE (session_id='session' AND served_prefix='frozen prefix' AND (SELECT value FROM session_render_cache WHERE session_id=session_meta.session_id AND cache_key='cached_m0_bytes')=X'66726F7A656E206279746573') OR (session_id='other-session' AND served_prefix='other prefix' AND (SELECT value FROM session_render_cache WHERE session_id=session_meta.session_id AND cache_key='cached_m0_bytes')=X'6F74686572206279746573')"),2);
         assert_eq!(
             fixture.scalar("SELECT SUM(project_memory_epoch) FROM project_state"),
             16

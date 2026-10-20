@@ -5,6 +5,7 @@ import {
 	createProjectionFixture,
 	isDashboardPayloadRead,
 } from "@magic-context/core/shared/memory-projection-fixtures.test";
+import { sessionRenderCacheSelect } from "../../plugin/src/features/magic-context/storage-session-cache";
 import * as autoSearchPi from "./auto-search-pi";
 import {
 	clearContextHandlerSession,
@@ -103,7 +104,7 @@ for (const busting of [false, true])
 			const m0 = () =>
 				f.db
 					.prepare(
-						"SELECT cached_m0_bytes FROM session_meta WHERE session_id=?",
+						`SELECT ${sessionRenderCacheSelect("cached_m0_bytes", "cached_m0_bytes", f.db)} FROM session_meta WHERE session_id=?`,
 					)
 					.get(a);
 			const before = m0();

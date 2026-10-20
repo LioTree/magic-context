@@ -8,6 +8,7 @@ import {
     getProcessedImageStrippedIds,
     loadPostprocessReplaySnapshot,
 } from "./storage-meta-persisted";
+import { sessionMetaCollectionSelect } from "./storage-session-collections";
 
 test("issue 699 marker persistence preserves legacy arrays and first-writer marker decisions", () => {
     const db = new Database(":memory:");
@@ -18,7 +19,7 @@ test("issue 699 marker persistence preserves legacy arrays and first-writer mark
             (
                 db
                     .prepare(
-                        "SELECT processed_image_stripped_ids AS value FROM session_meta WHERE session_id = 's'",
+                        `SELECT ${sessionMetaCollectionSelect("processed_image_stripped_ids", "value", db)} FROM session_meta WHERE session_id = 's'`,
                     )
                     .get() as { value: string }
             ).value;

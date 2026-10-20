@@ -1,10 +1,12 @@
 /// <reference types="bun-types" />
+
 import { afterEach, describe, expect, test } from "bun:test";
 import { join } from "node:path";
 import { loadPersistedLkgSlot, saveLkgSlotToDb } from "../../hooks/magic-context/lkg-persist";
 import type { LkgSlot } from "../../hooks/magic-context/lkg-slot";
 import { Database } from "../../shared/sqlite";
 import { cleanupTestTempDir, createTestTempDir } from "../../shared/test-temp-dir";
+import { seedSessionMeta } from "./__tests__/session-meta-fixture";
 import { LKG_PREFIX_CHUNK_CHARS, splitLkgPrefix } from "./lkg-prefix-chunks";
 import { MIGRATIONS, runMigrations } from "./migrations";
 import { initializeDatabase } from "./storage-db";
@@ -20,6 +22,7 @@ import {
     saveNativeToolInputs,
 } from "./storage-native-replay";
 import { parseReplayDocument, readReplayDocument } from "./storage-replay-document";
+import { sessionMetaCollectionSelect } from "./storage-session-collections";
 import { deleteSessionScopedRows } from "./storage-session-tables";
 
 const directories: string[] = [];
@@ -136,16 +139,15 @@ function chunkCount(db: Database, sessionId: string): number {
 function rawDocument(db: Database, sessionId: string): unknown {
     return (
         db
-            .prepare("SELECT trailing_blank_decisions AS d FROM session_meta WHERE session_id = ?")
+            .prepare(
+                `SELECT ${sessionMetaCollectionSelect("trailing_blank_decisions", "d", db)} FROM session_meta WHERE session_id = ?`,
+            )
             .get(sessionId) as { d: unknown } | undefined
     )?.d;
 }
 
 function insertRawDocument(db: Database, sessionId: string, document: string): void {
-    db.prepare("INSERT INTO session_meta (session_id, trailing_blank_decisions) VALUES (?, ?)").run(
-        sessionId,
-        document,
-    );
+    seedSessionMeta(db, { session_id: sessionId, trailing_blank_decisions: document });
 }
 
 function capture<T>(read: () => T): { value?: T; error?: string } {

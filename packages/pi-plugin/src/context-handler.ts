@@ -1,3 +1,4 @@
+import { sessionMetaCollectionSelect } from "../../plugin/src/features/magic-context/storage-session-collections";
 /**
  * Pi `context` event handler — the per-LLM-call transform pipeline.
  *
@@ -12675,9 +12676,10 @@ function loadPiPostTransformSnapshot(
 ): PiPostTransformSnapshot {
 	const row = db
 		.prepare(
-			`SELECT note_nudge_anchors, auto_search_hint_decisions,
-			        note_nudge_trigger_pending
-			   FROM session_meta
+			`SELECT ${sessionMetaCollectionSelect("note_nudge_anchors", "note_nudge_anchors", db)},
+			    ${sessionMetaCollectionSelect("auto_search_hint_decisions", "auto_search_hint_decisions", db)},
+			    note_nudge_trigger_pending
+			FROM session_meta
 			  WHERE session_id = ?`,
 		)
 		.get(sessionId) as
