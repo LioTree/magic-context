@@ -60,6 +60,10 @@ pub struct CkIngressMessage {
 /// the producer after MC returns CK messages.
 #[derive(Debug, Clone, Serialize, PartialEq)]
 pub struct FlatBlock {
+    /// User text read from a runner uses a delivery record instead of guessing
+    /// whether reminder-shaped words were written by the user.
+    pub(crate) runner_lane: bool,
+    pub(crate) runner_accounting_text: Option<Arc<str>>,
     pub id: String,
     pub mid: String,
     pub block_index: usize,
@@ -934,6 +938,8 @@ fn flatten_block(
     let bytes: Arc<str> = Arc::from(bytes);
     let wire = Arc::new(ProjectedWireBlock::new(block, &bytes));
     Ok(FlatBlock {
+        runner_lane: crate::providers::runner_origin(&msg.ck, index).0,
+        runner_accounting_text: crate::providers::runner_accounting(&msg.ck, index).map(Arc::from),
         id,
         mid: msg.mid.clone(),
         block_index: index,
@@ -947,7 +953,7 @@ fn flatten_block(
         arc_id,
         bytes,
         content_hash,
-        synthetic: msg.ck.meta.synthetic,
+        synthetic: msg.ck.meta.synthetic || crate::providers::runner_origin(&msg.ck, index).1,
         tool_call_id,
         output_kind,
         wire,

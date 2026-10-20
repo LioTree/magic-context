@@ -68,7 +68,13 @@ pub(crate) fn tool_bookmark(
             continue;
         }
         let text = block.scalar_text();
-        let cleaned = text.as_deref().map(strip_mc_text);
+        let cleaned = text.as_deref().map(|text| {
+            if block.runner_lane {
+                text.to_owned()
+            } else {
+                strip_mc_text(text)
+            }
+        });
         let authored = matches!(block.kind_tag.as_str(), "text" | "media" | "opaque")
             && cleaned
                 .as_deref()

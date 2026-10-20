@@ -139,7 +139,12 @@ pub(crate) fn real_user_turn_count(projection: &FlatProjection) -> u64 {
     projection
         .blocks
         .iter()
-        .filter(|block| block.role == "user" && !block.synthetic)
+        .filter(|block| {
+            block.role == "user"
+                && !block.synthetic
+                && (!block.runner_lane
+                    || matches!(block.kind_tag.as_str(), "text" | "media" | "opaque"))
+        })
         .map(|block| block.mid.as_str())
         .collect::<HashSet<_>>()
         .len() as u64
@@ -249,7 +254,7 @@ fn media_tokens(media: &MediaBlock, content: &str) -> i64 {
     }
 }
 
-fn tool_output_content(output: &CkOutputKind) -> String {
+pub(crate) fn tool_output_content(output: &CkOutputKind) -> String {
     match output {
         CkOutputKind::Text { text } | CkOutputKind::ErrorText { text } => text.clone(),
         CkOutputKind::Json { value } | CkOutputKind::ErrorJson { value } => {
@@ -633,7 +638,11 @@ pub(crate) fn measure_tail_hygiene_with_pending_drops(
             mc_store::CkKind::Text { .. } if block.role == "user" || block.role == "assistant" => {
                 let text = block.scalar_text().expect("text payload");
                 let content = caveman_content(&caveman_payloads, block).unwrap_or(&text);
-                let content = strip_channel1_reminder_spans(content);
+                let content = if block.runner_lane {
+                    content
+                } else {
+                    strip_channel1_reminder_spans(content)
+                };
                 if content.is_empty() || is_drop_sentinel(content) {
                     excluded_part(key, content)
                 } else {
@@ -662,9 +671,16 @@ pub(crate) fn measure_tail_hygiene_with_pending_drops(
             }
             mc_store::CkKind::ToolResult { output, .. } => {
                 let raw_content = block
-                    .scalar_text()
+                    .runner_accounting_text
+                    .as_deref()
+                    .map(std::borrow::Cow::Borrowed)
+                    .or_else(|| block.scalar_text())
                     .unwrap_or_else(|| std::borrow::Cow::Owned(tool_output_content(&output.kind)));
-                let content = strip_channel1_reminder_spans(&raw_content);
+                let content = if block.runner_lane {
+                    &raw_content
+                } else {
+                    strip_channel1_reminder_spans(&raw_content)
+                };
                 if content.is_empty() || is_drop_sentinel(content) {
                     excluded_part(key, content)
                 } else {

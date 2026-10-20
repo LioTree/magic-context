@@ -18,7 +18,7 @@ use std::collections::HashMap;
 /// conversation's codec (`AsyncRecord::fold_entries`).
 #[derive(Clone, Copy, Default, Debug, PartialEq, Eq)]
 pub(super) struct EntryFacts {
-    /// An authored user message: role `user` with no tool result in it.
+    /// A user message with authored text or media after delivered reminders are excluded.
     pub real_user: bool,
     /// Tool-result blocks the codec decodes from the message.
     pub tool_results: u64,

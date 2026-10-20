@@ -1,5 +1,7 @@
 use super::*;
 use cortexkit_bus_inmemory::{InMemoryBus, InMemoryConfig};
+mod reminder_replay;
+mod reminders;
 
 #[derive(Default)]
 struct Runner {
@@ -9,6 +11,7 @@ struct Runner {
     lineage: Mutex<String>,
     read_delay_ms: std::sync::atomic::AtomicU64,
     routed_reads: std::sync::atomic::AtomicU64,
+    sent: Mutex<Vec<Value>>,
 }
 
 #[async_trait]
@@ -39,6 +42,7 @@ impl session_resolver::ProviderRunner for Runner {
         _: Duration,
     ) -> Result<Value, SessionResolveError> {
         if method == "session.send" {
+            self.sent.lock().unwrap().push(params);
             return Ok(json!({"state":"pending","submission_id":"reminder"}));
         }
         if method == "role.describe" {

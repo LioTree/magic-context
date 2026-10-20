@@ -15,6 +15,9 @@ const DELIVERY: [Mode; 3] = [Mode::TurnSystem, Mode::ToolResult, Mode::Steer];
 const SEARCH_DELIVERY: [Mode; 2] = [Mode::ToolResult, Mode::Steer];
 /// All reminder kinds expire five minutes after the observation that produced them.
 pub const REMINDER_TTL_MS: u64 = 300_000;
+/// Allow a queued delivery to appear on the next transcript read after expiry.
+pub const DELIVERY_GRACE_MS: u64 = 60_000;
+const MAX_PENDING_DELIVERIES: usize = 128;
 
 const BODIES: [(&str, &str); 5] = [
     ("gentle", "Housekeeping: {summary} are reclaimable. Stamp each output with ctx_reduce as soon as you've taken what you need from it; don't wait for the task to finish."),
@@ -178,6 +181,77 @@ pub struct ReminderState {
     last_tool_tag: Option<u64>,
     last_time_message: Option<String>,
     last_search_message: Option<String>,
+    #[serde(default)]
+    pub(crate) ledger: DeliveryLedger,
+}
+
+/// Accepted sends awaiting one exact content-block echo from the runner.
+#[derive(Clone, Debug, Default, serde::Serialize, serde::Deserialize)]
+pub(crate) struct DeliveryLedger {
+    pending: Vec<SentReminder>,
+    latest: BTreeMap<String, u64>,
+    serial: u64,
+}
+
+#[derive(Clone, Debug, serde::Serialize, serde::Deserialize)]
+pub(crate) struct SentReminder {
+    pub text: String,
+    pub kind: String,
+    pub sent_at_ms: u64,
+    pub expires_at_ms: u64,
+    serial: u64,
+}
+
+impl DeliveryLedger {
+    pub(crate) fn retained_bytes(&self) -> usize {
+        self.pending
+            .iter()
+            .map(|sent| std::mem::size_of::<SentReminder>() + sent.text.len() + sent.kind.len())
+            .sum::<usize>()
+            + self.latest.keys().map(|key| key.len() + 64).sum::<usize>()
+    }
+    pub(crate) fn is_empty(&self) -> bool {
+        self.pending.is_empty()
+    }
+
+    pub(crate) fn contains(&self, text: &str) -> bool {
+        self.pending.iter().any(|sent| sent.text == text)
+    }
+    pub(crate) fn expire(&mut self, now_ms: u64) {
+        self.pending
+            .retain(|sent| now_ms <= sent.expires_at_ms.saturating_add(DELIVERY_GRACE_MS));
+    }
+
+    fn record(&mut self, send: &PreparedSend, text: String) {
+        let sent_at_ms = send.sent_at_ms;
+        self.expire(sent_at_ms);
+        self.serial = self.serial.saturating_add(1);
+        self.latest.insert(send.kind.into(), self.serial);
+        self.pending.push(SentReminder {
+            text,
+            kind: send.kind.into(),
+            sent_at_ms,
+            expires_at_ms: send.expires_at_ms,
+            serial: self.serial,
+        });
+        if self.pending.len() > MAX_PENDING_DELIVERIES {
+            self.pending.remove(0);
+        }
+    }
+
+    pub(crate) fn recognize(&mut self, text: &str, now_ms: u64) -> Option<SentReminder> {
+        self.expire(now_ms);
+        let index = self.pending.iter().position(|sent| sent.text == text)?;
+        Some(self.pending.remove(index))
+    }
+
+    pub(crate) fn stale(&self, sent: &SentReminder, now_ms: u64) -> bool {
+        now_ms >= sent.expires_at_ms
+            || self
+                .latest
+                .get(&sent.kind)
+                .is_some_and(|serial| *serial > sent.serial)
+    }
 }
 
 /// Facts derived from the runner transcript, not from an untrusted notice body.
@@ -229,6 +303,7 @@ struct PreparedSend {
     kind: &'static str,
     template: Option<TemplateUse>,
     prompt: String,
+    sent_at_ms: u64,
     expires_at_ms: u64,
 }
 
@@ -238,6 +313,7 @@ impl PreparedSend {
             kind,
             template: Some(template),
             prompt: String::new(),
+            sent_at_ms: now_ms,
             expires_at_ms: now_ms.saturating_add(REMINDER_TTL_MS),
         }
     }
@@ -284,8 +360,21 @@ async fn issue(
     session: &str,
     notice: &str,
     send: PreparedSend,
+    ledger: &mut DeliveryLedger,
     outcome: &mut ReminderOutcome,
 ) -> bool {
+    // Use the role's renderer, including its digest and slot validation, rather
+    // than a second interpolation implementation that could misidentify echoes.
+    let text = match &send.template {
+        Some(template) => match delivery_order::render(&templates(), template, |_| true) {
+            Ok(text) => text,
+            Err(error) => {
+                outcome.errors.push(format!("{}: {error:?}", send.kind));
+                return false;
+            }
+        },
+        None => send.prompt.clone(),
+    };
     let request = send.request(project, session, notice);
     match runner
         .call(
@@ -298,6 +387,7 @@ async fn issue(
         .await
     {
         Ok(reply) if accepted(&reply) => {
+            ledger.record(&send, text);
             outcome.issued.push(request);
             true
         }
@@ -340,6 +430,7 @@ pub async fn send_due_reminders(
     conditions: &ReminderConditions<'_>,
 ) -> ReminderOutcome {
     let mut outcome = ReminderOutcome::default();
+    state.ledger.expire(conditions.now_ms);
     // Older runners may ignore unknown fields and start an unwanted run. Never
     // send until discovery explicitly promises ordered, non-starting delivery.
     let description = match runner
@@ -420,6 +511,7 @@ pub async fn send_due_reminders(
             session,
             conditions.notice_id,
             PreparedSend::reminder("ctx_reduce", use_, conditions.now_ms),
+            &mut state.ledger,
             &mut outcome,
         )
         .await
@@ -483,6 +575,7 @@ pub async fn send_due_reminders(
             session,
             conditions.notice_id,
             PreparedSend::reminder("ctx_reduce", use_, conditions.now_ms),
+            &mut state.ledger,
             &mut outcome,
         )
         .await
@@ -505,6 +598,7 @@ pub async fn send_due_reminders(
                 session,
                 conditions.notice_id,
                 PreparedSend::reminder("time", marker, conditions.now_ms),
+                &mut state.ledger,
                 &mut outcome,
             )
             .await
@@ -523,6 +617,7 @@ pub async fn send_due_reminders(
                 kind: "search_hint",
                 template: None,
                 prompt: hint.into(),
+                sent_at_ms: conditions.now_ms,
                 expires_at_ms: conditions.now_ms.saturating_add(REMINDER_TTL_MS),
             };
             if issue(
@@ -531,6 +626,7 @@ pub async fn send_due_reminders(
                 session,
                 conditions.notice_id,
                 send,
+                &mut state.ledger,
                 &mut outcome,
             )
             .await
@@ -551,6 +647,94 @@ mod tests {
     use super::*;
     use crate::session_resolver::SessionResolveError;
     use std::sync::Mutex;
+
+    #[tokio::test]
+    async fn ledger_records_rendered_bytes_kind_time_and_is_bounded_one_shot() {
+        let runner = FakeRunner::default();
+        let baseline = baseline(30_000, 100_000);
+        let conditions = conditions(&baseline);
+        let mut state = ReminderState::default();
+        let outcome = send_due_reminders(
+            &runner,
+            Path::new("/test"),
+            "reminder-test",
+            &mut state,
+            &conditions,
+        )
+        .await;
+        assert_eq!(outcome.issued.len(), 3);
+        for send in outcome.issued {
+            let expected = if send.get("template").is_some() {
+                let use_: TemplateUse = serde_json::from_value(send["template"].clone()).unwrap();
+                delivery_order::render(&templates(), &use_, |_| true).unwrap()
+            } else {
+                send["prompt"].as_str().unwrap().to_owned()
+            };
+            let sent = state
+                .ledger
+                .recognize(&expected, conditions.now_ms)
+                .unwrap();
+            assert_eq!(format!("mc.{}", sent.kind), send["dedupe_key"]);
+            assert_eq!(sent.sent_at_ms, conditions.now_ms);
+            assert_eq!(sent.expires_at_ms, conditions.now_ms + REMINDER_TTL_MS);
+            assert!(state
+                .ledger
+                .recognize(&expected, conditions.now_ms)
+                .is_none());
+        }
+        for n in 0..MAX_PENDING_DELIVERIES + 10 {
+            state.ledger.record(
+                &PreparedSend::reminder("time", time_use(7_260_000).unwrap(), n as u64),
+                format!("{n}"),
+            );
+        }
+        assert_eq!(state.ledger.pending.len(), MAX_PENDING_DELIVERIES);
+        state
+            .ledger
+            .expire(REMINDER_TTL_MS + DELIVERY_GRACE_MS + MAX_PENDING_DELIVERIES as u64 + 11);
+        assert!(state.ledger.is_empty());
+    }
+
+    #[tokio::test]
+    async fn ledger_rejects_digest_mismatch_before_sending_and_never_records_refusals() {
+        let mut use_ = time_use(7_260_000).unwrap();
+        use_.digest = "incorrect".into();
+        let runner = FakeRunner::default();
+        let mut ledger = DeliveryLedger::default();
+        let mut outcome = ReminderOutcome::default();
+        assert!(
+            !issue(
+                &runner,
+                Path::new("/test"),
+                "reminder-test",
+                "test",
+                PreparedSend::reminder("time", use_, 1),
+                &mut ledger,
+                &mut outcome
+            )
+            .await
+        );
+        assert!(runner.sends.lock().unwrap().is_empty());
+        assert!(ledger.is_empty());
+        let runner = FakeRunner {
+            refuse: true,
+            ..Default::default()
+        };
+        assert!(
+            !issue(
+                &runner,
+                Path::new("/test"),
+                "reminder-test",
+                "test",
+                PreparedSend::reminder("time", time_use(7_260_000).unwrap(), 1),
+                &mut ledger,
+                &mut outcome
+            )
+            .await
+        );
+        assert_eq!(runner.sends.lock().unwrap().len(), 1);
+        assert!(ledger.is_empty());
+    }
 
     #[test]
     fn templates_render_typescript_fixture_bytes() {

@@ -7,6 +7,7 @@ use cortexkit_role_llm_runner::{read::ReadMessage, session_ref, tags};
 use serde::Deserialize;
 #[cfg(test)]
 mod differential_tests;
+pub(crate) mod reminder_echoes;
 mod resident;
 #[cfg(test)]
 mod scaling_tests;
@@ -136,6 +137,8 @@ pub(crate) struct AsyncRecord {
     pub(crate) dream_target: Option<Value>,
     #[serde(default)]
     pub(crate) reminder_cadence: Option<crate::runner_reminders::ReminderState>,
+    #[serde(default)]
+    reminder_echoes: reminder_echoes::ReminderEchoes,
     /// Generation of the tail-hygiene baseline the reminder cadence last saw.
     /// The cadence is stored without the baseline itself: the baseline has one
     /// measurement per tail part (it grows with the session), every reminder
@@ -714,6 +717,7 @@ impl State {
     /// Drop held entries after `through`, or all of them for `None`, with
     /// their tag addresses; the next save deletes the stored rows.
     fn truncate_entries(&mut self, through: Option<u64>) {
+        self.reminder_echoes.truncate(through);
         match through {
             Some(through) => {
                 self.entries.retain(|ordinal, _| *ordinal <= through);
@@ -762,7 +766,8 @@ impl State {
         let range = from.map_or(std::ops::Bound::Unbounded, std::ops::Bound::Excluded);
         let mut decoded = Vec::new();
         for (ordinal, entry) in self.entries.range((range, std::ops::Bound::Unbounded)) {
-            let message = decoded_entry(codec, &entry.inbound()?)?;
+            let mut message = decoded_entry(codec, &entry.inbound()?)?;
+            self.reminder_echoes.annotate(&mut message);
             if folded.is_none_or(|folded| *ordinal > folded) {
                 let tool_results = message
                     .ck
@@ -771,7 +776,7 @@ impl State {
                     .filter(|block| matches!(block.kind, ck_wire::CkKind::ToolResult { .. }))
                     .count() as u64;
                 let facts = resident::EntryFacts {
-                    real_user: message.ck.role == "user" && tool_results == 0,
+                    real_user: self.reminder_echoes.authored(&message),
                     tool_results,
                 };
                 self.aggregates.add(*ordinal, &entry.mid, facts, &message);
@@ -802,6 +807,12 @@ impl State {
         self.entry_bytes = (self.entries.last_key_value().map(|(n, _)| *n), entries);
         let mut views = Vec::new();
         let mut bytes = std::mem::size_of::<Self>();
+        // Reminder provenance is durable JSON as well as live structs.
+        bytes += self.reminder_echoes.retained_bytes() * 2;
+        bytes += self
+            .reminder_cadence
+            .as_ref()
+            .map_or(0, |cadence| cadence.ledger.retained_bytes() * 2);
         for view in self
             .published_engine
             .values()
@@ -1225,6 +1236,7 @@ impl McHandler {
             runner_route: None,
             dream_target: None,
             reminder_cadence: None,
+            reminder_echoes: Default::default(),
             reminder_baseline_generation: None,
             key,
             runner_module: match &binding.principal {
@@ -1329,7 +1341,15 @@ impl McHandler {
         #[cfg(test)]
         resident::counters::engine_pass();
         let messages = inbound_messages(state.entries.values())?;
-        codec.prepare_request(&mut template, &messages)?;
+        state
+            .reminder_echoes
+            .prepare(codec, &mut template, &messages, false)?;
+        template.native_reminder_strip_pending =
+            state.reminder_cadence.as_ref().is_some_and(|cadence| {
+                state
+                    .reminder_echoes
+                    .pending(&cadence.ledger, now_ms().max(0) as u64)
+            });
         template.native_tail_section = true;
         if let Some(policy) = &state.usage_policy {
             template.emergency_recovery_armed = policy.emergency_recovery_armed;
@@ -1722,12 +1742,13 @@ fn async_reminder_hints(
 ) -> Result<crate::runner_reminders::ReminderHints, HandlerOutcome> {
     let namespace = state.namespace();
     let rows = store.load_tags_for_session(&namespace).map_err(transient)?;
-    let messages = state
-        .entries
-        .values()
-        .map(|entry| decoded_entry(codec, &entry.inbound()?))
-        .collect::<Result<Vec<_>, _>>()?;
-    let projection = ck_wire::project_messages(&messages).map_err(transient)?;
+    let entries = inbound_messages(state.entries.values())?;
+    let mut request: TransformRequest = decode(&json!({"v":2,"kind":"compaction.step",
+        "session_id":namespace,"messages":[],"render_config":"async-reminder-hints"}))?;
+    state
+        .reminder_echoes
+        .prepare(codec, &mut request, &entries, false)?;
+    let projection = ck_wire::project_messages(&request.messages).map_err(transient)?;
     let mut active =
         transform::active_tags_for_nudge(&loaded.core, &loaded.meta, &projection, &rows, None);
     active.retain(|tag| {
@@ -1986,6 +2007,7 @@ impl McHandler {
                     });
             if verified {
                 state.resync = false;
+                state.reminder_echoes.finish_resync();
                 break;
             }
             state.reset(store)?;
@@ -2130,6 +2152,14 @@ impl McHandler {
                         return Err(transient("async entry changed on re-read"));
                     }
                 } else {
+                    if let Some(cadence) = &mut state.reminder_cadence {
+                        state.reminder_echoes.ingest(
+                            &entry,
+                            codec::Codec::from_params(&Value::Object(state.setup.params.clone()))?,
+                            &mut cadence.ledger,
+                            now_ms().max(0) as u64,
+                        )?;
+                    }
                     state
                         .entries
                         .insert(entry.ordinal, Arc::new(HeldEntry::from_read(&entry)?));
@@ -2220,7 +2250,7 @@ impl McHandler {
         drop(meter);
         let user = last
             .as_ref()
-            .filter(|message| message.ck.role == "user" && !carries_result(message));
+            .filter(|message| state.reminder_echoes.authored(message));
         let users = state.aggregates.real_users;
         let written = last_entry.as_ref().and_then(|entry| entry.written_at);
         let prior = prior_entry.as_ref().and_then(|entry| entry.written_at);
@@ -2435,6 +2465,14 @@ impl McHandler {
             .meta
             .coverage_ordinal;
         let mut ranges = ranges(state, codec, &wire, &candidate, coverage)?;
+        if let Some(cadence) = &state.reminder_cadence {
+            state.reminder_echoes.apply(
+                &cadence.ledger,
+                now_ms().max(0) as u64,
+                &state.entries,
+                &mut ranges,
+            )?;
+        }
         if let Some(head) = state.restored_head.take() {
             if let Some(view::ViewRange::Replace { from: 0, to, bytes }) =
                 ranges.first_mut().filter(|range| range.to() == head.to)
@@ -2821,6 +2859,7 @@ impl McHandler {
         let cadence = state.historian_cadence.clone();
         let settings = self.historian_settings_loader()(&state.key.project);
         let harness = state.key.harness.clone();
+        let reminder_echoes = state.reminder_echoes.clone();
         #[cfg(test)]
         let inflight = {
             struct Inflight(Arc<std::sync::atomic::AtomicU64>);
@@ -2856,7 +2895,7 @@ impl McHandler {
                     .into_iter()
                     .map(|(_, raw)| HeldEntry::from_stored(raw)?.inbound())
                     .collect::<Result<Vec<_>, _>>()?;
-                codec.prepare_request(&mut parsed, &messages)?;
+                reminder_echoes.prepare(codec, &mut parsed, &messages, true)?;
                 drop(messages);
                 let projection = ck_wire::project_messages(&parsed.messages).map_err(transient)?;
                 let mut timings = HistorianTriggerTimings::default();
