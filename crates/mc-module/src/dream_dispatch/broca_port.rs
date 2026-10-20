@@ -7,10 +7,15 @@
 //! the session's `session.subscribe` stream from its start. `release` closes the
 //! routes; it never deletes anything, since erasure is the runner's retention
 //! promise fixed on the first send.
+//!
+//! For a runner-lane conversation the same ops go to that conversation's own runner
+//! instead ([`SessionRunnerRoute`]), and the carrier names the parent session on
+//! every send.
 
 use super::broca_carrier::{BrocaPort, PortError};
 use super::executor::BrocaPorts;
-use crate::route_targets::{RegisteredRoute, RouteTargetConfig};
+use crate::route_targets::{RegisteredRoute, RouteTargetConfig, SessionRunnerRoute};
+use crate::session_resolver::llm_runner_role_versions;
 use serde_json::{json, Value};
 use std::path::PathBuf;
 use std::time::Duration;
@@ -31,6 +36,8 @@ pub struct SubcBroca {
     pub route_targets: RouteTargetConfig,
     pub project_root: PathBuf,
     pub harness: String,
+    /// When set, children go to this conversation's own runner, not the configured one.
+    pub session_runner: Option<SessionRunnerRoute>,
 }
 
 impl SubcBroca {
@@ -98,8 +105,11 @@ impl SubcBrocaPort {
     }
 
     fn route(&self, session: &str) -> Result<(RouteTarget, BindIdentity), PortError> {
-        let target = SubcBroca::target(&self.config.route_targets)
-            .ok_or_else(|| port_error("broca_unwired", "no runner route is declared", false))?;
+        let target = match &self.config.session_runner {
+            Some(route) => route.target(),
+            None => SubcBroca::target(&self.config.route_targets)
+                .ok_or_else(|| port_error("broca_unwired", "no runner route is declared", false))?,
+        };
         Ok((
             target,
             BindIdentity::new(
@@ -125,6 +135,7 @@ impl BrocaPort for SubcBrocaPort {
                 CallOptions {
                     timeout: OP_TIMEOUT,
                     route_retry_deadline: OP_TIMEOUT,
+                    role_versions: Some(llm_runner_role_versions()),
                     ..CallOptions::default()
                 },
             )
@@ -154,6 +165,7 @@ impl BrocaPort for SubcBrocaPort {
                     SubscribeOptions {
                         route_open_timeout: OP_TIMEOUT,
                         route_retry_deadline: OP_TIMEOUT,
+                        role_versions: Some(llm_runner_role_versions()),
                         ..SubscribeOptions::default()
                     },
                 )
@@ -184,9 +196,23 @@ impl BrocaPort for SubcBrocaPort {
         }
         if let (Ok((target, identity)), Some(consumer)) = (self.route(session), &self.consumer) {
             consumer
-                .close_route(target, identity, CloseRouteOptions::default())
+                .close_route(
+                    target,
+                    identity,
+                    CloseRouteOptions {
+                        role_versions: Some(llm_runner_role_versions()),
+                        ..CloseRouteOptions::default()
+                    },
+                )
                 .await;
         }
+    }
+
+    fn session_runner_parent(&self) -> Option<&str> {
+        self.config
+            .session_runner
+            .as_ref()
+            .map(SessionRunnerRoute::parent_session)
     }
 }
 

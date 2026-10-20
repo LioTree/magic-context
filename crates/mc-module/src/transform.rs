@@ -793,6 +793,13 @@ fn raw_replay_rebuild_core(
 /// back to CK messages at egress.
 #[derive(Debug, Clone, Serialize)]
 pub struct TransformRequest {
+    /// Internal delivery ownership, set only by the async runner adapter.
+    #[serde(skip)]
+    pub(crate) runner_owned_reminders: bool,
+    /// Internal proof for an async input with a covered logical prefix omitted.
+    /// Wire requests cannot assert coverage or bypass complete-lineage validation.
+    #[serde(skip)]
+    pub(crate) logical_prefix: Option<Arc<compaction::LogicalPrefix>>,
     /// Set only by the native provider handler, never by a wire request.
     #[serde(skip)]
     pub native_tail_section: bool,
@@ -1301,6 +1308,8 @@ impl<'de> Deserialize<'de> for TransformRequest {
             .unwrap_or_else(default_protected_tags);
         Ok(Self {
             native_tail_section: false,
+            runner_owned_reminders: false,
+            logical_prefix: None,
             native_fold_prefix: None,
             native_fold_sidecar: None,
             native_compartment_source_revision: None,
@@ -2417,12 +2426,15 @@ pub fn transform_with_projection(
 }
 
 /// The append-only runner seam. Transport handlers supply a complete, durably ingested
-/// lineage as `TransformRequest.messages`, not the byte-capped suffix of a status page.
+/// lineage as `TransformRequest.messages`, or an internally certified logical prefix
+/// plus its complete tail, never the byte-capped suffix of a status page.
 /// They persist this state together with their answer before sending it. In particular,
 /// the version high-water must survive an allocated-but-unsent answer.
 /// The caller resolves `template.session_id` from (project_root, session, harness);
 /// this engine seam neither resolves handles nor calls a gateway.
 pub mod compaction {
+    mod logical_prefix;
+    pub(crate) use logical_prefix::LogicalPrefix;
     #[cfg(test)]
     thread_local! {
         // Observe the exact request passed to the real engine, not a separate
@@ -2459,6 +2471,24 @@ pub mod compaction {
         model: &str,
         window: u64,
     ) -> Result<Option<ClassifierInput>, TransformError> {
+        skip_facts_with(store, namespace, ctx, model, window, false)
+    }
+
+    /// [`skip_facts`] for a caller whose held transcript is append-only and
+    /// digest-checked, as the async compaction provider's is: any change to a
+    /// held message forces a resync, which runs the engine. Replay treatments
+    /// then cannot meet content they need to repair, and project docs enter
+    /// the prefix only when a HARD pass renders it, so neither forces the
+    /// engine on its own the way they must for a host whose history can
+    /// change under it.
+    pub fn skip_facts_with(
+        store: &McStore,
+        namespace: &str,
+        ctx: &ProducerContext<'_>,
+        model: &str,
+        window: u64,
+        immutable_history: bool,
+    ) -> Result<Option<ClassifierInput>, TransformError> {
         let Some(core) = store.load_compaction_trigger_core(namespace)? else {
             return Ok(None);
         };
@@ -2494,8 +2524,9 @@ pub mod compaction {
             hard_fold_requested: first_fold || external || protection || meta.bootstrap_seed_fold_pending || meta.pending_rewrite.is_some()
                 // Replay treatments can need content-dependent repair. Without
                 // decoding content a preflight cannot prove them safe to skip.
-                || core.frozen_units.iter().any(|u| !matches!(u.key.as_str(), "m0" | "m1" | "m0-mural"))
-                || ctx.inject_docs,
+                || (!immutable_history
+                    && (core.frozen_units.iter().any(|u| !matches!(u.key.as_str(), "m0" | "m1" | "m0-mural"))
+                        || ctx.inject_docs)),
             boundary_present: true,
             reconcile_pending: core.reconcile_pending,
             m1_revision_changed: signal.revision != meta.m1_revision,
@@ -2658,6 +2689,22 @@ pub mod compaction {
         pub prefix_bust_permitted: bool,
     }
 
+    /// Who removes the signed reasoning a view invalidates. An Anthropic
+    /// signature covers every byte before its block, so once a view changes
+    /// an earlier message (a history head insertion included) every later
+    /// signed reasoning block must leave the request.
+    #[derive(Clone, Copy, Debug, PartialEq, Eq)]
+    pub enum SignedReasoning {
+        /// The view itself removes those blocks.
+        Strip,
+        /// The view keeps them. The runner applies it with the provider's
+        /// companion edit (or defers it) and reports `view_companion` or
+        /// `view_deferred`: the asynchronous compaction-provider contract
+        /// makes model-provider rules the runner's duty, so the view carries
+        /// only the provider's own edits.
+        RunnerCompanion,
+    }
+
     /// Produce Setup's full initial view. Setup is the only call that can initialize
     /// the served head without a previous view; ordinary steps require that view.
     pub fn setup(
@@ -2667,7 +2714,19 @@ pub mod compaction {
         status: &Status,
         state: &mut State,
     ) -> Result<Output, TransformError> {
-        run(store, template, ctx, status, state, true, None)
+        setup_with(store, template, ctx, status, state, SignedReasoning::Strip)
+    }
+
+    /// [`setup`], choosing who removes the signed reasoning the view invalidates.
+    pub fn setup_with(
+        store: &McStore,
+        template: &TransformRequest,
+        ctx: &ProducerContext<'_>,
+        status: &Status,
+        state: &mut State,
+        signed: SignedReasoning,
+    ) -> Result<Output, TransformError> {
+        run(store, template, ctx, status, state, true, None, signed)
     }
 
     pub fn step(
@@ -2677,14 +2736,26 @@ pub mod compaction {
         status: &Status,
         state: &mut State,
     ) -> Result<Output, TransformError> {
-        run(store, template, ctx, status, state, false, None)
+        step_with(store, template, ctx, status, state, SignedReasoning::Strip)
     }
 
-    pub(crate) trait AppliedComparison {
+    /// [`step`], choosing who removes the signed reasoning the view invalidates.
+    pub fn step_with(
+        store: &McStore,
+        template: &TransformRequest,
+        ctx: &ProducerContext<'_>,
+        status: &Status,
+        state: &mut State,
+        signed: SignedReasoning,
+    ) -> Result<Output, TransformError> {
+        run(store, template, ctx, status, state, false, None, signed)
+    }
+
+    pub trait AppliedComparison {
         fn matches(&self, candidate: &View, raw: &[CkIngressMessage]) -> bool;
     }
 
-    pub(crate) fn step_native(
+    pub fn step_native(
         store: &McStore,
         template: &TransformRequest,
         ctx: &ProducerContext<'_>,
@@ -2692,9 +2763,19 @@ pub mod compaction {
         state: &mut State,
         comparison: &dyn AppliedComparison,
     ) -> Result<Output, TransformError> {
-        run(store, template, ctx, status, state, false, Some(comparison))
+        run(
+            store,
+            template,
+            ctx,
+            status,
+            state,
+            false,
+            Some(comparison),
+            SignedReasoning::Strip,
+        )
     }
 
+    #[allow(clippy::too_many_arguments)]
     fn run(
         store: &McStore,
         template: &TransformRequest,
@@ -2703,6 +2784,7 @@ pub mod compaction {
         state: &mut State,
         initial: bool,
         comparison: Option<&dyn AppliedComparison>,
+        signed: SignedReasoning,
     ) -> Result<Output, TransformError> {
         if !ctx.compaction_enabled || status.context_window == 0 {
             return Err(TransformError::LineageProtocol(
@@ -2714,7 +2796,11 @@ pub mod compaction {
                 "compaction setup missing".to_string(),
             ));
         }
-        let mut range = working_range(status, &template.messages)?;
+        let mut range = if let Some(prefix) = &template.logical_prefix {
+            prefix.working_range(status, &template.messages)?
+        } else {
+            working_range(status, &template.messages)?
+        };
         if template.native_fold_prefix.is_some() {
             // status.last_applied_version acknowledges the last produced view.
             // Use that view's original range before updating last_applied below;
@@ -2845,7 +2931,7 @@ pub mod compaction {
         // in a View; this transport-only copy does not authorize new prefix edits.
         let transport_replay = host && status.pipeline_switch;
         if initial || permitted || transport_replay {
-            let replacement = replacement(&engine.response, &req, state.preset)?;
+            let replacement = replacement(&engine.response, &req, state.preset, signed)?;
             let candidate = View {
                 compaction_id: state.compaction_id.clone(),
                 version: 0,
@@ -2969,6 +3055,7 @@ pub mod compaction {
         response: &TransformResponse,
         req: &TransformRequest,
         preset: Preset,
+        signed: SignedReasoning,
     ) -> Result<Vec<CkWireMessage>, TransformError> {
         let messages = response
             .ck_messages
@@ -3020,6 +3107,9 @@ pub mod compaction {
             nonempty_text(message);
         }
         out.retain(|m| !m.content.is_empty());
+        if signed == SignedReasoning::RunnerCompanion {
+            return Ok(out);
+        }
         // Compare CK bytes, not metadata or message IDs. An insertion/deletion is an
         // edit too, so a head insertion strips every later signed block. Never alter
         // a signature's text: discard the entire reasoning block instead.
@@ -4804,12 +4894,19 @@ fn apply_once(
     profile_end!(perf_ingress_validation);
     let seed_or_sync_started_at = Instant::now();
     profile_start!(perf_seed, "seed_or_sync");
-    let transform_snapshot = if let Some(snapshot) =
-        req.native_fold_snapshot.as_ref().filter(|snapshot| {
-            store
-                .load_meta(&req.session_id)
-                .is_ok_and(|meta| meta.row_version == snapshot.loaded.row_version)
-        }) {
+    let transform_snapshot = if req.logical_prefix.is_some() {
+        store.load_logical_transform_snapshot(
+            &req.session_id,
+            &req.messages
+                .iter()
+                .map(|message| message.mid.as_str())
+                .collect::<Vec<_>>(),
+        )?
+    } else if let Some(snapshot) = req.native_fold_snapshot.as_ref().filter(|snapshot| {
+        store
+            .load_meta(&req.session_id)
+            .is_ok_and(|meta| meta.row_version == snapshot.loaded.row_version)
+    }) {
         (**snapshot).clone()
     } else if let Some(prefix) = &req.native_fold_prefix {
         store.load_native_transform_snapshot(
@@ -4828,7 +4925,7 @@ fn apply_once(
     timings.store_cache_state = transform_snapshot.timings.cache_state_ms;
     profile_start!(perf_tags, "store_tags");
     let tag_hydration_started_at = Instant::now();
-    let mut tag_rows = if req.native_fold_prefix.is_some() {
+    let mut tag_rows = if req.native_fold_prefix.is_some() || req.logical_prefix.is_some() {
         Arc::new(
             store.load_tags_for_blocks(
                 &req.session_id,
@@ -4851,6 +4948,14 @@ fn apply_once(
     timings.store_channel1 = transform_snapshot.timings.channel1_ms;
     timings.store_overlay_frontier = transform_snapshot.timings.overlay_frontier_ms;
     let loaded = transform_snapshot.loaded;
+    if let Some(prefix) = &req.logical_prefix {
+        let compartments = store.load_compartments(&req.session_id)?;
+        if !prefix.matches(&prefix.lineage, prefix.generation, &loaded, &compartments) {
+            return Err(TransformError::LineageProtocol(
+                "logical prefix certificate invalid".into(),
+            ));
+        }
+    }
     let overlay_frontier = transform_snapshot.overlay_frontier;
     // A stored frozen chunk or cache section that failed its digest (or its shape checks)
     // decoded as empty. The prefix may have been built against the lost value, so the pass
@@ -5022,7 +5127,11 @@ fn apply_once(
     } else {
         Vec::new()
     };
-    let channel1_appends = channel1_append_rows(&loaded.core, &legacy_channel1_appends);
+    let channel1_appends = channel1_append_rows(
+        &loaded.core,
+        &legacy_channel1_appends,
+        in_band_channel1_enabled(req),
+    );
     let auto_search_active = !req.is_subagent && req.auto_search_enabled;
     let mut user_hints = if tagging_active || auto_search_active {
         transform_snapshot.user_hints
@@ -6143,8 +6252,28 @@ fn apply_once(
         let protected_tokens_floor = floor_resolution.effective;
         // Pending same-pass mints are not persisted rows yet. Every consumer view below is projected
         // from this one walk over the hydrated mc_tags baseline, independent of the served array.
+        let logical_protection = if let Some(prefix) = &req.logical_prefix {
+            Some(
+                prefix
+                    .protection_rows(
+                        store,
+                        &req.session_id,
+                        protected_tokens_floor,
+                        active_calibration.tools_ratio,
+                    )?
+                    .ok_or_else(|| {
+                        TransformError::LineageProtocol(
+                            "logical prefix protection certificate invalid".into(),
+                        )
+                    })?,
+            )
+        } else {
+            None
+        };
         let protection_window = ProtectionWindow::from_persisted_rows_calibrated(
-            &tag_rows[..hydrated_tag_count],
+            logical_protection
+                .as_deref()
+                .unwrap_or(&tag_rows[..hydrated_tag_count]),
             protected_tokens_floor,
             active_calibration.tools_ratio,
         );
@@ -7722,6 +7851,9 @@ fn apply_once(
                         // bloat — and a later re-decide of that target with different bytes
                         // would false-fire the monotonicity conflict guard.
                         prune_covered_red_units(&mut core, &live, meta.coverage_ordinal);
+                        if let Some(prefix) = &req.logical_prefix {
+                            prefix.prune_covered_units(&mut core);
+                        }
                         prune_covered_caveman_units(&mut core, &live, meta.coverage_ordinal);
                     } else if compartment_seq_changed_since_meta {
                         meta.coverage_compartment_seq = Some(m1_signal.max_compartment_seq);
@@ -7875,7 +8007,11 @@ fn apply_once(
 
     profile_start!(perf_channel1, "evolution_channel1");
     prune_channel1_units(&mut core, &projection, meta.coverage_ordinal);
-    let mut channel1_appends = channel1_append_rows(&core, &legacy_channel1_appends);
+    let mut channel1_appends = channel1_append_rows(
+        &core,
+        &legacy_channel1_appends,
+        in_band_channel1_enabled(req),
+    );
     profile_end!(perf_channel1);
     let result_action = action_str(&plan, &core);
 
@@ -8057,13 +8193,18 @@ fn apply_once(
     // after reductions and their compliance grace. Provider inputs omit the
     // hook-reminder Appends; separately saved engine units retain any earlier
     // reminder's exact bytes, so no hook text enters as a second copy.
-    if tagging_active {
+    if tagging_active && in_band_channel1_enabled(req) {
         if let Some((row, unit)) = maybe_append_channel1_nudge(
             Channel1NudgeInputs {
                 covered_users: req
                     .native_fold_prefix
                     .as_ref()
-                    .map_or(0, |prefix| prefix.users),
+                    .map_or(0, |prefix| prefix.users)
+                    .saturating_add(
+                        req.logical_prefix
+                            .as_ref()
+                            .map_or(0, |prefix| prefix.covered_user_turns),
+                    ),
                 ctx,
                 core: &core,
                 projection: &projection,
@@ -8552,6 +8693,17 @@ fn apply_once(
         &projection,
         meta.coverage_ordinal,
     );
+    if let Some(prefix) = &req.logical_prefix {
+        consumed_drop_ids.extend(
+            pending_agent_drops
+                .iter()
+                .filter(|drop| {
+                    prefix.covers_target(&drop.target_id) && !consumed_drop_ids.contains(&drop.id)
+                })
+                .map(|drop| drop.id)
+                .collect::<Vec<_>>(),
+        );
+    }
     if let Some(prefix) = req
         .native_fold_prefix
         .as_ref()
@@ -8732,7 +8884,13 @@ fn apply_once(
                 },
             }
         });
-        store.commit_transform_with_provider_policy(
+        let commit = if req.logical_prefix.is_some() {
+            McStore::commit_logical_transform_with_provider_policy
+        } else {
+            McStore::commit_transform_with_provider_policy
+        };
+        commit(
+            store,
             &req.session_id,
             TransformCommit {
                 expected: commit_expected,
@@ -12882,7 +13040,7 @@ pub(crate) fn provider_engine_settings(meta: &ModuleMeta) -> Value {
             "channel1_last_fire_level":meta.channel1_last_fire_level,"channel1_last_fire_ordinal":meta.channel1_last_fire_ordinal}})
 }
 
-pub(crate) struct Channel1PolicyInputs {
+pub struct Channel1PolicyInputs {
     pub baseline: mc_store::TailHygieneBaseline,
     pub users: u64,
     pub tool_outputs: usize,
@@ -14561,10 +14719,20 @@ pub(crate) fn commit_channel1_fire(
     reminder
 }
 
+fn in_band_channel1_enabled(req: &TransformRequest) -> bool {
+    // Async runners render ctx_reduce reminders from session.send deliveries.
+    // Suppress generated appends and replay of stored appends to avoid duplicate delivery.
+    !req.runner_owned_reminders
+}
+
 fn channel1_append_rows(
     core: &CoreState,
     legacy_rows: &[Channel1AppendRow],
+    enabled: bool,
 ) -> Vec<Channel1AppendRow> {
+    if !enabled {
+        return Vec::new();
+    }
     let mut by_block = legacy_rows
         .iter()
         .cloned()
@@ -14685,7 +14853,7 @@ fn tag_rows_for_hygiene(
     rows
 }
 
-fn active_tags_for_nudge(
+pub(crate) fn active_tags_for_nudge(
     core: &CoreState,
     meta: &ModuleMeta,
     projection: &FlatProjection,
@@ -14983,7 +15151,7 @@ fn channel2_token_aggregate(baseline: Option<&TailHygieneBaseline>) -> Option<(i
     Some(effective_tail_hygiene(baseline))
 }
 
-fn oldest_channel2_hint(
+pub(crate) fn oldest_channel2_hint(
     active_tags: &[ActiveTagForNudge],
     protection_cutoff: &TagNumberCutoffProjection,
     queued_tag_numbers: &HashSet<i64>,
@@ -19952,6 +20120,40 @@ fn action_str(plan: &PassPlan, _core: &CoreState) -> String {
 
 #[cfg(test)]
 pub(crate) mod tests {
+    #[test]
+    fn runner_owned_reminders_do_not_replay_legacy_rows_or_units() {
+        let mut request = req("runner-delivery", "cfg", vec![]);
+        request.serializer_profile = "owned-broca".into();
+        let core = CoreState {
+            frozen_units: vec![FrozenUnit {
+                key: format!("{CHANNEL1_KEY_PREFIX}unit#0"),
+                kind: "channel1_append".into(),
+                frozen_payload: "old reminder".into(),
+                durability_class: mc_core::DurabilityClass::Lineage,
+                reset_rule: "unit#0".into(),
+            }],
+            ..CoreState::default()
+        };
+        let rows = [Channel1AppendRow {
+            block_id: "legacy#0".into(),
+            reminder_text: "legacy reminder".into(),
+            fired_at_ms: 1,
+        }];
+        assert_eq!(
+            channel1_append_rows(&core, &rows, in_band_channel1_enabled(&request)).len(),
+            2
+        );
+        request.runner_owned_reminders = true;
+        assert!(channel1_append_rows(&core, &rows, in_band_channel1_enabled(&request)).is_empty());
+        let mut wire = serde_json::to_value(&request).unwrap();
+        assert!(wire.get("runner_owned_reminders").is_none());
+        wire["runner_owned_reminders"] = serde_json::json!(true);
+        assert!(
+            !serde_json::from_value::<TransformRequest>(wire)
+                .unwrap()
+                .runner_owned_reminders
+        );
+    }
     mod memory_cache_review {
         use super::*;
         include!("transform_memory_cache_review_tests.rs");
@@ -23056,6 +23258,8 @@ pub(crate) mod tests {
     ) -> TransformRequest {
         TransformRequest {
             native_tail_section: false,
+            runner_owned_reminders: false,
+            logical_prefix: None,
             native_fold_prefix: None,
             native_fold_sidecar: None,
             native_compartment_source_revision: None,
@@ -33663,6 +33867,8 @@ pub(crate) mod tests {
     include!("tests/image_stripping_review_witness.rs");
     include!("tests/processed_images.rs");
     include!("tests/image_anthropic_differential.rs");
+    include!("tests/image_anthropic_codec_differential.rs");
+    include!("tests/compaction_signed_reasoning_companion.rs");
     include!("tests/independent_image_review.rs");
     include!("tests/signed_prefix_hold_review_r2.rs");
     include!("tests/signed_prefix_hold_review_r3.rs");

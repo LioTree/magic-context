@@ -101,12 +101,14 @@ fn manifest_before_participant(
         crate::prompt_surface::disable_smart_notes_in_tools(&mut tools, PromptSurfacePreset::Full);
     }
     // Without agent-data, model tools and provider roles still use optional
-    // project lookup and non-served Synapse retrieval. Pin routes independently
+    // project lookup, model catalog, bus bootstrap and non-served Synapse retrieval. Pin routes independently
     // so a disabled participant route cannot change both manifests.
     let mut targets = vec!["thalamus".to_string()];
     for id in [
         config.runner_module_id(),
         Some(config.provider_runner_module_id()),
+        Some("fusiform"),
+        Some("ckbus"),
         Some("entorhinal"),
     ]
     .into_iter()
@@ -124,9 +126,11 @@ fn manifest_before_participant(
     .trust_tier(Some(TrustTier::FirstParty))
     .protocol_ver(subc_protocol::PROTOCOL_VERSION)
     .capabilities(Some(subc_protocol::manifest::CapabilityDeclarations {
+        // The facades' conversation binding is a declared capability since
+        // mcp-conversation-binding/v1; it changes no route or service.
         provides: vec![
             cortexkit_role_compaction_provider::PROVIDES.to_string(),
-            cortexkit_role_step_transform_provider::PROVIDES.to_string(),
+            crate::MCP_CONVERSATION_BINDING_V1.to_string(),
         ],
         requires: vec![],
         must_never_reach: vec![],

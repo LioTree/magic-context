@@ -172,6 +172,23 @@ const TOOL_CHANNEL: u16 = 41;
 
 /// Broca 0.3.212's wire goldens, vendored with their checksums in `golden/README.md`.
 const GOLDEN_DESCRIBE: &[u8] = include_bytes!("golden/role_describe.json");
+
+fn child_runner_describe() -> Value {
+    let mut describe: Value = serde_json::from_slice(GOLDEN_DESCRIBE).unwrap();
+    // The frozen input-cap fixture predates runner-owned tags. These child-run
+    // tests do not pair a compaction provider, so omit that unrelated capability.
+    describe["capabilities"]
+        .as_array_mut()
+        .unwrap()
+        .retain(|capability| capability != "compaction");
+    for major in describe["majors"].as_array_mut().unwrap() {
+        major["ops"]
+            .as_array_mut()
+            .unwrap()
+            .retain(|op| op != "compaction.ready");
+    }
+    describe
+}
 const GOLDEN_DESCRIBE_SHA256: &str =
     "b02c1aeba85bfc1ad3a6dde615ba049c047e1f5f2ced66f90043c4fe34a5b0a2";
 const GOLDEN_EXHAUSTED: &[u8] = include_bytes!("golden/run_status.budget_exhausted.json");
@@ -287,8 +304,6 @@ impl FakeBroca {
         self.handler.bind_route(
             TOOL_CHANNEL,
             SessionBinding {
-                connection_incarnation: 1,
-                native_generation: None,
                 principal: None,
                 scope: None,
                 project_root: self.directory.clone(),
@@ -673,7 +688,7 @@ impl Fixture {
     /// A fixture whose runner answers `role.describe` with Broca's golden.
     fn golden() -> Self {
         let f = Self::new(&[]);
-        f.broca.state().describe = serde_json::from_slice(GOLDEN_DESCRIBE).unwrap();
+        f.broca.state().describe = child_runner_describe();
         f
     }
 
@@ -1345,7 +1360,7 @@ fn broca_goldens_match_their_pinned_checksums() {
         format!("{:x}", Sha256::digest(GOLDEN_EXHAUSTED)),
         GOLDEN_EXHAUSTED_SHA256
     );
-    let describe = check_describe(&serde_json::from_slice(GOLDEN_DESCRIBE).unwrap()).unwrap();
+    let describe = check_describe(&child_runner_describe()).unwrap();
     assert!(describe.declares(caps::INPUT_TOKEN_CAP));
 }
 
@@ -1500,3 +1515,5 @@ async fn broca_child_conformance_cap_cases_hold_through_the_carrier() {
 }
 
 mod executor;
+
+mod session_runner;

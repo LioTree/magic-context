@@ -553,3 +553,58 @@ fn task_roles_match_the_roles_each_host_opens() {
         assert_eq!(opened, declared, "{file}");
     }
 }
+
+/// A project whose children run on a runner-lane conversation's own runner needs
+/// neither a host claimant nor a configured Broca runner: with an unset or `host`
+/// dreamer runner on OpenCode, the memory-only operational tasks are published
+/// with no claimant declared. File-reading tasks keep Broca's file-read gate.
+#[test]
+fn a_session_runner_lane_publishes_without_a_claimant_or_configured_broca() {
+    let settings = json!({"dreamer": {"opencode": {"model": "provider/model"}}});
+    let explicit_host = McModuleConfig {
+        dreamer_runner: Some(HistorianRunnerKind::Host),
+        ..host_config()
+    };
+    for config in [host_config(), explicit_host] {
+        let input = OwnershipInput {
+            config: &config,
+            settings: Some(&settings),
+            harness: "opencode",
+            wiring: &Wiring::production(),
+            claimant: None,
+        };
+        // Off the runner lane the same input needs a claimant.
+        assert!(publish(&input).published.is_empty());
+        let lane = publish_on(&input, Some(true));
+        assert_eq!(
+            lane.published,
+            [
+                TaskName::Curate,
+                TaskName::Classify,
+                TaskName::ReviewUserMemories
+            ]
+        );
+        for task in [TaskName::Map, TaskName::Verify, TaskName::VerifyBroad] {
+            assert!(lane
+                .withheld
+                .contains(&(task, "session_runner_file_read".into())));
+        }
+        let unwired = publish_on(&input, Some(false));
+        assert!(unwired.published.is_empty());
+        assert!(unwired
+            .withheld
+            .iter()
+            .any(|(_, reason)| reason == "session_runner_unwired"));
+    }
+    let no_model = publish_on(
+        &OwnershipInput {
+            config: &host_config(),
+            settings: Some(&json!({})),
+            harness: "opencode",
+            wiring: &Wiring::production(),
+            claimant: None,
+        },
+        Some(true),
+    );
+    assert!(no_model.published.is_empty());
+}

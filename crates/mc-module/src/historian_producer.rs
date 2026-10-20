@@ -24,7 +24,7 @@ use subc_transport::{
 };
 use tokio::net::TcpStream;
 
-use crate::route_targets::{RegisteredRoute, RouteTargetConfig};
+use crate::route_targets::{RegisteredRoute, RouteTargetConfig, SessionRunnerRoute};
 
 /// Output budget for a historian summarization pass. llm-runner's default (4k) truncated
 /// a real 50k-input chunk mid-XML on the rig: a tiered compartment doc for a full chunk
@@ -67,12 +67,43 @@ struct SendParams<'a> {
     generation: GenerationRequest,
     #[serde(skip_serializing_if = "str::is_empty")]
     system: &'a str,
+    /// Runner parameters for a send to a session's own runner
+    /// ([`SessionRunnerRoute`]). Absent on every other route, so sends to the
+    /// process-configured runner module keep their exact bytes.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    parent: Option<&'a str>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    stop_when: Option<StopWhen>,
 }
+
+/// The runner-enforced step limit. A historian child has no tools, so it gets
+/// exactly one model step.
+#[derive(Serialize)]
+struct StopWhen {
+    max_steps: u32,
+}
+
+/// The step limit a historian child runs under on a session runner.
+const HISTORIAN_SESSION_RUNNER_MAX_STEPS: u32 = 1;
 
 #[derive(Serialize)]
 pub(crate) struct SendRequest<'a> {
     method: &'static str,
     params: SendParams<'a>,
+}
+
+impl<'a> SendRequest<'a> {
+    /// Address this send to a session runner: name the parent session the hidden
+    /// child runs under and limit the child to one step. `None` leaves the send as is.
+    pub(crate) fn for_session_runner(mut self, route: Option<&'a SessionRunnerRoute>) -> Self {
+        if let Some(route) = route {
+            self.params.parent = Some(route.parent_session());
+            self.params.stop_when = Some(StopWhen {
+                max_steps: HISTORIAN_SESSION_RUNNER_MAX_STEPS,
+            });
+        }
+        self
+    }
 }
 
 /// Build one `session.send` request. `model` is the canonical `provider/model` string,
@@ -111,6 +142,8 @@ pub(crate) fn session_send_request<'a>(
                 temperature,
             },
             system,
+            parent: None,
+            stop_when: None,
         },
     })
 }
@@ -871,6 +904,9 @@ pub struct HistorianProducer {
     /// Freeze the first send's policy for this session. In particular, a session that
     /// began without retention must not opt in on a later send.
     session_retention: Option<Option<u64>>,
+    /// When set, every route opens to this session's own runner instead of the
+    /// configured runner module, and every send names the parent session.
+    session_runner: Option<SessionRunnerRoute>,
 }
 
 impl HistorianProducer {
@@ -913,16 +949,19 @@ impl HistorianProducer {
         // does not record a retention. Giving stage sessions a retention would first require
         // persisting it in that stage request. Stage sends happen only while
         // `historian_stage::RUST_LIFECYCLE_ENABLED` is on, which it is not in production.
-        let request = serde_json::to_value(session_send_request(
-            stage_key,
-            system,
-            prompt,
-            model,
-            variant,
-            max_output_tokens,
-            temperature,
-            None,
-        )?)?;
+        let request = serde_json::to_value(
+            session_send_request(
+                stage_key,
+                system,
+                prompt,
+                model,
+                variant,
+                max_output_tokens,
+                temperature,
+                None,
+            )?
+            .for_session_runner(self.session_runner.as_ref()),
+        )?;
         match self.unary_json(route, &request).await {
             Ok(response) => match send_outcome(&response) {
                 SendOutcome::Active(run_id) => Ok(RunHandle { run_id }),
@@ -1022,7 +1061,18 @@ impl HistorianProducer {
             subscribe_route: None,
             route_retention: None,
             session_retention: None,
+            session_runner: None,
         })
+    }
+
+    /// Connect a producer whose routes go to a runner-lane conversation's own runner.
+    pub async fn connect_to_session_runner(
+        config: HistorianProducerConfig,
+        route: SessionRunnerRoute,
+    ) -> Result<Self, HistorianProducerError> {
+        let mut producer = Self::connect(config).await?;
+        producer.session_runner = Some(route);
+        Ok(producer)
     }
 
     /// Bind subsequent status/subscribe/cancel calls to an existing session. Reattach
@@ -1114,6 +1164,8 @@ impl HistorianProducer {
         // a distinct session id. Use that durable attempt identity as `send_id`, not a
         // connection nonce or frame correlation id: resending after a lost reply must
         // deduplicate, while a new attempt after a classified failure must start a new run.
+        // A local copy: the send body borrows it while the route is used mutably.
+        let session_runner = self.session_runner.clone();
         let body = session_send_request(
             session_id,
             system,
@@ -1123,7 +1175,8 @@ impl HistorianProducer {
             max_output_tokens,
             temperature,
             retention,
-        )?;
+        )?
+        .for_session_runner(session_runner.as_ref());
         let response = self.unary_json(route, body).await?;
         match send_outcome(&response) {
             SendOutcome::Active(run_id) => Ok(RunHandle { run_id }),
@@ -1325,11 +1378,14 @@ impl HistorianProducer {
             .session_id
             .clone()
             .ok_or(HistorianProducerError::MissingSession)?;
-        let target = self
-            .config
-            .route_targets
-            .target(RegisteredRoute::HistorianRunner)
-            .ok_or(HistorianProducerError::HostRunnerRequiresHostTransport)?;
+        let target = match &self.session_runner {
+            Some(route) => route.target(),
+            None => self
+                .config
+                .route_targets
+                .target(RegisteredRoute::HistorianRunner)
+                .ok_or(HistorianProducerError::HostRunnerRequiresHostTransport)?,
+        };
         let request = ClientControlRequest::RouteOpen {
             target,
             identity: BindIdentity::new(
@@ -1342,8 +1398,8 @@ impl HistorianProducer {
             admission_facts: None,
             // Historian routes carry no session scope; they run under the module's own identity.
             scope: None,
-            // The historian runner is not a versioned role route.
-            role_versions: None,
+            // The historian runner is an llm-runner management surface.
+            role_versions: Some(crate::session_resolver::llm_runner_role_versions()),
         };
         let corr = self.next_corr();
         let body = serde_json::to_vec(&request)?;
@@ -1987,7 +2043,11 @@ fn retry_after_secs_from_value(value: &Value) -> Option<u64> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use std::{collections::VecDeque, net::SocketAddr, sync::Arc};
+    use std::{
+        collections::{BTreeMap, VecDeque},
+        net::SocketAddr,
+        sync::Arc,
+    };
 
     use serde_json::json;
     use subc_transport::{
@@ -2475,6 +2535,8 @@ mod tests {
     #[derive(Debug, Default)]
     struct ServerLog {
         route_sessions: Vec<String>,
+        route_targets: Vec<subc_protocol::RouteTarget>,
+        route_role_versions: Vec<Option<BTreeMap<String, String>>>,
         role_describes: Vec<Value>,
         sends: Vec<Value>,
         subscribes: Vec<Value>,
@@ -2567,11 +2629,21 @@ mod tests {
                         FrameType::Request if frame.header.channel == 0 => {
                             let req: ClientControlRequest =
                                 serde_json::from_slice(&frame.body).unwrap();
-                            if let ClientControlRequest::RouteOpen { identity, .. } = req {
+                            if let ClientControlRequest::RouteOpen {
+                                identity,
+                                target,
+                                role_versions,
+                                ..
+                            } = req
+                            {
                                 let route = next_route;
                                 next_route += 1;
                                 route_sessions.insert(route, identity.session.clone());
-                                log_task.lock().await.route_sessions.push(identity.session);
+                                let mut log = log_task.lock().await;
+                                log.route_sessions.push(identity.session);
+                                log.route_targets.push(target);
+                                log.route_role_versions.push(role_versions);
+                                drop(log);
                                 send_response_frame(
                                     &mut stream,
                                     frame.header.channel,
@@ -3050,6 +3122,101 @@ mod tests {
         let log = server.log.lock().await;
         assert_eq!(log.retracts.len(), 1);
         assert_eq!(log.retracts[0]["submission_id"], json!("sub-77"));
+    }
+
+    async fn session_runner_client(server: &FakeServer) -> HistorianProducer {
+        HistorianProducer::connect_to_session_runner(
+            HistorianProducerConfig {
+                request_timeout: Duration::from_secs(2),
+                await_timeout: Duration::from_secs(2),
+                route_targets: RouteTargetConfig::default(),
+                ..HistorianProducerConfig::new(
+                    server.connection_file.clone(),
+                    std::env::current_dir().unwrap(),
+                    "opencode",
+                )
+            },
+            SessionRunnerRoute::for_principal(
+                Some(&subc_protocol::Principal::Reserved {
+                    module_id: "thalamus-harness".into(),
+                }),
+                "ses-parent",
+            )
+            .unwrap(),
+        )
+        .await
+        .unwrap()
+    }
+
+    /// A runner-lane historian reaches the conversation's own runner, not the
+    /// configured `broca` module, and every send names the parent session and the
+    /// one-step limit beside the empty tool list. Retention still follows the
+    /// runner's declared limits.
+    #[tokio::test]
+    async fn a_session_runner_send_reaches_the_sessions_runner_and_names_its_parent() {
+        let server = fake_server_with_role_describe(
+            json!({"state":"active","run_id":"run-1"}),
+            Vec::new(),
+            json!({"capabilities":["retention"],"retention":{"max_seconds":2_592_000,"delete_within_ms":3_600_000}}),
+            false,
+        )
+        .await;
+        let mut producer = session_runner_client(&server).await;
+        producer
+            .start("mc-hist-1", "system", "prompt", "provider/model")
+            .await
+            .unwrap();
+        let log = server.log.lock().await;
+        assert_eq!(
+            log.route_targets,
+            vec![subc_protocol::RouteTarget::ManagementSurface {
+                module_id: "thalamus-harness".into()
+            }],
+            "the configured broca target must not be used for a THALAMUS session"
+        );
+        assert_eq!(
+            log.route_role_versions,
+            vec![Some(BTreeMap::from([(
+                "llm-runner".to_string(),
+                "v1".to_string()
+            )]))],
+            "a runner route declares it speaks llm-runner/v1"
+        );
+        assert_eq!(log.route_sessions, vec!["mc-hist-1".to_string()]);
+        let send = &log.sends[0];
+        assert_eq!(send["parent"], "ses-parent");
+        assert_eq!(send["tools"], json!([]));
+        assert_eq!(send["stop_when"], json!({"max_steps": 1}));
+        assert_eq!(send["retention"], 86_400);
+        assert!(send.get("budget").is_none(), "{send}");
+    }
+
+    /// The configured-runner producer keeps its send bytes: no parent and no step
+    /// limit ride a send to the configured module.
+    #[tokio::test]
+    async fn a_configured_runner_send_carries_no_session_runner_fields() {
+        let server = fake_server(json!({"state":"active","run_id":"run-1"}), Vec::new()).await;
+        let mut producer = client(&server).await;
+        producer
+            .start("mc-hist-1", "system", "prompt", "provider/model")
+            .await
+            .unwrap();
+        let log = server.log.lock().await;
+        assert_eq!(
+            log.route_targets,
+            vec![subc_protocol::RouteTarget::ManagementSurface {
+                module_id: "llm-runner".into()
+            }]
+        );
+        assert_eq!(
+            log.route_role_versions,
+            vec![Some(BTreeMap::from([(
+                "llm-runner".to_string(),
+                "v1".to_string()
+            )]))]
+        );
+        assert!(log.sends[0].get("parent").is_none());
+        assert!(log.sends[0].get("stop_when").is_none());
     }
 
     #[tokio::test]

@@ -80,14 +80,11 @@ async fn main() -> Result<(), Box<dyn Error + Send + Sync>> {
     // background-completion route to Broca is opened. An unconfigured role is decided
     // per request by the harness, and a Claude Code request then still goes to Broca,
     // so that route stays declared. The provider runner route (Broca serving as the
-    // runner of compaction and step-transform providers) is declared separately and
+    // transcript source for compaction providers) is declared separately and
     // is optional: ck-mc starts and serves without it.
     let route_targets =
         RouteTargetConfig::for_configured_runners(mc_module::config::user_configured_runners());
     let smart_notes_enabled = mc_module::config::user_smart_notes_enabled();
-    // Step transforms always run on the resident engine; no configuration value
-    // selects the non-resident path. The resident engine's charged-memory cap
-    // (rust_provider_resident_process_cap_mb) is the only residency setting read.
     let result = subc_client_rs::serve_with(
         &connection_file,
         manifest_with_route_targets_and_smart_notes(
@@ -102,9 +99,6 @@ async fn main() -> Result<(), Box<dyn Error + Send + Sync>> {
                 module_id,
             )
             .with_startup_smart_notes_enabled(smart_notes_enabled)
-            .with_startup_provider_resident_process_cap(
-                mc_module::config::user_provider_resident_process_cap(),
-            )
             .with_log_directory(logger.logs_dir().to_path_buf()),
         ),
     )

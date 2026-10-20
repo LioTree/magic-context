@@ -95,11 +95,94 @@ impl RouteTargetConfig {
                 service_id: "session-door".into(),
             });
         }
+        if route == RegisteredRoute::FusiformCatalog {
+            return Some(RouteTarget::ToolProvider {
+                module_id: "fusiform".into(),
+            });
+        }
         route
             .module_id(self)
             .map(|module_id| RouteTarget::ManagementSurface {
                 module_id: module_id.to_string(),
             })
+    }
+}
+
+/// The runner module that owns OpenCode and Pi sessions on a runner lane.
+pub const THALAMUS_HARNESS_MODULE_ID: &str = "thalamus-harness";
+
+/// Runner modules that can run a session's background model calls (historian and
+/// dreamer) as hidden children of that same session, inside the session's own host.
+/// A conversation is on a runner lane when the daemon stamped one of these modules as
+/// the principal of the route that admitted it. `thalamus` is the Claude Code
+/// gateway serving its sessions as a runner (`anthropic-messages`).
+pub const SESSION_RUNNER_MODULE_IDS: [&str; 3] = [
+    THALAMUS_HARNESS_MODULE_ID,
+    DEFAULT_RUNNER_MODULE_ID,
+    DEFAULT_THALAMUS_MODULE_ID,
+];
+
+/// Where a runner-lane conversation's background model calls go: the llm-runner
+/// management surface of the module that runs the conversation, with the
+/// conversation's own session named as the parent of each hidden child.
+///
+/// The parent cannot ride the route's `BindIdentity` (it has no attribute field; its
+/// session slot names the child), so every send on this route carries it as the
+/// runner parameter `parent`. The runner uses it to admit `reserved:magic-context`
+/// only for sessions whose compaction provider is Magic Context.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct SessionRunnerRoute {
+    module_id: String,
+    parent_session: String,
+}
+
+impl SessionRunnerRoute {
+    /// The route for a conversation admitted under `principal` with runner session
+    /// `parent_session`. `None` when the principal is not a session runner module:
+    /// such a conversation keeps the process-configured routes.
+    pub fn for_principal(
+        principal: Option<&subc_protocol::Principal>,
+        parent_session: &str,
+    ) -> Option<Self> {
+        let Some(subc_protocol::Principal::Reserved { module_id }) = principal else {
+            return None;
+        };
+        (SESSION_RUNNER_MODULE_IDS.contains(&module_id.as_str()) && !parent_session.is_empty())
+            .then(|| Self {
+                module_id: module_id.clone(),
+                parent_session: parent_session.to_string(),
+            })
+    }
+
+    /// The route a background model call (historian firing, dream child, classify)
+    /// for this conversation takes, or `None` when it keeps the process-configured
+    /// runner: the conversation is not on a runner lane, or the user explicitly chose
+    /// `broca` (`resolved` is the role's runner, e.g.
+    /// `McModuleConfig::historian_runner_for(harness)`). Depends only on the
+    /// conversation's daemon-stamped principal and session, never on how the
+    /// conversation reports its progress.
+    pub fn for_background_call(
+        principal: Option<&subc_protocol::Principal>,
+        parent_session: &str,
+        resolved: crate::historian_runner::ResolvedRunner,
+    ) -> Option<Self> {
+        crate::historian_runner::uses_session_runner(resolved)
+            .then(|| Self::for_principal(principal, parent_session))
+            .flatten()
+    }
+
+    pub fn module_id(&self) -> &str {
+        &self.module_id
+    }
+
+    pub fn parent_session(&self) -> &str {
+        &self.parent_session
+    }
+
+    pub(crate) fn target(&self) -> RouteTarget {
+        RouteTarget::ManagementSurface {
+            module_id: self.module_id.clone(),
+        }
     }
 }
 
@@ -112,15 +195,19 @@ pub(crate) enum RegisteredRoute {
     SessionResolve,
     HistorianRunner,
     ProviderRunner,
+    FusiformCatalog,
+    CompactionBus,
     EntorhinalResolve,
     SynapseRerank,
 }
 
 impl RegisteredRoute {
-    const ALL: [Self; 7] = [
+    const ALL: [Self; 9] = [
         Self::SessionResolve,
         Self::HistorianRunner,
         Self::ProviderRunner,
+        Self::FusiformCatalog,
+        Self::CompactionBus,
         Self::EngramDoor,
         Self::EntorhinalSessionRef,
         Self::EntorhinalResolve,
@@ -134,6 +221,8 @@ impl RegisteredRoute {
             Self::SessionResolve => Some(DEFAULT_THALAMUS_MODULE_ID),
             Self::HistorianRunner => config.runner_module_id(),
             Self::ProviderRunner => Some(config.provider_runner_module_id()),
+            Self::FusiformCatalog => Some("fusiform"),
+            Self::CompactionBus => Some("ckbus"),
             Self::EntorhinalResolve => Some("entorhinal"),
             Self::SynapseRerank => Some("synapse"),
         }
@@ -152,6 +241,9 @@ impl RegisteredRoute {
             // Callbacks and transcript reads spend no provider quota. Declaring this target
             // does not open a connection or require the runner to be registered at startup.
             Self::ProviderRunner => Vec::new(),
+            // Model limits are a read-only catalog lookup and spend no provider quota.
+            Self::FusiformCatalog => Vec::new(),
+            Self::CompactionBus => Vec::new(),
             // Explicit mc.retrieval searches may call Synapse. Declaring this target
             // neither connects to Synapse nor starts automatic retrieval work.
             Self::SynapseRerank => Vec::new(),
@@ -236,9 +328,24 @@ pub(crate) fn catalog_provider_target_for_test() -> RouteTarget {
 #[cfg(test)]
 pub(crate) fn expected_routes_for_tests(runner: &str) -> Vec<String> {
     #[cfg(feature = "agent-data")]
-    let routes = vec!["thalamus", runner, "engram", "entorhinal", "synapse"];
+    let routes = vec![
+        "thalamus",
+        runner,
+        "fusiform",
+        "ckbus",
+        "engram",
+        "entorhinal",
+        "synapse",
+    ];
     #[cfg(not(feature = "agent-data"))]
-    let routes = vec!["thalamus", runner, "entorhinal", "synapse"];
+    let routes = vec![
+        "thalamus",
+        runner,
+        "fusiform",
+        "ckbus",
+        "entorhinal",
+        "synapse",
+    ];
     routes.into_iter().map(str::to_owned).collect()
 }
 
@@ -249,6 +356,28 @@ mod tests {
 
     use super::executable_staging;
     use super::*;
+
+    #[test]
+    fn every_session_runner_module_gets_its_own_route() {
+        for module in ["thalamus-harness", "broca", "thalamus"] {
+            let principal = subc_protocol::Principal::Reserved {
+                module_id: module.into(),
+            };
+            let route = SessionRunnerRoute::for_principal(Some(&principal), "s")
+                .unwrap_or_else(|| panic!("{module} is a session runner"));
+            assert_eq!(route.module_id(), module);
+            assert_eq!(
+                route.target(),
+                RouteTarget::ManagementSurface {
+                    module_id: module.into()
+                }
+            );
+        }
+        let other = subc_protocol::Principal::Reserved {
+            module_id: "fusiform".into(),
+        };
+        assert!(SessionRunnerRoute::for_principal(Some(&other), "s").is_none());
+    }
 
     #[test]
     fn route_targets_follow_the_resolved_runner() {
@@ -299,6 +428,19 @@ mod tests {
     }
 
     #[test]
+    fn fusiform_catalog_is_a_static_read_only_tool_provider_route() {
+        let config = RouteTargetConfig::host_runner();
+        assert_eq!(
+            config.target(RegisteredRoute::FusiformCatalog),
+            Some(RouteTarget::ToolProvider {
+                module_id: "fusiform".to_string()
+            })
+        );
+        assert!(RegisteredRoute::FusiformCatalog.self_signals().is_empty());
+        assert!(route_targets(&config).contains(&"fusiform".to_string()));
+    }
+
+    #[test]
     fn entorhinal_lookup_is_a_read_only_management_route() {
         let config = RouteTargetConfig::host_runner();
         assert_eq!(
@@ -316,7 +458,7 @@ mod tests {
             capabilities.provides,
             vec![
                 cortexkit_role_compaction_provider::PROVIDES.to_string(),
-                cortexkit_role_step_transform_provider::PROVIDES.to_string(),
+                crate::MCP_CONVERSATION_BINDING_V1.to_string(),
             ]
         );
         assert!(capabilities.requires.is_empty());
@@ -476,6 +618,10 @@ mod tests {
                 };
                 let module_id = match target {
                     RouteTarget::ManagementSurface { module_id } => module_id,
+                    RouteTarget::ToolProvider { module_id } => {
+                        assert_eq!(route, RegisteredRoute::FusiformCatalog);
+                        module_id
+                    }
                     RouteTarget::InternalService {
                         module_id,
                         service_id,
@@ -484,7 +630,6 @@ mod tests {
                         assert_eq!(service_id, "session-door");
                         module_id
                     }
-                    _ => panic!("registered route has an unexpected target kind"),
                 };
                 assert!(
                     consumed.contains(&module_id),

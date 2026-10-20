@@ -126,9 +126,39 @@ pub fn resolve_runner(configured: Option<HistorianRunnerKind>, harness: &str) ->
     }
 }
 
+/// Whether a runner-lane conversation (one admitted by its own runner module, such
+/// as `thalamus-harness` for OpenCode and Pi or `broca`) runs its background model
+/// calls on that runner, as hidden children of the conversation's session.
+///
+/// `host` means "run in the session's own harness", and on a runner lane that
+/// harness is the session's runner, so `host` and an unset runner both answer yes:
+/// these lanes never queue work for a host claimant. Only an explicitly configured
+/// `broca` keeps the configured Broca module route, as a deliberate user choice.
+pub fn uses_session_runner(resolved: ResolvedRunner) -> bool {
+    !(resolved.kind == HistorianRunnerKind::Broca && resolved.source == RunnerSource::Configured)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn only_an_explicit_broca_keeps_a_runner_lane_off_its_session_runner() {
+        for harness in ["opencode", "opencode2", "pi", "claude-code", ""] {
+            assert!(
+                uses_session_runner(resolve_runner(None, harness)),
+                "{harness:?}"
+            );
+            assert!(
+                uses_session_runner(resolve_runner(Some(HistorianRunnerKind::Host), harness)),
+                "{harness:?}"
+            );
+            assert!(
+                !uses_session_runner(resolve_runner(Some(HistorianRunnerKind::Broca), harness)),
+                "{harness:?}"
+            );
+        }
+    }
 
     #[test]
     fn an_unconfigured_runner_follows_the_harness() {

@@ -72,8 +72,6 @@ impl Fixture {
         handler.bind_route(
             7,
             SessionBinding {
-                connection_incarnation: 0,
-                native_generation: None,
                 principal: Some(principal()),
                 scope: Some(scope()),
                 project_root: PROJECT.into(),
@@ -370,18 +368,18 @@ async fn invalid_body() -> Value {
 async fn paused() -> Value {
     let f = Fixture::new(true);
     json!([
-        f.exchange("disabled-provider-declare", START, json!({"method":"transform.declare","params":{
-            "session":"session-a","harness":"opencode","request_id":"paused-declare","preset":"head",
-            "params":{"serializer_profile":"opencode-aisdk","observation":"answer"},"composition":{},
-            "model":"fixture","context_window":100000,"now":START,"lineage_id":"paused-lineage"
-        }})).await,
-        f.exchange("disabled-provider-setup", START, json!({"method":"compaction.setup","params":{
-            "session":"session-a","harness":"opencode","request_id":"paused-setup","preset":"head",
-            "params":{"serializer_profile":"opencode-aisdk","observation":"answer"},"composition":{},
-            "model":"fixture","context_window":100000,"now":START,"lineage_id":"paused-lineage"
-        }})).await,
-        f.exchange("disabled-no-queued-work", START, json!({"method":"historian.pending","v":1})).await,
-        f.exchange("disabled-no-claim", START, request("historian.claim", "run-a", "")).await,
+        f.exchange(
+            "disabled-no-queued-work",
+            START,
+            json!({"method":"historian.pending","v":1})
+        )
+        .await,
+        f.exchange(
+            "disabled-no-claim",
+            START,
+            request("historian.claim", "run-a", "")
+        )
+        .await,
     ])
 }
 
@@ -447,17 +445,19 @@ fn vector_path() -> PathBuf {
 fn verify(case: &str) {
     let frozen: Value = serde_json::from_slice(&std::fs::read(vector_path()).unwrap()).unwrap();
     let actual = run(case);
-    let expected = &frozen["cases"][case];
-    assert_eq!(
-        actual.as_array().unwrap().len(),
-        expected.as_array().unwrap().len()
-    );
-    for (actual, expected) in actual
+    let expected = frozen["cases"][case]
         .as_array()
         .unwrap()
         .iter()
-        .zip(expected.as_array().unwrap())
-    {
+        .filter(|entry| {
+            !matches!(
+                entry["id"].as_str(),
+                Some("disabled-provider-declare" | "disabled-provider-setup")
+            )
+        })
+        .collect::<Vec<_>>();
+    assert_eq!(actual.as_array().unwrap().len(), expected.len());
+    for (actual, expected) in actual.as_array().unwrap().iter().zip(expected) {
         assert_eq!(actual, expected, "{case}: {}", actual["id"]);
     }
 }
@@ -492,7 +492,7 @@ fn historian_claim_vectors_race_orderings() {
 }
 
 #[test]
-fn historian_claim_vectors_byte_identical_regeneration() {
+fn historian_claim_vectors_remaining_exchanges_regenerate_byte_identically() {
     let cases: serde_json::Map<String, Value> =
         CASES.into_iter().map(|id| (id.into(), run(id))).collect();
     let vectors = json!({"schema":"mc-historian-claim/v1", "limits":{"report_text_bytes":MAX_HISTORIAN_REPORT_BYTES,"facade_frame_bytes":MAX_FACADE_FRAME_BYTES}, "generator":{
@@ -506,8 +506,21 @@ fn historian_claim_vectors_byte_identical_regeneration() {
     if std::env::var_os("MC_WRITE_HISTORIAN_CLAIM_VECTORS").is_some() {
         std::fs::write(vector_path(), &bytes).unwrap();
     } else {
+        let mut expected: Value =
+            serde_json::from_str(&std::fs::read_to_string(vector_path()).unwrap()).unwrap();
+        // The shared plugin fixture still records its synchronous provider setup.
+        // Rust retains the claim protocol, but no longer serves those provider ops.
+        expected["cases"]["paused"]
+            .as_array_mut()
+            .unwrap()
+            .retain(|entry| {
+                !matches!(
+                    entry["id"].as_str(),
+                    Some("disabled-provider-declare" | "disabled-provider-setup")
+                )
+            });
         assert_eq!(
-            std::fs::read_to_string(vector_path()).unwrap(),
+            format!("{}\n", serde_json::to_string_pretty(&expected).unwrap()),
             bytes,
             "historian-claim-v1.json drift; run generator with --write"
         );

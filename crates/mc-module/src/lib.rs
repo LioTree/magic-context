@@ -344,15 +344,12 @@ pub mod project_docs;
 pub mod project_identity;
 pub mod prompt_surface;
 pub mod protection_window;
-#[cfg(test)]
-pub(crate) mod provider_transport_tests;
-mod providers;
+pub mod providers;
 mod recomp_staging;
 mod reply_pages;
 mod retained_size;
 pub mod retrieval;
 mod retrieval_store;
-mod transport_admission;
 mod transport_handler;
 pub use transport_handler::McTransportHandler;
 pub mod edit_admission;
@@ -360,6 +357,7 @@ pub mod engram_catalog;
 mod reclaim_distance;
 pub mod route_targets;
 pub mod runner_choices;
+pub mod runner_reminders;
 pub mod scheduler;
 pub mod selection;
 pub mod session_resolver;
@@ -436,7 +434,7 @@ use historian_host::{HostReportDeliveryError, HostRunLedger, HostRunReport};
 use historian_producer::{HistorianProducer, HistorianProducerConfig, HistorianProducerError};
 use historian_runner::HistorianRunnerKind;
 use prompt_surface::{PromptSurfacePreset, PromptSurfaceSelection};
-use route_targets::{route_targets, RouteTargetConfig};
+use route_targets::{route_targets, RouteTargetConfig, SessionRunnerRoute};
 use scheduler::MIN_PLAUSIBLE_CONTEXT_LIMIT;
 use selection::SelKind;
 #[cfg(test)]
@@ -474,10 +472,6 @@ use transform::{
 /// the daemon controls.
 #[derive(Debug, Clone, PartialEq)]
 pub struct SessionBinding {
-    pub connection_incarnation: u64,
-    /// Native provider generation resolved from the admitted route plan, never
-    /// from a message body or the user's durable session identifier.
-    pub native_generation: Option<mc_store::provider_records::ProviderGeneration>,
     /// Identity stamped by the daemon at bind, never supplied by an RPC body.
     pub principal: Option<subc_protocol::Principal>,
     /// Daemon-stamped scope owner and authorization, copied from the owner's scope.sync record at bind.
@@ -1879,8 +1873,6 @@ struct ModuleStateSyncWire {
     historian_model_chain: Option<Vec<String>>,
     #[serde(default)]
     pass_complete: Option<bool>,
-    #[serde(default)]
-    provider_pass: Option<Value>,
 }
 
 #[derive(Debug, Clone, Deserialize)]
@@ -2826,6 +2818,9 @@ struct FacadeScope {
     /// Daemon-bound filesystem path retained only for route-vocabulary enforcement.
     route_project_root: String,
     conversation_key: String,
+    /// The conversation is an asynchronous compaction conversation, so its
+    /// history tools take the async lane.
+    async_conversation: bool,
     memory_enabled: bool,
     /// Why memory is paused for this route, when its project identity is unavailable.
     memory_paused: Option<String>,
@@ -4184,6 +4179,10 @@ pub struct McHandler {
     fixed_config: Option<McModuleConfig>,
     #[cfg(test)]
     fixed_dream_settings: Option<Value>,
+    /// Trusted settings the provider historian resolves its models from when no host
+    /// sent a chain. Tests never read the environment's config; unset means `{}`.
+    #[cfg(test)]
+    fixed_historian_settings: Option<Value>,
     /// Replaces the production executor wiring in fixtures, so publication can be
     /// exercised for tasks this build does not yet run.
     #[cfg(test)]
@@ -4208,8 +4207,8 @@ pub struct McHandler {
     frozen_tool_catalogs: Mutex<HashMap<(PathBuf, String), tool_catalog::FrozenCatalog>>,
     provider_store: Arc<providers::Storage>,
     provider_serial: Arc<providers::ProviderSerial>,
-    provider_resident: Arc<providers::resident_hooks::ResidentHooks>,
     provider_runner: Arc<dyn session_resolver::ProviderRunner>,
+    historian_model_catalog: Arc<providers::HistorianModelCatalog>,
     provider_historian_worker: OnceLock<Arc<McHandler>>,
     provider_historian_budget: Arc<providers::historian_budget::Budget>,
     provider_historian_evaluations: Arc<Mutex<HashSet<String>>>,
@@ -4260,11 +4259,6 @@ pub struct McHandler {
     /// lock-free map) is appropriate because writes are rare (once per route open/close)
     /// and reads are one cheap lookup per transform.
     bindings: Mutex<HashMap<u16, SessionBinding>>,
-    native_route_plans: Mutex<HashMap<u16, providers::NativeConnectionPlan>>,
-    native_connection_sequence: std::sync::atomic::AtomicU64,
-    #[cfg(test)]
-    native_bundle_override:
-        Mutex<Option<cortexkit_role_step_transform_provider::claude_code::ClaudeCodeCapabilities>>,
     threshold_logged_routes: Mutex<HashSet<u16>>,
     /// Per-project evaluator capability asserted by the host's state-sync payload. Absence is
     /// fail-closed so a Rust-authority smart note cannot become permanently pending.
@@ -4297,6 +4291,37 @@ pub trait HistorianProducerFactory: Send + Sync {
         &self,
         project_root: &Path,
     ) -> Result<Box<dyn HistorianProducerDriver + Send>, HistorianProducerError>;
+
+    /// Connect a producer whose runs go to a runner-lane conversation's own runner
+    /// (`route`), as hidden children of that conversation's session. A factory that
+    /// cannot reach session runners refuses rather than falling back to the
+    /// configured runner, which would run the call outside the session's host.
+    async fn connect_session_runner(
+        &self,
+        _project_root: &Path,
+        route: &SessionRunnerRoute,
+    ) -> Result<Box<dyn HistorianProducerDriver + Send>, HistorianProducerError> {
+        Err(HistorianProducerError::Subc(
+            historian_producer::ProducerErrorBody::untagged(
+                "session_runner_unavailable",
+                format!(
+                    "no session runner transport for module {}",
+                    route.module_id()
+                ),
+            ),
+        ))
+    }
+}
+
+/// The route a runner-lane conversation's background model calls take, or `None`
+/// for a conversation that keeps the configured runner (it is not on a runner lane,
+/// or the user explicitly configured `broca`). See
+/// [`SessionRunnerRoute::for_background_call`].
+pub(crate) fn session_runner_route(
+    binding: &SessionBinding,
+    resolved: historian_runner::ResolvedRunner,
+) -> Option<SessionRunnerRoute> {
+    SessionRunnerRoute::for_background_call(binding.principal.as_ref(), &binding.session, resolved)
 }
 
 struct RealHistorianProducerFactory {
@@ -4320,6 +4345,28 @@ impl HistorianProducerFactory for RealHistorianProducerFactory {
                     "opencode",
                 )
             })
+            .await?,
+        ))
+    }
+
+    async fn connect_session_runner(
+        &self,
+        project_root: &Path,
+        route: &SessionRunnerRoute,
+    ) -> Result<Box<dyn HistorianProducerDriver + Send>, HistorianProducerError> {
+        Ok(Box::new(
+            HistorianProducer::connect_to_session_runner(
+                HistorianProducerConfig {
+                    handshake_timeout: Duration::from_secs(2),
+                    route_targets: self.route_targets.clone(),
+                    ..HistorianProducerConfig::new(
+                        self.connection_file.clone(),
+                        project_root,
+                        "opencode",
+                    )
+                },
+                route.clone(),
+            )
             .await?,
         ))
     }
@@ -4551,6 +4598,9 @@ struct HistorianPrepareContext<'a> {
     /// Early pass-through paths leave this absent and retain the legacy store fallback.
     tag_snapshot: Option<Arc<Vec<McTagRow>>>,
     reclaim_ride_available: bool,
+    /// Whether the conversation is on a runner lane: its firings and restart
+    /// reattach run on its own runner. Only the provider (runner-lane) path sets it.
+    runner_lane: bool,
     timings: &'a mut HistorianTriggerTimings,
 }
 
@@ -4558,6 +4608,7 @@ struct ReattachPublicationGuards {
     rust_background_enabled: bool,
     snapshot_generation: Option<u64>,
     log_fence: Option<Arc<dyn historian::HistorianPublicationFence>>,
+    session_runner: Option<SessionRunnerRoute>,
 }
 
 #[derive(Default)]
@@ -4867,6 +4918,10 @@ struct HistorianFiringTask {
     runner: HistorianRunnerKind,
     /// Waiters for runs queued for a claimant. Unused by the in-module runner.
     host_runs: Arc<HostRunLedger>,
+    /// Set for a runner-lane conversation: the completion runs on the
+    /// conversation's own runner over llm-runner, never on the claim queue and
+    /// never on the configured runner, whatever `runner` says.
+    session_runner: Option<SessionRunnerRoute>,
     model_chain_generation: u64,
     runner_refusal_cache: Arc<HistorianRunnerRefusalCache>,
     live_guard: SessionSetGuard,
@@ -5006,6 +5061,11 @@ impl McHandler {
         Self::new_with_connection_file(None)
     }
 
+    /// Transcript access shared by compaction engines using the runner route.
+    pub fn provider_runner(&self) -> &dyn session_resolver::ProviderRunner {
+        self.provider_runner.as_ref()
+    }
+
     pub fn new_with_connection_file(connection_file: Option<PathBuf>) -> Self {
         Self::new_with_connection_file_and_route_targets(
             connection_file,
@@ -5064,15 +5124,24 @@ impl McHandler {
                 Arc::clone(&move_visibility),
             )
         });
-        let provider_runner: Arc<dyn session_resolver::ProviderRunner> = match connection_file {
-            Some(path) => Arc::new(session_resolver::RealProviderRunner::new(
-                path,
-                route_targets,
-            )),
-            None => Arc::new(session_resolver::MissingProviderRunner),
-        };
+        let bus_connection_file = connection_file.clone();
+        let provider_runner: Arc<dyn session_resolver::ProviderRunner> =
+            match connection_file.as_ref() {
+                Some(path) => Arc::new(session_resolver::RealProviderRunner::new(
+                    path.clone(),
+                    route_targets.clone(),
+                )),
+                None => Arc::new(session_resolver::MissingProviderRunner),
+            };
+        let historian_model_catalog =
+            providers::HistorianModelCatalog::new(connection_file.clone(), route_targets);
         let store = Arc::new(OnceLock::new());
         let provider_store = Arc::new(providers::Storage::new(Arc::clone(&store)));
+        *provider_store
+            .async_runtime
+            .connection_file
+            .lock()
+            .expect("bus connection file") = bus_connection_file;
         McHandler {
             agent_data,
             move_visibility,
@@ -5103,6 +5172,8 @@ impl McHandler {
             #[cfg(test)]
             fixed_dream_settings: None,
             #[cfg(test)]
+            fixed_historian_settings: None,
+            #[cfg(test)]
             dream_wiring: None,
             reattaching_sessions: Arc::new(Mutex::new(HashSet::new())),
             live_historian_sessions: Arc::new(Mutex::new(HashMap::new())),
@@ -5123,8 +5194,8 @@ impl McHandler {
             frozen_tool_catalogs: Mutex::new(HashMap::new()),
             provider_store,
             provider_serial: Arc::new(providers::ProviderSerial::default()),
-            provider_resident: Arc::new(providers::resident_hooks::ResidentHooks::default()),
             provider_runner,
+            historian_model_catalog,
             provider_historian_worker: OnceLock::new(),
             provider_historian_budget: providers::historian_budget::Budget::process(),
             provider_historian_evaluations: Arc::new(Mutex::new(HashSet::new())),
@@ -5160,10 +5231,6 @@ impl McHandler {
             #[cfg(test)]
             publication_fence_write_hook: Arc::new(Mutex::new(None)),
             bindings: Mutex::new(HashMap::new()),
-            native_route_plans: Mutex::new(HashMap::new()),
-            native_connection_sequence: std::sync::atomic::AtomicU64::new(0),
-            #[cfg(test)]
-            native_bundle_override: Mutex::new(None),
             threshold_logged_routes: Mutex::new(HashSet::new()),
             note_evaluation_capabilities: Mutex::new(HashMap::new()),
             transform_route_channels: Mutex::new(HashMap::new()),
@@ -5215,7 +5282,7 @@ impl McHandler {
             .fetch_add(1, Ordering::Relaxed);
         let store = Arc::clone(&self.store);
         let coordinator = Arc::clone(&self.store_open);
-        let prime_serving_wal = self.provider_resident.is_enabled();
+        let prime_serving_wal = true;
         tokio::spawn(async move {
             let _guard = StoreOpenWaiterGuard {
                 coordinator: Arc::clone(&coordinator),
@@ -5562,6 +5629,7 @@ impl McHandler {
             resolve_project_identity_for_test: AtomicBool::new(false),
             fixed_config: Some(config),
             fixed_dream_settings: None,
+            fixed_historian_settings: None,
             dream_wiring: None,
             reattaching_sessions: Arc::new(Mutex::new(HashSet::new())),
             live_historian_sessions: Arc::new(Mutex::new(HashMap::new())),
@@ -5582,8 +5650,11 @@ impl McHandler {
             frozen_tool_catalogs: Mutex::new(HashMap::new()),
             provider_store,
             provider_serial: Arc::new(providers::ProviderSerial::default()),
-            provider_resident: Arc::new(providers::resident_hooks::ResidentHooks::default()),
             provider_runner: Arc::new(session_resolver::MissingProviderRunner),
+            historian_model_catalog: providers::HistorianModelCatalog::new(
+                None,
+                RouteTargetConfig::default(),
+            ),
             provider_historian_worker: OnceLock::new(),
             provider_historian_budget: providers::historian_budget::Budget::process(),
             provider_historian_evaluations: Arc::new(Mutex::new(HashSet::new())),
@@ -5607,10 +5678,6 @@ impl McHandler {
             #[cfg(test)]
             publication_fence_write_hook: Arc::new(Mutex::new(None)),
             bindings: Mutex::new(HashMap::new()),
-            native_route_plans: Mutex::new(HashMap::new()),
-            native_connection_sequence: std::sync::atomic::AtomicU64::new(0),
-            #[cfg(test)]
-            native_bundle_override: Mutex::new(None),
             threshold_logged_routes: Mutex::new(HashSet::new()),
             note_evaluation_capabilities: Mutex::new(HashMap::new()),
             transform_route_channels: Mutex::new(HashMap::new()),
@@ -5631,11 +5698,7 @@ impl McHandler {
     /// Record the route's session binding (called from `on_bind`). Last write wins for a
     /// reused channel — the daemon won't reuse a channel without a `route.gone` first, so
     /// this only overwrites a stale entry that somehow survived (defensive).
-    fn bind_route(&self, channel: u16, mut binding: SessionBinding) {
-        binding.connection_incarnation = self
-            .native_connection_sequence
-            .fetch_add(1, std::sync::atomic::Ordering::Relaxed)
-            + 1;
+    fn bind_route(&self, channel: u16, binding: SessionBinding) {
         DISPATCH_HEALTH.route_open(channel);
         self.binding_projects
             .lock()
@@ -5651,10 +5714,6 @@ impl McHandler {
             .remove(&channel);
         let replacement = {
             let mut bindings = self.bindings.lock().expect("bindings mutex");
-            self.native_route_plans
-                .lock()
-                .expect("native route plans mutex")
-                .remove(&channel);
             let previous = bindings.insert(channel, binding);
             previous.and_then(|previous| {
                 let still_bound = bindings
@@ -6096,10 +6155,6 @@ impl McHandler {
             .remove(&channel);
         let (removed_root, last_session_route) = {
             let mut bindings = self.bindings.lock().expect("bindings mutex");
-            self.native_route_plans
-                .lock()
-                .expect("native route plans mutex")
-                .remove(&channel);
             let removed = bindings.remove(&channel);
             let last_session_route = removed.as_ref().and_then(|binding| {
                 let still_bound = bindings
@@ -6504,27 +6559,6 @@ impl McHandler {
         self
     }
 
-    /// Test builds only: `false` swaps the resident step engine for the
-    /// non-resident oracle that byte-identical differentials compare against.
-    /// Production always serves step transforms through the resident engine.
-    #[cfg(test)]
-    pub fn with_startup_provider_resident_enabled(mut self, enabled: bool) -> Self {
-        self.provider_resident =
-            Arc::new(providers::resident_hooks::ResidentHooks::enabled(enabled));
-        self
-    }
-
-    /// Limit the resident step engine's charged cache bytes (startup-only).
-    pub fn with_startup_provider_resident_process_cap(mut self, bytes: usize) -> Self {
-        #[cfg(test)]
-        let resident =
-            providers::resident_hooks::ResidentHooks::enabled(self.provider_resident.is_enabled());
-        #[cfg(not(test))]
-        let resident = providers::resident_hooks::ResidentHooks::default();
-        self.provider_resident = Arc::new(resident.with_process_cap(bytes));
-        self
-    }
-
     /// Turn memory off in `config` while the route root's identity is unavailable, so the
     /// historian paths that read the configuration neither promote facts nor search
     /// memories into a project nobody can find again.
@@ -6746,6 +6780,7 @@ impl McHandler {
             rust_background_enabled,
             snapshot_generation,
             log_fence: log_publication_fence,
+            session_runner,
         } = guards;
         let project_path = binding.project_root.to_string_lossy().to_string();
         let harness = binding.harness.clone();
@@ -7041,7 +7076,14 @@ impl McHandler {
                             }
                             historian::RestartAction::ReattachProducer { .. } => {}
                         }
-                        let mut producer = factory.connect(&project_root).await?;
+                        // A run started on the conversation's own runner is
+                        // followed there; its run id means nothing to any other.
+                        let mut producer = match &session_runner {
+                            Some(route) => {
+                                factory.connect_session_runner(&project_root, route).await?
+                            }
+                            None => factory.connect(&project_root).await?,
+                        };
                         reattach_historian_producer(
                             &mut *producer,
                             historian::HistorianReattachRequest {
@@ -7132,6 +7174,7 @@ impl McHandler {
             publication_fence,
             tag_snapshot,
             reclaim_ride_available,
+            runner_lane,
             timings,
         } = prepare;
         let trigger_timer = HistorianTriggerTimer {
@@ -7209,6 +7252,9 @@ impl McHandler {
         let cfg = self.effective_config(&binding.project_root);
         let rust_background_enabled =
             rust_background_enabled.unwrap_or_else(|| cfg.rust_background_enabled());
+        let session_runner = runner_lane
+            .then(|| session_runner_route(binding, cfg.historian_runner_for(&binding.harness)))
+            .flatten();
         if loaded.meta.historian.state != HistorianPhase::Idle {
             let no_fire = self
                 .maybe_spawn_reattach(
@@ -7218,6 +7264,7 @@ impl McHandler {
                         rust_background_enabled,
                         snapshot_generation,
                         log_fence: publication_fence.clone(),
+                        session_runner: session_runner.clone(),
                     },
                     binding,
                     projection,
@@ -7758,6 +7805,7 @@ impl McHandler {
                 firing,
                 runner: self.record_historian_runner(&parsed.session_id, &cfg, &binding.harness),
                 host_runs: Arc::clone(&self.host_runs),
+                session_runner,
                 model_chain_generation,
                 runner_refusal_cache: Arc::clone(&self.historian_runner_refusals),
                 live_guard,
@@ -7927,6 +7975,9 @@ impl McHandler {
                 &binding.harness,
             ),
             host_runs: Arc::clone(&self.host_runs),
+            // Wrapup belongs to the request-driven transform path, which keeps the
+            // configured runner.
+            session_runner: None,
             model_chain_generation,
             runner_refusal_cache: Arc::clone(&self.historian_runner_refusals),
             live_guard,
@@ -8030,6 +8081,7 @@ impl McHandler {
             firing,
             runner,
             host_runs,
+            session_runner,
             model_chain_generation,
             runner_refusal_cache,
             live_guard,
@@ -8050,7 +8102,7 @@ impl McHandler {
         );
         let failure_started_at_ms = firing.now_ms;
         let configured_failure_backoff_at_ms = firing.failure_backoff_at_ms;
-        if runner == HistorianRunnerKind::Host {
+        if runner == HistorianRunnerKind::Host && session_runner.is_none() {
             // The host lane never opens a Broca route, so there is no connect step
             // to fail: the run is queued and this task waits for a claimant.
             let mut request = firing.as_fire_request(
@@ -8084,7 +8136,11 @@ impl McHandler {
             }
             return result;
         }
-        let result = match factory.connect(&project_root).await {
+        let connected = match &session_runner {
+            Some(route) => factory.connect_session_runner(&project_root, route).await,
+            None => factory.connect(&project_root).await,
+        };
+        let result = match connected {
             Ok(mut producer) => {
                 let mut request = firing.as_fire_request(
                     &store,
@@ -9481,11 +9537,14 @@ impl McHandler {
     }
 
     fn handle_session_flush_value(&self, channel: u16, request: &Value) -> HandlerOutcome {
-        let (session_id, _binding) =
-            match self.management_binding(channel, request, "session.flush") {
-                Ok(scope) => scope,
-                Err(outcome) => return outcome,
-            };
+        let (session_id, binding) = match self.management_binding(channel, request, "session.flush")
+        {
+            Ok(scope) => scope,
+            Err(outcome) => return outcome,
+        };
+        if let Some(outcome) = self.flush_async_compaction(&binding) {
+            return outcome;
+        }
         let store = match self.store.get() {
             Some(store) => store,
             None => return self.store_refusal(),
@@ -9732,7 +9791,7 @@ impl McHandler {
                     message: "Historian host lane requires an OpenCode or Pi harness".into(),
                 });
             }
-            providers::admit_host_lane(&binding)?;
+            ops_facade::authorize_harness_scope(&binding)?;
         }
         Ok(binding)
     }
@@ -12323,6 +12382,7 @@ impl McHandler {
                     publication_fence: None,
                     tag_snapshot: result.historian_tags.clone(),
                     reclaim_ride_available: result.reclaim_ride_available,
+                    runner_lane: false,
                     timings: &mut trigger_timings,
                 },
             ) {
@@ -12357,6 +12417,7 @@ impl McHandler {
                                 publication_fence: None,
                                 tag_snapshot: result.historian_tags.clone(),
                                 reclaim_ride_available: result.reclaim_ride_available,
+                                runner_lane: false,
                                 timings: &mut trigger_timings,
                             },
                         ) {
@@ -12432,6 +12493,7 @@ impl McHandler {
                     publication_fence: None,
                     tag_snapshot: result.historian_tags.clone(),
                     reclaim_ride_available: result.reclaim_ride_available,
+                    runner_lane: false,
                     timings: &mut trigger_timings,
                 },
             ) {
@@ -12645,47 +12707,6 @@ impl McHandler {
     }
 
     fn handle_state_sync_value(&self, channel: u16, request: Value) -> HandlerOutcome {
-        if request.get("provider_pass").is_some()
-            && serde_json::to_vec(&request).map_or(true, |bytes| bytes.len() > 3 * 1024 * 1024)
-        {
-            return HandlerOutcome::Error {
-                code: "provider_message_too_large".into(),
-                message: "provider state-sync page exceeds 3 MiB encoded cap".into(),
-            };
-        }
-        // A provider pass without appends still has a barrier, even when all
-        // synchronized watermarks are unchanged. This carries no message data.
-        if (request.get("pass_complete") == Some(&Value::Bool(true))
-            || request.get("provider_pass").is_some())
-            && request.get("shadow_generation").is_none()
-        {
-            let binding = match self
-                .state_sync_binding(channel, request.get("session_id").and_then(Value::as_str))
-            {
-                Ok(binding) => binding,
-                Err(error) => return error,
-            };
-            let Some(store) = self.store.get() else {
-                return self.store_refusal();
-            };
-            let chain: Option<Vec<String>> = match request.get("historian_model_chain") {
-                Some(value) => match serde_json::from_value(value.clone()) {
-                    Ok(chain) => Some(chain),
-                    Err(error) => return providers::invalid(error),
-                },
-                None => None,
-            };
-            return match self.sync_provider_pass_inputs(
-                &binding,
-                store,
-                chain.as_deref(),
-                request.get("pass_complete") == Some(&Value::Bool(true)),
-                request.get("provider_pass"),
-            ) {
-                Ok(()) => respond(json!({"ok":true})),
-                Err(error) => error,
-            };
-        }
         let started = Instant::now();
         let mut timing = state_sync_timing::StateSyncTiming {
             session: request
@@ -13230,21 +13251,6 @@ impl McHandler {
         store: &McStore,
         parsed: ModuleStateSyncWire,
     ) -> HandlerOutcome {
-        // Refuse contention before any authority or provider input is committed.
-        // Keep the same lock until both synchronized stores have been updated.
-        let _provider_serial = match self.host_provider_conversation(binding) {
-            Some((key, _)) => match self.provider_serial.try_lock_for(&key) {
-                Ok(guard) => Some(guard),
-                Err(_) => return providers::transient("provider conversation is busy"),
-            },
-            None => None,
-        };
-        if parsed.provider_pass.is_some() && _provider_serial.is_none() {
-            return providers::invalid("provider_pass requires an admitted host conversation");
-        }
-        let chain = parsed.historian_model_chain.clone();
-        let pass_complete = parsed.pass_complete == Some(true);
-        let provider_pass = parsed.provider_pass.as_ref();
         let note_evaluation_available = parsed.note_evaluation_available.unwrap_or(false);
         #[cfg(test)]
         if !parsed.compartments.is_empty() {
@@ -13356,20 +13362,6 @@ impl McHandler {
             acked_watermarks,
         }) {
             Ok(result) => {
-                if let Err(error) = self.sync_provider_pass_inputs_locked(
-                    binding,
-                    store,
-                    chain.as_deref(),
-                    pass_complete,
-                    provider_pass,
-                ) {
-                    return error;
-                }
-                if pass_complete {
-                    if let Some((key, _)) = self.host_provider_conversation(binding) {
-                        self.schedule_provider_historian(binding.clone(), key);
-                    }
-                }
                 self.set_note_evaluation_capability(
                     &binding.project_root,
                     note_evaluation_available,
@@ -13974,7 +13966,13 @@ impl McHandler {
                 &ledger_session,
                 runner_choices::RunnerChoice::new(dreamer_runner, &binding.harness),
             );
-        if host_completion.is_none() && dreamer_runner.kind == HistorianRunnerKind::Host {
+        // A runner-lane route runs the completion on its own runner, so it is never
+        // asked to run and resend it as a host completion.
+        let session_runner = session_runner_route(&binding, dreamer_runner);
+        if host_completion.is_none()
+            && dreamer_runner.kind == HistorianRunnerKind::Host
+            && session_runner.is_none()
+        {
             tracing::info!(
                 "mc-module: classify runner=host ({}): the host runs the completion for command {command_id}",
                 dreamer_runner.source.describe()
@@ -14050,7 +14048,15 @@ impl McHandler {
                     attempt_errors.push(format!("{model}: {detail}"));
                 }
             };
-            let mut producer = match self.producer_factory.connect(&binding.project_root).await {
+            let connected = match &session_runner {
+                Some(route) => {
+                    self.producer_factory
+                        .connect_session_runner(&binding.project_root, route)
+                        .await
+                }
+                None => self.producer_factory.connect(&binding.project_root).await,
+            };
+            let mut producer = match connected {
                 Ok(producer) => producer,
                 Err(error) => {
                     record_attempt("connect_failed", error.to_string());
@@ -14724,17 +14730,14 @@ impl McHandler {
                 .cloned()
         });
         let frozen = match self.facade_binding(channel) {
-            Ok(binding) if binding.harness == session_resolver::RUNNER_BIND_HARNESS => {
-                let key = self.provider_store.tool_key(&binding)?;
-                self.provider_store
-                    .load(&key)?
-                    .catalog
-                    .map(|catalog| tool_catalog::FrozenCatalog {
-                        compacting: catalog.compacting,
-                        tools: catalog.tools,
-                    })
-                    .or(frozen)
-            }
+            Ok(binding) if binding.harness == session_resolver::RUNNER_BIND_HARNESS => self
+                .provider_store
+                .catalog(&binding)?
+                .map(|catalog| tool_catalog::FrozenCatalog {
+                    compacting: catalog.compacting,
+                    tools: catalog.tools,
+                })
+                .or(frozen),
             _ => frozen,
         };
         if preset.is_none() && frozen.is_none() {
@@ -14852,15 +14855,23 @@ impl McHandler {
             binding.harness == OPENCODE_HARNESS || binding.harness == "opencode2";
         let transform_session_known =
             self.module_knows_transform_session(bound_session, &binding.project_root);
-        // Pi's route already names the real journal session. A daemon-authorized
-        // Thalamus declaration saved for this exact session confirms that binding;
-        // a harness string or full transform alone still requires host resolution.
-        let provider_session_known = self.host_provider_conversation(&binding).is_some();
-        let conversation_key = if binding.harness == session_resolver::RUNNER_BIND_HARNESS {
-            self.provider_store.tool_key(&binding)?.engine_key()
-        } else if (opencode_harness && transform_session_known)
-            || ((opencode_harness || binding.harness == "pi") && provider_session_known)
+        // The bind's (project_root, session) names an asynchronous compaction
+        // conversation whatever harness the bind declares: an MCP facade binds
+        // a runner's conversation by its session alone. More than one match
+        // refuses rather than guessing; none keeps the harness's own path.
+        let async_key = if binding.harness == session_resolver::RUNNER_BIND_HARNESS
+            || self.store.get().is_some()
         {
+            self.async_compaction_namespace(&binding)?
+        } else {
+            None
+        };
+        let async_conversation = async_key.is_some();
+        let conversation_key = if let Some(key) = async_key {
+            key
+        } else if binding.harness == session_resolver::RUNNER_BIND_HARNESS {
+            return Err(session_unresolved_error());
+        } else if opencode_harness && transform_session_known {
             bound_session.to_string()
         } else {
             match self
@@ -14910,6 +14921,7 @@ impl McHandler {
             memory_project_path,
             route_project_root,
             conversation_key,
+            async_conversation,
             memory_enabled: binding.config.memory_enabled && memory_paused.is_none(),
             memory_paused,
         })
@@ -14937,10 +14949,7 @@ impl McHandler {
             Ok(scope) => scope,
             Err(outcome) => return outcome,
         };
-        if self.facade_binding(channel).is_ok_and(|binding| {
-            binding.harness == session_resolver::RUNNER_BIND_HARNESS
-                || self.host_provider_conversation(&binding).is_some()
-        }) {
+        if facade_scope.async_conversation {
             return self.handle_provider_reduce(channel, &requested).await;
         }
         let store = match self.store_for_request().await {
@@ -16389,6 +16398,7 @@ impl ModuleHandler for McHandler {
             warn_if_log_directory_differs(&descriptor, log_directory);
         }
         self.begin_store_open(descriptor, origin);
+        self.start_async_compaction_background();
     }
 
     /// Return an atomics-only liveness snapshot. The SDK invokes this on its separate
@@ -16486,8 +16496,6 @@ impl ModuleHandler for McHandler {
         self.bind_route(
             req.handle.channel,
             SessionBinding {
-                connection_incarnation: 0,
-                native_generation: None,
                 principal: req.principal.clone(),
                 scope: req.scope.clone(),
                 project_root: req.identity.project_root.clone(),
@@ -16598,48 +16606,6 @@ impl McHandler {
             .await
     }
 
-    fn redact_unserved_tool_tags(&self, channel: u16, outcome: HandlerOutcome) -> HandlerOutcome {
-        let Ok(binding) = self.facade_binding(channel) else {
-            return outcome;
-        };
-        let Some((key, _)) = self.host_provider_conversation(&binding) else {
-            return outcome;
-        };
-        let Some(store) = self.store.get() else {
-            return self.store_refusal();
-        };
-        let numbers = match store.unserved_provider_tag_numbers(&key.store_key()) {
-            Ok(numbers) => numbers,
-            Err(error) => return tool_error_result(format!("Error reading served tags: {error}")),
-        };
-        if numbers.is_empty() {
-            return outcome;
-        }
-        let HandlerOutcome::Response(bytes) = outcome else {
-            return outcome;
-        };
-        let mut value: Value = match serde_json::from_slice(&bytes) {
-            Ok(value) => value,
-            Err(_) => return tool_error_result("Error reading tool response"),
-        };
-        // Filter every result string, including raw recovered text, snippets,
-        // error echoes and status details. Transform/hook answers deliberately
-        // bypass this boundary: they introduce the message's own tag, and retries
-        // must replay that exact tagged payload rather than a redacted variant.
-        fn redact(value: &mut Value, numbers: &BTreeSet<i64>) {
-            match value {
-                Value::String(text) => {
-                    *text = redact_unserved_tag_text(text, numbers);
-                }
-                Value::Array(values) => values.iter_mut().for_each(|v| redact(v, numbers)),
-                Value::Object(values) => values.values_mut().for_each(|v| redact(v, numbers)),
-                _ => {}
-            }
-        }
-        redact(&mut value, &numbers);
-        respond(value)
-    }
-
     async fn dispatch_value_with_inbound_bytes(
         &self,
         channel: u16,
@@ -16742,34 +16708,9 @@ impl McHandler {
         if let Some(outcome) = self.broca_dream_route(channel, method, &request) {
             return outcome;
         }
-        let provider_operation = if method == Some("tools/call") {
-            request.pointer("/params/name").and_then(Value::as_str)
-        } else {
-            method.or_else(|| request.get("name").and_then(Value::as_str))
-        };
-        if let Ok(binding) = self.facade_binding(channel) {
-            if let Some(refusal) =
-                providers::inbound_ceiling(&binding, provider_operation, inbound_bytes)
-            {
-                return refusal;
-            }
-        }
         let catalog_request = method.is_none()
             && request.get("name").and_then(Value::as_str) == Some("tool.catalog")
             && request.get("arguments").is_some();
-        if matches!(
-            method,
-            Some("compaction.setup" | "compaction.step" | "transform.hook")
-        ) {
-            if let (Ok(binding), Some(session)) = (
-                self.facade_binding(channel),
-                request.pointer("/params/session").and_then(Value::as_str),
-            ) {
-                if let Some(refusal) = self.provider_store.catalog_refusal(&binding, session) {
-                    return refusal;
-                }
-            }
-        }
         // A store that a newer ck-mc migrated past this binary refuses every request by name,
         // whatever its lane. Most lanes would refuse anyway because no store handle exists, but
         // Catalog discovery is the exception: its bytes derive from config, not
@@ -16790,12 +16731,7 @@ impl McHandler {
         if let Some(method) = method {
             return match method {
                 "role.describe" => providers::describe(),
-                "compaction.setup"
-                | "compaction.step"
-                | "compaction.delete"
-                | "compaction.view.read"
-                | "transform.declare"
-                | "transform.hook" => {
+                "compaction.setup" | "view.get" | "compaction.ride" => {
                     self.handle_provider_value(
                         channel,
                         method,
@@ -16836,10 +16772,7 @@ impl McHandler {
                 "todo_state.set" => self.handle_todo_state_set_value(channel, &request),
                 "session.flush" => self.handle_session_flush_value(channel, &request),
                 "session.recomp" => self.handle_session_recomp_value(channel, &request),
-                "session.status" => self.redact_unserved_tool_tags(
-                    channel,
-                    self.handle_session_status_value(channel, &request),
-                ),
+                "session.status" => self.handle_session_status_value(channel, &request),
                 "session.delete" => self.handle_session_delete_value(channel, &request),
                 "session.wrapup" => self.handle_session_wrapup_value(channel, &request).await,
                 // Explicit wire-debugging echo. Opt-in only: echoing every
@@ -16852,27 +16785,10 @@ impl McHandler {
         }
         if request.get("name").is_some() && request.get("arguments").is_some() {
             let outcome = self.handle_facade_value(channel, request).await;
-            return self.redact_unserved_tool_tags(channel, outcome);
+            return outcome;
         }
         unrecognized_request_error(&request)
     }
-}
-
-fn redact_unserved_tag_text(text: &str, numbers: &BTreeSet<i64>) -> String {
-    static TAG: OnceLock<regex::Regex> = OnceLock::new();
-    let tag = TAG.get_or_init(|| regex::Regex::new(r"§([0-9]+)§").expect("tag regex"));
-    tag.replace_all(text, |captures: &regex::Captures<'_>| {
-        if captures[1]
-            .parse()
-            .ok()
-            .is_some_and(|n| numbers.contains(&n))
-        {
-            "[unserved tag]".to_string()
-        } else {
-            captures[0].to_string()
-        }
-    })
-    .into_owned()
 }
 
 fn non_served_route_refusal(method: &str) -> HandlerOutcome {
@@ -16950,7 +16866,7 @@ const MAX_HISTORIAN_REPORT_BYTES: usize = MAX_FACADE_FRAME_BYTES;
 /// A daemon that predates principal stamping sends no principal at all. Both
 /// shapes are the plugin. Any other binding is treated as a harness module: a
 /// Direct route that asked the daemon for a scope, or a reserved or unverified
-/// principal. Those must pass `providers::admit_host_lane` and may only touch
+/// principal. Those must pass historian claim authorization and may only touch
 /// the run of their own bound session.
 fn historian_plugin_lane(binding: &SessionBinding) -> bool {
     match &binding.principal {
@@ -18911,7 +18827,6 @@ fn assemble_state_sync_seed(
             .or(batched_note_evaluation_available),
         historian_model_chain: final_batch.historian_model_chain,
         pass_complete: final_batch.pass_complete,
-        provider_pass: final_batch.provider_pass,
     }
 }
 
@@ -21439,6 +21354,11 @@ pub fn manifest_with_route_targets(
     manifest_with_route_targets_and_smart_notes(module_id, resolved_routes, true)
 }
 
+/// The ctx tool facades resolve a bind's `(project_root, session)` to an
+/// asynchronous compaction conversation whatever harness the bind names, so
+/// an MCP facade may bind a runner's conversation by its session alone.
+pub const MCP_CONVERSATION_BINDING_V1: &str = "mcp-conversation-binding/v1";
+
 pub fn manifest_with_route_targets_and_smart_notes(
     module_id: &str,
     resolved_routes: &RouteTargetConfig,
@@ -21454,7 +21374,7 @@ pub fn manifest_with_route_targets_and_smart_notes(
     // project, whereas MC uses one machine-wide store with project-keyed rows.
     let mut capabilities = vec![
         cortexkit_role_compaction_provider::PROVIDES.to_string(),
-        cortexkit_role_step_transform_provider::PROVIDES.to_string(),
+        MCP_CONVERSATION_BINDING_V1.to_string(),
     ];
     let mut provides = vec![ProviderRole::ToolProvider {
         tools,
@@ -23915,38 +23835,6 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn resident_startup_primes_wal_before_publishing_the_store() {
-        for enabled in [false, true] {
-            let dir = tempfile::tempdir().unwrap();
-            let descriptor = dev_descriptor_at(dir.path().to_str().unwrap());
-            drop(McStore::open_for_test(&descriptor).unwrap());
-            // Match the migration timestamps in store.db and context.db, then
-            // remove the fresh-install marker so attachment performs no repair
-            // writes that could hide a missing startup prime.
-            let seeded = McHandler::open_store_once(&descriptor, false)
-                .await
-                .unwrap();
-            seeded
-                .set_single_store_marker_build_for_test("restart-fixture")
-                .unwrap();
-            drop(seeded);
-            let StorageBackend::Sqlite { path } = &descriptor.backend else {
-                unreachable!()
-            };
-            let handler = McHandler::new().with_startup_provider_resident_enabled(enabled);
-            handler.begin_store_open(descriptor.clone(), DescriptorOrigin::DevFallback);
-            wait_for_store_open_phase(&handler, STORE_OPENED).await;
-            assert!(handler.store.get().is_some());
-            let bytes = std::fs::metadata(format!("{path}-wal")).map_or(0, |meta| meta.len());
-            assert_eq!(
-                bytes > 32,
-                enabled,
-                "only resident startup must prime WAL before publication"
-            );
-        }
-    }
-
-    #[tokio::test]
     async fn double_store_open_during_lease_wait_has_one_waiter() {
         let dir = tempfile::tempdir().unwrap();
         let data_home = dir.path().join("data");
@@ -24203,6 +24091,18 @@ mod tests {
             vec![ConsumerRole::ServiceClient {
                 of: route_targets::expected_routes_for_tests("broca")
             }]
+        );
+        let mut expected_capabilities = vec![
+            "compaction-provider/v1".to_string(),
+            "mcp-conversation-binding/v1".to_string(),
+        ];
+        if agent_data::ENABLED {
+            expected_capabilities.push(cortexkit_role_agent_data::PROVIDES.to_string());
+        }
+        assert_eq!(
+            m.capabilities.as_ref().map(|c| &c.provides),
+            Some(&expected_capabilities),
+            "capability list is pinned"
         );
         let ProviderRole::ToolProvider { tools, .. } = &m.provides[0] else {
             panic!("magic-context must expose a tool provider role");
@@ -25099,8 +24999,6 @@ mod tests {
 
     fn binding_with_harness(root: &str, harness: &str, session: &str) -> SessionBinding {
         SessionBinding {
-            connection_incarnation: 0,
-            native_generation: None,
             principal: None,
             scope: None,
             project_root: PathBuf::from(root),
@@ -40079,6 +39977,74 @@ mod tests {
                 .await;
             assert_eq!(error_code(outcome), "unrecognized_request_shape", "{alias}");
         }
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn runner_transcript_todo_matches_the_todo_state_set_anchor() {
+        // A runner sends no todo_state.set; ck-mc reads the todowrite call and
+        // its result from the transcript. The stored state, and the synthetic
+        // todo pair built from it, must equal what todo_state.set produces.
+        let fixture: Value =
+            serde_json::from_str(include_str!("../testdata/runner-todo-transcript.json")).unwrap();
+        let producer = Arc::new(ProducerState::default());
+        let (handler, store, _dir, _project) = handler_with_store(producer, default_test_config());
+        let set = &fixture["todo_state_set"];
+        let request = json!({
+            "method": "todo_state.set",
+            "v": 1,
+            "session_id": "ses",
+            "state_json": serde_json::to_string(&set["todos"]).unwrap(),
+            "owner_message_id": set["owner_message_id"],
+        });
+        assert_eq!(
+            call_dispatch_request(&handler, request).await,
+            json!({ "ok": true })
+        );
+
+        let transcript: Vec<crate::providers::codec::InboundMessage> =
+            serde_json::from_value(fixture["transcript"].clone()).unwrap();
+        let mut scan = crate::providers::runner_todo::TodoScan::default();
+        let derived = crate::providers::runner_todo::scan_status_messages(
+            &mut scan,
+            fixture["lineage_id"].as_str().unwrap(),
+            &transcript,
+        )
+        .unwrap()
+        .expect("the transcript holds a successful todowrite");
+        store
+            .set_todo_state(
+                "ses-derived",
+                &derived.state_json,
+                &derived.owner_message_id,
+                &derived.state_hash,
+            )
+            .unwrap();
+
+        let reported = store.load("ses").unwrap().meta;
+        let derived_meta = store.load("ses-derived").unwrap().meta;
+        assert_eq!(
+            reported.last_todo_state.as_deref(),
+            fixture["expected_state_json"].as_str()
+        );
+        assert_eq!(derived_meta.last_todo_state, reported.last_todo_state);
+        assert_eq!(
+            derived_meta.last_todo_state_hash,
+            reported.last_todo_state_hash
+        );
+        assert_eq!(
+            derived_meta.last_todo_state_owner_message_id,
+            reported.last_todo_state_owner_message_id
+        );
+        let anchor =
+            |meta: &mc_store::ModuleMeta| match crate::injection::advance_injection_from_meta(
+                meta, None, true, None,
+            ) {
+                crate::injection::InjectionOutcome::Replace(pair) => {
+                    pair.freeze_at(meta.last_todo_state_owner_message_id.clone())
+                }
+                other => panic!("expected a synthetic todo pair, got {other:?}"),
+            };
+        assert_eq!(anchor(&derived_meta), anchor(&reported));
     }
 
     #[tokio::test(flavor = "current_thread")]

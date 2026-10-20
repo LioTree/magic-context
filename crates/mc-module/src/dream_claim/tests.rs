@@ -137,8 +137,6 @@ impl Fixture {
         handler.bind_route(
             7,
             SessionBinding {
-                connection_incarnation: 1,
-                native_generation: None,
                 principal: None,
                 scope: None,
                 project_root: directory.clone(),

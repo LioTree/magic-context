@@ -1847,102 +1847,8 @@ mod served_differential {
         json!({"passes":passes,"facades":facades(&handler).await})
     }
 
-    fn native(ordinal: u64, text: &str) -> Value {
-        json!({"ordinal":ordinal,"mid":format!("m{ordinal}"),"message":{"info":{"id":format!("m{ordinal}"),"role":"user","time":{"created":1}},"parts":[{"id":format!("p{ordinal}"),"type":"text","text":text}]}})
-    }
-    async fn provider_lane() -> Value {
-        let (handler, store, _dir, mut bound) = fixture();
-        // Bridged provider operations require the daemon-stamped harness principal
-        // and session scope; the legacy Rust transform fixture remains unprivileged.
-        bound.principal = Some(subc_protocol::Principal::Reserved {
-            module_id: "thalamus-harness".into(),
-        });
-        bound.scope = Some(subc_protocol::scope::ScopeStamp {
-            owner: subc_protocol::Principal::Reserved {
-                module_id: "prefrontal-core".into(),
-            },
-            scope_ref: "ses".into(),
-            scope_epoch: 1,
-            kind: subc_protocol::scope::ScopeKind::Head,
-            parent: None,
-            parent_state: None,
-            attributes: Default::default(),
-            owner_authorized: true,
-        });
-        handler.bind_route(7, bound);
-        let setup = json!({"session":"ses","harness":"opencode","request_id":"setup","preset":"head","params":{"serializer_profile":"opencode-aisdk","observation":"answer","auto_search_enabled":true,"auto_search_min_prompt_chars":0,"auto_search_score_threshold":0.0},"composition":{},"model":"fixture","context_window":100000,"now":1,"lineage_id":"L"});
-        outcome_bytes(
-            handler
-                .dispatch_value(
-                    7,
-                    json!({"method":"transform.declare","params":{"params":setup["params"]}}),
-                )
-                .await,
-        );
-        outcome_bytes(
-            handler
-                .dispatch_value(7, json!({"method":"compaction.setup","params":setup}))
-                .await,
-        );
-        let entries = vec![
-            native(1, "queue backpressure"),
-            native(2, "queue needs bounded drains"),
-        ];
-        let mut applied = Value::Null;
-        let mut served = Value::Null;
-        let mut passes = Vec::new();
-        for pass in 0..3 {
-            let mut step = json!({"session":"ses","harness":"opencode","request_id":format!("step-{pass}"),"lineage_id":"L","step_id":format!("st-{pass}"),"step_kind":"user_turn","model":"fixture","context_window":100000,"estimate":{"request_tokens":1000},"messages":if pass==0 {entries.clone()} else {vec![]},"newest":{"ordinal":2,"mid":"m2"},"now":2+pass});
-            if pass == 0 {
-                step["prefix_rebuilding"] = json!({"reason":"pipeline_switch"});
-            } else {
-                step["last_applied"] = applied.clone();
-            }
-            if pass == 2 {
-                step["model"] = json!("next-model");
-                step["prefix_rebuilding"] = json!({"reason":"model_switch"});
-            }
-            let bytes = outcome_bytes(
-                handler
-                    .dispatch_value(7, json!({"method":"compaction.step","params":step}))
-                    .await,
-            );
-            let response: Value = serde_json::from_slice(&bytes).unwrap();
-            assert!(
-                response["answer"] == "noop" || response["answer"] == "compaction_message",
-                "{response}"
-            );
-            if response["answer"] == "compaction_message" {
-                applied = response["compaction"].clone();
-                served = applied["replacement"].clone();
-            }
-            assert!(served.is_array());
-            passes.push(json!({"pass_kind":response["answer"],"served_bytes":serde_json::to_vec(&served).unwrap()}));
-        }
-        store
-            .seed_memory(
-                2,
-                "git:i3-served",
-                "CONSTRAINTS",
-                "queue needs bounded drains dispatch",
-                80,
-            )
-            .unwrap();
-        let plan = json!({"serializer_profile":"opencode-aisdk","observation":"answer","auto_search_enabled":true,"auto_search_min_prompt_chars":0,"auto_search_score_threshold":0.0});
-
-        let message = native(3, "queue needs bounded drains dispatch")["message"].clone();
-        outcome_bytes(handler.dispatch_value(7,json!({"method":"state_sync","session_id":"ses","provider_pass":{"lineage_id":"L","appended":[{"mid":"m3","ordinal":3,"message":message}],"physical_tail":{"mid":"m3","ordinal":3},"exact_pass_plan":"hard"}})).await);
-        let hint = outcome_bytes(handler.dispatch_value(7,json!({"method":"transform.hook","params":{"session":"ses","harness":"opencode","params":plan,"lineage_id":"L","subject_mid":"m3","subject_ordinal":3,"message":message,"hook":"pre_user","blocks":["queue needs bounded drains dispatch"],"step_id":"hint"}})).await);
-        assert!(
-            String::from_utf8_lossy(&hint).contains("ctx-search-hint"),
-            "provider auto-hint fixture must produce an augmentation: {}",
-            String::from_utf8_lossy(&hint)
-        );
-        json!({"passes":passes,"auto_hint_reply_bytes":hint,"facades":facades(&handler).await})
-    }
-
     #[tokio::test]
-    async fn served_dispatch_matches_pre_integration_bytes_on_three_lanes() {
+    async fn served_dispatch_matches_pre_integration_bytes_on_full_array_lanes() {
         for (lane, value, expected) in [
             (
                 "current_rust",
@@ -1953,11 +1859,6 @@ mod served_differential {
                 "full_array",
                 legacy_lane(false).await,
                 "ee13bf2c5994c82fc20bfc901fdaccab634363b6da02cd70c762a9a3b5084e07",
-            ),
-            (
-                "fast_rust_provider",
-                provider_lane().await,
-                "71a1bae8a33dc88f03504046f31edf0326105ed6b21b4fdfe1a1896f75638a9c",
             ),
         ] {
             let bytes = serde_json::to_vec(&value).unwrap();

@@ -38,6 +38,7 @@ mod historian_claim;
 pub use historian_claim::with_historian_claim_fixture_entropy;
 mod historian_telemetry;
 pub use historian_telemetry::{HistorianInvocation, HistorianRunTelemetry};
+mod async_compaction;
 pub mod memory_history;
 pub mod memory_lifecycle;
 pub mod memory_projection;
@@ -49,6 +50,7 @@ pub mod parity_schema_manifest;
 pub mod private_permissions;
 #[cfg(test)]
 mod provider_delete_tests;
+#[cfg(test)]
 mod provider_legacy;
 mod provider_log;
 mod provider_policy_overlay;
@@ -3346,6 +3348,10 @@ const MIGRATIONS: &[Migration] = &[
         version: 73,
         // Retire whole-copy provider views; every lane now stores v2 recipes.
         statements: include_str!("migrations/store_073_provider_views_v1_retired.sql"),
+    },
+    Migration {
+        version: 74,
+        statements: include_str!("migrations/store_074_async_compaction.sql"),
     },
 ];
 
@@ -7799,7 +7805,6 @@ impl<'a> FacadeMutationTxn<'a> {
 pub struct McStore {
     inner: Arc<SqliteStore>,
     move_path: Option<std::path::PathBuf>,
-    provider_wal: Mutex<Option<provider_wal::ProviderWal>>,
     native_snapshot_fallbacks: Mutex<HashMap<String, cache_codec::NativeSnapshotRejection>>,
     // Distinguishes independent stores in the process-local tag baseline cache. Production
     // opens one store for the module lifetime; tests and embedded callers may open several.
@@ -8514,7 +8519,6 @@ impl McStore {
                 }
                 _ => None,
             },
-            provider_wal: Mutex::new(None),
             native_snapshot_fallbacks: Mutex::new(HashMap::new()),
             tag_cache_namespace: Arc::new(std::sync::atomic::AtomicU64::new(
                 NEXT_TAG_CACHE_NAMESPACE.fetch_add(1, Ordering::Relaxed),
@@ -9233,6 +9237,47 @@ impl McStore {
         }
     }
 
+    /// [`McStore::load_meta`] plus, from the same small row, an identity of
+    /// the tail hygiene baseline a full [`McStore::load`] would decode: the
+    /// sections version, the tail section's index entry (its digest) and the
+    /// native-tail reference kept in the small meta. Two equal identities mean
+    /// the same baseline, so a caller can keep a decoded baseline (one
+    /// measurement per tail part) and skip the full load while it holds.
+    /// `None` identity when the session has no row.
+    pub fn load_meta_with_tail_identity(
+        &self,
+        session_id: &str,
+    ) -> Result<(MetaSnapshot, Option<String>), McStoreError> {
+        let row = self
+            .inner
+            .with_conn(|conn| cache_codec::read_small_row(conn, session_id))?;
+        let identity = row.as_ref().and_then(cache_codec::tail_baseline_identity);
+        let user_profile_version = if self.has_context_domain() {
+            self.user_profile_version()?
+        } else {
+            0
+        };
+        let snapshot = match row {
+            None => MetaSnapshot {
+                row_version: None,
+                meta: ModuleMeta {
+                    user_profile_version,
+                    ..ModuleMeta::default()
+                },
+            },
+            Some(row) => {
+                let mut meta = cache_codec::decode_small_meta(&row.meta)
+                    .map_err(|error| McStoreError::Serde(error.to_string()))?;
+                meta.user_profile_version = user_profile_version;
+                MetaSnapshot {
+                    row_version: Some(row.row_version),
+                    meta,
+                }
+            }
+        };
+        Ok((snapshot, identity))
+    }
+
     /// Read the committed boundary from the small cache header without hydrating
     /// frozen units or covered-message policy. Native endpoint validation needs
     /// only this coordinate, not the history represented by the boundary.
@@ -9413,6 +9458,17 @@ impl McStore {
         self.load_transform_snapshot_with_hook(session_id, || {})
     }
 
+    /// Read identities only for the supplied live context. The caller must hold
+    /// a validated logical-prefix certificate; omitted identities remain in rows
+    /// and are not deleted by a transform commit using this scoped snapshot.
+    pub fn load_logical_transform_snapshot(
+        &self,
+        session_id: &str,
+        mids: &[&str],
+    ) -> Result<TransformSnapshot, McStoreError> {
+        self.load_transform_snapshot_scoped(session_id, None, Some(mids), || {})
+    }
+
     /// Internal native execution reads only identities in its validated live
     /// tail. Public full loads continue to reconstruct the entire baseline.
     pub fn load_native_transform_snapshot(
@@ -9421,7 +9477,8 @@ impl McStore {
         prefix: &provider_log::ProviderNativePrefix,
         mids: &[&str],
     ) -> Result<TransformSnapshot, McStoreError> {
-        let result = self.load_transform_snapshot_scoped(session_id, Some((prefix, mids)), || {});
+        let result =
+            self.load_transform_snapshot_scoped(session_id, Some((prefix, mids)), None, || {});
         if let Err(McStoreError::NativeSnapshotUnavailable(reason)) = &result {
             let mut logged = self
                 .native_snapshot_fallbacks
@@ -9456,13 +9513,14 @@ impl McStore {
         session_id: &str,
         after_state_read: impl FnOnce(),
     ) -> Result<TransformSnapshot, McStoreError> {
-        self.load_transform_snapshot_scoped(session_id, None, after_state_read)
+        self.load_transform_snapshot_scoped(session_id, None, None, after_state_read)
     }
 
     fn load_transform_snapshot_scoped(
         &self,
         session_id: &str,
         native: Option<(&provider_log::ProviderNativePrefix, &[&str])>,
+        logical_mids: Option<&[&str]>,
         after_state_read: impl FnOnce(),
     ) -> Result<TransformSnapshot, McStoreError> {
         let snapshot = self.inner.with_conn(|conn| {
@@ -9485,7 +9543,7 @@ impl McStore {
                         sections,
                     } = decoded;
                     log_discarded_sections(session_id, &sections);
-                    if let Some((_, mids)) = native {
+                    if let Some(mids) = native.map(|(_, mids)| mids).or(logical_mids) {
                         let mids=serde_json::to_string(mids).map_err(serde_to_sql_error)?;
                         let mut query=transaction.prepare_cached("SELECT mid,identities FROM mc_block_identities WHERE session_id=?1 AND mid IN (SELECT value FROM json_each(?2))")?;
                         for row in query.query_map(params![session_id,mids],|row|Ok((row.get::<_,String>(0)?,row.get::<_,String>(1)?)))? {
@@ -11444,6 +11502,27 @@ impl McStore {
         request: TransformCommit<'_>,
         provider_policy: Option<&provider_records::ProviderEnginePolicy>,
     ) -> Result<u64, McStoreError> {
+        self.commit_transform_scoped(session_id, request, provider_policy, false)
+    }
+
+    /// A certified logical-prefix pass read only its live identities. Preserve
+    /// the covered identity rows it omitted instead of treating them as deleted.
+    pub fn commit_logical_transform_with_provider_policy(
+        &self,
+        session_id: &str,
+        request: TransformCommit<'_>,
+        provider_policy: Option<&provider_records::ProviderEnginePolicy>,
+    ) -> Result<u64, McStoreError> {
+        self.commit_transform_scoped(session_id, request, provider_policy, true)
+    }
+
+    fn commit_transform_scoped(
+        &self,
+        session_id: &str,
+        request: TransformCommit<'_>,
+        provider_policy: Option<&provider_records::ProviderEnginePolicy>,
+        partial_identities: bool,
+    ) -> Result<u64, McStoreError> {
         let TransformCommit {
             expected,
             core,
@@ -11590,7 +11669,8 @@ impl McStore {
             // snapshot shows up as a changed head on the next pass.
 
             // Refuse before the diff runs rather than treating an unhydrated meta as a
-            // request to delete the session's identity history.
+            // request to delete the session's identity history. Scoped identity
+            // commits only upsert, so an empty scoped map cannot delete history.
             if let Some(prefix) = native_prefix {
                 let decoded = cache_codec::read_native_decoded(tx, session_id, prefix)
                     .map_err(|error| rusqlite::Error::ToSqlConversionFailure(Box::new(error)))?
@@ -11599,8 +11679,10 @@ impl McStore {
                     || decoded.sections.any_discarded() {
                     return Err(rusqlite::Error::InvalidQuery);
                 }
-            } else if let Some(stored) = refuse_unhydrated_block_identities_tx(tx, session_id, meta)? {
-                return Ok(CommitOutcome::UnhydratedBlockIdentities(stored));
+            } else if !partial_identities {
+                if let Some(stored) = refuse_unhydrated_block_identities_tx(tx, session_id, meta)? {
+                    return Ok(CommitOutcome::UnhydratedBlockIdentities(stored));
+                }
             }
             let stored_units = stored_index
                 .as_ref()
@@ -11620,12 +11702,12 @@ impl McStore {
             // WHICH entries differ means reading every stored row, so a pass that changed
             // none of them proves that from its fingerprint and skips the comparison
             // entirely; that is the common case and it must not cost a walk of the session.
-            let row_state_unchanged = native_prefix.is_none()
+            let row_state_unchanged = native_prefix.is_none() && !partial_identities
                 && row_state_digest_matches_tx(tx, session_id, current, &fingerprint)?;
             let row_state_writes = if row_state_unchanged {
                 0
             } else {
-                (if native_prefix.is_some() {
+                (if native_prefix.is_some() || partial_identities {
                     sync_native_block_identities_tx(tx, session_id, &meta.block_identity_by_mid)?
                 } else {
                     sync_block_identities_tx(tx, session_id, &meta.block_identity_by_mid)?

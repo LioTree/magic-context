@@ -110,10 +110,11 @@ const VIEWED_V1: [&str; 2] = ["broca", "claude-code"];
 const HARNESS: [&str; 4] = ["broca", "claude-code", "opencode", "opencode2"];
 
 /// Harnesses whose populated conversations still exist at `version`: migration
-/// 72 reset the two OpenCode ledgers.
+/// 72 reset the two OpenCode ledgers; 73 retired all remaining v1 view owners.
 fn seeded_harnesses(version: u32) -> impl Iterator<Item = &'static str> {
     HARNESS
         .into_iter()
+        .filter(move |_| version < 73)
         .filter(move |harness| version < 72 || !harness.starts_with("opencode"))
 }
 
@@ -490,7 +491,7 @@ fn assert_metadata_and_inventory(store: &McStore, version: u32) {
             }
         }
     }
-    if version == 73 {
+    if version == 74 {
         store
             .inner
             .with_conn(|conn| {
@@ -499,8 +500,8 @@ fn assert_metadata_and_inventory(store: &McStore, version: u32) {
                 Ok(())
             })
             .unwrap();
-        assert_eq!(crate::move_inventory::INVENTORY_VERSION, 8);
-        assert_eq!(crate::move_inventory::STORE_SCHEMA_VERSION, 73);
+        assert_eq!(crate::move_inventory::INVENTORY_VERSION, 9);
+        assert_eq!(crate::move_inventory::STORE_SCHEMA_VERSION, 74);
     }
 }
 
@@ -523,6 +524,7 @@ fn assert_fault_rolls_back(descriptor: &StorageDescriptor, before: &Snapshot, ta
                                 68 => "mc_provider_policy_changes_v1",
                                 71 => "mc_provider_policy_preparations_v1",
                                 72 => "mc_provider_policy_cuts_v1",
+                                74 => "mc_async_compaction_baselines",
                                 _ => "",
                             }
                     }
@@ -851,6 +853,119 @@ fn assert_intent(store: &McStore, target: u32) {
             assert_eq!(
                 scalar::<u32>(store, "SELECT count(*) FROM mc_provider_catalogs_v1"),
                 4
+            );
+        }
+        74 => {
+            for table in [
+                "mc_async_compaction",
+                "mc_async_compaction_entries",
+                "mc_async_compaction_views",
+                "mc_async_compaction_baselines",
+            ] {
+                assert_eq!(
+                    scalar::<u32>(store, &format!("SELECT count(*) FROM {table}")),
+                    0
+                );
+            }
+            let key = "[\"project\",\"async-owner\",\"opencode\"]";
+            let mut save =
+                store.async_compaction_save("async-ref", key, "async-owner", "{\"cursor\":7}");
+            save.append_entry(0, "{\"m\":0}".into(), "[]".into())
+                .append_entry(1, "{\"m\":1}".into(), "[]".into())
+                .baseline("applied", Some("{\"initial\":true}".into()));
+            save.commit().unwrap();
+            assert_eq!(
+                store.load_async_compaction("async-ref").unwrap().as_deref(),
+                Some("{\"cursor\":7}")
+            );
+            // A later save rewrites only the small record, cuts the held
+            // transcript after ordinal 0 and appends past the cut.
+            let mut save =
+                store.async_compaction_save("async-ref", key, "async-owner", "{\"cursor\":8}");
+            save.truncate_entries(Some(0))
+                .append_entry(1, "{\"m\":\"1b\"}".into(), "[]".into());
+            save.commit().unwrap();
+            let rows = store
+                .load_async_compaction_rows("async-ref")
+                .unwrap()
+                .unwrap();
+            assert_eq!(rows.state, "{\"cursor\":8}");
+            assert_eq!(
+                rows.entries,
+                vec![
+                    (0, "{\"m\":0}".to_string(), "[]".to_string()),
+                    (1, "{\"m\":\"1b\"}".to_string(), "[]".to_string())
+                ]
+            );
+            assert_eq!(
+                rows.baselines,
+                vec![("applied".to_string(), "{\"initial\":true}".to_string())]
+            );
+            // Held entries are immutable: appending a stored ordinal refuses.
+            let mut save =
+                store.async_compaction_save("async-ref", key, "async-owner", "{\"cursor\":9}");
+            save.append_entry(1, "{}".into(), "[]".into());
+            assert!(save.commit().is_err());
+            let version = store
+                .reserve_async_compaction_version("async-ref", 0)
+                .unwrap();
+            assert_eq!(version, 1);
+            for version in 1..=3 {
+                store
+                    .save_async_compaction_view(
+                        "async-ref",
+                        version,
+                        &format!("{{\"immutable\":{version}}}"),
+                        "{\"engine\":true}",
+                    )
+                    .unwrap();
+            }
+            assert_eq!(
+                store
+                    .load_async_compaction_view("async-ref", 1)
+                    .unwrap()
+                    .as_deref(),
+                Some("{\"immutable\":1}")
+            );
+            // Acknowledging version 2 evicts version 1 in the same transaction;
+            // a floor past every version still keeps the newest one.
+            let mut save =
+                store.async_compaction_save("async-ref", key, "async-owner", "{\"cursor\":9}");
+            save.retain_views_from(2);
+            save.commit().unwrap();
+            assert_eq!(
+                store.load_async_compaction_view("async-ref", 1).unwrap(),
+                None
+            );
+            assert!(store
+                .load_async_compaction_view("async-ref", 2)
+                .unwrap()
+                .is_some());
+            let mut save =
+                store.async_compaction_save("async-ref", key, "async-owner", "{\"cursor\":9}");
+            save.retain_views_from(10).clear_engine_views();
+            save.commit().unwrap();
+            let rows = store
+                .load_async_compaction_rows("async-ref")
+                .unwrap()
+                .unwrap();
+            assert!(rows.engine_views.is_empty());
+            assert_eq!(
+                scalar::<u32>(
+                    store,
+                    "SELECT count(*) FROM mc_async_compaction_views WHERE version=3"
+                ),
+                1
+            );
+            assert_eq!(
+                scalar::<u32>(store, "SELECT count(*) FROM mc_async_compaction_views"),
+                1
+            );
+            assert_eq!(
+                store
+                    .reserve_async_compaction_version("async-ref", 50)
+                    .unwrap(),
+                51
             );
         }
         _ => unreachable!(),
@@ -1497,3 +1612,4 @@ increment!(populated_69_to_70, 69);
 increment!(populated_70_to_71, 70);
 increment!(populated_71_to_72, 71);
 increment!(populated_72_to_73, 72);
+increment!(populated_73_to_74, 73);

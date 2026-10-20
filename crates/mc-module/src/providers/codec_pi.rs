@@ -1,8 +1,15 @@
 //! Pi provider ingress shares the journal codec with full native transforms.
 use super::*;
 
-pub(super) fn decode_messages(
-    messages: &[compact::status::StatusMessage],
+pub fn decode_messages(
+    messages: &[codec::InboundMessage],
+) -> Result<crate::codec::DecodedHarnessMessages, HandlerOutcome> {
+    decode_messages_from(messages, messages.first().map_or(0, |m| m.ordinal))
+}
+
+pub fn decode_messages_from(
+    messages: &[codec::InboundMessage],
+    source_from: u64,
 ) -> Result<crate::codec::DecodedHarnessMessages, HandlerOutcome> {
     for message in messages {
         if message.message.get("id").and_then(Value::as_str) != Some(message.mid.as_str())
@@ -28,7 +35,12 @@ pub(super) fn decode_messages(
         pins.mid_pins
             .insert(message.mid.clone(), message.mid.clone());
     }
-    let mut decoded = crate::codec::decode_pi_with_sidecar(&native, Some(&pins));
+    let ordinals = messages
+        .iter()
+        .map(|m| m.ordinal.saturating_sub(source_from).saturating_add(1))
+        .collect::<Vec<_>>();
+    let mut decoded =
+        crate::codec::pi::decode_pi_with_sidecar_and_ordinals(&native, Some(&pins), &ordinals);
     if decoded.messages.len() != messages.len() {
         return Err(error(
             "history_unreadable",
@@ -44,10 +56,10 @@ pub(super) fn decode_messages(
     Ok(decoded)
 }
 
-pub(super) fn encode_view(
+pub fn encode_view(
     view: &transform::compaction::View,
     request: &TransformRequest,
-) -> Result<compact::answer::CompactionMessage, HandlerOutcome> {
+) -> Result<codec::OutboundMessage, HandlerOutcome> {
     let native = request
         .native_messages
         .as_deref()
@@ -55,18 +67,17 @@ pub(super) fn encode_view(
     let source = native
         .iter()
         .zip(&request.messages)
-        .map(|(message, ingress)| compact::status::StatusMessage {
-            raw_message: None,
+        .map(|(message, ingress)| codec::InboundMessage {
             mid: ingress.mid.clone(),
             ordinal: ingress.ordinal,
             message: message.clone(),
         })
         .collect::<Vec<_>>();
-    let sidecar = decode_messages(&source)?.sidecar;
-    Ok(compact::answer::CompactionMessage::new(
+    let sidecar = decode_messages_from(&source, view.range.from)?.sidecar;
+    Ok(codec::OutboundMessage::new(
         &view.compaction_id,
         view.version,
-        compact::answer::Range::new(view.range.from, view.range.to),
+        codec::MessageRange::new(view.range.from, view.range.to),
         crate::codec::encode_pi(&view.replacement, &sidecar),
     ))
 }
@@ -74,11 +85,11 @@ pub(super) fn encode_view(
 /// Pi stores tool results separately from their assistant's calls. Read the
 /// actual preceding assistant and intervening results (at most 64 prior rows)
 /// so tool-pair validation never invents a missing call.
-pub(super) fn decode_hook_messages(
+pub fn decode_hook_messages(
     store: &McStore,
     key: &Key,
     lineage: &str,
-    entry: compact::status::StatusMessage,
+    entry: codec::InboundMessage,
 ) -> Result<crate::codec::DecodedHarnessMessages, HandlerOutcome> {
     let mut entries = Vec::new();
     if entry
@@ -102,8 +113,7 @@ pub(super) fn decode_hook_messages(
             if message.pointer("/message/role").and_then(Value::as_str) == Some("assistant") {
                 entries.clear();
             }
-            entries.push(compact::status::StatusMessage {
-                raw_message: None,
+            entries.push(codec::InboundMessage {
                 mid: source.mid,
                 ordinal: source.ordinal,
                 message,
@@ -120,8 +130,8 @@ mod tests {
 
     #[test]
     fn journal_identity_beats_repeated_timestamp_and_response_aliases() {
-        let entries: Vec<_> = ["entry-a", "entry-b"].into_iter().enumerate().map(|(i, id)| compact::status::StatusMessage {
-            raw_message: None, mid: id.into(), ordinal: 41 + i as u64,
+        let entries: Vec<_> = ["entry-a", "entry-b"].into_iter().enumerate().map(|(i, id)| codec::InboundMessage {
+            mid: id.into(), ordinal: 41 + i as u64,
             message: json!({"id":id,"type":"message","parentId":null,"message":{"role":"assistant","timestamp":1,"responseId":"same-response","content":[{"type":"text","text":id,"textSignature":"sig"}]}}),
         }).collect();
         let decoded = decode_messages(&entries).unwrap();
@@ -146,8 +156,7 @@ mod tests {
             json!({"id":"wrong","message":{"role":"user","content":"text"}}),
             json!({"role":"user","content":"text"}),
         ] {
-            assert!(decode_messages(&[compact::status::StatusMessage {
-                raw_message: None,
+            assert!(decode_messages(&[codec::InboundMessage {
                 mid: "expected".into(),
                 ordinal: 1,
                 message: native

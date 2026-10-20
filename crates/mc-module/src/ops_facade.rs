@@ -272,7 +272,7 @@ impl McHandler {
             Ok(scope) => scope,
             Err(outcome) => return outcome,
         };
-        if let Err(outcome) = crate::providers::admit_harness_module(&binding) {
+        if let Err(outcome) = authorize_harness_scope(&binding) {
             return outcome;
         }
         let Some(store) = self.store.get() else {
@@ -521,8 +521,6 @@ mod tests {
         handler.bind_route(
             7,
             SessionBinding {
-                connection_incarnation: 0,
-                native_generation: None,
                 principal: None,
                 scope: None,
                 project_root: dir.path().to_path_buf(),
@@ -1130,4 +1128,20 @@ mod repair_tests {
             .to_string()
             .contains("private-claim-token"));
     }
+}
+
+pub(crate) fn authorize_harness_scope(
+    binding: &crate::SessionBinding,
+) -> Result<(), subc_client_rs::HandlerOutcome> {
+    if !matches!(&binding.principal, Some(subc_protocol::Principal::Reserved { module_id }) if module_id == "thalamus-harness")
+    {
+        return Err(crate::providers::error(
+            "host_lane_requires_harness_module",
+            "Host lane requires reserved:thalamus-harness",
+        ));
+    }
+    if !binding.scope.as_ref().is_some_and(|scope| scope.owner_authorized && matches!(&scope.owner, subc_protocol::Principal::Reserved { module_id } if module_id == "prefrontal-core")) {
+        return Err(crate::providers::error("host_lane_scope_missing", "Host lane requires an authorized reserved:prefrontal-core scope"));
+    }
+    Ok(())
 }

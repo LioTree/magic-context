@@ -1,100 +1,45 @@
-//! Provider discovery and method routing; conversation state is owned by mc-store.
+//! Workspace engine adapters and provider discovery. The runner owns transcript tags.
 use super::*;
 use cortexkit_role_compaction_provider as compact;
-use cortexkit_role_step_transform_provider as hooks;
 use serde::Serialize;
 use std::collections::{BTreeMap, BTreeSet};
 
-mod cache_policy;
-mod capability_candidate;
+mod async_bus;
 #[cfg(test)]
-mod cc_native_review_tests;
+mod async_contract_vectors;
+mod async_provider;
 #[cfg(test)]
-#[path = "../tests/fixtures/cc-step-lane-witnesses.rs"]
-mod cc_step_lane_review;
-#[cfg(test)]
-mod claude_code_tests;
-mod codec;
-mod codec_claude_code;
-mod codec_opencode;
-mod codec_pi;
-mod compaction;
-pub(crate) mod fold_prefix;
-mod fold_working;
-mod historian;
-pub(crate) mod historian_budget;
-#[cfg(test)]
-pub(crate) mod hook_probe;
-#[cfg(test)]
-mod host_lane_tests;
-pub(crate) mod hygiene_memo;
-mod native_cut;
-mod native_plan;
-mod native_view;
-mod policy_summary;
-mod records;
-#[cfg(test)]
-mod relay_conformance;
-#[cfg(test)]
-pub(crate) mod resident;
-mod resident_bytes;
-pub(crate) mod resident_hooks;
-mod resident_view;
-mod runner_resident;
-mod session_delete;
-mod step_transform;
-#[cfg(test)]
-mod tests;
-#[cfg(test)]
-mod view_gc_lineage_tests;
-mod view_recipe;
+mod describe_fixture_tests;
 
-use codec::decode_message;
+pub mod codec;
+pub mod codec_anthropic;
 #[cfg(test)]
-use codec::{encode_message, validate_replacement};
+mod codec_native_tests;
+pub mod codec_opencode;
+pub mod codec_pi;
+pub mod compaction;
+pub mod fold_prefix;
+pub mod fold_working;
+pub mod historian;
+pub(crate) mod historian_config;
+pub(crate) use historian_config::HistorianModelCatalog;
+pub mod historian_budget;
+pub mod hygiene_memo;
+pub mod policy_summary;
+pub mod records;
+mod reduce;
+pub mod resident_bytes;
+pub(crate) mod runner_todo;
+pub(crate) mod usage_policy;
+pub mod view_recipe;
+
 pub(crate) use historian::RunCompletion;
-pub(crate) use native_plan::NativeConnectionPlan;
-#[cfg(test)]
-pub(crate) use records::Key;
-#[cfg(not(test))]
-use records::Key;
-use records::{frontier, ingest, scan, HookRecord, HookState, Record, Setup};
-pub(crate) use records::{Catalog, Storage};
-use step_transform::declaration;
-
-pub const HOOK_BUDGET_MS: u64 = 1_500;
-const HOST_ENVELOPE_BYTES: usize = hooks::hook::DEFAULT_HOOK_CAP_BYTES;
-const CLAUDE_CODE_HARNESS: &str = "claude-code";
-const CLAUDE_CODE_MODULE: &str = "thalamus";
-
-pub(crate) fn inbound_ceiling(
-    binding: &SessionBinding,
-    operation: Option<&str>,
-    bytes: Option<usize>,
-) -> Option<HandlerOutcome> {
-    if attested_claude_code(binding) && bytes.is_some_and(|bytes| bytes >= HOST_ENVELOPE_BYTES) {
-        let field = match operation {
-            Some("compaction.step") => "messages",
-            Some("transform.hook") => "message",
-            Some("compaction.view.read") => "raw_view",
-            _ => return None,
-        };
-        return Some(invalid_field(
-            field,
-            "native request exceeds the encoded envelope ceiling",
-        ));
-    }
-    None
-}
-
-pub fn runner_groups() -> [&'static str; 1] {
-    ["transcript_reads"]
-}
+pub use records::{Catalog, Key, Storage};
 
 /// Active and queued callers retain their lock; only idle entries can be evicted.
 /// A rebuild in one conversation must never queue a hook in another conversation.
 #[derive(Default)]
-pub(crate) struct ProviderSerial {
+pub struct ProviderSerial {
     locks: Mutex<HashMap<String, Arc<tokio::sync::Mutex<()>>>>,
 }
 
@@ -110,130 +55,15 @@ impl ProviderSerial {
                 .or_insert_with(|| Arc::new(tokio::sync::Mutex::new(()))),
         )
     }
-    pub(crate) async fn lock_for(&self, key: &Key) -> tokio::sync::OwnedMutexGuard<()> {
+    pub async fn lock_for(&self, key: &Key) -> tokio::sync::OwnedMutexGuard<()> {
         self.lock_arc(key).lock_owned().await
     }
-    pub(crate) fn try_lock_for(
+    pub fn try_lock_for(
         &self,
         key: &Key,
     ) -> Result<tokio::sync::OwnedMutexGuard<()>, tokio::sync::TryLockError> {
         self.lock_arc(key).try_lock_owned()
     }
-}
-
-fn invalid_field(field: &str, message: impl ToString) -> HandlerOutcome {
-    HandlerOutcome::ErrorWithDetail {
-        code: "invalid_params".into(),
-        message: message.to_string(),
-        detail: json!({"field":field}),
-    }
-}
-
-fn answer_observation(params: &Value) -> bool {
-    matches!(
-        params.get("serializer_profile").and_then(Value::as_str),
-        Some("opencode-aisdk" | "claude-code-anthropic" | "pi")
-    ) && params.get("observation").and_then(Value::as_str) == Some("answer")
-}
-
-fn attested_claude_code(binding: &SessionBinding) -> bool {
-    binding.harness == CLAUDE_CODE_HARNESS
-        && matches!(&binding.principal,
-        Some(subc_protocol::Principal::Reserved { module_id }) if module_id == CLAUDE_CODE_MODULE)
-}
-
-fn host_binding(binding: &SessionBinding) -> bool {
-    matches!(binding.harness.as_str(), "opencode" | "opencode2" | "pi")
-        || attested_claude_code(binding)
-}
-
-pub(crate) fn admit_host_lane(binding: &SessionBinding) -> Result<(), HandlerOutcome> {
-    if !matches!(binding.harness.as_str(), "opencode" | "opencode2" | "pi") {
-        return Ok(());
-    }
-    admit_harness_module(binding)
-}
-
-pub(super) fn admit_harness_module(binding: &SessionBinding) -> Result<(), HandlerOutcome> {
-    if !matches!(&binding.principal, Some(subc_protocol::Principal::Reserved { module_id }) if module_id == "thalamus-harness")
-    {
-        return Err(error(
-            "host_lane_requires_harness_module",
-            "Host lane requires reserved:thalamus-harness",
-        ));
-    }
-    if !binding.scope.as_ref().is_some_and(|scope| {
-        scope.owner_authorized
-            && matches!(&scope.owner, subc_protocol::Principal::Reserved { module_id } if module_id == "prefrontal-core")
-    }) {
-        return Err(error(
-            "host_lane_scope_missing",
-            "Host lane requires an authorized reserved:prefrontal-core scope",
-        ));
-    }
-    Ok(())
-}
-
-/// Claude Code requires the daemon-confirmed Thalamus caller and a plan choosing
-/// the Anthropic serializer with gateway-observed answers. Additional negotiated
-/// capabilities belong here, never in a caller-supplied principal field.
-fn admit_claude_code(
-    binding: &SessionBinding,
-    method: &str,
-    params: &Value,
-) -> Result<(), HandlerOutcome> {
-    // Claude Code capability selection is not offered yet. Reject a supplied
-    // bundle by name instead of ignoring it and running the existing codec path
-    // that checks only caller identity, serializer profile and observation mode.
-    if params
-        .get("claude_code")
-        .is_some_and(|value| !value.is_null())
-    {
-        return Err(invalid_field(
-            "claude_code",
-            "native capability publication is held",
-        ));
-    }
-    let thalamus = matches!(&binding.principal, Some(subc_protocol::Principal::Reserved { module_id }) if module_id == CLAUDE_CODE_MODULE);
-    let profile = params
-        .pointer("/params/serializer_profile")
-        .and_then(Value::as_str);
-    if (profile == Some("claude-code-anthropic") || binding.harness == CLAUDE_CODE_HARNESS)
-        && !thalamus
-    {
-        return Err(error(
-            "claude_code_lane_requires_attested_host",
-            "Claude Code provider lane requires reserved:thalamus",
-        ));
-    }
-    if thalamus
-        && (binding.harness != CLAUDE_CODE_HARNESS
-            || profile.is_some_and(|p| p != "claude-code-anthropic")
-            || (matches!(method, "transform.declare" | "compaction.setup")
-                && profile != Some("claude-code-anthropic")))
-    {
-        return Err(error(
-            "claude_code_lane_profile_mismatch",
-            "reserved:thalamus must use the Claude Code provider profile",
-        ));
-    }
-    Ok(())
-}
-
-pub fn describe() -> HandlerOutcome {
-    let mut answer: Value = match tool_catalog::role_describe_bytes() {
-        Ok(bytes) => serde_json::from_slice(&bytes).expect("compiled role description"),
-        Err(error) => return error.into_outcome(),
-    };
-    let majors = answer["majors"].as_array_mut().expect("role majors");
-    majors.push(
-        json!({"version": compact::PROVIDES, "ops": compact::REQUIRED_OPS, "stability": "alpha"}),
-    );
-    majors.push(
-        json!({"version": hooks::PROVIDES, "ops": hooks::REQUIRED_OPS, "stability": "alpha"}),
-    );
-    answer["runner_groups"] = json!(runner_groups());
-    HandlerOutcome::Response(serde_jcs::to_vec(&answer).expect("build-only role JSON"))
 }
 
 pub fn error(code: &str, message: impl ToString) -> HandlerOutcome {
@@ -266,25 +96,36 @@ pub fn preset(name: Option<&str>) -> Result<transform::compaction::Preset, Handl
         _ => Err(invalid("unknown provider preset")),
     }
 }
-pub const FAULT_POINTS: &[&str] = &[
-    "SetupRecorded",
-    "MessagesIngested",
-    "AnswerRecorded",
-    "WaitAnswered",
-    "WaitWorkDurable",
-    "HookStateRecorded",
-];
+pub fn runner_groups() -> [&'static str; 1] {
+    ["transcript_reads"]
+}
 
-pub fn fault(point: &str) {
-    debug_assert!(FAULT_POINTS.contains(&point));
-    #[cfg(feature = "drive-fault")]
-    if std::env::var("MC_PROVIDER_FAULT_POINT").ok().as_deref() == Some(point) {
-        // The harness sees this line, then sends a real process kill. A
-        // fault-enabled binary alone can park at a durable provider cut.
-        eprintln!("MC_PROVIDER_FAULT_REACHED {point}");
-        loop {
-            std::thread::park();
-        }
+pub fn describe() -> HandlerOutcome {
+    let mut answer: Value = match tool_catalog::role_describe_bytes() {
+        Ok(bytes) => serde_json::from_slice(&bytes).expect("compiled role description"),
+        Err(error) => return error.into_outcome(),
+    };
+    answer["majors"]
+        .as_array_mut()
+        .expect("role majors")
+        .push(json!({
+            "version": compact::PROVIDES,
+            "ops": ["role.describe", "compaction.setup", "view.get", "compaction.ride"],
+            "stability": "alpha"
+        }));
+    answer["runner_groups"] = json!(runner_groups());
+    answer["reminder_templates"] = crate::runner_reminders::catalog();
+    // ck-mc extension: the `params.serializer_profile` values Setup accepts,
+    // in the codec registry's fixed order.
+    answer["serializer_profiles"] = json!(codec::Codec::ALL.map(codec::Codec::wire_id));
+    HandlerOutcome::Response(serde_jcs::to_vec(&answer).expect("build-only role JSON"))
+}
+
+fn invalid_field(field: &str, message: impl ToString) -> HandlerOutcome {
+    HandlerOutcome::ErrorWithDetail {
+        code: "invalid_params".into(),
+        message: message.to_string(),
+        detail: json!({"field":field}),
     }
 }
 
@@ -295,187 +136,92 @@ impl McHandler {
         method: &str,
         params: &Value,
     ) -> HandlerOutcome {
-        let started = Instant::now();
-        let hook_count = u64::from(method == "transform.hook");
-        let result = self
-            .handle_provider_value_inner(channel, method, params)
-            .await;
-        let (response_bytes, outcome) = match &result {
-            HandlerOutcome::Response(bytes) => (bytes.len(), "response"),
-            _ => (0, "refused"),
-        };
-        tracing::info!(
-            session_id = params.get("session").and_then(|v| v.as_str()).unwrap_or(""),
-            harness = params.get("harness").and_then(|v| v.as_str()).unwrap_or(""),
-            request_id = params
-                .get("request_id")
-                .and_then(|v| v.as_str())
-                .unwrap_or(""),
-            method,
-            hook_count,
-            response_bytes,
-            outcome,
-            module_ms = started.elapsed().as_secs_f64() * 1000.0,
-            "provider module complete"
-        );
-        result
-    }
-
-    async fn handle_provider_value_inner(
-        &self,
-        channel: u16,
-        method: &str,
-        params: &Value,
-    ) -> HandlerOutcome {
-        let mut binding = match self.facade_binding(channel) {
+        let binding = match self.facade_binding(channel) {
             Ok(binding) => binding,
-            Err(_) => {
-                return error(
-                    "route_unbound",
-                    format!("{method} requires a bound project route"),
-                )
-            }
+            Err(_) => return error("route_unbound", "compaction requires a bound runner route"),
         };
-        if let Err(error) = admit_host_lane(&binding) {
-            return error;
-        }
-        if let Err(error) = admit_claude_code(&binding, method, params) {
-            return error;
-        }
-        // Harness strings select a codec, not authorization. OpenCode and Pi check the
-        // bound principal and scope; Claude Code still requires reserved:thalamus.
-        let host = host_binding(&binding);
-        if method == "compaction.delete"
-            && !matches!(binding.harness.as_str(), "opencode" | "opencode2" | "pi")
-        {
-            return error(
-                "host_lane_requires_harness_module",
-                "Deletion requires the authenticated host bridge",
-            );
-        }
-        if !host && binding.harness != session_resolver::RUNNER_BIND_HARNESS {
-            return error(
-                "route_unbound",
-                "provider operations require a host or runner bind",
-            );
-        }
-        if matches!(method, "transform.declare" | "compaction.setup") {
-            let plan = &params["params"];
-            if let Err(error) = codec::Codec::from_params(plan) {
-                return error;
-            }
-            if !host {
-                for (field, value) in [
-                    ("observation", "answer"),
-                    ("serializer_profile", "opencode-aisdk"),
-                ] {
-                    if plan.get(field).and_then(Value::as_str) == Some(value) {
-                        return invalid_field(
-                            &format!("params.{field}"),
-                            "runner plans cannot opt into host observation",
-                        );
-                    }
-                }
-            } else if !answer_observation(plan) {
-                return invalid_field(
-                    "params.observation",
-                    "host lane requires its native profile and answer observation",
-                );
-            }
-        }
-        if host {
-            for (field, expected) in [
-                ("session", binding.session.as_str()),
-                ("harness", binding.harness.as_str()),
-            ] {
-                if params
-                    .get(field)
-                    .and_then(Value::as_str)
-                    .is_some_and(|value| value != expected)
-                {
-                    return invalid_field(
-                        field,
-                        "provider call does not match its bound conversation",
-                    );
-                }
-            }
-            // Deletion needs route attestation, not a surviving frozen plan:
-            // a retry must still succeed after the first call removed that plan.
-            if method == "compaction.delete" {
-                return match self.provider_delete(&binding, params).await {
-                    Ok(bytes) => HandlerOutcome::Response(bytes),
-                    Err(error) => error,
-                };
-            }
-            if method == "transform.hook" && self.provider_resident.is_enabled() {
-                if let (Some(store), Some(session), Some(harness)) = (
-                    self.store.get(),
-                    params.get("session").and_then(Value::as_str),
-                    params.get("harness").and_then(Value::as_str),
-                ) {
-                    if let Ok(key) = Key::new(&binding, session, harness) {
-                        if self
-                            .provider_resident
-                            .is_building(store.tag_cache_namespace(), &key)
-                        {
-                            return transient(
-                                "resident_not_ready: session rebuild or admission in progress",
-                            );
-                        }
-                    }
-                }
-            }
-            if attested_claude_code(&binding) {
-                binding = match self
-                    .admit_native_plan(channel, &binding, method, params)
-                    .await
-                {
-                    Ok(binding) => binding,
-                    Err(error) => return error,
-                };
-            } else if let Err(error) = self.admit_host_plan(&binding, method, params).await {
-                return error;
-            }
-        }
-        if method == "transform.declare" {
-            return match declaration(params).and_then(|d| bytes(&d)) {
-                Ok(bytes) => HandlerOutcome::Response(bytes),
-                Err(e) => e,
-            };
+        if binding.harness != session_resolver::RUNNER_BIND_HARNESS {
+            return error("route_unbound", "compaction requires a runner bind");
         }
         if let Some(session) = params.get("session").and_then(Value::as_str) {
             if let Some(refusal) = self.provider_store.catalog_refusal(&binding, session) {
                 return refusal;
             }
         }
-        let resident_wal = self.provider_resident.is_enabled()
-            && matches!(
-                method,
-                "compaction.setup" | "compaction.step" | "transform.hook"
-            )
-            && (host || binding.harness == session_resolver::RUNNER_BIND_HARNESS);
-        if resident_wal {
-            if let Some(store) = self.store.get() {
-                store.prepare_provider_wal();
-            }
-        }
         let result = match method {
-            "compaction.setup" => self.provider_setup(channel, binding, params).await,
-            "compaction.step" => self.provider_step(channel, binding, params).await,
-            "compaction.view.read" if attested_claude_code(&binding) => {
-                self.provider_native_view_read(binding, params).await
-            }
-            "transform.hook" => self.provider_hook(channel, binding, params).await,
-            _ => Err(invalid("unknown provider method")),
+            "compaction.setup" => self.async_setup(channel, &binding, params).await,
+            "view.get" => self.async_view_get(&binding, params).await,
+            "compaction.ride" => self.async_ride(&binding, params).await,
+            _ => Err(invalid("unknown compaction operation")),
         };
-        if resident_wal {
-            if let Some(store) = self.store.get() {
-                store.finish_provider_wal();
-            }
-        }
         match result {
             Ok(bytes) => HandlerOutcome::Response(bytes),
             Err(error) => error,
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn discovery_does_not_advertise_retired_step_or_native_capabilities() {
+        let HandlerOutcome::Response(bytes) = describe() else {
+            panic!("role discovery failed")
+        };
+        let answer: Value = serde_json::from_slice(&bytes).unwrap();
+        let majors = answer["majors"].as_array().unwrap();
+        assert!(!majors
+            .iter()
+            .any(|major| major["version"] == "step-transform-provider/v1"));
+        let compaction = majors
+            .iter()
+            .find(|major| major["version"] == compact::PROVIDES)
+            .unwrap();
+        assert!(!compaction["ops"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|op| op == "compaction.step" || op == "compaction.view.read"));
+        assert!(answer.get("claude_code").is_none());
+    }
+
+    #[test]
+    fn discovery_lists_every_accepted_serializer_profile_in_fixed_order() {
+        let HandlerOutcome::Response(bytes) = describe() else {
+            panic!("role discovery failed")
+        };
+        let answer: Value = serde_json::from_slice(&bytes).unwrap();
+        assert_eq!(
+            answer["serializer_profiles"],
+            json!(["owned-broca", "opencode-aisdk", "pi", "anthropic-messages"])
+        );
+        for profile in answer["serializer_profiles"].as_array().unwrap() {
+            assert!(
+                codec::Codec::from_params(&json!({"serializer_profile": profile})).is_ok(),
+                "{profile} is advertised but refused"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn retired_step_and_hook_methods_are_unrecognized() {
+        let handler = McHandler::new();
+        for method in [
+            "compaction.step",
+            "compaction.delete",
+            "compaction.view.read",
+            "transform.declare",
+            "transform.hook",
+        ] {
+            let answer = handler
+                .dispatch_value(1, json!({"method":method,"params":{}}))
+                .await;
+            assert!(
+                matches!(answer, HandlerOutcome::Error { ref code, .. } if code == "unrecognized_request_shape"),
+                "{method}: {answer:?}"
+            );
         }
     }
 }

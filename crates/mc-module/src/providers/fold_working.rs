@@ -4,13 +4,13 @@ use super::resident_bytes::ByteArena;
 use super::*;
 
 #[derive(Clone, PartialEq, Eq)]
-pub(super) struct TailKey {
+pub struct TailKey {
     pub through: u64,
     pub newest: Option<u64>,
     pub answers: (u64, u64),
 }
 
-pub(super) struct FoldWorking {
+pub struct FoldWorking {
     pub key: TailKey,
     pub messages: Vec<ck_wire::CkIngressMessage>,
     pub native: Vec<Value>,
@@ -100,47 +100,11 @@ mod tests {
     use super::*;
 
     #[test]
-    fn oversized_live_tail_is_charged_and_evicted_not_refused() {
-        let resident = super::super::resident_hooks::ResidentHooks::enabled(true);
-        let key = super::super::records::Key {
-            project: "/fixture".into(),
-            session: "s".into(),
-            harness: "opencode".into(),
-            generation: None,
-        };
-        let mut lease = resident.begin(1, &key).unwrap().unwrap();
-        lease.state.fold_working = Some(FoldWorking {
-            key: TailKey {
-                through: 0,
-                newest: None,
-                answers: (0, 0),
-            },
-            messages: vec![],
-            native: vec![Value::String(
-                "x".repeat(super::super::resident_hooks::SESSION_CAP + 1),
-            )],
-            projection: Arc::new(ck_wire::project_messages(&[]).unwrap()),
-            prefix_messages: 0,
-            serve_native: true,
-        });
-        lease.publish();
-        assert_eq!(
-            resident.stats()["sessions"],
-            0,
-            "an over-cap cache must not remain ready"
-        );
-        assert!(
-            resident.begin(1, &key).unwrap().unwrap().cold,
-            "eviction rebuilds later instead of refusing"
-        );
-    }
-
-    #[test]
     fn live_tail_clone_preserves_decoder_identity_and_projection() {
-        let source = compact::status::StatusMessage {
+        let source = codec::InboundMessage {
             mid: "m11".into(),
             ordinal: 11,
-            raw_message: None,
+
             message: json!({"info":{"id":"m11","role":"assistant"},"parts":[{"type":"tool","tool":"bash",
                 "state":{"status":"completed","input":{"command":"inspect"},"output":"café 🦀 \\\"exact\\\""}}]}),
         };

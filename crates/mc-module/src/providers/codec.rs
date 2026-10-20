@@ -2,35 +2,104 @@
 use super::*;
 use serde::Deserialize;
 
+/// A transcript message held by the compaction engine, independent of its transport.
+#[derive(Clone, Debug, PartialEq, Deserialize, Serialize)]
+pub struct InboundMessage {
+    pub ordinal: u64,
+    pub mid: String,
+    pub message: Value,
+}
+
+/// The engine's rendered replacement and the transcript range it covers.
+#[derive(Clone, Debug, PartialEq, Deserialize, Serialize)]
+pub struct OutboundMessage {
+    pub compaction_id: String,
+    pub version: u64,
+    pub range: MessageRange,
+    pub replacement: Vec<Value>,
+}
+
+impl OutboundMessage {
+    pub fn new(
+        compaction_id: impl Into<String>,
+        version: u64,
+        range: MessageRange,
+        replacement: Vec<Value>,
+    ) -> Self {
+        Self {
+            compaction_id: compaction_id.into(),
+            version,
+            range,
+            replacement,
+        }
+    }
+}
+
+/// Half-open transcript ordinals covered by a rendered replacement.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Deserialize, Serialize)]
+pub struct MessageRange {
+    pub from: u64,
+    pub to: u64,
+}
+
+impl MessageRange {
+    pub fn new(from: u64, to: u64) -> Self {
+        Self { from, to }
+    }
+}
+
 /// Missing profile preserves the original Broca plan's strict native codec.
 /// Only profiles with a provider transcript codec are admitted here; accepting
 /// another engine profile would silently decode the runner's wrong schema.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
-#[allow(dead_code)] // Provider handlers adopt this dispatch as their host lanes are wired.
-pub(super) enum Codec {
+pub enum Codec {
     OwnedBroca,
     OpencodeAiSdk,
     Pi,
-    ClaudeCodeAnthropic,
+    /// llm-runner's `anthropic-messages` profile: entries are Anthropic
+    /// Messages request messages, rendered under the Claude Code serializer.
+    AnthropicMessages,
 }
 
-#[allow(dead_code)]
 impl Codec {
+    /// Every profile `from_params` admits, in the fixed order `role.describe`
+    /// advertises them.
+    pub const ALL: [Self; 4] = [
+        Self::OwnedBroca,
+        Self::OpencodeAiSdk,
+        Self::Pi,
+        Self::AnthropicMessages,
+    ];
+
+    /// The `params.serializer_profile` string that selects this codec.
+    pub const fn wire_id(self) -> &'static str {
+        match self {
+            Self::OwnedBroca => "owned-broca",
+            Self::OpencodeAiSdk => "opencode-aisdk",
+            Self::Pi => "pi",
+            Self::AnthropicMessages => {
+                cortexkit_role_llm_runner::serializer_profile::ANTHROPIC_MESSAGES
+            }
+        }
+    }
+
     /// Takes the plan item's opaque `params`, not the operation envelope.
     pub fn from_params(params: &Value) -> Result<Self, HandlerOutcome> {
         match params.get("serializer_profile") {
             None => Ok(Self::OwnedBroca),
-            Some(Value::String(profile)) if profile == "owned-broca" => Ok(Self::OwnedBroca),
-            Some(Value::String(profile)) if profile == "opencode-aisdk" => Ok(Self::OpencodeAiSdk),
-            Some(Value::String(profile)) if profile == "pi" => Ok(Self::Pi),
-            Some(Value::String(profile)) if profile == "claude-code-anthropic" => {
-                Ok(Self::ClaudeCodeAnthropic)
-            }
-            _ => Err(HandlerOutcome::ErrorWithDetail {
-                code: "invalid_params".into(),
-                message: "unknown provider serializer profile".into(),
-                detail: json!({"field":"params.serializer_profile"}),
-            }),
+            Some(Value::String(profile)) => Self::ALL
+                .into_iter()
+                .find(|codec| codec.wire_id() == profile)
+                .ok_or_else(Self::unknown_profile),
+            Some(_) => Err(Self::unknown_profile()),
+        }
+    }
+
+    fn unknown_profile() -> HandlerOutcome {
+        HandlerOutcome::ErrorWithDetail {
+            code: "invalid_params".into(),
+            message: "unknown provider serializer profile".into(),
+            detail: json!({"field":"params.serializer_profile"}),
         }
     }
 
@@ -39,16 +108,19 @@ impl Codec {
             Self::OwnedBroca => SerializerProfile::OwnedBroca,
             Self::OpencodeAiSdk => SerializerProfile::OpencodeAiSdk,
             Self::Pi => SerializerProfile::Pi,
-            Self::ClaudeCodeAnthropic => SerializerProfile::ClaudeCodeAnthropic,
+            // The engine's existing Anthropic serializer: the healing and
+            // rendering rules of the full-array Claude Code route.
+            Self::AnthropicMessages => SerializerProfile::ClaudeCodeAnthropic,
         }
     }
 
     pub fn decode_message(
         self,
-        message: &compact::status::StatusMessage,
+        message: &codec::InboundMessage,
     ) -> Result<ck_wire::CkIngressMessage, HandlerOutcome> {
         match self {
             Self::OwnedBroca => decode_message(message),
+            Self::AnthropicMessages => super::codec_anthropic::decode_message(message),
             Self::Pi => Ok(
                 super::codec_pi::decode_messages(std::slice::from_ref(message))?
                     .messages
@@ -56,15 +128,15 @@ impl Codec {
                     .next()
                     .expect("one Pi message"),
             ),
-            Self::ClaudeCodeAnthropic => super::codec_claude_code::decode_message(message),
             Self::OpencodeAiSdk => {
                 let decoded =
                     super::codec_opencode::decode_messages(std::slice::from_ref(message))?;
-                Ok(decoded
-                    .messages
-                    .into_iter()
-                    .next()
-                    .expect("one native message"))
+                decoded.messages.into_iter().next().ok_or_else(|| {
+                    error(
+                        "history_unreadable",
+                        "OpenCode entry did not decode to one message",
+                    )
+                })
             }
         }
     }
@@ -74,18 +146,20 @@ impl Codec {
     pub fn prepare_request(
         self,
         request: &mut TransformRequest,
-        messages: &[compact::status::StatusMessage],
+        messages: &[codec::InboundMessage],
+    ) -> Result<(), HandlerOutcome> {
+        self.prepare_request_from(request, messages, messages.first().map_or(0, |m| m.ordinal))
+    }
+
+    pub fn prepare_request_from(
+        self,
+        request: &mut TransformRequest,
+        messages: &[codec::InboundMessage],
+        source_from: u64,
     ) -> Result<(), HandlerOutcome> {
         let (ingress, native) = match self {
             Self::Pi => (
-                super::codec_pi::decode_messages(messages)?.messages,
-                Some(messages.iter().map(|m| m.message.clone()).collect()),
-            ),
-            Self::ClaudeCodeAnthropic => (
-                messages
-                    .iter()
-                    .map(super::codec_claude_code::decode_message)
-                    .collect::<Result<Vec<_>, _>>()?,
+                super::codec_pi::decode_messages_from(messages, source_from)?.messages,
                 Some(messages.iter().map(|m| m.message.clone()).collect()),
             ),
             Self::OwnedBroca => (
@@ -94,6 +168,13 @@ impl Codec {
                     .map(decode_message)
                     .collect::<Result<Vec<_>, _>>()?,
                 None,
+            ),
+            Self::AnthropicMessages => (
+                messages
+                    .iter()
+                    .map(super::codec_anthropic::decode_message)
+                    .collect::<Result<Vec<_>, _>>()?,
+                Some(messages.iter().map(|m| m.message.clone()).collect()),
             ),
             Self::OpencodeAiSdk => {
                 let decoded = super::codec_opencode::decode_messages(messages)?;
@@ -110,6 +191,12 @@ impl Codec {
         };
         request.messages = ingress;
         request.native_messages = native;
+        // Every `anthropic-messages` entry is an Anthropic Messages API
+        // message, so the engine applies Anthropic's signed-thinking turn rules
+        // whatever the session's model is called.
+        if self == Self::AnthropicMessages && request.provider_id.is_none() {
+            request.provider_id = Some("anthropic".into());
+        }
         request.serve_native = self == Self::OpencodeAiSdk;
         request.serializer_profile = self.serializer_profile().wire_id().into();
         Ok(())
@@ -120,15 +207,115 @@ impl Codec {
         view: &transform::compaction::View,
         request: &TransformRequest,
         context: &super::codec_opencode::NativeRenderContext<'_>,
-    ) -> Result<compact::answer::CompactionMessage, HandlerOutcome> {
+    ) -> Result<codec::OutboundMessage, HandlerOutcome> {
         match self {
             Self::OwnedBroca => encode_view(view),
+            Self::AnthropicMessages => super::codec_anthropic::encode_view(view),
             Self::Pi => super::codec_pi::encode_view(view, request),
-            Self::ClaudeCodeAnthropic => {
-                super::codec_claude_code::encode_view(view, request, None).map(|v| v.0)
-            }
             Self::OpencodeAiSdk => super::codec_opencode::encode_view(view, request, context),
         }
+    }
+
+    /// For each part of `rendered`, the index of the runner part of the same
+    /// message it was decoded from (`None` for an engine-authored part), when
+    /// the schema's parts carry no ids of their own to match by. `None` keeps
+    /// matching by part id, then by position.
+    pub fn part_origins(
+        self,
+        message: &ck_wire::CkWireMessage,
+        rendered: &Value,
+    ) -> Option<Vec<Option<usize>>> {
+        match self {
+            Self::AnthropicMessages => super::codec_anthropic::part_origins(message, rendered),
+            Self::OwnedBroca | Self::OpencodeAiSdk | Self::Pi => None,
+        }
+    }
+
+    /// Decode a runner's transcript entries, oldest first, into the engine's
+    /// CK messages. Each entry is decoded on its own, so the result for an
+    /// entry never depends on how the transcript was paged. `mid` must be the
+    /// runner's own message id (OpenCode `info.id`, a Pi journal entry `id`):
+    /// an entry without one is refused, never assigned an id. An
+    /// `anthropic-messages` body has no id member, so its `mid` is the one
+    /// the runner's read envelope names.
+    pub fn decode_entries(
+        self,
+        entries: &[InboundMessage],
+    ) -> Result<Vec<ck_wire::CkIngressMessage>, HandlerOutcome> {
+        entries
+            .iter()
+            .map(|entry| self.decode_message(entry))
+            .collect()
+    }
+
+    /// Render a view back into the runner's declared schema. `entries` are the
+    /// runner's held native messages for the view's lineage, so every message
+    /// the view leaves unchanged goes back as the runner's own bytes; `session`
+    /// is the runner's session name, which OpenCode stamps on messages ck-mc
+    /// authors (the history head). Messages ck-mc authors carry no native id;
+    /// the runner assigns one when it applies the view. Rendering takes no
+    /// engine reasoning-clear or tag decisions: those are already in the view's
+    /// messages, and provider and model restrictions are the runner's to apply.
+    /// The result is a pure function of the view, the session and the entries.
+    /// Broca's schema needs neither: its messages carry their native copy.
+    pub fn render_view(
+        self,
+        view: &transform::compaction::View,
+        session: &str,
+        entries: &[InboundMessage],
+    ) -> Result<OutboundMessage, HandlerOutcome> {
+        if self == Self::OwnedBroca {
+            return encode_view(view);
+        }
+        let mut request: TransformRequest = decode(&json!({"v":2,"kind":"compaction.step",
+            "serializer_profile":self.serializer_profile().wire_id(),"session_id":session,
+            "render_config":"","messages":[],"tool_present":false,"auto_search_enabled":false}))?;
+        self.prepare_request_from(&mut request, entries, view.range.from)?;
+        self.encode_prepared_view(view, &request)
+    }
+
+    /// Reuse ingress that the engine already decoded. Recreate only renderer
+    /// settings, so engine-only flags and the engine namespace cannot change
+    /// native rendering or the session id on synthetic OpenCode messages.
+    pub(crate) fn render_prepared_view(
+        self,
+        view: &transform::compaction::View,
+        session: &str,
+        source: &TransformRequest,
+    ) -> Result<OutboundMessage, HandlerOutcome> {
+        if self == Self::OwnedBroca {
+            return encode_view(view);
+        }
+        let mut request: TransformRequest = decode(&json!({"v":2,"kind":"compaction.step",
+            "serializer_profile":self.serializer_profile().wire_id(),"session_id":session,
+            "render_config":"","messages":[],"tool_present":false,"auto_search_enabled":false}))?;
+        request.messages = source.messages.clone();
+        request.native_messages = source.native_messages.clone();
+        request.serve_native = self == Self::OpencodeAiSdk;
+        if self == Self::AnthropicMessages {
+            request.provider_id = Some("anthropic".into());
+        }
+        self.encode_prepared_view(view, &request)
+    }
+
+    fn encode_prepared_view(
+        self,
+        view: &transform::compaction::View,
+        request: &TransformRequest,
+    ) -> Result<OutboundMessage, HandlerOutcome> {
+        let tags = BTreeMap::new();
+        self.encode_view(
+            view,
+            request,
+            &super::codec_opencode::NativeRenderContext {
+                reasoning_clear_units: &[],
+                tag_numbers: &tags,
+                mutation_exempt_mid: None,
+                lineage_anchor_mid: None,
+                transition_consumed: false,
+                native_reasoning_keep_mids: &[],
+            },
+        )
     }
 }
 
@@ -202,7 +389,7 @@ fn native(message: &Value) -> Result<NativeMessage, HandlerOutcome> {
 /// Preserve the native shell for unchanged content; authored content cannot
 /// inherit cache markers, origin attribution or encrypted reasoning.
 pub fn decode_message(
-    message: &compact::status::StatusMessage,
+    message: &codec::InboundMessage,
 ) -> Result<ck_wire::CkIngressMessage, HandlerOutcome> {
     use ck_wire::{
         CkKind, CkOutputKind, CkToolOutput, CkWireBlock, CkWireMessage, HarnessMeta, ProviderExtras,
@@ -279,7 +466,7 @@ pub fn decode_message(
     })
 }
 
-pub(super) fn encode_message(message: &ck_wire::CkWireMessage) -> Result<Value, HandlerOutcome> {
+pub fn encode_message(message: &ck_wire::CkWireMessage) -> Result<Value, HandlerOutcome> {
     use ck_wire::{CkKind, CkOutputKind};
     let mut content = Vec::new();
     for block in &message.content {
@@ -390,122 +577,18 @@ pub(super) fn encode_message(message: &ck_wire::CkWireMessage) -> Result<Value, 
 
 pub fn encode_view(
     view: &transform::compaction::View,
-) -> Result<compact::answer::CompactionMessage, HandlerOutcome> {
+) -> Result<codec::OutboundMessage, HandlerOutcome> {
     let replacement = view
         .replacement
         .iter()
         .map(encode_message)
         .collect::<Result<Vec<_>, _>>()?;
-    Ok(compact::answer::CompactionMessage::new(
+    Ok(codec::OutboundMessage::new(
         &view.compaction_id,
         view.version,
-        compact::answer::Range::new(view.range.from, view.range.to),
+        MessageRange::new(view.range.from, view.range.to),
         replacement,
     ))
-}
-
-pub(super) fn validate_replacement(
-    view: &compact::answer::CompactionMessage,
-    record: &Record,
-    lineage: &str,
-) -> Result<(), HandlerOutcome> {
-    validate_replacement_with(view, record, lineage, |message| {
-        record
-            .messages
-            .get(lineage)
-            .is_some_and(|entries| entries.values().any(|entry| entry.message == *message))
-    })
-}
-
-pub(super) fn validate_replacement_with(
-    view: &compact::answer::CompactionMessage,
-    record: &Record,
-    lineage: &str,
-    is_carried: impl Fn(&Value) -> bool,
-) -> Result<(), HandlerOutcome> {
-    let originals = record.messages.get(lineage);
-    for message in &view.replacement {
-        let parsed = native(message)?;
-        let carried = is_carried(message);
-        if parsed.role == "system" {
-            return Err(error("history_unreadable", "replacement_system_message"));
-        }
-        if !carried && parsed.cache_prefix_blocks.is_some() {
-            return Err(error("history_unreadable", "authored_cache_prefix_blocks"));
-        }
-        if !carried && parsed.origin.is_some() {
-            return Err(error("history_unreadable", "authored_origin"));
-        }
-        if !carried
-            && parsed.content.iter().any(|b| {
-                matches!(
-                    b,
-                    NativeBlock::Reasoning {
-                        signature: Some(_),
-                        ..
-                    } | NativeBlock::RedactedReasoning { .. }
-                )
-            })
-        {
-            return Err(error("history_unreadable", "authored_signed_reasoning"));
-        }
-    }
-    let mut conversation = view.replacement.clone();
-    if let Some(originals) = originals {
-        conversation.extend(
-            originals
-                .range(view.range.to..)
-                .map(|(_, entry)| entry.message.clone()),
-        );
-    }
-    let mut pending = BTreeSet::new();
-    let mut seen = BTreeSet::new();
-    for message in &conversation {
-        let parsed = native(message)?;
-        if parsed.role == "system" {
-            continue;
-        }
-        if matches!(parsed.role.as_str(), "assistant" | "user") && !pending.is_empty() {
-            return Err(error("history_unreadable", "turn_before_tool_result"));
-        }
-        if parsed.role == "tool" && pending.is_empty() {
-            return Err(error("history_unreadable", "orphan_tool_result"));
-        }
-        let mut results = 0;
-        for block in parsed.content {
-            match block {
-                NativeBlock::ToolCall { tool_call_id, .. } => {
-                    if parsed.role != "assistant" || !seen.insert(tool_call_id.clone()) {
-                        return Err(error("history_unreadable", "invalid_tool_call"));
-                    }
-                    pending.insert(tool_call_id);
-                }
-                NativeBlock::ToolResult { tool_call_id, .. } => {
-                    if parsed.role != "tool" || !pending.remove(&tool_call_id) {
-                        return Err(error("history_unreadable", "orphan_tool_result"));
-                    }
-                    results += 1;
-                }
-                _ => {}
-            }
-        }
-        if parsed.role == "tool" && results == 0 {
-            return Err(error("history_unreadable", "tool_message_without_result"));
-        }
-    }
-    if !pending.is_empty() {
-        return Err(error("history_unreadable", "missing_tool_result"));
-    }
-    Ok(())
-}
-
-pub(super) fn checked_view(
-    view: &transform::compaction::View,
-    record: &Record,
-) -> Result<compact::answer::CompactionMessage, HandlerOutcome> {
-    let answer = encode_view(view)?;
-    validate_replacement(&answer, record, &view.range.lineage_id)?;
-    Ok(answer)
 }
 
 #[cfg(test)]
@@ -518,7 +601,7 @@ mod dispatch_tests {
             let codec = Codec::from_params(&params).unwrap();
             assert_eq!(codec, Codec::OwnedBroca);
             assert_eq!(codec.serializer_profile(), SerializerProfile::OwnedBroca);
-            let entries: Vec<compact::status::StatusMessage> = serde_json::from_str(include_str!(
+            let entries: Vec<codec::InboundMessage> = serde_json::from_str(include_str!(
                 "../tests/fixtures/tool-catalog/broca-session-read-messages.json"
             ))
             .unwrap();
@@ -529,8 +612,7 @@ mod dispatch_tests {
                     bytes(&entry.message).unwrap()
                 );
             }
-            let invalid_entry = compact::status::StatusMessage {
-                raw_message: None,
+            let invalid_entry = codec::InboundMessage {
                 mid: "m".into(),
                 ordinal: 1,
                 message: json!({"role":"user","content":[{"type":"future","text":"a"}]}),

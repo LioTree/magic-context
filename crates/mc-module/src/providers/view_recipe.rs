@@ -1,7 +1,7 @@
 //! Lossless rendering recipes address immutable message identities. Unchanged
 //! source text is not copied merely to stamp a tag or append a reminder.
 use super::codec::Codec;
-use super::compaction::HostView;
+use super::compaction::EngineView;
 use super::*;
 use mc_store::{ProviderViewRecipe, ProviderViewSegment, ProviderViewTreatment};
 
@@ -132,36 +132,35 @@ fn original(
     message: &mc_store::provider_records::ProviderMessage,
 ) -> Result<(Value, Value), HandlerOutcome> {
     let native: Value = serde_json::from_slice(&message.message_bytes).map_err(transient)?;
-    let entry = compact::status::StatusMessage {
+    let entry = codec::InboundMessage {
         ordinal: message.ordinal,
         mid: message.mid.clone(),
         message: native.clone(),
-        raw_message: None,
     };
     let ck = Codec::OpencodeAiSdk.decode_message(&entry)?;
     Ok((serde_json::to_value(ck.ck).map_err(transient)?, native))
 }
 
-pub(super) fn save(
+pub fn save(
     store: &McStore,
     key: &Key,
-    view: &HostView,
+    view: &EngineView,
     state: &str,
 ) -> Result<(), HandlerOutcome> {
     save_with_base(store, key, view, state, None, None)
 }
 
-pub(super) trait RecipeBase {
+pub trait RecipeBase {
     fn version(&self) -> u64;
     fn lineage(&self) -> &str;
     fn same_slot(&self, position: usize, ck: &ck_wire::CkWireMessage, wire: &Value) -> bool;
     fn same_native(&self, mid: &str, ordinal: u64, ck: &[u8], wire: &Value) -> bool;
 }
 
-pub(super) fn save_with_base(
+pub fn save_with_base(
     store: &McStore,
     key: &Key,
-    view: &HostView,
+    view: &EngineView,
     state: &str,
     previous_view: Option<&dyn RecipeBase>,
     engine_bytes: Option<&[std::borrow::Cow<'_, [u8]>]>,
@@ -191,8 +190,13 @@ pub(super) fn save_with_base(
     };
     let source_ms = started.elapsed().as_secs_f64() * 1000.0;
     let mut metadata = if previous_view.is_some() {
-        serde_json::to_value(super::resident_view::ResidentView::metadata_of(view))
-            .map_err(transient)?
+        serde_json::to_value({
+            let mut shell = view.clone();
+            shell.engine.replacement.clear();
+            shell.wire.replacement.clear();
+            shell
+        })
+        .map_err(transient)?
     } else {
         serde_json::to_value(view).map_err(transient)?
     };
@@ -353,11 +357,11 @@ fn inherit(
     Ok(())
 }
 
-pub(super) fn load(
+pub fn load(
     store: &McStore,
     key: &Key,
     version: u64,
-) -> Result<Option<HostView>, HandlerOutcome> {
+) -> Result<Option<EngineView>, HandlerOutcome> {
     let started = std::time::Instant::now();
     let Some(resolved) = store
         .resolve_provider_view(&key.store_key(), version)
@@ -454,9 +458,8 @@ pub(super) fn load(
 /// The codec that decodes a recipe's native sources and the shape of the view
 /// assembled from them. Stored as the recipe's serializer profile.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub(super) enum RecipeLane {
+pub enum RecipeLane {
     OpencodeAiSdk,
-    ClaudeCodeAnthropic,
     /// A host-lane Broca view: engine and wire messages.
     OwnedBroca,
     /// A Broca runner record's engine-only view.
@@ -468,19 +471,23 @@ pub(super) enum RecipeLane {
 }
 
 impl RecipeLane {
-    fn host(codec: Codec) -> Self {
+    /// The recipe lane for a host-lane conversation's codec. An
+    /// `anthropic-messages` session exists only on the asynchronous runner
+    /// lane, which keeps its views in its own table, so it has no recipe lane.
+    fn host(codec: Codec) -> Result<Self, HandlerOutcome> {
         match codec {
-            Codec::OpencodeAiSdk => Self::OpencodeAiSdk,
-            Codec::ClaudeCodeAnthropic => Self::ClaudeCodeAnthropic,
-            Codec::OwnedBroca => Self::OwnedBroca,
-            Codec::Pi => Self::Pi,
+            Codec::OpencodeAiSdk => Ok(Self::OpencodeAiSdk),
+            Codec::OwnedBroca => Ok(Self::OwnedBroca),
+            Codec::Pi => Ok(Self::Pi),
+            Codec::AnthropicMessages => Err(transient(
+                "anthropic-messages views are not stored as host recipes",
+            )),
         }
     }
 
     fn profile(self) -> &'static str {
         match self {
             Self::OpencodeAiSdk => "opencode-aisdk",
-            Self::ClaudeCodeAnthropic => "claude-code-anthropic",
             Self::OwnedBroca => "owned-broca",
             Self::OwnedBrocaRunner => "owned-broca-runner",
             Self::Pi => "pi",
@@ -490,7 +497,6 @@ impl RecipeLane {
     fn render_key(self) -> &'static str {
         match self {
             Self::OpencodeAiSdk => "provider-open-code-render-v2",
-            Self::ClaudeCodeAnthropic => "provider-claude-code-raw-v1",
             Self::OwnedBroca => "provider-owned-broca-wire-v1",
             Self::OwnedBrocaRunner => "provider-owned-broca-engine-v1",
             Self::Pi => "provider-pi-whole-v1",
@@ -500,7 +506,6 @@ impl RecipeLane {
     fn from_profile(profile: &str) -> Result<Self, HandlerOutcome> {
         [
             Self::OpencodeAiSdk,
-            Self::ClaudeCodeAnthropic,
             Self::OwnedBroca,
             Self::OwnedBrocaRunner,
             Self::Pi,
@@ -511,14 +516,11 @@ impl RecipeLane {
     }
 }
 
-/// One message of a view in every form the view stores it: the engine's CK
-/// message, the wire message (absent for runner views), and Claude's exact raw
-/// JSON text.
+/// One view message in engine form and, when present, rendered serializer form.
 #[derive(Clone, Debug, PartialEq)]
 struct Item {
     engine: Value,
     wire: Option<Value>,
-    raw: Option<String>,
 }
 
 impl Item {
@@ -526,9 +528,6 @@ impl Item {
         let mut slot = json!({ "engine": self.engine });
         if let Some(wire) = &self.wire {
             slot["wire"] = wire.clone();
-        }
-        if let Some(raw) = &self.raw {
-            slot["raw"] = json!(raw);
         }
         slot
     }
@@ -540,54 +539,28 @@ impl Item {
                 .cloned()
                 .ok_or_else(|| transient("view synthetic slot has no engine message"))?,
             wire: slot.get("wire").cloned(),
-            raw: slot
-                .get("raw")
-                .map(|raw| {
-                    raw.as_str()
-                        .map(str::to_owned)
-                        .ok_or_else(|| transient("view raw slot is not text"))
-                })
-                .transpose()?,
         })
     }
 }
 
-/// Decode one stored native message through the lane's codec. Claude's raw
-/// text is copied from the stored envelope as-is, never parsed and re-encoded.
+/// Decode one stored transcript message through the recipe's codec.
 fn source_item(
     lane: RecipeLane,
     mid: &str,
     ordinal: u64,
     native: Value,
 ) -> Result<Item, HandlerOutcome> {
-    let entry = compact::status::StatusMessage {
+    let entry = codec::InboundMessage {
         ordinal,
         mid: mid.into(),
         message: native,
-        raw_message: None,
     };
     match lane {
-        RecipeLane::ClaudeCodeAnthropic => {
-            let ck = super::codec_claude_code::decode_message(&entry)?;
-            let raw = entry
-                .message
-                .get("raw_message")
-                .and_then(Value::as_str)
-                .ok_or_else(|| transient("Claude Code source has no raw message"))?
-                .to_owned();
-            let wire = serde_json::from_str(&raw).map_err(transient)?;
-            Ok(Item {
-                engine: serde_json::to_value(ck.ck).map_err(transient)?,
-                wire: Some(wire),
-                raw: Some(raw),
-            })
-        }
         RecipeLane::OwnedBroca | RecipeLane::OwnedBrocaRunner => {
             let ck = super::codec::decode_message(&entry)?;
             Ok(Item {
                 engine: serde_json::to_value(ck.ck).map_err(transient)?,
                 wire: (lane == RecipeLane::OwnedBroca).then_some(entry.message),
-                raw: None,
             })
         }
         RecipeLane::OpencodeAiSdk => {
@@ -600,53 +573,6 @@ fn source_item(
 /// Exact patches are format 2; OpenCode's whole-message treatments are format 1.
 const EXACT_PATCH_FORMAT: u64 = 2;
 
-/// Describe `target` as the bytes of `source` with one middle span replaced.
-/// Splitting only at bytes both strings share keeps every unchanged byte,
-/// including whitespace, key order and escape spelling, without parsing.
-fn raw_splice(source: &str, target: &str) -> Value {
-    let (s, t) = (source.as_bytes(), target.as_bytes());
-    let mut prefix = s.iter().zip(t).take_while(|(a, b)| a == b).count();
-    while !(source.is_char_boundary(prefix) && target.is_char_boundary(prefix)) {
-        prefix -= 1;
-    }
-    let room = s.len().min(t.len()) - prefix;
-    let mut suffix = s
-        .iter()
-        .rev()
-        .zip(t.iter().rev())
-        .take(room)
-        .take_while(|(a, b)| a == b)
-        .count();
-    while !target.is_char_boundary(t.len() - suffix) || !source.is_char_boundary(s.len() - suffix) {
-        suffix -= 1;
-    }
-    json!({"keep_prefix": prefix, "keep_suffix": suffix, "insert": &target[prefix..t.len() - suffix]})
-}
-
-fn apply_splice(source: &str, splice: &Value) -> Result<String, HandlerOutcome> {
-    let bound = |field: &str| {
-        splice[field]
-            .as_u64()
-            .and_then(|n| usize::try_from(n).ok())
-            .ok_or_else(|| transient("view raw splice is malformed"))
-    };
-    let (prefix, suffix) = (bound("keep_prefix")?, bound("keep_suffix")?);
-    let insert = splice["insert"]
-        .as_str()
-        .ok_or_else(|| transient("view raw splice is malformed"))?;
-    if prefix + suffix > source.len()
-        || !source.is_char_boundary(prefix)
-        || !source.is_char_boundary(source.len() - suffix)
-    {
-        return Err(transient("view raw splice does not fit its source"));
-    }
-    Ok(format!(
-        "{}{insert}{}",
-        &source[..prefix],
-        &source[source.len() - suffix..]
-    ))
-}
-
 /// The patch that turns a decoded source into a view message, `Ok(None)` when
 /// they are equal, or `Err(())` when the forms differ in kind.
 fn exact_patch(source: &Item, target: &Item) -> Result<Option<Value>, ()> {
@@ -658,20 +584,12 @@ fn exact_patch(source: &Item, target: &Item) -> Result<Option<Value>, ()> {
         (None, None) => {}
         _ => return Err(()),
     }
-    let raw = match (&source.raw, &target.raw) {
-        (Some(old), Some(new)) if old != new => Some(raw_splice(old, new)),
-        (Some(_), Some(_)) | (None, None) => None,
-        _ => return Err(()),
-    };
-    if engine.is_empty() && wire.is_empty() && raw.is_none() {
+    if engine.is_empty() && wire.is_empty() {
         return Ok(None);
     }
     let mut patch = json!({"format": EXACT_PATCH_FORMAT, "engine": engine});
     if !wire.is_empty() {
         patch["wire"] = serde_json::to_value(wire).map_err(|_| ())?;
-    }
-    if let Some(raw) = raw {
-        patch["raw"] = raw;
     }
     Ok(Some(patch))
 }
@@ -696,13 +614,6 @@ fn apply_exact(mut item: Item, patch: &Value) -> Result<Item, HandlerOutcome> {
                 .ok_or_else(|| transient("view wire patch has no wire source"))?,
             &wire,
         )?;
-    }
-    if let Some(splice) = patch.get("raw") {
-        let raw = item
-            .raw
-            .as_deref()
-            .ok_or_else(|| transient("view raw patch has no raw source"))?;
-        item.raw = Some(apply_splice(raw, splice)?);
     }
     Ok(item)
 }
@@ -847,181 +758,64 @@ fn resolve_items(
     Ok((resolved.recipe.metadata, items))
 }
 
-/// `[`, the raw messages joined by commas, `]`: the frozen Claude payload.
-fn joined(raws: &[String]) -> String {
-    format!("[{}]", raws.join(","))
-}
-
-/// Check a frozen reference against the joined raw messages without building
-/// the joined string first.
-fn joined_matches(reference: &compact::view::ViewRef, raws: &[String]) -> bool {
-    use sha2::{Digest, Sha256};
-    let mut hash = Sha256::new();
-    let mut length = 2u64;
-    hash.update(b"[");
-    for (index, raw) in raws.iter().enumerate() {
-        if index > 0 {
-            hash.update(b",");
-            length += 1;
-        }
-        hash.update(raw.as_bytes());
-        length += raw.len() as u64;
-    }
-    hash.update(b"]");
-    reference.byte_length == length && reference.sha256 == format!("{:x}", hash.finalize())
-}
-
-/// Recipe-format marker kept in host view metadata.
+/// Recipe-format marker stored with the message-free view metadata.
 const HOST_SHELL_FORMAT: u64 = 1;
 
-/// Split a host view into the metadata shell and its messages. The full and cut
-/// Claude payloads are not stored: both are the joined raw messages, and their
-/// references keep the digests and lengths they must reproduce. A view whose
-/// payloads are not exactly those joins is stored whole.
-fn decompose_host(view: &compaction::HostView) -> Result<(Value, Vec<Item>), HandlerOutcome> {
-    let whole = || -> Result<(Value, Vec<Item>), HandlerOutcome> {
+fn decompose_host(view: &compaction::EngineView) -> Result<(Value, Vec<Item>), HandlerOutcome> {
+    if view.wire.replacement.len() != view.engine.replacement.len() {
         let mut metadata = serde_json::to_value(view).map_err(transient)?;
         metadata["mc_recipe"] = json!({"format": HOST_SHELL_FORMAT, "whole": true});
-        Ok((metadata, Vec::new()))
-    };
-    let count = view.engine.replacement.len();
-    let raws = view.raw_replacement.as_deref();
-    if view.wire.replacement.len() != count || raws.is_some_and(|raws| raws.len() != count) {
-        return whole();
+        return Ok((metadata, Vec::new()));
     }
     let mut shell = view.clone();
     shell.engine.replacement.clear();
     shell.wire.replacement.clear();
-    if let Some(raw) = shell.raw_replacement.as_mut() {
-        raw.clear();
-    }
-    if let Some(frozen) = shell.wire.raw_view.as_mut() {
-        match (&frozen.payload, raws) {
-            (compact::view::RawPayload::Inline { bytes }, Some(raws)) if *bytes == joined(raws) => {
-                frozen.payload = compact::view::RawPayload::Inline {
-                    bytes: String::new(),
-                };
-            }
-            _ => return whole(),
-        }
-    }
-    let mut cut_head = None;
-    if let Some(cut) = shell.cut_replacement.as_mut() {
-        let Some(raws) = raws else {
-            return whole();
-        };
-        let head = view
-            .engine
-            .replacement
-            .iter()
-            .take_while(|message| {
-                !message
-                    .provider_extras
-                    .contains_key(super::codec_claude_code::EXTRAS)
-            })
-            .count();
-        if cut.bytes != joined(&raws[..head]) {
-            return whole();
-        }
-        cut.bytes.clear();
-        cut_head = Some(head);
-    }
-    let mut metadata = serde_json::to_value(&shell).map_err(transient)?;
-    metadata["mc_recipe"] = json!({"format": HOST_SHELL_FORMAT, "cut_head": cut_head});
-    let items = (0..count)
-        .map(|index| {
+    let mut metadata = serde_json::to_value(shell).map_err(transient)?;
+    metadata["mc_recipe"] = json!({"format": HOST_SHELL_FORMAT});
+    let items = view
+        .engine
+        .replacement
+        .iter()
+        .zip(&view.wire.replacement)
+        .map(|(engine, wire)| {
             Ok(Item {
-                engine: serde_json::to_value(&view.engine.replacement[index]).map_err(transient)?,
-                wire: Some(view.wire.replacement[index].clone()),
-                raw: raws.map(|raws| raws[index].clone()),
+                engine: serde_json::to_value(engine).map_err(transient)?,
+                wire: Some(wire.clone()),
             })
         })
         .collect::<Result<Vec<_>, HandlerOutcome>>()?;
     Ok((metadata, items))
 }
 
-fn stored_bytes_changed() -> HandlerOutcome {
-    transient("stored native view bytes no longer match their digest")
-}
-
-/// Rebuild a host view from its shell and messages, checking each frozen
-/// Claude payload's digest and length before materializing it inline.
 fn assemble_host(
     lane: RecipeLane,
     mut metadata: Value,
     items: Vec<Item>,
-) -> Result<compaction::HostView, HandlerOutcome> {
-    if !matches!(
-        lane,
-        RecipeLane::ClaudeCodeAnthropic | RecipeLane::OwnedBroca | RecipeLane::Pi
-    ) {
-        return Err(transient("recipe is not a host view"));
+) -> Result<compaction::EngineView, HandlerOutcome> {
+    if !matches!(lane, RecipeLane::OwnedBroca | RecipeLane::Pi) {
+        return Err(transient("recipe is not a rendered view"));
     }
     let marker = metadata
         .as_object_mut()
         .and_then(|fields| fields.remove("mc_recipe"))
-        .ok_or_else(|| transient("host view recipe has no shell marker"))?;
+        .ok_or_else(|| transient("view recipe has no shell marker"))?;
     if marker["format"] != json!(HOST_SHELL_FORMAT) {
-        return Err(transient("unknown host view recipe format"));
+        return Err(transient("unknown view recipe format"));
     }
-    let mut view: compaction::HostView = serde_json::from_value(metadata).map_err(transient)?;
+    let mut view: compaction::EngineView = serde_json::from_value(metadata).map_err(transient)?;
     if marker["whole"] == json!(true) {
         return Ok(view);
     }
-    let mut raws = Vec::new();
     for item in items {
         view.engine
             .replacement
             .push(serde_json::from_value(item.engine).map_err(transient)?);
         view.wire.replacement.push(
             item.wire
-                .ok_or_else(|| transient("host view message has no wire form"))?,
+                .ok_or_else(|| transient("view message has no rendered form"))?,
         );
-        if let Some(raw) = item.raw {
-            raws.push(raw);
-        }
-    }
-    if let Some(raw) = view.raw_replacement.as_mut() {
-        if raws.len() != view.engine.replacement.len() {
-            return Err(transient("host view raw messages are incomplete"));
-        }
-        *raw = raws;
-    }
-    let raws = view.raw_replacement.as_deref();
-    if let Some(frozen) = view.wire.raw_view.as_mut() {
-        let raws = raws.ok_or_else(stored_bytes_changed)?;
-        if !joined_matches(&frozen.view, raws) {
-            return Err(stored_bytes_changed());
-        }
-        frozen.payload = compact::view::RawPayload::Inline {
-            bytes: joined(raws),
-        };
-    }
-    if let Some(cut) = view.cut_replacement.as_mut() {
-        let head = marker["cut_head"]
-            .as_u64()
-            .and_then(|head| usize::try_from(head).ok())
-            .ok_or_else(stored_bytes_changed)?;
-        let raws = raws
-            .and_then(|raws| raws.get(..head))
-            .ok_or_else(stored_bytes_changed)?;
-        if !joined_matches(&cut.reference, raws) {
-            return Err(stored_bytes_changed());
-        }
-        cut.bytes = joined(raws);
     }
     Ok(view)
-}
-
-/// Claude names each native survivor by `(mid, ordinal)` in its provenance.
-fn claude_identity(message: &ck_wire::CkWireMessage) -> Option<(String, u64)> {
-    let provenance = message
-        .provider_extras
-        .get(super::codec_claude_code::EXTRAS)?;
-    Some((
-        provenance.get("mid")?.as_str()?.to_owned(),
-        provenance.get("ordinal")?.as_u64()?,
-    ))
 }
 
 /// Broca carries the whole native message it decoded from; that copy is the
@@ -1102,54 +896,10 @@ fn host_natives(
     store: &McStore,
     key: &Key,
     lane: RecipeLane,
-    view: &compaction::HostView,
+    view: &compaction::EngineView,
 ) -> Result<Vec<Option<Native>>, HandlerOutcome> {
     let messages = &view.engine.replacement;
     let range = &view.engine.range;
-    if lane == RecipeLane::ClaudeCodeAnthropic {
-        let identities: Vec<_> = messages
-            .iter()
-            .map(|message| {
-                (!message.meta.synthetic)
-                    .then(|| claude_identity(message))
-                    .flatten()
-            })
-            .collect();
-        let Some(first) = identities
-            .iter()
-            .flatten()
-            .map(|(_, ordinal)| *ordinal)
-            .min()
-        else {
-            return Ok(identities.iter().map(|_| None).collect());
-        };
-        let sources: BTreeMap<_, _> = parsed_sources(
-            store
-                .load_provider_message_sources_since(&key.store_key(), &range.lineage_id, first)
-                .map_err(transient)?,
-        )?
-        .into_iter()
-        .map(|(lineage, mid, ordinal, native)| {
-            ((mid.clone(), ordinal), (lineage, mid, ordinal, native))
-        })
-        .collect();
-        return identities
-            .into_iter()
-            .map(|identity| {
-                identity
-                    .and_then(|identity| sources.get(&identity))
-                    .map(|(lineage, mid, ordinal, native)| {
-                        Ok(Native {
-                            lineage: lineage.clone(),
-                            mid: mid.clone(),
-                            ordinal: *ordinal,
-                            source: source_item(lane, mid, *ordinal, native.clone())?,
-                        })
-                    })
-                    .transpose()
-            })
-            .collect();
-    }
     // Broca survivors normally sit at the end of the replaced range. Read that
     // tail first and widen to the whole range only if a survivor is missing.
     let wanted = messages
@@ -1180,12 +930,11 @@ fn baseline_cut(store: &McStore, key: &mc_store::ProviderSessionKey) -> Option<u
         .and_then(Value::as_u64)
 }
 
-/// Persist a Claude Code, Broca or Pi host view as an exact recipe. OpenCode
-/// views keep their own writer.
-pub(super) fn save_host(
+/// Persist a Broca or Pi rendered view as an exact recipe; OpenCode uses its own writer.
+pub fn save_host(
     store: &McStore,
     key: &Key,
-    view: &compaction::HostView,
+    view: &compaction::EngineView,
     state: &str,
 ) -> Result<(), HandlerOutcome> {
     let started = std::time::Instant::now();
@@ -1197,7 +946,7 @@ pub(super) fn save_host(
         .map(|c| serde_json::from_str::<Value>(&c.params_json).map_err(transient))
         .transpose()?
         .unwrap_or_else(|| json!({}));
-    let lane = RecipeLane::host(Codec::from_params(&params)?);
+    let lane = RecipeLane::host(Codec::from_params(&params)?)?;
     if lane == RecipeLane::OpencodeAiSdk {
         return save(store, key, view, state);
     }
@@ -1239,11 +988,11 @@ pub(super) fn save_host(
 
 /// Build the recipe of a Broca runner view from the record's in-memory
 /// transcript. The record writer inserts it in the record's own transaction.
-pub(super) fn runner_recipe(
+pub fn runner_recipe(
     store: &McStore,
     key: &mc_store::ProviderSessionKey,
     view: &transform::compaction::View,
-    messages: &BTreeMap<String, BTreeMap<u64, compact::status::StatusMessage>>,
+    messages: &BTreeMap<String, BTreeMap<u64, codec::InboundMessage>>,
     base: Option<u64>,
     state: &str,
 ) -> Result<ProviderViewRecipe, HandlerOutcome> {
@@ -1257,7 +1006,6 @@ pub(super) fn runner_recipe(
             Ok(Item {
                 engine: serde_json::to_value(message).map_err(transient)?,
                 wire: None,
-                raw: None,
             })
         })
         .collect::<Result<Vec<_>, HandlerOutcome>>()?;
@@ -1320,7 +1068,7 @@ pub(super) fn runner_recipe(
 }
 
 /// Resolve a Broca runner view recipe.
-pub(super) fn load_runner(
+pub fn load_runner(
     store: &McStore,
     key: &mc_store::ProviderSessionKey,
     version: u64,
@@ -1349,17 +1097,17 @@ pub(super) fn load_runner(
 /// the resolved host view serialized exactly as the whole-copy table held it.
 #[cfg(test)]
 #[derive(Clone, Debug, PartialEq, Eq)]
-pub(crate) struct StoredView {
-    pub(crate) version: u64,
-    pub(crate) lineage_id: String,
-    pub(crate) range_from: u64,
-    pub(crate) range_to: u64,
-    pub(crate) replacement_json: String,
-    pub(crate) state: String,
+pub struct StoredView {
+    pub version: u64,
+    pub lineage_id: String,
+    pub range_from: u64,
+    pub range_to: u64,
+    pub replacement_json: String,
+    pub state: String,
 }
 
 #[cfg(test)]
-pub(crate) fn stored_view(
+pub fn stored_view(
     store: &McStore,
     key: &mc_store::ProviderSessionKey,
     version: u64,
@@ -1396,7 +1144,7 @@ pub(crate) fn stored_view(
 }
 
 #[cfg(test)]
-pub(crate) fn stored_views(store: &McStore, key: &mc_store::ProviderSessionKey) -> Vec<StoredView> {
+pub fn stored_views(store: &McStore, key: &mc_store::ProviderSessionKey) -> Vec<StoredView> {
     store
         .load_provider_view_recipe_versions(key)
         .unwrap()

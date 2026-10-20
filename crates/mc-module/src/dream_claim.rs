@@ -6,7 +6,7 @@ use crate::dream_dispatch::ownership::{
     self, ClaimantDeclaration, Ownership, OwnershipInput, Wiring,
 };
 use crate::dream_dispatch::tick::{DreamHandles, DreamTarget, ManualRun};
-use crate::{invalid_params_error, now_ms, providers, respond, McHandler, SessionBinding};
+use crate::{invalid_params_error, now_ms, ops_facade, respond, McHandler, SessionBinding};
 use mc_store::dream_scheduler::schedules::TaskName;
 use serde_json::{json, Value};
 use std::sync::Arc;
@@ -51,8 +51,7 @@ impl McHandler {
                 message: format!("{method} on a channel with no session binding"),
             })?;
         if binding.principal.is_some() {
-            providers::admit_host_lane(&binding)
-                .and_then(|()| providers::admit_harness_module(&binding))?;
+            ops_facade::authorize_harness_scope(&binding)?;
         } else if !plugin_lane(&binding) {
             return Err(HandlerOutcome::Error {
                 code: "host_lane_requires_plugin".into(),
@@ -130,6 +129,10 @@ impl McHandler {
                 session: binding.session.clone(),
                 harness: binding.harness.clone(),
                 seen_at_ms: now_ms(),
+                // A dream management route is the claim protocol's own route; only
+                // a runner-lane conversation records a session runner
+                // (see `record_session_runner_dream_target`).
+                session_runner: None,
             },
         );
         // Tests drive runs explicitly; a background timer would race them.
@@ -204,6 +207,41 @@ impl McHandler {
             wiring: &wiring,
             claimant: claimant.as_ref(),
         })
+    }
+
+    /// Remember a runner-lane conversation as its project's dream target: the tick
+    /// then sends that project's dream children to `route` (the conversation's own
+    /// runner, as hidden children of `route.parent_session()`) instead of queueing
+    /// them for a host claimant. `project` is the project key the store files the
+    /// project's dream schedule under; `directory` is where children work.
+    ///
+    /// Nothing here reads a pass barrier, a provider plan or a route channel, so
+    /// any handler that has admitted the conversation can call it. Returns whether
+    /// the target was recorded: only while the Rust dreamer is switched on for
+    /// `directory`, as for [`Self::record_dream_target`].
+    pub(crate) fn record_session_runner_dream_target(
+        &self,
+        project: &str,
+        directory: &std::path::Path,
+        harness: &str,
+        route: crate::route_targets::SessionRunnerRoute,
+    ) -> bool {
+        if !self.effective_config(directory).rust_background_enabled() {
+            return false;
+        }
+        self.dream_runs.record(
+            project,
+            DreamTarget {
+                directory: directory.to_path_buf(),
+                session: route.parent_session().to_owned(),
+                harness: harness.to_owned(),
+                seen_at_ms: now_ms(),
+                session_runner: Some(route),
+            },
+        );
+        #[cfg(not(test))]
+        self.dream_handles().ensure_timer();
+        true
     }
 
     /// `dream.ownership {v:1, claimant?}` answers with the published list for the

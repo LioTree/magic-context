@@ -25,6 +25,25 @@ pub fn decode_pi_with_sidecar(
     entries: &[PiSessionEntryJson],
     prior: Option<&DecodeSidecar>,
 ) -> DecodedHarnessMessages {
+    decode_pi_with_origins(entries, prior, None)
+}
+
+/// Decode selected journal entries at their original one-based decode ordinals.
+/// Fallback tool IDs and sidecar identities must not depend on a slice's start.
+pub fn decode_pi_with_sidecar_and_ordinals(
+    entries: &[PiSessionEntryJson],
+    prior: Option<&DecodeSidecar>,
+    ordinals: &[u64],
+) -> DecodedHarnessMessages {
+    assert_eq!(entries.len(), ordinals.len());
+    decode_pi_with_origins(entries, prior, Some(ordinals))
+}
+
+fn decode_pi_with_origins(
+    entries: &[PiSessionEntryJson],
+    prior: Option<&DecodeSidecar>,
+    ordinals: Option<&[u64]>,
+) -> DecodedHarnessMessages {
     let mut sidecar = DecodeSidecar::new(HARNESS);
     if let Some(prior) = prior {
         sidecar.mid_pins = prior.mid_pins.clone();
@@ -35,7 +54,10 @@ pub fn decode_pi_with_sidecar(
 
     for (entry_index, raw_entry) in entries.iter().enumerate() {
         if raw_entry.get("type").and_then(Value::as_str) == Some("compaction") {
-            boundary = Some(pi_boundary(raw_entry, (entry_index + 1) as u64));
+            boundary = Some(pi_boundary(
+                raw_entry,
+                ordinals.map_or((entry_index + 1) as u64, |o| o[entry_index]),
+            ));
             continue;
         }
 
@@ -43,20 +65,21 @@ pub fn decode_pi_with_sidecar(
             if is_pi_opaque_entry(raw_entry) {
                 decoded.push(decode_opaque_entry(
                     raw_entry,
-                    (decoded.len() + 1) as u64,
+                    ordinals.map_or((decoded.len() + 1) as u64, |o| o[entry_index]),
                     &mut sidecar,
                 ));
             }
             continue;
         };
 
-        let ordinal = (decoded.len() + 1) as u64;
+        let ordinal = ordinals.map_or((decoded.len() + 1) as u64, |o| o[entry_index]);
         let role = message
             .get("role")
             .and_then(Value::as_str)
             .unwrap_or("unknown")
             .to_string();
-        let stable_key = pi_stable_key(raw_entry, message, entry_index);
+        let stable_index = ordinals.map_or(entry_index, |_| ordinal.saturating_sub(1) as usize);
+        let stable_key = pi_stable_key(raw_entry, message, stable_index);
         let mid = sidecar
             .inherit_pin(&stable_key)
             .unwrap_or_else(|| first_sight_pi_mid(raw_entry, message, &stable_key));
@@ -1527,4 +1550,24 @@ mod tests {
         assert!(decoded.messages.is_empty());
         assert_eq!(decoded.boundary.as_ref().unwrap().message_id, "entry-kept");
     }
+}
+#[test]
+fn absolute_pi_origins_match_full_decode_with_fallback_tool_ids() {
+    let entries = vec![
+        json!({"role":"user","content":"prefix"}),
+        json!({"role":"assistant","content":[{"type":"toolCall","name":"read","arguments":{"path":"x"}}]}),
+        json!({"role":"toolResult","toolName":"read","content":[{"type":"text","text":"result"}]}),
+        json!({"role":"assistant","content":[{"type":"thinking","thinking":"signed","thinkingSignature":"sig"},{"type":"text","text":"done"}]}),
+    ];
+    let full = decode_pi(&entries);
+    let suffix = decode_pi_with_sidecar_and_ordinals(&entries[1..], None, &[2, 3, 4]);
+    assert_eq!(suffix.messages, full.messages[1..]);
+    let messages = suffix
+        .messages
+        .iter()
+        .map(|m| m.ck.clone())
+        .collect::<Vec<_>>();
+    assert_eq!(encode_pi(&messages, &suffix.sidecar), entries[1..]);
+    let legacy = decode_pi(&entries[1..]);
+    assert_ne!(legacy.messages[0], suffix.messages[0]);
 }

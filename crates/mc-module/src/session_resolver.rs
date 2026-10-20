@@ -22,10 +22,31 @@ const SESSION_RESOLVE_DEADLINE: Duration = Duration::from_secs(2);
 /// The caller's harness travels separately in compaction and hook request bodies.
 pub const RUNNER_BIND_HARNESS: &str = "runner";
 
+/// The role versions every route this module opens to a runner declares:
+/// it speaks `llm-runner/v1` there. The declaration is part of the route's
+/// identity, so the same map must be given when the route is closed.
+pub fn llm_runner_role_versions() -> std::collections::BTreeMap<String, String> {
+    std::collections::BTreeMap::from([(
+        cortexkit_role_llm_runner::ROLE.to_string(),
+        cortexkit_role_llm_runner::VERSION.to_string(),
+    )])
+}
+
 /// Provider callbacks use the configured runner route and the SDK's daemon-verified
 /// module launch identity. They must never use the gateway's session resolver.
 #[async_trait]
 pub trait ProviderRunner: Send + Sync {
+    async fn call_for(
+        &self,
+        route: &crate::route_targets::SessionRunnerRoute,
+        project_root: &Path,
+        method: &str,
+        params: Value,
+        budget: Duration,
+    ) -> Result<Value, SessionResolveError> {
+        self.call(project_root, route.parent_session(), method, params, budget)
+            .await
+    }
     async fn call(
         &self,
         project_root: &Path,
@@ -52,6 +73,24 @@ impl RealProviderRunner {
 
 #[async_trait]
 impl ProviderRunner for RealProviderRunner {
+    async fn call_for(
+        &self,
+        route: &crate::route_targets::SessionRunnerRoute,
+        project_root: &Path,
+        method: &str,
+        params: Value,
+        budget: Duration,
+    ) -> Result<Value, SessionResolveError> {
+        self.call_target(
+            route.target(),
+            project_root,
+            route.parent_session(),
+            method,
+            params,
+            budget,
+        )
+        .await
+    }
     async fn call(
         &self,
         project_root: &Path,
@@ -64,6 +103,21 @@ impl ProviderRunner for RealProviderRunner {
             .route_targets
             .target(RegisteredRoute::ProviderRunner)
             .expect("provider runner has a registered target");
+        self.call_target(target, project_root, session, method, params, budget)
+            .await
+    }
+}
+
+impl RealProviderRunner {
+    async fn call_target(
+        &self,
+        target: RouteTarget,
+        project_root: &Path,
+        session: &str,
+        method: &str,
+        params: Value,
+        budget: Duration,
+    ) -> Result<Value, SessionResolveError> {
         let identity = BindIdentity::new(project_root.to_path_buf(), RUNNER_BIND_HARNESS, session);
         let work = async {
             let mut options = consumer_options();
@@ -81,12 +135,20 @@ impl ProviderRunner for RealProviderRunner {
                     CallOptions {
                         timeout: budget,
                         route_retry_deadline: budget,
+                        role_versions: Some(llm_runner_role_versions()),
                         ..call_options()
                     },
                 )
                 .await;
             consumer
-                .close_route(target, identity, CloseRouteOptions::default())
+                .close_route(
+                    target,
+                    identity,
+                    CloseRouteOptions {
+                        role_versions: Some(llm_runner_role_versions()),
+                        ..CloseRouteOptions::default()
+                    },
+                )
                 .await;
             consumer.close().await;
             let bytes = response.map_err(call_error_to_resolve_error)?;
@@ -362,5 +424,158 @@ mod tests {
             format!("{:?}", resolver.route_target()),
             "ManagementSurface { module_id: \"thalamus\" }"
         );
+    }
+
+    /// What a fake daemon saw of one runner route.open request: its target,
+    /// bind session and declared role versions.
+    #[derive(Debug, Default)]
+    struct SeenRoute {
+        target: Option<RouteTarget>,
+        session: String,
+        role_versions: Option<std::collections::BTreeMap<String, String>>,
+    }
+
+    /// A one-connection fake daemon answering every routed request with `{}`.
+    async fn fake_daemon() -> (
+        tempfile::TempDir,
+        PathBuf,
+        std::sync::Arc<std::sync::Mutex<Vec<SeenRoute>>>,
+    ) {
+        use subc_control::{ClientControlRequest, ClientControlResponse};
+        use subc_protocol::{Flags, Frame, FrameType, Priority};
+        use subc_transport::{
+            authenticate_server, generate_daemon_id, generate_key, read_frame, write_atomic,
+            write_frame, ConnectionInfo, Endpoint, SCHEMA_VERSION,
+        };
+        let temp = tempfile::tempdir().unwrap();
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        let key = generate_key().unwrap();
+        let daemon_id = generate_daemon_id().unwrap();
+        let connection_file = temp.path().join("connection.json");
+        write_atomic(
+            &connection_file,
+            &ConnectionInfo {
+                schema: SCHEMA_VERSION,
+                wire_version: Some(subc_protocol::PROTOCOL_VERSION),
+                endpoints: vec![Endpoint {
+                    host: address.ip().to_string(),
+                    port: address.port(),
+                }],
+                key: key.clone(),
+                daemon_id,
+                pid: std::process::id(),
+                daemon_ver: "fake".into(),
+            },
+        )
+        .unwrap();
+        let seen = std::sync::Arc::new(std::sync::Mutex::new(Vec::<SeenRoute>::new()));
+        let log = seen.clone();
+        tokio::spawn(async move {
+            while let Ok((mut stream, _)) = listener.accept().await {
+                authenticate_server(
+                    &mut stream,
+                    &key,
+                    &daemon_id,
+                    "fake",
+                    Duration::from_secs(2),
+                )
+                .await
+                .unwrap();
+                while let Ok(Some(frame)) = read_frame(&mut stream).await {
+                    let body = match frame.header.ty {
+                        FrameType::Request if frame.header.channel == 0 => {
+                            let Ok(ClientControlRequest::RouteOpen {
+                                target,
+                                identity,
+                                role_versions,
+                                ..
+                            }) = serde_json::from_slice(&frame.body)
+                            else {
+                                continue;
+                            };
+                            let mut log = log.lock().unwrap();
+                            log.push(SeenRoute {
+                                target: Some(target),
+                                session: identity.session,
+                                role_versions,
+                            });
+                            serde_json::to_vec(&ClientControlResponse::RouteOpen {
+                                route_channel: 9 + log.len() as u16,
+                                route_epoch: 1,
+                            })
+                            .unwrap()
+                        }
+                        FrameType::Request => b"{}".to_vec(),
+                        _ => continue,
+                    };
+                    let response = Frame::build(
+                        FrameType::Response,
+                        Flags::new(false, Priority::Interactive, false),
+                        frame.header.channel,
+                        frame.header.epoch,
+                        frame.header.corr,
+                        body,
+                    )
+                    .unwrap();
+                    write_frame(&mut stream, &response).await.unwrap();
+                }
+            }
+        });
+        (temp, connection_file, seen)
+    }
+
+    /// Both runner paths, the process-configured provider runner and a
+    /// conversation's own session runner, open their route declaring
+    /// `llm-runner/v1`.
+    #[tokio::test]
+    async fn every_provider_runner_route_declares_llm_runner_v1() {
+        let (_temp, connection_file, seen) = fake_daemon().await;
+        let runner =
+            RealProviderRunner::new(connection_file, RouteTargetConfig::runner_module("broca"));
+        let project = Path::new("/project");
+        runner
+            .call(
+                project,
+                "s",
+                "session.read",
+                json!({}),
+                Duration::from_secs(5),
+            )
+            .await
+            .unwrap();
+        let route = crate::route_targets::SessionRunnerRoute::for_principal(
+            Some(&subc_protocol::Principal::Reserved {
+                module_id: "thalamus-harness".into(),
+            }),
+            "parent",
+        )
+        .unwrap();
+        runner
+            .call_for(
+                &route,
+                project,
+                "session.read",
+                json!({}),
+                Duration::from_secs(5),
+            )
+            .await
+            .unwrap();
+        let seen = seen.lock().unwrap();
+        assert_eq!(seen.len(), 2, "{seen:?}");
+        let expected = Some(std::collections::BTreeMap::from([(
+            "llm-runner".to_string(),
+            "v1".to_string(),
+        )]));
+        for (route, module) in seen.iter().zip(["broca", "thalamus-harness"]) {
+            assert_eq!(
+                route.target,
+                Some(RouteTarget::ManagementSurface {
+                    module_id: module.into()
+                })
+            );
+            assert_eq!(route.role_versions, expected, "{route:?}");
+        }
+        assert_eq!(seen[1].session, "parent");
     }
 }

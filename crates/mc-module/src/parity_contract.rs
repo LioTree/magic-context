@@ -55,12 +55,6 @@ pub enum ProviderRole {
 pub enum LifecycleMethod {
     #[serde(rename = "compaction.setup")]
     CompactionSetup,
-    #[serde(rename = "compaction.step")]
-    CompactionStep,
-    #[serde(rename = "transform.declare")]
-    TransformDeclare,
-    #[serde(rename = "transform.hook")]
-    TransformHook,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -127,38 +121,12 @@ pub struct CompactionSetupRequest {
     pub source_revision: String,
 }
 
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(deny_unknown_fields)]
-pub struct CompactionStepRequest {
-    pub archive: RawArchiveBatch,
-    pub last_published_boundary: Option<MessageOrdinal>,
-    pub model: ModelDescriptor,
-}
-
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct ProviderTool {
     pub name: String,
     pub description: String,
     pub input_schema: Value,
-}
-
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(deny_unknown_fields)]
-pub struct TransformDeclareRequest {
-    pub agent_role: AgentRole,
-    pub callable_tools: Vec<String>,
-    pub model: ModelDescriptor,
-}
-
-/// Neutral CK JSON is preserved; native provider serialization remains bridge-owned.
-#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
-#[serde(deny_unknown_fields)]
-pub struct TransformHookRequest {
-    pub items: Vec<Value>,
-    pub source_revision: String,
-    pub model: ModelDescriptor,
-    pub visible_memory_ids: Vec<u64>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -187,21 +155,6 @@ pub trait LifecycleCallbacks: Send + Sync {
         &'a self,
         context: &'a RequestContext,
         request: &'a CompactionSetupRequest,
-    ) -> CallbackFuture<'a, LifecycleResult>;
-    fn compaction_step<'a>(
-        &'a self,
-        context: &'a RequestContext,
-        request: &'a CompactionStepRequest,
-    ) -> CallbackFuture<'a, LifecycleResult>;
-    fn transform_declare<'a>(
-        &'a self,
-        context: &'a RequestContext,
-        request: &'a TransformDeclareRequest,
-    ) -> CallbackFuture<'a, LifecycleResult>;
-    fn transform_hook<'a>(
-        &'a self,
-        context: &'a RequestContext,
-        request: &'a TransformHookRequest,
     ) -> CallbackFuture<'a, LifecycleResult>;
 }
 
