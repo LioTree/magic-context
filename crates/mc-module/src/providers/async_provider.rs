@@ -14,6 +14,7 @@ mod resident;
 mod scaling_tests;
 #[cfg(test)]
 mod tests;
+mod user_commands;
 use resident::{EngineView, HeldEntry};
 #[cfg(test)]
 use scaling_tests::reminder_work;
@@ -102,6 +103,8 @@ pub(crate) struct Runtime {
 
 #[derive(Serialize, Deserialize)]
 pub(crate) struct AsyncRecord {
+    #[serde(default, skip_serializing_if = "user_commands::Ledger::is_empty")]
+    commands: user_commands::Ledger,
     #[serde(default)]
     historian_cadence: Option<HistorianCadence>,
     #[serde(default)]
@@ -1276,6 +1279,7 @@ impl McHandler {
         let chosen = preset(request.preset.as_deref())?;
         let mut engine = transform::compaction::State::new(reference.clone(), chosen);
         let mut state = State {
+            commands: Default::default(),
             historian_cadence: None,
             historian_pending: false,
             restored_no_new_content: false,

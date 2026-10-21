@@ -424,7 +424,7 @@ pub(crate) fn role_describe_bytes() -> Result<Vec<u8>, CatalogError> {
     jcs_bytes(&json!({
         "majors": [{
             "version": PROVIDES,
-            "ops": [ops::ROLE_DESCRIBE, ops::TOOL_CATALOG],
+            "ops": [ops::ROLE_DESCRIBE, ops::TOOL_CATALOG, ops::USER_COMMAND_INVOKE, ops::LATE_RESULTS, ops::LATE_RESULTS_ACK],
             "stability": "alpha",
         }],
         "implementation_version": crate::version_line(),
@@ -482,6 +482,20 @@ pub(crate) fn catalog_answer(
         .map(|tool| catalog_tool(tool, surface, config))
         .collect::<Result<Vec<_>, _>>()?;
     content.insert("tools".to_string(), Value::Array(tools));
+    if compacting && preset == Preset::Head {
+        let declared = catalog::CatalogAnswer::new("", "").with_user_commands(vec![
+            cortexkit_role_tool_provider::user_command::UserCommand::new(
+                "ctx-status",
+                "Show magic context status, pending queue, cache TTL, and debug info",
+            ),
+            cortexkit_role_tool_provider::user_command::UserCommand::new(
+                "ctx-flush",
+                "Force-process all pending magic context operations immediately",
+            ),
+        ]);
+        content.insert("user_commands".into(), json!(declared.user_commands));
+        content.insert("capabilities".into(), json!({"late_results":true}));
+    }
     if let Some(item) = &request.system_text {
         let text_compacting = item
             .params
