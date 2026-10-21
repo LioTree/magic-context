@@ -114,9 +114,14 @@ impl FrozenEdits {
     }
 
     /// Re-anchor by source identity, never by an ordinal retained from another lineage.
+    ///
+    /// Parts are filled one at a time, then each tool arc is made whole
+    /// (`tool_arcs::complete_dropped_arcs`): a re-anchored drop of a call must
+    /// not leave its result served, nor the other way round.
     pub(super) fn apply(
         &self,
         state: &State,
+        kept: &tool_arcs::KeptMessages,
         ranges: &mut [view::ViewRange],
     ) -> Result<(), HandlerOutcome> {
         let mut anchored: BTreeMap<u64, Vec<view::PartEdit>> = BTreeMap::new();
@@ -145,7 +150,7 @@ impl FrozenEdits {
             };
             anchored.entry(*ordinal).or_default().push(edit);
         }
-        for range in ranges {
+        for range in ranges.iter_mut() {
             let view::ViewRange::Keep { from, to, edits } = range else {
                 continue;
             };
@@ -163,6 +168,7 @@ impl FrozenEdits {
             }
             edits.sort_by(|a, b| (a.ordinal, &a.part).cmp(&(b.ordinal, &b.part)));
         }
+        tool_arcs::complete_dropped_arcs(kept, ranges);
         Ok(())
     }
 }

@@ -70,7 +70,9 @@ fn tool_ids(messages: &[Value]) -> (BTreeSet<String>, BTreeSet<String>) {
 /// tool results it serves without their calls although the transcript holds
 /// both. The runner must refuse such a view (`tool_pair_split`); a runner that
 /// sent it would get an HTTP 400 from Anthropic for a `tool_result` that does
-/// not follow its `tool_use`.
+/// not follow its `tool_use`. Views the provider's own pairing check withheld
+/// count as well: that check is a safety net, and a view built correctly
+/// never reaches it.
 async fn split_tool_pairs(profile: Profile, seed: u64) -> (Vec<String>, Vec<String>) {
     let (mut pair, mut rng) = session_start(profile, seed, false).await;
     let mut checked = BTreeSet::new();
@@ -105,18 +107,22 @@ async fn split_tool_pairs(profile: Profile, seed: u64) -> (Vec<String>, Vec<Stri
             }
         }
     }
+    splits.extend(
+        tool_arcs::withheld::take(&pair.reference)
+            .into_iter()
+            .map(|split| format!("withheld by the pairing check: {split}")),
+    );
     (splits, pair.log.clone())
 }
 
-/// Differential seed 1199 (anthropic-messages), new since 5db74d82, where the
-/// same seed serves no split pair. An acknowledged view drops both sides of
-/// call181's arc. A later permitted pass serves a `[dropped]` placeholder for
-/// the result (message 182), and re-anchoring the acknowledged edits
-/// (`FrozenEdits::apply`) restores the drop of the call part alone: views 8 to
-/// 11 serve the `tool_result` for call181 (and call209) without its
-/// `tool_use`. With `FrozenEdits::apply` disabled this test passes.
+/// Differential seed 1199 (anthropic-messages). An acknowledged view drops
+/// both sides of call181's arc. A later permitted pass serves a `[dropped]`
+/// placeholder for the result (message 182), and re-anchoring the
+/// acknowledged edits (`FrozenEdits::apply`) part by part restored the drop of
+/// the call part alone, so views 8 to 11 served the `tool_result` for call181
+/// (and call209) without its `tool_use`. Re-anchoring now completes the drop
+/// of the whole arc (`tool_arcs::complete_dropped_arcs`).
 #[tokio::test]
-#[ignore = "cache review finding: fails until fixed"]
 async fn stack26_seed_1199_anthropic_views_keep_tool_results_with_their_calls() {
     let (splits, log) = split_tool_pairs(Profile::Anthropic, 1199).await;
     assert!(
@@ -127,13 +133,12 @@ async fn stack26_seed_1199_anthropic_views_keep_tool_results_with_their_calls() 
     );
 }
 
-/// Differential seed 1070 (pi), present already at 5db74d82: from view 2 on,
-/// call201's arc is dropped on the assistant side (its `toolCall` part) while
-/// the `toolResult` message stays with empty content. Its `toolCallId` is a
-/// message field, which a part edit cannot remove, so the served history keeps
-/// a result whose call is gone.
+/// Differential seed 1070 (pi): from view 2 on, call201's arc is fully
+/// dropped. Dropping every part of the `toolResult` message left it served
+/// with empty content and its `toolCallId`, a message field a part edit cannot
+/// remove, so the history kept a result whose call was gone. The view now
+/// removes the whole message (`tool_arcs::remove_dropped_tool_results`).
 #[tokio::test]
-#[ignore = "cache review finding: fails until fixed"]
 async fn stack26_seed_1070_pi_views_keep_tool_results_with_their_calls() {
     let (splits, log) = split_tool_pairs(Profile::Pi, 1070).await;
     assert!(

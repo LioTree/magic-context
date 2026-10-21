@@ -16,6 +16,7 @@ mod resident;
 mod scaling_tests;
 #[cfg(test)]
 mod tests;
+mod tool_arcs;
 mod user_commands;
 pub(super) mod wrapup;
 use resident::{EngineView, HeldEntry};
@@ -1253,9 +1254,21 @@ fn load_head(store: &McStore, reference: &str) -> Result<Option<State>, HandlerO
         .transpose()
 }
 
-fn checked_async_view(view: view::CompactionView) -> Result<view::CompactionView, HandlerOutcome> {
+/// Check a view before it is published: its structure (an error), then that it
+/// keeps every tool call together with its result in the runner's format
+/// (`Err` with the arcs it separates). A runner refuses a split view as
+/// `tool_pair_split`, and a model provider rejects the request.
+fn checked_async_view(
+    view: view::CompactionView,
+    codec: codec::Codec,
+    kept: &tool_arcs::KeptMessages,
+) -> Result<Result<view::CompactionView, Vec<String>>, HandlerOutcome> {
     view.check().map_err(|error| transient(error.name()))?;
-    Ok(view)
+    let splits = tool_arcs::split_pairs(codec, kept, &view.ranges);
+    if !splits.is_empty() {
+        return Ok(Err(splits));
+    }
+    Ok(Ok(view))
 }
 
 struct OverflowFact {
@@ -2043,13 +2056,15 @@ fn tag_rows_for<'a>(
     Ok(rows)
 }
 
+/// The view's ranges, and the transcript messages its keep ranges hold, read
+/// once here for the tool-arc checks that follow.
 fn ranges(
     state: &State,
     codec: codec::Codec,
     wire: &OutboundMessage,
     engine: &transform::compaction::View,
     history_through: Option<u64>,
-) -> Result<Vec<view::ViewRange>, HandlerOutcome> {
+) -> Result<(Vec<view::ViewRange>, tool_arcs::KeptMessages), HandlerOutcome> {
     let end = state
         .entries
         .last_key_value()
@@ -2058,6 +2073,7 @@ fn ranges(
         .checked_add(1)
         .ok_or_else(|| invalid("ordinal exhausted"))?;
     let mut ranges = Vec::new();
+    let mut kept = tool_arcs::KeptMessages::new();
     let mut synthetic = Vec::new();
     let mut next = 0;
     let history_end = history_through
@@ -2121,7 +2137,9 @@ fn ranges(
         if original.ordinal > next || !synthetic.is_empty() {
             append_view_gap(
                 state,
+                codec,
                 &mut ranges,
+                &mut kept,
                 &mut synthetic,
                 &mut next,
                 original.ordinal,
@@ -2175,23 +2193,32 @@ fn ranges(
             edits,
         ));
         next = original.ordinal + 1;
+        kept.insert(
+            original.ordinal,
+            tool_arcs::KeptMessage::new(codec, &original)?,
+        );
     }
     if next < end || !synthetic.is_empty() {
         append_view_gap(
             state,
+            codec,
             &mut ranges,
+            &mut kept,
             &mut synthetic,
             &mut next,
             end,
             history_end,
         )?;
     }
-    Ok(ranges)
+    Ok((ranges, kept))
 }
 
+#[allow(clippy::too_many_arguments)]
 fn append_view_gap(
     state: &State,
+    codec: codec::Codec,
     ranges: &mut Vec<view::ViewRange>,
+    kept: &mut tool_arcs::KeptMessages,
     synthetic: &mut Vec<Value>,
     next: &mut u64,
     to: u64,
@@ -2226,6 +2253,7 @@ fn append_view_gap(
             *ordinal + 1,
             edits,
         ));
+        kept.insert(*ordinal, tool_arcs::KeptMessage::new(codec, &entry)?);
     }
     *next = to;
     Ok(())
@@ -3303,8 +3331,8 @@ impl McHandler {
             .map_err(transient)?
             .meta
             .coverage_ordinal;
-        let mut ranges = ranges(state, codec, &wire, &candidate, coverage)?;
-        state.frozen_edits.apply(state, &mut ranges)?;
+        let (mut ranges, kept) = ranges(state, codec, &wire, &candidate, coverage)?;
+        state.frozen_edits.apply(state, &kept, &mut ranges)?;
         if let Some(cadence) = &state.reminder_cadence {
             state.reminder_echoes.apply(
                 &cadence.ledger,
@@ -3313,7 +3341,8 @@ impl McHandler {
                 &mut ranges,
             )?;
         }
-        if let Some(head) = state.restored_head.take() {
+        let restored_head = state.restored_head.take();
+        if let Some(head) = &restored_head {
             if let Some(view::ViewRange::Replace { from: 0, to, bytes }) =
                 ranges.first_mut().filter(|range| range.to() == head.to)
             {
@@ -3363,6 +3392,14 @@ impl McHandler {
                 }
             }
         }
+        // The cut covers the leading replace ranges the history head made, not
+        // a removed Pi tool result that may follow them.
+        let cut_through = ranges
+            .iter()
+            .take_while(|range| matches!(range, view::ViewRange::Replace { .. }))
+            .last()
+            .and_then(|range| range.to().checked_sub(1));
+        let ranges = tool_arcs::remove_dropped_tool_results(&kept, ranges);
         let version = store
             .reserve_async_compaction_version(&state.reference(), state.applied.unwrap_or(0))
             .map_err(transient)?;
@@ -3377,16 +3414,23 @@ impl McHandler {
             },
             ranges,
         );
-        if let Some(through) = view
-            .ranges
-            .iter()
-            .take_while(|range| matches!(range, view::ViewRange::Replace { .. }))
-            .last()
-            .and_then(|range| range.to().checked_sub(1))
-        {
+        if let Some(through) = cut_through {
             view = view.with_cut(view::ViewCut::new(format!("v{version}"), through));
         }
-        let view = checked_async_view(view)?;
+        let view = match checked_async_view(view, codec, &kept)? {
+            Ok(view) => view,
+            Err(splits) => {
+                // Defence in depth: publish nothing on this pass, exactly as
+                // when the engine does not permit a rebuild, and keep a
+                // restored head for the next permitted pass.
+                tracing::warn!(session_ref=%state.reference(), version, splits=?splits, reason="tool_pair_split", "async view withheld: it would separate a tool call from its result");
+                #[cfg(test)]
+                tool_arcs::withheld::record(&state.reference(), &splits);
+                state.restored_head = restored_head;
+                state.adopt_engine(engine)?;
+                return Ok(None);
+            }
+        };
         // Bind edits to the source as it existed at publication. A delayed
         // acknowledgement may arrive after the runner has rewritten those mids.
         let mut frozen_edits = frozen_edits::FrozenEdits::default();
