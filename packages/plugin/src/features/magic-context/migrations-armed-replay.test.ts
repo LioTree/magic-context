@@ -17,6 +17,7 @@ import { getMemoriesByProject, insertMemory } from "./memory/storage-memory";
 import { MIGRATIONS, runMigrations } from "./migrations";
 import { recordSessionProjectIdentity } from "./session-project-storage";
 import { initializeDatabase } from "./storage-db";
+import { restorePreV103SessionMetaLayout } from "./session-meta-pre-v103-test-support";
 import { getPersistedEpochFloor } from "./storage-meta-persisted";
 import { getOrCreateSessionMeta, updateSessionMeta } from "./storage-meta-session";
 import { addNote, getSmartNotes } from "./storage-notes";
@@ -1007,6 +1008,8 @@ test("every migration lands on populated rows and v72+ stores stay armed", () =>
 
     try {
         initializeDatabase(db);
+        // Replay from the layout every database before migration 103 had.
+        restorePreV103SessionMetaLayout(db);
         installMigrationLedgerFromSource(db);
 
         for (const [index, migration] of MIGRATIONS.entries()) {

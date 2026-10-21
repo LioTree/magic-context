@@ -2,6 +2,7 @@ import { sessionLog } from "../../shared/logger";
 import type { Database } from "../../shared/sqlite";
 import { isKnownAutocommit } from "../../shared/sqlite-helpers";
 import { ensureColumn } from "./storage-schema-helpers";
+import { sessionMetaHoldsPayloadColumns } from "./storage-session-payloads";
 import { decodeTemporalDecision } from "./temporal-decisions";
 
 // NULL records a message first observed on a defer without a served marker. It
@@ -96,7 +97,9 @@ export function installV95PerfSchema(
         // Carry decisions made by prerelease builds into indexed storage once.
         // Preserve unrelated replay entries, and never parse the blob on an
         // ordinary open after the table has been installed.
-        if (schema.has("session_meta")) {
+        // A database created in the separated session_meta layout keeps this replay
+        // value outside session_meta and has no prerelease decisions to carry over.
+        if (schema.has("session_meta") && sessionMetaHoldsPayloadColumns(db)) {
             // Sparse legacy schemas reach migrations before the normal initializer
             // supplies this replay column. They have no temporal blob to adopt yet.
             ensureColumn(db, "session_meta", "merged_reasoning_stripped_ids", "TEXT DEFAULT ''");

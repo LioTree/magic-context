@@ -11,6 +11,7 @@ import {
 } from "./migration-v95-perf-indexes";
 import { MIGRATIONS, runMigrations } from "./migrations";
 import { initializeDatabase, LATEST_SUPPORTED_VERSION } from "./storage-db";
+import { restorePreV103SessionMetaLayout } from "./session-meta-pre-v103-test-support";
 import { getOrCreateSessionMeta, updateSessionMeta } from "./storage-meta-session";
 import {
     sessionMetaCollectionSelect,
@@ -22,6 +23,7 @@ import { getTemporalDecisions } from "./temporal-decisions";
 function v94(): Database {
     const db = new Database(":memory:");
     initializeDatabase(db);
+    restorePreV103SessionMetaLayout(db);
     db.exec("DROP TABLE IF EXISTS temporal_decisions");
     for (const name of [
         "idx_message_fts_rowid_map_session_rowid",

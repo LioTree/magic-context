@@ -10,6 +10,7 @@ import { seedSessionMeta } from "./__tests__/session-meta-fixture";
 import { LKG_PREFIX_CHUNK_CHARS, splitLkgPrefix } from "./lkg-prefix-chunks";
 import { MIGRATIONS, runMigrations } from "./migrations";
 import { initializeDatabase } from "./storage-db";
+import { restorePreV103SessionMetaLayout } from "./session-meta-pre-v103-test-support";
 import {
     addTrailingBlankDecisions,
     demoteTrailingBlankKeepDecisions,
@@ -43,6 +44,7 @@ function tempDbPath(): string {
 function v93Database(path = ":memory:"): Database {
     const db = new Database(path);
     initializeDatabase(db);
+    restorePreV103SessionMetaLayout(db);
     // initializeDatabase already creates the migration-94 tables; remove them and
     // rebuild lkg_slots through migration 81 to exercise an actual upgrade from 93.
     db.exec(`

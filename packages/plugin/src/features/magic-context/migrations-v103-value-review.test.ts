@@ -2,6 +2,7 @@ import { expect, test } from "bun:test";
 import { Database } from "../../shared/sqlite";
 import { MIGRATIONS, runMigrations } from "./migrations";
 import { initializeDatabase } from "./storage-db";
+import { restorePreV103SessionMetaLayout } from "./session-meta-pre-v103-test-support";
 import { getOrCreateSessionMeta } from "./storage-meta";
 import {
     getAutoSearchHintDecisions,
@@ -32,6 +33,7 @@ function populatedV102(encoding: string): Database {
     const db = new Database(":memory:");
     db.exec(`PRAGMA encoding='${encoding}'`);
     initializeDatabase(db);
+    restorePreV103SessionMetaLayout(db);
     db.exec(`CREATE TABLE IF NOT EXISTS schema_migrations (
         version INTEGER PRIMARY KEY,
         description TEXT NOT NULL,

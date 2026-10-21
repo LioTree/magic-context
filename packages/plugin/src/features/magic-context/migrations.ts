@@ -13,6 +13,7 @@ import { repairOpenCode2HarnessLabels } from "./opencode2-relabel";
 import { installCompartmentHistoryVersions } from "./storage-compartment-history-version";
 import { installHostRunnerSchema } from "./storage-host-runner";
 import { ensureColumn, healAllNullColumns } from "./storage-schema-helpers";
+import { sessionMetaHoldsPayloadColumns } from "./storage-session-payloads";
 import { bumpEpochsForWorkspaceMemberSet } from "./workspaces";
 
 /** First version reserved for downstream migrations; upstream versions stay below it. */
@@ -848,6 +849,8 @@ export const MIGRATIONS: Migration[] = [
         version: 17,
         description: "Multi-anchor JSON storage for note-nudge and auto-search-hint persistence",
         up: (db: Database) => {
+            // Both columns hold values migration 103 moves out of session_meta.
+            if (!sessionMetaHoldsPayloadColumns(db)) return;
             const cols = db.prepare("PRAGMA table_info(session_meta)").all() as Array<{
                 name?: string;
             }>;
@@ -980,7 +983,7 @@ export const MIGRATIONS: Migration[] = [
             const hasMemoriesTable = tableExists(db, "memories");
 
             if (hasSessionMetaTable) {
-                ensureColumn(db, "session_meta", "cached_m0_bytes", "BLOB");
+                ensurePayloadColumn(db, "cached_m0_bytes", "BLOB");
                 ensureColumn(db, "session_meta", "cached_m0_project_memory_epoch", "INTEGER");
                 ensureColumn(
                     db,
@@ -994,7 +997,7 @@ export const MIGRATIONS: Migration[] = [
                 ensureColumn(db, "session_meta", "cached_m0_project_docs_hash", "TEXT");
                 ensureColumn(db, "session_meta", "cached_m0_materialized_at", "INTEGER");
                 ensureColumn(db, "session_meta", "cached_m0_session_facts_version", "INTEGER");
-                ensureColumn(db, "session_meta", "cached_m0_upgrade_state", "TEXT");
+                ensurePayloadColumn(db, "cached_m0_upgrade_state", "TEXT");
                 ensureColumn(db, "session_meta", "upgrade_reminded_at", "INTEGER");
             }
 
@@ -1219,7 +1222,7 @@ export const MIGRATIONS: Migration[] = [
                 CREATE INDEX IF NOT EXISTS idx_memory_mutation_log_project
                     ON memory_mutation_log(project_path, id);
             `);
-            ensureColumn(db, "session_meta", "cached_m0_bytes", "BLOB");
+            ensurePayloadColumn(db, "cached_m0_bytes", "BLOB");
             ensureColumn(db, "session_meta", "cached_m0_project_memory_epoch", "INTEGER");
             ensureColumn(db, "session_meta", "cached_m0_project_user_profile_version", "INTEGER");
             ensureColumn(db, "session_meta", "cached_m0_max_compartment_seq", "INTEGER");
@@ -1229,16 +1232,18 @@ export const MIGRATIONS: Migration[] = [
             ensureColumn(db, "session_meta", "cached_m0_project_docs_hash", "TEXT");
             ensureColumn(db, "session_meta", "cached_m0_materialized_at", "INTEGER");
             ensureColumn(db, "session_meta", "cached_m0_session_facts_version", "INTEGER");
-            ensureColumn(db, "session_meta", "cached_m0_upgrade_state", "TEXT");
-            ensureColumn(db, "session_meta", "cached_m1_bytes", "BLOB");
+            ensurePayloadColumn(db, "cached_m0_upgrade_state", "TEXT");
+            ensurePayloadColumn(db, "cached_m1_bytes", "BLOB");
             ensureColumn(db, "session_meta", "last_observed_model_key", "TEXT");
-            ensureColumn(db, "session_meta", "memory_block_cache", "TEXT DEFAULT ''");
+            ensurePayloadColumn(db, "memory_block_cache", "TEXT DEFAULT ''");
             ensureColumn(db, "session_meta", "memory_block_count", "INTEGER DEFAULT 0");
-            ensureColumn(db, "session_meta", "memory_block_ids", "TEXT DEFAULT ''");
+            ensurePayloadColumn(db, "memory_block_ids", "TEXT DEFAULT ''");
+            // A database created in the separated layout has no payload columns
+            // (and no rows yet), so only the columns that remain in session_meta clear.
+            const payloads = sessionMetaHoldsPayloadColumns(db);
             db.prepare(
                 `UPDATE session_meta SET
-                    cached_m0_bytes = NULL,
-                    cached_m1_bytes = NULL,
+                    ${payloads ? "cached_m0_bytes = NULL, cached_m1_bytes = NULL," : ""}
                     cached_m0_project_memory_epoch = NULL,
                     cached_m0_project_user_profile_version = NULL,
                     cached_m0_max_compartment_seq = NULL,
@@ -1248,10 +1253,8 @@ export const MIGRATIONS: Migration[] = [
                     cached_m0_project_docs_hash = NULL,
                     cached_m0_materialized_at = NULL,
                     cached_m0_session_facts_version = NULL,
-                    cached_m0_upgrade_state = NULL,
-                    memory_block_cache = '',
-                    memory_block_count = 0,
-                    memory_block_ids = ''`,
+                    ${payloads ? "cached_m0_upgrade_state = NULL, memory_block_cache = '', memory_block_ids = ''," : ""}
+                    memory_block_count = 0`,
             ).run();
         },
     },
@@ -2675,7 +2678,7 @@ export const MIGRATIONS: Migration[] = [
         description: "persist the frozen mural payload with each cached m0 baseline",
         up(db: Database): void {
             if (!tableExists(db, "session_meta")) return;
-            ensureColumn(db, "session_meta", "cached_m0_mural_data_url", "TEXT");
+            ensurePayloadColumn(db, "cached_m0_mural_data_url", "TEXT");
             ensureColumn(db, "session_meta", "cached_m0_mural_hash", "TEXT");
         },
     },
@@ -3402,6 +3405,14 @@ export function isSiblingMigrationConflict(db: Database, error: unknown, version
  * taking a read snapshot: one applies the migration and the waiter observes the
  * advanced version instead of failing a deferred read-to-write lock upgrade.
  */
+/**
+ * Add a session_meta column whose value migration 103 later moves into its own rows.
+ * A database created in that separated layout never gets the column back.
+ */
+function ensurePayloadColumn(db: Database, column: string, definition: string): void {
+    if (sessionMetaHoldsPayloadColumns(db)) ensureColumn(db, "session_meta", column, definition);
+}
+
 export function runMigrations(db: Database): void {
     try {
         ensureMigrationsTable(db);

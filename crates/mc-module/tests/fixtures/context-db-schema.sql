@@ -1021,6 +1021,11 @@ CREATE TABLE session_meta (
       historian_last_failure_at INTEGER DEFAULT NULL,
       system_prompt_hash TEXT DEFAULT '',
       memory_block_count INTEGER DEFAULT 0,
+      -- pending_compaction_marker_state: intentionally NULLABLE without a
+      -- default. Absence of a deferred marker is SQL NULL; presence is a
+      -- valid JSON blob written via setPendingCompactionMarkerState.
+      -- Excluded from the healAllNullColumns fallback list. Readers filter
+      -- IS NOT NULL AND != empty-string defensively. Plan v6 section 3.
       pending_compaction_marker_state TEXT,
       -- Target OpenCode message id used to inject the current compaction marker.
       -- Nullable for legacy persisted markers; repaired on the next marker move.
