@@ -3,7 +3,12 @@ import { sessionLog } from "../../shared/logger";
 import { isRecord } from "../../shared/record-type-guard";
 import type { Database } from "../../shared/sqlite";
 import { ensureSessionMetaRow } from "./storage-meta-shared";
-import { collectionStateMatches } from "./storage-session-collection-state";
+import {
+    collectionStateMatches,
+    readCollectionState,
+    readCollectionToken,
+    sameCollectionToken,
+} from "./storage-session-collection-state";
 import {
     applySessionMetaCollectionWrite,
     isSessionMetaCollectionInline,
@@ -679,6 +684,15 @@ export function prepareReplayDocumentUpdate(
             throw error;
         }
         const next = mutate(doc) ? serializeReplayDocument(doc) : (raw ?? null);
+        if (next === raw) {
+            const observed = readCollectionState(db, sessionId, "trailing_blank_decisions");
+            if (!observed.token.present || observed.value !== raw) continue;
+            return () =>
+                sameCollectionToken(
+                    observed.token,
+                    readCollectionToken(db, sessionId, "trailing_blank_decisions"),
+                );
+        }
         const plan = prepareSessionMetaCollectionWrite(
             db,
             sessionId,

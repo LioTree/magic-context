@@ -1,4 +1,5 @@
-import type { Database } from "../../shared/sqlite";
+import { isUtf8 } from "node:buffer";
+import { type Database, isSqliteTransactionOpen } from "../../shared/sqlite";
 import { layoutSessionMetaBytes, SESSION_META_CHUNK_BYTES } from "./session-meta-chunk-layout";
 import {
     SESSION_META_COLLECTION_DEFAULTS,
@@ -9,6 +10,8 @@ import {
     type CollectionState,
     clearCollectionStates,
     collectionStateMatches,
+    decodeCollectionText,
+    isWellFormedCollectionText,
     readCollectionState,
     readCollectionToken,
     rememberCollectionState,
@@ -176,7 +179,15 @@ function prepareBytes(
     value?: string | null,
 ): PreparedSessionMetaCollectionWrite {
     const previous = readCollectionState(db, sessionId, column);
-    if (storageType === "text" && value !== undefined && previous.value === value) {
+    if (
+        storageType === "text" &&
+        value !== undefined &&
+        previous.value === value &&
+        (value === null
+            ? previous.pieces.size === 1 && previous.pieces.get("-1")?.type === "null"
+            : previous.textExact) &&
+        (value !== SESSION_META_COLLECTION_DEFAULTS[column] || previous.pieces.size === 0)
+    ) {
         return { sessionId, column, previous, next: { ...previous }, changed: [], removed: [] };
     }
     const pieces = new Map<string, CollectionPiece>();
@@ -194,25 +205,32 @@ function prepareBytes(
             marker,
         });
         if (bytes !== null)
-            for (const [key, body] of layoutSessionMetaBytes(bytes))
-                pieces.set(key, {
-                    type: "blob",
-                    bytes: Buffer.from(body.buffer, body.byteOffset, body.byteLength),
-                });
+            for (const [key, body] of layoutSessionMetaBytes(bytes)) {
+                const old = previous.pieces.get(key);
+                if (old?.type === "blob" && old.bytes?.equals(body)) pieces.set(key, old);
+                else {
+                    // Copy changed fragments so later reuse does not keep earlier full serialized envelopes alive.
+                    pieces.set(key, { type: "blob", bytes: Buffer.from(body) });
+                }
+            }
     }
+    const sourceExact = typeof value === "string" && isWellFormedCollectionText(value);
+    const textExact = storageType !== "blob" && bytes !== null && (sourceExact || isUtf8(bytes));
     const next: CollectionState = {
         token: previous.token,
         pieces,
         value:
-            value === undefined
-                ? bytes === null
-                    ? null
-                    : storageType === "blob"
-                      ? bytes
-                      : bytes.toString("utf8")
-                : value,
+            bytes === null
+                ? null
+                : storageType === "blob"
+                  ? bytes
+                  : sourceExact
+                    ? value
+                    : decodeCollectionText(db, bytes, textExact),
+        rawBytes: bytes ?? Buffer.alloc(0),
+        textExact,
         rollbackGeneration: previous.rollbackGeneration,
-        retainedBytes: (bytes?.byteLength ?? 0) * 3 + pieces.size * 160,
+        retainedBytes: (bytes?.byteLength ?? 0) * 4 + pieces.size * 256,
     };
     const changed: Array<[string, CollectionPiece]> = [];
     for (const [key, piece] of pieces) {
@@ -256,8 +274,7 @@ export function applySessionMetaCollectionWrite(
     db: Database,
     plan: PreparedSessionMetaCollectionWrite,
 ): boolean {
-    const transaction = db as unknown as { inTransaction?: boolean; isTransaction?: boolean };
-    if (!transaction.inTransaction && !transaction.isTransaction)
+    if (!isSqliteTransactionOpen(db))
         throw new Error("collection publication requires a writer transaction");
     const current = readCollectionToken(db, plan.sessionId, plan.column);
     // SQLite triggers increment the revision for every chunk INSERT/UPDATE/DELETE, including raw SQL.

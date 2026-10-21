@@ -1167,12 +1167,25 @@ describe("createTransform", () => {
         const realDb = openDatabase();
         const preparedSql: string[] = [];
         const tokenQueryIds: string[][] = [];
+        const revisionReads: string[] = [];
         const db = new Proxy(realDb, {
             get(target, prop, receiver) {
                 if (prop === "prepare") {
                     return (sql: string) => {
                         preparedSql.push(sql);
                         const statement = target.prepare.call(target, sql);
+                        if (sql.includes("session_meta_collection_revisions AS revisions"))
+                            return new Proxy(statement, {
+                                get(stmt, key) {
+                                    if (key === "get")
+                                        return (...params: Parameters<typeof stmt.get>) => {
+                                            revisionReads.push(String(params[0]));
+                                            return stmt.get(...params);
+                                        };
+                                    const value = Reflect.get(stmt, key);
+                                    return typeof value === "function" ? value.bind(stmt) : value;
+                                },
+                            });
                         if (
                             !sql.includes("tags.reasoning_token_count") ||
                             !sql.includes("status = 'active'")
@@ -1247,6 +1260,7 @@ describe("createTransform", () => {
         expect(tokenQueryIds).toHaveLength(1);
         tokenQueryIds.length = 0;
         preparedSql.length = 0;
+        revisionReads.length = 0;
         const second = structuredClone(input);
         await transform({}, { messages: second });
 
@@ -1255,8 +1269,8 @@ describe("createTransform", () => {
             preparedSql.filter((sql) => sql.includes("SELECT historian_failure_count")).length,
         ).toBe(1);
         expect(
-            preparedSql.filter((sql) => sql.includes(" AS stale_reduce_stripped_ids")).length,
-        ).toBe(1);
+            revisionReads.filter((column) => column === "stale_reduce_stripped_ids"),
+        ).toHaveLength(1);
         expect(preparedSql.some((sql) => sql.includes("SELECT last_response_time FROM"))).toBe(
             false,
         );

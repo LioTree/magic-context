@@ -18,7 +18,10 @@ export const SESSION_META_CHUNKS_DDL = `CREATE TABLE IF NOT EXISTS session_meta_
     PRIMARY KEY (session_id, column_name, chunk)
 ) WITHOUT ROWID`;
 
-const bump = (row: "NEW" | "OLD", predicate = "1") => `INSERT INTO session_meta_collection_revisions(session_id,column_name,revision)
+const bump = (
+    row: "NEW" | "OLD",
+    predicate = "1",
+) => `INSERT INTO session_meta_collection_revisions(session_id,column_name,revision)
     SELECT ${row}.session_id,${row}.column_name,1 WHERE ${predicate}
     ON CONFLICT(session_id,column_name) DO UPDATE SET revision=revision+1;`;
 

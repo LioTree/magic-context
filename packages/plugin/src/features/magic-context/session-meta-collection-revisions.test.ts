@@ -1,6 +1,4 @@
 import { expect, test } from "bun:test";
-import { mkdtempSync, rmSync } from "node:fs";
-import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { loadPersistedLkgSlot, saveLkgSlotToDb } from "../../hooks/magic-context/lkg-persist";
 import {
@@ -9,6 +7,7 @@ import {
 } from "../../hooks/magic-context/lkg-served-marker";
 import type { LkgSlot } from "../../hooks/magic-context/lkg-slot";
 import { Database } from "../../shared/sqlite";
+import { createTestTempDir } from "../../shared/test-temp-dir";
 import { runMigrations } from "./migrations";
 import { initializeDatabase } from "./storage-db";
 import { readCollectionToken } from "./storage-session-collection-state";
@@ -60,7 +59,7 @@ test("raw SQL chunk INSERT UPDATE and DELETE advance the durable collection revi
 });
 
 test("a sibling raw writer invalidates a reused value through its indexed revision lookup", () => {
-    const root = mkdtempSync(join(tmpdir(), "mc-test-owned-collection-revisions-"));
+    const { dir: root, cleanup } = createTestTempDir("collection-revisions-");
     const writer = create(join(root, "context.db")),
         reader = new Database(join(root, "context.db"));
     try {
@@ -90,7 +89,7 @@ test("a sibling raw writer invalidates a reused value through its indexed revisi
     } finally {
         reader.close();
         writer.close();
-        rmSync(root, { recursive: true, force: true });
+        cleanup();
     }
 });
 
@@ -119,6 +118,22 @@ test("a prepared delta loses to a sibling revision without overwriting the winne
     }
 });
 
+test("unversioned chunk data fails closed instead of caching an absent revision", () => {
+    const db = create();
+    try {
+        writeSessionMetaCollection(db, "revisions", column, '["before"]');
+        expect(readSessionMetaCollection(db, "revisions", column)).toBe('["before"]');
+        db.prepare(
+            "DELETE FROM session_meta_collection_revisions WHERE session_id='revisions'",
+        ).run();
+        expect(() => readSessionMetaCollection(db, "revisions", column)).toThrow(
+            "no durable revision",
+        );
+    } finally {
+        db.close();
+    }
+});
+
 test("a rolled-back revision cannot validate cached uncommitted bytes after revision reuse", () => {
     const db = create();
     try {
@@ -137,7 +152,7 @@ test("a rolled-back revision cannot validate cached uncommitted bytes after revi
 });
 
 test("revision incarnation survives collection row deletion and session recreation", () => {
-    const root = mkdtempSync(join(tmpdir(), "mc-test-owned-collection-recreation-"));
+    const { dir: root, cleanup } = createTestTempDir("collection-recreation-");
     const writer = create(join(root, "context.db")),
         reader = new Database(join(root, "context.db"));
     try {
@@ -153,13 +168,15 @@ test("revision incarnation survives collection row deletion and session recreati
     } finally {
         reader.close();
         writer.close();
-        rmSync(root, { recursive: true, force: true });
+        cleanup();
     }
 });
 
 test("transparent connection proxies share rollback invalidation", () => {
     const actual = create(),
-        db = new Proxy(actual, { get: (target, key) => Reflect.get(target, key, target) });
+        db = new Proxy(actual, {
+            get: (target, key, receiver) => Reflect.get(target, key, receiver),
+        });
     try {
         writeSessionMetaCollection(db, "revisions", column, '["before"]');
         db.exec("BEGIN IMMEDIATE");
@@ -268,3 +285,84 @@ test("paired LKG publication retries a prepared revision outside the writer with
         db.close();
     }
 });
+
+test("delta plans reuse unchanged pieces and own only compact changed fragment buffers", () => {
+    const db = create();
+    try {
+        const values = Array.from({ length: 1000 }, (_, i) => `entry-${i}-` + "x".repeat(500));
+        const original = JSON.stringify(values);
+        writeSessionMetaCollection(db, "revisions", column, original);
+        const plan = prepareSessionMetaCollectionWrite(
+            db,
+            "revisions",
+            column,
+            JSON.stringify([...values, "after"]),
+        );
+        const unchanged = [...plan.previous.pieces].find(
+            ([key]) => key !== "-1" && !plan.changed.some(([changed]) => changed === key),
+        );
+        expect(unchanged).toBeDefined();
+        expect(plan.next.pieces.get(unchanged![0])).toBe(unchanged![1]);
+        const changed = plan.changed.find(([key, piece]) => key !== "-1" && piece.bytes !== null);
+        expect(changed).toBeDefined();
+        const body = changed![1].bytes!;
+        const saved = Buffer.from(body);
+        plan.next.rawBytes.fill(0);
+        expect(body).toEqual(saved);
+        expect(readSessionMetaCollection(db, "revisions", column)).toBe(original);
+    } finally {
+        db.close();
+    }
+});
+
+for (const mode of ["prepared", "query", "query-values", "script"] as const) {
+    test(`raw ${mode} rollback invalidates cached uncommitted collection bytes`, () => {
+        const db = create();
+        try {
+            writeSessionMetaCollection(db, "revisions", column, '["before"]');
+            db.exec("BEGIN IMMEDIATE");
+            writeSessionMetaCollection(db, "revisions", column, '["mutant"]');
+            expect(readSessionMetaCollection(db, "revisions", column)).toBe('["mutant"]');
+            const discarded = readCollectionToken(db, "revisions", column);
+            const raw = db as unknown as {
+                query(sql: string): { run(): unknown; values(): unknown };
+            };
+            if (mode === "prepared") db.prepare("ROLLBACK").run();
+            else if (mode === "query") raw.query("ROLLBACK").run();
+            else if (mode === "query-values") raw.query("ROLLBACK").values();
+            else db.exec("SELECT 1; ROLLBACK");
+            rawEdit(db, "before", "winner");
+            expect(readCollectionToken(db, "revisions", column)).toEqual(discarded);
+            expect(readSessionMetaCollection(db, "revisions", column)).toBe('["winner"]');
+        } finally {
+            db.close();
+        }
+    });
+}
+
+for (const mode of ["prepared-values", "prepared-iterate"] as const) {
+    test(`${mode} observes a trigger-induced automatic rollback`, () => {
+        const db = create();
+        try {
+            writeSessionMetaCollection(db, "revisions", column, '["before"]');
+            db.exec(
+                "CREATE TRIGGER abort_cache_insert BEFORE INSERT ON session_meta WHEN NEW.session_id='abort-cache' BEGIN SELECT RAISE(ROLLBACK,'forced cache rollback'); END",
+            );
+            db.exec("BEGIN IMMEDIATE");
+            writeSessionMetaCollection(db, "revisions", column, '["mutant"]');
+            expect(readSessionMetaCollection(db, "revisions", column)).toBe('["mutant"]');
+            const discarded = readCollectionToken(db, "revisions", column);
+            const command = db.prepare(
+                "INSERT INTO session_meta(session_id) VALUES ('abort-cache') RETURNING session_id",
+            ) as unknown as { values(): unknown; iterate(): Iterator<unknown> };
+            expect(() =>
+                mode === "prepared-values" ? command.values() : command.iterate().next(),
+            ).toThrow("forced cache rollback");
+            rawEdit(db, "before", "winner");
+            expect(readCollectionToken(db, "revisions", column)).toEqual(discarded);
+            expect(readSessionMetaCollection(db, "revisions", column)).toBe('["winner"]');
+        } finally {
+            db.close();
+        }
+    });
+}

@@ -310,15 +310,79 @@ const TAG_COLUMNS_OUTSIDE_IDENTITY = new Set([
 
 let tagIdentityWriteGeneration = 0;
 const rollbackStateKey = Symbol.for("magic-context.sqlite.rollback-generation.v1");
+type RollbackState = { generation: number; transactionOpen: () => boolean };
 
 /** Invalidate observations of uncommitted values when a transaction or savepoint rolls back. */
 export function getSqliteRollbackGeneration(db: BetterSqlite3.Database): number | undefined {
-    return (db as unknown as Record<symbol, { generation: number }>)[rollbackStateKey]?.generation;
+    return (db as unknown as Record<symbol, RollbackState>)[rollbackStateKey]?.generation;
+}
+
+export function isSqliteTransactionOpen(db: BetterSqlite3.Database): boolean {
+    const state = (db as unknown as Record<symbol, RollbackState>)[rollbackStateKey];
+    return state ? state.transactionOpen() : isInTransaction(db);
 }
 
 function noteSqliteRollback(db: BetterSqlite3.Database): void {
-    const state = (db as unknown as Record<symbol, { generation: number }>)[rollbackStateKey];
+    const state = (db as unknown as Record<symbol, RollbackState>)[rollbackStateKey];
     if (state) state.generation++;
+}
+
+const observedRollbackForms = new WeakMap<object, Set<PropertyKey>>();
+// Raw prepared/query commands and lazy iterators can roll back without passing through db.exec.
+function observeRollbackForms(
+    db: BetterSqlite3.Database,
+    statement: any,
+    sql: string,
+    observeErrors = false,
+    remainingPreparedMethods = false,
+): void {
+    const mayRollback = /\bROLLBACK\b/i.test(sql);
+    if (!mayRollback && !observeErrors) return;
+    let observed = observedRollbackForms.get(statement);
+    if (!observed) {
+        observed = new Set();
+        observedRollbackForms.set(statement, observed);
+    }
+    const executeObserved = <T>(operation: () => T): T => {
+        const wasInTransaction = isInTransaction(db);
+        try {
+            return operation();
+        } catch (error) {
+            if (wasInTransaction && !isInTransaction(db)) noteSqliteRollback(db);
+            throw error;
+        } finally {
+            if (mayRollback) noteSqliteRollback(db);
+        }
+    };
+    for (const key of ["run", "get", "all", "values", "iterate", Symbol.iterator]) {
+        // The db.prepare wrapper below already checks run/get/all for automatic rollback.
+        if (remainingPreparedMethods && !mayRollback && ["run", "get", "all"].includes(String(key)))
+            continue;
+        if (observed.has(key) || typeof statement[key] !== "function") continue;
+        observed.add(key);
+        const execute = statement[key].bind(statement);
+        Object.defineProperty(statement, key, {
+            configurable: true,
+            value: (...args: unknown[]) => {
+                const result = executeObserved(() => execute(...args));
+                if (key !== "iterate" && key !== Symbol.iterator) return result;
+                if (result === null || (typeof result !== "object" && typeof result !== "function"))
+                    return result;
+                const proxy: object = new Proxy(result, {
+                    get(target, property) {
+                        if (property === Symbol.iterator) return () => proxy;
+                        const method = Reflect.get(target, property, target);
+                        if (typeof method !== "function") return method;
+                        if (["next", "return", "throw"].includes(String(property)))
+                            return (...values: unknown[]) =>
+                                executeObserved(() => method.apply(target, values));
+                        return method.bind(target);
+                    },
+                });
+                return proxy;
+            },
+        });
+    }
 }
 
 /**
@@ -412,7 +476,9 @@ export function getTagIdentityWriteGeneration(): number {
  * snapshots without acquiring the writer lock. */
 function installTransactionRouting(db: BetterSqlite3.Database, readonly: boolean): void {
     // Transparent connection proxies must observe the same rollback lifetime as the underlying handle.
-    Object.defineProperty(db, rollbackStateKey, { value: { generation: 0 } });
+    Object.defineProperty(db, rollbackStateKey, {
+        value: { generation: 0, transactionOpen: () => isInTransaction(db) },
+    });
     const executeNative = db.exec.bind(db);
     const nativeExec = (sql: string) => {
         const wasInTransaction = isInTransaction(db);
@@ -422,7 +488,7 @@ function installTransactionRouting(db: BetterSqlite3.Database, readonly: boolean
             if (wasInTransaction && !isInTransaction(db)) noteSqliteRollback(db);
             throw error;
         } finally {
-            if (/^\s*ROLLBACK\b/i.test(sql)) noteSqliteRollback(db);
+            if (/\bROLLBACK\b/i.test(sql)) noteSqliteRollback(db);
         }
     };
     Object.defineProperty(db, "exec", {
@@ -474,6 +540,7 @@ function installTransactionRouting(db: BetterSqlite3.Database, readonly: boolean
         writable: true,
         value: (sql: string) => {
             const statement = nativePrepare(sql);
+            observeRollbackForms(db, statement, sql, true, true);
             // SELECT/EXPLAIN cannot acquire a writer. Treat CTEs conservatively:
             // WITH can introduce INSERT/UPDATE/DELETE as well as a read query.
             {
@@ -506,6 +573,19 @@ function installTransactionRouting(db: BetterSqlite3.Database, readonly: boolean
             return statement;
         },
     });
+    const nativeQuery = (
+        db as unknown as { query?: (sql: string, ...args: unknown[]) => any }
+    ).query?.bind(db);
+    if (nativeQuery)
+        Object.defineProperty(db, "query", {
+            configurable: true,
+            writable: true,
+            value: (sql: string, ...args: unknown[]) => {
+                const statement = nativeQuery(sql, ...args);
+                observeRollbackForms(db, statement, sql, true);
+                return statement;
+            },
+        });
     Object.defineProperty(db, "transaction", {
         configurable: true,
         writable: true,

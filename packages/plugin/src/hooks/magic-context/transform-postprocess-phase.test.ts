@@ -1195,6 +1195,7 @@ describe("postprocess replay snapshot", () => {
     it("serves byte-identical passes from one cached row and reloads after a database write", async () => {
         db = new Database(":memory:");
         initializeDatabase(db);
+        runMigrations(db);
         const sessionId = "ses-replay-snapshot";
         getOrCreateSessionMeta(db, sessionId);
         patchSessionMeta(db, sessionId, {
@@ -1205,12 +1206,26 @@ describe("postprocess replay snapshot", () => {
         });
 
         const preparedSql: string[] = [];
+        const revisionReads: string[] = [];
         const spiedDb = new Proxy(db, {
             get(target, prop) {
                 if (prop !== "prepare") return Reflect.get(target, prop, target);
                 return (sql: string) => {
                     preparedSql.push(sql);
-                    return target.prepare.call(target, sql);
+                    const statement = target.prepare.call(target, sql);
+                    if (!sql.includes("session_meta_collection_revisions AS revisions"))
+                        return statement;
+                    return new Proxy(statement, {
+                        get(stmt, key) {
+                            if (key === "get")
+                                return (...params: Parameters<typeof stmt.get>) => {
+                                    revisionReads.push(String(params[0]));
+                                    return stmt.get(...params);
+                                };
+                            const value = Reflect.get(stmt, key);
+                            return typeof value === "function" ? value.bind(stmt) : value;
+                        },
+                    });
                 };
             },
         }) as Database;
@@ -1241,15 +1256,12 @@ describe("postprocess replay snapshot", () => {
         const second = await run();
         expect(digest(second)).toBe(digest(first));
         expect(
-            preparedSql.filter((sql) => sql.includes(" AS stale_reduce_stripped_ids")).length,
-        ).toBe(1);
+            revisionReads.filter((column) => column === "stale_reduce_stripped_ids"),
+        ).toHaveLength(2);
+        expect(revisionReads.filter((column) => column === "note_nudge_anchors")).toHaveLength(2);
         expect(
-            preparedSql.some(
-                (sql) =>
-                    /\bAS\s+(?:note_nudge_anchors|trailing_blank_decisions)\b/.test(sql) &&
-                    !/\bAS\s+stale_reduce_stripped_ids\b/.test(sql),
-            ),
-        ).toBe(false);
+            preparedSql.filter((sql) => sql.includes("SELECT todo_permission_denied")),
+        ).toHaveLength(1);
 
         updateSessionMetaCollection(
             db,

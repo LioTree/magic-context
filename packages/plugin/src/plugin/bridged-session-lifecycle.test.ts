@@ -274,7 +274,12 @@ async function runTurn(entry: ReturnType<typeof opencodeEntry>, sessionId: strin
     return { messages, system, toolOutput };
 }
 
-const CREATED_ROWS = { session_meta: 1, session_projects: 1, session_meta_chunks: 12 };
+const CREATED_ROWS = {
+    session_meta: 1,
+    session_projects: 1,
+    session_meta_chunks: 12,
+    session_meta_collection_revisions: 1,
+};
 
 describe("a session enrolled after its session.created", () => {
     test("keeps only session.created's metadata and payloads, writes nothing for its turns and indexes nothing", async () => {

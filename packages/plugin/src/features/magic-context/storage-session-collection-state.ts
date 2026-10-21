@@ -1,3 +1,4 @@
+import { isUtf8 } from "node:buffer";
 import { type Database, getSqliteRollbackGeneration } from "../../shared/sqlite";
 import {
     SESSION_META_COLLECTION_DEFAULTS,
@@ -10,6 +11,8 @@ export type CollectionState = {
     token: CollectionToken;
     pieces: Map<string, CollectionPiece>;
     value: unknown;
+    rawBytes: Buffer;
+    textExact: boolean;
     rollbackGeneration: number;
     retainedBytes: number;
 };
@@ -72,6 +75,7 @@ export function rememberCollectionState(
 }
 
 export function collectionStateFromPieces(
+    db: Database,
     token: CollectionToken,
     pieces: Map<string, CollectionPiece>,
     column: SessionMetaCollection,
@@ -81,19 +85,33 @@ export function collectionStateFromPieces(
         key !== "-1" && piece.bytes !== null ? [piece.bytes] : [],
     );
     const raw = Buffer.concat(bodies);
+    let rawBytes = Buffer.from(SESSION_META_COLLECTION_DEFAULTS[column]);
+    let textExact = true;
     let value: unknown = SESSION_META_COLLECTION_DEFAULTS[column];
     if (marker) {
-        if (marker.type === "null") value = null;
-        else if (marker.type === "integer" || marker.type === "real") value = marker.marker;
-        else if (marker.type === "text" && marker.marker === "blob") value = raw;
-        else value = raw.toString("utf8");
+        rawBytes = raw;
+        if (marker.type === "null") {
+            value = null;
+            textExact = false;
+        } else if (marker.type === "integer" || marker.type === "real") {
+            value = marker.marker;
+            textExact = false;
+        } else if (marker.type === "text" && marker.marker === "blob") {
+            value = raw;
+            textExact = false;
+        } else {
+            textExact = isUtf8(raw);
+            value = decodeCollectionText(db, raw, textExact);
+        }
     }
     return {
         token,
         pieces,
         value,
+        rawBytes,
+        textExact,
         rollbackGeneration: 0,
-        retainedBytes: raw.byteLength * 3 + pieces.size * 160,
+        retainedBytes: raw.byteLength * 4 + pieces.size * 256,
     };
 }
 
@@ -139,7 +157,10 @@ export function readCollectionState(
                         marker: row.marker,
                     });
             }
-            const state = collectionStateFromPieces(coherent, pieces, column);
+            // Existing chunks without a revision cannot be validated safely against another writer's changes.
+            if (pieces.size > 0 && coherent.id === null)
+                throw new Error("Session collection chunks have no durable revision");
+            const state = collectionStateFromPieces(db, coherent, pieces, column);
             rememberCollectionState(db, sessionId, column, state);
             return state;
         })
@@ -157,7 +178,21 @@ export function collectionStateMatches(
         return actual === null && expected == null;
     if (actual instanceof Uint8Array)
         return expected instanceof Uint8Array && Buffer.from(actual).equals(Buffer.from(expected));
-    if (typeof actual === "string") return typeof expected === "string" && actual === expected;
+    if (typeof actual === "string") {
+        if (typeof expected !== "string") return false;
+        if (state.textExact) {
+            if (actual === expected) return true;
+            if (isWellFormedCollectionText(expected)) return false;
+        }
+        // Invalid stored UTF-8 and lone-surrogate bindings must retain SQLite's byte-exact IS semantics.
+        return (
+            (
+                db
+                    .prepare("SELECT CAST(? AS TEXT) IS ? AS matched")
+                    .get(state.rawBytes, expected) as { matched: number }
+            ).matched === 1
+        );
+    }
     const marker = state.pieces.get("-1");
     if (marker?.type === "integer")
         return (
@@ -171,4 +206,14 @@ export function collectionStateMatches(
         (db.prepare("SELECT ? IS ? AS matched").get(actual, expected) as { matched: number })
             .matched === 1
     );
+}
+
+/** The supported runtimes expose this boolean check without allocating a normalized copy of a large string. */
+export function isWellFormedCollectionText(value: string): boolean {
+    return (value as string & { isWellFormed(): boolean }).isWellFormed();
+}
+
+export function decodeCollectionText(db: Database, bytes: Buffer, valid = isUtf8(bytes)): string {
+    if (valid) return bytes.toString("utf8");
+    return (db.prepare("SELECT CAST(? AS TEXT) AS value").get(bytes) as { value: string }).value;
 }
