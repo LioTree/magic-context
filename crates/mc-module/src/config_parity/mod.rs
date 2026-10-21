@@ -343,18 +343,11 @@ impl TrustedConfigResolver {
         if let Some(profile) = profile {
             effective["profile"] = json!(profile);
         }
-        let user_subc = value_at(&user, "subc.connection_file")
-            .and_then(Value::as_str)
-            .is_some_and(|v| !v.trim().is_empty());
-        if effective["transform_mode"] == "rust"
-            && (effective["compaction"]["enabled"] == false || !user_subc)
-        {
-            effective["transform_mode"] = json!("ts");
-            warnings.push(Warning::new(
-                "transform_mode",
-                "Rust mode requires compaction and trusted user subc configuration.",
-            ));
-        }
+        // The plugin accepts these retired keys but ignores their values after parsing:
+        // `loadPluginConfigDetailed` always resolves transform_mode to TypeScript and
+        // rust_pipeline to full_request (packages/plugin/src/config/index.ts:788-894).
+        effective["transform_mode"] = json!("ts");
+        effective["rust_pipeline"] = json!("full_request");
         if let Some(value) = value_at(&effective, "subc.connection_file").and_then(Value::as_str) {
             if value == "~" {
                 let home = self.home.to_string_lossy().into_owned();
