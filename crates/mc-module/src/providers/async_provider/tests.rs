@@ -992,6 +992,93 @@ async fn runner_ordinals_may_start_at_one() {
     assert_eq!(rig.state().entries.first_key_value().unwrap().0, &1);
 }
 
+/// Source message ids that the conversation's acknowledged frozen edits name.
+fn frozen_mids(rig: &Rig) -> BTreeSet<String> {
+    let json = rig.state().frozen_edits.json().unwrap();
+    serde_json::from_str::<Vec<Value>>(&json)
+        .unwrap()
+        .iter()
+        .map(|part| part["mid"].as_str().unwrap().to_owned())
+        .collect()
+}
+
+/// Serve and acknowledge a view whose reduction edits message `m21` (tag 163),
+/// then forget that acknowledgement's frozen edits while keeping
+/// `state.applied` on it. That is the state an acknowledgement reaches a reset
+/// or fork in when the notice-time capture did not record it (for example a
+/// conversation stored by a build that recorded acknowledgements without
+/// capturing their edits): only the capture taken right before the reset or
+/// fork can keep the reduction.
+async fn acknowledged_reduction_without_notice_capture(rig: &Rig) -> u64 {
+    rig.fill(40);
+    rig.notice(1, 1_000, None).await;
+    rig.history(20, "history before explicit reduction");
+    rig.notice(2, 1_000, None).await;
+    let baseline = rig.newest().unwrap();
+    rig.queue(&[163]).await;
+    rig.notice(3, 90_000, Some(baseline)).await;
+    let reduced = rig.newest().unwrap();
+    assert_ne!(reduced, baseline, "precondition: the reduction was served");
+    rig.notice(4, 1_000, Some(reduced)).await;
+    assert!(
+        frozen_mids(rig).contains("m21"),
+        "precondition: the acknowledgement captured the reduction"
+    );
+    let store = rig.h.store.get().unwrap();
+    let mut state = rig.h.checkout(store, &rig.reference).unwrap().unwrap();
+    state.frozen_edits = Default::default();
+    state.frozen_edits.dirty = true;
+    state.frozen_edits_version = None;
+    state.save(store, &[]).unwrap();
+    rig.h.checkin(state);
+    assert!(frozen_mids(rig).is_empty());
+    assert_eq!(rig.state().applied, Some(reduced));
+    reduced
+}
+
+/// A reset with no notice in between (a ride whose transcript read fails)
+/// must capture the acknowledged view's edits before it discards the engine
+/// state that produced them.
+#[tokio::test]
+async fn reset_without_a_notice_keeps_the_acknowledged_reduction() {
+    let dir = tempfile::tempdir().unwrap();
+    let rig = Rig::new(dir.path()).await;
+    acknowledged_reduction_without_notice_capture(&rig).await;
+    let generation = rig.state().generation;
+    rig.runner
+        .read_unavailable
+        .store(true, std::sync::atomic::Ordering::Relaxed);
+    assert!(rig.ride("ceiling").await.is_none());
+    rig.runner
+        .read_unavailable
+        .store(false, std::sync::atomic::Ordering::Relaxed);
+    assert!(rig.state().generation > generation, "the ride reset");
+    assert!(
+        frozen_mids(&rig).contains("m21"),
+        "the reset kept the acknowledged reduction"
+    );
+}
+
+/// A fork notice that names no applied view (so the notice-time capture has
+/// nothing to record) must still capture the acknowledged view's edits before
+/// the fork cuts the held entries.
+#[tokio::test]
+async fn fork_without_an_applied_version_keeps_the_acknowledged_reduction() {
+    let dir = tempfile::tempdir().unwrap();
+    let rig = Rig::new(dir.path()).await;
+    acknowledged_reduction_without_notice_capture(&rig).await;
+    let digest =
+        contract::digest::content_digest(&rig.state().entries[&39].read().unwrap().message);
+    *rig.runner.lineage.lock().unwrap() = "fork:verified".into();
+    rig.notice_with_descent(5, 1_000, None, Some(format!("L:39:{digest}")))
+        .await;
+    assert_eq!(rig.state().lineage.as_deref(), Some("fork:verified"));
+    assert!(
+        frozen_mids(&rig).contains("m21"),
+        "the fork kept the acknowledged reduction"
+    );
+}
+
 #[tokio::test]
 async fn fork_descent_preserves_only_verified_prefix_state() {
     let dir = tempfile::tempdir().unwrap();
