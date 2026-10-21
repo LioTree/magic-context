@@ -587,8 +587,9 @@ function persistLkgSlot(
             prepared = undefined;
             try {
                 db.transaction(() => {
-                    // Historical migration fixtures also save pre-marker slots. When the
-                    // columns exist, an uncertified overwrite must clear their old ids.
+                    // Some migration fixtures save slots created before the served-marker columns
+                    // existed. When those columns are present, an uncertified overwrite must clear
+                    // any prior served-capture metadata.
                     const withServedMetadata =
                         slot.servedCaptureId !== undefined ||
                         (

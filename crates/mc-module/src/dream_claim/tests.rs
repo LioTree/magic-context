@@ -870,18 +870,17 @@ async fn dream_claim_attested_harness_and_foreground_arguments() {
     binding.principal = Some(subc_protocol::Principal::Reserved {
         module_id: "thalamus-harness".into(),
     });
-    binding.scope = Some(subc_protocol::scope::ScopeStamp {
-        owner: subc_protocol::Principal::Reserved {
-            module_id: "prefrontal-core".into(),
-        },
-        scope_ref: "parent".into(),
-        scope_epoch: 1,
-        kind: subc_protocol::scope::ScopeKind::Head,
-        parent: None,
-        parent_state: None,
-        attributes: Default::default(),
-        owner_authorized: true,
-    });
+    binding.scope = Some(
+        subc_protocol::scope::ScopeStamp::new(
+            subc_protocol::Principal::Reserved {
+                module_id: "prefrontal-core".into(),
+            },
+            "parent",
+            1,
+            subc_protocol::scope::ScopeKind::Head,
+        )
+        .with_owner_authorized(true),
+    );
     for harness in ["opencode", "opencode2", "pi", "omp"] {
         binding.harness = harness.into();
         f.handler.bind_route(11, binding.clone());

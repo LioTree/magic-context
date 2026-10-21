@@ -11,6 +11,26 @@ use std::{
 use subc_client_rs::HandlerOutcome;
 
 pub(crate) const FRAME_TARGET: usize = 512 * 1024;
+// Keep unpaged bodies below the daemon's 4 MiB egress cap, leaving room for the
+// reply envelope and other bytes counted toward that cap.
+const UNPAGED_BODY_LIMIT: usize = 3 * 1024 * 1024;
+
+pub(crate) fn bound_health(report: subc_client_rs::HealthReport) -> subc_client_rs::HealthReport {
+    if serde_json::to_vec(&report).is_ok_and(|body| body.len() <= UNPAGED_BODY_LIMIT) {
+        return report;
+    }
+    subc_client_rs::HealthReport {
+        status: if report.status == subc_client_rs::HealthStatus::Failing {
+            subc_client_rs::HealthStatus::Failing
+        } else {
+            subc_client_rs::HealthStatus::Degraded
+        },
+        detail: Some(
+            "frame_too_large: health diagnostics exceeded the daemon egress budget".into(),
+        ),
+        metrics: None,
+    }
+}
 // Each page's `data` is cut by its JSON-escaped size, not its raw size, so a page fills
 // most of the frame. A fixed raw cut had to assume the worst case (one byte escaping to
 // six) and so used 64 KiB pages, which turned a large reply into a hundred-plus sequential
@@ -78,10 +98,40 @@ impl ReplyPages {
         outcome: HandlerOutcome,
         accept_reply_pages: bool,
     ) -> HandlerOutcome {
-        let HandlerOutcome::Response(bytes) = outcome else {
-            return outcome;
+        let bytes = match outcome {
+            HandlerOutcome::Response(bytes) => bytes,
+            HandlerOutcome::ErrorWithDetail {
+                ref code,
+                ref message,
+                ref detail,
+            } => {
+                if serde_json::to_vec(&json!({"code":code,"message":message,"detail":detail}))
+                    .map_or(true, |body| body.len() > UNPAGED_BODY_LIMIT)
+                {
+                    return error("frame_too_large");
+                }
+                return outcome;
+            }
+            HandlerOutcome::Error {
+                ref code,
+                ref message,
+            } => {
+                if serde_json::to_vec(&json!({"code":code,"message":message}))
+                    .map_or(true, |body| body.len() > UNPAGED_BODY_LIMIT)
+                {
+                    return error("frame_too_large");
+                }
+                return outcome;
+            }
+            HandlerOutcome::Streamed => return outcome,
         };
-        if !accept_reply_pages || bytes.len() <= FRAME_TARGET {
+        if !accept_reply_pages {
+            if bytes.len() > UNPAGED_BODY_LIMIT {
+                return error("frame_too_large");
+            }
+            return HandlerOutcome::Response(bytes);
+        }
+        if bytes.len() <= FRAME_TARGET {
             return HandlerOutcome::Response(bytes);
         }
         if bytes.len() > CACHE_BYTES {
@@ -166,10 +216,9 @@ mod tests {
     use serde_json::Value;
 
     #[test]
-    fn old_shape_requests_keep_oversized_unary_replies_byte_identical() {
-        let original =
-            serde_json::to_vec(&json!({"screenshots": "QUJD".repeat(1_100_000)})).unwrap();
-        assert!(original.len() > 4 * 1024 * 1024);
+    fn unpaged_replies_within_egress_budget_keep_bytes() {
+        let original = serde_json::to_vec(&json!({"screenshots": "QUJD".repeat(600_000)})).unwrap();
+        assert!(original.len() > FRAME_TARGET && original.len() <= UNPAGED_BODY_LIMIT);
         for body in [
             br#"{"method":"transform","input":[]}"#.as_slice(),
             br#"{"method":"transform","accept_reply_pages":false}"#.as_slice(),
@@ -187,6 +236,35 @@ mod tests {
             assert_eq!(reply, original);
             assert!(cache.entries.is_empty());
         }
+    }
+
+    #[test]
+    fn unpaged_views_and_error_details_refuse_before_daemon_egress_overflow() {
+        let mut cache = ReplyPages::default();
+        let oversized = "x".repeat(4 * 1024 * 1024 - subc_protocol::HEADER_LEN + 1);
+        for outcome in [
+            HandlerOutcome::Response(
+                serde_json::to_vec(&json!({"answer":"view","ranges":[oversized]})).unwrap(),
+            ),
+            HandlerOutcome::Error {
+                code: "failure".into(),
+                message: oversized.clone(),
+            },
+            HandlerOutcome::ErrorWithDetail {
+                code: "failure".into(),
+                message: "failure".into(),
+                detail: json!({"view":oversized}),
+            },
+        ] {
+            assert!(
+                matches!(cache.bound((7,1), outcome, false), HandlerOutcome::Error { code, .. } if code == "frame_too_large")
+            );
+        }
+        let exact = vec![b'x'; UNPAGED_BODY_LIMIT];
+        assert!(exact.len() + subc_protocol::HEADER_LEN < 4 * 1024 * 1024);
+        assert!(
+            matches!(cache.bound((7,1), HandlerOutcome::Response(exact.clone()), false), HandlerOutcome::Response(bytes) if bytes == exact)
+        );
     }
 
     #[test]

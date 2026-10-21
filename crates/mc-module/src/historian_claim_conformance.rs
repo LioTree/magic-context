@@ -27,18 +27,15 @@ fn principal() -> subc_protocol::Principal {
 }
 
 fn scope() -> subc_protocol::scope::ScopeStamp {
-    subc_protocol::scope::ScopeStamp {
-        owner: subc_protocol::Principal::Reserved {
+    subc_protocol::scope::ScopeStamp::new(
+        subc_protocol::Principal::Reserved {
             module_id: "prefrontal-core".into(),
         },
-        scope_ref: "historian-session".into(),
-        scope_epoch: 1,
-        kind: subc_protocol::scope::ScopeKind::Head,
-        parent: None,
-        parent_state: None,
-        attributes: Default::default(),
-        owner_authorized: true,
-    }
+        "historian-session",
+        1,
+        subc_protocol::scope::ScopeKind::Head,
+    )
+    .with_owner_authorized(true)
 }
 
 struct Fixture {

@@ -43,7 +43,7 @@ chrono = { version = "0.4", default-features = false, features = ["clock"] }
 # unify with mc-store's and cortexkit-store's.
 rusqlite = { workspace = true }
 # subc-protocol is resolved from crates.io, matching the role crate's dependency.
-cortexkit-role-tool-provider = "=0.5.0"
+cortexkit-role-tool-provider = "=0.10.0"
 cortexkit-role-agent-data = "0.1"
 # Runner-owned tags and context-ceiling details for async compaction.
 cortexkit-role-llm-runner = "=0.3.8"
@@ -95,7 +95,7 @@ cortexkit-role-agent-data = { version = "0.1", features = ["test-vectors"] }
 cpu-time = "1"
 subc-core = { workspace = true }
 # Embedded real-daemon coverage of HELLO_ACK/open versus the first plan fetch.
-subc-daemon = "=0.31.4"
+subc-daemon = "=0.36.19"
 # Enable the store's seed helpers for mc-module's compose tests (populate memories +
 # mutations). The feature is gated so the writers never reach production builds.
 mc-store = { workspace = true, features = ["test-support"] }
@@ -115,5 +115,5 @@ tokio = { workspace = true, features = ["test-util"] }
 nkeys = { version = "=0.4.5", default-features = false }
 # The role's conformance suite, run in-process against tool.catalog and
 # role.describe (src/tests/tool_catalog_conformance.rs).
-cortexkit-role-tool-provider-conformance = "=0.5.0"
+cortexkit-role-tool-provider-conformance = "=0.10.0"
 cortexkit-role-llm-runner-conformance = "=0.8.6"

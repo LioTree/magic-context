@@ -1289,7 +1289,12 @@ async fn mc_pipe_only_supervision_through_real_daemon() {
     );
     let (principal, request) = tokio::time::timeout(START_TIMEOUT, observed_rx.recv())
         .await
-        .expect("historian route never carried traffic")
+        .unwrap_or_else(|_| {
+            panic!(
+                "historian route never carried traffic; root={}",
+                temp.0.display()
+            )
+        })
         .unwrap();
     assert_eq!(
         principal,
@@ -1344,15 +1349,23 @@ impl subc_client_rs::ModuleHandler for CensusRunner {
             .cloned()
             .unwrap();
         let request: serde_json::Value = serde_json::from_slice(&body).unwrap();
-        // Before sending, the historian requires tool-free, single-step execution
-        // plus run-operation and run-status support. This traffic-only fake does not
-        // execute completions and needs no retention, output caps or streaming.
+        // The historian sends a request only when the runner advertises tool-free,
+        // single-step execution and support for run operations and run-status queries.
+        // The census also advertises streaming and usage, but this traffic-only fake
+        // executes no completions and needs no retention or output caps.
         if request["method"] == "role.describe" {
             use cortexkit_role_llm_runner::capabilities as caps;
             return subc_client_rs::HandlerOutcome::Response(
-                serde_json::to_vec(&json!({ "result": { "capabilities": [
-                    caps::NO_TOOLS, caps::MAX_STEPS, caps::RUN_OPS, caps::RUN_STATUS
-                ] } }))
+                serde_json::to_vec(&json!({ "result": {
+                    "capabilities": [
+                        caps::NO_TOOLS,
+                        caps::MAX_STEPS,
+                        caps::RUN_OPS,
+                        caps::RUN_STATUS,
+                        "streaming",
+                        "run_usage"
+                    ]
+                } }))
                 .unwrap(),
             );
         }

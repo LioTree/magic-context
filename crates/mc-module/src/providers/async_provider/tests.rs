@@ -3,6 +3,7 @@ use cortexkit_bus_inmemory::{InMemoryBus, InMemoryConfig};
 mod reminder_replay;
 mod reminders;
 mod wrapup;
+mod user_commands_tests;
 
 #[derive(Default)]
 struct Runner {

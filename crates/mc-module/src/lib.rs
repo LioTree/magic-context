@@ -14752,6 +14752,12 @@ impl McHandler {
         let Some(name) = request.get("name").and_then(Value::as_str) else {
             return unrecognized_request_error(&request);
         };
+        if matches!(
+            name,
+            "user_command.invoke" | "late_results" | "late_results.ack"
+        ) {
+            return self.handle_user_command_op(channel, name, &request).await;
+        }
         if let Err(outcome) = self.check_catalog_call(channel, name, &request) {
             return outcome;
         }

@@ -60,8 +60,9 @@ function decisionRows(
         .all(sessionId) as Array<{ message_id: string; decision: string }>;
 }
 
-// Decision rows are intercepted by SQL prefix; the envelope uses its logical CAS boundary.
-// Interleave before writer acquisition rather than between chunks under the writer lock.
+// Decision rows are intercepted by SQL prefix; replay-document writes use the
+// collection compare-and-swap API. Inject the competing update before the writer
+// transaction begins, not between chunk writes while the lock is held.
 const DECISION_WRITE_PREFIXES = [
     "INSERT INTO session_replay_decisions",
     "UPDATE session_replay_decisions",
