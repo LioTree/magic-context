@@ -150,6 +150,39 @@ async fn covered_view_work_tracks_tail_not_session() {
 }
 
 #[tokio::test]
+async fn first_certified_notice_renders_only_the_view_sources() {
+    // The first notice over an already summarized transcript has no
+    // certificate yet, so its engine pass reads every held message. Once that
+    // pass certifies the covered prefix, rendering must still be bounded by the
+    // view's own sources, not by the transcript.
+    for size in [80, 800] {
+        let dir = tempfile::tempdir().unwrap();
+        let mut rig = Rig::new(dir.path()).await;
+        rig.append(size);
+        rig.history(size - 13, "completed covered prefix");
+        view_work::take(&rig.reference);
+        rig.notice(1_000, None).await;
+        let work = view_work::take(&rig.reference);
+        assert!(
+            rig.state().logical_prefix.is_some(),
+            "size={size}: the first pass did not certify its prefix"
+        );
+        assert!(
+            rig.newest_view().is_some(),
+            "size={size}: no view published"
+        );
+        assert_eq!(
+            work.engine_input, size as usize,
+            "size={size}: the first pass reads the whole transcript"
+        );
+        assert!(
+            work.renderer_input > 0 && work.renderer_input <= 14,
+            "size={size}: {work:?}"
+        );
+    }
+}
+
+#[tokio::test]
 async fn covered_ride_keeps_prefix_during_historian_meta_write() {
     // One conflict exercises the fresh-snapshot retry; two exhaust the retry
     // budget and must still use the valid certificate for rendering.

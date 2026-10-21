@@ -1283,6 +1283,38 @@ async fn resident_matches_the_full_recompute_oracle() {
 }
 
 #[tokio::test]
+async fn first_certified_view_matches_full_lineage_render() {
+    // The resident side renders the first certified view from the view's own
+    // sources; the oracle renders it from the whole lineage. `both` requires
+    // the published bytes, ranges and edits to be identical.
+    for profile in PROFILES {
+        let mut pair = Pair::new(profile, false).await;
+        pair.append(200);
+        let reference = pair.reference.clone();
+        pair.both("covered history before the first notice", |side| {
+            let reference = reference.clone();
+            Box::pin(async move { publish_history(side, &reference, 187) })
+        })
+        .await;
+        let mut rng = Rng(17);
+        let outcome = pair.notice(&mut rng, None).await;
+        assert_eq!(outcome, "ok", "{profile:?}: {outcome}");
+        let head = load(pair.resident.store(), &pair.reference)
+            .unwrap()
+            .unwrap();
+        assert!(
+            head.logical_prefix.is_some(),
+            "{profile:?}: the first pass did not certify; log={:?}",
+            pair.log
+        );
+        assert!(
+            !pair.newest_versions().is_empty(),
+            "{profile:?}: no view published"
+        );
+    }
+}
+
+#[tokio::test]
 async fn prefix_matches_full_lineage_with_crossing_native_arcs() {
     for profile in PROFILES {
         let mut pair = Pair::new(profile, false).await;
