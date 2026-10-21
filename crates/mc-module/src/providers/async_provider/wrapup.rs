@@ -367,31 +367,26 @@ impl McHandler {
         let permit = Arc::clone(&drive.permit);
         tokio::task::spawn_blocking(move || {
             let _permit = permit;
-            let mut loaded = store.load(&namespace).map_err(transient)?;
-            let mut changed = false;
             // Before a first view, per-message identity vectors may be missing
             // from storage. Persist missing vectors without changing cached
-            // messages; reject vectors that conflict with stored values.
-            for (mid, vector) in identities {
-                match loaded.meta.block_identity_by_mid.get(&mid) {
-                    Some(held) if held != &vector => {
-                        return Err(transient(format!(
-                            "async wrapup source identity changed: {mid}"
-                        )));
-                    }
-                    Some(_) => {}
-                    None => {
-                        loaded.meta.block_identity_by_mid.insert(mid, vector);
-                        changed = true;
-                    }
+            // messages; the store refuses vectors that conflict with stored values
+            // and writes nothing in that case.
+            let Some(row_version) = store.load_meta(&namespace).map_err(transient)?.row_version
+            else {
+                if identities.is_empty() {
+                    return Ok(());
                 }
+                return Err(transient(
+                    "async wrapup has no cache state to record identities",
+                ));
+            };
+            match store.commit_block_identities(&namespace, row_version, &identities) {
+                Ok(_) => Ok(()),
+                Err(mc_store::McStoreError::BlockIdentityConflict { mid, .. }) => Err(transient(
+                    format!("async wrapup source identity changed: {mid}"),
+                )),
+                Err(error) => Err(transient(error)),
             }
-            if changed {
-                store
-                    .commit(&namespace, loaded.row_version, &loaded.core, &loaded.meta)
-                    .map_err(transient)?;
-            }
-            Ok(())
         })
         .await
         .map_err(transient)?

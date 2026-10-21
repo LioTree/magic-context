@@ -6428,6 +6428,12 @@ pub enum McStoreError {
         base_row_version: u64,
         meta_only_steps: u64,
     },
+    /// [`McStore::commit_block_identities`] was given a vector for a message id whose stored
+    /// vector differs. Stored identities are never replaced by that writer; nothing was written.
+    BlockIdentityConflict {
+        session_id: String,
+        mid: String,
+    },
 }
 
 impl std::fmt::Display for McStoreError {
@@ -6535,6 +6541,10 @@ impl std::fmt::Display for McStoreError {
                 f,
                 "commit expects row_version {expected:?} over a base loaded at \
                  {base_row_version} plus {meta_only_steps} meta-only steps"
+            ),
+            McStoreError::BlockIdentityConflict { session_id, mid } => write!(
+                f,
+                "session {session_id} already holds different block identities for {mid}"
             ),
         }
     }
@@ -9435,6 +9445,90 @@ impl McStore {
             expected: Some(expected),
             found,
         })
+    }
+
+    /// Add block identities a session does not have yet, under the `row_version` CAS.
+    ///
+    /// Block identities live as rows in `mc_block_identities`, outside the meta blob, so
+    /// [`McStore::commit_meta`] cannot store them; this writes those rows and nothing else:
+    /// never `core_state`, `meta`, `section_index`, or a chunk or section row. A message id
+    /// that already has a row must hold exactly the given vector; any difference refuses the
+    /// whole batch with [`McStoreError::BlockIdentityConflict`] before a row is written.
+    ///
+    /// When rows are added, `row_version` is bumped. A full commit that loaded the session
+    /// before this write replaces the stored identities with its own (older) map, which would
+    /// delete the new rows; the bump makes that commit fail its CAS instead. The row-state
+    /// digest is dropped because it described the identity rows as they were. Nothing to add
+    /// keeps the current `row_version`.
+    ///
+    /// `expected` is required: there is no session row to version before the first full
+    /// commit, and creating one is a full codec write this narrow writer does not do.
+    pub fn commit_block_identities(
+        &self,
+        session_id: &str,
+        expected: u64,
+        identities: &BTreeMap<String, Vec<BlockIdentity>>,
+    ) -> Result<u64, McStoreError> {
+        self.inner.with_conn_fenced(|tx| {
+            move_store::check_writer(tx, session_id)?;
+            let current: Option<i64> = tx
+                .query_row(
+                    "SELECT row_version FROM mc_cache_state WHERE session_id = ?1",
+                    [session_id],
+                    |row| row.get(0),
+                )
+                .optional()?;
+            let Some(current) = current else {
+                return Ok(Err(McStoreError::CasConflict {
+                    expected: Some(expected),
+                    found: 0,
+                }));
+            };
+            if current != expected as i64 {
+                return Ok(Err(McStoreError::CasConflict {
+                    expected: Some(expected),
+                    found: current.max(0) as u64,
+                }));
+            }
+            // Check the whole batch before writing, so a conflict leaves no row behind.
+            let mut missing = Vec::new();
+            for (mid, vector) in identities {
+                match block_identities_for_mid_tx(tx, session_id, mid)? {
+                    Some(held) if &held != vector => {
+                        return Ok(Err(McStoreError::BlockIdentityConflict {
+                            session_id: session_id.to_string(),
+                            mid: mid.clone(),
+                        }));
+                    }
+                    Some(_) => {}
+                    None => missing.push((
+                        mid,
+                        serde_json::to_string(vector).map_err(serde_to_sql_error)?,
+                    )),
+                }
+            }
+            if missing.is_empty() {
+                return Ok(Ok(expected));
+            }
+            for (mid, vector) in &missing {
+                tx.execute(
+                    "INSERT INTO mc_block_identities (session_id, mid, identities)
+                     VALUES (?1, ?2, ?3)",
+                    params![session_id, mid, vector],
+                )?;
+            }
+            let next = expected + 1;
+            tx.execute(
+                "UPDATE mc_cache_state SET row_version = ?2, last_activity_at = ?3
+                  WHERE session_id = ?1 AND row_version = ?4",
+                params![session_id, next as i64, current_time_ms(), expected as i64],
+            )?;
+            tx.execute(
+                "DELETE FROM mc_cache_state_digest WHERE session_id = ?1",
+                [session_id],
+            )?;
+            Ok(Ok(next))
+        })?
     }
 
     /// Read bootstrap cursors without hydrating frozen units or compartment summary bodies.
@@ -19690,6 +19784,175 @@ mod tests {
         assert_eq!(reloaded.meta, meta);
         assert_eq!(reloaded.core, core);
         assert_eq!(reloaded.row_version, Some(version));
+    }
+
+    fn cache_row_columns(store: &McStore, session: &str) -> (i64, String, String, String) {
+        store
+            .inner
+            .with_conn(|conn| {
+                conn.query_row(
+                    "SELECT row_version, core_state, meta, section_index FROM mc_cache_state
+                      WHERE session_id = ?1",
+                    [session],
+                    |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?)),
+                )
+            })
+            .unwrap()
+    }
+
+    fn digest_rows(store: &McStore, session: &str) -> i64 {
+        store
+            .inner
+            .with_conn(|conn| {
+                conn.query_row(
+                    "SELECT COUNT(*) FROM mc_cache_state_digest WHERE session_id = ?1",
+                    [session],
+                    |row| row.get(0),
+                )
+            })
+            .unwrap()
+    }
+
+    /// A session with three identities, a frozen unit and a meta scalar, so a writer that
+    /// touched anything besides the identity rows would show up in the cache row.
+    fn seeded_identity_session(store: &McStore) -> u64 {
+        let core = CoreState {
+            boundary_id: "b1".to_string(),
+            frozen_units: vec![FrozenUnit {
+                key: "m000000".to_string(),
+                kind: "synth-region".to_string(),
+                frozen_payload: "frozen".to_string(),
+                durability_class: DurabilityClass::Lineage,
+                reset_rule: String::new(),
+            }],
+            ..CoreState::default()
+        };
+        let meta = ModuleMeta {
+            initialized: true,
+            block_identity_by_mid: identity_map(3),
+            ..ModuleMeta::default()
+        };
+        store.commit("ses", None, &core, &meta).unwrap()
+    }
+
+    #[test]
+    fn commit_block_identities_adds_only_missing_rows_and_bumps_the_row_version() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = McStore::open_for_test(&descriptor(dir.path())).unwrap();
+        let version = seeded_identity_session(&store);
+        let (_, core_before, meta_before, index_before) = cache_row_columns(&store, "ses");
+        assert_eq!(digest_rows(&store, "ses"), 1);
+
+        // The first three match what is stored; the last two are new.
+        let wanted = identity_map(5);
+        let next = store
+            .commit_block_identities("ses", version, &wanted)
+            .unwrap();
+        assert_eq!(next, version + 1);
+        let (row_version, core_after, meta_after, index_after) = cache_row_columns(&store, "ses");
+        assert_eq!(row_version, next as i64);
+        assert_eq!(
+            (core_after, meta_after, index_after),
+            (core_before, meta_before, index_before),
+            "an identity-only write must not rewrite the cache row's state"
+        );
+        assert_eq!(
+            digest_rows(&store, "ses"),
+            0,
+            "the digest described the identity rows before the insert"
+        );
+        let loaded = store.load("ses").unwrap();
+        assert_eq!(loaded.meta.block_identity_by_mid, wanted);
+        assert_eq!(loaded.core.frozen_units[0].frozen_payload, "frozen");
+
+        // Nothing left to add: no write, no bump.
+        assert_eq!(
+            store.commit_block_identities("ses", next, &wanted).unwrap(),
+            next
+        );
+        assert_eq!(cache_row_columns(&store, "ses").0, next as i64);
+    }
+
+    #[test]
+    fn commit_block_identities_refuses_a_stale_row_version_without_writing() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = McStore::open_for_test(&descriptor(dir.path())).unwrap();
+        let version = seeded_identity_session(&store);
+        let error = store
+            .commit_block_identities("ses", version + 7, &identity_map(5))
+            .unwrap_err();
+        assert!(
+            matches!(error, McStoreError::CasConflict { expected: Some(e), found } if e == version + 7 && found == version),
+            "{error}"
+        );
+        assert_eq!(
+            store.load("ses").unwrap().meta.block_identity_by_mid,
+            identity_map(3)
+        );
+        assert_eq!(cache_row_columns(&store, "ses").0, version as i64);
+        assert_eq!(digest_rows(&store, "ses"), 1);
+
+        // A session with no cache row has no version to match; nothing is created.
+        let error = store
+            .commit_block_identities("absent", 1, &identity_map(1))
+            .unwrap_err();
+        assert!(
+            matches!(error, McStoreError::CasConflict { found: 0, .. }),
+            "{error}"
+        );
+        assert!(store.load("absent").unwrap().row_version.is_none());
+        assert!(store
+            .load("absent")
+            .unwrap()
+            .meta
+            .block_identity_by_mid
+            .is_empty());
+    }
+
+    #[test]
+    fn commit_block_identities_refuses_a_differing_vector_and_writes_nothing() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = McStore::open_for_test(&descriptor(dir.path())).unwrap();
+        let version = seeded_identity_session(&store);
+        // One new message id sorts before the conflicting one, so a writer that inserted
+        // as it validated would leave it behind.
+        let mut wanted = identity_map(5);
+        wanted.get_mut("m000002").unwrap()[0].byte_fingerprint = "changed".to_string();
+        let copied = wanted["m000004"].clone();
+        wanted.insert("m000001a".to_string(), copied);
+        let error = store
+            .commit_block_identities("ses", version, &wanted)
+            .unwrap_err();
+        assert!(
+            matches!(&error, McStoreError::BlockIdentityConflict { session_id, mid } if session_id == "ses" && mid == "m000002"),
+            "{error}"
+        );
+        assert_eq!(
+            store.load("ses").unwrap().meta.block_identity_by_mid,
+            identity_map(3)
+        );
+        assert_eq!(cache_row_columns(&store, "ses").0, version as i64);
+        assert_eq!(digest_rows(&store, "ses"), 1);
+    }
+
+    #[test]
+    fn a_full_commit_loaded_before_commit_block_identities_cannot_delete_its_rows() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = McStore::open_for_test(&descriptor(dir.path())).unwrap();
+        let version = seeded_identity_session(&store);
+        let stale = store.load("ses").unwrap();
+        store
+            .commit_block_identities("ses", version, &identity_map(5))
+            .unwrap();
+        // The stale map lacks the two new rows; committing it would delete them.
+        let error = store
+            .commit("ses", stale.row_version, &stale.core, &stale.meta)
+            .unwrap_err();
+        assert!(matches!(error, McStoreError::CasConflict { .. }), "{error}");
+        assert_eq!(
+            store.load("ses").unwrap().meta.block_identity_by_mid,
+            identity_map(5)
+        );
     }
 
     #[test]

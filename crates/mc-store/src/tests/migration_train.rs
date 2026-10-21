@@ -1602,7 +1602,13 @@ fn released_63_to_74_preserves_data_and_fences_the_old_binary() {
     assert!(!before.tables.contains_key("mc_async_compaction"));
     let upgraded = McStore::open(&descriptor).unwrap();
     assert_eq!(LATEST_MIGRATION_VERSION, 74);
-    assert_eq!(crate::move_inventory::CONTEXT_SCHEMA_VERSION, 102);
+    // The move inventory's context.db pin must match the context schema this binary
+    // ships (the plugin's LATEST_SUPPORTED_VERSION, read at compile time), so the
+    // expectation moves with each new context migration instead of being a literal.
+    assert_eq!(
+        crate::move_inventory::CONTEXT_SCHEMA_VERSION,
+        crate::context_schema::BOOTSTRAP_VERSION
+    );
     assert_metadata_and_inventory(&upgraded, 74);
     let after = store_snapshot(&upgraded);
     for table in ["mc_tags", "pending_agent_drops"] {
