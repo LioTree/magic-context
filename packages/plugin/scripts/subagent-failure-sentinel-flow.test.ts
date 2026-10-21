@@ -34,7 +34,10 @@ type FlowPure = {
     evaluateFailures: typeof evaluateFailures;
 };
 type Digest = { agent: string; item: { title: string; body: string; data: Record<string, unknown> }; action: string; options?: { replace_key?: string } };
-type FlowResult = { examined: number; alerts: number; bounded: boolean; history_read: boolean; watermark: { ended_at: number; id: number } };
+type FlowResult = {
+    examined: number; alerts: number; bounded: boolean; evaluated: boolean; bootstrap_rows: number;
+    tail_rows: number; stored_bytes: number; watermark: { ended_at: number; id: number };
+};
 
 // basal evaluates the script as the body of an async function.
 const AsyncFunction = Object.getPrototypeOf(async () => {}).constructor as new (
@@ -114,11 +117,28 @@ function fakeOp(module: string, op: string, args: Record<string, unknown>) {
     return { rows: kept, more: rows.length > kept.length };
 }
 
+// Bytes one run put in basal's journal, counted as basal records them: the full
+// arguments and outcome of every `ops.call` and `kv` call. Reset per run.
+let journalBytes = 0;
+const jsonBytes = (value: unknown) => new TextEncoder().encode(JSON.stringify(value) ?? "null").length;
+
 async function runFlow(now: number, options: { replaceKeySupported?: boolean } = {}): Promise<FlowResult> {
-    // Values go through JSON, as basal's kv stores them.
+    journalBytes = 0;
+    const journal = <T>(args: unknown, result: T): T => {
+        journalBytes += jsonBytes(args) + jsonBytes(result);
+        return result;
+    };
+    // Values go through JSON, as basal's kv stores them, under basal's default
+    // limits: 64 KiB of JSON per value and 1 MiB of keys and values per flow.
     const kv = {
-        get: async (key: string) => (kvStore.has(key) ? JSON.parse(JSON.stringify(kvStore.get(key))) : null),
-        set: async (key: string, value: unknown) => { kvStore.set(key, JSON.parse(JSON.stringify(value))); },
+        get: async (key: string) => journal([key], kvStore.has(key) ? JSON.parse(JSON.stringify(kvStore.get(key))) : null),
+        set: async (key: string, value: unknown) => {
+            expect(jsonBytes(value)).toBeLessThanOrEqual(64 * 1024);
+            kvStore.set(key, JSON.parse(JSON.stringify(value)));
+            expect(kvBytes()).toBeLessThanOrEqual(1024 * 1024);
+            return journal([key, value], true);
+        },
+        delete: async (key: string) => journal([key], kvStore.delete(key)),
     };
     const digest = async (agent: string, item: Digest["item"], action: string, opts?: Digest["options"]) => {
         if (opts?.replace_key !== undefined && options.replaceKeySupported === false) {
@@ -126,9 +146,16 @@ async function runFlow(now: number, options: { replaceKeySupported?: boolean } =
         }
         digests.push({ agent, item, action, options: opts });
     };
-    const ops = { call: async (module: string, op: string, args: Record<string, unknown>) => JSON.parse(JSON.stringify(fakeOp(module, op, args))) };
+    const ops = { call: async (module: string, op: string, args: Record<string, unknown>) => journal(args, JSON.parse(JSON.stringify(fakeOp(module, op, args)))) };
     const script = new AsyncFunction("ops", "kv", "sink", "Date", FLOW_SOURCE);
     return (await script(ops, kv, { digest }, { now: () => now })) as FlowResult;
+}
+
+// The flow's whole kv footprint: key and JSON value bytes.
+function kvBytes(): number {
+    let total = 0;
+    for (const [key, value] of kvStore) total += new TextEncoder().encode(key).length + jsonBytes(value);
+    return total;
 }
 
 async function runOld(now: number) {
@@ -148,6 +175,12 @@ function seed(cursorEndedAt = NOW - SETTLE) {
     kvStore.set("state", state);
 }
 
+// The part of the flow's kv state the script also keeps: its cursor and dedupe keys.
+function sharedState() {
+    const { cursor, sent } = kvStore.get("state") as { cursor: unknown; sent: unknown };
+    return { version: 1, cursor, sent };
+}
+
 // Runs both at `now`, requires identical outcomes, and returns the flow's alerts.
 async function step(now: number): Promise<Alert[]> {
     const wakesBefore = oldWakes.length;
@@ -155,13 +188,10 @@ async function step(now: number): Promise<Alert[]> {
     const old = await runOld(now);
     const flowed = await runFlow(now);
     const oldState = JSON.parse(readFileSync(join(root, "state.json"), "utf8"));
-    expect(kvStore.get("state")).toEqual(oldState);
-    // Without a new failure the flow skips the history read the script made, so
-    // only then do the counts that include history agree.
-    if (flowed.history_read) {
-        expect(flowed.examined).toBe(old.examined);
-        expect(flowed.bounded).toBe(old.bounded);
-    }
+    expect(sharedState()).toEqual(oldState);
+    // Without a new failure the flow skips the evaluation the script made, so
+    // only then does `bounded` cover the same reads.
+    if (flowed.evaluated) expect(flowed.bounded).toBe(old.bounded);
     expect(flowed.alerts).toBe(old.alerts.length);
     expect(flowed.watermark).toEqual(oldState.cursor);
     const newWakes = oldWakes.slice(wakesBefore);
@@ -335,7 +365,7 @@ test("watermark resumes equal timestamps by id and bounds a backlog", async () =
     const first = await runFlow(at());
     await runOld(at());
     expect(first.bounded).toBe(true);
-    expect(kvStore.get("state")).toEqual(JSON.parse(readFileSync(join(root, "state.json"), "utf8")));
+    expect(sharedState()).toEqual(JSON.parse(readFileSync(join(root, "state.json"), "utf8")));
     expect(kvStore.get("state")).toMatchObject({ cursor: { id: 500 } });
     await step(at());
     expect(kvStore.get("state")).toMatchObject({ cursor: { id: 503 } });
@@ -373,10 +403,11 @@ test("a history over 5,000 rows holds back the window rules in both", async () =
     add("failed", NOW - 1_000, "first failure of its kind");
     const flowed = await runFlow(at());
     const old = await runOld(at());
-    expect(flowed.history_read).toBe(true);
+    expect(flowed.evaluated).toBe(true);
+    // The cold start's seven-day read stops at 5,000 rows, as the script's did.
+    expect(flowed.bootstrap_rows).toBe(5_000);
     expect(flowed.bounded).toBe(old.bounded);
     expect(flowed.bounded).toBe(true);
-    expect(flowed.examined).toBe(old.examined);
     expect(flowed.alerts).toBe(old.alerts.length);
     expect(old.alerts.some((alert) => alert.rule === "new_class")).toBe(false);
 }, 30_000);
@@ -402,9 +433,120 @@ test("a core without replace_key support still gets the wake", async () => {
 });
 
 test("a corrupt stored state stops the run instead of resetting the cursor", async () => {
+    kvStore.set("state", { version: 99, cursor: { ended_at: 1, id: 1 }, sent: {} });
+    await expect(runFlow(at())).rejects.toThrow("invalid failure sentinel state");
+    // A current-version state without its record bookkeeping is corrupt too.
     kvStore.set("state", { version: 2, cursor: { ended_at: 1, id: 1 }, sent: {} });
     await expect(runFlow(at())).rejects.toThrow("invalid failure sentinel state");
 });
+
+// ---- Incremental runs against the script's full re-evaluation ----
+//
+// After its first run the flow judges new rows against what it stored, not a
+// fresh seven-day read. These sequences run both at every step over more than
+// seven days, so each comparison covers hours leaving the records, failures
+// moving into the older-failure summary, and their expiry.
+
+const HOUR = 3_600_000;
+
+// Window reads that reach back past the stored records: only a cold start may make one.
+function longWindowReads(since: number) {
+    return opCalls.slice(since).filter((call) => call.query === "window" && (call.until as number) - (call.after as number) > 2 * DAY);
+}
+
+test("incremental runs match full re-evaluation across the 24-hour, 48-hour and 7-day edges", async () => {
+    seed();
+    const B = NOW;
+    // Seven-day edge: two classes whose only earlier failure is a millisecond apart.
+    attempt({ session: "k0", status: "failed", time: B + 1_000, error: "edge class K", task: "edge-k" });
+    attempt({ session: "l0", status: "failed", time: B + 1_001, error: "edge class L", task: "edge-l" });
+    // A quota failure recovered by its fallback: it must not count as an earlier
+    // failure once it has moved into the summary.
+    const quota = attempt({ session: "q0", status: "failed", time: B + 2_000, error: QUOTA, task: "quota-y" });
+    attempt({ session: "q0", status: "completed", time: B + 30_000, task: "fallback", parent: quota });
+    // Day 3: the same quota class, but its fallback fails too.
+    const quota2 = attempt({ session: "q1", status: "failed", time: B + 3 * DAY + 1_000, error: QUOTA, task: "quota-y" });
+    attempt({ session: "q1", status: "failed", time: B + 3 * DAY + 31_000, task: "fallback", parent: quota2, error: "overloaded 529" });
+    // A quota failure whose fallback has not settled yet at its run: only the unsettled tail recovers it.
+    const Rp = B + 2 * DAY + 5 * HOUR;
+    const tailPrimary = attempt({ session: "t0", status: "failed", time: Rp - SETTLE - 1_000, error: QUOTA, task: "tail-z" });
+    attempt({ session: "t0", status: "completed", time: Rp - 60_000, task: "fallback", parent: tailPrimary });
+    // 24-hour edge: the share rule must count the row 1 ms inside the day and not the one on its edge.
+    const Rs = B + 5 * DAY + 12_345;
+    for (let i = 0; i < 5; i++) attempt({ session: `x${i}`, status: "completed", time: Rs - 20 * HOUR + i, task: "share-x" });
+    attempt({ session: "x5", status: "failed", time: Rs - 10 * HOUR, error: "share failure 1", task: "share-x" });
+    attempt({ session: "x6", status: "completed", time: Rs - DAY, task: "share-x" });
+    attempt({ session: "x7", status: "empty", time: Rs - DAY + 1, task: "share-x" });
+    attempt({ session: "x8", status: "failed", time: Rs - SETTLE - 1_000, error: "share failure 2", task: "share-x" });
+    // 48-hour edge: the doubling rule's prior day starts 1 ms after `now - 48h`.
+    const Rd = B + 6 * DAY + 777;
+    attempt({ session: "d0", status: "failed", time: Rd - 2 * DAY, error: "doubling class D", task: "double" });
+    attempt({ session: "d1", status: "failed", time: Rd - 2 * DAY + 1, error: "doubling class D", task: "double" });
+    attempt({ session: "d2", status: "failed", time: Rd - 3 * HOUR, error: "doubling class D", task: "double" });
+    attempt({ session: "d3", status: "failed", time: Rd - SETTLE - 500, error: "doubling class D", task: "double" });
+    // Seven days after K's failure, K's is gone from the window and L's is not.
+    // The regular run at B + 7d settles rows up to 1 s before R7's bound, so these land in R7.
+    const R7 = B + 1_000 + 7 * DAY;
+    attempt({ session: "k1", status: "failed", time: R7 - SETTLE - 500, error: "edge class K", task: "edge-k" });
+    attempt({ session: "l1", status: "failed", time: R7 - SETTLE - 499, error: "edge class L", task: "edge-l" });
+
+    const R0 = B + 30_000 + SETTLE + 60_000;
+    const Rq = B + 3 * DAY + 31_000 + SETTLE + 1;
+    const runs = new Set([R0, Rp, Rq, Rs, Rd, R7]);
+    for (let t = B + 6 * HOUR; t <= B + 8 * DAY; t += 6 * HOUR) runs.add(t);
+    const byRun = new Map<number, Alert[]>();
+    let afterBootstrap = 0;
+    for (const run of [...runs].sort((a, b) => a - b)) {
+        byRun.set(run, await step(run));
+        if (run === R0) afterBootstrap = opCalls.length;
+        // The state never holds records older than the hour before `now - 48h`.
+        const hours = [...kvStore.keys()].filter((key) => key.startsWith("hour:")).map((key) => Number(key.slice(5, key.indexOf("#"))));
+        expect(hours.every((hour) => hour >= Math.floor((run - 2 * DAY) / HOUR) - 1)).toBe(true);
+    }
+    // Only the first run read the seven-day window; every later one was incremental.
+    expect(longWindowReads(afterBootstrap)).toEqual([]);
+    expect([...kvStore.keys()].some((key) => key.startsWith("older#"))).toBe(true);
+    const rules = (run: number) => byRun.get(run)!.map((alert) => `${alert.rule}:${alert.task}`).sort();
+    expect(rules(R0)).toEqual(["new_class:edge-k", "new_class:edge-l"]);
+    expect(rules(Rp)).toEqual([]);
+    expect(rules(Rq)).toContain("new_class:quota-y");
+    expect(byRun.get(Rs)!.find((alert) => alert.rule === "failure_share")).toMatchObject({ task: "share-x", count: 2, share: 0.25, empty: 1 });
+    expect(byRun.get(Rd)!.find((alert) => alert.rule === "class_doubled")).toMatchObject({ task: "double", count: 2 });
+    expect(rules(R7)).toEqual(["new_class:edge-k"]);
+}, 30_000);
+
+test("incremental runs match full re-evaluation on generated traffic over nine days", async () => {
+    seed();
+    const pick = generator(7);
+    const tasks = ["historian", "classify", null, "verify"];
+    const statuses = ["completed", "completed", "completed", "failed", "timed_out", "empty", "aborted"];
+    db.transaction(() => {
+        for (let i = 0; i < 700; i++) {
+            const time = NOW + pick(9 * DAY);
+            const status = statuses[pick(statuses.length)]!;
+            const session = `g-${pick(40)}`;
+            const subagent = pick(4) ? "historian" : "dreamer";
+            const id = attempt({ session, status, time, error: status === "failed" || status === "timed_out" ? GENERATED_ERRORS[pick(GENERATED_ERRORS.length)] : null, task: tasks[pick(tasks.length)]!, subagent });
+            // Half the failures get a fallback, linked or not, finishing or failing,
+            // inside or outside the unlinked match window, sometimes after the settle window.
+            if ((status === "failed" || status === "timed_out") && pick(2) === 0) {
+                attempt({
+                    session: pick(6) ? session : "g-other", subagent, task: "fallback",
+                    status: pick(3) ? "completed" : "failed", time: time + 1_000 + pick(15 * 60_000),
+                    parent: pick(2) ? id : null, error: null,
+                });
+            }
+        }
+    })();
+    let alerted = 0;
+    let run = NOW;
+    while (run < NOW + 10 * DAY) {
+        run += HOUR + pick(5 * HOUR);
+        if ((await step(run)).length) alerted++;
+    }
+    // The traffic reaches the rules often enough for the comparison to mean something.
+    expect(alerted).toBeGreaterThan(5);
+}, 60_000);
 
 // ---- The evaluation alone, on generated rows ----
 
