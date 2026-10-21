@@ -13,6 +13,23 @@ use subc_client_rs::HandlerOutcome;
 pub(crate) const FRAME_TARGET: usize = 512 * 1024;
 // Leave room for the envelope and daemon accounting below its 4 MiB egress cap.
 const UNPAGED_BODY_LIMIT: usize = 3 * 1024 * 1024;
+
+pub(crate) fn bound_health(report: subc_client_rs::HealthReport) -> subc_client_rs::HealthReport {
+    if serde_json::to_vec(&report).is_ok_and(|body| body.len() <= UNPAGED_BODY_LIMIT) {
+        return report;
+    }
+    subc_client_rs::HealthReport {
+        status: if report.status == subc_client_rs::HealthStatus::Failing {
+            subc_client_rs::HealthStatus::Failing
+        } else {
+            subc_client_rs::HealthStatus::Degraded
+        },
+        detail: Some(
+            "frame_too_large: health diagnostics exceeded the daemon egress budget".into(),
+        ),
+        metrics: None,
+    }
+}
 // Each page's `data` is cut by its JSON-escaped size, not its raw size, so a page fills
 // most of the frame. A fixed raw cut had to assume the worst case (one byte escaping to
 // six) and so used 64 KiB pages, which turned a large reply into a hundred-plus sequential

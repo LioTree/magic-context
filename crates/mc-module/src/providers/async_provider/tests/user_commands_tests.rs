@@ -56,6 +56,21 @@ async fn ready(dir: &Path) -> Rig {
     let rig = Rig::new(dir).await;
     rig.fill(40);
     rig.notice(1, 1000, None).await;
+    // Finish the notice's historian evaluation before measuring command writes.
+    tokio::time::timeout(Duration::from_secs(10), async {
+        while rig
+            .h
+            .provider_store
+            .async_runtime
+            .historian_inflight
+            .load(std::sync::atomic::Ordering::SeqCst)
+            != 0
+        {
+            tokio::time::sleep(Duration::from_millis(2)).await;
+        }
+    })
+    .await
+    .expect("notice historian settled");
     attest(&rig, Some(stamp()));
     rig
 }
@@ -176,7 +191,6 @@ async fn user_flush_publishes_once_under_shared_permission_and_nothing_when_idle
     let dir = tempfile::tempdir().unwrap();
     let rig = ready(dir.path()).await;
     rig.queue(&[103]).await;
-    pending_history(&rig);
     let store = rig.h.store.get().unwrap();
     assert!(
         !store
@@ -202,15 +216,48 @@ async fn user_flush_publishes_once_under_shared_permission_and_nothing_when_idle
     assert!(rig.pending_targets().is_empty());
     let meta = store.load_meta(&rig.state().namespace()).unwrap().meta;
     assert!(!meta.soft_refresh_pending);
-    assert_eq!(meta.coverage_ordinal, Some(9));
-    let view = rig.get(before + 1).await;
-    assert!(String::from_utf8(rig.render(&view))
-        .unwrap()
-        .contains("user-command history"));
     let idle = response(invoke(&rig, "idle", "ctx-flush", "").await);
     assert_eq!(idle["state"], "done");
     assert!(idle["text"].as_str().unwrap().contains("Nothing to flush"));
     assert_eq!(rig.newest(), Some(before + 1));
+}
+
+#[tokio::test]
+async fn flush_applies_pending_history_in_published_view() {
+    let dir = tempfile::tempdir().unwrap();
+    let rig = ready(dir.path()).await;
+    pending_history(&rig);
+    let before = rig.newest().unwrap_or(0);
+    assert_eq!(
+        response(invoke(&rig, "history", "ctx-flush", "").await)["state"],
+        "accepted"
+    );
+    let result = terminal(&rig).await;
+    assert_eq!(
+        result["entries"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|entry| entry["kind"] == "result")
+            .unwrap()["result"]["state"],
+        "done"
+    );
+    assert_eq!(rig.newest(), Some(before + 1));
+    assert_eq!(
+        rig.h
+            .store
+            .get()
+            .unwrap()
+            .load_meta(&rig.state().namespace())
+            .unwrap()
+            .meta
+            .coverage_ordinal,
+        Some(9)
+    );
+    let view = rig.get(before + 1).await;
+    assert!(String::from_utf8(rig.render(&view))
+        .unwrap()
+        .contains("user-command history"));
 }
 
 #[tokio::test]

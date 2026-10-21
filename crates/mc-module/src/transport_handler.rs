@@ -1,7 +1,7 @@
 //! Keep synchronous store and encoding work off the module's control-plane runtime.
 
 use crate::{
-    reply_pages::{accepts_reply_pages, ReplyPages},
+    reply_pages::{accepts_reply_pages, bound_health, ReplyPages},
     McHandler,
 };
 use std::{
@@ -64,7 +64,8 @@ impl<H: ModuleHandler> ModuleHandler for McTransportHandler<H> {
         self.inner.on_connection_end(end).await;
     }
     async fn health(&self) -> HealthReport {
-        self.inner.health().await
+        // The SDK sends health outside the ordinary data-response adapter.
+        bound_health(self.inner.health().await)
     }
     async fn handle(&self, ctx: RequestCtx, body: Vec<u8>) -> HandlerOutcome {
         let inner = Arc::clone(&self.inner);
@@ -116,5 +117,69 @@ impl<H: ModuleHandler> ModuleHandler for McTransportHandler<H> {
                 message: error.to_string(),
             },
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use subc_client_rs::HealthStatus;
+
+    struct HealthFixture(HealthReport);
+    #[async_trait]
+    impl ModuleHandler for HealthFixture {
+        async fn health(&self) -> HealthReport {
+            self.0.clone()
+        }
+        async fn handle(&self, _: RequestCtx, _: Vec<u8>) -> HandlerOutcome {
+            HandlerOutcome::Error {
+                code: "unused".into(),
+                message: "health fixture".into(),
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn oversized_health_is_bounded_through_the_real_transport_adapter() {
+        for status in [HealthStatus::Ok, HealthStatus::Failing] {
+            let original = HealthReport {
+                status,
+                detail: None,
+                metrics: Some(serde_json::json!({"runner_choices":"x".repeat(4*1024*1024)})),
+            };
+            assert!(
+                serde_json::to_vec(&original).unwrap().len() + subc_protocol::HEADER_LEN
+                    > 4 * 1024 * 1024
+            );
+            let report = McTransportHandler::new(HealthFixture(original))
+                .health()
+                .await;
+            assert!(
+                serde_json::to_vec(&report).unwrap().len() + subc_protocol::HEADER_LEN
+                    < 4 * 1024 * 1024
+            );
+            assert!(report.detail.unwrap().starts_with("frame_too_large"));
+            assert!(report.metrics.is_none());
+            assert_eq!(
+                report.status,
+                if status == HealthStatus::Failing {
+                    HealthStatus::Failing
+                } else {
+                    HealthStatus::Degraded
+                }
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn ordinary_health_remains_byte_identical_through_transport() {
+        let original = HealthReport::ok();
+        let report = McTransportHandler::new(HealthFixture(original.clone()))
+            .health()
+            .await;
+        assert_eq!(
+            serde_json::to_vec(&report).unwrap(),
+            serde_json::to_vec(&original).unwrap()
+        );
     }
 }
