@@ -10034,7 +10034,24 @@ impl McHandler {
     /// flow's read of `subagent_invocations`, served on the management surface.
     /// The reply is the management envelope `{result: {rows, more}}`. See
     /// [`subagent_invocations_read`] for the queries and their bounds.
-    fn handle_subagent_invocations_read(&self, request: &Value) -> HandlerOutcome {
+    fn handle_subagent_invocations_read(&self, channel: u16, request: &Value) -> HandlerOutcome {
+        // The caller is judged from the daemon's bind stamp, before any argument is read.
+        let admitted = match self.bindings.lock().expect("route bindings").get(&channel) {
+            Some(binding) => subagent_invocations_read::authorize_caller(
+                binding.principal.as_ref(),
+                binding.scope.as_ref(),
+            ),
+            None => Err(format!(
+                "{} on a channel with no binding",
+                subagent_invocations_read::METHOD
+            )),
+        };
+        if let Err(message) = admitted {
+            return HandlerOutcome::Error {
+                code: "caller_forbidden".to_string(),
+                message,
+            };
+        }
         let query =
             match subagent_invocations_read::parse(request.get("params").unwrap_or(&Value::Null)) {
                 Ok(query) => query,
@@ -16779,13 +16796,17 @@ impl ModuleHandler for McHandler {
 
     async fn handle(&self, ctx: RequestCtx, body: Vec<u8>) -> HandlerOutcome {
         let channel = ctx.route_handle().channel;
-        if self.agent_data.as_ref().is_some_and(|service| {
-            service
-                .channels
-                .lock()
-                .expect("agent data channels")
-                .contains(&channel)
-        }) {
+        // A flow-scoped route never takes the agent-data lane: it falls through to
+        // the dispatcher, whose flow fence admits only the flow ops.
+        if !self.flow_scoped(channel)
+            && self.agent_data.as_ref().is_some_and(|service| {
+                service
+                    .channels
+                    .lock()
+                    .expect("agent data channels")
+                    .contains(&channel)
+            })
+        {
             let admitted = self.bindings.lock().expect("route bindings").get(&channel).is_some_and(|binding|
                 matches!(&binding.principal, Some(subc_protocol::Principal::Reserved { module_id }) if module_id == "entorhinal"));
             if !admitted {
@@ -16834,7 +16855,47 @@ impl ModuleHandler for McHandler {
     }
 }
 
+/// The only methods a flow-scoped route may call. Declaring `flow-scopes/v1`
+/// promises the daemon that ck-mc never treats a flow as its owner agent for
+/// approvals, writes or grants; admitting a flow route to a fixed list of
+/// read-only ops keeps that true whatever the other lanes' own checks do. A new
+/// flow op joins this list deliberately.
+const FLOW_ROUTE_METHODS: &[&str] = &[subagent_invocations_read::METHOD];
+
 impl McHandler {
+    /// Whether the daemon bound `channel` under a flow's scope (`flow_id` in the stamp).
+    fn flow_scoped(&self, channel: u16) -> bool {
+        self.bindings
+            .lock()
+            .expect("route bindings")
+            .get(&channel)
+            .and_then(|binding| binding.scope.as_ref())
+            .is_some_and(|scope| scope.attributes.flow_id.is_some())
+    }
+
+    /// Refuses, before any dispatch, every request on a flow-scoped route except
+    /// a [`FLOW_ROUTE_METHODS`] call in the `{"method": ...}` shape. Tool-call
+    /// shapes (`{"name", "arguments"}`) carry no method and are refused too.
+    fn flow_route_refusal(&self, channel: u16, request: &Value) -> Option<HandlerOutcome> {
+        if !self.flow_scoped(channel) {
+            return None;
+        }
+        let method = request.get("method").and_then(Value::as_str);
+        if method.is_some_and(|method| FLOW_ROUTE_METHODS.contains(&method)) {
+            return None;
+        }
+        let named = method
+            .or_else(|| request.get("name").and_then(Value::as_str))
+            .or_else(|| request.get("kind").and_then(Value::as_str))
+            .unwrap_or("(no method)");
+        Some(HandlerOutcome::Error {
+            code: "flow_route_not_admitted".to_string(),
+            message: format!(
+                "a flow-scoped route may call only {FLOW_ROUTE_METHODS:?}, not `{named}`"
+            ),
+        })
+    }
+
     /// Route a parsed request body to its handler. Split from `handle()` so the
     /// routing arms are unit-testable (`RequestCtx` cannot be constructed
     /// outside the transport).
@@ -16854,6 +16915,9 @@ impl McHandler {
             .get("method")
             .and_then(Value::as_str)
             .or_else(|| request.get("kind").and_then(Value::as_str));
+        if let Some(refusal) = self.flow_route_refusal(channel, &request) {
+            return refusal;
+        }
         if let Some(method) = method.filter(|method| method.starts_with("agent_data.")) {
             let Some(service) = &self.agent_data else {
                 return HandlerOutcome::Error {
@@ -17005,7 +17069,7 @@ impl McHandler {
                 "dream.run" => self.handle_dream_run(channel, &request),
                 "historian.pending" => self.handle_historian_pending_value(channel, &request),
                 subagent_invocations_read::METHOD => {
-                    self.handle_subagent_invocations_read(&request)
+                    self.handle_subagent_invocations_read(channel, &request)
                 }
                 "historian.claim" => self.handle_historian_claim_value(channel, &request),
                 "historian.heartbeat" => self.handle_historian_heartbeat_value(channel, &request),
@@ -21616,6 +21680,11 @@ pub fn manifest_with_route_targets_and_smart_notes(
     let mut capabilities = vec![
         cortexkit_role_compaction_provider::PROVIDES.to_string(),
         MCP_CONVERSATION_BINDING_V1.to_string(),
+        // basal reaches `subagent_invocations.read` over the calling flow's own
+        // scoped route, which the daemon opens only to a module declaring this.
+        // The promise it makes (a flow is never treated as its owner agent) is
+        // kept by the dispatcher's flow fence and the op's caller check.
+        subc_protocol::scope::FLOW_SCOPES_CAPABILITY.to_string(),
     ];
     let mut provides = vec![
         ProviderRole::ToolProvider {
@@ -24360,6 +24429,7 @@ mod tests {
         let mut expected_capabilities = vec![
             "compaction-provider/v1".to_string(),
             "mcp-conversation-binding/v1".to_string(),
+            "flow-scopes/v1".to_string(),
         ];
         if agent_data::ENABLED {
             expected_capabilities.push(cortexkit_role_agent_data::PROVIDES.to_string());

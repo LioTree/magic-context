@@ -456,6 +456,7 @@ mod tests {
             vec![
                 cortexkit_role_compaction_provider::PROVIDES.to_string(),
                 crate::MCP_CONVERSATION_BINDING_V1.to_string(),
+                subc_protocol::scope::FLOW_SCOPES_CAPABILITY.to_string(),
             ]
         );
         assert!(capabilities.requires.is_empty());
