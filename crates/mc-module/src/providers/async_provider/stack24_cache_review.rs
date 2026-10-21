@@ -161,11 +161,12 @@ impl Review {
                 entry.message["content"][0]["content"] =
                     json!([{"type":"text","text":output},{"type":"text","text":text}]);
             }
+            entry.written_at = Some(now_ms().max(0) as u64);
             return Some(entry);
         } else {
             return None;
         };
-        entry.written_at = Some(1_000_000 + n * 7_000);
+        entry.written_at = Some(now_ms().max(0) as u64);
         Some(entry)
     }
 

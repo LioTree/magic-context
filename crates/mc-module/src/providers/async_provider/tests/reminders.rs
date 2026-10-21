@@ -24,7 +24,7 @@ fn user(n: u64, texts: &[&str]) -> ReadMessage {
                 })
                 .collect(),
         );
-    entry.written_at = Some(1_000_000 + n * 1000);
+    entry.written_at = Some(now_ms().max(0) as u64);
     entry
 }
 
@@ -47,7 +47,16 @@ fn result(n: u64, body: Value, extra: Option<&str>) -> ReadMessage {
         content.push(json!({"type":"text","text":text}));
         rows.push(tags::PartTag::tagged("1", format!("§{}§", 1001 + n * 4)));
     }
-    ReadMessage::new(n, format!("m{n}"), json!({"role":"user","content":content})).with_tags(rows)
+    written_now(
+        ReadMessage::new(n, format!("m{n}"), json!({"role":"user","content":content}))
+            .with_tags(rows),
+    )
+}
+
+// Delivery fixtures must be written after their send, just like runner echoes.
+fn written_now(mut entry: ReadMessage) -> ReadMessage {
+    entry.written_at = Some(now_ms().max(0) as u64);
+    entry
 }
 
 async fn send(rig: &Rig, text: &str, notice: &str) {
@@ -520,10 +529,10 @@ async fn delivered_reminders_steer_is_profile_independent_and_pi_tool_content_is
             }
             _ => json!({"role":"user","content":[{"type":"text","text":"profile reminder"}]}),
         };
-        rig.runner.entries.lock().unwrap().push(
+        rig.runner.entries.lock().unwrap().push(written_now(
             ReadMessage::new(0, "m0", message)
                 .with_tags(vec![tags::PartTag::tagged("0", "§1000§")]),
-        );
+        ));
         rig.notice(1, 5000, None).await;
         let mut state = rig.state();
         let codec = codec::Codec::from_params(&json!({"serializer_profile":profile})).unwrap();
@@ -537,6 +546,7 @@ async fn delivered_reminders_steer_is_profile_independent_and_pi_tool_content_is
             let mut entries = rig.runner.entries.lock().unwrap();
             entries.push(ReadMessage::new(1, "m1", json!({"type":"message","id":"m1","message":{"role":"assistant","content":[{"type":"toolCall","id":"pi-call","name":"read","arguments":{}}]}})).with_tags(vec![tags::PartTag::untagged("0")]));
             entries.push(ReadMessage::new(2, "m2", json!({"type":"message","id":"m2","message":{"role":"toolResult","toolCallId":"pi-call","toolName":"read","isError":false,"content":[{"type":"text","text":"real Pi output"},{"type":"text","text":"pi tool reminder"}]}})).with_tags(vec![tags::PartTag::tagged("0", "§1008§"),tags::PartTag::untagged("1")]));
+            entries.last_mut().unwrap().written_at = Some(now_ms().max(0) as u64);
         }
         rig.notice(2, 5000, rig.newest()).await;
         send(&rig, "replacement", "replace-pi").await;
@@ -585,6 +595,7 @@ async fn stack24_user_paste_cannot_consume_pending_delivery_provenance() {
     // The fake runner records the send but never inserts it into the transcript.
     // This block is deliberately authored by the user, before the real delivery.
     *rig.runner.entries.lock().unwrap() = vec![user(0, &[pasted])];
+    rig.runner.entries.lock().unwrap()[0].written_at = Some(1_000_000);
     rig.notice(1, 5000, None).await;
     let (request, projection) = request(&rig, true);
     let chunk = crate::historian_chunk::build_historian_chunk(
@@ -615,6 +626,7 @@ async fn stack24_pending_delivery_collision_must_not_strip_authored_paste() {
     let pasted = "Magic Context hint copied by the user";
     send(&rig, pasted, "pending-steer").await;
     rig.runner.entries.lock().unwrap().push(user(1, &[pasted]));
+    rig.runner.entries.lock().unwrap()[1].written_at = Some(1_000_000);
     rig.notice(2, 5000, rig.newest()).await;
     send(
         &rig,

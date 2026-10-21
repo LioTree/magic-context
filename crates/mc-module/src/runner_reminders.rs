@@ -304,9 +304,20 @@ impl DeliveryLedger {
         }
     }
 
-    pub(crate) fn recognize(&mut self, text: &str, now_ms: u64) -> Option<SentReminder> {
+    pub(crate) fn recognize(
+        &mut self,
+        text: &str,
+        now_ms: u64,
+        written_at: Option<u64>,
+    ) -> Option<SentReminder> {
         self.expire(now_ms);
-        let index = self.pending.iter().position(|sent| sent.text == text)?;
+        // Without a write time, an exact authored paste cannot be distinguished
+        // from a delivery. Never consume provenance for content predating its send.
+        let written_at = written_at?;
+        let index = self
+            .pending
+            .iter()
+            .rposition(|sent| sent.text == text && sent.sent_at_ms <= written_at)?;
         Some(self.pending.remove(index))
     }
 
@@ -859,6 +870,37 @@ async fn send_due_reminders_impl<const FULL_META: bool>(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn ledger_recognition_requires_ordered_write_and_prefers_newest_send() {
+        let mut ledger = DeliveryLedger::default();
+        for sent_at_ms in [100, 200] {
+            let send = PreparedSend {
+                kind: "search_hint",
+                template: None,
+                prompt: "identical text".into(),
+                sent_at_ms,
+                expires_at_ms: 1000,
+            };
+            ledger.record(&send, send.prompt.clone());
+        }
+        assert!(ledger.recognize("identical text", 300, None).is_none());
+        assert!(ledger.recognize("identical text", 300, Some(99)).is_none());
+        assert_eq!(
+            ledger
+                .recognize("identical text", 300, Some(250))
+                .unwrap()
+                .sent_at_ms,
+            200
+        );
+        assert_eq!(
+            ledger
+                .recognize("identical text", 300, Some(150))
+                .unwrap()
+                .sent_at_ms,
+            100
+        );
+    }
     use crate::session_resolver::SessionResolveError;
     use std::sync::Mutex;
 
@@ -886,14 +928,14 @@ mod tests {
             };
             let sent = state
                 .ledger
-                .recognize(&expected, conditions.now_ms)
+                .recognize(&expected, conditions.now_ms, Some(conditions.now_ms))
                 .unwrap();
             assert_eq!(format!("mc.{}", sent.kind), send["dedupe_key"]);
             assert_eq!(sent.sent_at_ms, conditions.now_ms);
             assert_eq!(sent.expires_at_ms, conditions.now_ms + REMINDER_TTL_MS);
             assert!(state
                 .ledger
-                .recognize(&expected, conditions.now_ms)
+                .recognize(&expected, conditions.now_ms, Some(conditions.now_ms))
                 .is_none());
         }
         for n in 0..MAX_PENDING_DELIVERIES + 10 {

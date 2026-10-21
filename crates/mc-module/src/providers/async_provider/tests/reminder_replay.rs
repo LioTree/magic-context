@@ -78,7 +78,8 @@ async fn randomized_reminder_base_head_view_replay_320_notices() {
             json!({"role":"user","content":[{"type":"text","text":text}]}),
         )
         .with_tags(vec![tags::PartTag::untagged("0")]);
-        entry.written_at = Some(1_000_000 + n * 1000);
+        // Delivered fixtures use the same clock as session.send so chronology is provable.
+        entry.written_at = Some(now_ms().max(0) as u64);
         rig.runner.entries.lock().unwrap().push(entry);
         let before = current
             .as_ref()

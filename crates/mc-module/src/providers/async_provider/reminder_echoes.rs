@@ -127,7 +127,7 @@ impl ReminderEchoes {
                     .flatten()
             });
             if let Some(text) = text.filter(|_| decoded.ck.role == "user" || tool_message) {
-                if let Some(sent) = ledger.recognize(text, now) {
+                if let Some(sent) = ledger.recognize(text, now, entry.written_at) {
                     let ck_index = (!tool_message)
                         .then(|| {
                             decoded.ck.content.iter().enumerate().find_map(|(index, block)| {
@@ -171,7 +171,7 @@ impl ReminderEchoes {
                         else {
                             continue;
                         };
-                        if let Some(sent) = ledger.recognize(text, now) {
+                        if let Some(sent) = ledger.recognize(text, now, entry.written_at) {
                             self.blocks.push(Echo {
                                 ordinal: entry.ordinal,
                                 mid: entry.mid.clone(),
