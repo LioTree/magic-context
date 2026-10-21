@@ -90,7 +90,10 @@ export function readSessionMetaCollection(
         return row?.[column] ?? (row ? null : SESSION_META_COLLECTION_DEFAULTS[column]);
     }
     const value = readCollectionState(db, sessionId, column).value;
-    return value instanceof Uint8Array ? Buffer.from(value) : value;
+    // Keep SQLite's Uint8Array result: JSON-array BLOBs coerce to comma-separated numbers.
+    // Buffer would decode them as JSON text, causing reasoning/image-removal readers to
+    // apply stored decisions that their JSON parsers previously rejected.
+    return value instanceof Uint8Array ? new Uint8Array(value) : value;
 }
 
 /** Preserve the caller's exact serialization and prepare its delta before acquiring a writer. */

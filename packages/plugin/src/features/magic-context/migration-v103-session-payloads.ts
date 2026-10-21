@@ -11,6 +11,14 @@ import {
 
 /** Move payload bytes verbatim; replay identities and materialization markers stay unchanged. */
 export function splitSessionMetaPayloads(db: Database): void {
+    const { encoding } = db.prepare("PRAGMA encoding").get() as { encoding: string };
+    // Chunk reads, writes and comparisons use UTF-8 bytes. Refuse other encodings
+    // before moving any payload or dropping columns, rather than corrupting replay text.
+    if (encoding !== "UTF-8") {
+        throw new Error(
+            `Migration 103 requires UTF-8 database encoding; found ${encoding}. Convert a backup to UTF-8 before retrying.`,
+        );
+    }
     db.exec(SESSION_RENDER_CACHE_DDL);
     db.exec(SESSION_META_CHUNKS_DDL);
     db.exec(SESSION_META_COLLECTION_REVISIONS_DDL);
