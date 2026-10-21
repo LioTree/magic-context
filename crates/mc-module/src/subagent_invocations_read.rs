@@ -19,9 +19,18 @@
 //!
 //! The op only reads, through the module's query-only context reader. Unknown
 //! arguments are refused by name with `invalid_params`.
+//!
+//! Only Magic Context's own flows may call it. [`authorize_caller`] checks the
+//! daemon-stamped route identity, never a request argument: the carrier must be
+//! `reserved:basal`, the scope must be an owner-authorized
+//! `reserved:prefrontal-core` scope for a flow (`flow_id` present, call mode
+//! `flow`), and the flow's author (`agent_id`) must be [`MC_AGENT_ID`].
 
 use rusqlite::{params, Connection, Row};
 use serde_json::{json, Map, Value};
+use subc_protocol::call_mode::{derive_call_mode, CallMode};
+use subc_protocol::scope::ScopeStamp;
+use subc_protocol::Principal;
 
 /// The management op name, declared as a query in the module manifest.
 pub(crate) const METHOD: &str = "subagent_invocations.read";
@@ -34,6 +43,60 @@ pub(crate) const WINDOW_LIMIT: u32 = 5_000;
 pub(crate) const PAGE_BUDGET_BYTES: usize = 256 * 1024;
 /// The longest error text a row carries, in UTF-8 bytes.
 pub(crate) const ERROR_MAX_BYTES: usize = 32 * 1024;
+
+/// The prefrontal agent id of MC, the agent that authors the subagent failure
+/// sentinel flow. basal stamps a flow's author as the scope's `agent_id`, so
+/// only flows MC installed may read the rows. Change it here if MC's agent is
+/// ever recreated under a new id.
+pub(crate) const MC_AGENT_ID: &str = "agent_b613e5cf2ee55b8c";
+/// The module that carries every flow's calls to other modules.
+const FLOW_CARRIER: &str = "basal";
+/// The module that owns flow scopes and is authorized to set their attributes.
+const FLOW_SCOPE_OWNER: &str = "prefrontal-core";
+
+fn reserved(principal: &Principal, module: &str) -> bool {
+    matches!(principal, Principal::Reserved { module_id } if module_id == module)
+}
+
+/// Admits a route only when the daemon stamped it as one of MC's own flows.
+/// Every refusal names the field that failed. With only `flow-scopes/v1`
+/// declared the daemon sends no explicit call mode, so the mode is derived
+/// from the stamp exactly as the SDK derives it for the bind.
+pub(crate) fn authorize_caller(
+    principal: Option<&Principal>,
+    scope: Option<&ScopeStamp>,
+) -> Result<(), String> {
+    if !principal.is_some_and(|principal| reserved(principal, FLOW_CARRIER)) {
+        return Err(format!(
+            "{METHOD} needs the flow carrier reserved:{FLOW_CARRIER}, got {principal:?}"
+        ));
+    }
+    let Some(scope) = scope else {
+        return Err(format!("{METHOD} needs a daemon scope stamp"));
+    };
+    if !reserved(&scope.owner, FLOW_SCOPE_OWNER) {
+        return Err(format!(
+            "{METHOD} needs a scope owned by reserved:{FLOW_SCOPE_OWNER}, got {:?}",
+            scope.owner
+        ));
+    }
+    if !scope.owner_authorized {
+        return Err(format!("{METHOD} needs an owner_authorized scope"));
+    }
+    if scope.attributes.flow_id.is_none() {
+        return Err(format!("{METHOD} needs a scope with `flow_id`"));
+    }
+    let mode = derive_call_mode(Some(scope));
+    if mode != CallMode::Flow {
+        return Err(format!("{METHOD} needs call mode `flow`, got {mode:?}"));
+    }
+    match scope.attributes.agent_id.as_deref() {
+        Some(MC_AGENT_ID) => Ok(()),
+        other => Err(format!(
+            "{METHOD} needs `agent_id` {MC_AGENT_ID}, got {other:?}"
+        )),
+    }
+}
 
 const FIELDS: &str =
     "id, session_id, subagent, task, started_at, ended_at, status, error, parent_invocation_id";
