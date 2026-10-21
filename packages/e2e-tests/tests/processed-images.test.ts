@@ -3,6 +3,7 @@ import { writeFileSync } from "node:fs";
 import { join, resolve } from "node:path";
 import { Database } from "../../plugin/src/shared/sqlite";
 import { processedImagePng } from "../src/processed-image-fixture";
+import { sessionMetaFieldSelect } from "../src/session-meta-fields";
 import { MockProvider } from "../src/mock-provider/server";
 import { createIsolatedEnv, PLUGIN_ENTRY, spawnOpencode } from "../src/opencode-runner/spawn";
 
@@ -145,7 +146,7 @@ test("issue 699 OpenCode 1 wire image bytes drop after an admitted positive-wate
             JSON.stringify(
                 db
                     .prepare(
-                        "SELECT processed_image_stripped_ids FROM session_meta WHERE session_id = ?",
+                        `SELECT ${sessionMetaFieldSelect("processed_image_stripped_ids")} FROM session_meta WHERE session_id = ?`,
                     )
                     .get(session.id),
             ),
@@ -171,7 +172,9 @@ test("issue 699 OpenCode 1 wire image bytes drop after an admitted positive-wate
         expect(imageData(rewritten)).toEqual([]);
         expect(JSON.stringify(rewritten)).toContain("[image stripped]");
         const frozen = db
-            .prepare("SELECT processed_image_stripped_ids FROM session_meta WHERE session_id = ?")
+            .prepare(
+                `SELECT ${sessionMetaFieldSelect("processed_image_stripped_ids")} FROM session_meta WHERE session_id = ?`,
+            )
             .get(session.id) as { processed_image_stripped_ids: string };
         expect(JSON.parse(frozen.processed_image_stripped_ids).ids).toHaveLength(2);
         const replay = await turn("IMAGE-DEFER-AFTER");

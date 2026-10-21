@@ -14,6 +14,7 @@ import {
 	readReplayEnvelope,
 	updateReplayDocument,
 } from "@magic-context/core/features/magic-context/storage-replay-document";
+import { clearSessionPayloadStatements } from "@magic-context/core/features/magic-context/storage-session-collection-state";
 import * as logger from "@magic-context/core/shared/logger";
 import { createTestTempDir } from "@magic-context/core/shared/test-temp-dir";
 import {
@@ -354,17 +355,22 @@ it("ordinary native defer does not clone the full input or enter the final fit b
 		const restore = spyOn(lkg, "restorePiLkgInputForFit");
 		let claimIo = 0;
 		const prepareStatement = db.prepare.bind(db);
+		// Payload accessors reuse statements compiled earlier; forget them so each one is
+		// prepared through this spy. Executions are attributed to the reclaim claim by the
+		// stack at execution time, since a statement may first be compiled by another caller.
+		clearSessionPayloadStatements(db);
 		const statements = spyOn(db, "prepare").mockImplementation(
 			(sql: string) => {
 				const statement = prepareStatement(sql);
-				if (!new Error().stack?.includes("/pi-fit-reclaim.ts:"))
-					return statement;
 				return new Proxy(statement, {
 					get(target, property) {
 						const value = Reflect.get(target, property, target);
 						if (typeof value !== "function") return value;
 						return (...args: unknown[]) => {
-							if (["get", "all", "run", "values"].includes(String(property)))
+							if (
+								["get", "all", "run", "values"].includes(String(property)) &&
+								new Error().stack?.includes("/pi-fit-reclaim.ts:")
+							)
 								claimIo++;
 							return Reflect.apply(value, target, args);
 						};

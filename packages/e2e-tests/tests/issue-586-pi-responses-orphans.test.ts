@@ -37,6 +37,7 @@ import {
 	resolvePiHostInvocation,
 } from "../src/pi-runner/spawn";
 import { prepareContextDatabase } from "../src/prepare-context-db";
+import { sessionMetaFieldSelect, writeSessionMetaField } from "../src/session-meta-fields";
 
 const root = realpathSync(tmpdir());
 const enabled = /\/magic-context\/issue-586(?:\/|$)/.test(root);
@@ -468,7 +469,7 @@ function assertIsolatedProcess(pid: number): void {
 					.all(sessionId) as Array<{ owner: string | null; mode: string }>;
 				const row = db
 					.prepare(
-						"SELECT stripped_placeholder_ids AS s, trailing_blank_decisions AS d FROM session_meta WHERE session_id = ?",
+						`SELECT ${sessionMetaFieldSelect("stripped_placeholder_ids", "s")}, ${sessionMetaFieldSelect("trailing_blank_decisions", "d")} FROM session_meta WHERE session_id = ?`,
 					)
 					.get(sessionId) as { s?: string; d?: string };
 				db.close();
@@ -542,14 +543,12 @@ function assertIsolatedProcess(pid: number): void {
 			// invalid while the rest of the replay document still parses).
 			const writable = new Database(dbPath);
 			writable.exec("PRAGMA busy_timeout = 5000");
-			writable
-				.prepare(
-					"UPDATE session_meta SET trailing_blank_decisions = ? WHERE session_id = ?",
-				)
-				.run(
-					'{"version":2,"trailingBlank":{},"piNative":{"toolInputs":"{","reasoningIds":[]}}',
-					sessionId,
-				);
+			writeSessionMetaField(
+				writable,
+				sessionId,
+				"trailing_blank_decisions",
+				'{"version":2,"trailingBlank":{},"piNative":{"toolInputs":"{","reasoningIds":[]}}',
+			);
 			writable.close();
 			await step("unreadable markers, defer", "work phase 9");
 			await step("unreadable markers, defer", "work phase 10");

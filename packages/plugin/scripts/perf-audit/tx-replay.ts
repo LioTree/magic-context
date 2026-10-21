@@ -5,6 +5,8 @@ import { createHash } from "node:crypto";
 import { copyFileSync, mkdirSync, mkdtempSync, rmSync, symlinkSync } from "node:fs";
 import { join, resolve } from "node:path";
 import { pathToFileURL } from "node:url";
+import { sessionRenderCacheSelect } from "../../src/features/magic-context/storage-session-cache";
+import { sessionMetaCollectionSelect } from "../../src/features/magic-context/storage-session-collections";
 import type { TransformDeps } from "../../src/hooks/magic-context/transform";
 import type { MessageLike } from "../../src/hooks/magic-context/tag-messages";
 
@@ -94,7 +96,14 @@ async function replay(api: Runtime, messages: MessageLike[], label: string) {
         const baseline = deps.channel1StateBySession?.get(sid);
         console.log(JSON.stringify({ label, messages: messages.length, deferMedianMs: +times.slice(1).sort((a, b) => a - b)[1].toFixed(3), hashes, decisionHash: hash(decisions), effective: baseline && [baseline.baselineU + baseline.turnDeltaU, baseline.baselineT + baseline.turnDeltaT] }));
         const effective = baseline && [baseline.baselineU + baseline.turnDeltaU, baseline.baselineT + baseline.turnDeltaT];
-        const persistedReplay = db.prepare("SELECT cached_m0_bytes, cached_m1_bytes, stale_reduce_stripped_ids, processed_image_stripped_ids, stripped_placeholder_ids, merged_reasoning_stripped_ids, trailing_blank_decisions FROM session_meta WHERE session_id = ?").get(sid);
+        // The baseline ref may predate context migration 103, which moved these values out of
+        // session_meta; the accessors read whichever layout this run's store has.
+        const replayFields = [
+            sessionRenderCacheSelect("cached_m0_bytes", "cached_m0_bytes", db),
+            sessionRenderCacheSelect("cached_m1_bytes", "cached_m1_bytes", db),
+            ...(["stale_reduce_stripped_ids", "processed_image_stripped_ids", "stripped_placeholder_ids", "merged_reasoning_stripped_ids", "trailing_blank_decisions"] as const).map(column => sessionMetaCollectionSelect(column, column, db)),
+        ];
+        const persistedReplay = db.prepare(`SELECT ${replayFields.join(", ")} FROM session_meta WHERE session_id = ?`).get(sid);
         return { hashes, decisionHash: hash(decisions), effective, replayHash: hash(persistedReplay) };
     } finally { db.close(); }
 }

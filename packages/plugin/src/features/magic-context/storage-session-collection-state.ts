@@ -1,5 +1,10 @@
 import { isUtf8 } from "node:buffer";
-import { type Database, getSqliteRollbackGeneration } from "../../shared/sqlite";
+import {
+    type Database,
+    getSqliteRollbackGeneration,
+    prepareCachedStatement,
+    type Statement,
+} from "../../shared/sqlite";
 import {
     SESSION_META_COLLECTION_DEFAULTS,
     type SessionMetaCollection,
@@ -19,8 +24,46 @@ export type CollectionState = {
 const CACHE_BYTES = 64 * 1024 * 1024;
 const CACHE_ENTRIES = 32;
 const caches = new WeakMap<Database, Map<string, CollectionState>>();
+const cacheCounters = { hits: 0, misses: 0 };
+
+/** How many collection reads the per-connection cache answered, for tests and benchmarks. */
+export function collectionCacheCounters(): { hits: number; misses: number } {
+    return { ...cacheCounters };
+}
+
 const keyFor = (sessionId: string, column: SessionMetaCollection) =>
     JSON.stringify([sessionId, column]);
+
+const statementCaches = new WeakMap<object, Map<string, Statement>>();
+
+/**
+ * Compile each fixed payload-accessor statement once per connection. Every read checks
+ * the collection's revision, and compiling that query on every pass cost more than
+ * running it; the moved values made the per-pass compile work noticeably larger.
+ */
+export function sessionPayloadStatement(db: Pick<Database, "prepare">, sql: string): Statement {
+    let statements = statementCaches.get(db);
+    if (!statements) {
+        statements = new Map();
+        statementCaches.set(db, statements);
+    }
+    let statement = statements.get(sql);
+    if (!statement) {
+        statement = prepareCachedStatement(db as Database, sql);
+        statements.set(sql, statement);
+    }
+    return statement;
+}
+
+/**
+ * Forget this connection's compiled payload statements, so the next accessor call
+ * prepares them again through `db.prepare`. Tests that observe statements by wrapping
+ * `db.prepare` call this first; otherwise statements compiled before the observation
+ * started would run unseen.
+ */
+export function clearSessionPayloadStatements(db: Pick<Database, "prepare">): void {
+    statementCaches.delete(db);
+}
 
 export function sameCollectionToken(a: CollectionToken, b: CollectionToken): boolean {
     return a.present === b.present && a.id === b.id && a.revision === b.revision;
@@ -32,14 +75,12 @@ export function readCollectionToken(
     sessionId: string,
     column: SessionMetaCollection,
 ): CollectionToken {
-    const row = db
-        .prepare(`SELECT CAST(revisions.id AS TEXT) AS id, CAST(revisions.revision AS TEXT) AS revision
+    const row = sessionPayloadStatement(
+        db,
+        `SELECT CAST(revisions.id AS TEXT) AS id, CAST(revisions.revision AS TEXT) AS revision
         FROM session_meta AS owner LEFT JOIN session_meta_collection_revisions AS revisions
-        ON revisions.session_id=owner.session_id AND revisions.column_name=? WHERE owner.session_id=?`)
-        .get(column, sessionId) as
-        | { id: string | null; revision: string | null }
-        | null
-        | undefined;
+        ON revisions.session_id=owner.session_id AND revisions.column_name=? WHERE owner.session_id=?`,
+    ).get(column, sessionId) as { id: string | null; revision: string | null } | null | undefined;
     return { present: row != null, id: row?.id ?? null, revision: row?.revision ?? null };
 }
 
@@ -133,18 +174,21 @@ export function readCollectionState(
     ) {
         cache.delete(key);
         cache.set(key, cached);
+        cacheCounters.hits++;
         return cached;
     }
+    cacheCounters.misses++;
     return db
         .transaction(() => {
             const coherent = readCollectionToken(db, sessionId, column);
             const pieces = new Map<string, CollectionPiece>();
             if (coherent.present) {
-                const rows = db
-                    .prepare(`SELECT chunk, typeof(body) AS storage_type, CAST(body AS BLOB) AS bytes,
+                const rows = sessionPayloadStatement(
+                    db,
+                    `SELECT chunk, typeof(body) AS storage_type, CAST(body AS BLOB) AS bytes,
                 CASE WHEN chunk='-1' THEN body END AS marker
-                FROM session_meta_chunks WHERE session_id=? AND column_name=? ORDER BY chunk`)
-                    .all(sessionId, column) as {
+                FROM session_meta_chunks WHERE session_id=? AND column_name=? ORDER BY chunk`,
+                ).all(sessionId, column) as {
                     chunk: string;
                     storage_type: string;
                     bytes: Uint8Array | null;

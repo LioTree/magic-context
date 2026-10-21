@@ -716,6 +716,11 @@ CREATE TABLE session_meta (
       historian_last_failure_at INTEGER DEFAULT NULL,
       system_prompt_hash TEXT DEFAULT '',
       memory_block_count INTEGER DEFAULT 0,
+      -- pending_compaction_marker_state: intentionally NULLABLE without a
+      -- default. Absence of a deferred marker is SQL NULL; presence is a
+      -- valid JSON blob written via setPendingCompactionMarkerState.
+      -- Excluded from the healAllNullColumns fallback list. Readers filter
+      -- IS NOT NULL AND != empty-string defensively. Plan v6 section 3.
       pending_compaction_marker_state TEXT,
       -- Target OpenCode message id used to inject the current compaction marker.
       -- Nullable for legacy persisted markers; repaired on the next marker move.
@@ -954,38 +959,6 @@ CREATE INDEX idx_memories_project_category_hash ON memories(project_path, catego
 
 CREATE INDEX idx_message_history_index_updated_at ON message_history_index(updated_at);
 
-CREATE TABLE compartment_history_versions (
-            session_id TEXT PRIMARY KEY NOT NULL,
-            generation TEXT NOT NULL DEFAULT (lower(hex(randomblob(16)))),
-            version INTEGER NOT NULL DEFAULT 0 CHECK (version >= 0),
-            rewrite_version INTEGER NOT NULL DEFAULT 0 CHECK (rewrite_version >= 0),
-            seeded INTEGER NOT NULL DEFAULT 0 CHECK (seeded IN (0, 1))
-        );
-
-CREATE TRIGGER compartment_history_ai AFTER INSERT ON compartments BEGIN
-            INSERT INTO compartment_history_versions(session_id, version) VALUES (NEW.session_id, 1)
-            ON CONFLICT(session_id) DO UPDATE SET version = version + 1;
-        END;
-
-CREATE TRIGGER compartment_history_ad AFTER DELETE ON compartments BEGIN
-            INSERT INTO compartment_history_versions(session_id, version) VALUES (OLD.session_id, 1)
-            ON CONFLICT(session_id) DO UPDATE SET version = version + 1;
-        END;
-
-CREATE INDEX idx_message_fts_rowid_map_session_time
-        ON message_fts_rowid_map(session_id, message_time_ms);
-
-CREATE UNIQUE INDEX idx_primer_candidates_occurrence
-        ON primer_candidates(project_path, harness, session_id, source_start_message_id, source_end_message_id);
-
-CREATE INDEX idx_tags_pi_adopt
-            ON tags(session_id, entry_fingerprint)
-            WHERE type='message' AND entry_fingerprint IS NOT NULL;
-
-CREATE INDEX idx_tags_pi_fallback_tool_owner
-            ON tags(session_id, tool_owner_message_id)
-            WHERE type='tool';
-
 CREATE TABLE session_render_cache (
     session_id TEXT NOT NULL,
     cache_key TEXT NOT NULL,
@@ -1029,6 +1002,38 @@ CREATE TRIGGER session_meta_chunks_revision_ad AFTER DELETE ON session_meta_chun
     SELECT OLD.session_id,OLD.column_name,1 WHERE 1
     ON CONFLICT(session_id,column_name) DO UPDATE SET revision=revision+1;
 END;
+
+CREATE TABLE compartment_history_versions (
+            session_id TEXT PRIMARY KEY NOT NULL,
+            generation TEXT NOT NULL DEFAULT (lower(hex(randomblob(16)))),
+            version INTEGER NOT NULL DEFAULT 0 CHECK (version >= 0),
+            rewrite_version INTEGER NOT NULL DEFAULT 0 CHECK (rewrite_version >= 0),
+            seeded INTEGER NOT NULL DEFAULT 0 CHECK (seeded IN (0, 1))
+        );
+
+CREATE TRIGGER compartment_history_ai AFTER INSERT ON compartments BEGIN
+            INSERT INTO compartment_history_versions(session_id, version) VALUES (NEW.session_id, 1)
+            ON CONFLICT(session_id) DO UPDATE SET version = version + 1;
+        END;
+
+CREATE TRIGGER compartment_history_ad AFTER DELETE ON compartments BEGIN
+            INSERT INTO compartment_history_versions(session_id, version) VALUES (OLD.session_id, 1)
+            ON CONFLICT(session_id) DO UPDATE SET version = version + 1;
+        END;
+
+CREATE INDEX idx_message_fts_rowid_map_session_time
+        ON message_fts_rowid_map(session_id, message_time_ms);
+
+CREATE UNIQUE INDEX idx_primer_candidates_occurrence
+        ON primer_candidates(project_path, harness, session_id, source_start_message_id, source_end_message_id);
+
+CREATE INDEX idx_tags_pi_adopt
+            ON tags(session_id, entry_fingerprint)
+            WHERE type='message' AND entry_fingerprint IS NOT NULL;
+
+CREATE INDEX idx_tags_pi_fallback_tool_owner
+            ON tags(session_id, tool_owner_message_id)
+            WHERE type='tool';
 
 CREATE TABLE identity_merge_log (
          id INTEGER PRIMARY KEY AUTOINCREMENT,

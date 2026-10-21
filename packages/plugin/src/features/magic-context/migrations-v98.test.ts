@@ -5,6 +5,7 @@ import { cleanupTestTempDir, createTestTempDir } from "../../shared/test-temp-di
 import { sessionMetaFixtureRow } from "./__tests__/session-meta-fixture";
 import { installCompartmentRescoreSchema } from "./migration-v98-compartment-rescore";
 import { LATEST_MIGRATION_VERSION, MIGRATIONS, runMigrations } from "./migrations";
+import { restorePreV103SessionMetaLayout } from "./session-meta-pre-v103-test-support";
 import { initializeDatabase, LATEST_SUPPORTED_VERSION } from "./storage-db";
 import { deleteSessionScopedRows, SESSION_SCOPED_TABLES } from "./storage-session-tables";
 
@@ -31,6 +32,7 @@ function schema(db: Database): unknown[] {
 function populatedV97(): Database {
     const db = new Database(":memory:");
     initializeDatabase(db);
+    restorePreV103SessionMetaLayout(db);
     // Drop the tables and column created by fresh-store initialization so the
     // test verifies that migration v98 creates them on a populated older store.
     for (const table of [...scoreTables, ...projectTables]) db.exec(`DROP TABLE ${table}`);

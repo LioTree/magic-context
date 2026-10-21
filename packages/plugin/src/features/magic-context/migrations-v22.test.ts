@@ -8,6 +8,7 @@ import { closeQuietly } from "../../shared/sqlite-helpers";
 import { createTestTempDirFromPath } from "../../shared/test-temp-dir";
 import { patchSessionMeta } from "./__tests__/session-meta-fixture";
 import { MIGRATIONS, runMigrations } from "./migrations";
+import { restorePreV103SessionMetaLayout } from "./session-meta-pre-v103-test-support";
 import { closeDatabase, initializeDatabase, openDatabase } from "./storage-db";
 import { getOrCreateSessionMeta } from "./storage-meta-session";
 import { clearCachedM0M1, persistCachedM0 } from "./storage-meta-shared";
@@ -119,6 +120,8 @@ describe("migration v22", () => {
         const db = new Database(":memory:");
         try {
             initializeDatabase(db);
+            // v22 runs on stores from before migration 103, which keep the payload columns.
+            restorePreV103SessionMetaLayout(db);
             // Later migrations intentionally relocate payloads; this assertion is about v22's DDL.
             MIGRATIONS.find((step) => step.version === 22)!.up(db);
 

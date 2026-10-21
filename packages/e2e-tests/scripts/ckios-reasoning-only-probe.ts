@@ -6,6 +6,7 @@ import { createOpencodeClient } from "@opencode-ai/sdk";
 import { MockProvider } from "../src/mock-provider/server";
 import { spawnOpencode } from "../src/opencode-runner/spawn";
 import { openTestDb } from "../src/test-db";
+import { sessionMetaFieldSelect } from "../src/session-meta-fields";
 import { appendCompartments } from "../../plugin/src/features/magic-context/compartment-storage";
 import { setPendingCompactionMarkerState } from "../../plugin/src/features/magic-context/storage-meta-persisted";
 import { queuePendingOp } from "../../plugin/src/features/magic-context/storage";
@@ -142,7 +143,7 @@ for (const lane of ["plain", "mc", "marker", "marker-drops", "marker-dropped-bou
             writeFileSync(`${output}/${lane}-pre-upgrade-after.jsonl`, readFileSync(`${output}/${lane}-after.jsonl`));
             const db = openTestDb(resolve(env.dataDir, "cortexkit/magic-context/context.db"));
             try {
-                writeFileSync(`${output}/${lane}-pre-upgrade-ledger.json`, JSON.stringify(db.query("SELECT merged_reasoning_stripped_ids FROM session_meta WHERE session_id = ?").get(id)));
+                writeFileSync(`${output}/${lane}-pre-upgrade-ledger.json`, JSON.stringify(db.query(`SELECT ${sessionMetaFieldSelect("merged_reasoning_stripped_ids", "merged_reasoning_stripped_ids", db)} FROM session_meta WHERE session_id = ?`).get(id)));
                 // What the pre-fix build durably recorded as its last served array. Since
                 // context.db v94 the prefix is stored as ordered slices in lkg_slot_chunks,
                 // so its length is the sum of the slice lengths. This reads the rows directly:

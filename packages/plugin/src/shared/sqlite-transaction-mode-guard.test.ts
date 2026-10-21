@@ -29,8 +29,6 @@ const READ_ONLY_DEFERRED_TRANSACTIONS: Record<string, string> = {
         "reads cached render values, markers and the revision-validated manifest in one snapshot; never writes",
     "packages/pi-plugin/src/context-handler.ts#loadPiPostTransformSnapshot":
         "reads the note trigger and revision-validated note/search collections together; never writes",
-    "packages/pi-plugin/src/inject-compartments-pi.ts#readCachedPiM0M1Row":
-        "reads cached Pi render values, markers and revision-validated manifest in one snapshot; never writes",
     "packages/plugin/src/features/magic-context/memory/history-applier.ts#previewMemoryRestore":
         "reads history, canonical memories and successor links to construct a preview; never writes receipts, revisions, epochs or derived data",
     "packages/plugin/src/hooks/magic-context/score-visibility.ts#readCompartmentScoreVisibility":

@@ -3,9 +3,13 @@ import { expect, test } from "bun:test";
 import { spawnSync } from "node:child_process";
 import { mkdirSync, readFileSync, realpathSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
-import { dirname, join } from "node:path";
+import { dirname, join, resolve } from "node:path";
 import { TestHarness } from "../src/harness";
 import { MockProvider } from "../src/mock-provider/server";
+import { sessionMetaFieldSelect } from "../src/session-meta-fields";
+
+// The seed script runs inside the host's bash tool, outside this test process.
+const SESSION_META_FIELDS_MODULE = resolve(import.meta.dir, "../src/session-meta-fields.ts");
 
 const bytes = (v: unknown) =>
 	JSON.stringify(v, (k, x) => (k === "cache_control" ? undefined : x));
@@ -239,7 +243,7 @@ for (const { band, mode } of [{ band: 76, mode: "drops" }, { band: 85, mode: "dr
 					tag = tags[1]!.tag_number;
                     if (mode.startsWith("legacy-")) {
                         const owners = h.contextDb().query("SELECT tool_owner_message_id AS id FROM tags WHERE session_id = ? AND type = 'tool' ORDER BY tag_number").all(childId) as Array<{ id: string }>;
-                        writeFileSync(join(h.workdir, "seed-legacy.ts"), `import {Database} from "bun:sqlite"; import {join} from "node:path"; const db = new Database(join(process.env.MAGIC_CONTEXT_STORAGE_DIR!, "context.db")); db.exec("PRAGMA busy_timeout = 10000"); db.query("UPDATE session_meta SET merged_reasoning_stripped_ids = ? WHERE session_id = ?").run(${JSON.stringify(JSON.stringify([`binding_mismatch:${owners[1]!.id}`, `binding_mismatch:${owners[2]!.id}`]))}, ${JSON.stringify(childId)}); db.close(); console.log("Legacy seed installed");`);
+                        writeFileSync(join(h.workdir, "seed-legacy.ts"), `import {Database} from "bun:sqlite"; import {join} from "node:path"; import {writeSessionMetaField} from ${JSON.stringify(SESSION_META_FIELDS_MODULE)}; const db = new Database(join(process.env.MAGIC_CONTEXT_STORAGE_DIR!, "context.db")); db.exec("PRAGMA busy_timeout = 10000"); writeSessionMetaField(db, ${JSON.stringify(childId)}, "merged_reasoning_stripped_ids", ${JSON.stringify(JSON.stringify([`binding_mismatch:${owners[1]!.id}`, `binding_mismatch:${owners[2]!.id}`]))}); db.close(); console.log("Legacy seed installed");`);
                         return { ...tool("bash", { command: "bun seed-legacy.ts", description: "Seed recorded legacy thinking decision" }), usage: { ...usage, cache_read_input_tokens: Math.ceil(band * (100_000 - 8192) / 100) } };
                     }
 
@@ -377,7 +381,7 @@ for (const { band, mode } of [{ band: 76, mode: "drops" }, { band: 85, mode: "dr
         } finally {
             const hostProofDb = new Database(join(h.dataDir, "opencode", "opencode.db"), { readonly: true });
             try { writeFileSync(join(proof, "original-thinking-parts.json"), JSON.stringify(hostProofDb.query("SELECT message_id, data FROM part WHERE session_id = ? AND json_extract(data, '$.type') = 'reasoning'").all(childId), null, 2)); } finally { hostProofDb.close(); }
-            writeFileSync(join(proof, "recovery-state.json"), JSON.stringify(h.contextDb().query("SELECT thinking_binding_recovery_target, merged_reasoning_stripped_ids FROM session_meta WHERE session_id = ?").get(childId), null, 2));
+            writeFileSync(join(proof, "recovery-state.json"), JSON.stringify(h.contextDb().query(`SELECT thinking_binding_recovery_target, ${sessionMetaFieldSelect("merged_reasoning_stripped_ids")} FROM session_meta WHERE session_id = ?`).get(childId), null, 2));
 			writeFileSync(
 				join(proof, "requests.json"),
 				JSON.stringify(h.mock.requests(), null, 2),

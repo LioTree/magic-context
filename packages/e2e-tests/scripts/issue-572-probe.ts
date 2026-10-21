@@ -1,6 +1,7 @@
 import { Database } from "bun:sqlite";
 import { spawnOpencode } from "../src/opencode-runner/spawn";
 import { MockProvider } from "../src/mock-provider/server";
+import { sessionMetaFieldSelect, writeSessionMetaField } from "../src/session-meta-fields";
 import { appendCompartments } from "../../plugin/src/features/magic-context/compartment-storage";
 import { insertMemory } from "../../plugin/src/features/magic-context/memory/storage-memory";
 import { readFileSync, realpathSync, writeFileSync } from "node:fs";
@@ -93,7 +94,7 @@ async function turn(id: string, n: number) {
 	const snapshot = () =>
 		snapshotDb
 			.prepare(
-				"SELECT cached_m0_upgrade_state, last_usage_context_limit, observed_safe_input_tokens, detected_context_limit FROM session_meta WHERE session_id = ?",
+				`SELECT ${sessionMetaFieldSelect("cached_m0_upgrade_state")}, last_usage_context_limit, observed_safe_input_tokens, detected_context_limit FROM session_meta WHERE session_id = ?`,
 			)
 			.get(id);
 	console.log("BEFORE", n, snapshot());
@@ -127,7 +128,7 @@ async function turn(id: string, n: number) {
 	);
 	const row = snapshotDb
 		.prepare(
-			"SELECT cached_m0_upgrade_state, cached_m0_bytes FROM session_meta WHERE session_id = ?",
+			`SELECT ${sessionMetaFieldSelect("cached_m0_upgrade_state")}, ${sessionMetaFieldSelect("cached_m0_bytes")} FROM session_meta WHERE session_id = ?`,
 		)
 		.get(id) as {
 		cached_m0_upgrade_state: string;
@@ -240,9 +241,7 @@ try {
 		category: "ARCHITECTURE",
 		content: "The mock provider is isolated.",
 	});
-	db.prepare(
-		"UPDATE session_meta SET cached_m1_bytes = NULL WHERE session_id = ?",
-	).run(session.id);
+	writeSessionMetaField(db, session.id, "cached_m1_bytes", null);
 	db.close();
 	if (mode === "shrink")
 		mock.setDefault({

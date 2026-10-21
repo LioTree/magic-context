@@ -8,6 +8,7 @@ import {
 	getNativeReplayState,
 	saveNativeToolInputs,
 } from "@magic-context/core/features/magic-context/storage-native-replay";
+import { clearSessionPayloadStatements } from "@magic-context/core/features/magic-context/storage-session-collection-state";
 import * as collections from "@magic-context/core/features/magic-context/storage-session-collections";
 import { sessionMetaCollectionSelect } from "@magic-context/core/features/magic-context/storage-session-collections";
 import { createTagger } from "@magic-context/core/features/magic-context/tagger";
@@ -149,6 +150,9 @@ export function runHeuristicCostFixture() {
 			if (/^BEGIN(?:\s+DEFERRED)?\s*;?\s*$/i.test(sql)) readTransactions++;
 			return exec(sql);
 		};
+		// Accessors reuse statements compiled before this point; forget them so every
+		// statement the cleanup runs is prepared, and so observed, through this wrapper.
+		clearSessionPayloadStatements(db);
 		db.prepare = ((sql: string) => {
 			const statement = prepare(sql);
 			return new Proxy(statement, {
