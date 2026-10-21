@@ -8064,7 +8064,17 @@ fn apply_once(
             .and_then(|baseline| baseline.protected_tools_policy.clone())
             .unwrap_or_else(|| [("todowrite".into(), 0), ("ctx_reduce".into(), 3)].into())
     };
-    let nudge_tool_blocks = if adopted_tools_policy == ctx.protected_tools {
+    // A historian replacement can expose messages below the previous coverage.
+    // Hygiene must protect tools in the resulting tail, not just the old selector input.
+    let rewound_tail = (meta.coverage_ordinal < loaded.meta.coverage_ordinal)
+        .then(|| tail_sel_items(&live, meta.coverage_ordinal, &HashMap::new()));
+    let nudge_tool_blocks = if let Some(tail) = &rewound_tail {
+        crate::selection::protected_blocks_for_policy(
+            tail,
+            &frozen_red_targets(&core),
+            &adopted_tools_policy,
+        )
+    } else if adopted_tools_policy == ctx.protected_tools {
         selection_outcome.protected_tool_block_ids.clone()
     } else {
         crate::selection::protected_blocks_for_policy(
