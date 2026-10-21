@@ -338,6 +338,7 @@ pub mod m1_compose;
 pub mod memory_render;
 pub mod memory_tool;
 mod memory_verification;
+pub mod offline_first_pass;
 pub mod offline_move;
 mod ops_facade;
 pub mod parity_contract;

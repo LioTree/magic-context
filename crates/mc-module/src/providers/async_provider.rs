@@ -11,6 +11,7 @@ mod frozen_edits;
 mod held_entries;
 mod historian_tail;
 mod moved_session;
+pub(crate) mod offline_first_pass;
 pub(crate) mod reminder_echoes;
 mod resident;
 #[cfg(test)]
@@ -303,6 +304,10 @@ pub(crate) struct AsyncRecord {
     conditions: Option<BTreeMap<String, String>>,
     resync: bool,
     generation: u64,
+    /// Set on a record `ck-mc offline first-pass` prepared, until the first
+    /// live notice adopts or discards it; see `offline_first_pass`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    offline_first_pass: Option<offline_first_pass::OfflineFirstPass>,
 }
 
 fn deserialize_logical_prefix<'de, D: serde::Deserializer<'de>>(
@@ -1159,6 +1164,8 @@ impl State {
         }
         self.resync = true;
         self.partial_read_seq = None;
+        // The held entries an offline proof described are gone with the reset.
+        self.offline_first_pass = None;
         // A runner that lost its state continues under a new lineage
         // (contract §5.3), which reaches here as a resync: the conversation
         // starts over, so an earlier protocol failure no longer applies.
@@ -1485,7 +1492,15 @@ impl McHandler {
             moved_session::Fence::Refuse(answer) => return bytes(&answer),
         };
         let reference = session_ref(&key.harness, &key.project.to_string_lossy(), &key.session);
-        if let Some(state) = load_head(store, &reference)? {
+        let existing = load_head(store, &reference)?;
+        // A record the offline first pass prepared is kept only for the exact
+        // Setup it was prepared under; any other Setup discards it and sets the
+        // conversation up fresh in the next generation.
+        let discarded = existing.as_ref().and_then(|state| {
+            offline_first_pass::setup_mismatch(state, binding, &request)
+                .map(|reason| (state.generation, reason))
+        });
+        if let Some(state) = existing.filter(|_| discarded.is_none()) {
             self.authorize_async(binding, &state)?;
             let project = self.historian_lane_project(channel, binding, store)?;
             self.record_session_runner_dream_target(
@@ -1504,6 +1519,55 @@ impl McHandler {
             answer["request_id"] = json!(request.request_id);
             return bytes(&answer);
         }
+        let generation = match discarded {
+            Some((generation, reason)) => {
+                offline_first_pass::log_discard(&reference, reason);
+                generation
+                    .checked_add(1)
+                    .ok_or_else(|| transient("async generation exhausted"))?
+            }
+            None => 0,
+        };
+        let mut state =
+            self.new_async_record(channel, binding, &request, key, standalone_move, generation)?;
+        if discarded.is_some() {
+            state.forget_discarded_rows();
+        }
+        // A conversation set up again under the same reference must never
+        // reuse a resident copy of an earlier one.
+        self.provider_store
+            .async_runtime
+            .resident
+            .lock()
+            .expect("async resident cache")
+            .forget(&reference);
+        state.save(store, &[])?;
+        if discarded.is_some() {
+            store
+                .retire_unannounced_async_views(&reference)
+                .map_err(transient)?;
+        }
+        bytes(&state.initial)
+    }
+
+    /// A new conversation record for `request`, with Setup's engine pass run
+    /// and its initial answer built; not yet saved. `generation` is 0 for a
+    /// first Setup and the next generation when an offline-prepared record is
+    /// discarded, so the fresh record starts in an empty engine namespace.
+    fn new_async_record(
+        &self,
+        channel: u16,
+        binding: &SessionBinding,
+        request: &compact::setup::SetupRequest,
+        key: Key,
+        standalone_move: Option<crate::offline_move::MoveRecord>,
+        generation: u64,
+    ) -> Result<State, HandlerOutcome> {
+        let store = self
+            .store
+            .get()
+            .ok_or_else(|| transient("store unavailable"))?;
+        let reference = session_ref(&key.harness, &key.project.to_string_lossy(), &key.session);
         let codec = codec::Codec::from_params(&Value::Object(request.params.clone()))?;
         let chosen = preset(request.preset.as_deref())?;
         let mut engine = transform::compaction::State::new(reference.clone(), chosen);
@@ -1570,7 +1634,8 @@ impl McHandler {
             marker_outcomes: BTreeMap::new(),
             conditions: None,
             resync: false,
-            generation: 0,
+            generation,
+            offline_first_pass: None,
         };
         let route = state.runner()?;
         state.runner_route =
@@ -1619,16 +1684,7 @@ impl McHandler {
             state.initial["tag_checkpoint"] = json!(moved.tag_checkpoint);
             state.initial["cut"] = json!(moved.cut);
         }
-        // A conversation set up again under the same reference must never
-        // reuse a resident copy of an earlier one.
-        self.provider_store
-            .async_runtime
-            .resident
-            .lock()
-            .expect("async resident cache")
-            .forget(&reference);
-        state.save(store, &[])?;
-        bytes(&state.initial)
+        Ok(state)
     }
 
     fn async_engine(
@@ -2623,7 +2679,9 @@ impl McHandler {
         {
             let view: view::CompactionView = serde_json::from_str(&raw).map_err(transient)?;
             if load_head(store, &reference)?.is_none_or(|state| {
-                state.resync || state.lineage.as_deref() != Some(&view.lineage_id)
+                state.resync
+                    || state.offline_first_pass.is_some()
+                    || state.lineage.as_deref() != Some(&view.lineage_id)
             }) {
                 continue;
             }
@@ -2735,6 +2793,14 @@ impl McHandler {
             .ok_or_else(|| transient("async session disappeared"))?;
         #[cfg(test)]
         drop(phase);
+        // A record the offline first pass prepared is checked against what the
+        // runner serves now, once, before anything else: it is either adopted
+        // whole or discarded for a fresh record.
+        if state.offline_first_pass.is_some() {
+            state = self
+                .settle_offline_first_pass(state, store, &message.headers)
+                .await?;
+        }
         // A retry of the notice whose read the budget cut short continues that
         // read. The lineage held then was taken from the runner's own pages
         // during this notice, so the notice's older lineage header does not move
@@ -3698,7 +3764,9 @@ impl McHandler {
             state = self
                 .checkout(store, &request.session_ref)?
                 .ok_or_else(|| transient("async session disappeared"))?;
-            if state.resync {
+            // An offline-prepared record serves nothing until a notice has
+            // checked it against the runner's transcript.
+            if state.resync || state.offline_first_pass.is_some() {
                 self.checkin(state);
                 return bytes(&ride::RideAnswer::nothing());
             }
