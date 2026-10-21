@@ -2,8 +2,8 @@ use super::*;
 use cortexkit_bus_inmemory::{InMemoryBus, InMemoryConfig};
 mod reminder_replay;
 mod reminders;
-mod wrapup;
 mod user_commands_tests;
+mod wrapup;
 
 #[derive(Default)]
 struct Runner {
@@ -185,8 +185,9 @@ impl Rig {
         harness: &str,
         model: &str,
         params: Value,
+        configure: impl FnOnce(&mut McHandler),
     ) -> Self {
-        Self::setup_with_model(dir, module, harness, model, params, |_| {}).await
+        Self::setup_with_model(dir, module, harness, model, params, configure).await
     }
 
     async fn setup_with_model(
@@ -2087,7 +2088,7 @@ async fn broca_async_lane_fires_session_model_without_historian_block() {
     let dir = tempfile::tempdir().unwrap();
     let session_runner =
         crate::providers::session_runner_fake::FakeSessionRunner::for_project(dir.path());
-    let rig = Rig::setup_with_model(
+    let rig = Rig::open_with_model(
         dir.path(),
         "broca",
         "broca",

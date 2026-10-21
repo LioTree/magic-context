@@ -37,8 +37,7 @@ async fn fixture(dir: &Path) -> (Rig, Arc<FakeSessionRunner>) {
 }
 
 impl Rig {
-    /// Inject command intent without pretending that a provider slash-command
-    /// operation exists. Production command delivery still needs a contract.
+    /// Call the lower-level admission method to check refusal statuses directly.
     async fn wrapup_command(&self, command: &str) -> AsyncWrapupAdmission {
         assert_eq!(command, "/ctx-wrapup");
         self.h
@@ -52,6 +51,62 @@ impl Rig {
             )
             .await
             .unwrap()
+    }
+
+    /// Exercise the provider's real person-command invocation and late-result routes.
+    async fn user_wrapup_command(&self, key: &str, input: &str) -> Value {
+        let mut binding = self.h.facade_binding(7).unwrap();
+        binding.scope = Some(
+            subc_protocol::scope::ScopeStamp::new(
+                subc_protocol::Principal::Reserved {
+                    module_id: "prefrontal-core".into(),
+                },
+                "person-session",
+                1,
+                subc_protocol::scope::ScopeKind::Head,
+            )
+            .with_owner_authorized(true),
+        );
+        self.h.bind_route(7, binding);
+        response(
+            self.h
+                .dispatch_value(
+                    7,
+                    json!({
+                        "name":"user_command.invoke",
+                        "call_key":key,
+                        "arguments":{"command":"ctx-wrapup","input":input}
+                    }),
+                )
+                .await,
+        )
+    }
+
+    async fn user_wrapup_late_results(&self) -> Value {
+        response(
+            self.h
+                .dispatch_value(7, json!({"name":"late_results","arguments":{"since":null}}))
+                .await,
+        )
+    }
+
+    async fn user_wrapup_terminal(&self) -> Value {
+        tokio::time::timeout(Duration::from_secs(10), async {
+            loop {
+                let late = self.user_wrapup_late_results().await;
+                if late["entries"]
+                    .as_array()
+                    .unwrap()
+                    .iter()
+                    .any(|entry| entry["kind"] == "result")
+                {
+                    return late;
+                }
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("user wrapup command result arrived")
     }
 
     fn narrative(&self, count: u64) {
@@ -109,10 +164,23 @@ async fn async_wrapup_command_runs_child_and_defers_identical_bytes_until_permit
     let before_bytes = serde_json::to_vec(&rig.get(before.view_version).await).unwrap();
     let before_render = rig.render(&before);
 
-    let accepted = tokio::time::timeout(Duration::from_secs(1), rig.wrapup_command("/ctx-wrapup"))
-        .await
-        .expect("admission does not await the child");
-    assert_eq!(accepted, AsyncWrapupAdmission::Accepted);
+    let accepted = tokio::time::timeout(
+        Duration::from_secs(1),
+        rig.user_wrapup_command("wrapup", "keep-20"),
+    )
+    .await
+    .expect("command admission does not await the child");
+    assert_eq!(accepted["state"], "accepted");
+    assert!(accepted["job"].as_str().unwrap().starts_with("ctx-wrapup-"));
+    let progress = rig.user_wrapup_late_results().await;
+    assert_eq!(
+        progress["entries"][0]["kind"], "progress",
+        "the accepted command publishes progress through late results"
+    );
+    assert!(progress["entries"][0]["text"]
+        .as_str()
+        .unwrap()
+        .contains("wrapup"));
     let send = tokio::time::timeout(Duration::from_secs(10), child.next_unfinished())
         .await
         .expect("summarizer child started");
@@ -140,6 +208,16 @@ async fn async_wrapup_command_runs_child_and_defers_identical_bytes_until_permit
       <meta><messages_processed>0-24</messages_processed><unprocessed_from>25</unprocessed_from></meta></output>"#.to_string();
     child.finish(&send.run_id, output);
     rig.wrapup_done().await;
+    let late = rig.user_wrapup_terminal().await;
+    let entries = late["entries"].as_array().unwrap();
+    assert_eq!(
+        entries
+            .iter()
+            .map(|entry| entry["kind"].as_str().unwrap())
+            .collect::<Vec<_>>(),
+        ["progress", "result"]
+    );
+    assert_eq!(entries[1]["result"]["state"], "done");
     let namespace = rig.state().namespace();
     let compartments = rig
         .h

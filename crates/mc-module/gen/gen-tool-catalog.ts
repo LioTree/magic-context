@@ -823,6 +823,7 @@ export function answer(request: CatalogRequest, config: ResolvedConfig): JsonObj
         content.user_commands = [
             { name: "ctx-status", description: "Show magic context status, pending queue, cache TTL, and debug info" },
             { name: "ctx-flush", description: "Force-process all pending magic context operations immediately" },
+            { name: "ctx-wrapup", description: "Summarize older history while keeping the newest N messages with optional keep-N" },
         ];
         content.capabilities = { late_results: true };
     }

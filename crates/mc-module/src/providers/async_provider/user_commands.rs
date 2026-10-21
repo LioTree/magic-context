@@ -4,8 +4,30 @@ use cortexkit_role_tool_provider::{errors, late_results as late, user_command as
 use serde::{Deserialize, Serialize};
 use subc_protocol::{scope::ScopeKind, Principal};
 
+use super::wrapup::{AsyncWrapupAdmission, AsyncWrapupTarget};
+
 const RECEIPT_RETENTION_MS: u64 = 24 * 60 * 60 * 1_000;
 const MAX_RECEIPTS: usize = 1024;
+const DEFAULT_WRAPUP_KEEP: usize = 20;
+
+fn parse_wrapup_keep(input: &str) -> Result<usize, HandlerOutcome> {
+    if input.trim().is_empty() {
+        return Ok(DEFAULT_WRAPUP_KEEP);
+    }
+    let Some(value) = input.trim().strip_prefix("keep-") else {
+        return Err(wire_error(errors::invalid_request(
+            "keep",
+            "expected no argument or keep-N with a positive integer",
+        )));
+    };
+    match value.parse::<usize>() {
+        Ok(keep) if keep > 0 => Ok(keep),
+        _ => Err(wire_error(errors::invalid_request(
+            "keep",
+            "expected no argument or keep-N with a positive integer",
+        ))),
+    }
+}
 
 #[derive(Default, Serialize, Deserialize)]
 pub(super) struct Ledger(BTreeMap<String, Log>);
@@ -245,15 +267,33 @@ impl McHandler {
         if let Some(receipt) = state.commands.0.get(who).and_then(|log| log.calls.get(key)) {
             return respond(json!(receipt.first));
         }
-        if !matches!(arguments.command.as_str(), "ctx-status" | "ctx-flush") {
+        if !matches!(
+            arguments.command.as_str(),
+            "ctx-status" | "ctx-flush" | "ctx-wrapup"
+        ) {
             return wire_error(errors::unknown_user_command(&arguments.command));
         }
-        if !arguments.input.trim().is_empty() {
-            return wire_error(errors::invalid_request(
-                "input",
-                format!("{} takes no arguments", arguments.command),
-            ));
-        }
+        let wrapup = if arguments.command == "ctx-wrapup" {
+            let keep = match parse_wrapup_keep(&arguments.input) {
+                Ok(keep) => keep,
+                Err(error) => return error,
+            };
+            Some((
+                keep,
+                AsyncWrapupTarget {
+                    reference: reference.clone(),
+                    lineage: state.lineage.clone().unwrap_or_default(),
+                },
+            ))
+        } else {
+            if !arguments.input.trim().is_empty() {
+                return wire_error(errors::invalid_request(
+                    "input",
+                    format!("{} takes no arguments", arguments.command),
+                ));
+            }
+            None
+        };
         if state
             .commands
             .0
@@ -269,6 +309,18 @@ impl McHandler {
                 Ok(text) => command::UserCommandReply::new("done", text),
                 Err(error) => return error,
             }
+        } else if arguments.command == "ctx-wrapup" {
+            if state.resync || state.failed() {
+                return refused("async_compaction_not_ready", &arguments.command);
+            }
+            command::UserCommandReply::new(
+                "accepted",
+                "Wrapup accepted; summarizing the current session history.",
+            )
+            .with_job(format!(
+                "ctx-wrapup-{}",
+                crate::sha256_hex(json!([who, key]).to_string().as_bytes())
+            ))
         } else {
             if state.resync || state.failed() || state.conditions.is_none() {
                 return refused("async_compaction_not_ready", &arguments.command);
@@ -301,11 +353,16 @@ impl McHandler {
             },
         );
         if accepted {
+            let progress = if arguments.command == "ctx-wrapup" {
+                "Preparing a wrapup of the current session history."
+            } else {
+                "Applying the user-permitted rebuild."
+            };
             log.append(
                 binding,
                 key,
                 late::kinds::PROGRESS,
-                command::UserCommandReply::new("accepted", "Applying the user-permitted rebuild."),
+                command::UserCommandReply::new("accepted", progress),
             );
         }
         if let Err(error) = state.save(store, &[]) {
@@ -322,9 +379,17 @@ impl McHandler {
             let binding = binding.clone();
             let who = who.to_owned();
             let key = key.to_owned();
-            tokio::spawn(async move {
-                worker.run_command_flush(binding, reference, who, key).await;
-            });
+            if let Some((keep, target)) = wrapup {
+                tokio::spawn(async move {
+                    worker
+                        .run_command_wrapup(binding, reference, who, key, target, keep)
+                        .await;
+                });
+            } else {
+                tokio::spawn(async move {
+                    worker.run_command_flush(binding, reference, who, key).await;
+                });
+            }
         }
         respond(json!(reply))
     }
@@ -431,6 +496,74 @@ impl McHandler {
                     compact_status_detail(&format!("{error:?}"))
                 ),
             ),
+        };
+        let log = state
+            .commands
+            .0
+            .get_mut(&who)
+            .expect("accepted command log");
+        if let Some(receipt) = log.calls.get_mut(&key) {
+            if !receipt.terminal {
+                receipt.terminal = true;
+                log.append(&binding, &key, late::kinds::RESULT, reply);
+            }
+        }
+        if let Err(error) = state.save(store, &[]) {
+            tracing::warn!(?error, "user-command result could not be saved");
+        }
+        self.checkin(state);
+        drop(_serial);
+        if let Err(error) = self.announce_async_views().await {
+            tracing::warn!(?error, "user-command view announcement failed");
+        }
+    }
+
+    async fn run_command_wrapup(
+        &self,
+        binding: SessionBinding,
+        reference: String,
+        who: String,
+        key: String,
+        target: AsyncWrapupTarget,
+        keep: usize,
+    ) {
+        let result = self
+            .execute_async_wrapup_command(&binding, &target, keep)
+            .await;
+        let reply = match result {
+            Ok(AsyncWrapupAdmission::Accepted) => command::UserCommandReply::new(
+                "done",
+                "Wrapup completed; the updated history is ready for the next permitted view.",
+            ),
+            Ok(AsyncWrapupAdmission::UnknownConversation) => command::UserCommandReply::new(
+                "failed",
+                "ctx-wrapup failed: the conversation or its lineage is no longer available.",
+            ),
+            Ok(AsyncWrapupAdmission::AlreadyRunning) => command::UserCommandReply::new(
+                "failed",
+                "ctx-wrapup failed: another historian or wrapup is already running.",
+            ),
+            Ok(AsyncWrapupAdmission::Ceiling) => command::UserCommandReply::new(
+                "failed",
+                "ctx-wrapup failed: the historian work budget is full.",
+            ),
+            Err(error) => command::UserCommandReply::new(
+                "failed",
+                format!(
+                    "ctx-wrapup failed: {}",
+                    compact_status_detail(&format!("{error:?}"))
+                ),
+            ),
+        };
+        let Some(store) = self.store.get() else {
+            return;
+        };
+        let Ok(Some(head)) = load_head(store, &reference) else {
+            return;
+        };
+        let _serial = self.provider_serial.lock_for(&head.key).await;
+        let Ok(Some(mut state)) = self.checkout(store, &reference) else {
+            return;
         };
         let log = state
             .commands

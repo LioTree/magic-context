@@ -1,6 +1,6 @@
 {
-  "generation": "69fa03d3423d553fad106fe84d8b2a5aef52d67da29ce23fcd29941de36718b4",
-  "catalog_digest": "69fa03d3423d553fad106fe84d8b2a5aef52d67da29ce23fcd29941de36718b4",
+  "generation": "bf4485c03ebc7eb8862862f870a764ce470fe167bb3dc716e9a321cfdca3652e",
+  "catalog_digest": "bf4485c03ebc7eb8862862f870a764ce470fe167bb3dc716e9a321cfdca3652e",
   "composition_digest": "c7dd640f65180d13af85feec11f66b90b7a184ef351485c4e68c7b974be5cb1c",
   "tools": [
     {
@@ -256,6 +256,10 @@
     {
       "name": "ctx-flush",
       "description": "Force-process all pending magic context operations immediately"
+    },
+    {
+      "name": "ctx-wrapup",
+      "description": "Summarize older history while keeping the newest N messages with optional keep-N"
     }
   ],
   "capabilities": {

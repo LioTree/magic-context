@@ -15,6 +15,16 @@ describe("role catalogs", () => {
                     ...(provider ? { compaction: { provider } } : {}) };
                 const reply = answer({ preset, params: {}, composition, system_text: { preset, params: {} } }, EXAMPLE_CONFIG);
                 expect((reply.tools as { name: string }[]).map((tool) => tool.name)).toEqual(names);
+                const userCommands = reply.user_commands as { name: string }[] | undefined;
+                if (compacting && preset === "head") {
+                    expect(userCommands?.map((command) => command.name)).toEqual([
+                        "ctx-status",
+                        "ctx-flush",
+                        "ctx-wrapup",
+                    ]);
+                } else {
+                    expect(reply.user_commands).toBeUndefined();
+                }
                 const text = (reply.system_text as { text: string }).text;
                 if (!compacting && preset !== "head") expect(text).toBe("");
                 else expect(text).not.toBe("");

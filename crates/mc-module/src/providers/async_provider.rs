@@ -16,8 +16,8 @@ mod resident;
 mod scaling_tests;
 #[cfg(test)]
 mod tests;
-pub(super) mod wrapup;
 mod user_commands;
+pub(super) mod wrapup;
 use resident::{EngineView, HeldEntry};
 #[cfg(test)]
 use scaling_tests::reminder_work;

@@ -492,6 +492,10 @@ pub(crate) fn catalog_answer(
                 "ctx-flush",
                 "Force-process all pending magic context operations immediately",
             ),
+            cortexkit_role_tool_provider::user_command::UserCommand::new(
+                "ctx-wrapup",
+                "Summarize older history while keeping the newest N messages with optional keep-N",
+            ),
         ]);
         content.insert("user_commands".into(), json!(declared.user_commands));
         content.insert("capabilities".into(), json!({"late_results":true}));

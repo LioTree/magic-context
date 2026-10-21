@@ -290,6 +290,35 @@ fn every_role_and_compaction_cell_serves_its_exact_tools_and_text() {
 }
 
 #[test]
+fn user_commands_are_declared_only_for_compacting_head_catalogs() {
+    let config = example_catalog_config();
+    for preset in ["head", "worker", "reader"] {
+        for compacting in [false, true] {
+            let answer =
+                tool_catalog::catalog_answer(&role_request(preset, compacting, "full"), &config)
+                    .unwrap();
+            let commands = answer
+                .get("user_commands")
+                .and_then(Value::as_array)
+                .map(|commands| {
+                    commands
+                        .iter()
+                        .map(|command| command["name"].as_str().unwrap())
+                        .collect::<Vec<_>>()
+                });
+            if preset == "head" && compacting {
+                assert_eq!(
+                    commands,
+                    Some(vec!["ctx-status", "ctx-flush", "ctx-wrapup"])
+                );
+            } else {
+                assert!(commands.is_none(), "{preset} compacting={compacting}");
+            }
+        }
+    }
+}
+
+#[test]
 fn compacting_preflight_param_returns_tools_and_text_for_the_composed_request() {
     let config = example_catalog_config();
     let request = json!({

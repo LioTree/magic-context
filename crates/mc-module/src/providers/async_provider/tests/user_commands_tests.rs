@@ -327,6 +327,10 @@ async fn non_async_worker_unknown_and_bad_arguments_are_named_refusals() {
         refusal(invoke(&rig, "bad", "ctx-status", "extra").await).1["field"],
         "input"
     );
+    assert_eq!(
+        refusal(invoke(&rig, "bad-wrapup", "ctx-wrapup", "keep-0").await).1["field"],
+        "keep"
+    );
     attest(
         &rig,
         Some(ScopeStamp::new(

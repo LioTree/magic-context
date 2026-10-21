@@ -44,17 +44,51 @@ impl McHandler {
         target: &AsyncWrapupTarget,
         keep: usize,
     ) -> Result<AsyncWrapupAdmission, HandlerOutcome> {
+        let drive = match self.admit_async_wrapup(binding, target, keep).await? {
+            Ok(drive) => drive,
+            Err(refusal) => return Ok(refusal),
+        };
+        let worker = self.provider_historian_worker();
+        tokio::spawn(async move {
+            if let Err(error) = worker.finish_async_wrapup(&drive).await {
+                tracing::warn!(?error, "async wrapup stopped");
+            }
+        });
+        Ok(AsyncWrapupAdmission::Accepted)
+    }
+
+    /// Run a wrapup for a user command and return only after its view is published.
+    pub(super) async fn execute_async_wrapup_command(
+        &self,
+        binding: &SessionBinding,
+        target: &AsyncWrapupTarget,
+        keep: usize,
+    ) -> Result<AsyncWrapupAdmission, HandlerOutcome> {
+        let drive = match self.admit_async_wrapup(binding, target, keep).await? {
+            Ok(drive) => drive,
+            Err(refusal) => return Ok(refusal),
+        };
+        self.finish_async_wrapup(&drive).await?;
+        Ok(AsyncWrapupAdmission::Accepted)
+    }
+
+    async fn admit_async_wrapup(
+        &self,
+        binding: &SessionBinding,
+        target: &AsyncWrapupTarget,
+        keep: usize,
+    ) -> Result<Result<Drive, AsyncWrapupAdmission>, HandlerOutcome> {
         let store = self
             .store
             .get()
             .ok_or_else(|| transient("store unavailable"))?;
         let Some(head) = load_head(store, &target.reference)? else {
-            return Ok(AsyncWrapupAdmission::UnknownConversation);
+            return Ok(Err(AsyncWrapupAdmission::UnknownConversation));
         };
         self.authorize_async(binding, &head)?;
         let _serial = self.provider_serial.lock_for(&head.key).await;
         let Some(state) = self.checkout(store, &target.reference)? else {
-            return Ok(AsyncWrapupAdmission::UnknownConversation);
+            return Ok(Err(AsyncWrapupAdmission::UnknownConversation));
         };
         let admitted = (|| {
             self.authorize_async(binding, &state)?;
@@ -104,29 +138,21 @@ impl McHandler {
             }))
         })();
         self.checkin(state);
-        let drive = match admitted? {
-            Ok(drive) => drive,
-            Err(refusal) => return Ok(refusal),
-        };
-        let worker = self.provider_historian_worker();
-        tokio::spawn(async move {
-            let reference = drive.reference.clone();
-            let namespace = drive.parsed.session_id.clone();
-            let store = worker.store.get().expect("admitted wrapup has a store");
-            let before = store.load_compartments(&namespace).map(|rows| rows.len());
-            // Keep the admission guard and memory charge through publication wake.
-            let result = worker.drive_async_wrapup(&drive).await;
-            if let Err(error) = result {
-                tracing::warn!(?error, "async wrapup stopped");
-            }
-            let after = store.load_compartments(&namespace).map(|rows| rows.len());
-            if matches!((before, after), (Ok(before), Ok(after)) if after > before) {
-                if let Err(error) = worker.publish_async_wake(&reference).await {
-                    tracing::warn!(?error, "async wrapup view publication failed");
-                }
-            }
-        });
-        Ok(AsyncWrapupAdmission::Accepted)
+        admitted
+    }
+
+    async fn finish_async_wrapup(&self, drive: &Drive) -> Result<(), HandlerOutcome> {
+        let reference = drive.reference.clone();
+        let namespace = drive.parsed.session_id.clone();
+        let store = self.store.get().expect("admitted wrapup has a store");
+        let before = store.load_compartments(&namespace).map(|rows| rows.len());
+        // Keep the admission guard and memory charge through publication wake.
+        let result = self.drive_async_wrapup(drive).await;
+        let after = store.load_compartments(&namespace).map(|rows| rows.len());
+        if matches!((before, after), (Ok(before), Ok(after)) if after > before) {
+            self.publish_async_wake(&reference).await?;
+        }
+        result
     }
 }
 
