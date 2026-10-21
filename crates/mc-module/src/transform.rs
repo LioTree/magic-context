@@ -19097,26 +19097,31 @@ fn build_output_with_tags_inner(
                             exempt: reasoning_mutation_exempt,
                         },
                     );
-                    let drop_indexes: HashSet<usize> = blocks
-                        .iter()
-                        .filter(|block| match &block.wire_shape().kind {
-                            ck_wire::CkKind::ToolCall { id, .. }
-                            | ck_wire::CkKind::ToolResult { id, .. } => full_drop_ids.contains(id),
-                            _ => false,
+                }
+                // A frozen full drop removes both sides of the arc. A revert can make its
+                // call the latest reasoning assistant again; mutation protection must not
+                // resurrect that call while its already-dropped result remains absent.
+                let drop_indexes: HashSet<usize> = blocks
+                    .iter()
+                    .filter(|block| match &block.wire_shape().kind {
+                        ck_wire::CkKind::ToolCall { id, .. }
+                        | ck_wire::CkKind::ToolResult { id, .. } => full_drop_ids.contains(id),
+                        _ => false,
+                    })
+                    .map(|block| block.block_index)
+                    .collect();
+                if !drop_indexes.is_empty() {
+                    rebuilt.content = rebuilt
+                        .content
+                        .into_iter()
+                        .enumerate()
+                        .filter_map(|(index, block)| {
+                            (!drop_indexes.contains(&index)).then_some(block)
                         })
-                        .map(|block| block.block_index)
                         .collect();
-                    if !drop_indexes.is_empty() {
-                        rebuilt.content = rebuilt
-                            .content
-                            .into_iter()
-                            .enumerate()
-                            .filter_map(|(index, block)| {
-                                (!drop_indexes.contains(&index)).then_some(block)
-                            })
-                            .collect();
-                        rebuilt.mark_modified();
-                    }
+                    rebuilt.mark_modified();
+                }
+                if !mutation_exempt {
                     apply_tag_overlay_to_message(
                         &mut rebuilt,
                         msg,
@@ -48081,6 +48086,105 @@ pub(crate) mod tests {
             message.meta.harness_id.as_deref() != Some("reasoning-adjacency-result")
         }));
         assert!(!has_reasoning_assistant_adjacency(&served));
+    }
+
+    #[test]
+    fn frozen_full_tool_drop_survives_reasoning_exemption_after_revert() {
+        let mut call = reasoning_tool_shell_message("call", 1, "paired", false);
+        call.ck.content.insert(
+            1,
+            CkWireBlock::bare(ck_wire::CkKind::Text {
+                text: "completed assistant text".into(),
+            }),
+        );
+        let request = cc_req(
+            "frozen-drop-revert",
+            "cfg0",
+            vec![
+                call.clone(),
+                tool_result("result", 2, "paired", "large output"),
+                item("continuation", 3, "next user turn"),
+                reasoning_item("newer", 4, "new reasoning", "new answer"),
+                item("end", 5, "latest user turn"),
+            ],
+        );
+        let meta = ModuleMeta::default();
+        // ctx_reduce can freeze just the result. Automatic selection may also freeze
+        // the call as a full drop or retain its arguments with a placeholder result.
+        for call_kind in [None, Some("drop"), Some("skeleton_real")] {
+            let mut core = CoreState {
+                frozen_units: vec![red_unit("result#0", "drop", "[dropped]")],
+                ..Default::default()
+            };
+            if let Some(kind) = call_kind {
+                core.frozen_units
+                    .push(red_unit("call#2", kind, "[dropped]"));
+            }
+            let render = |request: &TransformRequest,
+                          snapshot: Option<&SerializedOutputCacheSnapshot>,
+                          indexed: bool| {
+                let projection = project_messages(&request.messages).unwrap();
+                build_output_with_tags_inner(
+                    &core,
+                    &meta,
+                    &projection,
+                    request,
+                    None,
+                    false,
+                    latest_assistant_message_mutation_exempt_mid(
+                        &request.messages,
+                        SerializerProfile::parse(&request.serializer_profile),
+                        request.mid_turn,
+                    ),
+                    &BTreeMap::new(),
+                    0,
+                    true,
+                    snapshot,
+                    false,
+                    indexed,
+                )
+                .unwrap()
+            };
+            let before = render(&request, None, true);
+            let snapshot = SerializedOutputCacheSnapshot {
+                entries: before.cache_entries,
+            };
+            let mut reverted = request.clone();
+            reverted.messages.truncate(3);
+            assert_eq!(
+                latest_assistant_message_mutation_exempt_mid(
+                    &reverted.messages,
+                    SerializerProfile::parse(&reverted.serializer_profile),
+                    false,
+                ),
+                Some("call"),
+            );
+            let warm = render(&reverted, Some(&snapshot), true);
+            let cold = render(&reverted, None, false);
+            assert_eq!(
+                canonical_output(&warm.messages),
+                canonical_output(&cold.messages)
+            );
+            let served_call = warm
+                .messages
+                .iter()
+                .find(|m| m.meta.harness_id.as_deref() == Some("call"))
+                .unwrap();
+            let expected = if call_kind == Some("skeleton_real") {
+                call.ck.content.clone()
+            } else {
+                call.ck.content[..2].to_vec()
+            };
+            assert_eq!(served_call.content, expected, "call kind {call_kind:?}");
+            assert_eq!(
+                warm.messages
+                    .iter()
+                    .any(|m| m.meta.harness_id.as_deref() == Some("result")),
+                call_kind == Some("skeleton_real"),
+                "only a skeleton keeps its result shell",
+            );
+            assert_no_orphaned_tool_arcs(&warm.messages);
+        }
     }
 
     #[test]

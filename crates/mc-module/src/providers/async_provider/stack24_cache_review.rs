@@ -515,13 +515,11 @@ async fn stack24_seed_1301_reclaimable_outputs_match_full_processing() {
 }
 
 #[tokio::test]
-#[ignore = "seed 1379 pairing fix is tracked separately"]
 async fn stack24_seed_1379_completes_without_a_tool_pairing_panic() {
     session(Profile::Anthropic, 1379, 32).await;
 }
 
 #[tokio::test]
-#[ignore = "seed 1379 pairing fix is tracked separately"]
 async fn stack24_full_processing_seed_1379_control() {
     let seed = 1379u64;
     let mut rng = Rng(seed.wrapping_mul(0x9E37_79B9_7F4A_7C15) | 1);
