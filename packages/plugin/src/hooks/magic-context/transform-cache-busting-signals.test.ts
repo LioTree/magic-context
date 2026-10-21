@@ -1,4 +1,5 @@
 /// <reference types="bun-types" />
+import { observeSessionMetaCollectionWrites } from "../../features/magic-context/__tests__/session-meta-faults";
 import { createTestTempDirFromPath } from "../../shared/test-temp-dir";
 
 /**
@@ -650,10 +651,15 @@ describe("three-set cache-busting refactor (Oracle review 2026-04-26)", () => {
 
             db.exec("CREATE TEMP TABLE stripped_placeholder_writes (count INTEGER NOT NULL)");
             db.exec("INSERT INTO stripped_placeholder_writes VALUES (0)");
-            db.exec(`CREATE TEMP TRIGGER count_stripped_placeholder_writes
-                AFTER UPDATE OF stripped_placeholder_ids ON session_meta
-                WHEN OLD.stripped_placeholder_ids IS NOT NEW.stripped_placeholder_ids
-                BEGIN UPDATE stripped_placeholder_writes SET count = count + 1; END`);
+            observeSessionMetaCollectionWrites(
+                db,
+                "stripped_placeholder_ids",
+                "count_stripped_placeholder_writes",
+                (_id, value, previous) => {
+                    if (value !== previous)
+                        db.prepare("UPDATE stripped_placeholder_writes SET count=count+1").run();
+                },
+            );
 
             decision = "defer";
             const replayMessages = sourceMessages().filter(

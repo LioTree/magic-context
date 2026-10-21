@@ -12,6 +12,12 @@ import {
 	getInMemorySlot,
 	resetLkgSlotsForTest,
 } from "@magic-context/core/hooks/magic-context/lkg-slot";
+import { rejectSessionMetaCollectionWrites } from "../../plugin/src/features/magic-context/__tests__/session-meta-faults";
+import { patchSessionMeta } from "../../plugin/src/features/magic-context/__tests__/session-meta-fixture";
+import {
+	sessionMetaCollectionSelect,
+	updateSessionMetaCollection,
+} from "../../plugin/src/features/magic-context/storage-session-collections";
 import { createTestTempDir } from "../../plugin/src/shared/test-temp-dir";
 import {
 	clearContextHandlerSession,
@@ -393,8 +399,15 @@ test("number-only write failure serves without publishing and counts every faile
 		ctx.sessionManager.getBranch = () => {
 			throw new Error("branch unavailable");
 		};
-		db.exec(
-			`CREATE TRIGGER reject_number_evidence BEFORE UPDATE OF trailing_blank_decisions ON session_meta WHEN instr(NEW.trailing_blank_decisions, '"piServedTagNumbers"') > 0 BEGIN SELECT RAISE(ABORT, 'fixture evidence IO failure'); END`,
+		rejectSessionMetaCollectionWrites(
+			db,
+			"trailing_blank_decisions",
+			"reject_number_evidence",
+			{
+				error: "fixture evidence IO failure",
+				when: (value) =>
+					typeof value === "string" && value.includes('"piServedTagNumbers"'),
+			},
 		);
 		const publication = observePiPublicationForTest(sessionId);
 		try {
@@ -430,9 +443,12 @@ for (const envelope of [
 	test(`unreadable publication envelope serves without writing: ${envelope}`, async () => {
 		await fixture(async (db, sessionId, root) => {
 			expect(updateReplayDocument(db, sessionId, () => false)).toBe(true);
-			db.prepare(
-				"UPDATE session_meta SET trailing_blank_decisions = ? WHERE session_id = ?",
-			).run(envelope, sessionId);
+			updateSessionMetaCollection(
+				db,
+				sessionId,
+				"trailing_blank_decisions",
+				envelope,
+			);
 			const fake = createFakePi();
 			registerPiContextHandler(fake.pi as never, { db });
 			const handler = fake.handlers.get("context");
@@ -453,7 +469,7 @@ for (const envelope of [
 				expect(
 					db
 						.prepare(
-							"SELECT trailing_blank_decisions FROM session_meta WHERE session_id = ?",
+							`SELECT ${sessionMetaCollectionSelect("trailing_blank_decisions", "trailing_blank_decisions", db)} FROM session_meta WHERE session_id = ?`,
 						)
 						.get(sessionId),
 				).toEqual({ trailing_blank_decisions: envelope });
@@ -478,9 +494,7 @@ for (const envelope of [
 test("unpaired envelope-conflict repairs once and keeps serving", async () => {
 	await fixture(async (db, sessionId, root) => {
 		expect(updateReplayDocument(db, sessionId, () => false)).toBe(true);
-		db.prepare(
-			"UPDATE session_meta SET trailing_blank_decisions = '{' WHERE session_id = ?",
-		).run(sessionId);
+		patchSessionMeta(db, sessionId, { trailing_blank_decisions: "{" });
 		const fake = createFakePi();
 		registerPiContextHandler(fake.pi as never, { db });
 		const handler = fake.handlers.get("context");

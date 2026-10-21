@@ -178,12 +178,13 @@ impl Fixture {
         embedding(&live, 20);
         candidate(&live, 202, 3, 4);
         live.execute(
-            "INSERT INTO session_meta(session_id, cached_m0_bytes, cached_m1_bytes, cached_m0_max_compartment_seq,
-                 cached_m0_last_baseline_end_message_id, pending_compaction_marker_state, memory_block_cache, compaction_marker_state)
-             VALUES (?1, x'01', x'02', 4, 'm45', '{\"ordinal\":48}', 'memories', '{\"boundaryOrdinal\":50}')",
+            "INSERT INTO session_meta(session_id, cached_m0_max_compartment_seq,
+                 cached_m0_last_baseline_end_message_id, pending_compaction_marker_state, compaction_marker_state)
+             VALUES (?1, 4, 'm45', '{\"ordinal\":48}', '{\"boundaryOrdinal\":50}')",
             params![SESSION],
         )
         .unwrap();
+        live.execute("INSERT INTO session_render_cache(session_id,cache_key,value) VALUES (?1,'cached_m0_bytes',x'01'),(?1,'cached_m1_bytes',x'02'),(?1,'memory_block_cache','memories')", params![SESSION]).unwrap();
         live.execute(
             "UPDATE session_meta SET served_prefix = ?1, held_release = ?2 WHERE session_id = ?3",
             params![
@@ -428,8 +429,8 @@ fn apply_restores_the_backup_history_with_its_ids_and_dependents() {
     );
     let meta: SessionMetaAfter = live
         .query_row(
-            "SELECT cached_m0_bytes, cached_m1_bytes, cached_m0_max_compartment_seq, cached_m0_last_baseline_end_message_id,
-                    pending_compaction_marker_state, memory_block_cache, compaction_marker_state
+            "SELECT (SELECT value FROM session_render_cache WHERE session_id=session_meta.session_id AND cache_key='cached_m0_bytes'), (SELECT value FROM session_render_cache WHERE session_id=session_meta.session_id AND cache_key='cached_m1_bytes'), cached_m0_max_compartment_seq, cached_m0_last_baseline_end_message_id,
+                    pending_compaction_marker_state, COALESCE((SELECT value FROM session_render_cache WHERE session_id=session_meta.session_id AND cache_key='memory_block_cache'), ''), compaction_marker_state
                FROM session_meta WHERE session_id = ?1",
             params![SESSION],
             |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?, row.get(4)?, row.get(5)?, row.get(6)?)),
@@ -613,7 +614,13 @@ fn repair_discards_typescript_memory_ids_with_the_cached_pair() {
     let fixture = Fixture::new();
     let live = fixture.live();
     live.execute(
-        "UPDATE session_meta SET cached_m0_upgrade_state = ?2, memory_block_ids = '[1,2]', memory_block_count = 2 WHERE session_id = ?1",
+        "UPDATE session_meta SET memory_block_count=2 WHERE session_id=?1",
+        [SESSION],
+    )
+    .unwrap();
+    live.execute("INSERT INTO session_meta_chunks(session_id,column_name,chunk,body) VALUES (?1,'memory_block_ids',-1,x''),(?1,'memory_block_ids',0,CAST('[1,2]' AS BLOB))", [SESSION]).unwrap();
+    live.execute(
+        "INSERT INTO session_render_cache(session_id,cache_key,value) VALUES (?1,'cached_m0_upgrade_state',?2)",
         params![SESSION, "ready|compartment-render:cre2|memory-render:mre3|m0-memory-ids:[1]"],
     ).unwrap();
     drop(live);
@@ -621,7 +628,7 @@ fn repair_discards_typescript_memory_ids_with_the_cached_pair() {
     fixture.apply();
     let live = fixture.live();
     let cleared: ClearedCachedPair = live.query_row(
-        "SELECT cached_m0_upgrade_state, cached_m0_bytes, cached_m1_bytes, memory_block_ids, memory_block_count FROM session_meta WHERE session_id = ?1",
+        "SELECT (SELECT value FROM session_render_cache WHERE session_id=session_meta.session_id AND cache_key='cached_m0_upgrade_state'), (SELECT value FROM session_render_cache WHERE session_id=session_meta.session_id AND cache_key='cached_m0_bytes'), (SELECT value FROM session_render_cache WHERE session_id=session_meta.session_id AND cache_key='cached_m1_bytes'), COALESCE((SELECT CAST(group_concat(body, '') AS TEXT) FROM (SELECT body FROM session_meta_chunks WHERE session_id=session_meta.session_id AND column_name='memory_block_ids' AND chunk>=0 ORDER BY chunk)), ''), memory_block_count FROM session_meta WHERE session_id = ?1",
         params![SESSION],
         |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?, row.get(4)?)),
     ).unwrap();

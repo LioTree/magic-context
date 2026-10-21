@@ -1,3 +1,4 @@
+import { rejectSessionRenderCacheWrites } from "../../plugin/src/features/magic-context/__tests__/session-meta-faults";
 // Randomized multi-pass driver for Pi turns whose signed thinking binds every
 // preceding provider-visible byte. Each run drives the real context
 // handler with a seeded sequence of tool steps, user turns, queued drops,
@@ -1259,8 +1260,14 @@ test("Pi carried identity repair: a failing declared rebuild refuses at most one
 		}
 	};
 	try {
-		fixture.db.exec(
-			"CREATE TRIGGER r2_fail_m0_clear BEFORE UPDATE OF cached_m0_bytes ON session_meta WHEN NEW.cached_m0_bytes IS NULL BEGIN SELECT RAISE(FAIL, 'injected m0 clear failure'); END",
+		rejectSessionRenderCacheWrites(
+			fixture.db,
+			"cached_m0_bytes",
+			"r2_fail_m0_clear",
+			{
+				error: "injected m0 clear failure",
+				when: (value, previous) => value === null,
+			},
 		);
 		dropSlot(fixture.sessionId, "r2-no-lkg");
 		fixture.heldStep();

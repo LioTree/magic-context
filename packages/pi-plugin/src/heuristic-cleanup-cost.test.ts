@@ -1,6 +1,10 @@
 import { beforeAll, describe, expect, it, spyOn } from "bun:test";
 import { rmSync } from "node:fs";
 import { getNativeReplayState } from "@magic-context/core/features/magic-context/storage-native-replay";
+import {
+	clearSessionMetaFixtureFault,
+	rejectSessionMetaCollectionWrites,
+} from "../../plugin/src/features/magic-context/__tests__/session-meta-faults";
 import { runHeuristicCostFixture } from "./__tests__/heuristic-cost-fixture";
 import {
 	clearContextHandlerSession,
@@ -47,9 +51,11 @@ describe("heuristic cleanup cost", () => {
 		expect(fixture.steps.measureReclaim?.calls).toBe(130);
 		expect(fixture.steps.dropTargets?.calls).toBe(48);
 		expect(fixture.autocommitDocumentWrites).toBe(0);
+		expect(fixture.nativeChunkWrites).toBeGreaterThan(0);
 		// Each of the 48 tool decisions commits before touching the transcript;
 		// native-marker preparation and injection cleanup each commit once.
-		expect(fixture.transactions).toBe(50);
+		// Cold snapshot reads add read-only transactions, not commits that persist decisions.
+		expect(fixture.transactions - fixture.readTransactions).toBe(50);
 		// The full snapshot is shared with Channel-1 accounting. Heuristics do
 		// not re-read it for each tool or perform any per-drop tag query.
 		expect(fixture.steps.tagQueries?.calls).toBe(1);
@@ -66,8 +72,11 @@ describe("heuristic cleanup cost", () => {
 				saved,
 				canApply: true,
 			};
-			db.exec(
-				"CREATE TRIGGER reject_native BEFORE UPDATE OF trailing_blank_decisions ON session_meta BEGIN SELECT RAISE(ABORT, 'rejected'); END",
+			rejectSessionMetaCollectionWrites(
+				db,
+				"trailing_blank_decisions",
+				"reject_native",
+				{ error: "rejected" },
 			);
 			preparePiToolRemovalMeasurements(args);
 			expect([...saved]).toEqual([]);
@@ -75,7 +84,7 @@ describe("heuristic cleanup cost", () => {
 				[],
 			);
 			expect(authorizePiToolRemoval({ ...args, callId: "a" })).toBe("defer");
-			db.exec("DROP TRIGGER reject_native");
+			clearSessionMetaFixtureFault(db, "reject_native");
 			preparePiToolRemovalMeasurements({ ...args, canApply: false });
 			expect([...saved]).toEqual([]);
 			preparePiToolRemovalMeasurements(args);

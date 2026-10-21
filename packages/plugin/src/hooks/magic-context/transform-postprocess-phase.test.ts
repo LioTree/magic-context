@@ -6,6 +6,14 @@ import { mkdirSync, rmSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import todoRideGolden from "../../../../../crates/mc-module/testdata/todo-ride-only.json";
+import {
+    clearSessionMetaFixtureFault,
+    rejectSessionMetaCollectionWrites,
+} from "../../features/magic-context/__tests__/session-meta-faults";
+import {
+    editCachedUpgradeFixture,
+    patchSessionMeta,
+} from "../../features/magic-context/__tests__/session-meta-fixture";
 import { appendCompartments } from "../../features/magic-context/compartment-storage";
 import * as embeddingModule from "../../features/magic-context/memory/embedding";
 import { runMigrations } from "../../features/magic-context/migrations";
@@ -60,6 +68,7 @@ import {
 } from "../../features/magic-context/storage-meta-persisted";
 import * as reasoningStorage from "../../features/magic-context/storage-reasoning-removal";
 import { getRemovedReasoningIds } from "../../features/magic-context/storage-reasoning-removal";
+import { updateSessionMetaCollection } from "../../features/magic-context/storage-session-collections";
 import * as storageTags from "../../features/magic-context/storage-tags";
 import {
     markWhitespaceAssistantTagInert,
@@ -1186,23 +1195,37 @@ describe("postprocess replay snapshot", () => {
     it("serves byte-identical passes from one cached row and reloads after a database write", async () => {
         db = new Database(":memory:");
         initializeDatabase(db);
+        runMigrations(db);
         const sessionId = "ses-replay-snapshot";
         getOrCreateSessionMeta(db, sessionId);
-        db.prepare(
-            "UPDATE session_meta SET note_nudge_anchors = ?, trailing_blank_decisions = ? WHERE session_id = ?",
-        ).run(
-            JSON.stringify([{ messageId: "snapshot-user", text: "\nreplay-v1" }]),
-            JSON.stringify({ "snapshot-assistant": "strip" }),
-            sessionId,
-        );
+        patchSessionMeta(db, sessionId, {
+            note_nudge_anchors: JSON.stringify([
+                { messageId: "snapshot-user", text: "\nreplay-v1" },
+            ]),
+            trailing_blank_decisions: JSON.stringify({ "snapshot-assistant": "strip" }),
+        });
 
         const preparedSql: string[] = [];
+        const revisionReads: string[] = [];
         const spiedDb = new Proxy(db, {
             get(target, prop) {
                 if (prop !== "prepare") return Reflect.get(target, prop, target);
                 return (sql: string) => {
                     preparedSql.push(sql);
-                    return target.prepare.call(target, sql);
+                    const statement = target.prepare.call(target, sql);
+                    if (!sql.includes("session_meta_collection_revisions AS revisions"))
+                        return statement;
+                    return new Proxy(statement, {
+                        get(stmt, key) {
+                            if (key === "get")
+                                return (...params: Parameters<typeof stmt.get>) => {
+                                    revisionReads.push(String(params[0]));
+                                    return stmt.get(...params);
+                                };
+                            const value = Reflect.get(stmt, key);
+                            return typeof value === "function" ? value.bind(stmt) : value;
+                        },
+                    });
                 };
             },
         }) as Database;
@@ -1233,17 +1256,18 @@ describe("postprocess replay snapshot", () => {
         const second = await run();
         expect(digest(second)).toBe(digest(first));
         expect(
-            preparedSql.filter((sql) => sql.includes("SELECT stale_reduce_stripped_ids")).length,
-        ).toBe(1);
+            revisionReads.filter((column) => column === "stale_reduce_stripped_ids"),
+        ).toHaveLength(2);
+        expect(revisionReads.filter((column) => column === "note_nudge_anchors")).toHaveLength(2);
         expect(
-            preparedSql.some((sql) =>
-                /SELECT (?:note_nudge_anchors|trailing_blank_decisions) FROM/.test(sql),
-            ),
-        ).toBe(false);
+            preparedSql.filter((sql) => sql.includes("SELECT todo_permission_denied")),
+        ).toHaveLength(1);
 
-        db.prepare("UPDATE session_meta SET note_nudge_anchors = ? WHERE session_id = ?").run(
-            JSON.stringify([{ messageId: "snapshot-user", text: "\nreplay-v2" }]),
+        updateSessionMetaCollection(
+            db,
             sessionId,
+            "note_nudge_anchors",
+            JSON.stringify([{ messageId: "snapshot-user", text: "\nreplay-v2" }]),
         );
         const afterPassInvalidation = await run();
         expect(digest(afterPassInvalidation)).not.toBe(digest(second));
@@ -6367,9 +6391,9 @@ describe("executed m[0] hard-fold folds the execute pass in", () => {
                 });
         };
         const setCachedUpgradeState = (sessionId: string, from: string, to: string) => {
-            db.prepare(
-                "UPDATE session_meta SET cached_m0_upgrade_state = replace(cached_m0_upgrade_state, ?, ?) WHERE session_id = ?",
-            ).run(from, to, sessionId);
+            editCachedUpgradeFixture(db, sessionId, (value) =>
+                value === null ? null : from.length > 0 ? value.replaceAll(from, to) : value,
+            );
         };
 
         // Each HARD trigger listed below is armed alone on a session whose
@@ -6450,9 +6474,9 @@ describe("executed m[0] hard-fold folds the execute pass in", () => {
             const sessionId = "ses-identical-cached-m1-missing";
             materializeBaseline(sessionId);
             const defer = await pass(sessionId);
-            db.prepare("UPDATE session_meta SET cached_m1_bytes = NULL WHERE session_id = ?").run(
-                sessionId,
-            );
+            db.prepare(
+                "DELETE FROM session_render_cache WHERE cache_key = 'cached_m1_bytes' AND session_id = ?",
+            ).run(sessionId);
             const hard = await pass(sessionId);
             expect(hard.result.materialized).toBe(true);
             expect(hard.result.materializeReason).toBe("cached_m1_missing");
@@ -6994,7 +7018,7 @@ describe("executed m[0] hard-fold folds the execute pass in", () => {
                 reason: "cached_m1_missing",
                 arm: async (sessionId) => {
                     db.prepare(
-                        "UPDATE session_meta SET cached_m1_bytes = NULL WHERE session_id = ?",
+                        "DELETE FROM session_render_cache WHERE cache_key = 'cached_m1_bytes' AND session_id = ?",
                     ).run(sessionId);
                     return undefined;
                 },
@@ -10339,18 +10363,15 @@ it("competing persisted pair cannot replace the previously served TypeScript pre
             beforePhase3ForTest: !options.messages
                 ? () => {
                       competingWrites += 1;
-                      db.prepare(
-                          `UPDATE session_meta
-                              SET cached_m0_bytes = ?, cached_m1_bytes = ?,
-                                  cached_m0_max_compartment_seq = 2,
-                                  cached_m0_last_baseline_end_message_id = ?
-                            WHERE session_id = ?`,
-                      ).run(
-                          Buffer.from("<session-history>PAIR_B</session-history>", "utf8"),
-                          Buffer.from(pairA!.m1Text!, "utf8"),
-                          "covered-b",
-                          sessionId,
-                      );
+                      patchSessionMeta(db, sessionId, {
+                          cached_m0_bytes: Buffer.from(
+                              "<session-history>PAIR_B</session-history>",
+                              "utf8",
+                          ),
+                          cached_m1_bytes: Buffer.from(pairA!.m1Text!, "utf8"),
+                          cached_m0_max_compartment_seq: 2,
+                          cached_m0_last_baseline_end_message_id: "covered-b",
+                      });
                       queueM0Mutation(db, {
                           sessionId,
                           mutationType: "compartment_merge",
@@ -11467,8 +11488,11 @@ describe("proactive strip of thinking on busting passes", () => {
                 findMessage(servedRequests.get(sessionId)![3].messages, "assistant-four"),
             ),
         ).toBe(1);
-        db.exec(
-            "CREATE TRIGGER reject_system_companion BEFORE UPDATE OF merged_reasoning_stripped_ids ON session_meta BEGIN SELECT RAISE(ABORT, 'reject companion'); END",
+        rejectSessionMetaCollectionWrites(
+            db,
+            "merged_reasoning_stripped_ids",
+            "reject_system_companion",
+            { error: "reject companion" },
         );
         await expect(
             serve(sessionId, appendTurn(buildSession(sessionId), sessionId, "four"), {
@@ -11476,7 +11500,7 @@ describe("proactive strip of thinking on busting passes", () => {
             }),
         ).rejects.toMatchObject({ site: "proactive-thinking-strip-persistence-failure" });
         expect(servedRequests.get(sessionId)?.length).toBe(4);
-        db.exec("DROP TRIGGER reject_system_companion");
+        clearSessionMetaFixtureFault(db, "reject_system_companion");
         // The host already serves the new system, so the next pass owes the strip.
         const retried = await serve(
             sessionId,
@@ -11728,9 +11752,9 @@ describe("proactive strip of thinking on busting passes", () => {
         openDb();
         const sessionId = "ses-proactive-persist-failure";
         await serve(sessionId, buildSession(sessionId), { busting: false });
-        db.exec(
-            "CREATE TRIGGER refuse_freeze BEFORE UPDATE OF merged_reasoning_stripped_ids ON session_meta BEGIN SELECT RAISE(FAIL, 'transient freeze write failure'); END",
-        );
+        rejectSessionMetaCollectionWrites(db, "merged_reasoning_stripped_ids", "refuse_freeze", {
+            error: "transient freeze write failure",
+        });
         const failed = buildSession(sessionId, "re-rendered first user message");
         const before = JSON.stringify(failed);
         await expect(serve(sessionId, failed, { busting: true })).rejects.toMatchObject({
@@ -11743,7 +11767,7 @@ describe("proactive strip of thinking on busting passes", () => {
         // With the store writable again, the failed pass left no strip decision
         // behind, but the host still serves the changed system prompt, so the
         // next pass owes the strip and lands it.
-        db.exec("DROP TRIGGER refuse_freeze");
+        clearSessionMetaFixtureFault(db, "refuse_freeze");
         const retry = buildSession(sessionId, "re-rendered first user message");
         const retryResult = await serve(sessionId, retry, { busting: false });
         expect(retryResult.proactiveThinkingStrip).toEqual({ messageIds: ALL_ASSISTANTS });
@@ -11856,9 +11880,9 @@ describe("proactive strip of thinking on busting passes", () => {
         openDb();
         const sessionId = "ses-proactive-rust-persist-failure";
         getOrCreateSessionMeta(db, sessionId);
-        db.exec(
-            "CREATE TRIGGER refuse_freeze BEFORE UPDATE OF merged_reasoning_stripped_ids ON session_meta BEGIN SELECT RAISE(FAIL, 'transient freeze write failure'); END",
-        );
+        rejectSessionMetaCollectionWrites(db, "merged_reasoning_stripped_ids", "refuse_freeze", {
+            error: "transient freeze write failure",
+        });
         const busting = buildSession(sessionId);
         const before = JSON.stringify(busting);
         const result = runRustModePostprocess({
@@ -13976,8 +14000,11 @@ describe("independent image cache safety through both host projections", () => {
             initializeDatabase(db);
             const sessionId = `independent-fault-${host}`;
             getOrCreateSessionMeta(db, sessionId);
-            db.exec(
-                `CREATE TRIGGER fail_independent_image_freeze BEFORE UPDATE OF processed_image_stripped_ids ON session_meta BEGIN SELECT RAISE(ABORT, 'independent image persistence fault'); END`,
+            rejectSessionMetaCollectionWrites(
+                db,
+                "processed_image_stripped_ids",
+                "fail_independent_image_freeze",
+                { error: "independent image persistence fault" },
             );
             const projected = project("openai");
             const before = projected.bytes();
@@ -13997,7 +14024,7 @@ describe("independent image cache safety through both host projections", () => {
             projected.commit();
             expect(projected.bytes()).toBe(before);
             expect([...getProcessedImageStrippedIds(db, sessionId)]).toEqual([]);
-            db.exec("DROP TRIGGER fail_independent_image_freeze");
+            clearSessionMetaFixtureFault(db, "fail_independent_image_freeze");
             const deferred = await serve(sessionId, false);
             expect(deferred.bytes()).toBe(deferred.before);
             const retry = await serve(sessionId, true);

@@ -8,7 +8,7 @@ use serde::{Deserialize, Serialize};
 
 /// Section-inventory protocol version serialized in move manifests.
 pub const INVENTORY_VERSION: u32 = 9;
-pub const CONTEXT_SCHEMA_VERSION: u32 = 102;
+pub const CONTEXT_SCHEMA_VERSION: u32 = 103;
 pub const STORE_SCHEMA_VERSION: u32 = 74;
 pub const GLOBAL_USER_PROFILE_PROJECT_PATH: &str = "__global__";
 
@@ -280,7 +280,7 @@ pub const TABLES: &[TableInventory] = &[
         None
     ),
     // BEGIN FRESH-MIGRATION CENSUS
-    // context.db: 111 tables observed after fresh migration.
+    // context.db: 113 tables observed after fresh migration.
     table!(
         Context,
         "authority_capture_bounds",
@@ -1819,8 +1819,6 @@ pub const TABLES: &[TableInventory] = &[
             "note_nudge_trigger_message_id",
             "note_nudge_sticky_text",
             "note_nudge_sticky_message_id",
-            "note_nudge_anchors",
-            "auto_search_hint_decisions",
             "last_todo_state",
             "todo_permission_denied",
             "todo_synthetic_call_id",
@@ -1838,16 +1836,13 @@ pub const TABLES: &[TableInventory] = &[
             "historian_last_error",
             "historian_last_failure_at",
             "system_prompt_hash",
-            "memory_block_cache",
             "memory_block_count",
-            "memory_block_ids",
             "pending_compaction_marker_state",
             "compaction_marker_target_end_message_id",
             "pending_pi_compaction_marker_state",
             "new_work_tokens",
             "total_input_tokens",
             "deferred_execute_state",
-            "cached_m0_bytes",
             "served_prefix",
             "held_release",
             "cached_m0_score_selection_watermark",
@@ -1859,7 +1854,6 @@ pub const TABLES: &[TableInventory] = &[
             "cached_m0_max_mutation_id",
             "cached_m0_max_memory_mutation_id",
             "cached_m0_project_docs_hash",
-            "cached_m1_bytes",
             "last_observed_model_key",
             "last_usage_context_limit",
             "prior_boundary_ordinal",
@@ -1877,7 +1871,6 @@ pub const TABLES: &[TableInventory] = &[
             "compaction_mode_record",
             "cached_m0_materialized_at",
             "cached_m0_session_facts_version",
-            "cached_m0_upgrade_state",
             "cached_m0_system_hash",
             "cached_m0_tool_set_hash",
             "cached_m0_model_key",
@@ -1889,11 +1882,6 @@ pub const TABLES: &[TableInventory] = &[
             "note_last_read_at",
             "cleared_reasoning_through_tag",
             "tool_reclaim_watermark",
-            "stripped_placeholder_ids",
-            "stale_reduce_stripped_ids",
-            "processed_image_stripped_ids",
-            "merged_reasoning_stripped_ids",
-            "trailing_blank_decisions",
             "system_prompt_tokens",
             "compaction_marker_state",
             "key_files",
@@ -1907,7 +1895,6 @@ pub const TABLES: &[TableInventory] = &[
             "emergency_recovery_origin",
             "upgrade_reminder_last_sent_at",
             "upgrade_reminder_count",
-            "cached_m0_mural_data_url",
             "cached_m0_mural_hash",
             "coordinate_generation",
             "coordinate_rebase_notice"
@@ -1918,11 +1905,45 @@ pub const TABLES: &[TableInventory] = &[
     ),
     table!(
         Context,
+        "session_meta_chunks",
+        Ship,
+        RowSelector::Predicate("session_id = ?1"),
+        &["session_id", "column_name", "chunk"],
+        &["session_id", "column_name", "chunk", "body"],
+        &[],
+        Some(KeyPolicy::Preserve),
+        None
+    ),
+    // Chunk imports rebuild local revision identities through SQLite triggers.
+    table!(
+        Context,
+        "session_meta_collection_revisions",
+        LocalReset,
+        RowSelector::Predicate("session_id = ?1"),
+        &["id"],
+        &["id", "session_id", "column_name", "revision"],
+        &[],
+        None,
+        None
+    ),
+    table!(
+        Context,
         "session_projects",
         Ship,
         RowSelector::Predicate("session_id = ?1"),
         &["session_id", "harness"],
         &["session_id", "harness", "project_path", "updated_at"],
+        &[],
+        Some(KeyPolicy::Preserve),
+        None
+    ),
+    table!(
+        Context,
+        "session_render_cache",
+        Ship,
+        RowSelector::Predicate("session_id = ?1"),
+        &["session_id", "cache_key"],
+        &["session_id", "cache_key", "value"],
         &[],
         Some(KeyPolicy::Preserve),
         None
@@ -4341,7 +4362,13 @@ mod tests {
             .unwrap();
         assert_bun_succeeded(&output);
         let session_tables: Vec<String> = serde_json::from_slice(&output.stdout).unwrap();
-        assert_eq!(session_tables.len(), 46);
+        assert_eq!(session_tables.len(), 49);
+        assert!(session_tables
+            .iter()
+            .any(|table| table == "session_render_cache"));
+        assert!(session_tables
+            .iter()
+            .any(|table| table == "session_meta_chunks"));
         for table in session_tables {
             assert!(matches!(
                 entry(Store::Context, &table).unwrap().class,

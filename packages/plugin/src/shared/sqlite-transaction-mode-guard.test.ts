@@ -19,6 +19,18 @@ import ts from "typescript";
  * block every writer for the length of the read.
  */
 const READ_ONLY_DEFERRED_TRANSACTIONS: Record<string, string> = {
+    "packages/plugin/src/features/magic-context/storage-session-collection-state.ts#readCollectionState":
+        "reads the collection revision, owner and raw chunks in one snapshot and caches them in memory; never writes chunks or revisions",
+    "packages/plugin/src/features/magic-context/storage-meta-persisted.ts#loadPostprocessReplaySnapshot":
+        "reads metadata headers and revision-validated collection values in one snapshot; never writes",
+    "packages/plugin/src/hooks/magic-context/inject-compartments.ts#getVisibleMemoryIds":
+        "reads the cached render pair and its revision-validated manifest together; never writes",
+    "packages/plugin/src/hooks/magic-context/inject-compartments.ts#readCachedM0M1Row":
+        "reads cached render values, markers and the revision-validated manifest in one snapshot; never writes",
+    "packages/pi-plugin/src/context-handler.ts#loadPiPostTransformSnapshot":
+        "reads the note trigger and revision-validated note/search collections together; never writes",
+    "packages/pi-plugin/src/inject-compartments-pi.ts#readCachedPiM0M1Row":
+        "reads cached Pi render values, markers and revision-validated manifest in one snapshot; never writes",
     "packages/plugin/src/features/magic-context/memory/history-applier.ts#previewMemoryRestore":
         "reads history, canonical memories and successor links to construct a preview; never writes receipts, revisions, epochs or derived data",
     "packages/plugin/src/hooks/magic-context/score-visibility.ts#readCompartmentScoreVisibility":

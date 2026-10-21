@@ -13,6 +13,14 @@ import {
 	saveNativeToolInputs,
 } from "@magic-context/core/features/magic-context/storage-native-replay";
 import {
+	clearSessionMetaFixtureFault,
+	rejectSessionMetaCollectionWrites,
+} from "../../plugin/src/features/magic-context/__tests__/session-meta-faults";
+import {
+	sessionMetaCollectionSelect,
+	updateSessionMetaCollection,
+} from "../../plugin/src/features/magic-context/storage-session-collections";
+import {
 	clearContextHandlerSession,
 	registerPiContextHandler,
 	signalPiPendingMaterialization,
@@ -283,11 +291,12 @@ describe("native upgrade application", () => {
 						reasoningIds: lane === "reasoningIds" ? {} : ["entry-old"],
 					},
 				});
-				f.db
-					.prepare(
-						"UPDATE session_meta SET trailing_blank_decisions = ? WHERE session_id = ?",
-					)
-					.run(stored, sessionId);
+				updateSessionMetaCollection(
+					f.db,
+					sessionId,
+					"trailing_blank_decisions",
+					stored,
+				);
 				const before = nativeBytes([oldAssistant()]);
 				for (const percent of [0, 90, 0]) {
 					f.restart();
@@ -303,7 +312,7 @@ describe("native upgrade application", () => {
 				}
 				const row = f.db
 					.prepare(
-						"SELECT trailing_blank_decisions FROM session_meta WHERE session_id = ?",
+						`SELECT ${sessionMetaCollectionSelect("trailing_blank_decisions", "trailing_blank_decisions", f.db)} FROM session_meta WHERE session_id = ?`,
 					)
 					.get(sessionId) as { trailing_blank_decisions: string };
 				const { piServedTagNumbers, ...nativeDocument } = JSON.parse(
@@ -328,11 +337,12 @@ describe("native upgrade application", () => {
 				trailingBlank: { "entry-old": "strip" },
 				piNative: { toolInputs: {}, reasoningIds: ["entry-old"] },
 			});
-			f.db
-				.prepare(
-					"UPDATE session_meta SET trailing_blank_decisions = ? WHERE session_id = ?",
-				)
-				.run(stored, sessionId);
+			updateSessionMetaCollection(
+				f.db,
+				sessionId,
+				"trailing_blank_decisions",
+				stored,
+			);
 			publication.reset();
 			const original = nativeBytes([oldAssistant()]);
 			for (const percent of [0, 90, 0]) {
@@ -350,7 +360,7 @@ describe("native upgrade application", () => {
 			expect(
 				f.db
 					.prepare(
-						"SELECT trailing_blank_decisions FROM session_meta WHERE session_id = ?",
+						`SELECT ${sessionMetaCollectionSelect("trailing_blank_decisions", "trailing_blank_decisions", f.db)} FROM session_meta WHERE session_id = ?`,
 					)
 					.get(sessionId),
 			).toEqual({ trailing_blank_decisions: stored });
@@ -368,16 +378,27 @@ describe("native upgrade application", () => {
 			try {
 				await f.seedLegacy();
 				const empty = lane === "toolInputs" ? "{}" : "[]";
-				f.db.exec(
-					`CREATE TRIGGER fail_native_write BEFORE UPDATE OF trailing_blank_decisions ON session_meta
-					 WHEN COALESCE(json_extract(NEW.trailing_blank_decisions, '$.piNative.${lane}'), '${empty}')
-					   != COALESCE(json_extract(NULLIF(OLD.trailing_blank_decisions, ''), '$.piNative.${lane}'), '${empty}')
-					 BEGIN SELECT RAISE(FAIL, 'native persistence failure'); END`,
+				rejectSessionMetaCollectionWrites(
+					f.db,
+					"trailing_blank_decisions",
+					"fail_native_write",
+					{
+						error: "native persistence failure",
+						when: (value, previous) => {
+							const state = (raw: unknown) =>
+								typeof raw === "string" && raw
+									? (JSON.parse(raw).piNative?.[lane] ?? JSON.parse(empty))
+									: JSON.parse(empty);
+							return (
+								JSON.stringify(state(value)) !== JSON.stringify(state(previous))
+							);
+						},
+					},
 				);
 				const failed = nativeBytes(await f.pass(90));
 				const retained = lane === "toolInputs" ? staleInput : ciphertext;
 				expect(failed).toContain(retained);
-				f.db.exec("DROP TRIGGER fail_native_write");
+				clearSessionMetaFixtureFault(f.db, "fail_native_write");
 				expect(nativeBytes(await f.pass(0))).toBe(failed);
 				f.restart();
 				expect(nativeBytes(await f.pass(0))).toBe(failed);
@@ -418,11 +439,14 @@ describe("native upgrade application", () => {
 			expect(b).toContain("first marker");
 			expect(run("different marker", false)).toBe(b);
 			expect(run("different marker", false, false)).toBe(b);
-			db.exec(
-				"CREATE TRIGGER fail_update BEFORE UPDATE OF trailing_blank_decisions ON session_meta BEGIN SELECT RAISE(FAIL, 'rejected native update'); END",
+			rejectSessionMetaCollectionWrites(
+				db,
+				"trailing_blank_decisions",
+				"fail_update",
+				{ error: "rejected native update" },
 			);
 			expect(run("different marker", true)).toBe(b);
-			db.exec("DROP TRIGGER fail_update");
+			clearSessionMetaFixtureFault(db, "fail_update");
 			expect(run("different marker", false)).toBe(b);
 			const c = run("different marker", true);
 			expect(c).toContain("different marker");

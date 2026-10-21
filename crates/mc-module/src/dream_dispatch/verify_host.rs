@@ -697,7 +697,8 @@ mod tests {
                     tx.execute("INSERT INTO memory_verifications(memory_id,file_path,verified_at,mapped_at,mapping_origin) VALUES(?1,'lib.rs',0,1,'mapper')", [id])?;
                     tx.execute("INSERT INTO memory_embeddings(memory_id,embedding,model_id) VALUES(?1,?2,'model')", params![id,vec![0_u8;8]])?;
                 }
-                tx.execute("INSERT INTO session_meta(session_id,served_prefix,cached_m0_bytes) VALUES('session','frozen prefix',?1)", [b"frozen bytes"])?;
+                tx.execute("INSERT INTO session_meta(session_id,served_prefix) VALUES ('session','frozen prefix')", [])?;
+                tx.execute("INSERT INTO session_render_cache(session_id,cache_key,value) VALUES ('session','cached_m0_bytes',?1)", [b"frozen bytes"])?;
                 tx.execute("INSERT INTO project_state(project_path,project_memory_epoch) VALUES('project',7)", [])?;
                 Ok(())
             }).unwrap();
@@ -783,7 +784,7 @@ mod tests {
             assert_eq!(fixture.scalar("SELECT COUNT(*) FROM memory_embeddings"), 2);
             assert_eq!(fixture.scalar("SELECT COUNT(*) FROM memories WHERE id=4 AND revision=1 AND verified_at IS NULL"), 1);
             fixture.store.with_context_read(|db| {
-                let (prefix, bytes): (String, Vec<u8>) = db.query_row("SELECT served_prefix,cached_m0_bytes FROM session_meta WHERE session_id='session'", [], |row| Ok((row.get(0)?, row.get(1)?)))?;
+                let (prefix, bytes): (String, Vec<u8>) = db.query_row("SELECT served_prefix,(SELECT value FROM session_render_cache WHERE session_id=session_meta.session_id AND cache_key='cached_m0_bytes') FROM session_meta WHERE session_id='session'", [], |row| Ok((row.get(0)?, row.get(1)?)))?;
                 assert_eq!(prefix, "frozen prefix"); assert_eq!(bytes, b"frozen bytes");
                 assert_eq!(db.query_row("SELECT COUNT(*) FROM memory_journal WHERE operation='verification' AND json_extract(after_json,'$.checkedCommit') IS NOT NULL", [], |row| row.get::<_, i64>(0))?, 3);
                 Ok(())

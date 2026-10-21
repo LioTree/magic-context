@@ -28,6 +28,10 @@ import { dropSlot } from "@magic-context/core/hooks/magic-context/lkg-slot";
 import { isAnthropicFamilyRoute } from "@magic-context/core/hooks/magic-context/sentinel";
 import { getHarness } from "@magic-context/core/shared/harness";
 import { log } from "@magic-context/core/shared/logger";
+import {
+	readSessionMetaCollection,
+	updateSessionMetaCollection,
+} from "../../plugin/src/features/magic-context/storage-session-collections";
 import { resetPiUpperEstimateReclaim } from "./pi-fit-reclaim";
 import { clearPiLkgSessionState } from "./pi-lkg";
 import { piContentFallbackIds, resolvePiStableId } from "./read-session-pi";
@@ -521,13 +525,13 @@ export function preparePiThinkingStripWrite(
 				"Cannot persist thinking omission without a stable entry id",
 			);
 		};
-	const row = db
-		.prepare(
-			"SELECT merged_reasoning_stripped_ids FROM session_meta WHERE session_id = ?",
-		)
-		.get(sessionId) as
-		| { merged_reasoning_stripped_ids: string | null }
-		| undefined;
+	const row = {
+		merged_reasoning_stripped_ids: readSessionMetaCollection(
+			db,
+			sessionId,
+			"merged_reasoning_stripped_ids",
+		),
+	} as { merged_reasoning_stripped_ids: string | null } | undefined;
 	const raw = row?.merged_reasoning_stripped_ids ?? null;
 	let stored: unknown;
 	try {
@@ -544,11 +548,13 @@ export function preparePiThinkingStripWrite(
 	for (const id of plan.entryIds) ids.add(piThinkingOmissionOrderId(id, "end"));
 	const next = JSON.stringify([...ids]);
 	return () => {
-		const result = db
-			.prepare(
-				"UPDATE session_meta SET merged_reasoning_stripped_ids = ? WHERE session_id = ? AND merged_reasoning_stripped_ids IS ?",
-			)
-			.run(next, sessionId, raw);
+		const result = updateSessionMetaCollection(
+			db,
+			sessionId,
+			"merged_reasoning_stripped_ids",
+			next,
+			{ value: raw },
+		);
 		// A peer changed the ledger after planning. Refuse this lane rather than
 		// overwrite the peer's choices or rerun a pipeline that allocated tags.
 		if (!(result.changes > 0))
@@ -627,11 +633,13 @@ function readPiOmissionLedger(
 	db: ContextDatabase,
 	sessionId: string,
 ): PiOmissionLedger {
-	const row = db
-		.prepare(
-			"SELECT merged_reasoning_stripped_ids FROM session_meta WHERE session_id = ?",
-		)
-		.get(sessionId) as { merged_reasoning_stripped_ids?: string | null } | null;
+	const row = {
+		merged_reasoning_stripped_ids: readSessionMetaCollection(
+			db,
+			sessionId,
+			"merged_reasoning_stripped_ids",
+		),
+	} as { merged_reasoning_stripped_ids?: string | null } | null;
 	const raw = row?.merged_reasoning_stripped_ids ?? null;
 	let views = omissionLedgers.get(db);
 	if (!views) {

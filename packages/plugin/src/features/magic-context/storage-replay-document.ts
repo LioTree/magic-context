@@ -3,6 +3,20 @@ import { sessionLog } from "../../shared/logger";
 import { isRecord } from "../../shared/record-type-guard";
 import type { Database } from "../../shared/sqlite";
 import { ensureSessionMetaRow } from "./storage-meta-shared";
+import {
+    collectionStateMatches,
+    readCollectionState,
+    readCollectionToken,
+    sameCollectionToken,
+} from "./storage-session-collection-state";
+import {
+    applySessionMetaCollectionWrite,
+    isSessionMetaCollectionInline,
+    prepareSessionMetaCollectionWrite,
+    readSessionMetaCollection,
+    sessionMetaCollectionValueSql,
+    updateSessionMetaCollection,
+} from "./storage-session-collections";
 
 const CAS_RETRY_LIMIT = 5;
 const MISSING_REPLAY_DOCUMENT_COLUMN = Symbol("missing replay document column");
@@ -58,7 +72,7 @@ export function isRustMarkerAdmissionFenced(db: Database, sessionId: string): bo
     if (!fencedThisProcess.has(sessionId)) return false;
     const row = db
         .prepare(
-            "SELECT COALESCE(json_extract(NULLIF(trailing_blank_decisions, ''), '$.rustMarkerAdmissionFence'), 0) AS fenced FROM session_meta WHERE session_id=?",
+            `SELECT COALESCE(json_extract(NULLIF(${sessionMetaCollectionValueSql("trailing_blank_decisions", db)}, ''), '$.rustMarkerAdmissionFence'), 0) AS fenced FROM session_meta WHERE session_id=?`,
         )
         .get(sessionId) as { fenced?: number } | undefined;
     return row?.fenced === 1;
@@ -277,12 +291,14 @@ function readRawReplayDocument(
     const snapshot = replaySnapshots.getStore();
     const reusable =
         !fresh && snapshot?.active && snapshot.db === db && snapshot.sessionId === sessionId;
-    if (reusable && snapshot.loaded) return snapshot.raw;
+    if (
+        reusable &&
+        snapshot.loaded &&
+        isSessionMetaCollectionInline(db, "trailing_blank_decisions")
+    )
+        return snapshot.raw;
     try {
-        const row = db
-            .prepare("SELECT trailing_blank_decisions FROM session_meta WHERE session_id = ?")
-            .get(sessionId) as { trailing_blank_decisions?: unknown } | undefined;
-        const raw = row?.trailing_blank_decisions;
+        const raw = readSessionMetaCollection(db, sessionId, "trailing_blank_decisions");
         if (raw === null || raw === undefined || typeof raw === "string") {
             if (reusable) {
                 snapshot.raw = raw;
@@ -488,11 +504,13 @@ export function updateReplayDocument(
 
         const next = serializeReplayDocument(doc);
         if (next === raw) return true;
-        const result = db
-            .prepare(
-                "UPDATE session_meta SET trailing_blank_decisions = ? WHERE session_id = ? AND trailing_blank_decisions IS ?",
-            )
-            .run(next, sessionId, raw);
+        const result = updateSessionMetaCollection(
+            db,
+            sessionId,
+            "trailing_blank_decisions",
+            next,
+            { value: raw ?? null },
+        );
         if (result.changes > 0) return true;
     }
 
@@ -623,20 +641,70 @@ export function updateTrailingBlankDecisions(
 export function writeReplayDocument(db: Database, sessionId: string, doc: ReplayDocument): void {
     invalidateReplayEnvelopeSnapshot(db, sessionId);
     if (!hasReplayDecisionTable(db)) {
-        db.prepare("UPDATE session_meta SET trailing_blank_decisions = ? WHERE session_id = ?").run(
-            serializeReplayDocument(doc),
+        updateSessionMetaCollection(
+            db,
             sessionId,
+            "trailing_blank_decisions",
+            serializeReplayDocument(doc),
         );
         return;
     }
     const decisions = parseTrailingBlank(doc.trailingBlank, "strict");
-    db.prepare("UPDATE session_meta SET trailing_blank_decisions = ? WHERE session_id = ?").run(
-        doc.version === 1 ? "" : serializeReplayDocument({ ...doc, trailingBlank: {} }),
+    updateSessionMetaCollection(
+        db,
         sessionId,
+        "trailing_blank_decisions",
+        doc.version === 1 ? "" : serializeReplayDocument({ ...doc, trailingBlank: {} }),
     );
     db.prepare("DELETE FROM session_replay_decisions WHERE session_id = ?").run(sessionId);
     const insert = db.prepare(
         "INSERT INTO session_replay_decisions (session_id, message_id, decision) VALUES (?, ?, ?)",
     );
     for (const [id, decision] of Object.entries(decisions)) insert.run(sessionId, id, decision);
+}
+
+/** Prepare the replay-document edit before the caller opens a transaction; apply the returned publisher inside it. */
+export function prepareReplayDocumentUpdate(
+    db: Database,
+    sessionId: string,
+    mutate: (doc: ReplayDocument) => boolean,
+): (() => boolean) | null {
+    if (isSessionMetaCollectionInline(db, "trailing_blank_decisions"))
+        return () => updateReplayDocument(db, sessionId, mutate);
+    invalidateReplayEnvelopeSnapshot(db, sessionId);
+    ensureSessionMetaRow(db, sessionId);
+    for (let attempt = 0; attempt < CAS_RETRY_LIMIT; attempt++) {
+        const raw = readRawReplayDocument(db, sessionId, true);
+        if (raw === MISSING_REPLAY_DOCUMENT_COLUMN) return null;
+        let doc: ReplayDocument;
+        try {
+            doc = parseReplayDocument(raw);
+        } catch (error) {
+            if (error instanceof ReplayDocumentError) return null;
+            throw error;
+        }
+        const next = mutate(doc) ? serializeReplayDocument(doc) : (raw ?? null);
+        if (next === raw) {
+            const observed = readCollectionState(db, sessionId, "trailing_blank_decisions");
+            if (!observed.token.present || observed.value !== raw) continue;
+            return () =>
+                sameCollectionToken(
+                    observed.token,
+                    readCollectionToken(db, sessionId, "trailing_blank_decisions"),
+                );
+        }
+        const plan = prepareSessionMetaCollectionWrite(
+            db,
+            sessionId,
+            "trailing_blank_decisions",
+            next,
+        );
+        if (!collectionStateMatches(db, plan.previous, raw ?? null)) continue;
+        return () => {
+            const applied = applySessionMetaCollectionWrite(db, plan);
+            if (applied) invalidateReplayEnvelopeSnapshot(db, sessionId);
+            return applied;
+        };
+    }
+    return null;
 }

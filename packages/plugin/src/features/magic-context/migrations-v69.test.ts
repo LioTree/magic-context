@@ -27,7 +27,6 @@ function makePreV65ReplayFixture(db: DatabaseType): void {
         ALTER TABLE session_meta DROP COLUMN coordinate_rebase_notice;
         ALTER TABLE session_meta DROP COLUMN coordinate_generation;
         ALTER TABLE session_meta DROP COLUMN cached_m0_mural_hash;
-        ALTER TABLE session_meta DROP COLUMN cached_m0_mural_data_url;
         ALTER TABLE session_meta DROP COLUMN upgrade_reminder_count;
         ALTER TABLE session_meta DROP COLUMN upgrade_reminder_last_sent_at;
         DROP INDEX idx_memory_mutation_log_visibility;

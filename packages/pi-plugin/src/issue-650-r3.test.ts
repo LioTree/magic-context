@@ -23,6 +23,7 @@ import {
 	type Database,
 	getTagIdentityWriteGeneration,
 } from "@magic-context/core/shared/sqlite";
+import { updateSessionMetaCollection } from "../../plugin/src/features/magic-context/storage-session-collections";
 import {
 	__test,
 	clearContextHandlerSession,
@@ -268,9 +269,12 @@ function fillDecisionLedger(db: Database, sessionId: string, count: number) {
 	const entries = Array.from({ length: count }, (_, n) =>
 		encodePiContentDecision("tag-identity-repair-once", `filler-${n}`),
 	);
-	db.prepare(
-		"UPDATE session_meta SET merged_reasoning_stripped_ids = ? WHERE session_id = ?",
-	).run(JSON.stringify(entries), sessionId);
+	updateSessionMetaCollection(
+		db,
+		sessionId,
+		"merged_reasoning_stripped_ids",
+		JSON.stringify(entries),
+	);
 }
 
 for (const free of [0, 1] as const) {

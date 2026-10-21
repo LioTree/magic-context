@@ -8,6 +8,7 @@ import { installV95PerfSchema } from "./migration-v95-perf-indexes";
 import { installCompartmentRescoreSchema } from "./migration-v98-compartment-rescore";
 import { installMemoryLifecycleSchema } from "./migration-v99-memory-lifecycle";
 import { installTrimSourceIndexes } from "./migration-v101-trim-indexes";
+import { splitSessionMetaPayloads } from "./migration-v103-session-payloads";
 import { repairOpenCode2HarnessLabels } from "./opencode2-relabel";
 import { installCompartmentHistoryVersions } from "./storage-compartment-history-version";
 import { installHostRunnerSchema } from "./storage-host-runner";
@@ -3285,6 +3286,11 @@ export const MIGRATIONS: Migration[] = [
             if (!tableExists(db, "lkg_served_markers")) return;
             ensureColumn(db, "lkg_served_markers", "served_digest", "TEXT");
         },
+    },
+    {
+        version: 103,
+        description: "isolate session render payloads and chunk growing replay metadata",
+        up: splitSessionMetaPayloads,
     },
 ];
 

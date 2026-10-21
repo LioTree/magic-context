@@ -1,8 +1,10 @@
 /// <reference types="bun-types" />
+
 import { describe, expect, it, spyOn } from "bun:test";
 import { initializeDatabase } from "../../features/magic-context/storage-db";
 import { getOrCreateSessionMeta } from "../../features/magic-context/storage-meta";
 import { getTrailingBlankDecisions } from "../../features/magic-context/storage-meta-persisted";
+import { updateSessionMetaCollection } from "../../features/magic-context/storage-session-collections";
 import { createTagger } from "../../features/magic-context/tagger";
 import { Database } from "../../shared/sqlite";
 import type { MessageLike } from "./transform-operations";
@@ -20,9 +22,7 @@ function withDb(run: (db: Database) => void) {
 }
 
 function setDocument(db: Database, raw: string) {
-    db.prepare(
-        "UPDATE session_meta SET trailing_blank_decisions = ? WHERE session_id = 'replay'",
-    ).run(raw);
+    updateSessionMetaCollection(db, "replay", "trailing_blank_decisions", raw);
 }
 
 function postprocess(db: Database): MessageLike[] {

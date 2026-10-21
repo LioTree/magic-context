@@ -1,4 +1,8 @@
 import { afterEach, beforeEach, describe, expect, spyOn, test } from "bun:test";
+import {
+    clearSessionMetaFixtureFault,
+    rejectSessionMetaCollectionWrites,
+} from "../../features/magic-context/__tests__/session-meta-faults";
 import * as embedding from "../../features/magic-context/memory/embedding";
 import { runMigrations } from "../../features/magic-context/migrations";
 import { initializeDatabase } from "../../features/magic-context/storage-db";
@@ -67,15 +71,18 @@ for (const host of ["opencode", "opencode2"] as const) {
             return { bytes: JSON.stringify(messages[0]), outcome };
         };
         try {
-            fixture.db.exec(
-                `CREATE TRIGGER review_fail_cas BEFORE UPDATE OF auto_search_hint_decisions ON session_meta BEGIN SELECT RAISE(IGNORE); END;`,
+            rejectSessionMetaCollectionWrites(
+                fixture.db,
+                "auto_search_hint_decisions",
+                "review_fail_cas",
+                { ignore: true },
             );
             const first = await invoke();
             expect(first.outcome).toEqual({ ok: false, kind: "cas-exhaustion" });
             expect(first.bytes).not.toContain("<ctx-search-hint>");
             expect(getAutoSearchHintDecisions(fixture.db, sessionId)).toEqual([]);
             clearAutoSearchForSession(sessionId);
-            fixture.db.exec("DROP TRIGGER review_fail_cas");
+            clearSessionMetaFixtureFault(fixture.db, "review_fail_cas");
             fixture.reopen(true);
             expect((await invoke()).bytes).toBe(first.bytes);
             expect(search).toHaveBeenCalledTimes(1);
@@ -83,15 +90,18 @@ for (const host of ["opencode", "opencode2"] as const) {
                 { messageId: "served", decision: "no-hint", reason: "error" },
             ]);
             expect(getUnpublishedAutoSearchNoHint(sessionId, "served")).toBeUndefined();
-            fixture.db.exec(
-                `CREATE TRIGGER review_fail_cas BEFORE UPDATE OF auto_search_hint_decisions ON session_meta BEGIN SELECT RAISE(IGNORE); END;`,
+            rejectSessionMetaCollectionWrites(
+                fixture.db,
+                "auto_search_hint_decisions",
+                "review_fail_cas",
+                { ignore: true },
             );
             const failedHintSave = await invoke(fixture.db, "hint-save-failed");
             expect(failedHintSave.bytes).not.toContain("<ctx-search-hint>");
             expect((await invoke(fixture.db, "hint-save-failed")).bytes).toBe(failedHintSave.bytes);
             expect(search).toHaveBeenCalledTimes(2);
             expect(getUnpublishedAutoSearchNoHint(sessionId, "hint-save-failed")).toBe("error");
-            fixture.db.exec("DROP TRIGGER review_fail_cas");
+            clearSessionMetaFixtureFault(fixture.db, "review_fail_cas");
             expect((await invoke(fixture.db, "hint-save-failed")).bytes).toBe(failedHintSave.bytes);
             expect(getUnpublishedAutoSearchNoHint(sessionId, "hint-save-failed")).toBeUndefined();
             expect((await invoke(fixture.db, "new-user")).bytes).toContain(

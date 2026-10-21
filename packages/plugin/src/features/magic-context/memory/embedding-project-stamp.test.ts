@@ -2,8 +2,10 @@ import { expect, test } from "bun:test";
 import { join } from "node:path";
 import { Database } from "../../../shared/sqlite";
 import { createTestTempDir } from "../../../shared/test-temp-dir";
+import { seedSessionMeta } from "../__tests__/session-meta-fixture";
 import { runMigrations } from "../migrations";
 import { initializeDatabase } from "../storage-db";
+import { sessionRenderCacheSelect } from "../storage-session-cache";
 import {
     getProjectEmbeddings,
     PROJECT_EMBEDDING_CACHE_EPOCH_SQL,
@@ -314,11 +316,11 @@ test("embedding project epoch lookup uses the project primary-key index and repo
 test("embedding epoch invalidates after dashboard delta admission without clearing served prefix bytes", () => {
     const f = fixture();
     try {
-        f.reader
-            .prepare(
-                "INSERT INTO session_meta(session_id,cached_m0_bytes,cached_m1_bytes) VALUES ('held-dashboard',?,?)",
-            )
-            .run(Buffer.from("frozen m0"), Buffer.from("frozen m1"));
+        seedSessionMeta(f.reader, {
+            session_id: "held-dashboard",
+            cached_m0_bytes: Buffer.from("frozen m0"),
+            cached_m1_bytes: Buffer.from("frozen m1"),
+        });
         const warm = getProjectEmbeddings(f.reader, f.projectPath, "stamp:model");
         const receipt = applyDashboardMemoryEdit(f.writer, {
             projectPath: f.projectPath,
@@ -337,7 +339,7 @@ test("embedding epoch invalidates after dashboard delta admission without cleari
         expect(getProjectEmbeddings(f.reader, f.projectPath, "stamp:model")).not.toBe(warm);
         const cache = f.reader
             .prepare(
-                "SELECT cached_m0_bytes,cached_m1_bytes FROM session_meta WHERE session_id='held-dashboard'",
+                `SELECT ${sessionRenderCacheSelect("cached_m0_bytes", "cached_m0_bytes", f.reader)}, ${sessionRenderCacheSelect("cached_m1_bytes", "cached_m1_bytes", f.reader)} FROM session_meta WHERE session_id='held-dashboard'`,
             )
             .get() as { cached_m0_bytes: Uint8Array; cached_m1_bytes: Uint8Array };
         expect(Buffer.from(cache.cached_m0_bytes).toString()).toBe("frozen m0");

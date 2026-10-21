@@ -4,6 +4,10 @@ import { afterEach, describe, expect, it } from "bun:test";
 import { createHash } from "node:crypto";
 import prefixBoundGolden from "../../../../../crates/mc-module/testdata/prefix-bound-reasoning-trim.json";
 import budgetGolden from "../../../../../crates/mc-module/testdata/reasoning-budget-trim.json";
+import {
+    observeSessionMetaCollectionWrites,
+    rejectSessionMetaCollectionWrites,
+} from "../../features/magic-context/__tests__/session-meta-faults";
 import { sessionDecisionCalibration } from "../../features/magic-context/session-decision-calibration";
 import {
     getActiveTagsBySession,
@@ -24,6 +28,11 @@ import {
     getRemovedReasoningIds,
 } from "../../features/magic-context/storage-reasoning-removal";
 import { readReplayDocument } from "../../features/magic-context/storage-replay-document";
+import {
+    isSessionMetaCollection,
+    sessionMetaCollectionSelect,
+    updateSessionMetaCollection,
+} from "../../features/magic-context/storage-session-collections";
 import { createTagger } from "../../features/magic-context/tagger";
 import { Database } from "../../shared/sqlite";
 import { EmergencyFailClosedError } from "./emergency-fail-closed";
@@ -570,9 +579,12 @@ describe("reasoning removal through postprocess", () => {
         getOrCreateSessionMeta(database, sessionId);
         // A document this reader cannot parse: the removal set is unknown, so
         // serving an empty set could bring removed reasoning back.
-        database
-            .prepare("UPDATE session_meta SET trailing_blank_decisions = ? WHERE session_id = ?")
-            .run('{"version":7}', sessionId);
+        updateSessionMetaCollection(
+            database,
+            sessionId,
+            "trailing_blank_decisions",
+            '{"version":7}',
+        );
         await expect(
             pass(database, sessionId, toolLoop(8), { busting: true, providerID: "openai" }),
         ).rejects.toBeInstanceOf(EmergencyFailClosedError);
@@ -582,13 +594,16 @@ describe("reasoning removal through postprocess", () => {
         const database = openDb();
         const sessionId = "ses-removal-document";
         getOrCreateSessionMeta(database, sessionId);
-        database
-            .prepare("UPDATE session_meta SET trailing_blank_decisions = ? WHERE session_id = ?")
-            .run(JSON.stringify({ "assistant-x": "strip" }), sessionId);
+        updateSessionMetaCollection(
+            database,
+            sessionId,
+            "trailing_blank_decisions",
+            JSON.stringify({ "assistant-x": "strip" }),
+        );
         expect(addRemovedReasoningIds(database, sessionId, ["assistant-0"])).toBe(true);
         const raw = database
             .prepare(
-                "SELECT trailing_blank_decisions AS raw FROM session_meta WHERE session_id = ?",
+                `SELECT ${sessionMetaCollectionSelect("trailing_blank_decisions", "raw", database)} FROM session_meta WHERE session_id = ?`,
             )
             .get(sessionId) as { raw: string };
         expect(JSON.parse(raw.raw)).toEqual({
@@ -607,14 +622,17 @@ describe("reasoning removal through postprocess", () => {
         expect(getRemovedReasoningIds(database, sessionId).size).toBe(5);
         const raw = database
             .prepare(
-                "SELECT trailing_blank_decisions AS raw FROM session_meta WHERE session_id = ?",
+                `SELECT ${sessionMetaCollectionSelect("trailing_blank_decisions", "raw", database)} FROM session_meta WHERE session_id = ?`,
             )
             .get(sessionId) as { raw: string };
         const corrupted = JSON.parse(raw.raw);
         corrupted.reasoningRemoval.messageIds.push(42);
-        database
-            .prepare("UPDATE session_meta SET trailing_blank_decisions = ? WHERE session_id = ?")
-            .run(JSON.stringify(corrupted), sessionId);
+        updateSessionMetaCollection(
+            database,
+            sessionId,
+            "trailing_blank_decisions",
+            JSON.stringify(corrupted),
+        );
         const deferred = toolLoop(8);
         await pass(database, sessionId, deferred, { busting: false, providerID: "openai" });
         expect(sha256(deferred.messages)).toBe(sha256(busting.messages));
@@ -764,9 +782,16 @@ describe("reasoning removal through postprocess", () => {
     };
     /** ABORT makes the write throw; IGNORE makes it silently change nothing. */
     const blockWrites = (database: Database, column: string, how: "ABORT" | "IGNORE" = "ABORT") =>
-        database.exec(
-            `CREATE TRIGGER block_${column} BEFORE UPDATE OF ${column} ON session_meta BEGIN SELECT RAISE(${how === "ABORT" ? "ABORT, 'blocked'" : "IGNORE"}); END;`,
-        );
+        isSessionMetaCollection(column)
+            ? rejectSessionMetaCollectionWrites(
+                  database,
+                  column,
+                  `block_${column}`,
+                  how === "IGNORE" ? { ignore: true } : { error: "blocked" },
+              )
+            : database.exec(
+                  `CREATE TRIGGER block_${column} BEFORE UPDATE OF ${column} ON session_meta BEGIN SELECT RAISE(${how === "ABORT" ? "ABORT, 'blocked'" : "IGNORE"}); END;`,
+              );
     /** The persisted watermark, replayed onto a fresh array as transform.ts does on every pass. */
     const replayOnNextPass = (
         database: Database,
@@ -875,14 +900,19 @@ describe("reasoning removal through postprocess", () => {
         getOrCreateSessionMeta(database, sessionId);
         // Stand-in for a concurrent writer: when this pass's write lands, another
         // process's id (assistant-6, newer than the age cutoff) joins the set.
-        database.exec(`CREATE TRIGGER concurrent_writer AFTER UPDATE OF trailing_blank_decisions ON session_meta
-            WHEN NEW.trailing_blank_decisions LIKE '%assistant-0%' AND NEW.trailing_blank_decisions NOT LIKE '%assistant-6%'
-            BEGIN
-              UPDATE session_meta SET trailing_blank_decisions = json_insert(
-                json_insert(NEW.trailing_blank_decisions, '$.reasoningRemoval.messageIds[#]', 'assistant-6'),
-                '$.reasoningRemovalBackup.messageIds[#]', 'assistant-6')
-              WHERE session_id = NEW.session_id;
-            END;`);
+        observeSessionMetaCollectionWrites(
+            database,
+            "trailing_blank_decisions",
+            "concurrent_writer",
+            (id, value) => {
+                if (
+                    typeof value === "string" &&
+                    value.includes("assistant-0") &&
+                    !value.includes("assistant-6")
+                )
+                    addRemovedReasoningIds(database, id, ["assistant-6"]);
+            },
+        );
         const session = toolLoop(8);
         await pass(database, sessionId, session, { busting: true, providerID: "openai" });
         expect(getRemovedReasoningIds(database, sessionId).has("assistant-6")).toBe(true);
@@ -895,15 +925,18 @@ describe("reasoning removal through postprocess", () => {
         await pass(database, sessionId, toolLoop(8), { busting: true, providerID: "openai" });
         const raw = database
             .prepare(
-                "SELECT trailing_blank_decisions AS raw FROM session_meta WHERE session_id = ?",
+                `SELECT ${sessionMetaCollectionSelect("trailing_blank_decisions", "raw", database)} FROM session_meta WHERE session_id = ?`,
             )
             .get(sessionId) as { raw: string };
         const corrupted = JSON.parse(raw.raw);
         corrupted.reasoningRemoval.messageIds.push(42);
         corrupted.reasoningRemovalBackup.messageIds.push(42);
-        database
-            .prepare("UPDATE session_meta SET trailing_blank_decisions = ? WHERE session_id = ?")
-            .run(JSON.stringify(corrupted), sessionId);
+        updateSessionMetaCollection(
+            database,
+            sessionId,
+            "trailing_blank_decisions",
+            JSON.stringify(corrupted),
+        );
         await expect(
             pass(database, sessionId, toolLoop(8), { busting: false, providerID: "openai" }),
         ).rejects.toBeInstanceOf(EmergencyFailClosedError);

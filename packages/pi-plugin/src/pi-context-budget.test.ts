@@ -3,6 +3,7 @@ import {
 	guardSqliteTransformPass,
 	withSqliteTransformPass,
 } from "@magic-context/core/shared/sqlite";
+import { sessionMetaFixtureRow } from "../../plugin/src/features/magic-context/__tests__/session-meta-fixture";
 import { PiContextBudget, PiContextDeadlineError } from "./pi-context-budget";
 import { createTestDb } from "./test-utils.test";
 
@@ -38,9 +39,7 @@ test("elapsed time fences a commit after an event-loop stall without a timer fir
 				})();
 			}),
 		).toThrow(PiContextDeadlineError);
-		expect(
-			db.prepare("SELECT * FROM session_meta WHERE session_id='stalled'").get(),
-		).toBeNull();
+		expect(sessionMetaFixtureRow(db, "stalled")).toBeNull();
 	} finally {
 		db.close();
 	}

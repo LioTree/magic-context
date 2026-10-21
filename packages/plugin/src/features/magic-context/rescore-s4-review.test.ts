@@ -27,6 +27,7 @@ import { createV2HiddenCompletionExecutor, type HiddenChildHost } from "../../v2
 import { HiddenChildHook, hiddenToolCallRefusal } from "../../v2/hooks/hidden-child";
 import type { SessionContext } from "../../v2/hooks/types";
 import type { StoreRow } from "../../v2/store-reader";
+import { seedSessionMeta } from "./__tests__/session-meta-fixture";
 import { getCompartments } from "./compartment-storage";
 import { runMigrations } from "./migrations";
 import { RESCORE_HEARTBEAT_MS, type RescoreAdmission, RescoreService } from "./rescore-service";
@@ -351,13 +352,18 @@ describe("rescore-s4-review controls", () => {
         "CONTROL publish and undo leave seeded cache bytes epochs and materialization unchanged",
         () => {
             const f = fixture();
-            f.db
-                .prepare(`INSERT INTO session_meta(session_id,cached_m0_bytes,cached_m1_bytes,
-            cached_m0_materialized_at,cached_m0_project_memory_epoch,cached_m0_score_selection_watermark,
-            served_prefix,held_release,cached_m0_max_mutation_id,cached_m0_max_compartment_seq)
-            VALUES ('session',X'6d302d66726f7a656e',X'6d312d66726f7a656e',123456,17,0,
-            'frozen boundary sections','held',19,0)`)
-                .run();
+            seedSessionMeta(f.db, {
+                session_id: "session",
+                cached_m0_bytes: Buffer.from("6d302d66726f7a656e", "hex"),
+                cached_m1_bytes: Buffer.from("6d312d66726f7a656e", "hex"),
+                cached_m0_materialized_at: 123456,
+                cached_m0_project_memory_epoch: 17,
+                cached_m0_score_selection_watermark: 0,
+                served_prefix: "frozen boundary sections",
+                held_release: "held",
+                cached_m0_max_mutation_id: 19,
+                cached_m0_max_compartment_seq: 0,
+            });
             f.db
                 .prepare(
                     "INSERT INTO project_state(project_path,project_memory_epoch,updated_at) VALUES ('git:rescore-review',17,123)",

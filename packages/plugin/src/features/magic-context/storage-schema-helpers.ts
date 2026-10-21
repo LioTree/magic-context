@@ -1,5 +1,6 @@
 import type { Database, Statement } from "../../shared/sqlite";
 import { isKnownAutocommit } from "../../shared/sqlite-helpers";
+import { sessionMetaCollectionValueSql } from "./storage-session-collections";
 
 interface ColumnCache {
     version: number;
@@ -176,13 +177,17 @@ function getSessionMetaColumns(db: Database): Set<string> {
 }
 
 function healMissingMemoryBlockIds(db: Database, columns: ReadonlySet<string>): void {
-    if (
-        !columns.has("memory_block_cache") ||
-        !columns.has("memory_block_ids") ||
-        !columns.has("memory_block_count")
-    ) {
+    if (!columns.has("memory_block_count")) return;
+    const ids = sessionMetaCollectionValueSql("memory_block_ids", db);
+    if (!columns.has("memory_block_cache")) {
+        if (db.prepare("SELECT 1 FROM sqlite_master WHERE name = 'session_render_cache'").get()) {
+            db.prepare(`DELETE FROM session_render_cache WHERE cache_key = 'memory_block_cache'
+                AND session_id IN (SELECT session_id FROM session_meta
+                    WHERE (${ids} IS NULL OR ${ids} = '') AND memory_block_count > 0)`).run();
+        }
         return;
     }
+    if (!columns.has("memory_block_ids")) return;
     db.prepare(
         "UPDATE session_meta SET memory_block_cache = '' WHERE memory_block_cache != '' AND (memory_block_ids IS NULL OR memory_block_ids = '') AND memory_block_count > 0",
     ).run();

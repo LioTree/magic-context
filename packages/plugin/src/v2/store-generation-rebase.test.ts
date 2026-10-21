@@ -1,5 +1,6 @@
 import { beforeEach, expect, test } from "bun:test";
 import { createHash } from "node:crypto";
+import { patchSessionMeta } from "../features/magic-context/__tests__/session-meta-fixture";
 
 import {
     getCompartments,
@@ -591,7 +592,7 @@ test("chunk windows, depth records and the replay slot are rebuilt rather than r
     expect(
         db
             .prepare(
-                "SELECT cached_m0_bytes AS m0, cached_m1_bytes AS m1 FROM session_meta WHERE session_id = ?",
+                "SELECT (SELECT value FROM session_render_cache WHERE session_id = session_meta.session_id AND cache_key = 'cached_m0_bytes') AS m0, (SELECT value FROM session_render_cache WHERE session_id = session_meta.session_id AND cache_key = 'cached_m1_bytes') AS m1 FROM session_meta WHERE session_id = ?",
             )
             .get("ses_a"),
     ).toEqual({ m0: null, m1: null });
@@ -1003,18 +1004,17 @@ for (const lane of [
         const h1 = getOrCreateSessionMeta(db, sessionId).systemPromptHash;
         expect(h1).not.toBe("");
 
-        db.prepare(
-            `UPDATE session_meta
-                SET coordinate_generation = ?, coordinate_rebase_notice = ?,
-                    cached_m0_bytes = X'6d30', cached_m1_bytes = X'6d31',
-                    cached_m0_system_hash = ?
-              WHERE session_id = ?`,
-        ).run(
-            lane.source,
-            JSON.stringify({ generation: lane.source, previousGeneration: lane.generation, at: 1 }),
-            h1,
-            sessionId,
-        );
+        patchSessionMeta(db, sessionId, {
+            coordinate_generation: lane.source,
+            coordinate_rebase_notice: JSON.stringify({
+                generation: lane.source,
+                previousGeneration: lane.generation,
+                at: 1,
+            }),
+            cached_m0_bytes: Buffer.from("6d30", "hex"),
+            cached_m1_bytes: Buffer.from("6d31", "hex"),
+            cached_m0_system_hash: h1,
+        });
 
         const projection =
             lane.generation === "v2" ? v2Projection(syntheticSplit) : v1Projection(sessionId);
@@ -1084,14 +1084,15 @@ test("a session whose coordinates already match the projection pays only the sta
             id: number;
         }
     ).id;
-    db.prepare(
-        `UPDATE session_meta
-            SET cached_m0_bytes = X'6d30', cached_m1_bytes = X'6d31',
-                cached_m0_system_hash = 'sys', cached_m0_max_compartment_seq = 1,
-                memory_block_cache = '<project-memory/>', memory_block_count = 1,
-                prior_boundary_ordinal = 4
-          WHERE session_id = ?`,
-    ).run("ses_a");
+    patchSessionMeta(db, "ses_a", {
+        cached_m0_bytes: Buffer.from("6d30", "hex"),
+        cached_m1_bytes: Buffer.from("6d31", "hex"),
+        cached_m0_system_hash: "sys",
+        cached_m0_max_compartment_seq: 1,
+        memory_block_cache: "<project-memory/>",
+        memory_block_count: 1,
+        prior_boundary_ordinal: 4,
+    });
     db.prepare(
         `INSERT INTO compartment_chunk_embeddings
             (compartment_id, session_id, project_path, harness, window_index, start_ordinal,
@@ -1509,9 +1510,10 @@ function insertStuckStampedSession(sessionId: string): void {
 
 test("a session already stamped with an overlapping unresolved row is repaired on the next pass, with no flip", () => {
     insertStuckStampedSession("ses_stuck");
-    db.prepare(
-        "UPDATE session_meta SET cached_m0_bytes = X'6d30', cached_m1_bytes = X'6d31' WHERE session_id = ?",
-    ).run("ses_stuck");
+    patchSessionMeta(db, "ses_stuck", {
+        cached_m0_bytes: Buffer.from("6d30", "hex"),
+        cached_m1_bytes: Buffer.from("6d31", "hex"),
+    });
     expect(validateStoredCompartments(getCompartments(db, "ses_stuck"))).toBe(
         "overlap before message 55 (saw 54-65)",
     );
@@ -1552,7 +1554,7 @@ test("a session already stamped with an overlapping unresolved row is repaired o
     expect(
         db
             .prepare(
-                "SELECT hex(cached_m0_bytes) AS m0, hex(cached_m1_bytes) AS m1 FROM session_meta WHERE session_id = ?",
+                "SELECT hex((SELECT value FROM session_render_cache WHERE session_id = session_meta.session_id AND cache_key = 'cached_m0_bytes')) AS m0, hex((SELECT value FROM session_render_cache WHERE session_id = session_meta.session_id AND cache_key = 'cached_m1_bytes')) AS m1 FROM session_meta WHERE session_id = ?",
             )
             .get("ses_stuck"),
     ).toEqual({ m0: "6D30", m1: "6D31" });
@@ -1622,7 +1624,7 @@ test("a defer pass after the repair replays the cached render byte-identical", (
     // holding rather than two renders that happen to agree.
     clearInjectionCache("ses_531_defer");
     db.prepare(
-        "UPDATE session_meta SET cached_m0_bytes = NULL, cached_m1_bytes = NULL WHERE session_id = ?",
+        "DELETE FROM session_render_cache WHERE cache_key IN ('cached_m0_bytes', 'cached_m1_bytes') AND session_id = ?",
     ).run("ses_531_defer");
     const rebuilt = renderPass(true);
     expect({ m0: rebuilt.m0Bytes?.toString("hex"), m1: rebuilt.m1Text }).not.toEqual(before);

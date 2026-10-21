@@ -1,3 +1,4 @@
+import { readSessionMetaCollection } from "../../plugin/src/features/magic-context/storage-session-collections";
 /**
  * Pi-side `<session-history>` injection — mirrors OpenCode's
  * `prepareCompartmentInjection` + `renderCompartmentInjection`
@@ -67,6 +68,11 @@ import {
 	readProjectDocsCanonical,
 } from "@magic-context/core/features/magic-context/storage";
 import { readSessionMeta } from "@magic-context/core/features/magic-context/storage-meta-session";
+import {
+	sessionRenderCacheSelect,
+	writeSessionRenderCache,
+} from "@magic-context/core/features/magic-context/storage-session-cache";
+import { writeSessionMetaCollection } from "@magic-context/core/features/magic-context/storage-session-collections";
 import {
 	getActiveUserMemories,
 	type UserMemory,
@@ -925,9 +931,10 @@ export function trimPiMessagesToCachedBoundary(
 			}
 		: (db
 				.prepare(
-					`SELECT cached_m0_bytes AS m0, cached_m1_bytes AS m1,
-					        cached_m0_last_baseline_end_message_id AS boundary
-					 FROM session_meta WHERE session_id = ?`,
+					`SELECT ${sessionRenderCacheSelect("cached_m0_bytes", "m0")},
+					    ${sessionRenderCacheSelect("cached_m1_bytes", "m1")},
+					    cached_m0_last_baseline_end_message_id AS boundary
+					FROM session_meta WHERE session_id = ?`,
 				)
 				.get(sessionId) as
 				| { m0?: unknown; m1?: unknown; boundary?: unknown }
@@ -2040,11 +2047,16 @@ export function materializeM0Pi(
 		// path, so they'd stay frozen at the last legacy value — wrong sidebar
 		// "Injected" count AND a stale ctx_search hide-already-visible filter after
 		// any memory change (e.g. migration delete+reinserts with new ids).
+		writeSessionMetaCollection(
+			db,
+			state.sessionId,
+			"memory_block_ids",
+			visibleIdsJson,
+		);
 		db.prepare(
-			"UPDATE session_meta SET memory_block_count = ?, memory_block_ids = ?, cached_m0_last_baseline_end_message_id = ?, cached_m0_score_selection_watermark = ? WHERE session_id = ?",
+			"UPDATE session_meta SET memory_block_count = ?, cached_m0_last_baseline_end_message_id = ?, cached_m0_score_selection_watermark = ? WHERE session_id = ?",
 		).run(
 			visibleMemoryIds.length,
-			visibleIdsJson,
 			snapshotMarkers.lastBaselineEndMessageId,
 			snapshotMarkers.scoreSelectionWatermark ?? 0,
 			state.sessionId,
@@ -2546,29 +2558,45 @@ function readCachedPiM0M1Row(
 	sessionId: string,
 ): CachedPiM0M1Row | null {
 	return db
-		.prepare(
-			`SELECT cached_m0_bytes, cached_m0_score_selection_watermark, cached_m0_mural_data_url,
-					cached_m0_mural_hash, cached_m1_bytes,
-					cached_m0_project_memory_epoch,
-					cached_m0_workspace_fingerprint,
-					cached_m0_project_user_profile_version,
-					cached_m0_max_compartment_seq,
-					cached_m0_max_memory_id,
-					cached_m0_max_mutation_id,
-					cached_m0_max_memory_mutation_id,
-					cached_m0_project_docs_hash,
-					cached_m0_materialized_at,
-					cached_m0_session_facts_version,
-					cached_m0_upgrade_state,
-					cached_m0_system_hash,
-					cached_m0_model_key,
-					cached_m0_project_identity,
-					cached_m0_last_baseline_end_message_id,
-					memory_block_ids
-			   FROM session_meta
+		.transaction(() => {
+			const row = db
+				.prepare(
+					`SELECT ${sessionRenderCacheSelect("cached_m0_bytes")},
+			    cached_m0_score_selection_watermark,
+			    ${sessionRenderCacheSelect("cached_m0_mural_data_url")},
+			    cached_m0_mural_hash,
+			    ${sessionRenderCacheSelect("cached_m1_bytes")},
+			    cached_m0_project_memory_epoch,
+			    cached_m0_workspace_fingerprint,
+			    cached_m0_project_user_profile_version,
+			    cached_m0_max_compartment_seq,
+			    cached_m0_max_memory_id,
+			    cached_m0_max_mutation_id,
+			    cached_m0_max_memory_mutation_id,
+			    cached_m0_project_docs_hash,
+			    cached_m0_materialized_at,
+			    cached_m0_session_facts_version,
+			    ${sessionRenderCacheSelect("cached_m0_upgrade_state")},
+			    cached_m0_system_hash,
+			    cached_m0_model_key,
+			    cached_m0_project_identity,
+			    cached_m0_last_baseline_end_message_id
+			FROM session_meta
 			  WHERE session_id = ?`,
-		)
-		.get(sessionId) as CachedPiM0M1Row | null;
+				)
+				.get(sessionId) as CachedPiM0M1Row | null;
+			return row
+				? {
+						...row,
+						memory_block_ids: readSessionMetaCollection(
+							db,
+							sessionId,
+							"memory_block_ids",
+						) as string | null,
+					}
+				: null;
+		})
+		.deferred();
 }
 
 export interface PiM0M1PassSnapshot {
@@ -2883,18 +2911,33 @@ function softRefreshCachedM1Pi(args: {
 		steps.mark("m1Render");
 
 		args.db
-			.prepare(
-				`UPDATE session_meta SET cached_m1_bytes = ?, cached_m0_last_baseline_end_message_id = ?,
-				 memory_block_count = ?, memory_block_ids = ?, cached_m0_upgrade_state = ? WHERE session_id = ?`,
-			)
-			.run(
-				m1Bytes,
-				advancedBoundary,
-				visibleMemoryIds.length,
-				visibleIdsJson,
-				withCachedM0MemoryIds(row.cached_m0_upgrade_state, renderedM0Ids),
-				args.state.sessionId,
-			);
+			.transaction(() => {
+				writeSessionRenderCache(
+					args.db,
+					args.state.sessionId,
+					"cached_m1_bytes",
+					m1Bytes,
+				);
+				writeSessionMetaCollection(
+					args.db,
+					args.state.sessionId,
+					"memory_block_ids",
+					visibleIdsJson,
+				);
+				writeSessionRenderCache(
+					args.db,
+					args.state.sessionId,
+					"cached_m0_upgrade_state",
+					withCachedM0MemoryIds(row.cached_m0_upgrade_state, renderedM0Ids),
+				);
+				args.db
+					.prepare(
+						`UPDATE session_meta SET cached_m0_last_baseline_end_message_id = ?,
+				 memory_block_count = ? WHERE session_id = ?`,
+					)
+					.run(advancedBoundary, visibleMemoryIds.length, args.state.sessionId);
+			})
+			.immediate();
 		writeSoftProjection(args.db, {
 			sessionId: args.state.sessionId,
 			projectPath,
@@ -3450,11 +3493,13 @@ export function injectM0M1Pi(
 	// SOFT and defer passes that must not read them.
 	const memoryCount = parseMemoryBlockIds(
 		(
-			db
-				.prepare(
-					"SELECT memory_block_ids FROM session_meta WHERE session_id = ?",
-				)
-				.get(state.sessionId) as { memory_block_ids: string | null } | null
+			{
+				memory_block_ids: readSessionMetaCollection(
+					db,
+					state.sessionId,
+					"memory_block_ids",
+				),
+			} as { memory_block_ids: string | null } | null
 		)?.memory_block_ids ?? null,
 	).length;
 	const result: PiM0M1InjectionResult = {

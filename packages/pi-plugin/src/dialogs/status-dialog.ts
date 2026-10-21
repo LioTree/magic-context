@@ -48,6 +48,7 @@ import {
 	getSessionWorkMetrics,
 } from "@magic-context/core/features/magic-context/storage-meta-persisted";
 import { getNotes } from "@magic-context/core/features/magic-context/storage-notes";
+import { sessionRenderCacheSelect } from "@magic-context/core/features/magic-context/storage-session-cache";
 import { getTagsBySession } from "@magic-context/core/features/magic-context/storage-tags";
 import { getEmbedDrainUiStatus } from "@magic-context/core/hooks/magic-context/embed-session-state";
 import { resolveExecuteThresholdDetail } from "@magic-context/core/hooks/magic-context/event-resolvers";
@@ -1400,7 +1401,14 @@ function readSessionMetaRow(db: ContextDatabase, sessionId: string) {
 				historian_last_error: string | null;
 			}
 		>(
-			"SELECT memory_block_cache, memory_block_count, cached_m0_bytes, cached_m1_bytes, historian_failure_count, historian_last_failure_at, historian_last_error FROM session_meta WHERE session_id = ?",
+			`SELECT ${sessionRenderCacheSelect("memory_block_cache")},
+			    memory_block_count,
+			    ${sessionRenderCacheSelect("cached_m0_bytes")},
+			    ${sessionRenderCacheSelect("cached_m1_bytes")},
+			    historian_failure_count,
+			    historian_last_failure_at,
+			    historian_last_error
+			FROM session_meta WHERE session_id = ?`,
 		)
 		.get(sessionId);
 }

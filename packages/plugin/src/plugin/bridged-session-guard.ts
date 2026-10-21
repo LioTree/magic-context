@@ -1,4 +1,5 @@
 import type { Hooks, ToolDefinition } from "@opencode-ai/plugin";
+import { deleteSessionMetaWithPayloads } from "../features/magic-context/storage-session-payloads";
 import {
     BRIDGED_SESSIONS_KEY,
     hasBridgedSessions,
@@ -123,24 +124,21 @@ function deletedBridgedSessionId(event: unknown): string | undefined {
 }
 
 /**
- * Remove the two rows OpenCode 1's `session.created` handler wrote for a
+ * Remove the metadata and project state OpenCode 1's `session.created` handler wrote for a
  * session that was enrolled in a bridge afterwards: its `session_meta` row
  * (subagent flag, cache TTL) and its `session_projects` row (project
  * identity). The bridge enrolls sessions that already exist, so their
  * `session.created` can reach Magic Context before the enrollment does (a
  * session enrolled earlier has its `session.created` stood down and owns no
- * rows here). Every hook after enrollment stands down, including the normal
- * `session.deleted` cleanup. This removes exactly
- * those rows and nothing else: in bridge mode other writers may own further
- * rows for the same session, and cleaning those up is the bridge's job.
+ * rows here). After enrollment every hook skips the session, including normal
+ * `session.deleted` cleanup. Remove that metadata, its separately stored payloads,
+ * and the project row. Other writers may own further rows for the same session;
+ * cleaning those up remains the bridge's job.
  */
 export function dropBridgedSessionCreatedRows(db: Database, sessionId: string): void {
     const harness = getHarness();
     db.transaction(() => {
-        db.prepare("DELETE FROM session_meta WHERE session_id = ? AND harness = ?").run(
-            sessionId,
-            harness,
-        );
+        deleteSessionMetaWithPayloads(db, sessionId, harness);
         db.prepare("DELETE FROM session_projects WHERE session_id = ? AND harness = ?").run(
             sessionId,
             harness,

@@ -63,6 +63,15 @@ import {
     readProjectDocsCanonical,
 } from "../../features/magic-context/storage";
 import {
+    sessionRenderCacheSelect,
+    sessionRenderCacheValueSql,
+    writeSessionRenderCache,
+} from "../../features/magic-context/storage-session-cache";
+import {
+    readSessionMetaCollection,
+    writeSessionMetaCollection,
+} from "../../features/magic-context/storage-session-collections";
+import {
     getActiveUserMemories,
     type UserMemory,
 } from "../../features/magic-context/user-memory/storage-user-memory";
@@ -262,14 +271,31 @@ export function getVisibleMemoryIds(db: Database, sessionId: string): Set<number
         const projected = readFullyVisibleMemoryIds(db, sessionId);
         if (projected !== undefined) return projected.size > 0 ? projected : null;
         const row = db
-            .prepare(
-                "SELECT memory_block_ids, cached_m0_bytes, cached_m1_bytes FROM session_meta WHERE session_id = ?",
-            )
-            .get(sessionId) as {
-            memory_block_ids: string | null;
-            cached_m0_bytes: Buffer | Uint8Array | null;
-            cached_m1_bytes: Buffer | Uint8Array | null;
-        } | null;
+            .transaction(() => {
+                const header = db
+                    .prepare(
+                        `SELECT ${sessionRenderCacheSelect("cached_m0_bytes")},
+                    ${sessionRenderCacheSelect("cached_m1_bytes")}
+                FROM session_meta WHERE session_id = ?`,
+                    )
+                    .get(sessionId) as
+                    | {
+                          cached_m0_bytes: Buffer | Uint8Array | null;
+                          cached_m1_bytes: Buffer | Uint8Array | null;
+                      }
+                    | undefined;
+                return header
+                    ? {
+                          ...header,
+                          memory_block_ids: readSessionMetaCollection(
+                              db,
+                              sessionId,
+                              "memory_block_ids",
+                          ) as string | null,
+                      }
+                    : null;
+            })
+            .deferred();
         if (!row?.memory_block_ids) return null;
         const parsed = JSON.parse(row.memory_block_ids) as unknown;
         if (!Array.isArray(parsed)) return null;
@@ -555,12 +581,10 @@ export function prepareCompartmentInjection(
     if (projectPath) {
         // Use cached memory block to avoid cache busting on background changes (ctx_memory write, promotion).
         // Cache is cleared by replaceSessionFacts/replaceAllCompartmentState after historian/compressor/recomp.
-        // Audit note: `as` cast is safe here — session_meta schema is owned by this plugin and the two
-        // columns are guaranteed present after initializeDatabase(). A type guard would add overhead on a
-        // hot path (every transform) for a table we fully control.
+        // Read the stable payload and its count in the same SQLite snapshot.
         const cachedMemory = db
             .prepare(
-                "SELECT memory_block_cache, memory_block_count FROM session_meta WHERE session_id = ?",
+                `SELECT ${sessionRenderCacheSelect("memory_block_cache")}, memory_block_count FROM session_meta WHERE session_id = ?`,
             )
             .get(sessionId) as { memory_block_cache: string; memory_block_count: number } | null;
 
@@ -587,9 +611,18 @@ export function prepareCompartmentInjection(
             // proceed with a one-turn cache miss than crash the user's prompt.
             // Issue: https://github.com/cortexkit/magic-context/issues/23
             try {
-                db.prepare(
-                    "UPDATE session_meta SET memory_block_cache = ?, memory_block_count = ?, memory_block_ids = ? WHERE session_id = ?",
-                ).run(memoryBlock ?? "", memoryCount, JSON.stringify(renderedIds), sessionId);
+                db.transaction(() => {
+                    writeSessionRenderCache(db, sessionId, "memory_block_cache", memoryBlock ?? "");
+                    writeSessionMetaCollection(
+                        db,
+                        sessionId,
+                        "memory_block_ids",
+                        JSON.stringify(renderedIds),
+                    );
+                    db.prepare(
+                        "UPDATE session_meta SET memory_block_count = ? WHERE session_id = ?",
+                    ).run(memoryCount, sessionId);
+                }).immediate();
             } catch (error) {
                 const code = (error as { code?: string } | null)?.code;
                 if (code === "SQLITE_BUSY") {
@@ -830,7 +863,7 @@ function readCachedBaselineState(
 ): { hasCachedM0: boolean; boundary: string | null } {
     const row = db
         .prepare(
-            "SELECT cached_m0_bytes AS m0, cached_m0_last_baseline_end_message_id AS boundary FROM session_meta WHERE session_id = ?",
+            `SELECT ${sessionRenderCacheSelect("cached_m0_bytes", "m0")}, cached_m0_last_baseline_end_message_id AS boundary FROM session_meta WHERE session_id = ?`,
         )
         .get(sessionId) as { m0: unknown; boundary: string | null } | undefined;
     const boundary = row?.boundary;
@@ -2914,13 +2947,18 @@ export function materializeM0(options: M0M1RenderOptions): MaterializeM0Result {
         // dogfood 2026-05-30: AFT showed "Injected 256" against 124 live memories,
         // all 256 ids deleted. Same transaction as the m[0] snapshot so the cached
         // bytes and their id manifest never diverge.
+        writeSessionMetaCollection(
+            options.db,
+            options.sessionId,
+            "memory_block_ids",
+            visibleIdsJson,
+        );
         options.db
             .prepare(
-                "UPDATE session_meta SET memory_block_count = ?, memory_block_ids = ?, cached_m0_last_baseline_end_message_id = ?, cached_m0_score_selection_watermark = ? WHERE session_id = ?",
+                "UPDATE session_meta SET memory_block_count = ?, cached_m0_last_baseline_end_message_id = ?, cached_m0_score_selection_watermark = ? WHERE session_id = ?",
             )
             .run(
                 visibleMemoryIds.length,
-                visibleIdsJson,
                 baselineEndMessageId,
                 snapshotMarkers.scoreSelectionWatermark ?? 0,
                 options.sessionId,
@@ -3662,30 +3700,46 @@ export function hydrateCachedM0Mural(db: Database, sessionId: string, state: M0M
 
 function readCachedM0M1Row(db: Database, sessionId: string): CachedM0M1Row | null {
     return db
-        .prepare(
-            `SELECT cached_m0_bytes, cached_m0_score_selection_watermark, cached_m0_mural_data_url,
-                    cached_m0_mural_hash, cached_m1_bytes,
-                    cached_m0_project_memory_epoch,
-                    cached_m0_workspace_fingerprint,
-                    cached_m0_project_user_profile_version,
-                    cached_m0_max_compartment_seq,
-                    cached_m0_max_memory_id,
-                    cached_m0_max_mutation_id,
-                    cached_m0_max_memory_mutation_id,
-                    cached_m0_project_docs_hash,
-                    cached_m0_materialized_at,
-                    cached_m0_session_facts_version,
-                     cached_m0_upgrade_state,
-                     cached_m0_system_hash,
-                     cached_m0_tool_set_hash,
-                     cached_m0_model_key,
-                     cached_m0_project_identity,
-                     cached_m0_last_baseline_end_message_id,
-                     memory_block_ids
-               FROM session_meta
+        .transaction(() => {
+            const row = db
+                .prepare(
+                    `SELECT ${sessionRenderCacheSelect("cached_m0_bytes")},
+                cached_m0_score_selection_watermark,
+                ${sessionRenderCacheSelect("cached_m0_mural_data_url")},
+                cached_m0_mural_hash,
+                ${sessionRenderCacheSelect("cached_m1_bytes")},
+                cached_m0_project_memory_epoch,
+                cached_m0_workspace_fingerprint,
+                cached_m0_project_user_profile_version,
+                cached_m0_max_compartment_seq,
+                cached_m0_max_memory_id,
+                cached_m0_max_mutation_id,
+                cached_m0_max_memory_mutation_id,
+                cached_m0_project_docs_hash,
+                cached_m0_materialized_at,
+                cached_m0_session_facts_version,
+                ${sessionRenderCacheSelect("cached_m0_upgrade_state")},
+                cached_m0_system_hash,
+                cached_m0_tool_set_hash,
+                cached_m0_model_key,
+                cached_m0_project_identity,
+                cached_m0_last_baseline_end_message_id
+            FROM session_meta
               WHERE session_id = ?`,
-        )
-        .get(sessionId) as CachedM0M1Row | null;
+                )
+                .get(sessionId) as CachedM0M1Row | null;
+            return row
+                ? {
+                      ...row,
+                      memory_block_ids: readSessionMetaCollection(
+                          db,
+                          sessionId,
+                          "memory_block_ids",
+                      ) as string | null,
+                  }
+                : null;
+        })
+        .deferred();
 }
 
 function markersFromCachedRow(row: CachedM0M1Row): M0SnapshotMarkers | null {
@@ -3894,23 +3948,30 @@ function softRefreshCachedM1(options: M0M1RenderOptions): RenderM1Result {
         steps.mark("m1Render");
 
         options.db
-            .prepare(
-                `UPDATE session_meta
-                    SET cached_m1_bytes = ?,
-                        cached_m0_last_baseline_end_message_id = ?,
-                        memory_block_count = ?,
-                        memory_block_ids = ?,
-                        cached_m0_upgrade_state = ?
+            .transaction(() => {
+                writeSessionRenderCache(options.db, options.sessionId, "cached_m1_bytes", m1Bytes);
+                writeSessionMetaCollection(
+                    options.db,
+                    options.sessionId,
+                    "memory_block_ids",
+                    visibleIdsJson,
+                );
+                writeSessionRenderCache(
+                    options.db,
+                    options.sessionId,
+                    "cached_m0_upgrade_state",
+                    withCachedM0MemoryIds(row.cached_m0_upgrade_state, renderedM0Ids),
+                );
+                options.db
+                    .prepare(
+                        `UPDATE session_meta
+                    SET cached_m0_last_baseline_end_message_id = ?,
+                        memory_block_count = ?
                   WHERE session_id = ?`,
-            )
-            .run(
-                m1Bytes,
-                baselineEndMessageId,
-                visibleMemoryIds.length,
-                visibleIdsJson,
-                withCachedM0MemoryIds(row.cached_m0_upgrade_state, renderedM0Ids),
-                options.sessionId,
-            );
+                    )
+                    .run(baselineEndMessageId, visibleMemoryIds.length, options.sessionId);
+            })
+            .immediate();
         writeSoftProjection(options.db, {
             sessionId: options.sessionId,
             projectPath: options.projectPath,
@@ -4678,7 +4739,7 @@ export function prepareCachedM0M1Replay(
 export function hasCompleteCachedM0M1(db: Database, sessionId: string): boolean {
     const row = db
         .prepare(
-            "SELECT length(cached_m0_bytes) > 0 AND length(cached_m1_bytes) > 0 AS complete FROM session_meta WHERE session_id = ?",
+            `SELECT length(${sessionRenderCacheValueSql("cached_m0_bytes")}) > 0 AND length(${sessionRenderCacheValueSql("cached_m1_bytes")}) > 0 AS complete FROM session_meta WHERE session_id = ?`,
         )
         .get(sessionId) as { complete: number | null } | null;
     return row?.complete === 1;

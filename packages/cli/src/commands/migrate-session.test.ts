@@ -10,6 +10,7 @@ import {
 } from "@magic-context/core/features/magic-context/storage";
 import { SubcModuleTransport } from "@magic-context/core/hooks/magic-context/module-transport";
 import { Database } from "@magic-context/core/shared/sqlite";
+import { seedSessionMeta } from "../../../plugin/src/features/magic-context/__tests__/session-meta-fixture";
 import { createTestTempDirFromPath } from "../../../plugin/src/shared/test-temp-dir";
 import { promptIO } from "../lib/prompts";
 
@@ -91,11 +92,11 @@ function makeContextDb(): Database {
             session_id TEXT NOT NULL,
             project_path TEXT NOT NULL
         );
-        CREATE TABLE session_meta (
-            session_id TEXT PRIMARY KEY,
-            cached_m0_bytes BLOB,
-            cached_m1_bytes BLOB
-        );
+        CREATE TABLE session_meta (session_id TEXT PRIMARY KEY);
+        CREATE TABLE session_render_cache (
+            session_id TEXT NOT NULL, cache_key TEXT NOT NULL, value BLOB NOT NULL,
+            PRIMARY KEY(session_id, cache_key)
+        ) WITHOUT ROWID;
         CREATE TABLE project_state (
             project_path TEXT PRIMARY KEY,
             project_memory_epoch INTEGER NOT NULL DEFAULT 0,
@@ -162,10 +163,7 @@ function seedSession(oc: Database, ctx: Database): void {
     ctx.prepare(
         "INSERT INTO compartment_chunk_embeddings (session_id, project_path) VALUES (?, ?)",
     ).run(SID, FROM);
-    ctx.prepare("INSERT INTO session_meta (session_id, cached_m0_bytes) VALUES (?, ?)").run(
-        SID,
-        new Uint8Array([9]),
-    );
+    seedSessionMeta(ctx, { session_id: SID, cached_m0_bytes: new Uint8Array([9]) });
 }
 
 function makeDeps(oc: Database, ctx: Database, targetIsGit = true): MigrateSessionDeps {
@@ -358,7 +356,9 @@ describe("applyMigrateSession — OpenCode + context re-stamp", () => {
         ).c;
         expect(remainingOldChunks).toBe(0);
         const meta = ctx
-            .prepare("SELECT cached_m0_bytes FROM session_meta WHERE session_id = ?")
+            .prepare(
+                "SELECT (SELECT value FROM session_render_cache WHERE session_id=session_meta.session_id AND cache_key='cached_m0_bytes') AS cached_m0_bytes FROM session_meta WHERE session_id = ?",
+            )
             .get(SID) as { cached_m0_bytes: unknown };
         expect(meta.cached_m0_bytes).toBeNull();
         // "leave" → no memory movement, no epoch bump.

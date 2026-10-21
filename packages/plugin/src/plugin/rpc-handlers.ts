@@ -60,6 +60,10 @@ import {
     getCompactionMarkerHealth,
     getObservedEpochFloor,
 } from "../features/magic-context/storage-meta-persisted";
+import {
+    SESSION_RENDER_CACHE_COLUMNS,
+    sessionRenderCacheSelect,
+} from "../features/magic-context/storage-session-cache";
 import { getMeasuredToolDefinitionTokens } from "../features/magic-context/tool-definition-tokens";
 import {
     computeOpenCodeWorkMetricsIncremental,
@@ -236,7 +240,7 @@ export function buildSidebarSnapshot(
 
         const meta = db
             .prepare<[string], Record<string, unknown>>(
-                "SELECT * FROM session_meta WHERE session_id = ?",
+                `SELECT *, ${SESSION_RENDER_CACHE_COLUMNS.map((column) => sessionRenderCacheSelect(column)).join(", ")} FROM session_meta WHERE session_id = ?`,
             )
             .get(sessionId);
 

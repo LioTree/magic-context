@@ -1,11 +1,11 @@
-//! Historical context.db upgrades for starting versions 87 through 102.
+//! Historical context.db upgrades for starting versions 87 through 103.
 //!
 //! Starting versions 0 through 86 require identity repairs, embedding rebuilds,
 //! authority-trigger repairs, and host-evidence harness relabeling that this runner
 //! has not ported. Refuse them rather than silently skip required repairs.
 //! The caller supplies an open connection and a clock; this module never discovers host stores.
 
-use std::{fmt, time::Duration};
+use std::{collections::BTreeSet, fmt, time::Duration};
 
 use rusqlite::{params, types::ValueRef, Connection, OptionalExtension, TransactionBehavior};
 use serde::Deserialize;
@@ -15,6 +15,7 @@ use sha2::{Digest, Sha256};
 use crate::context_schema::{
     bootstrap::BOOTSTRAP_VERSION,
     fingerprints::{fingerprint, schema_snapshot},
+    session_payload_layout::layout_session_meta_bytes,
 };
 use crate::parity_schema_manifest::{ContentHash, ContextSchemaReport};
 
@@ -134,6 +135,9 @@ pub fn upgrade(db: &mut Connection, now_ms: i64) -> Result<ContextSchemaReport, 
 }
 
 fn apply(db: &Connection, step: &Step, now_ms: i64) -> Result<(), UpgradeError> {
+    if step.version == 103 {
+        return split_session_meta(db, step);
+    }
     if step.version == 94 {
         split_lkg(db, now_ms)?;
     }
@@ -523,4 +527,102 @@ fn stringify_js(raw: &RawValue) -> String {
             format!("{sign}{body}")
         }
     }
+}
+
+/// Preserve SQLite storage classes and raw bytes; replay documents are never parsed or reserialized.
+fn split_session_meta(db: &Connection, step: &Step) -> Result<(), UpgradeError> {
+    for name in [
+        "session_render_cache",
+        "session_meta_chunks",
+        "session_meta_collection_revisions",
+    ] {
+        let ddl = step
+            .sql
+            .iter()
+            .find(|sql| {
+                sql.trim_start()
+                    .starts_with(&format!("CREATE TABLE IF NOT EXISTS {name} ("))
+            })
+            .ok_or_else(|| UpgradeError::InvalidAsset(format!("missing {name} DDL")))?;
+        db.execute_batch(ddl)?;
+    }
+    for column in [
+        "cached_m0_bytes",
+        "cached_m1_bytes",
+        "cached_m0_mural_data_url",
+        "memory_block_cache",
+        "cached_m0_upgrade_state",
+    ] {
+        if !column_exists(db, "session_meta", column)? {
+            continue;
+        }
+        let predicate = if column == "memory_block_cache" {
+            format!("({column} IS NULL OR {column} != '')")
+        } else {
+            format!("{column} IS NOT NULL")
+        };
+        db.execute_batch(&format!("INSERT INTO session_render_cache(session_id,cache_key,value)
+            SELECT session_id,'{column}',{column} FROM session_meta WHERE {predicate}
+            ON CONFLICT(session_id,cache_key) DO UPDATE SET value=excluded.value WHERE value IS NOT excluded.value;
+            ALTER TABLE session_meta DROP COLUMN {column};"))?;
+    }
+    for (column, fallback) in [
+        ("trailing_blank_decisions", ""),
+        ("merged_reasoning_stripped_ids", ""),
+        ("note_nudge_anchors", "[]"),
+        ("auto_search_hint_decisions", "[]"),
+        ("stale_reduce_stripped_ids", ""),
+        ("stripped_placeholder_ids", ""),
+        ("processed_image_stripped_ids", ""),
+        ("memory_block_ids", ""),
+    ] {
+        if !column_exists(db, "session_meta", column)? {
+            continue;
+        }
+        let rows: Vec<(String, String, Option<Vec<u8>>)> = {
+            let mut statement = db.prepare(&format!("SELECT session_id,typeof({column}),CAST({column} AS BLOB) FROM session_meta WHERE {column} IS NULL OR {column} != ?1"))?;
+            let rows = statement.query_map([fallback], |row| {
+                Ok((row.get(0)?, row.get(1)?, row.get(2)?))
+            })?;
+            rows.collect::<Result<_, _>>()?
+        };
+        {
+            let mut upsert = db.prepare("INSERT INTO session_meta_chunks(session_id,column_name,chunk,body) VALUES (?1,?2,?3,?4)
+                ON CONFLICT(session_id,column_name,chunk) DO UPDATE SET body=excluded.body WHERE body IS NOT excluded.body")?;
+            let mut trim = db.prepare("DELETE FROM session_meta_chunks WHERE session_id=?1 AND column_name=?2 AND chunk=?3")?;
+            for (session, storage_type, bytes) in rows {
+                let marker = match storage_type.as_str() {
+                    "null" => rusqlite::types::Value::Null,
+                    "text" => rusqlite::types::Value::Blob(Vec::new()),
+                    value => rusqlite::types::Value::Text(value.into()),
+                };
+                upsert.execute(params![session, column, "-1", marker])?;
+                let pieces = bytes
+                    .as_deref()
+                    .map(layout_session_meta_bytes)
+                    .unwrap_or_default();
+                let mut kept: BTreeSet<String> =
+                    pieces.iter().map(|(key, _)| key.clone()).collect();
+                kept.insert("-1".into());
+                let previous: Vec<String> = {
+                    let mut query = db.prepare("SELECT chunk FROM session_meta_chunks WHERE session_id=?1 AND column_name=?2")?;
+                    let rows = query.query_map(params![session, column], |row| row.get(0))?;
+                    rows.collect::<Result<_, _>>()?
+                };
+                for (key, body) in pieces {
+                    upsert.execute(params![session, column, key, body])?;
+                }
+                for key in previous {
+                    if !kept.contains(&key) {
+                        trim.execute(params![session, column, key])?;
+                    }
+                }
+                if storage_type == "integer" || storage_type == "real" {
+                    db.execute(&format!("UPDATE session_meta_chunks SET body=(SELECT {column} FROM session_meta WHERE session_id=?1) WHERE session_id=?1 AND column_name=?2 AND chunk='-1'"),params![session,column])?;
+                }
+            }
+        }
+        db.execute_batch(&format!("ALTER TABLE session_meta DROP COLUMN {column}"))?;
+    }
+    Ok(())
 }

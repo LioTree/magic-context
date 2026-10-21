@@ -706,7 +706,7 @@ export type DreamerConfig = z.infer<typeof DreamerConfigSchema>;
 /**
  * Historian metadata remains harness-independent. Model resolution moves to strict
  * per-harness blocks; two_pass and disallowed_tools stay here. TypeScript hosts do
-  * not resolve models from historian.broca, but validate the block for ck-mc sessions.
+ * not resolve models from historian.broca, but validate the block for ck-mc sessions.
  */
 export const HistorianConfigSchema = AgentMetadataSchema.extend({
     expand_tools: z

@@ -641,7 +641,8 @@ mod tests {
                 tx.execute("INSERT INTO memory_history(memory_id,revision,previous_text,applied_at,reason,evidence_json,source_ids_json,decision_key) VALUES(1,1,'original text',1,'edit','[]','[]','older')", [])?;
                 tx.execute("INSERT INTO memory_journal(project_path,decision_key,operation,receipt_json,applied_at) VALUES('project','older','edit','{}',1)", [])?;
                 tx.execute("INSERT INTO memory_embeddings(memory_id,embedding,model_id) VALUES(1,?1,'model')", [vec![0_u8;8]])?;
-                tx.execute("INSERT INTO session_meta(session_id,served_prefix,cached_m0_bytes) VALUES('parent','frozen prefix',?1)", [b"frozen bytes".as_slice()])?;
+                tx.execute("INSERT INTO session_meta(session_id,served_prefix) VALUES ('parent','frozen prefix')", [])?;
+                tx.execute("INSERT INTO session_render_cache(session_id,cache_key,value) VALUES ('parent','cached_m0_bytes',?1)", [b"frozen bytes".as_slice()])?;
                 tx.execute("INSERT INTO project_state(project_path,project_memory_epoch) VALUES('project',7)", [])?;
                 if task == TaskName::ReviewUserMemories {
                     for id in 1..=3 {
@@ -761,7 +762,7 @@ mod tests {
             f.scalar("SELECT project_memory_epoch FROM project_state WHERE project_path='project'"),
             7
         );
-        let served: (String,Vec<u8>) = f.store.with_context_read(|db| db.query_row("SELECT served_prefix,cached_m0_bytes FROM session_meta WHERE session_id='parent'",[],|r| Ok((r.get(0)?,r.get(1)?)))).unwrap();
+        let served: (String,Vec<u8>) = f.store.with_context_read(|db| db.query_row("SELECT served_prefix,(SELECT value FROM session_render_cache WHERE session_id=session_meta.session_id AND cache_key='cached_m0_bytes') FROM session_meta WHERE session_id='parent'",[],|r| Ok((r.get(0)?,r.get(1)?)))).unwrap();
         assert_eq!(served, ("frozen prefix".into(), b"frozen bytes".to_vec()));
         assert_eq!(host.attempts().len(), 2);
         for request in &host.carrier.requests {

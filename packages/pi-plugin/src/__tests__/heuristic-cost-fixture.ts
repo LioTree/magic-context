@@ -1,3 +1,4 @@
+import { spyOn } from "bun:test";
 import { createHash } from "node:crypto";
 import { mkdirSync, mkdtempSync } from "node:fs";
 import { tmpdir } from "node:os";
@@ -7,7 +8,10 @@ import {
 	getNativeReplayState,
 	saveNativeToolInputs,
 } from "@magic-context/core/features/magic-context/storage-native-replay";
+import * as collections from "@magic-context/core/features/magic-context/storage-session-collections";
+import { sessionMetaCollectionSelect } from "@magic-context/core/features/magic-context/storage-session-collections";
 import { createTagger } from "@magic-context/core/features/magic-context/tagger";
+import { isSqliteTransactionOpen } from "@magic-context/core/shared/sqlite";
 import { tagTranscript } from "@magic-context/core/shared/tag-transcript";
 import { applyPiHeuristicCleanup } from "../heuristic-cleanup-pi";
 import {
@@ -29,6 +33,7 @@ export function runHeuristicCostFixture() {
 	const root = mkdtempSync(join(parent, "fixture-"));
 	const db = createTestDb(join(root, "context.db"));
 	const sessionId = "heuristic-cost-fixture";
+	let restoreDocumentObserver: (() => void) | undefined;
 	try {
 		const insert = db.prepare(`INSERT INTO tags
 			(session_id, message_id, type, status, byte_size, tag_number, harness)
@@ -123,9 +128,25 @@ export function runHeuristicCostFixture() {
 		const prepare = db.prepare.bind(db);
 		const exec = db.exec.bind(db);
 		let transactions = 0;
+		let readTransactions = 0;
+		let nativeChunkWrites = 0;
 		let autocommitDocumentWrites = 0;
+		const updateDocument = collections.updateSessionMetaCollection;
+		// One logical replay edit may publish several changed chunks.
+		const documentObserver = spyOn(
+			collections,
+			"updateSessionMetaCollection",
+		).mockImplementation((connection, id, column, value, expected) =>
+			connection === db && column === "trailing_blank_decisions"
+				? time("nativeDocumentWrites", () =>
+						updateDocument(connection, id, column, value, expected),
+					)
+				: updateDocument(connection, id, column, value, expected),
+		);
+		restoreDocumentObserver = () => documentObserver.mockRestore();
 		db.exec = (sql) => {
 			if (/^BEGIN/i.test(sql)) transactions++;
+			if (/^BEGIN(?:\s+DEFERRED)?\s*;?\s*$/i.test(sql)) readTransactions++;
 			return exec(sql);
 		};
 		db.prepare = ((sql: string) => {
@@ -135,24 +156,20 @@ export function runHeuristicCostFixture() {
 					const method = Reflect.get(target, key);
 					if (typeof method !== "function") return method;
 					return (...args: unknown[]) => {
-						const connection = db as unknown as {
-							inTransaction?: boolean;
-							isTransaction?: boolean;
-						};
 						if (
-							/UPDATE session_meta SET trailing_blank_decisions/.test(sql) &&
 							key === "run" &&
-							!connection.inTransaction &&
-							!connection.isTransaction
-						)
-							autocommitDocumentWrites++;
+							/^\s*(INSERT|UPDATE|DELETE)/i.test(sql) &&
+							sql.includes("session_meta_chunks") &&
+							args[1] === "trailing_blank_decisions"
+						) {
+							nativeChunkWrites++;
+							if (!isSqliteTransactionOpen(db)) autocommitDocumentWrites++;
+						}
 						const name = /FROM tags/.test(sql)
 							? "tagQueries"
-							: /UPDATE session_meta SET trailing_blank_decisions/.test(sql)
-								? "nativeDocumentWrites"
-								: /UPDATE tags/.test(sql)
-									? "tagWrites"
-									: "otherSql";
+							: /UPDATE tags/.test(sql)
+								? "tagWrites"
+								: "otherSql";
 						return time(name, () => {
 							const value = method.apply(target, args);
 							if (Array.isArray(value)) {
@@ -210,7 +227,7 @@ export function runHeuristicCostFixture() {
 		const replayDocument = (
 			db
 				.prepare(
-					"SELECT trailing_blank_decisions AS doc FROM session_meta WHERE session_id = ?",
+					`SELECT ${sessionMetaCollectionSelect("trailing_blank_decisions", "doc", db)} FROM session_meta WHERE session_id = ?`,
 				)
 				.get(sessionId) as { doc: string }
 		).doc;
@@ -220,6 +237,8 @@ export function runHeuristicCostFixture() {
 			root,
 			steps,
 			transactions,
+			readTransactions,
+			nativeChunkWrites,
 			autocommitDocumentWrites,
 			result,
 			hashes: {
@@ -232,6 +251,7 @@ export function runHeuristicCostFixture() {
 			replayDocument,
 		};
 	} finally {
+		restoreDocumentObserver?.();
 		db.close();
 	}
 }

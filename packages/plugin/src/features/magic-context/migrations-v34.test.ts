@@ -1,6 +1,7 @@
 import { describe, expect, test } from "bun:test";
 import { Database } from "../../shared/sqlite";
 import { closeQuietly } from "../../shared/sqlite-helpers";
+import { sessionMetaFixtureRow } from "./__tests__/session-meta-fixture";
 import { LATEST_MIGRATION_VERSION, runMigrations } from "./migrations";
 import { initializeDatabase, LATEST_SUPPORTED_VERSION } from "./storage-db";
 
@@ -146,9 +147,7 @@ describe("migration v34/v35 — workspaces", () => {
 
             runMigrations(db);
 
-            const row = db
-                .prepare("SELECT * FROM session_meta WHERE session_id = 's1'")
-                .get() as Record<string, unknown>;
+            const row = sessionMetaFixtureRow(db, "s1") as Record<string, unknown>;
             for (const column of CLEARED_NULL_COLUMNS) {
                 expect(row[column], column).toBeNull();
             }

@@ -1541,12 +1541,16 @@ pub fn get_context_token_breakdown(
     // snapshot (cached_m0_bytes). Measuring Σp1 instead overcounts the
     // Compartments bucket AND starves Conversation toward 0. Mirrors the
     // plugin sidebar fix (rpc-handlers.ts).
+    let payload_query = if table_exists(conn, "session_render_cache")
+        && !table_has_column(conn, "session_meta", "cached_m0_bytes")
+    {
+        "SELECT (SELECT value FROM session_render_cache WHERE session_id = ?1 AND cache_key = 'cached_m0_bytes'),
+                (SELECT value FROM session_render_cache WHERE session_id = ?1 AND cache_key = 'cached_m1_bytes')"
+    } else {
+        "SELECT cached_m0_bytes, cached_m1_bytes FROM session_meta WHERE session_id = ?1"
+    };
     let (m0_bytes, m1_bytes): (Option<Vec<u8>>, Option<Vec<u8>>) = conn
-        .query_row(
-            "SELECT cached_m0_bytes, cached_m1_bytes FROM session_meta WHERE session_id = ?1",
-            [session_id],
-            |r| Ok((r.get(0)?, r.get(1)?)),
-        )
+        .query_row(payload_query, [session_id], |r| Ok((r.get(0)?, r.get(1)?)))
         .unwrap_or((None, None));
     let m0_history = m0_bytes
         .as_ref()
@@ -1589,13 +1593,17 @@ pub fn get_context_token_breakdown(
         )
         .unwrap_or(0);
 
-    // Get memory block cache (rendered XML) and count from session_meta
+    // Read the rendered memory text and its count from one snapshot.
+    let memory_query = if table_exists(conn, "session_render_cache")
+        && !table_has_column(conn, "session_meta", "cached_m0_bytes")
+    {
+        "SELECT (SELECT value FROM session_render_cache WHERE session_id = ?1 AND cache_key = 'memory_block_cache'),
+                COALESCE(memory_block_count, 0) FROM session_meta WHERE session_id = ?1"
+    } else {
+        "SELECT memory_block_cache, COALESCE(memory_block_count, 0) FROM session_meta WHERE session_id = ?1"
+    };
     let (memory_cache_str, memory_count): (Option<String>, i64) = conn
-        .query_row(
-            "SELECT memory_block_cache, COALESCE(memory_block_count, 0) FROM session_meta WHERE session_id = ?1",
-            [session_id],
-            |r| Ok((r.get(0)?, r.get(1)?)),
-        )
+        .query_row(memory_query, [session_id], |r| Ok((r.get(0)?, r.get(1)?)))
         .unwrap_or((None, 0));
 
     let memory_chars = memory_cache_str
@@ -6525,6 +6533,47 @@ fn bump_session_facts_version_for_session(
 /// Routine memory, user-memory, and fact mutations must use scoped version counters instead.
 pub fn invalidate_all_memory_block_caches(conn: &Connection) -> Result<usize, rusqlite::Error> {
     crate::writer_diagnostics::statement("invalidate_memory_caches", || {
+        if table_exists(conn, "session_render_cache")
+            && !table_has_column(conn, "session_meta", "cached_m0_bytes")
+        {
+            let normalized = !table_has_column(conn, "session_meta", "memory_block_ids");
+            let ids = if normalized {
+                "session_id IN (SELECT session_id FROM session_meta_chunks WHERE column_name='memory_block_ids'
+                    AND (chunk>=0 OR (chunk=-1 AND (body='blob' OR typeof(body) IN ('integer','real')))))"
+            } else {
+                "memory_block_ids != ''"
+            };
+            conn.execute_batch("SAVEPOINT invalidate_memory_payloads")?;
+            let result = (|| -> Result<usize, rusqlite::Error> {
+                let sessions: Vec<String> = {
+                    let mut query = conn.prepare(&format!("SELECT session_id FROM session_meta WHERE {ids}
+                        OR cached_m0_max_memory_mutation_id IS NOT NULL
+                        OR session_id IN (SELECT session_id FROM session_render_cache
+                            WHERE (cache_key IN ('cached_m0_bytes','cached_m1_bytes') AND value IS NOT NULL)
+                               OR (cache_key='memory_block_cache' AND value != ''))"))?;
+                    let rows = query.query_map([], |row| row.get(0))?;
+                    rows.collect::<Result<_, _>>()?
+                };
+                let reset = if normalized {
+                    "UPDATE session_meta SET cached_m0_max_memory_mutation_id=NULL WHERE session_id=?1"
+                } else {
+                    "UPDATE session_meta SET memory_block_ids='',cached_m0_max_memory_mutation_id=NULL WHERE session_id=?1"
+                };
+                for session in &sessions {
+                    conn.execute(reset, [session])?;
+                    conn.execute("DELETE FROM session_render_cache WHERE session_id=?1 AND cache_key IN ('cached_m0_bytes','cached_m1_bytes','memory_block_cache')", [session])?;
+                    if normalized {
+                        conn.execute("DELETE FROM session_meta_chunks WHERE session_id=?1 AND column_name='memory_block_ids'", [session])?;
+                    }
+                }
+                Ok(sessions.len())
+            })();
+            if result.is_err() {
+                let _ = conn.execute_batch("ROLLBACK TO invalidate_memory_payloads");
+            }
+            conn.execute_batch("RELEASE invalidate_memory_payloads")?;
+            return result;
+        }
         conn.execute(
             "UPDATE session_meta
          SET memory_block_cache = '',
@@ -9321,6 +9370,80 @@ mod session_history_slice_tests {
             super::estimate_tokens(m0_chars) + super::estimate_tokens(m1_chars)
         );
         assert!(breakdown.compartment_tokens > super::estimate_tokens(m0_chars));
+    }
+
+    #[test]
+    fn separated_render_payloads_preserve_buckets_and_clear_all() {
+        let conn = rusqlite::Connection::open_in_memory().unwrap();
+        conn.execute_batch(
+            "CREATE TABLE session_meta (session_id TEXT, last_input_tokens INTEGER,
+                 system_prompt_tokens INTEGER, memory_block_count INTEGER,
+                 memory_block_ids TEXT DEFAULT '', cached_m0_max_memory_mutation_id INTEGER);
+             INSERT INTO session_meta VALUES ('s', 50000, 1000, 1, '[1]', 2);
+             CREATE TABLE session_render_cache (session_id TEXT, cache_key TEXT, value BLOB);
+             CREATE TABLE compartments (session_id TEXT, title TEXT, content TEXT);
+             CREATE TABLE session_facts (session_id TEXT);",
+        )
+        .unwrap();
+        let m0 = "<session-history>stable history</session-history>";
+        let m1 = "<session-history-since><new-compartments>new history</new-compartments></session-history-since>";
+        for (key, bytes) in [
+            ("cached_m0_bytes", m0.as_bytes()),
+            ("cached_m1_bytes", m1.as_bytes()),
+        ] {
+            conn.execute(
+                "INSERT INTO session_render_cache VALUES ('s', ?1, ?2)",
+                rusqlite::params![key, bytes],
+            )
+            .unwrap();
+        }
+        conn.execute("INSERT INTO session_render_cache VALUES ('s', 'memory_block_cache', '<project-memory>remember</project-memory>')", []).unwrap();
+        conn.execute(
+            "INSERT INTO session_render_cache VALUES ('s', 'cached_m0_mural_data_url', 'image')",
+            [],
+        )
+        .unwrap();
+        let breakdown = super::get_context_token_breakdown(&conn, "s")
+            .unwrap()
+            .unwrap();
+        assert_eq!(
+            breakdown.compartment_tokens,
+            super::estimate_tokens(extract_session_history_slice(m0).unwrap().len() as i64)
+                + super::estimate_tokens(extract_new_compartments_slice(m1).unwrap().len() as i64)
+        );
+        assert_eq!(
+            breakdown.memory_tokens,
+            super::estimate_tokens("<project-memory>remember</project-memory>".len() as i64)
+        );
+        assert_eq!(super::invalidate_all_memory_block_caches(&conn).unwrap(), 1);
+        assert_eq!(
+            conn.query_row("SELECT COUNT(*) FROM session_render_cache", [], |r| r
+                .get::<_, i64>(0))
+                .unwrap(),
+            1
+        );
+        assert_eq!(super::invalidate_all_memory_block_caches(&conn).unwrap(), 0);
+    }
+
+    #[test]
+    fn normalized_manifest_clear_preserves_null_rows_and_the_callers_transaction() {
+        let conn = rusqlite::Connection::open_in_memory().unwrap();
+        conn.execute_batch("CREATE TABLE session_meta(session_id TEXT PRIMARY KEY, cached_m0_max_memory_mutation_id INTEGER);
+            INSERT INTO session_meta VALUES ('changed',NULL),('null-only',NULL);
+            CREATE TABLE session_render_cache(session_id TEXT,cache_key TEXT,value BLOB);
+            INSERT INTO session_render_cache VALUES ('changed','cached_m0_mural_data_url','keep'),('null-only','memory_block_cache',NULL);
+            CREATE TABLE session_meta_chunks(session_id TEXT,column_name TEXT,chunk TEXT,body BLOB);
+            INSERT INTO session_meta_chunks VALUES ('changed','memory_block_ids','-1',X''),('changed','memory_block_ids','0',CAST('[1]' AS BLOB));
+            BEGIN IMMEDIATE;").unwrap();
+        assert_eq!(super::invalidate_all_memory_block_caches(&conn).unwrap(),1);
+        assert!(!conn.is_autocommit());
+        assert_eq!(conn.query_row("SELECT COUNT(*) FROM session_meta_chunks",[],|r|r.get::<_,i64>(0)).unwrap(),0);
+        conn.execute_batch("ROLLBACK").unwrap();
+        assert_eq!(conn.query_row("SELECT COUNT(*) FROM session_meta_chunks",[],|r|r.get::<_,i64>(0)).unwrap(),2);
+        assert_eq!(super::invalidate_all_memory_block_caches(&conn).unwrap(),1);
+        assert_eq!(super::invalidate_all_memory_block_caches(&conn).unwrap(),0);
+        assert_eq!(conn.query_row("SELECT COUNT(*) FROM session_render_cache WHERE session_id='null-only' AND value IS NULL",[],|r|r.get::<_,i64>(0)).unwrap(),1);
+        assert_eq!(conn.query_row("SELECT COUNT(*) FROM session_render_cache WHERE cache_key='cached_m0_mural_data_url'",[],|r|r.get::<_,i64>(0)).unwrap(),1);
     }
 
     #[test]

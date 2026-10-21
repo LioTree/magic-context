@@ -7,6 +7,10 @@ import { getMergedReasoningStrippedIds } from "@magic-context/core/features/magi
 import { pairedThinkingEdit } from "@magic-context/core/hooks/magic-context/paired-thinking-edit";
 import * as writeTiming from "@magic-context/core/shared/write-transaction-timing";
 import {
+	sessionMetaCollectionSelect,
+	updateSessionMetaCollection,
+} from "../../plugin/src/features/magic-context/storage-session-collections";
+import {
 	__test,
 	clearContextHandlerSession,
 	registerPiContextHandler,
@@ -155,9 +159,12 @@ it("a stale companion plan rolls back its edit without overwriting a peer's ledg
 			entryIds: ["ours"],
 		});
 		const peer = JSON.stringify(["binding_mismatch:peer"]);
-		db.prepare(
-			"UPDATE session_meta SET merged_reasoning_stripped_ids = ? WHERE session_id = ?",
-		).run(peer, sessionId);
+		updateSessionMetaCollection(
+			db,
+			sessionId,
+			"merged_reasoning_stripped_ids",
+			peer,
+		);
 		expect(() =>
 			pairedThinkingEdit({
 				db,
@@ -172,7 +179,7 @@ it("a stale companion plan rolls back its edit without overwriting a peer's ledg
 		).toThrow("Thinking omission plan changed");
 		const row = db
 			.prepare(
-				"SELECT counter, merged_reasoning_stripped_ids FROM session_meta WHERE session_id = ?",
+				`SELECT counter, ${sessionMetaCollectionSelect("merged_reasoning_stripped_ids", "merged_reasoning_stripped_ids", db)} FROM session_meta WHERE session_id = ?`,
 			)
 			.get(sessionId);
 		expect(row).toEqual({ counter: 0, merged_reasoning_stripped_ids: peer });

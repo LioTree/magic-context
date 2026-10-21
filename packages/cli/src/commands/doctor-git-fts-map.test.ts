@@ -8,6 +8,7 @@ import {
     LATEST_SUPPORTED_VERSION,
 } from "@magic-context/core/features/magic-context/storage-db";
 import { Database } from "@magic-context/core/shared/sqlite";
+import { sessionMetaFixtureRows } from "../../../plugin/src/features/magic-context/__tests__/session-meta-fixture";
 import { createTestTempDir } from "../../../plugin/src/shared/test-temp-dir";
 import { inspectGitFtsMap, runDoctorGitFtsMap, runDoctorGitFtsMapCli } from "./doctor-git-fts-map";
 
@@ -73,7 +74,7 @@ test("offline repair verifies a paired backup before replacing only map inventor
     mutate("DELETE FROM git_commit_fts_rowid_map; DELETE FROM schema_migrations WHERE version>=95");
     const before = read();
     const fts = before.prepare("SELECT rowid,* FROM git_commits_fts ORDER BY rowid").all();
-    const meta = before.prepare("SELECT * FROM session_meta").all();
+    const meta = sessionMetaFixtureRows(before);
     before.close();
     let verified = false;
     expect(
@@ -123,7 +124,7 @@ test("offline repair verifies a paired backup before replacing only map inventor
         expect(after.prepare("SELECT rowid,* FROM git_commits_fts ORDER BY rowid").all()).toEqual(
             fts,
         );
-        expect(after.prepare("SELECT * FROM session_meta").all()).toEqual(meta);
+        expect(sessionMetaFixtureRows(after)).toEqual(meta);
         expect(after.prepare("SELECT MAX(version) AS v FROM schema_migrations").get()).toEqual({
             v: 94,
         });
