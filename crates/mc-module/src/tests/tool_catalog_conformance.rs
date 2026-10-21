@@ -23,7 +23,6 @@ use cortexkit_role_tool_provider_conformance::{
     run_suite, CallSpec, Capability, CaseOutcome, Exchange, ObservedFrame, RouteFailure,
     ScopedPrincipals, SuiteVerdict, ToolProviderSubject, ToolRoute, CASES,
 };
-use subc_protocol::ErrorBody;
 
 use super::*;
 
@@ -114,14 +113,22 @@ impl ToolRoute for Route {
                     RouteFailure::new(format!("a response that is not JSON: {error}"))
                 })?)
             }
-            HandlerOutcome::Error { code, message } => {
-                ObservedFrame::Error(ErrorBody::new(code, message))
-            }
+            HandlerOutcome::Error { code, message } => ObservedFrame::Error(
+                serde_json::from_value(json!({
+                    "code": code, "message": message
+                }))
+                .unwrap(),
+            ),
             HandlerOutcome::ErrorWithDetail {
                 code,
                 message,
                 detail,
-            } => ObservedFrame::Error(ErrorBody::new(code, message).with_detail(detail)),
+            } => ObservedFrame::Error(
+                serde_json::from_value(json!({
+                    "code": code, "message": message, "detail": detail
+                }))
+                .unwrap(),
+            ),
             HandlerOutcome::Streamed => ObservedFrame::StreamEnd,
         };
         Ok(Exchange {
