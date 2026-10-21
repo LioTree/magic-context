@@ -484,6 +484,13 @@ test("incremental runs match full re-evaluation across the 24-hour, 48-hour and 
     attempt({ session: "d1", status: "failed", time: Rd - 2 * DAY + 1, error: "doubling class D", task: "double" });
     attempt({ session: "d2", status: "failed", time: Rd - 3 * HOUR, error: "doubling class D", task: "double" });
     attempt({ session: "d3", status: "failed", time: Rd - SETTLE - 500, error: "doubling class D", task: "double" });
+    // Class E has two failures just inside its prior day and three in the current
+    // one, so it has not doubled; counting only one of the prior pair would say it had.
+    attempt({ session: "e1", status: "failed", time: Rd - 2 * DAY + 1, error: "doubling class E", task: "double-e" });
+    attempt({ session: "e2", status: "failed", time: Rd - 2 * DAY + 2, error: "doubling class E", task: "double-e" });
+    attempt({ session: "e3", status: "failed", time: Rd - 5 * HOUR, error: "doubling class E", task: "double-e" });
+    attempt({ session: "e4", status: "failed", time: Rd - 4 * HOUR, error: "doubling class E", task: "double-e" });
+    attempt({ session: "e5", status: "failed", time: Rd - SETTLE - 400, error: "doubling class E", task: "double-e" });
     // Seven days after K's failure, K's is gone from the window and L's is not.
     // The regular run at B + 7d settles rows up to 1 s before R7's bound, so these land in R7.
     const R7 = B + 1_000 + 7 * DAY;
@@ -511,7 +518,7 @@ test("incremental runs match full re-evaluation across the 24-hour, 48-hour and 
     expect(rules(Rp)).toEqual([]);
     expect(rules(Rq)).toContain("new_class:quota-y");
     expect(byRun.get(Rs)!.find((alert) => alert.rule === "failure_share")).toMatchObject({ task: "share-x", count: 2, share: 0.25, empty: 1 });
-    expect(byRun.get(Rd)!.find((alert) => alert.rule === "class_doubled")).toMatchObject({ task: "double", count: 2 });
+    expect(byRun.get(Rd)!.filter((alert) => alert.rule === "class_doubled")).toMatchObject([{ task: "double", count: 2 }]);
     expect(rules(R7)).toEqual(["new_class:edge-k"]);
 }, 30_000);
 
