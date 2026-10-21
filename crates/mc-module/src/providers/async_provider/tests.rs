@@ -854,7 +854,9 @@ fn part_edit_bytes_participate_in_digest() {
             )],
         )],
     );
-    let view = checked_async_view(view).unwrap();
+    let view = checked_async_view(view, codec::Codec::OwnedBroca, &Default::default())
+        .unwrap()
+        .unwrap();
     assert_eq!(view.digest, independent_digest(&view));
     let mut changed = view.clone();
     if let view::ViewRange::Keep { edits, .. } = &mut changed.ranges[0] {
@@ -1611,7 +1613,7 @@ async fn synthetic_ids_never_fall_back_to_positional_transcript_matches() {
         replacement: vec![original.ck],
     };
     let wire:OutboundMessage=decode(&json!({"compaction_id":"proof","version":1,"range":{"from":0,"to":1},"replacement":[{"info":{"id":"synthetic-todo","role":"user"},"parts":[{"id":"synthetic-part","type":"text","text":"inserted content"}]},entry.message]})).unwrap();
-    let ranges = ranges(&state, codec::Codec::OpencodeAiSdk, &wire, &engine, None).unwrap();
+    let (ranges, _) = ranges(&state, codec::Codec::OpencodeAiSdk, &wire, &engine, None).unwrap();
     assert!(matches!(
         &ranges[0],
         view::ViewRange::Replace { from: 0, to: 0, .. }
