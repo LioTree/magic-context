@@ -14,6 +14,7 @@ mod resident;
 mod scaling_tests;
 #[cfg(test)]
 mod tests;
+pub(super) mod wrapup;
 use resident::{EngineView, HeldEntry};
 #[cfg(test)]
 use scaling_tests::reminder_work;
@@ -3453,6 +3454,14 @@ impl McHandler {
         if state.engine.preset != transform::compaction::Preset::Head {
             return Ok(());
         }
+        if self
+            .wrapup_sessions
+            .lock()
+            .expect("wrapup sessions mutex")
+            .contains_key(&state.namespace())
+        {
+            return Ok(());
+        }
         #[cfg(test)]
         self.provider_store
             .async_runtime
@@ -3460,31 +3469,7 @@ impl McHandler {
             .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
         let binding = self.async_binding(state);
         let codec = codec::Codec::from_params(&Value::Object(state.setup.params.clone()))?;
-        let mut request = self.async_historian_fields(state);
-        request["v"] = json!(2);
-        request["kind"] = json!("compaction.async");
-        request["session_id"] = json!(state.namespace());
-        request["render_config"] = json!("async-provider");
-        request["messages"] = json!([]);
-        let notice = state
-            .conditions
-            .as_ref()
-            .map(notice::AdvanceNotice::from_headers)
-            .transpose()
-            .map_err(|e| transient(e.name()))?;
-        request["model_key"] = json!(notice
-            .as_ref()
-            .map(|n| n.model.as_str())
-            .unwrap_or(&state.setup.model));
-        if let Some(notice) = &notice {
-            request["usage"] = serde_json::to_value(mc_store::ModuleUsage {
-                current_total_input_tokens: notice.est_tokens,
-                context_limit_tokens: notice.window.or(state.setup.context_window).unwrap_or(0),
-                ..Default::default()
-            })
-            .map_err(transient)?;
-        }
-        let mut parsed: TransformRequest = decode(&request)?;
+        let mut parsed = self.async_historian_request(state)?;
         // Use ModuleMeta's baseline coverage: a newly stored compartment may
         // not have been folded into that baseline yet. Start early enough to
         // pair tool results after coverage with their original tool calls.
@@ -3621,6 +3606,34 @@ impl McHandler {
             }
         });
         Ok(())
+    }
+
+    fn async_historian_request(&self, state: &State) -> Result<TransformRequest, HandlerOutcome> {
+        let mut request = self.async_historian_fields(state);
+        request["v"] = json!(2);
+        request["kind"] = json!("compaction.async");
+        request["session_id"] = json!(state.namespace());
+        request["render_config"] = json!("async-provider");
+        request["messages"] = json!([]);
+        let notice = state
+            .conditions
+            .as_ref()
+            .map(notice::AdvanceNotice::from_headers)
+            .transpose()
+            .map_err(|e| transient(e.name()))?;
+        request["model_key"] = json!(notice
+            .as_ref()
+            .map(|n| n.model.as_str())
+            .unwrap_or(&state.setup.model));
+        if let Some(notice) = &notice {
+            request["usage"] = serde_json::to_value(mc_store::ModuleUsage {
+                current_total_input_tokens: notice.est_tokens,
+                context_limit_tokens: notice.window.or(state.setup.context_window).unwrap_or(0),
+                ..Default::default()
+            })
+            .map_err(transient)?;
+        }
+        decode(&request)
     }
 
     fn async_historian_fields(&self, state: &State) -> Value {

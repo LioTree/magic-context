@@ -4641,6 +4641,7 @@ struct WrapupPrepareContext {
     now: i64,
     project_path: String,
     allow_unknown_module_retry: bool,
+    publication_fence: Option<Arc<dyn historian::HistorianPublicationFence>>,
 }
 
 #[derive(Clone)]
@@ -7936,6 +7937,7 @@ impl McHandler {
             now,
             project_path,
             allow_unknown_module_retry,
+            publication_fence,
         } = context;
         let loaded = match store.load(&parsed.session_id) {
             Ok(loaded) => loaded,
@@ -8026,19 +8028,28 @@ impl McHandler {
             failure_backoff_at_ms: now + HISTORIAN_FAILURE_BACKOFF_MS,
             min_chunk_tokens: DEFAULT_HISTORIAN_MIN_CHUNK_TOKENS,
         };
-        let runner_refit = (cfg.historian_runner_for(&binding.harness).kind
-            == HistorianRunnerKind::Broca)
+        let session_runner = publication_fence
+            .is_some()
+            .then(|| session_runner_route(binding, cfg.historian_runner_for(&binding.harness)))
+            .flatten();
+        let runner_refit = (session_runner.is_some()
+            || cfg.historian_runner_for(&binding.harness).kind == HistorianRunnerKind::Broca)
             .then(|| {
                 historian_runner_refit(
                     assembler_config.clone(),
                     &parsed.messages,
                     projection,
                     now,
-                    false,
+                    publication_fence.is_some(),
                     true,
                 )
             });
-        let assemble = assemble_historian_firing(
+        let assembler = if publication_fence.is_some() {
+            historian_chunk::assemble_provider_historian_firing
+        } else {
+            assemble_historian_firing
+        };
+        let assemble = assembler(
             &store,
             &parsed.messages,
             &live,
@@ -8093,14 +8104,14 @@ impl McHandler {
                 &binding.harness,
             ),
             host_runs: Arc::clone(&self.host_runs),
-            // Wrapup belongs to the request-driven transform path, which keeps the
-            // configured runner.
-            session_runner: None,
+            // A background summarizer uses its parent conversation's runner;
+            // session.wrapup keeps the configured standalone transport.
+            session_runner,
             model_chain_generation,
             runner_refusal_cache: Arc::clone(&self.historian_runner_refusals),
             live_guard,
             connect_failure_commit_hook: Arc::clone(&self.connect_failure_commit_hook),
-            publication_fence: None,
+            publication_fence,
             provider_completion: None,
         }))
     }
@@ -11186,6 +11197,7 @@ impl McHandler {
                     now: round_now,
                     project_path: project_path.clone(),
                     allow_unknown_module_retry: unknown_module_observed_at.is_some(),
+                    publication_fence: None,
                 },
             );
             // Assembly performs store reads, so verify the raw-history generation again

@@ -89,6 +89,32 @@ impl Budget {
             .await
             .expect("historian memory open");
         drop(waiting);
+        self.admit(slots, memory, charge, start)
+    }
+
+    /// Explicit requests refuse a full budget instead of queueing behind other
+    /// conversations while their caller waits for admission.
+    pub(crate) fn try_acquire(self: &Arc<Self>, native_bytes: usize) -> Option<Arc<Permit>> {
+        let start = Instant::now();
+        let charge = native_bytes
+            .saturating_mul(128)
+            .div_ceil(MIB)
+            .saturating_add(32)
+            .min(self.limit_mb) as u32;
+        let slots = Arc::clone(&self.slots).try_acquire_owned().ok()?;
+        let memory = Arc::clone(&self.memory)
+            .try_acquire_many_owned(charge)
+            .ok()?;
+        Some(self.admit(slots, memory, charge, start))
+    }
+
+    fn admit(
+        self: &Arc<Self>,
+        slots: OwnedSemaphorePermit,
+        memory: OwnedSemaphorePermit,
+        charge: u32,
+        start: Instant,
+    ) -> Arc<Permit> {
         let delay = start.elapsed().as_micros().min(u64::MAX as u128) as u64;
         self.queue_us.fetch_add(delay, Ordering::Relaxed);
         self.max_queue_us.fetch_max(delay, Ordering::Relaxed);
@@ -136,6 +162,21 @@ impl Drop for Permit {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[tokio::test]
+    async fn explicit_admission_refuses_capacity_without_leaking_a_slot() {
+        for (slots, memory) in [(1, 128), (2, 32)] {
+            let budget = Budget::new(slots, memory);
+            let held = budget.acquire(0).await;
+            assert!(budget.try_acquire(0).is_none());
+            assert_eq!(budget.stats()["queued"], 0);
+            drop(held);
+            let admitted = budget.try_acquire(0).expect("capacity was released");
+            drop(admitted);
+            assert_eq!(budget.stats()["active"], 0);
+            assert_eq!(budget.stats()["charged_mb"], 0);
+        }
+    }
 
     #[tokio::test]
     async fn concurrency_and_memory_limits_queue_across_sessions() {

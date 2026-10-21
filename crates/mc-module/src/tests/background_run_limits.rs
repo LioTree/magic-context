@@ -219,6 +219,7 @@ async fn configured_broca_wrapup_refits_its_captured_source_without_an_output_ca
             now: now_ms(),
             project_path: project.to_string_lossy().into_owned(),
             allow_unknown_module_retry: false,
+            publication_fence: None,
         },
     );
     let PreparedWrapupAction::FireReady(task) = prepared else {

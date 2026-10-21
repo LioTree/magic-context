@@ -310,6 +310,7 @@ impl McHandler {
             worker.memory_paused_routes = Arc::clone(&self.memory_paused_routes);
             worker.reattaching_sessions = Arc::clone(&self.reattaching_sessions);
             worker.live_historian_sessions = Arc::clone(&self.live_historian_sessions);
+            worker.wrapup_sessions = Arc::clone(&self.wrapup_sessions);
             worker.transform_snapshots = Arc::clone(&self.transform_snapshots);
             worker.connect_failure_commit_hook = Arc::clone(&self.connect_failure_commit_hook);
             #[cfg(test)]
