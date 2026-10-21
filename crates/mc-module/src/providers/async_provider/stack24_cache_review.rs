@@ -199,7 +199,30 @@ impl Review {
             .collect::<Vec<_>>()
             .join(" <- ");
         let mut parts = BTreeMap::new();
-        for range in &view.ranges {
+        self.check_served_history(profile, version, &context, entries, model);
+        // A replace range of one message by no messages removes that message
+        // (`emptied_messages::shape`); for these observations it is a drop of
+        // each of the message's parts, as it was before such messages were
+        // removed.
+        let removed: Vec<view::ViewRange> = view
+            .ranges
+            .iter()
+            .filter_map(|range| match range {
+                view::ViewRange::Replace { from, to, bytes }
+                    if *to == from + 1 && bytes == "[]" =>
+                {
+                    let entry = entries.iter().find(|entry| entry.ordinal == *from)?;
+                    let drops = entry
+                        .tags
+                        .iter()
+                        .map(|row| view::PartEdit::drop(*from, &entry.mid, &row.part))
+                        .collect();
+                    Some(view::ViewRange::keep_with_edits(*from, *to, drops))
+                }
+                _ => None,
+            })
+            .collect();
+        for range in view.ranges.iter().chain(&removed) {
             let view::ViewRange::Keep { from, to, edits } = range else {
                 continue;
             };
@@ -290,6 +313,65 @@ impl Review {
             generation,
             parts,
         });
+    }
+
+    /// Observations on the history a runner sends under one view (`model`):
+    /// a message with empty content (`EMPTY`; Anthropic answers HTTP 400), a
+    /// tool result served without its call although the transcript holds the
+    /// call (`ORPHAN`), and, for Anthropic, two adjacent assistant messages
+    /// (`ADJACENT`).
+    fn check_served_history(
+        &mut self,
+        profile: Profile,
+        version: u64,
+        context: &str,
+        entries: &[ReadMessage],
+        model: &str,
+    ) {
+        *self.counts.entry(format!("views_{profile:?}")).or_default() += 1;
+        let served: Vec<Value> = serde_json::from_str(model).unwrap();
+        for (index, message) in served.iter().enumerate() {
+            let body = message.get("message").unwrap_or(message);
+            let empty = message
+                .get("parts")
+                .or_else(|| body.get("content"))
+                .and_then(Value::as_array)
+                .is_some_and(Vec::is_empty);
+            if empty {
+                *self.counts.entry("empty_messages".into()).or_default() += 1;
+                self.violations.push(format!(
+                    "EMPTY view {version} ({context}) serves message {index} ({:?}) with empty content",
+                    tool_arcs::role(message)
+                ));
+            }
+        }
+        if profile == Profile::Anthropic {
+            for (index, pair) in served.windows(2).enumerate() {
+                if pair
+                    .iter()
+                    .all(|message| tool_arcs::role(message) == Some("assistant"))
+                {
+                    *self.counts.entry("adjacent_assistants".into()).or_default() += 1;
+                    self.violations.push(format!(
+                        "ADJACENT view {version} ({context}) serves assistant messages {index} and {}",
+                        index + 1
+                    ));
+                }
+            }
+        }
+        let source: Vec<Value> = entries.iter().map(|entry| entry.message.clone()).collect();
+        let (source_calls, _) = stack26_cache_review::tool_ids(&source);
+        let (calls, results) = stack26_cache_review::tool_ids(&served);
+        let orphans: Vec<_> = results
+            .difference(&calls)
+            .filter(|id| source_calls.contains(*id))
+            .collect();
+        if !orphans.is_empty() {
+            *self.counts.entry("orphan_views".into()).or_default() += 1;
+            self.violations.push(format!(
+                "ORPHAN view {version} ({context}) serves results without calls {orphans:?}"
+            ));
+        }
     }
 
     /// Compare every view with the view the runner had most recently
@@ -962,19 +1044,37 @@ enum Resync {
 }
 
 /// Every part edit a view makes on source ordinals below `below`, and the
-/// ordinals it keeps there.
+/// ordinals it keeps there. A message the view removes whole (a replace
+/// range of that one message by no messages, `emptied_messages::shape`)
+/// counts as kept with every part dropped, the form a view gave it before
+/// such messages were removed.
 fn kept_edits(pair: &Pair, version: u64, below: u64) -> (BTreeSet<u64>, PartEdits) {
     let (views, _) = pair.oracle.views(&pair.reference);
     let (_, json) = views.iter().find(|(v, _)| *v == version).unwrap();
     let view: view::CompactionView = serde_json::from_str(json).unwrap();
+    let entries = pair.transcript.entries.lock().unwrap();
     let mut kept = BTreeSet::new();
     let mut edits = BTreeMap::new();
     for range in &view.ranges {
-        if let view::ViewRange::Keep { from, to, edits: e } = range {
-            kept.extend((*from..*to).filter(|n| *n < below));
-            for edit in e.iter().filter(|edit| edit.ordinal < below) {
-                edits.insert((edit.ordinal, edit.part.clone()), edit.bytes.clone());
+        match range {
+            view::ViewRange::Keep { from, to, edits: e } => {
+                kept.extend((*from..*to).filter(|n| *n < below));
+                for edit in e.iter().filter(|edit| edit.ordinal < below) {
+                    edits.insert((edit.ordinal, edit.part.clone()), edit.bytes.clone());
+                }
             }
+            view::ViewRange::Replace { from, to, bytes }
+                if *to == from + 1 && bytes == "[]" && *from < below =>
+            {
+                let Some(entry) = entries.iter().find(|entry| entry.ordinal == *from) else {
+                    continue;
+                };
+                kept.insert(*from);
+                for row in &entry.tags {
+                    edits.insert((*from, row.part.clone()), None);
+                }
+            }
+            _ => {}
         }
     }
     (kept, edits)

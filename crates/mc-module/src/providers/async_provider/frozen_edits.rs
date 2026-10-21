@@ -88,40 +88,61 @@ impl FrozenEdits {
         entries: &BTreeMap<u64, Arc<HeldEntry>>,
     ) -> Result<(), HandlerOutcome> {
         for range in &view.ranges {
-            let view::ViewRange::Keep { edits, .. } = range else {
-                continue;
-            };
-            let mut source = None;
-            for edit in edits {
-                if source
-                    .as_ref()
-                    .is_none_or(|entry: &ReadMessage| entry.ordinal != edit.ordinal)
-                {
-                    source = entries
-                        .get(&edit.ordinal)
-                        .map(|entry| entry.read())
-                        .transpose()?;
-                }
-                let Some(entry) = source.as_ref().filter(|entry| entry.mid == edit.mid) else {
-                    continue;
-                };
-                let Some(index) = entry.tags.iter().position(|row| row.part == edit.part) else {
-                    continue;
-                };
-                let native = parts(&entry.message)?;
-                let Some(part) = native.get(index) else {
-                    continue;
-                };
-                let part = FrozenPart {
-                    mid: edit.mid.clone(),
-                    part: edit.part.clone(),
-                    digest: contract::digest::content_digest(part),
-                    bytes: edit.bytes.clone(),
-                };
-                self.insert(part);
+            if let view::ViewRange::Keep { edits, .. } = range {
+                self.capture_edits(edits, entries)?;
             }
         }
         Ok(())
+    }
+
+    /// Capture part edits that are not in the view's keep ranges: the drops of
+    /// a message the view removes whole (`emptied_messages::shape`). A later
+    /// pass re-anchors them like any served drop, so the message stays
+    /// removed even after the engine forgot the reduction.
+    pub(super) fn capture_edits(
+        &mut self,
+        edits: &[view::PartEdit],
+        entries: &BTreeMap<u64, Arc<HeldEntry>>,
+    ) -> Result<(), HandlerOutcome> {
+        let mut source = None;
+        for edit in edits {
+            if source
+                .as_ref()
+                .is_none_or(|entry: &ReadMessage| entry.ordinal != edit.ordinal)
+            {
+                source = entries
+                    .get(&edit.ordinal)
+                    .map(|entry| entry.read())
+                    .transpose()?;
+            }
+            let Some(entry) = source.as_ref().filter(|entry| entry.mid == edit.mid) else {
+                continue;
+            };
+            let Some(index) = entry.tags.iter().position(|row| row.part == edit.part) else {
+                continue;
+            };
+            let native = parts(&entry.message)?;
+            let Some(part) = native.get(index) else {
+                continue;
+            };
+            let part = FrozenPart {
+                mid: edit.mid.clone(),
+                part: edit.part.clone(),
+                digest: contract::digest::content_digest(part),
+                bytes: edit.bytes.clone(),
+            };
+            self.insert(part);
+        }
+        Ok(())
+    }
+
+    /// Whether an acknowledged view replaced part `part` of message `mid`
+    /// with exactly `bytes`.
+    pub(super) fn served(&self, mid: &str, part: &str, bytes: &str) -> bool {
+        self.parts
+            .range((mid.to_owned(), part.to_owned(), String::new())..)
+            .take_while(|((at, key, _), _)| at == mid && key == part)
+            .any(|(_, frozen)| frozen.bytes.as_deref() == Some(bytes))
     }
 
     /// Re-anchor by source identity, never by an ordinal retained from another lineage.

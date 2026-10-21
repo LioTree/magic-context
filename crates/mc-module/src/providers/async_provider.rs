@@ -7,6 +7,7 @@ use cortexkit_role_llm_runner::{read::ReadMessage, session_ref, tags};
 use serde::Deserialize;
 #[cfg(test)]
 mod differential_tests;
+mod emptied_messages;
 mod frozen_edits;
 mod held_entries;
 mod historian_tail;
@@ -3551,13 +3552,14 @@ impl McHandler {
             }
         }
         // The cut covers the leading replace ranges the history head made, not
-        // a removed Pi tool result that may follow them.
+        // a removed message that may follow them.
         let cut_through = ranges
             .iter()
             .take_while(|range| matches!(range, view::ViewRange::Replace { .. }))
             .last()
             .and_then(|range| range.to().checked_sub(1));
-        let ranges = tool_arcs::remove_dropped_tool_results(&kept, ranges);
+        let shaped = emptied_messages::shape(codec, &kept, &state.frozen_edits, ranges);
+        let ranges = shaped.ranges;
         let version = store
             .reserve_async_compaction_version(&state.reference(), state.applied.unwrap_or(0))
             .map_err(transient)?;
@@ -3593,6 +3595,7 @@ impl McHandler {
         // acknowledgement may arrive after the runner has rewritten those mids.
         let mut frozen_edits = frozen_edits::FrozenEdits::default();
         frozen_edits.capture(&view, &state.entries)?;
+        frozen_edits.capture_edits(&shaped.removed, &state.entries)?;
         #[derive(Serialize)]
         struct PublishedEngine<'a> {
             #[serde(flatten)]
