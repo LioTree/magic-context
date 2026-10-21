@@ -1377,8 +1377,11 @@ impl McHandler {
     ) -> Result<Vec<u8>, HandlerOutcome> {
         let request: compact::setup::SetupRequest = decode(params)?;
         let bound_session = binding.session.as_str();
-        let setup_session = request.session.trim();
-        if !bound_session.is_empty() && bound_session != setup_session {
+        // The session handle is an opaque caller-chosen string (compaction-provider
+        // contract §1 and §4): compare, key and bind it as exact bytes, never trimmed, so
+        // the conversation key, its runner route and its reverse-call identity all
+        // name the one session the runner reported.
+        if !bound_session.is_empty() && bound_session != request.session {
             return Err(HandlerOutcome::ErrorWithDetail {
                 code: "setup_identity_mismatch".into(),
                 message: "Setup session does not match the bound route session".into(),
@@ -1475,7 +1478,7 @@ impl McHandler {
             runner_identity: Some(session_resolver::RunnerBindIdentity {
                 project_root: binding.project_root.clone(),
                 harness: request.harness.clone(),
-                session: request.session.trim().into(),
+                session: request.session.clone(),
             }),
             runner_module: match &binding.principal {
                 Some(subc_protocol::Principal::Reserved { module_id }) => module_id.clone(),
