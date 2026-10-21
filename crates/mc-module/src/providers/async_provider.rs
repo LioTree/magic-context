@@ -151,6 +151,10 @@ pub(crate) struct AsyncRecord {
     /// a separate baseline row so quiet notices never rewrite their payloads.
     #[serde(skip)]
     frozen_edits: frozen_edits::FrozenEdits,
+    #[serde(default)]
+    frozen_edits_version: Option<u64>,
+    #[serde(skip)]
+    retired_frozen: frozen_edits::RetiredViews,
     /// Generation of the tail-hygiene baseline the reminder cadence last saw.
     /// The cadence is stored without the baseline itself: the baseline has one
     /// measurement per tail part (it grows with the session), every reminder
@@ -533,6 +537,9 @@ impl State {
             })
             .fold(applied, u64::min)
         });
+        if let Some(floor) = retain_from {
+            self.retired_frozen.retain_from(floor);
+        }
         let mut appended = Vec::new();
         for (ordinal, entry) in self.unsaved_entries() {
             appended.push((
@@ -559,6 +566,9 @@ impl State {
         if self.frozen_edits.dirty {
             save.baseline("frozen_edits", Some(self.frozen_edits.json()?));
         }
+        if self.retired_frozen.dirty {
+            save.baseline("retired_native_edits", Some(self.retired_frozen.json()?));
+        }
         if self.journal.clear_published {
             save.clear_engine_views();
         }
@@ -573,6 +583,7 @@ impl State {
         }
         self.journal.truncate = None;
         self.frozen_edits.dirty = false;
+        self.retired_frozen.dirty = false;
         self.journal.clear_published = false;
         self.journal.persisted_through = self.entries.last_key_value().map(|(n, _)| *n);
         self.journal.produced = self
@@ -855,6 +866,13 @@ impl State {
         let mut bytes = std::mem::size_of::<Self>();
         // Reminder provenance is durable JSON as well as live structs.
         bytes += self.reminder_echoes.retained_bytes() * 2;
+        bytes += self.frozen_edits.retained_bytes;
+        bytes += self
+            .retired_frozen
+            .views
+            .values()
+            .map(|edits| edits.retained_bytes + 96)
+            .sum::<usize>();
         bytes += self
             .reminder_cadence
             .as_ref()
@@ -867,6 +885,10 @@ impl State {
         {
             if !views.iter().any(|seen| Arc::ptr_eq(seen, &view.json)) {
                 bytes += view.json.len() + 64;
+                bytes += view
+                    .frozen_edits
+                    .as_ref()
+                    .map_or(0, |edits| edits.retained_bytes);
                 views.push(Arc::clone(&view.json));
             }
         }
@@ -892,6 +914,30 @@ impl State {
                 .reminder_hint_state
                 .as_ref()
                 .map_or(0, |cached| cached.bytes)
+    }
+
+    fn capture_frozen_version(
+        &mut self,
+        store: &McStore,
+        version: u64,
+    ) -> Result<(), HandlerOutcome> {
+        if let Some(edits) = self
+            .published_engine
+            .get(&version)
+            .and_then(|view| view.frozen_edits.as_ref())
+            .or_else(|| self.retired_frozen.views.get(&version))
+        {
+            self.frozen_edits.merge(edits);
+        } else if let Some(raw) = store
+            .load_async_compaction_view(&self.reference(), version)
+            .map_err(transient)?
+        {
+            // Older stored views lack publication-time provenance. Preserve only
+            // edits for which this conversation still holds a source identity.
+            let view = serde_json::from_str(&raw).map_err(transient)?;
+            self.frozen_edits.capture(&view, &self.entries)?;
+        }
+        Ok(())
     }
 
     fn reset(&mut self, store: &McStore) -> Result<(), HandlerOutcome> {
@@ -970,8 +1016,8 @@ impl State {
                 .flatten()
                 .map(|raw| serde_json::from_str::<view::CompactionView>(&raw).map_err(transient))
                 .transpose()?;
-            if let Some(view) = &applied {
-                self.frozen_edits.capture(view, &self.entries)?;
+            if let Some(version) = self.applied {
+                self.capture_frozen_version(store, version)?;
             }
             let head = applied.and_then(|view| match view.ranges.first()? {
                 view::ViewRange::Replace { from: 0, to, bytes }
@@ -1018,6 +1064,14 @@ impl State {
         self.engine = transform::compaction::State::new(self.reference(), self.engine.preset);
         self.produced_view = None;
         self.applied_view = None;
+        for (version, view) in &self.published_engine {
+            if let Some(edits) = &view.frozen_edits {
+                self.retired_frozen
+                    .views
+                    .insert(*version, Arc::clone(edits));
+                self.retired_frozen.dirty = true;
+            }
+        }
         self.published_engine.clear();
         self.journal.clear_published = true;
         self.save(store, &[])?;
@@ -1087,6 +1141,9 @@ fn load(store: &McStore, reference: &str) -> Result<Option<State>, HandlerOutcom
     let applied = resolve("applied", state.engine_baselines.applied)?;
     if let Some(json) = stored.remove("frozen_edits") {
         state.frozen_edits = frozen_edits::FrozenEdits::from_json(&json)?;
+    }
+    if let Some(json) = stored.remove("retired_native_edits") {
+        state.retired_frozen = frozen_edits::RetiredViews::from_json(&json)?;
     }
     state.produced_view = produced;
     state.applied_view = applied;
@@ -1313,6 +1370,8 @@ impl McHandler {
             reminder_hint_state: None,
             reminder_echoes: Default::default(),
             frozen_edits: Default::default(),
+            frozen_edits_version: None,
+            retired_frozen: Default::default(),
             reminder_baseline_generation: None,
             key,
             runner_module: match &binding.principal {
@@ -2492,6 +2551,19 @@ impl McHandler {
             return Ok(());
         }
         let duplicate = notice.seq <= state.seq;
+        // A historian replacement can move its covered message range backward.
+        // Capture acknowledged edits before coverage pruning evicts their engine units.
+        if !duplicate {
+            if let Some(version) = notice.applied_view_version.filter(|version| {
+                state.frozen_edits_version != Some(*version)
+                    && !notice.events.iter().any(|event| matches!(event,
+                        notice::Event::ViewDeferred { view_version, .. }
+                        | notice::Event::ViewRefused { view_version, .. } if view_version == version))
+            }) {
+                state.capture_frozen_version(store, version)?;
+                state.frozen_edits_version = Some(version);
+            }
+        }
         let mut descended = false;
         if let Some(lineage) = message
             .headers
@@ -2506,15 +2578,8 @@ impl McHandler {
                 let parent = state.lineage.clone().expect("held lineage");
                 // A fork can cut away source identities needed by a later restore.
                 // Capture acknowledged edits before dropping those held entries.
-                if let Some(raw) = state
-                    .applied
-                    .map(|version| store.load_async_compaction_view(&state.reference(), version))
-                    .transpose()
-                    .map_err(transient)?
-                    .flatten()
-                {
-                    let view = serde_json::from_str(&raw).map_err(transient)?;
-                    state.frozen_edits.capture(&view, &state.entries)?;
+                if let Some(version) = state.applied {
+                    state.capture_frozen_version(store, version)?;
                 }
                 state.truncate_entries(Some(through));
                 let mut engine = state.engine_with_baselines()?;
@@ -3207,7 +3272,22 @@ impl McHandler {
             view = view.with_cut(view::ViewCut::new(format!("v{version}"), through));
         }
         let view = checked_async_view(view)?;
-        let engine_json: Arc<str> = serde_json::to_string(&candidate).map_err(transient)?.into();
+        // Bind edits to the source as it existed at publication. A delayed
+        // acknowledgement may arrive after the runner has rewritten those mids.
+        let mut frozen_edits = frozen_edits::FrozenEdits::default();
+        frozen_edits.capture(&view, &state.entries)?;
+        #[derive(Serialize)]
+        struct PublishedEngine<'a> {
+            #[serde(flatten)]
+            view: &'a transform::compaction::View,
+            native_frozen_edits: &'a frozen_edits::FrozenEdits,
+        }
+        let engine_json: Arc<str> = serde_json::to_string(&PublishedEngine {
+            view: &candidate,
+            native_frozen_edits: &frozen_edits,
+        })
+        .map_err(transient)?
+        .into();
         store
             .save_async_compaction_view(
                 &state.reference(),
@@ -3216,9 +3296,10 @@ impl McHandler {
                 &engine_json,
             )
             .map_err(transient)?;
-        state
-            .published_engine
-            .insert(version, EngineView::with_json(&candidate, engine_json));
+        state.published_engine.insert(
+            version,
+            EngineView::with_json(&candidate, engine_json).with_frozen_edits(frozen_edits),
+        );
         // The produced baseline is this published view; adopting after the
         // insert shares its serialized form instead of serializing it again.
         state.adopt_engine(engine)?;

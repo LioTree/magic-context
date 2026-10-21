@@ -1,7 +1,7 @@
 //! Native edits already acknowledged by the runner, independent of engine cache eviction.
 use super::*;
 
-#[derive(Clone, Serialize, Deserialize)]
+#[derive(Clone, PartialEq, Eq, Serialize, Deserialize)]
 struct FrozenPart {
     mid: String,
     part: String,
@@ -9,26 +9,65 @@ struct FrozenPart {
     bytes: Option<String>,
 }
 
+impl FrozenPart {
+    fn retained_bytes(&self) -> usize {
+        192 + self.mid.len() * 2
+            + self.part.len() * 2
+            + self.digest.len()
+            + self.bytes.as_ref().map_or(0, String::len)
+    }
+}
+
 #[derive(Default)]
 pub(super) struct FrozenEdits {
-    parts: BTreeMap<(String, String), FrozenPart>,
+    parts: BTreeMap<(String, String, String), FrozenPart>,
+    pub(super) retained_bytes: usize,
     pub(super) dirty: bool,
+}
+
+impl Serialize for FrozenEdits {
+    fn serialize<S: serde::Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
+        serializer.collect_seq(self.parts.values())
+    }
+}
+
+impl<'de> Deserialize<'de> for FrozenEdits {
+    fn deserialize<D: serde::Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
+        let parts = Vec::<FrozenPart>::deserialize(deserializer)?;
+        let mut edits = Self::default();
+        for part in parts {
+            edits.insert(part);
+        }
+        edits.dirty = false;
+        Ok(edits)
+    }
 }
 
 impl FrozenEdits {
     pub(super) fn from_json(json: &str) -> Result<Self, HandlerOutcome> {
-        let parts: Vec<FrozenPart> = serde_json::from_str(json).map_err(transient)?;
-        Ok(Self {
-            parts: parts
-                .into_iter()
-                .map(|part| ((part.mid.clone(), part.part.clone()), part))
-                .collect(),
-            dirty: false,
-        })
+        serde_json::from_str(json).map_err(transient)
     }
 
     pub(super) fn json(&self) -> Result<String, HandlerOutcome> {
-        serde_json::to_string(&self.parts.values().collect::<Vec<_>>()).map_err(transient)
+        serde_json::to_string(self).map_err(transient)
+    }
+
+    fn insert(&mut self, part: FrozenPart) {
+        let key = (part.mid.clone(), part.part.clone(), part.digest.clone());
+        if self.parts.get(&key) == Some(&part) {
+            return;
+        }
+        self.retained_bytes += part.retained_bytes() + part.digest.len();
+        if let Some(old) = self.parts.insert(key, part) {
+            self.retained_bytes -= old.retained_bytes() + old.digest.len();
+        }
+        self.dirty = true;
+    }
+
+    pub(super) fn merge(&mut self, acknowledged: &Self) {
+        for part in acknowledged.parts.values() {
+            self.insert(part.clone());
+        }
     }
 
     /// Capture the actual native bytes, not a newly rendered reduction whose tags may differ.
@@ -62,16 +101,13 @@ impl FrozenEdits {
                 let Some(part) = native.get(index) else {
                     continue;
                 };
-                self.parts.insert(
-                    (edit.mid.clone(), edit.part.clone()),
-                    FrozenPart {
-                        mid: edit.mid.clone(),
-                        part: edit.part.clone(),
-                        digest: contract::digest::content_digest(part),
-                        bytes: edit.bytes.clone(),
-                    },
-                );
-                self.dirty = true;
+                let part = FrozenPart {
+                    mid: edit.mid.clone(),
+                    part: edit.part.clone(),
+                    digest: contract::digest::content_digest(part),
+                    bytes: edit.bytes.clone(),
+                };
+                self.insert(part);
             }
         }
         Ok(())
@@ -128,5 +164,43 @@ impl FrozenEdits {
             edits.sort_by(|a, b| (a.ordinal, &a.part).cmp(&(b.ordinal, &b.part)));
         }
         Ok(())
+    }
+}
+
+/// Keep publication-time provenance for versions whose engine baselines are
+/// retired during a resync before acknowledgement. Native views remain immutable.
+#[derive(Default)]
+pub(super) struct RetiredViews {
+    pub(super) views: BTreeMap<u64, Arc<FrozenEdits>>,
+    pub(super) dirty: bool,
+}
+
+impl RetiredViews {
+    pub(super) fn from_json(json: &str) -> Result<Self, HandlerOutcome> {
+        let views: BTreeMap<u64, FrozenEdits> = serde_json::from_str(json).map_err(transient)?;
+        Ok(Self {
+            views: views
+                .into_iter()
+                .map(|(n, edits)| (n, Arc::new(edits)))
+                .collect(),
+            dirty: false,
+        })
+    }
+
+    pub(super) fn json(&self) -> Result<String, HandlerOutcome> {
+        serde_json::to_string(
+            &self
+                .views
+                .iter()
+                .map(|(n, edits)| (n, edits.as_ref()))
+                .collect::<BTreeMap<_, _>>(),
+        )
+        .map_err(transient)
+    }
+
+    pub(super) fn retain_from(&mut self, floor: u64) {
+        let before = self.views.len();
+        self.views.retain(|version, _| *version >= floor);
+        self.dirty |= self.views.len() != before;
     }
 }

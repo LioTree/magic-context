@@ -104,6 +104,7 @@ impl HeldEntry {
 pub(super) struct EngineView {
     pub(super) identity: ViewIdentity,
     pub(super) json: Arc<str>,
+    pub(super) frozen_edits: Option<Arc<frozen_edits::FrozenEdits>>,
 }
 
 impl EngineView {
@@ -118,7 +119,13 @@ impl EngineView {
         Self {
             identity: view_identity(view),
             json,
+            frozen_edits: None,
         }
+    }
+
+    pub(super) fn with_frozen_edits(mut self, edits: frozen_edits::FrozenEdits) -> Self {
+        self.frozen_edits = Some(Arc::new(edits));
+        self
     }
 
     /// A stored engine view. Only what its identity needs is read; the
@@ -129,11 +136,14 @@ impl EngineView {
             version: u64,
             range: transform::compaction::Range,
             replacement: Vec<serde::de::IgnoredAny>,
+            #[serde(default)]
+            native_frozen_edits: Option<frozen_edits::FrozenEdits>,
         }
         let head: Head = serde_json::from_str(&json).map_err(transient)?;
         Ok(Self {
             identity: (head.version, head.range, head.replacement.len()),
             json: json.into(),
+            frozen_edits: head.native_frozen_edits.map(Arc::new),
         })
     }
 

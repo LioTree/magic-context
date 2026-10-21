@@ -1142,3 +1142,25 @@ async fn stack24_seed_1197_coverage_rewind_keeps_served_reductions() {
         restored.first()
     );
 }
+
+/// Delayed acknowledgements and transcript rewrites must use the publication's
+/// source digests, even when reminder echoes change what a reused mid contains.
+#[tokio::test]
+async fn stack25_delayed_acknowledgements_keep_publication_source_identities() {
+    for (profile, seed) in [
+        (Profile::OpenCode, 7009),
+        (Profile::Pi, 7030),
+        (Profile::Anthropic, 7071),
+        (Profile::Pi, 7178),
+        (Profile::Anthropic, 7335),
+        (Profile::OpenCode, 7341),
+        (Profile::Pi, 7362),
+    ] {
+        let (violations, _, _) = review_session(profile, seed, 32, true).await;
+        let restored = violations
+            .iter()
+            .filter(|row| row.starts_with("RESTORED"))
+            .collect::<Vec<_>>();
+        assert!(restored.is_empty(), "seed {seed} {profile:?}: {restored:?}");
+    }
+}
