@@ -1239,11 +1239,18 @@ async fn mc_pipe_only_supervision_through_real_daemon() {
     let (observed_tx, mut observed_rx) = tokio::sync::mpsc::unbounded_channel();
     let manifest = ModuleManifest::builder("broca", "0.0.0")
         .provides(vec![ProviderRole::ManagementSurface {
-            operations: vec![ManagementOperation {
-                name: "session.send".into(),
-                kind: ManagementOperationKind::Query,
-                description: None,
-            }],
+            operations: vec![
+                ManagementOperation {
+                    name: "role.describe".into(),
+                    kind: ManagementOperationKind::Query,
+                    description: None,
+                },
+                ManagementOperation {
+                    name: "session.send".into(),
+                    kind: ManagementOperationKind::Query,
+                    description: None,
+                },
+            ],
             config_schema: json!({}),
             observability: vec![],
             identity_scope: vec![],
@@ -1291,6 +1298,11 @@ async fn mc_pipe_only_supervision_through_real_daemon() {
         })
     );
     assert_eq!(request["method"], "session.send");
+    assert_eq!(request["params"]["model"]["provider"], "anthropic");
+    assert_eq!(request["params"]["model"]["model"], "claude-sonnet-4");
+    assert_eq!(request["params"]["tools"], json!([]));
+    assert_eq!(request["params"]["stop_when"]["max_steps"], 1);
+    assert!(request["params"].get("parent").is_none());
     drop(runner);
     serving.abort();
     let _ = serving.await;
@@ -1332,12 +1344,16 @@ impl subc_client_rs::ModuleHandler for CensusRunner {
             .cloned()
             .unwrap();
         let request: serde_json::Value = serde_json::from_slice(&body).unwrap();
-        // The historian asks the runner which session policies it supports
-        // before it sends. Answer with no optional policies so the following
-        // session.send is the request this census observes.
+        // Before sending, the historian requires tool-free, single-step execution
+        // plus run-operation and run-status support. This traffic-only fake does not
+        // execute completions and needs no retention, output caps or streaming.
         if request["method"] == "role.describe" {
+            use cortexkit_role_llm_runner::capabilities as caps;
             return subc_client_rs::HandlerOutcome::Response(
-                serde_json::to_vec(&json!({ "result": {} })).unwrap(),
+                serde_json::to_vec(&json!({ "result": { "capabilities": [
+                    caps::NO_TOOLS, caps::MAX_STEPS, caps::RUN_OPS, caps::RUN_STATUS
+                ] } }))
+                .unwrap(),
             );
         }
         // The test stops reading after the first send; later requests from a

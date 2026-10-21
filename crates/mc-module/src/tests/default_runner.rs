@@ -1,4 +1,4 @@
-//! The runner a request gets when the user tier names none.
+//! The default runner for a full-array transform when no runner is configured by the user.
 //!
 //! The harness that bound the route decides: OpenCode 1 and OpenCode 2 hosts run
 //! the completion themselves through the claim lane, while Claude Code (which
@@ -197,6 +197,63 @@ async fn an_unconfigured_claude_code_session_still_folds_through_broca() {
             status["historian"]["runner"],
             runner_status("broca", "default_for_harness", harness, "last_completion"),
             "{harness}: {status}"
+        );
+    }
+}
+
+/// A gateway principal does not turn a full-array transform into the asynchronous
+/// provider lane. With no host claimant, Claude Code must still reach Broca and
+/// publish its summary; only provider-lane children follow the session's runner.
+#[tokio::test(flavor = "current_thread")]
+async fn a_thalamus_gateway_full_array_session_folds_through_broca() {
+    for configured in [None, Some(HistorianRunnerKind::Broca)] {
+        let mut config = default_test_config();
+        config.historian_runner = configured;
+        let producer = Arc::new(ProducerState::default());
+        let (handler, store, _dir, project) =
+            handler_with_store(Arc::clone(&producer), config.clone());
+        let mut binding = binding_with_harness(project.to_str().unwrap(), "claude-code", "ses");
+        binding.principal = Some(subc_protocol::Principal::Reserved {
+            module_id: "thalamus".into(),
+        });
+        binding.config = config;
+        handler.bind_route(7, binding);
+
+        let wire = request(big_messages());
+        assert_eq!(wire["serializer_profile"], "owned-llmrunner");
+        assert_eq!(wire["historian_model_chain"], json!([TEST_HISTORIAN_MODEL]));
+        assert!(wire["messages"].is_array());
+        assert!(wire.get("tail_delta").is_none());
+        let fired = call_dispatch_request(&handler, wire).await;
+        assert_eq!(fired["historian"]["fired"], json!(true), "{fired}");
+        wait_for_count(&producer.starts, 1).await;
+        wait_for_idle(&store).await;
+
+        assert_eq!(producer.connects.load(Ordering::SeqCst), 1);
+        assert_eq!(producer.session_runner_connects.load(Ordering::SeqCst), 0);
+        assert_eq!(store.load_compartments("ses").unwrap().len(), 1);
+        assert_eq!(
+            producer.models.lock().unwrap().as_slice(),
+            &[TEST_HISTORIAN_MODEL.to_string()]
+        );
+        assert!(store
+            .list_pending_historian_runs(project.to_str().unwrap(), Some("ses"), now_ms())
+            .unwrap()
+            .is_empty());
+        let status = session_status(&handler).await;
+        assert_eq!(
+            status["historian"]["runner"],
+            runner_status(
+                "broca",
+                if configured.is_some() {
+                    "configured"
+                } else {
+                    "default_for_harness"
+                },
+                "claude-code",
+                "last_completion",
+            ),
+            "{status}"
         );
     }
 }

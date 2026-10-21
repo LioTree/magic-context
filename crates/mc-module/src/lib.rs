@@ -25745,6 +25745,7 @@ mod tests {
     struct ProducerState {
         runner_limits: Mutex<Option<runner_limits::RunnerLimits>>,
         connects: AtomicUsize,
+        session_runner_connects: AtomicUsize,
         starts: AtomicUsize,
         start_errors: Mutex<VecDeque<Result<RunHandle, HistorianProducerError>>>,
         binds: AtomicUsize,
@@ -25798,6 +25799,9 @@ mod tests {
             project: &Path,
             _route: &SessionRunnerRoute,
         ) -> Result<Box<dyn HistorianProducerDriver + Send>, HistorianProducerError> {
+            self.state
+                .session_runner_connects
+                .fetch_add(1, Ordering::SeqCst);
             self.connect(project).await
         }
     }
