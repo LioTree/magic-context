@@ -472,18 +472,17 @@ pub(crate) fn attest_ui_fixture(
     binding.principal = Some(subc_protocol::Principal::Reserved {
         module_id: "thalamus-harness".into(),
     });
-    binding.scope = Some(subc_protocol::scope::ScopeStamp {
-        owner: subc_protocol::Principal::Reserved {
-            module_id: "prefrontal-core".into(),
-        },
-        scope_ref: "ui-session".into(),
-        scope_epoch: 1,
-        kind: subc_protocol::scope::ScopeKind::Head,
-        parent: None,
-        parent_state: None,
-        attributes: Default::default(),
-        owner_authorized: true,
-    });
+    binding.scope = Some(
+        subc_protocol::scope::ScopeStamp::new(
+            subc_protocol::Principal::Reserved {
+                module_id: "prefrontal-core".into(),
+            },
+            "ui-session",
+            1,
+            subc_protocol::scope::ScopeKind::Head,
+        )
+        .with_owner_authorized(true),
+    );
     if let Some(store) = store {
         store.with_context_conn_for_test(|conn| {
             for session in [&binding.session,"ops-b"] {

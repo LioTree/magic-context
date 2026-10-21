@@ -1282,7 +1282,12 @@ async fn mc_pipe_only_supervision_through_real_daemon() {
     );
     let (principal, request) = tokio::time::timeout(START_TIMEOUT, observed_rx.recv())
         .await
-        .expect("historian route never carried traffic")
+        .unwrap_or_else(|_| {
+            panic!(
+                "historian route never carried traffic; root={}",
+                temp.0.display()
+            )
+        })
         .unwrap();
     assert_eq!(
         principal,
@@ -1332,12 +1337,14 @@ impl subc_client_rs::ModuleHandler for CensusRunner {
             .cloned()
             .unwrap();
         let request: serde_json::Value = serde_json::from_slice(&body).unwrap();
-        // The historian asks the runner which session policies it supports
-        // before it sends. Answer with no optional policies so the following
-        // session.send is the request this census observes.
+        // The historian requires lifecycle support and tool/step limits before
+        // sending. The census advertises those groups but no retention policy.
         if request["method"] == "role.describe" {
             return subc_client_rs::HandlerOutcome::Response(
-                serde_json::to_vec(&json!({ "result": {} })).unwrap(),
+                serde_json::to_vec(&json!({ "result": {
+                    "capabilities": ["run_ops", "run_status", "streaming", "run_usage", "no_tools", "max_steps"]
+                } }))
+                .unwrap(),
             );
         }
         // The test stops reading after the first send; later requests from a

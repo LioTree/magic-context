@@ -23,6 +23,7 @@ use cortexkit_role_tool_provider_conformance::{
     run_suite, CallSpec, Capability, CaseOutcome, Exchange, ObservedFrame, RouteFailure,
     ScopedPrincipals, SuiteVerdict, ToolProviderSubject, ToolRoute, CASES,
 };
+use subc_protocol::ErrorBody;
 
 use super::*;
 
@@ -113,22 +114,14 @@ impl ToolRoute for Route {
                     RouteFailure::new(format!("a response that is not JSON: {error}"))
                 })?)
             }
-            HandlerOutcome::Error { code, message } => ObservedFrame::Error(
-                serde_json::from_value(json!({
-                    "code": code, "message": message
-                }))
-                .unwrap(),
-            ),
+            HandlerOutcome::Error { code, message } => {
+                ObservedFrame::Error(ErrorBody::new(code, message))
+            }
             HandlerOutcome::ErrorWithDetail {
                 code,
                 message,
                 detail,
-            } => ObservedFrame::Error(
-                serde_json::from_value(json!({
-                    "code": code, "message": message, "detail": detail
-                }))
-                .unwrap(),
-            ),
+            } => ObservedFrame::Error(ErrorBody::new(code, message).with_detail(detail)),
             HandlerOutcome::Streamed => ObservedFrame::StreamEnd,
         };
         Ok(Exchange {
@@ -197,9 +190,13 @@ async fn the_role_conformance_suite_passes_every_case_magic_context_can_run() {
     let report = run_suite(&Subject, work.path()).await.unwrap();
     let rendered = report.render();
     let expected_to_run = [
+        "user_commands_catalog",
         "role_describe_shape",
         "role_describe_cacheable",
         "catalog_schemas_flat",
+        "catalog_reply_valid",
+        "catalog_modes_valid",
+        "catalog_emits_events_boolean",
         "catalog_schema_digest_stable",
         "catalog_digest_only",
         "catalog_unknown_preset_refused",
