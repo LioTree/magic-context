@@ -101,6 +101,16 @@ async fn person_admission_refuses_run_flow_and_unscoped_invokes() {
     let dir = tempfile::tempdir().unwrap();
     let rig = ready(dir.path()).await;
     assert!(user_command::admitted(Some(&stamp())));
+    let flow = stamp().with_attributes(ScopeAttributes::new().with_flow_id(Some("flow".into())));
+    // The role's own admission still refuses a flow scope...
+    assert!(!user_command::admitted(Some(&flow)));
+    // ...but a flow-scoped route never reaches it: the dispatcher's flow fence
+    // refuses every method but the flow ops first.
+    attest(&rig, Some(flow));
+    match invoke(&rig, "admit", "ctx-status", "").await {
+        HandlerOutcome::Error { code, .. } => assert_eq!(code, "flow_route_not_admitted"),
+        other => panic!("expected the flow fence's refusal: {other:?}"),
+    }
     for scope in [
         Some(
             stamp().with_attributes(
@@ -109,7 +119,6 @@ async fn person_admission_refuses_run_flow_and_unscoped_invokes() {
                     .with_run_id(Some("run".into())),
             ),
         ),
-        Some(stamp().with_attributes(ScopeAttributes::new().with_flow_id(Some("flow".into())))),
         None,
     ] {
         attest(&rig, scope);
