@@ -439,6 +439,11 @@ async fn review_session(
     let pair = session_pair_with(profile, seed, steps, echoes).await;
     let mut review = pair.review.borrow_mut();
     review.check_served_edits();
+    // Views the provider's pairing check withheld: that check is a safety
+    // net, so a split it caught is still a finding.
+    for split in tool_arcs::withheld::take(&pair.reference) {
+        review.violations.push(format!("WITHHELD {split}"));
+    }
     (
         std::mem::take(&mut review.violations),
         review.counts.clone(),
