@@ -333,6 +333,7 @@ pub mod historian_validate;
 pub mod host_store;
 mod image_tokens;
 pub mod injection;
+pub mod offline_move;
 pub mod m0_compose;
 pub mod m1_compose;
 pub mod memory_render;

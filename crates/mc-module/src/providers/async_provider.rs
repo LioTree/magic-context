@@ -10,6 +10,7 @@ mod differential_tests;
 mod frozen_edits;
 mod held_entries;
 mod historian_tail;
+mod moved_session;
 pub(crate) mod reminder_echoes;
 mod resident;
 #[cfg(test)]
@@ -171,6 +172,10 @@ pub(crate) struct AsyncRecord {
     resync_sources: Option<ResyncSources>,
     #[serde(default)]
     restored_head: Option<RestoredHead>,
+    /// Set for a session the offline move brought over from the standalone
+    /// OpenCode 1 plugin; see `moved_session`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    standalone_move: Option<moved_session::StandaloneMove>,
     /// A protocol error met while advancing this conversation; see
     /// `record_protocol_failure`. Absent while the conversation is healthy.
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -557,6 +562,7 @@ impl State {
     fn ingest_read(&mut self, store: &McStore, codec: codec::Codec) -> Result<(), HandlerOutcome> {
         self.reindex()?;
         self.restore_sources(store, codec)?;
+        self.bind_standalone_move(store, codec)?;
         let rows = self.unsaved_tag_rows(codec)?;
         self.save(store, &rows)
     }
@@ -1421,6 +1427,18 @@ impl McHandler {
                 &json!({"answer":"refuse","request_id":request.request_id,"code":"provider_busy","provider_code":"bus_not_ready","reason":reason}),
             );
         }
+        // Checked before an existing record is answered: a session the standalone
+        // plugin still owns must never be served, whatever ck-mc holds for it.
+        let standalone_move = match moved_session::setup_fence(
+            store,
+            &request.harness,
+            setup_session,
+            &request.request_id,
+        )? {
+            moved_session::Fence::Fresh => None,
+            moved_session::Fence::Moved(record) => Some(record),
+            moved_session::Fence::Refuse(answer) => return bytes(&answer),
+        };
         let reference = session_ref(&key.harness, &key.project.to_string_lossy(), &key.session);
         if let Some(state) = load_head(store, &reference)? {
             self.authorize_async(binding, &state)?;
@@ -1451,6 +1469,7 @@ impl McHandler {
             restored_no_new_content: false,
             resync_sources: None,
             restored_head: None,
+            standalone_move: standalone_move.map(moved_session::StandaloneMove::from_record),
             failure: None,
             engine_failed: false,
             last_discarded_drops: 0,
@@ -1548,6 +1567,12 @@ impl McHandler {
         // `serializer_profile` is a ck-mc extension member: the profile this
         // Setup accepted, so the runner can confirm ck-mc reads its schema.
         state.initial = json!({"answer":"ready","request_id":request.request_id,"initial":wire, "ceiling":CeilingPolicy::new(0.95,300_000).with_on_overflow(),"serializer_profile":codec.wire_id()});
+        // The setup checkpoint of a moved session: `initial` is repeated on every
+        // later setup, so the runner always gets the same checkpoint and cut.
+        if let Some(moved) = &state.standalone_move {
+            state.initial["tag_checkpoint"] = json!(moved.tag_checkpoint);
+            state.initial["cut"] = json!(moved.cut);
+        }
         // A conversation set up again under the same reference must never
         // reuse a resident copy of an earlier one.
         self.provider_store

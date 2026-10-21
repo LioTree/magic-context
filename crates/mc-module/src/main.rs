@@ -48,6 +48,12 @@ async fn main() -> Result<(), Box<dyn Error + Send + Sync>> {
         let args: Vec<String> = std::env::args().skip(2).collect();
         std::process::exit(mc_module::single_store_repair::cli_main(&args));
     }
+    // The offline move of a standalone OpenCode 1 session to mode 3 runs in a
+    // restart window with every host and ck-mc stopped.
+    if std::env::args().nth(1).as_deref() == Some("offline") {
+        let args: Vec<String> = std::env::args().skip(2).collect();
+        std::process::exit(mc_module::offline_move::cli_main(&args));
+    }
     let module_id = effective_module_id();
 
     let logger = match cortexkit_log::init_from_env() {

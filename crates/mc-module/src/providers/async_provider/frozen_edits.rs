@@ -64,6 +64,17 @@ impl FrozenEdits {
         self.dirty = true;
     }
 
+    /// Record a whole-part drop that was applied before ck-mc served the session:
+    /// a reduction the standalone plugin applied before the offline move.
+    pub(super) fn insert_drop(&mut self, mid: &str, part: &str, digest: &str) {
+        self.insert(FrozenPart {
+            mid: mid.to_owned(),
+            part: part.to_owned(),
+            digest: digest.to_owned(),
+            bytes: None,
+        });
+    }
+
     pub(super) fn merge(&mut self, acknowledged: &Self) {
         for part in acknowledged.parts.values() {
             self.insert(part.clone());
