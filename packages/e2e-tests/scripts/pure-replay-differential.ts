@@ -68,6 +68,46 @@ if (Bun.argv.includes("--provider-pipeline")) {
 	process.exit(0);
 }
 
+// Context migration 103 moved the cached render payloads (cached_m0_bytes and its upgrade
+// identity) out of session_meta into session_render_cache rows. This script is copied
+// unchanged into older refs, whose plugin source has no render-cache accessors and whose
+// databases still carry the old columns. Use the checkout's own accessors when it has
+// them, and the old columns otherwise.
+type RenderCacheAccess =
+	typeof import("../../plugin/src/features/magic-context/storage-session-cache");
+type ReplayRenderCacheColumn = "cached_m0_bytes" | "cached_m0_upgrade_state";
+let renderCacheAccess: Promise<RenderCacheAccess | undefined> | undefined;
+function loadRenderCacheAccess(): Promise<RenderCacheAccess | undefined> {
+	renderCacheAccess ??= import(
+		"../../plugin/src/features/magic-context/storage-session-cache"
+	).catch(() => undefined);
+	return renderCacheAccess;
+}
+async function renderCacheSelect(
+	db: Database,
+	column: ReplayRenderCacheColumn,
+): Promise<string> {
+	const access = await loadRenderCacheAccess();
+	return access
+		? access.sessionRenderCacheSelect(column, column, db as never)
+		: column;
+}
+async function writeCachedM0Bytes(
+	db: Database,
+	sessionId: string,
+	bytes: Buffer,
+): Promise<void> {
+	const access = await loadRenderCacheAccess();
+	if (access) {
+		access.writeSessionRenderCache(db as never, sessionId, "cached_m0_bytes", bytes);
+		return;
+	}
+	db.prepare("UPDATE session_meta SET cached_m0_bytes = ? WHERE session_id = ?").run(
+		bytes,
+		sessionId,
+	);
+}
+
 function valueAfter(flag: string): string | undefined {
 	const index = Bun.argv.indexOf(flag);
 	return index === -1 ? undefined : Bun.argv[index + 1];
@@ -294,7 +334,7 @@ async function captureCurrentCheckout(
 		const hostFiles = harness.inspectIsolation();
 		const generation = db
 			.prepare(
-				"SELECT cached_m0_bytes, cached_m0_materialized_at FROM session_meta WHERE session_id = ?",
+				`SELECT ${await renderCacheSelect(db, "cached_m0_bytes")}, cached_m0_materialized_at FROM session_meta WHERE session_id = ?`,
 			)
 			.get(sessionId) as {
 			cached_m0_bytes: Uint8Array | null;
@@ -332,7 +372,7 @@ async function captureCurrentCheckout(
 			const decision = observations.at(-1);
 			const current = db
 				.prepare(
-					"SELECT cached_m0_bytes, cached_m0_materialized_at FROM session_meta WHERE session_id = ?",
+					`SELECT ${await renderCacheSelect(db, "cached_m0_bytes")}, cached_m0_materialized_at FROM session_meta WHERE session_id = ?`,
 				)
 				.get(sessionId) as typeof generation;
 			if (
@@ -653,7 +693,7 @@ async function capturePricedCheckout(
 		if (actualHardHistory !== expectedHistory) {
 			const meta = db
 				.prepare(
-					"SELECT cached_m0_upgrade_state, cached_m0_model_key, last_usage_context_limit FROM session_meta WHERE session_id = ?",
+					`SELECT ${await renderCacheSelect(db, "cached_m0_upgrade_state")}, cached_m0_model_key, last_usage_context_limit FROM session_meta WHERE session_id = ?`,
 				)
 				.get(sessionId);
 			const markers = (text: string) =>
@@ -718,9 +758,7 @@ async function capturePricedCheckout(
 			throw new Error("tail fixture has no independently eligible tool tags");
 		// Seed identical cached history in master and candidate; queued tool drops must not re-render it.
 		const commonHistory = `<session-history>\n${renderDecayedCompartments({ compartments, historyBudgetTokens: 60000 })}\n</session-history>`;
-		db.prepare(
-			"UPDATE session_meta SET cached_m0_bytes = ? WHERE session_id = ?",
-		).run(Buffer.from(commonHistory), sessionId);
+		await writeCachedM0Bytes(db, sessionId, Buffer.from(commonHistory));
 		db.close();
 		await harness.restart();
 		db = harness.openFixtureWriter();

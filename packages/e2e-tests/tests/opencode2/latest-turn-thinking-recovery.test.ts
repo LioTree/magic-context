@@ -26,6 +26,7 @@ import {
 	waitForPluginActive,
 } from "../../src/opencode2-runner/spawn";
 import { cleanupE2ETempDir } from "../../src/temp-dir";
+import { writeSessionMetaField } from "../../src/session-meta-fields";
 
 const MARKER = "ISSUE-630-OC2-RECOVERY";
 const bytes = (value: unknown) =>
@@ -133,9 +134,12 @@ test("OC2 arms thinking recovery for the rejected turn from its event stream and
 					)
 						.map((row) => row.id)
 						.slice(0, 2);
-					db.query(
-						"UPDATE session_meta SET merged_reasoning_stripped_ids = ? WHERE session_id = ?",
-					).run(JSON.stringify(seeded.map((id) => `binding_mismatch:${id}`)), session.id);
+					writeSessionMetaField(
+						db,
+						session.id,
+						"merged_reasoning_stripped_ids",
+						JSON.stringify(seeded.map((id) => `binding_mismatch:${id}`)),
+					);
 				} finally {
 					db.close();
 				}

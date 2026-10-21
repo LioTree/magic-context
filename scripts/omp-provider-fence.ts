@@ -372,6 +372,7 @@ import {Database} from 'bun:sqlite';
 import {appendCompartments} from ${JSON.stringify(resolve(import.meta.dir, "../packages/plugin/src/features/magic-context/compartment-storage.ts"))};
 import {piPreparedStructure} from ${JSON.stringify(resolve(import.meta.dir, "../packages/pi-plugin/src/pi-dispatch-structure.ts"))};
 import {getTagsBySession} from ${JSON.stringify(resolve(import.meta.dir, "../packages/plugin/src/features/magic-context/storage.ts"))};
+import {sessionRenderCacheSelect} from ${JSON.stringify(resolve(import.meta.dir, "../packages/plugin/src/features/magic-context/storage-session-cache.ts"))};
 import {applyCavemanCleanup} from ${JSON.stringify(resolve(import.meta.dir, "../packages/plugin/src/hooks/magic-context/caveman-cleanup.ts"))};
 const log = value => appendFileSync(${JSON.stringify(join(root, "hooks.jsonl"))},JSON.stringify({at:Date.now(),...value})+'\\n');
 export default async pi => {
@@ -411,7 +412,7 @@ export default async pi => {
         log({phase:'prepared',messages:result?.messages,structure:piPreparedStructure(result?.messages??[],ctx.model)});
         if(${JSON.stringify(historyCase)}==='materialized' && result?.messages) {
           const db=new Database(process.env.MAGIC_CONTEXT_STORAGE_DIR+'/context.db',{readonly:true});
-          try {log({phase:'materialized-proof',leadingRoles:result.messages.map(message=>message.role),rows:db.query('SELECT cached_m0_bytes,cached_m1_bytes FROM session_meta WHERE session_id=?').all(ctx.sessionManager.getSessionId()).map(row=>({m0:new TextDecoder().decode(row.cached_m0_bytes),m1:new TextDecoder().decode(row.cached_m1_bytes)}))});}
+          try {log({phase:'materialized-proof',leadingRoles:result.messages.map(message=>message.role),rows:db.query('SELECT '+sessionRenderCacheSelect('cached_m0_bytes','cached_m0_bytes',db)+','+sessionRenderCacheSelect('cached_m1_bytes','cached_m1_bytes',db)+' FROM session_meta WHERE session_id=?').all(ctx.sessionManager.getSessionId()).map(row=>({m0:new TextDecoder().decode(row.cached_m0_bytes),m1:new TextDecoder().decode(row.cached_m1_bytes)}))});}
           finally {db.close();}
         }
         if(${JSON.stringify(mode)}==='raw' || globalThis.__mc683Raw) return {messages:raw};

@@ -13,6 +13,7 @@ import { setPersistedCompactionMarkerState } from "../../plugin/src/features/mag
 import { TestHarness } from "../src/harness";
 import { createIsolatedEnv } from "../src/opencode-runner/spawn";
 import { cleanupE2ETempDir } from "../src/temp-dir";
+import { sessionMetaFieldSelect } from "../src/session-meta-fields";
 import { OpenCode2TestHarness } from "../src/opencode2-harness";
 import { PiTestHarness } from "../src/pi-harness";
 import { resolvePiPackageJson } from "../src/pi-runner/spawn";
@@ -325,7 +326,7 @@ try {
         }
         finally { db.close(); }
         if (!stock) {
-            const row = rows("SELECT * FROM session_meta WHERE session_id = ?")[0] ?? {};
+            const row = rows(`SELECT *, ${sessionMetaFieldSelect("trailing_blank_decisions")}, ${sessionMetaFieldSelect("merged_reasoning_stripped_ids")} FROM session_meta WHERE session_id = ?`)[0] ?? {};
             report.frozenDecisions = Object.fromEntries(Object.entries(row).filter(([key]) => /trailing_blank_decisions|merged_reasoning/.test(key)));
         }
     }

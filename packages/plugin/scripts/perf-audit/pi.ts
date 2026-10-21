@@ -34,6 +34,7 @@ process.env.NODE_ENV = "test";
 const { Database } = await import("../../src/shared/sqlite");
 const { initializeDatabase } = await import("../../src/features/magic-context/storage-db");
 const { runMigrations } = await import("../../src/features/magic-context/migrations");
+const { writeSessionRenderCache } = await import("../../src/features/magic-context/storage-session-cache");
 const { getOrCreateSessionMeta } = await import("../../src/features/magic-context/storage-meta");
 const { getMemoriesByProject } = await import("../../src/features/magic-context/memory/storage-memory");
 const { stripSystemInjection } = await import("../../src/hooks/magic-context/system-injection-stripper");
@@ -136,7 +137,7 @@ try {
     db.prepare("UPDATE session_meta SET channel2_nudge_state = '' WHERE session_id = 'audit' AND channel2_nudge_state = 'pending'").run();
    }),
   };
-  db.prepare("UPDATE session_meta SET cached_m0_bytes = ?, cached_m1_bytes = ?, cached_m0_mural_data_url = ? WHERE session_id = 'audit'").run(Buffer.from("m0 ".repeat(5000)),Buffer.from("m1 ".repeat(100)),"data:image/png;base64,"+"a".repeat(1024*1024));
+  writeSessionRenderCache(db,"audit","cached_m0_bytes",Buffer.from("m0 ".repeat(5000))); writeSessionRenderCache(db,"audit","cached_m1_bytes",Buffer.from("m1 ".repeat(100))); writeSessionRenderCache(db,"audit","cached_m0_mural_data_url","data:image/png;base64,"+"a".repeat(1024*1024));
   Object.assign(timings, { meta4BlobReads: median(() => { for(let i=0;i<4;i++) getOrCreateSessionMeta(db,"audit"); }), m0BlobSnapshot: median(() => createPiM0M1PassSnapshot({db,sessionId:"audit",compactionOff:false})) });
   const plans = ["message_id", "tool_owner_message_id"].map(column => db.prepare(`EXPLAIN QUERY PLAN SELECT 1 FROM tags WHERE session_id = ? AND type = ? AND ${column} LIKE 'pi-msg-%' LIMIT 1`).all("audit",column === "message_id" ? "message" : "tool"));
   const memoBeforeTeardown = hygieneTest.contentMemoStats();

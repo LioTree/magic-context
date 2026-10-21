@@ -4,6 +4,7 @@ import { join } from "node:path";
 import { OpenCode } from "@opencode/client";
 import { Database } from "bun:sqlite";
 import { isolation, spawnOpencode2, waitForPluginActive } from "../../src/opencode2-runner/spawn";
+import { sessionMetaFieldSelect, writeSessionMetaField } from "../../src/session-meta-fields";
 
 const png = "iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAYAAAAfFcSJAAAADUlEQVR42mP8z8BQDwAEhQGAhKmMIQAAAABJRU5ErkJggg==";
 
@@ -45,15 +46,16 @@ test("a persisted project mural reaches the vision-capable host as Media on pric
         const contextPath = join(fixture.env.XDG_DATA_HOME!, "cortexkit", "magic-context", "context.db");
         const db = new Database(contextPath);
         try {
-            const metadata = db.prepare("SELECT cached_m0_upgrade_state AS upgrade FROM session_meta WHERE session_id = ?")
+            const metadata = db.prepare(`SELECT ${sessionMetaFieldSelect("cached_m0_upgrade_state", "upgrade")} FROM session_meta WHERE session_id = ?`)
                 .get(session.id) as { upgrade: string | null } | undefined;
             if (!metadata?.upgrade) throw new Error("mural session did not persist initial m0 fold");
             db.prepare(`INSERT OR REPLACE INTO mural_manifest
                 (project_path, image, content_hash, rendered_at, memory_ids_json, width, height)
                 VALUES (?, ?, ?, ?, '[]', 1, 1)`)
                 .run(fixture.cwd, Buffer.from(png, "base64"), "fixture-mural-hash", Date.now());
-            db.prepare("UPDATE session_meta SET cached_m0_mural_data_url = ?, cached_m0_mural_hash = ? WHERE session_id = ?")
-                .run(`data:image/png;base64,${png}`, "fixture-mural-hash", session.id);
+            writeSessionMetaField(db, session.id, "cached_m0_mural_data_url", `data:image/png;base64,${png}`);
+            db.prepare("UPDATE session_meta SET cached_m0_mural_hash = ? WHERE session_id = ?")
+                .run("fixture-mural-hash", session.id);
         } finally { db.close(); }
         host = await spawnOpencode2(options);
         client = OpenCode.make({ baseUrl: host.url,

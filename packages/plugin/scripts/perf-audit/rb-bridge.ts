@@ -20,6 +20,20 @@ const { getPendingOps, hasPendingDropOps: scalarDropProbe, queuePendingOp } = aw
 // The same instrument can be copied to an older checkout before the scalar
 // probe existed; measure that checkout's original predicate in that case.
 const hasPendingDropOps = scalarDropProbe ?? ((db: Parameters<typeof getPendingOps>[0], sessionId: string) => getPendingOps(db, sessionId).length > 0);
+// Context migration 103 moved cached_m0_bytes and stripped_placeholder_ids out of
+// session_meta into their own rows. An older checkout has no accessors for the moved
+// values and still keeps them in session_meta columns.
+const renderCache = await import("../../src/features/magic-context/storage-session-cache").catch(() => undefined);
+const collections = await import("../../src/features/magic-context/storage-session-collections").catch(() => undefined);
+type AuditDatabase = Parameters<typeof getPendingOps>[0];
+function writeCachedM0Bytes(db: AuditDatabase, sessionId: string, value: Buffer | null): void {
+    if (renderCache) renderCache.writeSessionRenderCache(db, sessionId, "cached_m0_bytes", value);
+    else db.prepare("UPDATE session_meta SET cached_m0_bytes = ? WHERE session_id = ?").run(value, sessionId);
+}
+function writeStrippedPlaceholderIds(db: AuditDatabase, sessionId: string, value: string): void {
+    if (collections) collections.writeSessionMetaCollection(db, sessionId, "stripped_placeholder_ids", value);
+    else db.prepare("UPDATE session_meta SET stripped_placeholder_ids = ? WHERE session_id = ?").run(value, sessionId);
+}
 const { getOverflowState, setSessionWorkMetrics } = await import("../../src/features/magic-context/storage-meta-persisted");
 const { cloneModuleNativeOutput } = await import("../../src/hooks/magic-context/module-wire");
 const { buildModuleStateSyncPayload, syncModuleState, loadModuleWatermarks } = await import("../../src/hooks/magic-context/module-state-sync");
@@ -90,20 +104,20 @@ try {
         const m0Args = { m0Text, projectIdentity: undefined, injectionBudgetTokens: undefined, memoryBlockCount: 0 };
         const tokens = computeM0BlockTokens(db, sessionId, m0Args);
         const blob = Buffer.alloc(Math.min(n * 300, 24_000_000), 65);
-        db.prepare("UPDATE session_meta SET cached_m0_bytes = ? WHERE session_id = ?").run(blob, sessionId);
+        writeCachedM0Bytes(db, sessionId, blob);
         rows.push({ n, jsonBytes: Buffer.byteLength(jsonPrefix), rb1StringifyMs: measure(() => JSON.stringify(messages)), rb1PersistMs: persistMs, rb1WritesPerCapture: (changesAfter - changesBefore) / 8, rb1PersistedHash: hash(loadPersistedLkgSlot(db, sessionId)), rb3NoteEntryMs: noteMs, rb4CloneMs: measure(() => cloneModuleNativeOutput(messages)), rb8SelectAllMs: measure(() => db.prepare("SELECT * FROM session_meta WHERE session_id = ?").get(sessionId)), rb8BpeMs: measure(() => computeM0BlockTokens(db, sessionId, m0Args)), rb8TokenHash: hash(tokens) });
 
         db.transaction(() => { for (let i = 0; i < n; i++) queuePendingOp(db, sessionId, i, "drop", i); })();
         rows.push({ n, rb11PendingRowsMs: measure(() => getPendingOps(db, sessionId)), rb11ProbeMs: measure(() => hasPendingDropOps(db, sessionId)), rb11OverflowTwoReadsMs: measure(() => { getOverflowState(db, sessionId); getOverflowState(db, sessionId); }), rb11UnknownOperationPreserved: true });
         db.prepare("DELETE FROM pending_ops WHERE session_id = ?").run(sessionId);
-        db.prepare("UPDATE session_meta SET cached_m0_bytes = NULL WHERE session_id = ?").run(sessionId);
+        writeCachedM0Bytes(db, sessionId, null);
         const stripIds = Array.from({ length: n }, (_, i) => `strip-${(i * 173) % n}`);
-        db.prepare("UPDATE session_meta SET stripped_placeholder_ids = ? WHERE session_id = ?").run(JSON.stringify(stripIds), sessionId);
+        writeStrippedPlaceholderIds(db, sessionId, JSON.stringify(stripIds));
         const seedState = { moduleGeneration: 1, lastAckedSeq: 0, lastAckedWatermarks: null, idOrdinalMemoGeneration: 1, idOrdinalMemo: new Map<string, number>(), seedPassPending: true };
         const seedArgs = { state: seedState, pass: { db, sessionId, nowMs: 1 }, force: true, seedId: "fixed-audit-seed" };
         const seed = await buildModuleStateSyncPayload(seedArgs);
         rows.push({ n, rb13ColdStripSeedMs: await measureAsync(() => buildModuleStateSyncPayload(seedArgs), 3), rb13SeedHash: hash(seed) });
-        db.prepare("UPDATE session_meta SET stripped_placeholder_ids = '' WHERE session_id = ?").run(sessionId);
+        writeStrippedPlaceholderIds(db, sessionId, "");
     }
     const state = { moduleGeneration: 1, lastAckedSeq: 0, lastAckedWatermarks: null, idOrdinalMemoGeneration: 1, idOrdinalMemo: new Map<string, number>(), seedPassPending: true };
     const pass = { db, sessionId, nowMs: 1 };

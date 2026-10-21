@@ -3,6 +3,7 @@ import { createHash } from "node:crypto";
 import { existsSync, mkdirSync, mkdtempSync, readFileSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
+import { sessionMetaFieldSelect } from "../src/session-meta-fields";
 import { openTestDb } from "../src/test-db";
 
 /**
@@ -74,7 +75,7 @@ test("scoped gate concurrent priced and defer processes never serve a mixed swee
         const db = openTestDb(dbPath);
         try {
             const row = db
-                .query("SELECT merged_reasoning_stripped_ids AS ids FROM session_meta WHERE session_id = ?")
+                .query(`SELECT ${sessionMetaFieldSelect("merged_reasoning_stripped_ids", "ids")} FROM session_meta WHERE session_id = ?`)
                 .get(sessionId) as { ids: string | null } | undefined;
             return String(row?.ids ?? "").includes("@tool-sweep-scoped");
         } finally {

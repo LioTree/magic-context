@@ -10,6 +10,7 @@ import { TestHarness } from "../src/harness";
 import { markerWorkerBundleFixture } from "../src/marker-worker-bundle-fixture";
 import { buildMockHistorianPayload, findHistorianOrdinalRange } from "../src/mock-historian";
 import { assertOpenPaths } from "../src/opencode2-runner/spawn";
+import { sessionMetaFieldValueSql } from "../src/session-meta-fields";
 
 /**
  * A native OpenCode compaction (`/compact`) on a Magic Context session.
@@ -98,7 +99,7 @@ function readBaseline(sessionId: string): {
     const row = h
         .contextDb()
         .prepare(
-            "SELECT cached_m0_last_baseline_end_message_id AS boundary, cached_m0_bytes IS NOT NULL AS has_m0, cached_m0_materialized_at AS at FROM session_meta WHERE session_id = ?",
+            `SELECT cached_m0_last_baseline_end_message_id AS boundary, ${sessionMetaFieldValueSql("cached_m0_bytes")} IS NOT NULL AS has_m0, cached_m0_materialized_at AS at FROM session_meta WHERE session_id = ?`,
         )
         .get(sessionId) as { boundary: string | null; has_m0: number; at: number | null } | null;
     return {

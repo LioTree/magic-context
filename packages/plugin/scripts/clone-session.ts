@@ -7,6 +7,18 @@ import { getDataDir, getMagicContextStorageDir } from "../src/shared/data-path";
 import { Database } from "../src/shared/sqlite";
 import { closeQuietly } from "../src/shared/sqlite-helpers";
 import { clearSession } from "../src/features/magic-context/storage-meta-session";
+import {
+    readSessionRenderCache,
+    SESSION_RENDER_CACHE_COLUMNS,
+    writeSessionRenderCache,
+} from "../src/features/magic-context/storage-session-cache";
+import {
+    readSessionMetaCollection,
+    SESSION_META_COLLECTION_DEFAULTS,
+    type SessionMetaCollection,
+    writeSessionMetaCollection,
+    writeSessionMetaCollectionBytes,
+} from "../src/features/magic-context/storage-session-collections";
 import { SESSION_SCOPED_TABLES } from "../src/features/magic-context/storage-session-tables";
 import {
     copySessionStateForClone,
@@ -1087,6 +1099,54 @@ function copyContextMeta(
         ...values,
         destinationSessionId,
     );
+    copyMovedContextMeta(db, sourceSessionId, destinationSessionId, messageIds, partIds);
+}
+
+/**
+ * Context migration 103 moved the large session values out of session_meta columns into
+ * session_render_cache and session_meta_chunks rows. Copy each moved value by the same
+ * rules the column copy above applied while it was a column: contextMetaReset decides
+ * which values reset, the replay document stays with the core clone, and the rest is
+ * remapped. On a database from before the move these values are still columns, so the
+ * column copy above has already handled them and they are skipped here.
+ */
+function copyMovedContextMeta(
+    db: Database,
+    sourceSessionId: string,
+    destinationSessionId: string,
+    messageIds: IdMap,
+    partIds: IdMap,
+): void {
+    const inline = new Set(columns(db, "session_meta").map((column) => column.name));
+    const copied = (column: string, value: unknown): unknown => {
+        const reset = contextMetaReset({ name: column, type: "TEXT", pk: 0 });
+        if (reset !== undefined) return reset;
+        return rewriteContextValue(column, value, sourceSessionId, destinationSessionId, messageIds, partIds);
+    };
+    if (tableExists(db, "session_render_cache")) {
+        for (const column of SESSION_RENDER_CACHE_COLUMNS) {
+            if (inline.has(column)) continue;
+            const value = copied(column, readSessionRenderCache(db, sourceSessionId, column));
+            writeSessionRenderCache(db, destinationSessionId, column, value as Parameters<typeof writeSessionRenderCache>[3]);
+        }
+    }
+    if (tableExists(db, "session_meta_chunks")) {
+        for (const column of Object.keys(SESSION_META_COLLECTION_DEFAULTS) as SessionMetaCollection[]) {
+            if (column === "trailing_blank_decisions" || inline.has(column)) continue;
+            const value = copied(column, readSessionMetaCollection(db, sourceSessionId, column));
+            if (value instanceof Uint8Array) {
+                writeSessionMetaCollectionBytes(db, destinationSessionId, column, value, "blob");
+            } else {
+                // These values are text; a stray numeric value is copied as its text form.
+                writeSessionMetaCollection(
+                    db,
+                    destinationSessionId,
+                    column,
+                    value === null || value === undefined ? null : String(value),
+                );
+            }
+        }
+    }
 }
 
 function copyContextAdditionalTables(

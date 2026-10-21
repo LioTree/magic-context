@@ -23,6 +23,7 @@ import { MockProvider } from "../../../e2e-tests/src/mock-provider/server";
 import { awaitPluginActivation } from "../../../e2e-tests/src/opencode2-runner/plugin-activation";
 import { CLI as V2_CLI } from "../../../e2e-tests/src/opencode2-runner/spawn";
 import { runMigrations } from "../../src/features/magic-context/migrations";
+import { sessionRenderCacheSelect } from "../../src/features/magic-context/storage-session-cache";
 
 const root = realpathSync(process.argv[2]);
 assert.ok(root.startsWith(`${realpathSync(join(process.env.TMPDIR, "magic-context"))}/`));
@@ -683,7 +684,9 @@ for (const version of [1, 2]) {
         try {
             const row = connection
                 .query(
-                    "SELECT cached_m0_bytes,cached_m1_bytes,cached_m0_materialized_at FROM session_meta WHERE session_id=?",
+                    // The baseline build may predate context migration 103, which moved the
+                    // cached heads out of session_meta; read whichever layout this store has.
+                    `SELECT ${sessionRenderCacheSelect("cached_m0_bytes", "cached_m0_bytes", connection)},${sessionRenderCacheSelect("cached_m1_bytes", "cached_m1_bytes", connection)},cached_m0_materialized_at FROM session_meta WHERE session_id=?`,
                 )
                 .get(id);
             assert.ok(

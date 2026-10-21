@@ -3,6 +3,7 @@ import { createHash } from "node:crypto";
 import { existsSync, readFileSync, writeFileSync } from "node:fs";
 import { join } from "node:path";
 import { processedImagePng } from "../../src/processed-image-fixture";
+import { writeSessionMetaField } from "../../src/session-meta-fields";
 import { OpenCode } from "@opencode/client";
 import { Database } from "../../../plugin/src/shared/sqlite";
 import { gaDatabasePath, V2StoreReader } from "../../../plugin/src/v2/store-reader";
@@ -339,8 +340,7 @@ test("independent frozen user and tool images survive an OC2 checkpoint and proc
         const mc = new Database(join(host.env.MAGIC_CONTEXT_STORAGE_DIR!, "context.db"));
         try {
             mc.exec("PRAGMA busy_timeout = 5000");
-            mc.prepare("UPDATE session_meta SET processed_image_stripped_ids = ? WHERE session_id = ?")
-                .run(JSON.stringify({ ids, textMarkerIds: ids }), run.session.id);
+            writeSessionMetaField(mc, run.session.id, "processed_image_stripped_ids", JSON.stringify({ ids, textMarkerIds: ids }));
         } finally { mc.close(); }
         const frozen = (await run.turn("FROZEN-BEFORE-CHECKPOINT")).at(-1)!;
         expect(JSON.stringify(frozen)).not.toContain(data);

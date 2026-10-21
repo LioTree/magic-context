@@ -8,6 +8,7 @@ import {
     conversionFixture, SHARED_MOCK_MODEL_ID, SHARED_MOCK_PROVIDER_ID, spawnOpencode1,
 } from "../../src/opencode2-runner/conversion-lane";
 import { spawnOpencode2, waitForPluginActive } from "../../src/opencode2-runner/spawn";
+import { sessionMetaFieldSelect, writeSessionMetaField } from "../../src/session-meta-fields";
 import { rpcPortDir } from "../../../plugin/src/shared/rpc-utils";
 
 const TOOL_COUNT = 155;
@@ -143,11 +144,12 @@ test("converted 750k session explicit flush exercises reporter emergency drop pa
         seedConvertedTail(fixture.openCodeDbPath, sessionID);
         const contextDb = new Database(fixture.contextDbPath);
         try {
-            const row = contextDb.prepare("SELECT cached_m0_upgrade_state AS upgrade FROM session_meta WHERE session_id = ?")
+            const row = contextDb.prepare(`SELECT ${sessionMetaFieldSelect("cached_m0_upgrade_state", "upgrade")} FROM session_meta WHERE session_id = ?`)
                 .get(sessionID) as { upgrade: string | null } | undefined;
             if (!row?.upgrade) throw new Error("warmup did not materialize m0 upgrade state");
-            contextDb.prepare("UPDATE session_meta SET cached_m0_upgrade_state = ?, cached_m0_last_baseline_end_message_id = ? WHERE session_id = ?")
-                .run(row.upgrade.replace(/\|render-budgets:[^|]+/, "|render-budgets:m9999-h99999"), "msg_absent_fixture_boundary", sessionID);
+            writeSessionMetaField(contextDb, sessionID, "cached_m0_upgrade_state", row.upgrade.replace(/\|render-budgets:[^|]+/, "|render-budgets:m9999-h99999"));
+            contextDb.prepare("UPDATE session_meta SET cached_m0_last_baseline_end_message_id = ? WHERE session_id = ?")
+                .run("msg_absent_fixture_boundary", sessionID);
             contextDb.prepare(`INSERT INTO compartments
                 (session_id, sequence, start_message, end_message, start_message_id, end_message_id, title, content, created_at, harness)
                 VALUES (?, 1, 0, 1, 'msg_absent_fixture_start', 'msg_absent_fixture_boundary', 'fixture', 'fixture', ?, 'opencode2')`)

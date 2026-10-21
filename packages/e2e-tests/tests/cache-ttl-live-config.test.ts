@@ -5,6 +5,7 @@ import { copyFileSync, mkdirSync, readFileSync, realpathSync, writeFileSync } fr
 import { tmpdir } from "node:os";
 import { dirname, join } from "node:path";
 import { TestHarness } from "../src/harness";
+import { sessionMetaFieldSelect } from "../src/session-meta-fields";
 
 // OpenCode moves cache annotations as new messages append. Compare every content byte,
 // system instruction and tool definition, excluding only those moving annotations.
@@ -49,7 +50,7 @@ test("OpenCode 1 live cache_ttl edits affect the next idle check without changin
         };
         containment();
         const session = await h.createSession();
-        const meta = () => h.contextDb().query("SELECT cache_ttl, trailing_blank_decisions, last_response_time FROM session_meta WHERE session_id = ?").get(session) as { cache_ttl: string; trailing_blank_decisions: string; last_response_time: number };
+        const meta = () => h.contextDb().query(`SELECT cache_ttl, ${sessionMetaFieldSelect("trailing_blank_decisions")}, last_response_time FROM session_meta WHERE session_id = ?`).get(session) as { cache_ttl: string; trailing_blank_decisions: string; last_response_time: number };
         const completedPrompt = async (text: string) => {
             const result = await h.sendPrompt(session, text) as { data: { info: { id: string; time: { completed: number } } } };
             const assistant = result.data.info;

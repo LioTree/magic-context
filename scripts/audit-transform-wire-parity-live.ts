@@ -17,6 +17,7 @@ import { dirname, join, resolve } from "node:path";
 import { fileURLToPath } from "node:url";
 import { cavemanCompress } from "../packages/plugin/src/hooks/magic-context/caveman";
 import { computeTargetDepth } from "../packages/plugin/src/hooks/magic-context/caveman-cleanup";
+import { sessionRenderCacheSelect } from "../packages/plugin/src/features/magic-context/storage-session-cache";
 
 const ROOT = resolve(dirname(fileURLToPath(import.meta.url)), "..");
 const RUST_SESSIONS = [
@@ -939,13 +940,19 @@ function piEvidence(context: Database, root: string): Record<string, unknown> {
 		}
 		if (!sessionId || !tableExists(context, "session_meta")) continue;
 		const metaColumns = columns(context, "session_meta");
+		// Context migration 103 moved the cached heads into session_render_cache; the
+		// accessor reads whichever layout this database has.
+		const renderCache = tableExists(context, "session_render_cache");
 		const selected = [
-			"cached_m0_bytes",
-			"cached_m1_bytes",
-			"pending_pi_compaction_marker_state",
-		]
-			.filter((column) => metaColumns.has(column))
-			.join(", ");
+			...(["cached_m0_bytes", "cached_m1_bytes"] as const)
+				.filter((column) => renderCache || metaColumns.has(column))
+				.map((column) =>
+					sessionRenderCacheSelect(column, column, context as never),
+				),
+			...["pending_pi_compaction_marker_state"].filter((column) =>
+				metaColumns.has(column),
+			),
+		].join(", ");
 		const meta = selected
 			? (context
 					.query(`SELECT ${selected} FROM session_meta WHERE session_id = ?`)

@@ -23,6 +23,7 @@ import { existsSync, mkdirSync, readFileSync, realpathSync, writeFileSync } from
 import { homedir } from "node:os";
 import { join, resolve } from "node:path";
 import { MockProvider } from "../../packages/e2e-tests/src/mock-provider/server";
+import { sessionRenderCacheValueSql } from "../../packages/plugin/src/features/magic-context/storage-session-cache";
 
 const args = new Map<string, string>();
 for (let index = 2; index < process.argv.length; index += 2) {
@@ -154,7 +155,7 @@ try {
             `SELECT (SELECT COUNT(*) FROM compartments WHERE session_id = ?1) AS compartments,
                     (SELECT MAX(end_message) FROM compartments WHERE session_id = ?1) AS end_message,
                     cached_m0_max_compartment_seq, cached_m0_materialized_at, cached_m0_last_baseline_end_message_id,
-                    length(cached_m0_bytes) AS cached_m0_length, pending_compaction_marker_state
+                    length(${sessionRenderCacheValueSql("cached_m0_bytes", db as never)}) AS cached_m0_length, pending_compaction_marker_state
                FROM session_meta WHERE session_id = ?1`,
         ).get(session);
     } finally {
