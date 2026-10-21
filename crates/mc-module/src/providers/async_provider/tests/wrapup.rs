@@ -562,3 +562,66 @@ async fn async_wrapup_refuses_an_already_running_historian() {
     assert_eq!(rig.h.provider_historian_budget.stats()["active"], 0);
     drop(held);
 }
+
+/// A person's `/ctx-wrapup` must not fail because another call on the same
+/// conversation happens to hold the conversation lock when the summary is
+/// published. Here a held lock stands in for a `late_results` poll or an
+/// advance notice that is still running: both take that lock, and a host polls
+/// `late_results` while it shows the wrapup's progress. Today the publication
+/// fence only tries the lock once and refuses with "async lineage sources
+/// changed", although neither the lineage nor the generation changed.
+#[tokio::test]
+#[ignore = "cache review finding: fails until fixed"]
+async fn stack26_wrapup_publication_survives_a_concurrent_conversation_call() {
+    let dir = tempfile::tempdir().unwrap();
+    let (rig, child) = fixture(dir.path()).await;
+    rig.narrative(45);
+    rig.notice(1, 1_000, None).await;
+    rig.historian_evaluation_done().await;
+    let before = rig
+        .ride("ttl_expired")
+        .await
+        .expect("initial permitted view");
+    rig.notice(2, 1_000, Some(before.view_version)).await;
+    let accepted = rig.user_wrapup_command("wrapup", "keep-20").await;
+    assert_eq!(accepted["state"], "accepted");
+    let send = tokio::time::timeout(Duration::from_secs(10), child.next_unfinished())
+        .await
+        .expect("summarizer child started");
+    let generation = rig.state().generation;
+    // Another call on this conversation holds its lock while the summary lands.
+    let held = rig.h.provider_serial.lock_for(&rig.state().key).await;
+    child.finish(
+        &send.run_id,
+        r#"<output><compartments>
+      <compartment start="0" end="24" title="history" episode_type="feature" importance="60"><p1>wrapup durable history</p1><p2>history</p2><p3>history</p3><p4 /></compartment>
+      </compartments><meta><messages_processed>0-24</messages_processed><unprocessed_from>25</unprocessed_from></meta></output>"#
+            .to_string(),
+    );
+    // Give the drive time to reach the publication fence, then release the lock.
+    let _ = tokio::time::timeout(Duration::from_secs(3), async {
+        while !rig.h.wrapup_sessions.lock().unwrap().is_empty() {
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+    })
+    .await;
+    drop(held);
+    let late = rig.user_wrapup_terminal().await;
+    let result = late["entries"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|entry| entry["kind"] == "result")
+        .unwrap()
+        .clone();
+    assert_eq!(
+        rig.state().generation,
+        generation,
+        "the lineage did not change"
+    );
+    assert_eq!(
+        result["result"]["state"], "done",
+        "a briefly held conversation lock failed the wrapup: {}",
+        result["result"]["text"]
+    );
+}

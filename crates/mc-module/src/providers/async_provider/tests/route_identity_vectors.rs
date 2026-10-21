@@ -164,3 +164,29 @@ async fn published_route_identity_vectors_match_async_provider_setup_and_reverse
         other => panic!("unattested route was accepted: {other:?}"),
     }
 }
+
+/// Setup accepts a session id with surrounding whitespace (it compares the
+/// trimmed id with the route's bound session). The conversation's runner route
+/// and its bind identity must then still name the same session: the production
+/// runner refuses every `session.read` and `session.send` whose identity session
+/// differs from the route's parent session ("session runner route identity
+/// mismatch"). Today the bind identity keeps the trimmed id and the route keeps
+/// the untrimmed one.
+#[tokio::test]
+#[ignore = "cache review finding: fails until fixed"]
+async fn stack26_padded_setup_session_keeps_runner_route_and_identity_on_one_session() {
+    let dir = tempfile::tempdir().unwrap();
+    let rig = setup_vector_rig(
+        dir.path(),
+        &json!({"harness":"runner","session":""}),
+        &json!({"harness":"broca","session":"conversation-1 "}),
+    )
+    .await;
+    let state = rig.state();
+    let route = state.runner().unwrap();
+    assert_eq!(
+        route.parent_session(),
+        state.runner_identity().session,
+        "route and bind identity address different sessions"
+    );
+}

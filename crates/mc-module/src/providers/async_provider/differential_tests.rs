@@ -13,8 +13,8 @@ use cortexkit_bus_inmemory::{InMemoryBus, InMemoryConfig};
 #[path = "stack24_cache_review.rs"]
 mod stack24_cache_review;
 
-#[path = "stack26_review_campaign.rs"]
-mod stack26_review_campaign;
+#[path = "stack26_cache_review.rs"]
+mod stack26_cache_review;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum Profile {
@@ -1229,20 +1229,8 @@ async fn session_pair(profile: Profile, seed: u64, steps: u64) -> Pair {
 /// into the transcript (see `stack24_cache_review::Review::message`).
 async fn session_pair_with(profile: Profile, seed: u64, steps: u64, echoes: bool) -> Pair {
     let (mut pair, mut rng) = session_start(profile, seed, echoes).await;
-    let mut checked = BTreeSet::new();
-    if std::env::var_os("MC_STACK26_COMMANDS").is_some() {
-        stack26_review_campaign::check_views(&pair, &mut checked);
-    }
-    for step in 0..steps {
+    for _ in 0..steps {
         pair.step(&mut rng).await;
-        if std::env::var_os("MC_STACK26_COMMANDS").is_some() {
-            stack26_review_campaign::check_views(&pair, &mut checked);
-            if step % 8 == 3 {
-                let command = ["ctx-status", "ctx-flush", "ctx-wrapup"][(step / 8) as usize % 3];
-                stack26_review_campaign::command(&mut pair, command).await;
-                stack26_review_campaign::check_views(&pair, &mut checked);
-            }
-        }
     }
     pair
 }
