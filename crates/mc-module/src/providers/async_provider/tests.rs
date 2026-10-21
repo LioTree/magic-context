@@ -1,5 +1,6 @@
 use super::*;
 use cortexkit_bus_inmemory::{InMemoryBus, InMemoryConfig};
+mod moved_session;
 mod reminder_replay;
 mod reminders;
 mod route_identity_vectors;
@@ -277,6 +278,23 @@ impl Rig {
         params: Value,
         configure: impl FnOnce(&mut McHandler),
     ) -> Self {
+        let (rig, answer) =
+            Self::try_setup_with_model(dir, module, bind, setup, model, params, configure).await;
+        assert_eq!(answer["answer"], "ready", "{answer}");
+        assert_eq!(answer["ceiling"]["at_share"], 0.95);
+        rig
+    }
+
+    /// Build the rig and send its setup, returning the setup answer whatever it is.
+    async fn try_setup_with_model(
+        dir: &Path,
+        module: &str,
+        bind: (&str, &str),
+        setup: (&str, &str),
+        model: &str,
+        params: Value,
+        configure: impl FnOnce(&mut McHandler),
+    ) -> (Self, Value) {
         let (bind_harness, bind_session) = bind;
         let (setup_harness, setup_session) = setup;
         let descriptor = StorageDescriptor {
@@ -348,9 +366,7 @@ impl Rig {
                 json!({"session":setup_session,"harness":setup_harness,"request_id":"setup","model":model,"context_window":100_000,"composition":{"render_tags":true},"params":params,"lineage_id":"L","now":1}),
             )
             .await;
-        assert_eq!(answer["answer"], "ready", "{answer}");
-        assert_eq!(answer["ceiling"]["at_share"], 0.95);
-        rig
+        (rig, answer)
     }
     async fn op(&self, method: &str, params: Value) -> Value {
         response(

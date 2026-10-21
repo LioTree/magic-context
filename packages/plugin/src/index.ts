@@ -27,6 +27,7 @@ import {
     resolveProjectIdentityForSession,
     setHomeProjectPermission,
 } from "./features/magic-context/memory/project-identity";
+import { createMovedSessionCheck } from "./features/magic-context/mode3-move-record";
 import { backfillSessionActivity } from "./features/magic-context/session-activity";
 import { runSessionProjectBackfill } from "./features/magic-context/session-project-backfill";
 import { SMART_NOTE_COMPILER_SYSTEM_PROMPT } from "./features/magic-context/smart-notes/compiler-prompt";
@@ -375,6 +376,14 @@ const server: Plugin = async (ctx) => {
     } = {
         magicContext: hooks.magicContext,
     };
+    // Sessions the offline move handed to mode 3 are refused at the shared hook
+    // gate below. The check reads context.db only once storage is open; a
+    // disabled plugin never opens (and so never creates) it.
+    const isMovedSession = createMovedSessionCheck(() => {
+        if (!pluginConfig.enabled || !magicContextRuntime.magicContext) return null;
+        const db = openDatabase();
+        return db && isDatabasePersisted(db) ? db : null;
+    });
 
     // Loud fail-closed gate: when the user enabled MC but storage cannot open
     // (schema fence / migration hard failure), block primary transforms instead
@@ -646,7 +655,7 @@ const server: Plugin = async (ctx) => {
         rpcServer = new MagicContextRpcServer(storageDir, ctx.directory);
         // Per-session RPC requests (sidebar, status, flush, recomp, ...) about a
         // session another product's bridge serves are refused, not answered.
-        guardBridgedSessionRpc(rpcServer);
+        guardBridgedSessionRpc(rpcServer, isMovedSession);
         registerRpcHandlers(rpcServer, {
             directory: ctx.directory,
             config: pluginConfig,
@@ -706,7 +715,7 @@ const server: Plugin = async (ctx) => {
         rpcServer = new MagicContextRpcServer(storageDir, ctx.directory);
         // Per-session RPC requests (sidebar, status, flush, recomp, ...) about a
         // session another product's bridge serves are refused, not answered.
-        guardBridgedSessionRpc(rpcServer);
+        guardBridgedSessionRpc(rpcServer, isMovedSession);
         registerRpcHandlers(rpcServer, {
             directory: ctx.directory,
             config: pluginConfig,
@@ -1153,6 +1162,7 @@ const server: Plugin = async (ctx) => {
     // Sessions another product's bridge has enrolled get none of these hooks'
     // work; every other session reaches them unchanged.
     return standDownForBridgedSessions(entryHooks, {
+        isMovedSession,
         // When our session.created handler ran before the bridge enrolled the
         // session, the two rows it wrote are the only ones to remove on deletion.
         // Storage that never opened (disabled plugin, fail-closed) wrote none.

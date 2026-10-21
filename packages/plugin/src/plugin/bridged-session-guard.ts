@@ -1,4 +1,5 @@
 import type { Hooks, ToolDefinition } from "@opencode-ai/plugin";
+import { MOVED_SESSION_MESSAGE } from "../features/magic-context/mode3-move-record";
 import { deleteSessionMetaWithPayloads } from "../features/magic-context/storage-session-payloads";
 import {
     BRIDGED_SESSIONS_KEY,
@@ -24,6 +25,11 @@ import type { Database } from "../shared/sqlite";
  * no toasts. Sessions that are not enrolled reach the original callbacks with
  * the same arguments and get back the same promise, so they behave exactly as
  * before.
+ *
+ * The same gate refuses sessions the offline move handed to mode 3 (see
+ * `features/magic-context/mode3-move-record.ts`), so no hook can manage one by
+ * mistake. Those fail closed: their transform throws one clear message instead
+ * of passing the history through unmanaged, and every other hook does nothing.
  *
  * OpenCode 2 (`v2/`) and Pi register through their own entry points and do not
  * use this wrapper.
@@ -92,24 +98,41 @@ function transformSessionId(messages: ReadonlyArray<{ info?: unknown }>): string
  * with no session (server.instance.disposed, installation updates) never match.
  */
 export function eventConcernsBridgedSession(event: unknown): boolean {
-    if (!hasBridgedSessions() || !isRecord(event)) return false;
+    return hasBridgedSessions() && eventConcernsSession(event, isBridgedSession);
+}
+
+/** Whether a host event concerns a session `matches` accepts; see above. */
+function eventConcernsSession(event: unknown, matches: (sessionID: unknown) => boolean): boolean {
+    if (!isRecord(event)) return false;
     const properties = event.properties;
     if (!isRecord(properties)) return false;
-    if (isBridgedSession(properties.sessionID)) return true;
+    if (matches(properties.sessionID)) return true;
     const info = properties.info;
     if (isRecord(info)) {
-        if (isBridgedSession(info.sessionID)) return true;
+        if (matches(info.sessionID)) return true;
         if (
             typeof event.type === "string" &&
             event.type.startsWith("session.") &&
-            isBridgedSession(info.id)
+            matches(info.id)
         ) {
             return true;
         }
     }
     const part = properties.part;
-    return isRecord(part) && isBridgedSession(part.sessionID);
+    return isRecord(part) && matches(part.sessionID);
 }
+
+/** The error a moved session's transform throws, so the user sees why. */
+export class MovedSessionError extends Error {
+    readonly code = "MAGIC_CONTEXT_SESSION_MOVED";
+
+    constructor() {
+        super(MOVED_SESSION_MESSAGE);
+        this.name = "MovedSessionError";
+    }
+}
+
+const NEVER_MOVED = (): boolean => false;
 
 /**
  * The session a `session.deleted` event removes, when that session is
@@ -146,9 +169,10 @@ export function dropBridgedSessionCreatedRows(db: Database, sessionId: string): 
     }).immediate();
 }
 
-/** Refuse Magic Context tool calls that arrive for an enrolled session. */
+/** Refuse Magic Context tool calls that arrive for an enrolled or moved session. */
 export function guardBridgedSessionTools(
     tools: Record<string, ToolDefinition>,
+    isMovedSession: (sessionID: unknown) => boolean = NEVER_MOVED,
 ): Record<string, ToolDefinition> {
     return Object.fromEntries(
         Object.entries(tools).map(([id, definition]) => [
@@ -158,6 +182,9 @@ export function guardBridgedSessionTools(
                 execute(args, context) {
                     if (isBridgedSession(context?.sessionID)) {
                         return Promise.resolve(bridgedSessionToolRefusal(id, context.sessionID));
+                    }
+                    if (isMovedSession(context?.sessionID)) {
+                        return Promise.resolve(`Error: ${MOVED_SESSION_MESSAGE}`);
                     }
                     return definition.execute(args, context);
                 },
@@ -172,13 +199,18 @@ export function guardBridgedSessionTools(
  * registered. Methods without a session parameter (memory history,
  * announcements, toast duration) are unaffected.
  */
-export function guardBridgedSessionRpc(server: MagicContextRpcServer): void {
+export function guardBridgedSessionRpc(
+    server: MagicContextRpcServer,
+    isMovedSession: (sessionID: unknown) => boolean = NEVER_MOVED,
+): void {
     const register = server.handle.bind(server);
     server.handle = (method, handler) =>
         register(method, (params) =>
             isBridgedSession(params?.sessionId)
                 ? Promise.resolve({ error: BRIDGED_SESSION_RPC_ERROR })
-                : handler(params),
+                : isMovedSession(params?.sessionId)
+                  ? Promise.resolve({ error: MOVED_SESSION_MESSAGE })
+                  : handler(params),
         );
 }
 
@@ -188,12 +220,20 @@ export interface StandDownOptions {
      * deleted. The plugin entry uses it to run `dropBridgedSessionCreatedRows`.
      */
     onBridgedSessionDeleted?: (sessionId: string) => void;
+    /**
+     * Whether the offline move handed the session to mode 3. Such a session is
+     * stood down like an enrolled one, except that its transform fails closed.
+     */
+    isMovedSession?: (sessionId: unknown) => boolean;
 }
 
 /** Wrap the OpenCode 1 hooks object so enrolled sessions are left untouched. */
 export function standDownForBridgedSessions(hooks: Hooks, options: StandDownOptions = {}): Hooks {
     const guarded: Hooks = { ...hooks };
     const slots = guarded as Record<string, unknown>;
+    const isMovedSession = options.isMovedSession ?? NEVER_MOVED;
+    const standsDown = (sessionID: unknown) =>
+        isBridgedSession(sessionID) || isMovedSession(sessionID);
 
     // `tool.definition` carries no session; the plugin entry (src/index.ts)
     // attributes it to the provider and model of the most recent
@@ -208,11 +248,11 @@ export function standDownForBridgedSessions(hooks: Hooks, options: StandDownOpti
         slots[key] =
             key === "chat.message"
                 ? (input: { sessionID?: unknown }, output: unknown) => {
-                      lastChatMessageBridged = isBridgedSession(input?.sessionID);
+                      lastChatMessageBridged = standsDown(input?.sessionID);
                       return lastChatMessageBridged ? RESOLVED : inner(input, output);
                   }
                 : (input: { sessionID?: unknown }, output: unknown) =>
-                      isBridgedSession(input?.sessionID) ? RESOLVED : inner(input, output);
+                      standsDown(input?.sessionID) ? RESOLVED : inner(input, output);
     }
 
     const toolDefinition = hooks["tool.definition"];
@@ -233,15 +273,23 @@ export function standDownForBridgedSessions(hooks: Hooks, options: StandDownOpti
         slots["experimental.chat.messages.transform"] = (
             input: Record<string, never>,
             output: { messages: Array<{ info?: unknown }> },
-        ) =>
-            hasBridgedSessions() && isBridgedSession(transformSessionId(output.messages))
-                ? Promise.resolve(output.messages)
-                : transform(input, output);
+        ) => {
+            if (hasBridgedSessions() && isBridgedSession(transformSessionId(output.messages))) {
+                return Promise.resolve(output.messages);
+            }
+            // A moved session is never served unmanaged: the history it would
+            // send is the full uncompacted session.
+            if (isMovedSession(transformSessionId(output.messages))) {
+                return Promise.reject(new MovedSessionError());
+            }
+            return transform(input, output);
+        };
     }
 
     const event = hooks.event;
     if (event) {
         guarded.event = (input) => {
+            if (eventConcernsSession(input?.event, isMovedSession)) return RESOLVED;
             if (!eventConcernsBridgedSession(input?.event)) return event(input);
             const deleted = deletedBridgedSessionId(input?.event);
             if (deleted && options.onBridgedSessionDeleted) {
@@ -258,7 +306,7 @@ export function standDownForBridgedSessions(hooks: Hooks, options: StandDownOpti
         };
     }
 
-    if (hooks.tool) guarded.tool = guardBridgedSessionTools(hooks.tool);
+    if (hooks.tool) guarded.tool = guardBridgedSessionTools(hooks.tool, isMovedSession);
 
     return guarded;
 }

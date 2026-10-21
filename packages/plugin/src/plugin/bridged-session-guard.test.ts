@@ -627,6 +627,10 @@ describe("plugin entry wiring", () => {
     test("the hooks object OpenCode receives is wrapped by the stand-down guard", () => {
         expect(entry).toMatch(/const entryHooks: Hooks = \{\n\s{8}tool: tools,/);
         expect(entry).toMatch(/return standDownForBridgedSessions\(entryHooks, \{/);
+        // The guard also refuses sessions the offline move handed to mode 3.
+        expect(entry).toMatch(
+            /return standDownForBridgedSessions\(entryHooks, \{\n\s*isMovedSession,/,
+        );
         // Nothing else is returned to the host.
         expect([...entry.matchAll(/^ {4}return /gm)]).toHaveLength(1);
     });
@@ -634,7 +638,10 @@ describe("plugin entry wiring", () => {
     test("every RPC registration on the entry is guarded first", () => {
         const registrations = [...entry.matchAll(/registerRpcHandlers\(rpcServer,/g)].length;
         const guards = [
-            ...entry.matchAll(/guardBridgedSessionRpc\(rpcServer\);\n\s*registerRpcHandlers\(/g),
+            // The same guard also refuses sessions moved to mode 3.
+            ...entry.matchAll(
+                /guardBridgedSessionRpc\(rpcServer, isMovedSession\);\n\s*registerRpcHandlers\(/g,
+            ),
         ].length;
         expect(registrations).toBeGreaterThan(0);
         expect(guards).toBe(registrations);

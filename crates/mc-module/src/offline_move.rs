@@ -232,9 +232,11 @@ pub fn check_holders(paths: &StorePaths, check: &dyn HolderCheck) -> Result<(), 
 }
 
 /// Open a database for reading without creating or changing anything. A WAL
-/// database that was closed cleanly has no `-shm` file, and a plain read-only
-/// open of it fails; nothing else has it open (the holder check ran), so it is
-/// then opened immutable.
+/// database that has a `-wal` file is opened read-only, so its committed WAL
+/// content is read. One without a `-wal` file has nothing outside the main file,
+/// and is opened immutable: a plain read-only open would create empty `-wal` and
+/// `-shm` files. Nothing else holds it open (the holder check ran first), as
+/// immutable requires; the restart window job reads its stores the same way.
 fn open_read_only(path: &Path) -> Result<Connection, Refusal> {
     if !path.exists() {
         return Err(Refusal::new(
@@ -242,16 +244,24 @@ fn open_read_only(path: &Path) -> Result<Connection, Refusal> {
             format!("{} does not exist", path.display()),
         ));
     }
-    let flags = OpenFlags::SQLITE_OPEN_READ_ONLY | OpenFlags::SQLITE_OPEN_URI;
-    let reader = Connection::open_with_flags(path, flags)
-        .and_then(|conn| conn.query_row("SELECT 1", [], |_| Ok(())).map(|_| conn));
-    match reader {
-        Ok(conn) => Ok(conn),
-        Err(_) => {
-            let uri = format!("file:{}?immutable=1", path.display());
-            Connection::open_with_flags(uri, flags).map_err(sql)
+    let mut wal = path.as_os_str().to_owned();
+    wal.push("-wal");
+    let mode = if Path::new(&wal).exists() {
+        "mode=ro"
+    } else {
+        "immutable=1"
+    };
+    let mut encoded = String::new();
+    for ch in path.to_string_lossy().chars() {
+        match ch {
+            '%' => encoded.push_str("%25"),
+            '?' => encoded.push_str("%3f"),
+            '#' => encoded.push_str("%23"),
+            other => encoded.push(other),
         }
     }
+    let flags = OpenFlags::SQLITE_OPEN_READ_ONLY | OpenFlags::SQLITE_OPEN_URI;
+    Connection::open_with_flags(format!("file:{encoded}?{mode}"), flags).map_err(sql)
 }
 
 fn table_exists(conn: &Connection, table: &str) -> rusqlite::Result<bool> {
@@ -306,9 +316,7 @@ pub fn has_standalone_state(conn: &Connection, session: &str) -> rusqlite::Resul
             continue;
         }
         let found: bool = conn.query_row(
-            &format!(
-                "SELECT EXISTS(SELECT 1 FROM {table} WHERE session_id=?1 AND harness=?2)"
-            ),
+            &format!("SELECT EXISTS(SELECT 1 FROM {table} WHERE session_id=?1 AND harness=?2)"),
             params![session, HARNESS],
             |row| row.get(0),
         )?;
@@ -370,12 +378,12 @@ fn load_host_session(conn: &Connection, session: &str) -> Result<HostSession, Re
         .map_err(sql)?;
     let rows = statement
         .query_map([session], |row| {
-            let summary: Value = row
-                .get::<_, rusqlite::types::Value>(2)
-                .map(|value| match value {
-                    rusqlite::types::Value::Integer(n) => json!(n),
-                    _ => Value::Null,
-                })?;
+            let summary: Value =
+                row.get::<_, rusqlite::types::Value>(2)
+                    .map(|value| match value {
+                        rusqlite::types::Value::Integer(n) => json!(n),
+                        _ => Value::Null,
+                    })?;
             Ok(MessageRow {
                 id: row.get(0)?,
                 role: row.get(1)?,
@@ -478,7 +486,8 @@ enum PositionalKind {
 /// Parse standalone's positional address `<message id>:p<index>` (text) or
 /// `<message id>:file<index>` (file); the index counts every part of the message.
 fn parse_positional(address: &str) -> Option<(&str, PositionalKind, usize)> {
-    let (head, digits) = address.split_at(address.trim_end_matches(|c: char| c.is_ascii_digit()).len());
+    let (head, digits) =
+        address.split_at(address.trim_end_matches(|c: char| c.is_ascii_digit()).len());
     if digits.is_empty() {
         return None;
     }
@@ -620,10 +629,16 @@ pub fn plan(paths: &StorePaths, session: &str) -> Result<Plan, Refusal> {
         ));
     }
     let context = open_read_only(&paths.context_db)?;
-    if read_move_record_raw(&context, session).map_err(sql)?.is_some() {
+    if read_move_record_raw(&context, session)
+        .map_err(sql)?
+        .is_some()
+    {
         return Err(Refusal::new(
             "already_moved",
-            format!("context.db already holds the moved record {}", move_record_key(session)),
+            format!(
+                "context.db already holds the moved record {}",
+                move_record_key(session)
+            ),
         ));
     }
     let meta: Option<(String, Option<i64>, Option<String>, Option<String>)> = context
@@ -647,7 +662,10 @@ pub fn plan(paths: &StorePaths, session: &str) -> Result<Plan, Refusal> {
             format!("the session is managed for harness {harness:?}, not OpenCode 1"),
         ));
     }
-    if pending_marker.as_deref().is_some_and(|state| !state.trim().is_empty()) {
+    if pending_marker
+        .as_deref()
+        .is_some_and(|state| !state.trim().is_empty())
+    {
         return Err(Refusal::new(
             "marker_pending_not_in_effect",
             "standalone has a compaction marker it has not written yet; resume standalone so it \
@@ -803,13 +821,19 @@ pub fn plan(paths: &StorePaths, session: &str) -> Result<Plan, Refusal> {
     let [marker] = marker_parts.as_slice() else {
         return Err(Refusal::new(
             "marker_ambiguous",
-            format!("the boundary message {cut} holds {} compaction parts", marker_parts.len()),
+            format!(
+                "the boundary message {cut} holds {} compaction parts",
+                marker_parts.len()
+            ),
         ));
     };
     let marker_part = marker.id.clone();
     if let Some(state) = marker_state.filter(|state| !state.trim().is_empty()) {
         let state: Value = serde_json::from_str(&state).map_err(|error| {
-            Refusal::new("marker_state_mismatch", format!("compaction_marker_state: {error}"))
+            Refusal::new(
+                "marker_state_mismatch",
+                format!("compaction_marker_state: {error}"),
+            )
         })?;
         for (field, expected) in [
             ("boundaryMessageId", cut.as_str()),
@@ -820,14 +844,18 @@ pub fn plan(paths: &StorePaths, session: &str) -> Result<Plan, Refusal> {
                 if stored != expected {
                     return Err(Refusal::new(
                         "marker_state_mismatch",
-                        format!("standalone recorded {field}={stored} but opencode.db has {expected}"),
+                        format!(
+                            "standalone recorded {field}={stored} but opencode.db has {expected}"
+                        ),
                     ));
                 }
             }
         }
     }
     let marker_before: String = opencode
-        .query_row("SELECT data FROM part WHERE id=?1", [&marker_part], |row| row.get(0))
+        .query_row("SELECT data FROM part WHERE id=?1", [&marker_part], |row| {
+            row.get(0)
+        })
         .map_err(sql)?;
     let marker_json: Value = serde_json::from_str(&marker_before)
         .map_err(|error| Refusal::new("marker_state_mismatch", error.to_string()))?;
@@ -875,7 +903,9 @@ pub fn plan(paths: &StorePaths, session: &str) -> Result<Plan, Refusal> {
             if !host.position.contains_key(mid.as_str()) || *mid == summary_id {
                 return Err(Refusal::new(
                     "summary_boundary_unrepresentable",
-                    format!("compartment {sequence} endpoint {mid:?} is not a message of the session"),
+                    format!(
+                        "compartment {sequence} endpoint {mid:?} is not a message of the session"
+                    ),
                 ));
             }
         }
@@ -926,7 +956,10 @@ pub fn plan(paths: &StorePaths, session: &str) -> Result<Plan, Refusal> {
     for tag in &tags {
         if tag.kind == "message" || tag.kind == "file" {
             if let Some((mid, kind, index)) = parse_positional(&tag.address) {
-                positional.entry(mid).or_default().push((kind, index, tag.number));
+                positional
+                    .entry(mid)
+                    .or_default()
+                    .push((kind, index, tag.number));
             }
         }
     }
@@ -1028,7 +1061,9 @@ pub fn plan(paths: &StorePaths, session: &str) -> Result<Plan, Refusal> {
             part,
             kind,
             source_tag: number,
-            drop_mode: (kind == DropKind::Applied).then(|| tag.drop_mode.clone()).flatten(),
+            drop_mode: (kind == DropKind::Applied)
+                .then(|| tag.drop_mode.clone())
+                .flatten(),
             queued_at_ms: queued_at,
         });
     }
@@ -1121,14 +1156,16 @@ pub fn apply(paths: &StorePaths, plan: &Plan, stop: Option<StopAfter>) -> Result
         tx.commit().map_err(interrupted("opencode.db commit"))?;
     }
     if stop == Some(StopAfter::MarkerKey) {
-        return Err(MoveError::Interrupted("stopped after the marker key".into()));
+        return Err(MoveError::Interrupted(
+            "stopped after the marker key".into(),
+        ));
     }
     let mut context = open_writer(&paths.context_db)?;
     let tx = context
         .transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)
         .map_err(interrupted("context.db"))?;
-    let value = serde_json::to_string(record)
-        .map_err(|error| MoveError::Interrupted(error.to_string()))?;
+    let value =
+        serde_json::to_string(record).map_err(|error| MoveError::Interrupted(error.to_string()))?;
     // A plain insert: an existing record is someone else's commit, never overwritten.
     tx.execute(
         "INSERT INTO schema_migrations_meta(key, value) VALUES (?1, ?2)",
@@ -1176,7 +1213,11 @@ fn parse_args(args: &[String]) -> Result<(StorePaths, String, bool), String> {
         _ => return Err(USAGE.into()),
     }
     while let Some(arg) = iter.next() {
-        let mut value = || iter.next().cloned().ok_or_else(|| format!("{arg} needs a value"));
+        let mut value = || {
+            iter.next()
+                .cloned()
+                .ok_or_else(|| format!("{arg} needs a value"))
+        };
         match arg.as_str() {
             "--session" => session = Some(value()?),
             "--opencode-db" => opencode_db = Some(PathBuf::from(value()?)),
@@ -1206,7 +1247,10 @@ pub fn cli_main(args: &[String]) -> i32 {
     let (paths, session, dry_run) = match parse_args(args) {
         Ok(parsed) => parsed,
         Err(usage) => {
-            println!("{}", json!({"status":"refused","refusal":{"code":"usage","detail":usage}}));
+            println!(
+                "{}",
+                json!({"status":"refused","refusal":{"code":"usage","detail":usage}})
+            );
             return 2;
         }
     };
@@ -1236,7 +1280,10 @@ pub fn cli_main(args: &[String]) -> i32 {
             2
         }
         Err(MoveError::Interrupted(reason)) => {
-            println!("{}", json!({"status":"interrupted","session":session,"error":reason}));
+            println!(
+                "{}",
+                json!({"status":"interrupted","session":session,"error":reason})
+            );
             eprintln!(
                 "SESSION INCOMPLETE {session}: {reason}. Rerun the same command to finish, or restore the window's backups."
             );
@@ -1247,4 +1294,4 @@ pub fn cli_main(args: &[String]) -> i32 {
 
 #[cfg(test)]
 #[path = "offline_move_tests.rs"]
-mod tests;
+pub(crate) mod tests;

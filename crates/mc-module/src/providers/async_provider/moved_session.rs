@@ -103,7 +103,11 @@ impl AsyncRecord {
         else {
             return Ok(());
         };
-        let Some(first) = self.entries.first_key_value().map(|(n, e)| (*n, e.mid.clone())) else {
+        let Some(first) = self
+            .entries
+            .first_key_value()
+            .map(|(n, e)| (*n, e.mid.clone()))
+        else {
             return Ok(());
         };
         let reference = self.reference();
@@ -130,7 +134,10 @@ impl AsyncRecord {
                 self.mid_index.get(mid).copied().ok_or_else(|| {
                     refuse(
                         "moved_session_history_unrepresentable",
-                        format!("summary {} names message {mid}, which the runner did not serve", compartment.sequence),
+                        format!(
+                            "summary {} names message {mid}, which the runner did not serve",
+                            compartment.sequence
+                        ),
                     )
                 })
             };
@@ -157,7 +164,10 @@ impl AsyncRecord {
                 .ok_or_else(|| {
                     refuse(
                         "moved_session_history_unrepresentable",
-                        format!("summary {} starts where no block is served", compartment.sequence),
+                        format!(
+                            "summary {} starts where no block is served",
+                            compartment.sequence
+                        ),
                     )
                 })?;
             let end_block = self
@@ -165,7 +175,10 @@ impl AsyncRecord {
                 .ok_or_else(|| {
                     refuse(
                         "moved_session_history_unrepresentable",
-                        format!("summary {} ends where no block is served", compartment.sequence),
+                        format!(
+                            "summary {} ends where no block is served",
+                            compartment.sequence
+                        ),
                     )
                 })?;
             retained.push(mc_store::StoredCompartment {
