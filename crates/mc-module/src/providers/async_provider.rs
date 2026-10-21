@@ -1630,6 +1630,44 @@ fn compact_prefix_hygiene(
     prefix: &transform::compaction::LogicalPrefix,
     loaded: &mut mc_store::LoadedState,
 ) -> Result<(), mc_store::McStoreError> {
+    let mut retried = false;
+    loop {
+        match compact_prefix_hygiene_once(store, state, prefix, loaded) {
+            Err(error @ mc_store::McStoreError::CasConflict { .. }) => {
+                // Historian decision metadata is written outside the provider
+                // lock. Rebase cleanup on that write, never overwrite it or
+                // discard a certificate whose coverage is still valid.
+                *loaded = store
+                    .load_logical_transform_snapshot(&state.namespace(), &[])?
+                    .loaded;
+                let compartments = store.load_compartments(&state.namespace())?;
+                if !prefix.matches(
+                    state.lineage.as_deref().unwrap_or_default(),
+                    state.generation,
+                    loaded,
+                    &compartments,
+                ) {
+                    return Err(error);
+                }
+                if retried {
+                    // Pruning zero-token parts is optional. Bound retries so
+                    // metadata churn cannot stall a ride or force a full render.
+                    tracing::debug!(session_ref=%state.reference(), reason="prefix_hygiene_contention", "deferring prefix hygiene cleanup");
+                    return Ok(());
+                }
+                retried = true;
+            }
+            result => return result,
+        }
+    }
+}
+
+fn compact_prefix_hygiene_once(
+    store: &McStore,
+    state: &State,
+    prefix: &transform::compaction::LogicalPrefix,
+    loaded: &mut mc_store::LoadedState,
+) -> Result<(), mc_store::McStoreError> {
     let Some(baseline) = &mut loaded.meta.tail_hygiene_baseline else {
         return Ok(());
     };
@@ -1655,6 +1693,8 @@ fn compact_prefix_hygiene(
     if baseline.baseline_parts.len() == before {
         return Ok(());
     }
+    #[cfg(test)]
+    scaling_tests::hygiene_interleaving::run(&state.reference());
     store.commit_logical_transform_with_provider_policy(
         &state.namespace(),
         mc_store::TransformCommit {
