@@ -61,12 +61,15 @@ beforeEach(() => {
     mkdirSync(join(tmpdir(), "magic-context"), { recursive: true });
     root = mkdtempSync(join(tmpdir(), "magic-context", "subagent-failure-flow-"));
     db = new Database(join(root, "context.db"));
+    // Fixture rows need no durability; without fsyncs the 5,000-row cases stay quick.
+    db.exec("PRAGMA synchronous = OFF");
     db.exec(readFileSync(join(import.meta.dir, "../../../crates/mc-module/tests/fixtures/context-db-schema.sql"), "utf8"));
     serial = 0;
     kvStore = new Map();
     opCalls = [];
     digests = [];
     oldWakes = [];
+    pageRows = 7;
 });
 afterEach(() => { db.close(false); rmSync(root, { recursive: true, force: true }); });
 
@@ -83,9 +86,9 @@ function attempt(fields: { session: string; status: string; time: number; error?
 
 // Stands in for ck-mc's `subagent_invocations.read`, with the same arguments,
 // limits and `{rows, more}` reply. ck-mc ends a page at a byte budget; here a
-// page ends after PAGE_ROWS rows, so the flow's multi-page reads are exercised
+// page ends after `pageRows` rows, so the flow's multi-page reads are exercised
 // against the script's single queries.
-const PAGE_ROWS = 7;
+let pageRows: number;
 function fakeOp(module: string, op: string, args: Record<string, unknown>) {
     expect([module, op]).toEqual(["magic-context", "subagent_invocations.read"]);
     opCalls.push(args);
@@ -107,7 +110,7 @@ function fakeOp(module: string, op: string, args: Record<string, unknown>) {
         rows = db.query(`SELECT ${FIELDS} FROM subagent_invocations WHERE ended_at > ? AND ended_at <= ? AND (ended_at < ? OR (ended_at = ? AND id < ?)) ORDER BY ended_at DESC, id DESC LIMIT ?`)
             .all(args.after as number, args.until as number, before.ended_at, before.ended_at, before.id, limit + 1) as Row[];
     }
-    const kept = rows.slice(0, Math.min(limit, PAGE_ROWS));
+    const kept = rows.slice(0, Math.min(limit, pageRows));
     return { rows: kept, more: rows.length > kept.length };
 }
 
@@ -326,7 +329,9 @@ test("one wake contains all alerting classes and uses the persisted watermark", 
 
 test("watermark resumes equal timestamps by id and bounds a backlog", async () => {
     seed();
-    for (let i = 0; i < 503; i++) add("completed");
+    db.transaction(() => {
+        for (let i = 0; i < 503; i++) add("completed");
+    })();
     const first = await runFlow(at());
     await runOld(at());
     expect(first.bounded).toBe(true);
@@ -359,8 +364,12 @@ test("a backlog of failures pages through both queries and still matches", async
 });
 
 test("a history over 5,000 rows holds back the window rules in both", async () => {
+    // Larger pages keep this case quick; the backlog case covers small ones.
+    pageRows = 1_000;
     seed();
-    for (let i = 0; i < 5_001; i++) add("completed", NOW - 2 * DAY + i);
+    db.transaction(() => {
+        for (let i = 0; i < 5_001; i++) add("completed", NOW - 2 * DAY + i);
+    })();
     add("failed", NOW - 1_000, "first failure of its kind");
     const flowed = await runFlow(at());
     const old = await runOld(at());
@@ -370,7 +379,7 @@ test("a history over 5,000 rows holds back the window rules in both", async () =
     expect(flowed.examined).toBe(old.examined);
     expect(flowed.alerts).toBe(old.alerts.length);
     expect(old.alerts.some((alert) => alert.rule === "new_class")).toBe(false);
-});
+}, 30_000);
 
 test("an oversized wake keeps whole alerts within the digest body limit", async () => {
     seed();
