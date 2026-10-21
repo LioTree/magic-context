@@ -7,6 +7,7 @@ use cortexkit_role_llm_runner::{read::ReadMessage, session_ref, tags};
 use serde::Deserialize;
 #[cfg(test)]
 mod differential_tests;
+mod frozen_edits;
 mod historian_tail;
 pub(crate) mod reminder_echoes;
 mod resident;
@@ -146,6 +147,10 @@ pub(crate) struct AsyncRecord {
     pub(crate) reminder_cadence: Option<crate::runner_reminders::ReminderState>,
     #[serde(default)]
     reminder_echoes: reminder_echoes::ReminderEchoes,
+    /// Acknowledged native reductions survive engine generation resets. Stored in
+    /// a separate baseline row so quiet notices never rewrite their payloads.
+    #[serde(skip)]
+    frozen_edits: frozen_edits::FrozenEdits,
     /// Generation of the tail-hygiene baseline the reminder cadence last saw.
     /// The cadence is stored without the baseline itself: the baseline has one
     /// measurement per tail part (it grows with the session), every reminder
@@ -551,6 +556,9 @@ impl State {
         for (slot, view) in baselines {
             save.baseline(slot, view.map(|json| json.to_string()));
         }
+        if self.frozen_edits.dirty {
+            save.baseline("frozen_edits", Some(self.frozen_edits.json()?));
+        }
         if self.journal.clear_published {
             save.clear_engine_views();
         }
@@ -564,6 +572,7 @@ impl State {
             return Err(transient(error));
         }
         self.journal.truncate = None;
+        self.frozen_edits.dirty = false;
         self.journal.clear_published = false;
         self.journal.persisted_through = self.entries.last_key_value().map(|(n, _)| *n);
         self.journal.produced = self
@@ -961,6 +970,9 @@ impl State {
                 .flatten()
                 .map(|raw| serde_json::from_str::<view::CompactionView>(&raw).map_err(transient))
                 .transpose()?;
+            if let Some(view) = &applied {
+                self.frozen_edits.capture(view, &self.entries)?;
+            }
             let head = applied.and_then(|view| match view.ranges.first()? {
                 view::ViewRange::Replace { from: 0, to, bytes }
                     if *to == 0 || self.entries.contains_key(&(to - 1)) =>
@@ -1073,6 +1085,9 @@ fn load(store: &McStore, reference: &str) -> Result<Option<State>, HandlerOutcom
     };
     let produced = resolve("produced", state.engine_baselines.produced)?;
     let applied = resolve("applied", state.engine_baselines.applied)?;
+    if let Some(json) = stored.remove("frozen_edits") {
+        state.frozen_edits = frozen_edits::FrozenEdits::from_json(&json)?;
+    }
     state.produced_view = produced;
     state.applied_view = applied;
     let through = state.entries.last_key_value().map(|(n, _)| *n);
@@ -1297,6 +1312,7 @@ impl McHandler {
             reminder_cadence: None,
             reminder_hint_state: None,
             reminder_echoes: Default::default(),
+            frozen_edits: Default::default(),
             reminder_baseline_generation: None,
             key,
             runner_module: match &binding.principal {
@@ -2488,6 +2504,18 @@ impl McHandler {
                 .and_then(|header| verified_descent(&state, header))
             {
                 let parent = state.lineage.clone().expect("held lineage");
+                // A fork can cut away source identities needed by a later restore.
+                // Capture acknowledged edits before dropping those held entries.
+                if let Some(raw) = state
+                    .applied
+                    .map(|version| store.load_async_compaction_view(&state.reference(), version))
+                    .transpose()
+                    .map_err(transient)?
+                    .flatten()
+                {
+                    let view = serde_json::from_str(&raw).map_err(transient)?;
+                    state.frozen_edits.capture(&view, &state.entries)?;
+                }
                 state.truncate_entries(Some(through));
                 let mut engine = state.engine_with_baselines()?;
                 engine
@@ -3096,6 +3124,7 @@ impl McHandler {
             .meta
             .coverage_ordinal;
         let mut ranges = ranges(state, codec, &wire, &candidate, coverage)?;
+        state.frozen_edits.apply(state, &mut ranges)?;
         if let Some(cadence) = &state.reminder_cadence {
             state.reminder_echoes.apply(
                 &cadence.ledger,
