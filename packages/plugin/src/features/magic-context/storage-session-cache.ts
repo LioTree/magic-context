@@ -1,4 +1,5 @@
 import type { Database } from "../../shared/sqlite";
+import { sessionPayloadStatement } from "./storage-session-collection-state";
 
 export const SESSION_RENDER_CACHE_DDL = `CREATE TABLE IF NOT EXISTS session_render_cache (
     session_id TEXT NOT NULL,
@@ -56,11 +57,10 @@ export function readSessionRenderCache(
     sessionId: string,
     column: SessionRenderCacheColumn,
 ): Buffer | Uint8Array | string | number | null {
-    const row = db
-        .prepare("SELECT value FROM session_render_cache WHERE session_id = ? AND cache_key = ?")
-        .get(sessionId, column) as
-        | { value: Buffer | Uint8Array | string | number | null }
-        | undefined;
+    const row = sessionPayloadStatement(
+        db,
+        "SELECT value FROM session_render_cache WHERE session_id = ? AND cache_key = ?",
+    ).get(sessionId, column) as { value: Buffer | Uint8Array | string | number | null } | undefined;
     return row ? row.value : column === "memory_block_cache" ? "" : null;
 }
 
@@ -75,20 +75,23 @@ export function writeSessionRenderCache(
         (value === null && column !== "memory_block_cache") ||
         (column === "memory_block_cache" && value === "")
     ) {
-        db.prepare("DELETE FROM session_render_cache WHERE session_id = ? AND cache_key = ?").run(
-            sessionId,
-            column,
-        );
+        sessionPayloadStatement(
+            db,
+            "DELETE FROM session_render_cache WHERE session_id = ? AND cache_key = ?",
+        ).run(sessionId, column);
         return;
     }
     const binding =
         typeof value === "number" && column !== "cached_m0_bytes" && column !== "cached_m1_bytes"
             ? "CAST(? AS TEXT)"
             : "?";
-    db.prepare(`INSERT INTO session_render_cache (session_id, cache_key, value)
+    sessionPayloadStatement(
+        db,
+        `INSERT INTO session_render_cache (session_id, cache_key, value)
         SELECT ?, ?, ${binding} WHERE EXISTS (SELECT 1 FROM session_meta WHERE session_id=?)
         ON CONFLICT(session_id, cache_key) DO UPDATE SET value = excluded.value
-        WHERE value IS NOT excluded.value`).run(sessionId, column, value, sessionId);
+        WHERE value IS NOT excluded.value`,
+    ).run(sessionId, column, value, sessionId);
 }
 
 export function clearSessionRenderCache(db: Pick<Database, "prepare">, sessionId: string): void {

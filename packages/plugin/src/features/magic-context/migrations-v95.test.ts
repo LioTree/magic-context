@@ -10,8 +10,8 @@ import {
     V95_REDUNDANT_INDEXES,
 } from "./migration-v95-perf-indexes";
 import { MIGRATIONS, runMigrations } from "./migrations";
-import { initializeDatabase, LATEST_SUPPORTED_VERSION } from "./storage-db";
 import { restorePreV103SessionMetaLayout } from "./session-meta-pre-v103-test-support";
+import { initializeDatabase, LATEST_SUPPORTED_VERSION } from "./storage-db";
 import { getOrCreateSessionMeta, updateSessionMeta } from "./storage-meta-session";
 import {
     sessionMetaCollectionSelect,

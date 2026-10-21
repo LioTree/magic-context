@@ -9,8 +9,8 @@ import { cleanupTestTempDir, createTestTempDir } from "../../shared/test-temp-di
 import { seedSessionMeta } from "./__tests__/session-meta-fixture";
 import { LKG_PREFIX_CHUNK_CHARS, splitLkgPrefix } from "./lkg-prefix-chunks";
 import { MIGRATIONS, runMigrations } from "./migrations";
-import { initializeDatabase } from "./storage-db";
 import { restorePreV103SessionMetaLayout } from "./session-meta-pre-v103-test-support";
+import { initializeDatabase } from "./storage-db";
 import {
     addTrailingBlankDecisions,
     demoteTrailingBlankKeepDecisions,

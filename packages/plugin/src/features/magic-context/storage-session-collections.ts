@@ -16,6 +16,7 @@ import {
     readCollectionToken,
     rememberCollectionState,
     sameCollectionToken,
+    sessionPayloadStatement,
 } from "./storage-session-collection-state";
 
 export type { SessionMetaCollection } from "./session-meta-collection-schema";
@@ -109,7 +110,7 @@ export function writeSessionMetaCollection(
     }
     for (let attempt = 0; attempt < 5; attempt++) {
         const plan = prepareSessionMetaCollectionWrite(db, sessionId, column, value);
-        if (!plan.previous.token.present) return;
+        if (!plan.previous.token.present || isUnchanged(plan)) return;
         if (db.transaction(() => applySessionMetaCollectionWrite(db, plan)).immediate()) return;
     }
     throw new Error("session metadata collection revision changed repeatedly");
@@ -130,7 +131,7 @@ export function writeSessionMetaCollectionBytes(
             bytes === null ? null : Buffer.from(bytes),
             storageType,
         );
-        if (!plan.previous.token.present) return;
+        if (!plan.previous.token.present || isUnchanged(plan)) return;
         if (db.transaction(() => applySessionMetaCollectionWrite(db, plan)).immediate()) return;
     }
     throw new Error("session metadata collection revision changed repeatedly");
@@ -157,11 +158,22 @@ export function updateSessionMetaCollection(
         (expected && !collectionStateMatches(db, plan.previous, expected.value))
     )
         return { changes: 0 };
+    if (isUnchanged(plan)) return { changes: 1 };
     return {
         changes: db.transaction(() => applySessionMetaCollectionWrite(db, plan)).immediate()
             ? 1
             : 0,
     };
+}
+
+/**
+ * The stored chunks already hold exactly the value being written. The plan was built
+ * from a revision-checked snapshot, so the write takes effect at that read: taking the
+ * writer lock only to confirm that nothing changes would cost a transaction (or a
+ * savepoint inside the caller's) on every pass that rewrites an unchanged value.
+ */
+function isUnchanged(plan: PreparedSessionMetaCollectionWrite): boolean {
+    return plan.changed.length === 0 && plan.removed.length === 0;
 }
 
 export interface PreparedSessionMetaCollectionWrite {
@@ -284,13 +296,18 @@ export function applySessionMetaCollectionWrite(
     // An unchanged revision-row ID and revision prove that these chunks (including storage-class markers)
     // have not changed since this delta was prepared, replacing the full-value IS comparison under the lock.
     if (!current.present || !sameCollectionToken(current, plan.previous.token)) return false;
-    const upsert =
-        db.prepare(`INSERT INTO session_meta_chunks(session_id,column_name,chunk,body) VALUES(?,?,?,?)
-        ON CONFLICT(session_id,column_name,chunk) DO UPDATE SET body=excluded.body WHERE body IS NOT excluded.body`);
-    for (const [key, piece] of plan.changed)
-        upsert.run(plan.sessionId, plan.column, key, key === "-1" ? piece.marker : piece.bytes);
+    if (plan.changed.length) {
+        const upsert = sessionPayloadStatement(
+            db,
+            `INSERT INTO session_meta_chunks(session_id,column_name,chunk,body) VALUES(?,?,?,?)
+        ON CONFLICT(session_id,column_name,chunk) DO UPDATE SET body=excluded.body WHERE body IS NOT excluded.body`,
+        );
+        for (const [key, piece] of plan.changed)
+            upsert.run(plan.sessionId, plan.column, key, key === "-1" ? piece.marker : piece.bytes);
+    }
     if (plan.removed.length) {
-        const remove = db.prepare(
+        const remove = sessionPayloadStatement(
+            db,
             "DELETE FROM session_meta_chunks WHERE session_id=? AND column_name=? AND chunk=?",
         );
         for (const key of plan.removed) remove.run(plan.sessionId, plan.column, key);

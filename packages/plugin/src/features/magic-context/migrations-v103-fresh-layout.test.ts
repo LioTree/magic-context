@@ -2,9 +2,12 @@ import { describe, expect, test } from "bun:test";
 import { Database } from "../../shared/sqlite";
 import { runMigrations } from "./migrations";
 import { schemaSnapshot } from "./schema-fingerprint";
-import { initializeDatabase } from "./storage-db";
 import { restorePreV103SessionMetaLayout } from "./session-meta-pre-v103-test-support";
-import { SESSION_META_PAYLOAD_COLUMNS, sessionMetaHoldsPayloadColumns } from "./storage-session-payloads";
+import { initializeDatabase } from "./storage-db";
+import {
+    SESSION_META_PAYLOAD_COLUMNS,
+    sessionMetaHoldsPayloadColumns,
+} from "./storage-session-payloads";
 
 function fresh(): Database {
     const db = new Database(":memory:");
@@ -42,9 +45,9 @@ describe("migration 103 fresh session_meta layout", () => {
                     (column) => column.name,
                 ),
             );
-            expect(SESSION_META_PAYLOAD_COLUMNS.filter((column) => afterInitializer.has(column))).toEqual(
-                [],
-            );
+            expect(
+                SESSION_META_PAYLOAD_COLUMNS.filter((column) => afterInitializer.has(column)),
+            ).toEqual([]);
             expect(sessionMetaHoldsPayloadColumns(db)).toBe(false);
             // The migrations before 103 run on a fresh database too; none may add a column back.
             runMigrations(db);

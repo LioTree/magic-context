@@ -72,7 +72,11 @@ import {
 	sessionRenderCacheSelect,
 	writeSessionRenderCache,
 } from "@magic-context/core/features/magic-context/storage-session-cache";
-import { writeSessionMetaCollection } from "@magic-context/core/features/magic-context/storage-session-collections";
+import { sessionPayloadStatement } from "@magic-context/core/features/magic-context/storage-session-collection-state";
+import {
+	sessionMetaCollectionSelect,
+	writeSessionMetaCollection,
+} from "@magic-context/core/features/magic-context/storage-session-collections";
 import {
 	getActiveUserMemories,
 	type UserMemory,
@@ -2557,11 +2561,12 @@ function readCachedPiM0M1Row(
 	db: ContextDatabase,
 	sessionId: string,
 ): CachedPiM0M1Row | null {
-	return db
-		.transaction(() => {
-			const row = db
-				.prepare(
-					`SELECT ${sessionRenderCacheSelect("cached_m0_bytes")},
+	// One statement reads the row and its memory-block ids from the same snapshot,
+	// so no transaction is needed to keep them coherent. The statement text is fixed
+	// per connection; compile it once rather than on every pass.
+	return (sessionPayloadStatement(
+		db,
+		`SELECT ${sessionRenderCacheSelect("cached_m0_bytes")},
 			    cached_m0_score_selection_watermark,
 			    ${sessionRenderCacheSelect("cached_m0_mural_data_url")},
 			    cached_m0_mural_hash,
@@ -2580,23 +2585,11 @@ function readCachedPiM0M1Row(
 			    cached_m0_system_hash,
 			    cached_m0_model_key,
 			    cached_m0_project_identity,
-			    cached_m0_last_baseline_end_message_id
+			    cached_m0_last_baseline_end_message_id,
+			    ${sessionMetaCollectionSelect("memory_block_ids", "memory_block_ids", db)}
 			FROM session_meta
 			  WHERE session_id = ?`,
-				)
-				.get(sessionId) as CachedPiM0M1Row | null;
-			return row
-				? {
-						...row,
-						memory_block_ids: readSessionMetaCollection(
-							db,
-							sessionId,
-							"memory_block_ids",
-						) as string | null,
-					}
-				: null;
-		})
-		.deferred();
+	).get(sessionId) ?? null) as CachedPiM0M1Row | null;
 }
 
 export interface PiM0M1PassSnapshot {

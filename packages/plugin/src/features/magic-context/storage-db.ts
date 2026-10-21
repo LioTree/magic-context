@@ -78,11 +78,11 @@ import { installCompartmentHistoryVersions } from "./storage-compartment-history
 import { installHostRunnerSchema } from "./storage-host-runner";
 import { ensureColumn, healAllNullColumns } from "./storage-schema-helpers";
 import { SESSION_RENDER_CACHE_DDL } from "./storage-session-cache";
-import { sessionMetaHoldsPayloadColumns } from "./storage-session-payloads";
 import {
     SESSION_META_CHUNKS_DDL,
     SESSION_META_COLLECTION_REVISIONS_DDL,
 } from "./storage-session-collections";
+import { sessionMetaHoldsPayloadColumns } from "./storage-session-payloads";
 import { installTagIdentityRevisionTrigger } from "./storage-tag-identity-revision";
 import { StoreVersionMismatchError } from "./store-version-mismatch";
 import {
@@ -2350,8 +2350,7 @@ CREATE INDEX IF NOT EXISTS idx_dream_queue_pending ON dream_queue(started_at, en
     ensureColumn(db, "memories", "mural_cue_hash", "TEXT");
     ensureColumn(db, "memories", "mural_cue_at", "INTEGER");
     ensureColumn(db, "memory_verifications", "mapped_at", "INTEGER NOT NULL DEFAULT 0");
-    if (payloadColumnsInline)
-        ensureColumn(db, "session_meta", "cached_m0_bytes", "BLOB");
+    if (payloadColumnsInline) ensureColumn(db, "session_meta", "cached_m0_bytes", "BLOB");
     ensureColumn(db, "session_meta", "cached_m0_project_memory_epoch", "INTEGER");
     ensureColumn(db, "session_meta", "cached_m0_workspace_fingerprint", "TEXT");
     ensureColumn(db, "session_meta", "cached_m0_project_user_profile_version", "INTEGER");
@@ -2360,8 +2359,7 @@ CREATE INDEX IF NOT EXISTS idx_dream_queue_pending ON dream_queue(started_at, en
     ensureColumn(db, "session_meta", "cached_m0_max_mutation_id", "INTEGER");
     ensureColumn(db, "session_meta", "cached_m0_max_memory_mutation_id", "INTEGER");
     ensureColumn(db, "session_meta", "cached_m0_project_docs_hash", "TEXT");
-    if (payloadColumnsInline)
-        ensureColumn(db, "session_meta", "cached_m1_bytes", "BLOB");
+    if (payloadColumnsInline) ensureColumn(db, "session_meta", "cached_m1_bytes", "BLOB");
     ensureColumn(db, "session_meta", "last_observed_model_key", "TEXT");
     ensureColumn(db, "session_meta", "last_usage_context_limit", "INTEGER NOT NULL DEFAULT 0");
     ensureColumn(db, "session_meta", "prior_boundary_ordinal", "INTEGER NOT NULL DEFAULT 1");
@@ -2398,8 +2396,7 @@ CREATE INDEX IF NOT EXISTS idx_dream_queue_pending ON dream_queue(started_at, en
     ensureColumn(db, "session_meta", "compaction_mode_record", "TEXT");
     ensureColumn(db, "session_meta", "cached_m0_materialized_at", "INTEGER");
     ensureColumn(db, "session_meta", "cached_m0_session_facts_version", "INTEGER");
-    if (payloadColumnsInline)
-        ensureColumn(db, "session_meta", "cached_m0_upgrade_state", "TEXT");
+    if (payloadColumnsInline) ensureColumn(db, "session_meta", "cached_m0_upgrade_state", "TEXT");
     ensureColumn(db, "session_meta", "cached_m0_system_hash", "TEXT");
     ensureColumn(db, "session_meta", "cached_m0_tool_set_hash", "TEXT");
     ensureColumn(db, "session_meta", "cached_m0_model_key", "TEXT");
@@ -2414,8 +2411,7 @@ CREATE INDEX IF NOT EXISTS idx_dream_queue_pending ON dream_queue(started_at, en
     // Keep migration order canonical: v66 reminder fields precede v67 mural cache fields.
     ensureColumn(db, "session_meta", "upgrade_reminder_last_sent_at", "INTEGER");
     ensureColumn(db, "session_meta", "upgrade_reminder_count", "INTEGER NOT NULL DEFAULT 0");
-    if (payloadColumnsInline)
-        ensureColumn(db, "session_meta", "cached_m0_mural_data_url", "TEXT");
+    if (payloadColumnsInline) ensureColumn(db, "session_meta", "cached_m0_mural_data_url", "TEXT");
     db.exec(SESSION_RENDER_CACHE_DDL);
     db.exec(SESSION_META_CHUNKS_DDL);
     db.exec(SESSION_META_COLLECTION_REVISIONS_DDL);

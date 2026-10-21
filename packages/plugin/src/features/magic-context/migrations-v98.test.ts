@@ -5,8 +5,8 @@ import { cleanupTestTempDir, createTestTempDir } from "../../shared/test-temp-di
 import { sessionMetaFixtureRow } from "./__tests__/session-meta-fixture";
 import { installCompartmentRescoreSchema } from "./migration-v98-compartment-rescore";
 import { LATEST_MIGRATION_VERSION, MIGRATIONS, runMigrations } from "./migrations";
-import { initializeDatabase, LATEST_SUPPORTED_VERSION } from "./storage-db";
 import { restorePreV103SessionMetaLayout } from "./session-meta-pre-v103-test-support";
+import { initializeDatabase, LATEST_SUPPORTED_VERSION } from "./storage-db";
 import { deleteSessionScopedRows, SESSION_SCOPED_TABLES } from "./storage-session-tables";
 
 const scoreTables = ["compartment_score_selections", "compartment_score_revisions"];

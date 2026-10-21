@@ -7,6 +7,8 @@ import { getHarness, type HarnessId } from "../../shared/harness";
 import { piModelRefToCanonical } from "../../shared/harness-provider-map";
 import {
     type Database,
+    prepareCachedStatement,
+    type Statement,
     withoutSqliteTransformPass,
     withSqliteBackgroundWriter,
 } from "../../shared/sqlite";
@@ -103,10 +105,21 @@ function getSessionMetaSelectColumns(db: Database): string {
     return projection;
 }
 
+// The projection is fixed per connection, and since migration 103 it reads each cached
+// payload through a subquery; compiling that statement again on every read cost more
+// than running it.
+const sessionMetaSelectStatements = new WeakMap<Database, Statement>();
+
 function findSessionMeta(db: Database, sessionId: string): SessionMeta | undefined {
-    const result = db
-        .prepare(`SELECT ${getSessionMetaSelectColumns(db)} FROM session_meta WHERE session_id = ?`)
-        .get(sessionId);
+    let statement = sessionMetaSelectStatements.get(db);
+    if (!statement) {
+        statement = prepareCachedStatement(
+            db,
+            `SELECT ${getSessionMetaSelectColumns(db)} FROM session_meta WHERE session_id = ?`,
+        );
+        sessionMetaSelectStatements.set(db, statement);
+    }
+    const result = statement.get(sessionId);
 
     return isSessionMetaRow(result) ? toSessionMeta(result) : undefined;
 }

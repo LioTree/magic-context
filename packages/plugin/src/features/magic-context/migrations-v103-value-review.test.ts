@@ -1,8 +1,8 @@
 import { expect, test } from "bun:test";
 import { Database } from "../../shared/sqlite";
 import { MIGRATIONS, runMigrations } from "./migrations";
-import { initializeDatabase } from "./storage-db";
 import { restorePreV103SessionMetaLayout } from "./session-meta-pre-v103-test-support";
+import { initializeDatabase } from "./storage-db";
 import { getOrCreateSessionMeta } from "./storage-meta";
 import {
     getAutoSearchHintDecisions,
