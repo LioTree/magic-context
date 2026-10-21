@@ -436,12 +436,14 @@ async fn moved_175k_first_read_cost() {
         .await
         .unwrap();
     let read_ms = read_started.elapsed().as_millis();
+    let rss_after_read = peak_rss_kib();
     let pages = rig.runner.reads.lock().unwrap().len();
     let ingest_started = Instant::now();
     state
         .ingest_read(store, codec::Codec::OpencodeAiSdk)
         .unwrap();
     let ingest_ms = ingest_started.elapsed().as_millis();
+    let rss_after_ingest = peak_rss_kib();
     let held = state.entries.len();
     let pending_import = state
         .standalone_move
@@ -490,8 +492,30 @@ async fn moved_175k_first_read_cost() {
     .unwrap_or("timed out");
     let notice_ms = started.elapsed().as_millis();
     let state = rig.state();
+    let phases = [
+        "phase:read",
+        "phase:index",
+        "phase:policy",
+        "phase:publish",
+        "phase:reminders",
+        "phase:cadence",
+        "pub:engine",
+        "pub:certify",
+        "pub:render",
+        "pub:ranges",
+        "save",
+        "load",
+    ]
+    .iter()
+    .map(|kind| {
+        let stats = scaling_tests::save_meter::read_kind(&rig.reference, kind);
+        format!("{kind}={}ms/{}", stats.wall_nanos / 1_000_000, stats.saves)
+    })
+    .collect::<Vec<_>>()
+    .join(" ");
+    println!("FIRST_READ_PHASES {phases}");
     println!(
-        "FIRST_READ read_ms={read_ms} pages={pages} messages={count} served_bytes={bytes} ingest_bind_ms={ingest_ms} held={held} pending_import_after_bind={pending_import} compartments={} first_notice={outcome} first_notice_ms={notice_ms} published_views={} move_ms={move_ms} peak_rss_kib={:?} rss_before_read_kib={rss_before:?}",
+        "FIRST_READ read_ms={read_ms} peak_after_read_kib={rss_after_read:?} pages={pages} messages={count} served_bytes={bytes} ingest_bind_ms={ingest_ms} peak_after_ingest_kib={rss_after_ingest:?} held={held} pending_import_after_bind={pending_import} compartments={} first_notice={outcome} first_notice_ms={notice_ms} published_views={} move_ms={move_ms} peak_rss_kib={:?} rss_before_read_kib={rss_before:?}",
         store.load_compartments(&state.namespace()).unwrap().len(),
         state.published_engine.len(),
         peak_rss_kib(),

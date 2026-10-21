@@ -138,6 +138,16 @@ impl<S: Stream + 'static> Publisher for Bus<S> {
     }
 }
 
+/// How far one budgeted transcript read got.
+enum ReadProgress {
+    Complete,
+    /// Every page read was valid, but the budget ran out before the runner's
+    /// last page; `next` is the first ordinal not read.
+    Incomplete {
+        next: u64,
+    },
+}
+
 #[derive(Default)]
 pub(crate) struct Runtime {
     #[cfg(test)]
@@ -156,6 +166,9 @@ pub(crate) struct Runtime {
     unconfigured_logged: OnceLock<()>,
     /// Conversations kept in memory between operations; see `resident`.
     pub(crate) resident: Mutex<resident::ResidentCache>,
+    /// A test's notice read budget instead of the production one.
+    #[cfg(test)]
+    pub(crate) notice_read_budget: Mutex<Option<Duration>>,
 }
 
 #[derive(Serialize, Deserialize)]
@@ -176,6 +189,10 @@ pub(crate) struct AsyncRecord {
     /// OpenCode 1 plugin; see `moved_session`.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     standalone_move: Option<moved_session::StandaloneMove>,
+    /// The notice whose transcript read ran out of budget and is continued on
+    /// its retry; see `read_async_resumable`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    partial_read_seq: Option<u64>,
     /// A protocol error met while advancing this conversation; see
     /// `record_protocol_failure`. Absent while the conversation is healthy.
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -555,6 +572,19 @@ impl State {
     }
     fn namespace(&self) -> String {
         format!("{}:async:{}", self.key.engine_key(), self.generation)
+    }
+
+    /// Persist the entries of a read the budget cut short, with their tag
+    /// rows, so a retry continues after them. Sources restored after a resync
+    /// and a moved session's import are bound only once the read completes.
+    fn save_partial_read(
+        &mut self,
+        store: &McStore,
+        codec: codec::Codec,
+    ) -> Result<(), HandlerOutcome> {
+        self.reindex()?;
+        let rows = self.unsaved_tag_rows(codec)?;
+        self.save(store, &rows)
     }
 
     /// Validate and persist a completed transcript read while its provider
@@ -1127,6 +1157,7 @@ impl State {
             });
         }
         self.resync = true;
+        self.partial_read_seq = None;
         // A runner that lost its state continues under a new lineage
         // (contract §5.3), which reaches here as a resync: the conversation
         // starts over, so an earlier protocol failure no longer applies.
@@ -1470,6 +1501,7 @@ impl McHandler {
             resync_sources: None,
             restored_head: None,
             standalone_move: standalone_move.map(moved_session::StandaloneMove::from_record),
+            partial_read_seq: None,
             failure: None,
             engine_failed: false,
             last_discarded_drops: 0,
@@ -2673,10 +2705,17 @@ impl McHandler {
             .ok_or_else(|| transient("async session disappeared"))?;
         #[cfg(test)]
         drop(phase);
-        let moves_lineage = message
-            .headers
-            .get("lineage_id")
-            .is_some_and(|new| state.lineage.as_ref().is_some_and(|old| old != new));
+        // A retry of the notice whose read the budget cut short continues that
+        // read. The lineage held then was taken from the runner's own pages
+        // during this notice, so the notice's older lineage header does not move
+        // it; a lineage change the runner makes meanwhile still fails the next
+        // page and resets the read.
+        let resuming = state.partial_read_seq == Some(notice.seq);
+        let moves_lineage = !resuming
+            && message
+                .headers
+                .get("lineage_id")
+                .is_some_and(|new| state.lineage.as_ref().is_some_and(|old| old != new));
         if state.failed() && !moves_lineage {
             // A failed conversation does no work until the runner moves it
             // to a new lineage; the notice is acknowledged.
@@ -2701,6 +2740,7 @@ impl McHandler {
         if let Some(lineage) = message
             .headers
             .get("lineage_id")
+            .filter(|_| !resuming)
             .filter(|new| state.lineage.as_ref().is_some_and(|old| old != *new))
         {
             if let Some(through) = message
@@ -2771,8 +2811,22 @@ impl McHandler {
         for attempt in 0..2 {
             let from = state.entries.last_key_value().map_or(0, |(n, _)| *n);
             let read = self
-                .read_async(&mut state, from, Duration::from_secs(10))
+                .read_async_resumable(&mut state, from, self.notice_read_budget())
                 .await;
+            if let Ok(ReadProgress::Incomplete { next }) = read {
+                // The budget ran out while every page was still valid. Keep
+                // what was read so the retried notice continues from it; a
+                // first read of a long session takes several attempts.
+                state.partial_read_seq = Some(notice.seq);
+                state.save_partial_read(store, codec)?;
+                let held_through = state.entries.last_key_value().map(|(n, _)| *n);
+                tracing::info!(session_ref=%notice.session_ref, ?held_through, next, "async read incomplete; the retry resumes from the held entries");
+                self.checkin(state);
+                return Err(transient(format!(
+                    "async read incomplete; resuming from ordinal {next}"
+                )));
+            }
+            let read = read.map(|_| ());
             let verified = read.is_ok()
                 && state
                     .entries
@@ -2783,6 +2837,7 @@ impl McHandler {
                         contract::digest::content_digest(&entry.message) == notice.through_digest
                     });
             if verified {
+                state.partial_read_seq = None;
                 state.resync = false;
                 state.reminder_echoes.finish_resync();
                 break;
@@ -2867,14 +2922,57 @@ impl McHandler {
         self.announce_async_views().await
     }
 
+    /// The time one notice may spend reading the transcript. A read that
+    /// does not finish in it is kept and continued on the notice's retry.
+    fn notice_read_budget(&self) -> Duration {
+        #[cfg(test)]
+        if let Some(budget) = *self
+            .provider_store
+            .async_runtime
+            .notice_read_budget
+            .lock()
+            .expect("notice read budget")
+        {
+            return budget;
+        }
+        Duration::from_secs(10)
+    }
+
     async fn read_async(
+        &self,
+        state: &mut State,
+        from: u64,
+        budget: Duration,
+    ) -> Result<(), HandlerOutcome> {
+        match self.read_async_resumable(state, from, budget).await? {
+            ReadProgress::Complete => Ok(()),
+            ReadProgress::Incomplete { .. } => {
+                Err(transient("async paging did not advance within deadline"))
+            }
+        }
+    }
+
+    /// Read the transcript from `from` until the runner has no next page, or
+    /// until `budget` runs out between two valid pages. Every held entry is
+    /// still checked; only the budget makes a read `Incomplete`, never a page
+    /// the runner refused or one that contradicts what is held.
+    async fn read_async_resumable(
         &self,
         state: &mut State,
         mut from: u64,
         budget: Duration,
-    ) -> Result<(), HandlerOutcome> {
-        let deadline = Instant::now() + budget;
+    ) -> Result<ReadProgress, HandlerOutcome> {
+        let started = Instant::now();
+        let deadline = started + budget;
+        // Stop before a page that the remaining budget could cut short: a page
+        // call cut by its timeout is a failed read, not a resumable one.
+        let mut slowest_page = Duration::ZERO;
+        let mut pages = 0u64;
         loop {
+            let page_started = Instant::now();
+            if pages > 0 && deadline.saturating_duration_since(page_started) <= slowest_page {
+                return Ok(ReadProgress::Incomplete { next: from });
+            }
             let mut params = json!({"from_ordinal":from,"max_bytes":1_048_576});
             if let Some(lineage) = &state.lineage {
                 params["lineage_id"] = json!(lineage);
@@ -2943,12 +3041,17 @@ impl McHandler {
             let Some(next) = page["next_from_ordinal"].as_u64() else {
                 break;
             };
-            if next != expected || next <= from || Instant::now() >= deadline {
-                return Err(transient("async paging did not advance within deadline"));
+            if next != expected || next <= from {
+                return Err(transient("async paging did not advance"));
             }
+            pages += 1;
+            slowest_page = slowest_page.max(page_started.elapsed());
             from = next;
+            if Instant::now() >= deadline {
+                return Ok(ReadProgress::Incomplete { next });
+            }
         }
-        Ok(())
+        Ok(ReadProgress::Complete)
     }
 
     async fn advance_async_reminders(
@@ -3259,8 +3362,14 @@ impl McHandler {
             last_not_applied: None,
         };
         let mut engine = state.engine_with_baselines()?;
+        #[cfg(test)]
+        let meter = scaling_tests::save_meter::start_kind(&state.reference(), "pub:engine");
         let (template, output) =
             self.async_engine(channel, &binding, state, codec, &status, &mut engine)?;
+        #[cfg(test)]
+        drop(meter);
+        #[cfg(test)]
+        let meter = scaling_tests::save_meter::start_kind(&state.reference(), "pub:certify");
         if output.prefix_bust_permitted
             && !self.async_oracle()
             && engine.preset == transform::compaction::Preset::Head
@@ -3313,6 +3422,10 @@ impl McHandler {
             state.adopt_engine(engine)?;
             return Ok(None);
         }
+        #[cfg(test)]
+        drop(meter);
+        #[cfg(test)]
+        let meter = scaling_tests::save_meter::start_kind(&state.reference(), "pub:render");
         let wire = if self.async_oracle() || state.logical_prefix.is_none() {
             rendered_view(codec, &candidate, state, true)?
         } else {
@@ -3328,6 +3441,10 @@ impl McHandler {
             .map_err(transient)?
             .meta
             .coverage_ordinal;
+        #[cfg(test)]
+        drop(meter);
+        #[cfg(test)]
+        let _meter = scaling_tests::save_meter::start_kind(&state.reference(), "pub:ranges");
         let mut ranges = ranges(state, codec, &wire, &candidate, coverage)?;
         state.frozen_edits.apply(state, &mut ranges)?;
         if let Some(cadence) = &state.reminder_cadence {
