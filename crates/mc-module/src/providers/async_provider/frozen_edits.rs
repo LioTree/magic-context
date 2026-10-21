@@ -128,21 +128,24 @@ impl FrozenEdits {
     ///
     /// Parts are filled one at a time, then each tool arc is made whole
     /// (`tool_arcs::complete_dropped_arcs`): a re-anchored drop of a call must
-    /// not leave its result served, nor the other way round.
+    /// not leave its result served, nor the other way round. Last, each keep
+    /// range's edits are put in the order the contract requires: by ordinal,
+    /// then by the part's position in its message (`tool_arcs::sort_edits`).
     pub(super) fn apply(
         &self,
-        state: &State,
+        mid_index: &BTreeMap<String, u64>,
+        entries: &BTreeMap<u64, Arc<HeldEntry>>,
         kept: &tool_arcs::KeptMessages,
         ranges: &mut [view::ViewRange],
     ) -> Result<(), HandlerOutcome> {
         let mut anchored: BTreeMap<u64, Vec<view::PartEdit>> = BTreeMap::new();
         let mut sources = HashMap::new();
         for part in self.parts.values() {
-            let Some(ordinal) = state.mid_index.get(&part.mid) else {
+            let Some(ordinal) = mid_index.get(&part.mid) else {
                 continue;
             };
             if !sources.contains_key(ordinal) {
-                sources.insert(*ordinal, state.entries[ordinal].read()?);
+                sources.insert(*ordinal, entries[ordinal].read()?);
             }
             let entry = &sources[ordinal];
             let Some(index) = entry.tags.iter().position(|row| row.part == part.part) else {
@@ -177,9 +180,13 @@ impl FrozenEdits {
                     }
                 }
             }
-            edits.sort_by(|a, b| (a.ordinal, &a.part).cmp(&(b.ordinal, &b.part)));
         }
         tool_arcs::complete_dropped_arcs(kept, ranges);
+        for range in ranges.iter_mut() {
+            if let view::ViewRange::Keep { edits, .. } = range {
+                tool_arcs::sort_edits(kept, edits);
+            }
+        }
         Ok(())
     }
 }
@@ -219,5 +226,174 @@ impl RetiredViews {
         let before = self.views.len();
         self.views.retain(|version, _| *version >= floor);
         self.dirty |= self.views.len() != before;
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// An Anthropic assistant message of `count` text parts keyed "0", "1",
+    /// ..., with a `tool_use` as its last part when `call` names one.
+    fn message(ordinal: u64, count: usize, call: Option<&str>) -> ReadMessage {
+        let mut content: Vec<Value> = (0..count)
+            .map(|index| json!({"type":"text","text":format!("part {index}")}))
+            .collect();
+        if let Some(id) = call {
+            content.push(json!({"type":"tool_use","id":id,"name":"read","input":{}}));
+        }
+        let tags = (0..content.len())
+            .map(|index| tags::PartTag::untagged(index.to_string()))
+            .collect();
+        ReadMessage::new(
+            ordinal,
+            format!("m{ordinal}"),
+            json!({"role":"assistant","content":content}),
+        )
+        .with_tags(tags)
+    }
+
+    fn result(ordinal: u64, call: &str) -> ReadMessage {
+        ReadMessage::new(
+            ordinal,
+            format!("m{ordinal}"),
+            json!({"role":"user","content":[{"type":"tool_result","tool_use_id":call,"content":"out"}]}),
+        )
+        .with_tags(vec![tags::PartTag::untagged("0")])
+    }
+
+    struct Fixture {
+        entries: BTreeMap<u64, Arc<HeldEntry>>,
+        mid_index: BTreeMap<String, u64>,
+        kept: tool_arcs::KeptMessages,
+        frozen: FrozenEdits,
+    }
+
+    impl Fixture {
+        fn new(messages: &[ReadMessage]) -> Self {
+            let mut fixture = Self {
+                entries: BTreeMap::new(),
+                mid_index: BTreeMap::new(),
+                kept: BTreeMap::new(),
+                frozen: FrozenEdits::default(),
+            };
+            for entry in messages {
+                fixture.entries.insert(
+                    entry.ordinal,
+                    Arc::new(HeldEntry::from_read(entry).unwrap()),
+                );
+                fixture.mid_index.insert(entry.mid.clone(), entry.ordinal);
+                fixture.kept.insert(
+                    entry.ordinal,
+                    tool_arcs::KeptMessage::new(codec::Codec::AnthropicMessages, entry).unwrap(),
+                );
+            }
+            fixture
+        }
+
+        /// Record that an acknowledged view dropped part `index` of `entry`.
+        fn acknowledged_drop(&mut self, entry: &ReadMessage, index: usize) {
+            let native = parts(&entry.message).unwrap();
+            self.frozen.insert_drop(
+                &entry.mid,
+                &entry.tags[index].part,
+                &contract::digest::content_digest(&native[index]),
+            );
+        }
+
+        fn apply(&self, ranges: &mut [view::ViewRange]) {
+            self.frozen
+                .apply(&self.mid_index, &self.entries, &self.kept, ranges)
+                .unwrap();
+        }
+
+        /// The contract's own check that every message's edits follow its
+        /// part order (`rejected:edit_order` on the runner).
+        fn part_order(
+            &self,
+            ranges: Vec<view::ViewRange>,
+        ) -> Result<(), Option<view::ViewProblem>> {
+            let last = *self.entries.keys().last().unwrap();
+            let view = view::CompactionView::new(
+                "00000000000000000000000000000000",
+                1,
+                "L",
+                compact::lineage::MessageRef {
+                    ordinal: last,
+                    mid: format!("m{last}"),
+                },
+                ranges,
+            );
+            view.check().unwrap();
+            view.check_parts(|ordinal| {
+                self.entries.get(&ordinal).map(|entry| {
+                    entry
+                        .read()
+                        .unwrap()
+                        .tags
+                        .iter()
+                        .map(|row| row.part.clone())
+                        .collect()
+                })
+            })
+        }
+    }
+
+    /// Part keys "0" to "11": an acknowledged drop of part "10" re-anchored
+    /// next to this pass's edit of part "2" must follow it, although "10"
+    /// sorts before "2" as a string.
+    #[test]
+    fn re_anchored_edits_follow_part_position_past_ten_parts() {
+        let entry = message(0, 12, None);
+        let mut fixture = Fixture::new(std::slice::from_ref(&entry));
+        fixture.acknowledged_drop(&entry, 10);
+        let replace = view::PartEdit::replace(0, "m0", "2", r#"{"type":"text","text":"short"}"#);
+        let mut ranges = vec![view::ViewRange::keep_with_edits(
+            0,
+            1,
+            vec![replace.clone()],
+        )];
+        fixture.apply(&mut ranges);
+        assert_eq!(
+            ranges,
+            vec![view::ViewRange::keep_with_edits(
+                0,
+                1,
+                vec![replace, view::PartEdit::drop(0, "m0", "10")]
+            )]
+        );
+        assert_eq!(fixture.part_order(ranges), Ok(()));
+    }
+
+    /// A drop that completes a tool arc is added after the per-part fill and
+    /// lands in part order too: part "12" (the `tool_use`) after "2" and "10".
+    #[test]
+    fn a_completed_arc_drop_follows_part_position() {
+        let call = message(0, 12, Some("call1"));
+        let answer = result(1, "call1");
+        let mut fixture = Fixture::new(&[call.clone(), answer.clone()]);
+        fixture.acknowledged_drop(&call, 10);
+        fixture.acknowledged_drop(&answer, 0);
+        let replace = view::PartEdit::replace(0, "m0", "2", r#"{"type":"text","text":"short"}"#);
+        let mut ranges = vec![view::ViewRange::keep_with_edits(
+            0,
+            2,
+            vec![replace.clone()],
+        )];
+        fixture.apply(&mut ranges);
+        assert_eq!(
+            ranges,
+            vec![view::ViewRange::keep_with_edits(
+                0,
+                2,
+                vec![
+                    replace,
+                    view::PartEdit::drop(0, "m0", "10"),
+                    view::PartEdit::drop(0, "m0", "12"),
+                    view::PartEdit::drop(1, "m1", "0"),
+                ]
+            )]
+        );
+        assert_eq!(fixture.part_order(ranges), Ok(()));
     }
 }

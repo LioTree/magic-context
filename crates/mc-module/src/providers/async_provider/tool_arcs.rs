@@ -204,6 +204,9 @@ fn side_dropped(
 /// reduction is undone and the bytes stay what the runner already holds. The
 /// other resolution, serving the call again, would restore content an
 /// acknowledged view removed.
+///
+/// A drop added for a part the range did not edit yet goes at the end of the
+/// range's edits; the caller puts them in part order afterwards (`sort_edits`).
 pub(super) fn complete_dropped_arcs(kept: &KeptMessages, ranges: &mut [view::ViewRange]) {
     let mut drops: BTreeMap<u64, BTreeSet<usize>> = BTreeMap::new();
     {
@@ -235,7 +238,6 @@ pub(super) fn complete_dropped_arcs(kept: &KeptMessages, ranges: &mut [view::Vie
         let view::ViewRange::Keep { from, to, edits } = range else {
             continue;
         };
-        let mut changed = false;
         for (ordinal, parts) in drops.range(*from..*to) {
             let message = &kept[ordinal];
             for part in parts {
@@ -250,19 +252,24 @@ pub(super) fn complete_dropped_arcs(kept: &KeptMessages, ranges: &mut [view::Vie
                     Some(edit) => *edit = drop,
                     None => edits.push(drop),
                 }
-                changed = true;
             }
         }
-        if changed {
-            // Edits follow the parts' order within each message.
-            edits.sort_by_key(|edit| {
-                let position = kept
-                    .get(&edit.ordinal)
-                    .and_then(|message| message.parts.iter().position(|part| *part == edit.part));
-                (edit.ordinal, position)
-            });
-        }
     }
+}
+
+/// Sort one keep range's edits as the contract requires: by ordinal, then by
+/// the part's position in its message (the order of the message's part keys).
+/// Part keys are opaque strings, so their string order is not the part order:
+/// with keys `"0"` to `"11"`, `"10"` sorts before `"2"`. An edit whose key
+/// the kept message does not list sorts first within its message, by key;
+/// publication never builds such an edit.
+pub(super) fn sort_edits(kept: &KeptMessages, edits: &mut [view::PartEdit]) {
+    edits.sort_by_cached_key(|edit| {
+        let position = kept
+            .get(&edit.ordinal)
+            .and_then(|message| message.parts.iter().position(|part| *part == edit.part));
+        (edit.ordinal, position, edit.part.clone())
+    });
 }
 
 /// Serve a fully dropped Pi `toolResult` message by removing the message.

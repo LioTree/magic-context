@@ -3488,7 +3488,9 @@ impl McHandler {
         #[cfg(test)]
         let _meter = scaling_tests::save_meter::start_kind(&state.reference(), "pub:ranges");
         let (mut ranges, kept) = ranges(state, codec, &wire, &candidate, coverage)?;
-        state.frozen_edits.apply(state, &kept, &mut ranges)?;
+        state
+            .frozen_edits
+            .apply(&state.mid_index, &state.entries, &kept, &mut ranges)?;
         if let Some(cadence) = &state.reminder_cadence {
             state.reminder_echoes.apply(
                 &cadence.ledger,
