@@ -297,7 +297,7 @@ impl AsyncRecord {
                 message: entry.message.clone(),
             },
         )?;
-        let mut blocks = decoded.ck.content.iter().enumerate().map(|(index, block)| {
+        let blocks = decoded.ck.content.iter().enumerate().map(|(index, block)| {
             let native = block
                 .provider_extras
                 .get("_cortexkit_codec")
@@ -310,8 +310,9 @@ impl AsyncRecord {
             blocks
                 .filter(|(_, native)| limit.is_none_or(|limit| *native <= limit))
                 .map(|(index, _)| index)
-                .last()
+                .next_back()
         } else {
+            let mut blocks = blocks;
             blocks
                 .find(|(_, native)| limit.is_none_or(|limit| *native >= limit))
                 .map(|(index, _)| index)

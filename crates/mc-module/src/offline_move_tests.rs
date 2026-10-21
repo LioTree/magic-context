@@ -344,7 +344,8 @@ fn move_rerun_after_a_crash_at_each_write_step_ends_identical() {
 
 #[test]
 fn move_refuses_each_case_by_name_without_writing() {
-    let cases: Vec<(&str, Box<dyn Fn(&StorePaths)>)> = vec![
+    type BreakSource = Box<dyn Fn(&StorePaths)>;
+    let cases: Vec<(&str, BreakSource)> = vec![
         (
             "marker_pending_not_in_effect",
             Box::new(|paths| {
@@ -645,7 +646,7 @@ pub(crate) fn write_synthetic_stores(dir: &Path, shape: &Synthetic) -> StorePath
                     continue;
                 }
                 tag += 1;
-                let dropped = tag % 10 == 0;
+                let dropped = tag.is_multiple_of(10);
                 let (address, kind, owner) = match call {
                     Some(call) => (call.clone(), "tool", Some(mid.clone())),
                     None => (format!("{mid}:p{position}"), "message", None),
@@ -660,7 +661,7 @@ pub(crate) fn write_synthetic_stores(dir: &Path, shape: &Synthetic) -> StorePath
                     owner
                 ])
                 .unwrap();
-                if index > cut && !dropped && queued_count < 50 && tag % 7 == 0 {
+                if index > cut && !dropped && queued_count < 50 && tag.is_multiple_of(7) {
                     queued
                         .execute(params![session, tag as i64, 1_000 + tag as i64])
                         .unwrap();

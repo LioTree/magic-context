@@ -464,7 +464,8 @@ async fn moved_175k_first_read_cost() {
     headers.insert("lineage_id".into(), "L".into());
     let notice = notice::AdvanceNotice::from_headers(&headers).unwrap();
     let started = Instant::now();
-    rig.bus
+    let _ = rig
+        .bus
         .publish(
             &notice::event_subject("fixture", &rig.module, notice::ADVANCED_EVENT),
             &bus_id(&rig.reference, "advanced", 1),

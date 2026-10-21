@@ -611,6 +611,9 @@ impl Plan {
     }
 }
 
+/// `session_meta`'s harness, counter, pending marker and persisted marker state.
+type SessionMetaRow = (String, Option<i64>, Option<String>, Option<String>);
+
 struct TagRow {
     number: u64,
     address: String,
@@ -641,7 +644,7 @@ pub fn plan(paths: &StorePaths, session: &str) -> Result<Plan, Refusal> {
             ),
         ));
     }
-    let meta: Option<(String, Option<i64>, Option<String>, Option<String>)> = context
+    let meta: Option<SessionMetaRow> = context
         .query_row(
             "SELECT harness, counter, pending_compaction_marker_state, compaction_marker_state
                FROM session_meta WHERE session_id=?1",
