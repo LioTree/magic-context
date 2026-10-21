@@ -161,6 +161,14 @@ async fn call_key_returns_first_reply_without_dispatching_changed_command() {
     assert_eq!(replay, first);
     assert_eq!(rig.newest(), before);
     assert!(pull(&rig).await["entries"].as_array().unwrap().is_empty());
+    let restarted = McHandler::new();
+    restarted
+        .store
+        .set(Arc::clone(rig.h.store.get().unwrap()))
+        .ok()
+        .unwrap();
+    restarted.bind_route(7, rig.h.facade_binding(7).unwrap());
+    assert_eq!(response(restarted.dispatch_value(7, json!({"name":"user_command.invoke","call_key":"replay","arguments":{"command":"ctx-flush","input":""}})).await), first);
 }
 
 #[tokio::test]
@@ -210,9 +218,23 @@ async fn long_command_reports_progress_then_one_result_and_acknowledges() {
     let dir = tempfile::tempdir().unwrap();
     let rig = ready(dir.path()).await;
     rig.queue(&[103]).await;
-    let reply = response(invoke(&rig, "long", "ctx-flush", "").await);
+    let reply = response(
+        tokio::time::timeout(
+            Duration::from_secs(5),
+            invoke(&rig, "long", "ctx-flush", ""),
+        )
+        .await
+        .expect("prompt command admission"),
+    );
     assert_eq!(reply["state"], "accepted");
     assert!(reply["job"].as_str().unwrap().starts_with("ctx-flush-"));
+    let held = rig.h.provider_serial.lock_for(&rig.state().key).await;
+    tokio::spawn(async move {
+        tokio::time::sleep(Duration::from_secs(6)).await;
+        drop(held);
+    })
+    .await
+    .unwrap();
     let late = terminal(&rig).await;
     let entries = late["entries"].as_array().unwrap();
     assert_eq!(
