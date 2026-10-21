@@ -3458,6 +3458,15 @@ impl McHandler {
         let meter = scaling_tests::save_meter::start_kind(&state.reference(), "pub:render");
         let wire = if self.async_oracle() || state.logical_prefix.is_none() {
             rendered_view(codec, &candidate, state, true)?
+        } else if template.logical_prefix.is_none() {
+            // This pass read every held message, but `certify` above has just
+            // proven its covered prefix. Render from the view's own source
+            // messages only, as Setup does once a certificate exists: covered
+            // sources cannot change tail-native rendering, and a subset the
+            // codec cannot render falls back to the whole lineage inside
+            // `rendered_view`. Rendering through `template` here would copy and
+            // walk every held message again.
+            rendered_view(codec, &candidate, state, false)?
         } else {
             #[cfg(test)]
             scaling_tests::view_work::renderer(&state.reference(), template.messages.len());
