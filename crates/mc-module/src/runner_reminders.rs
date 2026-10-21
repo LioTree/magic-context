@@ -46,6 +46,8 @@ pub(crate) mod phase_meter {
 const MAX: i64 = 100_000;
 const DELIVERY: [Mode; 3] = [Mode::TurnSystem, Mode::ToolResult, Mode::Steer];
 const SEARCH_DELIVERY: [Mode; 2] = [Mode::ToolResult, Mode::Steer];
+const NO_DELIVERY_MODE: &str = "not due: runner cannot land any delivery mode";
+const REFUSED_DELIVERY: &str = "not due: runner previously refused this delivery list";
 /// All reminder kinds expire five minutes after the observation that produced them.
 pub const REMINDER_TTL_MS: u64 = 300_000;
 /// Allow a queued delivery to appear on the next transcript read after expiry.
@@ -215,7 +217,37 @@ pub struct ReminderState {
     last_time_message: Option<String>,
     last_search_message: Option<String>,
     #[serde(default)]
+    delivery_refusals: DeliveryRefusals,
+    #[serde(default)]
     pub(crate) ledger: DeliveryLedger,
+}
+
+/// Keep refused mode lists only for the runner description under which they were recorded.
+#[derive(Clone, Debug, Default, serde::Serialize, serde::Deserialize)]
+struct DeliveryRefusals {
+    #[serde(default)]
+    runner_description: Option<Value>,
+    #[serde(default)]
+    lists: Vec<Vec<Mode>>,
+}
+
+impl DeliveryRefusals {
+    fn use_description(&mut self, description: &Value) {
+        if self.runner_description.as_ref() != Some(description) {
+            self.runner_description = Some(description.clone());
+            self.lists.clear();
+        }
+    }
+
+    fn contains(&self, modes: &[Mode]) -> bool {
+        self.lists.iter().any(|refused| refused == modes)
+    }
+
+    fn record(&mut self, modes: &[Mode]) {
+        if !self.contains(modes) {
+            self.lists.push(modes.to_vec());
+        }
+    }
 }
 
 /// Accepted sends awaiting one exact content-block echo from the runner.
@@ -351,7 +383,7 @@ impl PreparedSend {
         }
     }
 
-    fn request(&self, project: &Path, session: &str, notice: &str) -> Value {
+    fn request(&self, project: &Path, session: &str, notice: &str, modes: &[Mode]) -> Value {
         // The immutable payload, not the replacement key, identifies a retry.
         let identity = json!([
             project.to_string_lossy(),
@@ -360,20 +392,16 @@ impl PreparedSend {
             self.kind,
             self.template,
             self.prompt,
-            self.expires_at_ms
+            self.expires_at_ms,
+            modes
         ]);
         let send_id =
             crate::sha256_hex(&serde_jcs::to_vec(&identity).expect("send identity serializes"));
-        self.wire_request(send_id)
+        self.wire_request(send_id, modes)
     }
 
-    fn wire_request(&self, send_id: String) -> Value {
-        let modes = if self.template.is_some() {
-            DELIVERY.to_vec()
-        } else {
-            SEARCH_DELIVERY.to_vec()
-        };
-        let mut order = DeliveryOrder::new(modes)
+    fn wire_request(&self, send_id: String, modes: &[Mode]) -> Value {
+        let mut order = DeliveryOrder::new(modes.to_vec())
             .with_dedupe_key(format!("mc.{}", self.kind))
             .with_expires_at_ms(self.expires_at_ms);
         if let Some(template) = &self.template {
@@ -393,9 +421,22 @@ async fn issue(
     session: &str,
     notice: &str,
     send: PreparedSend,
-    ledger: &mut DeliveryLedger,
+    modes: &[Mode],
+    state: &mut ReminderState,
     outcome: &mut ReminderOutcome,
 ) -> bool {
+    if modes.is_empty() {
+        if !outcome.not_due.contains(&NO_DELIVERY_MODE) {
+            outcome.not_due.push(NO_DELIVERY_MODE);
+        }
+        return false;
+    }
+    if state.delivery_refusals.contains(modes) {
+        if !outcome.not_due.contains(&REFUSED_DELIVERY) {
+            outcome.not_due.push(REFUSED_DELIVERY);
+        }
+        return false;
+    }
     // Use the role's renderer, including its digest and slot validation, rather
     // than a second interpolation implementation that could misidentify echoes.
     let text = match &send.template {
@@ -408,7 +449,7 @@ async fn issue(
         },
         None => send.prompt.clone(),
     };
-    let request = send.request(project, session, notice);
+    let request = send.request(project, session, notice, modes);
     match runner
         .call(
             project,
@@ -420,11 +461,14 @@ async fn issue(
         .await
     {
         Ok(reply) if accepted(&reply) => {
-            ledger.record(&send, text);
+            state.ledger.record(&send, text);
             outcome.issued.push(request);
             true
         }
         Ok(reply) => {
+            if delivery_unsupported(&reply) {
+                state.delivery_refusals.record(modes);
+            }
             outcome.errors.push(format!("{}: {reply}", send.kind));
             false
         }
@@ -433,6 +477,31 @@ async fn issue(
             false
         }
     }
+}
+
+fn delivery_unsupported(reply: &Value) -> bool {
+    let body = reply.get("result").unwrap_or(reply);
+    let error = body.get("error").unwrap_or(body);
+    error.get("code").and_then(Value::as_str)
+        == Some(cortexkit_role_llm_runner::errors::DELIVERY_UNSUPPORTED)
+}
+
+fn delivery_modes(
+    templated: bool,
+    description: &cortexkit_role_llm_runner::describe::RoleDescribe,
+) -> Vec<Mode> {
+    let modes: &[Mode] = if templated {
+        &DELIVERY
+    } else {
+        &SEARCH_DELIVERY
+    };
+    modes
+        .iter()
+        .copied()
+        .filter(|mode| {
+            description.delivery_order_modes.is_none() || mode.is_declared_by(description)
+        })
+        .collect()
 }
 
 fn accepted(reply: &Value) -> bool {
@@ -556,14 +625,14 @@ async fn send_due_reminders_impl<const FULL_META: bool>(
         }
     };
     let description = description.get("result").unwrap_or(&description);
-    if cortexkit_role_llm_runner::describe::check_describe(description).is_err()
-        || !description["capabilities"]
-            .as_array()
-            .is_some_and(|caps| caps.iter().any(|cap| cap == "delivery_order"))
-    {
-        outcome.not_due.push("runner_missing_delivery_order");
-        return outcome;
-    }
+    let describe = match cortexkit_role_llm_runner::describe::check_describe(description) {
+        Ok(describe) if describe.declares("delivery_order") => describe,
+        _ => {
+            outcome.not_due.push("runner_missing_delivery_order");
+            return outcome;
+        }
+    };
+    state.delivery_refusals.use_description(description);
 
     #[cfg(test)]
     let meter = phase_meter::start("meta_clone");
@@ -640,13 +709,15 @@ async fn send_due_reminders_impl<const FULL_META: bool>(
             count,
             &selected.oldest_reclaimable,
         );
+        let modes = delivery_modes(true, &describe);
         if issue(
             runner,
             project_root,
             session,
             conditions.notice_id,
             PreparedSend::reminder("ctx_reduce", use_, conditions.now_ms),
-            &mut state.ledger,
+            &modes,
+            state,
             &mut outcome,
         )
         .await
@@ -704,13 +775,15 @@ async fn send_due_reminders_impl<const FULL_META: bool>(
             transform::reclaimable_tool_output_count(conditions.baseline),
             &selected.channel2,
         );
+        let modes = delivery_modes(true, &describe);
         if issue(
             runner,
             project_root,
             session,
             conditions.notice_id,
             PreparedSend::reminder("ctx_reduce", use_, conditions.now_ms),
-            &mut state.ledger,
+            &modes,
+            state,
             &mut outcome,
         )
         .await
@@ -727,13 +800,15 @@ async fn send_due_reminders_impl<const FULL_META: bool>(
             .then(|| conditions.gap_ms.and_then(time_use))
             .flatten();
         if let Some(marker) = marker.filter(|_| state.last_time_message.as_deref() != Some(mid)) {
+            let modes = delivery_modes(true, &describe);
             if issue(
                 runner,
                 project_root,
                 session,
                 conditions.notice_id,
                 PreparedSend::reminder("time", marker, conditions.now_ms),
-                &mut state.ledger,
+                &modes,
+                state,
                 &mut outcome,
             )
             .await
@@ -755,13 +830,15 @@ async fn send_due_reminders_impl<const FULL_META: bool>(
                 sent_at_ms: conditions.now_ms,
                 expires_at_ms: conditions.now_ms.saturating_add(REMINDER_TTL_MS),
             };
+            let modes = delivery_modes(false, &describe);
             if issue(
                 runner,
                 project_root,
                 session,
                 conditions.notice_id,
                 send,
-                &mut state.ledger,
+                &modes,
+                state,
                 &mut outcome,
             )
             .await
@@ -835,7 +912,7 @@ mod tests {
         let mut use_ = time_use(7_260_000).unwrap();
         use_.digest = "incorrect".into();
         let runner = FakeRunner::default();
-        let mut ledger = DeliveryLedger::default();
+        let mut state = ReminderState::default();
         let mut outcome = ReminderOutcome::default();
         assert!(
             !issue(
@@ -844,13 +921,14 @@ mod tests {
                 "reminder-test",
                 "test",
                 PreparedSend::reminder("time", use_, 1),
-                &mut ledger,
+                &DELIVERY,
+                &mut state,
                 &mut outcome
             )
             .await
         );
         assert!(runner.sends.lock().unwrap().is_empty());
-        assert!(ledger.is_empty());
+        assert!(state.ledger.is_empty());
         let runner = FakeRunner {
             refuse: true,
             ..Default::default()
@@ -862,13 +940,14 @@ mod tests {
                 "reminder-test",
                 "test",
                 PreparedSend::reminder("time", time_use(7_260_000).unwrap(), 1),
-                &mut ledger,
+                &DELIVERY,
+                &mut state,
                 &mut outcome
             )
             .await
         );
         assert_eq!(runner.sends.lock().unwrap().len(), 1);
-        assert!(ledger.is_empty());
+        assert!(state.ledger.is_empty());
     }
 
     #[test]
@@ -992,8 +1071,12 @@ mod tests {
     #[derive(Default)]
     struct FakeRunner {
         sends: Mutex<Vec<Value>>,
+        describe_calls: Mutex<usize>,
+        delivery_modes: Mutex<Option<Vec<String>>>,
+        description_version: Mutex<Option<String>>,
         missing_capability: bool,
         refuse: bool,
+        delivery_unsupported: bool,
     }
 
     #[subc_client_rs::async_trait]
@@ -1008,18 +1091,54 @@ mod tests {
         ) -> Result<Value, SessionResolveError> {
             assert_eq!(session, "reminder-test");
             match method {
-                "role.describe" => Ok(json!({
-                    "majors":[{"version":"llm-runner/v1","ops":["role.describe","session.baseline","session.send"]}],
-                    "implementation_version":"fake", "session_capabilities_from":"baseline",
-                    "capabilities":if self.missing_capability {vec![]} else {vec!["delivery_order"]}
-                })),
+                "role.describe" => {
+                    *self.describe_calls.lock().unwrap() += 1;
+                    let modes = self.delivery_modes.lock().unwrap().clone();
+                    let mut capabilities = vec!["delivery_order"];
+                    if modes
+                        .as_ref()
+                        .is_some_and(|modes| modes.iter().any(|mode| mode == "steer"))
+                    {
+                        capabilities.push("steer");
+                    }
+                    if modes
+                        .as_ref()
+                        .is_some_and(|modes| modes.iter().any(|mode| mode == "idle_start"))
+                    {
+                        capabilities.push("queue");
+                    }
+                    let version = self
+                        .description_version
+                        .lock()
+                        .unwrap()
+                        .clone()
+                        .unwrap_or_else(|| "fake".into());
+                    let mut description = json!({
+                        "majors":[{"version":"llm-runner/v1","ops":["role.describe","session.baseline","session.send"]}],
+                        "implementation_version":version, "session_capabilities_from":"baseline",
+                        "capabilities":if self.missing_capability {vec![]} else {capabilities}
+                    });
+                    if let Some(modes) = modes {
+                        description["delivery_order_modes"] = json!(modes);
+                    }
+                    Ok(description)
+                }
                 "session.send" => {
                     let request: SendRequest = serde_json::from_value(params.clone()).unwrap();
                     request.check_delivery_order(&["delivery_order"]).unwrap();
-                    if let Some(template) = request.delivery_order().unwrap().unwrap().template {
+                    let order = request.delivery_order().unwrap().unwrap();
+                    if let Some(template) = order.template {
                         delivery_order::render(&templates(), &template, |_| true).unwrap();
                     }
                     self.sends.lock().unwrap().push(params);
+                    if self.delivery_unsupported {
+                        return Ok(json!({
+                            "error": {
+                                "code": "delivery_unsupported",
+                                "detail": {"delivery": order.modes}
+                            }
+                        }));
+                    }
                     if self.refuse {
                         Ok(json!({"error":{"code":"invalid_params"}}))
                     } else {
@@ -1096,6 +1215,116 @@ mod tests {
         for send in sends {
             assert!(send.get("delivery_order").is_none());
         }
+    }
+
+    #[tokio::test]
+    async fn declared_delivery_modes_narrow_lists_in_the_original_order() {
+        let runner = FakeRunner::default();
+        *runner.delivery_modes.lock().unwrap() = Some(vec!["steer".into()]);
+        let baseline = baseline(30_000, 100_000);
+        let outcome = send_due_reminders(
+            &runner,
+            Path::new("/throwaway/reminders"),
+            "reminder-test",
+            &mut ReminderState::default(),
+            &conditions(&baseline),
+        )
+        .await;
+
+        assert_eq!(outcome.issued.len(), 3);
+        assert!(outcome.errors.is_empty(), "{:?}", outcome.errors);
+        assert!(runner
+            .sends
+            .lock()
+            .unwrap()
+            .iter()
+            .all(|send| send["delivery"] == json!(["steer"])));
+        assert_eq!(*runner.describe_calls.lock().unwrap(), 1);
+    }
+
+    #[tokio::test]
+    async fn declared_modes_outside_reminder_lists_do_not_send_or_count_as_an_error() {
+        let runner = FakeRunner::default();
+        *runner.delivery_modes.lock().unwrap() = Some(vec!["idle_start".into()]);
+        let baseline = baseline(30_000, 100_000);
+        let outcome = send_due_reminders(
+            &runner,
+            Path::new("/throwaway/reminders"),
+            "reminder-test",
+            &mut ReminderState::default(),
+            &conditions(&baseline),
+        )
+        .await;
+
+        assert!(outcome.issued.is_empty());
+        assert!(outcome.errors.is_empty(), "{:?}", outcome.errors);
+        assert!(outcome.not_due.contains(&NO_DELIVERY_MODE));
+        assert!(runner.sends.lock().unwrap().is_empty());
+    }
+
+    #[tokio::test]
+    async fn delivery_unsupported_is_remembered_per_list_across_restart_until_description_changes()
+    {
+        let runner = FakeRunner {
+            delivery_unsupported: true,
+            ..Default::default()
+        };
+        let root = Path::new("/throwaway/reminders");
+        let baseline = baseline(30_000, 100_000);
+        let conditions = conditions(&baseline);
+        let mut state = ReminderState::default();
+        let first =
+            send_due_reminders(&runner, root, "reminder-test", &mut state, &conditions).await;
+        assert_eq!(first.errors.len(), 2);
+        let initial_sends = runner.sends.lock().unwrap().clone();
+        assert_eq!(initial_sends.len(), 2);
+        assert_eq!(
+            initial_sends[0]["delivery"],
+            json!(["turn_system", "tool_result", "steer"])
+        );
+        assert_eq!(
+            initial_sends[1]["delivery"],
+            json!(["tool_result", "steer"])
+        );
+
+        let saved = serde_json::to_value(&state).unwrap();
+        let mut restarted_state: ReminderState = serde_json::from_value(saved).unwrap();
+        let second = send_due_reminders(
+            &runner,
+            root,
+            "reminder-test",
+            &mut restarted_state,
+            &conditions,
+        )
+        .await;
+        assert!(second.errors.is_empty(), "{:?}", second.errors);
+        assert!(second.not_due.contains(&REFUSED_DELIVERY));
+        assert_eq!(runner.sends.lock().unwrap().len(), initial_sends.len());
+
+        *runner.description_version.lock().unwrap() = Some("fake-reconnected".into());
+        let third = send_due_reminders(
+            &runner,
+            root,
+            "reminder-test",
+            &mut restarted_state,
+            &conditions,
+        )
+        .await;
+        assert_eq!(third.errors.len(), 2);
+        assert_eq!(runner.sends.lock().unwrap().len(), initial_sends.len() * 2);
+        assert_eq!(*runner.describe_calls.lock().unwrap(), 3);
+    }
+
+    #[test]
+    fn old_reminder_state_without_refusal_memory_deserializes() {
+        let mut old_state = serde_json::to_value(ReminderState::default()).unwrap();
+        old_state
+            .as_object_mut()
+            .unwrap()
+            .remove("delivery_refusals");
+        let decoded: ReminderState = serde_json::from_value(old_state).unwrap();
+        assert!(decoded.delivery_refusals.runner_description.is_none());
+        assert!(decoded.delivery_refusals.lists.is_empty());
     }
 
     #[tokio::test]
