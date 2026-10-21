@@ -1254,10 +1254,11 @@ fn load_head(store: &McStore, reference: &str) -> Result<Option<State>, HandlerO
         .transpose()
 }
 
-/// Check a view before it is published: its structure (an error), then that it
-/// keeps every tool call together with its result in the runner's format
-/// (`Err` with the arcs it separates). A runner refuses a split view as
-/// `tool_pair_split`, and a model provider rejects the request.
+/// Check a view before it is published. A malformed view is an error. A view
+/// that separates a tool call from its result in the runner's format yields
+/// the inner `Err`, describing each separated arc, and the caller withholds
+/// it: a runner would refuse it as `tool_pair_split`, and a model provider
+/// would reject the history.
 fn checked_async_view(
     view: view::CompactionView,
     codec: codec::Codec,
@@ -2056,8 +2057,9 @@ fn tag_rows_for<'a>(
     Ok(rows)
 }
 
-/// The view's ranges, and the transcript messages its keep ranges hold, read
-/// once here for the tool-arc checks that follow.
+/// Build the view's ranges, and collect the transcript messages its keep ranges
+/// hold for the tool-arc checks that follow, so those checks parse no message
+/// again.
 fn ranges(
     state: &State,
     codec: codec::Codec,

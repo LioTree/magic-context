@@ -447,8 +447,9 @@ pub(super) fn split_pairs(
     splits
 }
 
-/// Views withheld by the pairing guard, by session reference, so tests can
-/// tell a root cause that the guard caught from one that never happened.
+/// The splits the pairing check found in views it withheld, by session
+/// reference, so tests can report a split view the provider built even though
+/// the check kept it from being published.
 #[cfg(test)]
 pub(super) mod withheld {
     use std::collections::BTreeMap;
