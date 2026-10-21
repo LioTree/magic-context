@@ -349,3 +349,109 @@ async fn non_async_worker_unknown_and_bad_arguments_are_named_refusals() {
         "async_compaction_required"
     );
 }
+
+fn save_receipt_ledger(rig: &Rig, ledger: Value) {
+    let mut state = rig.state();
+    state.commands = serde_json::from_value(ledger).unwrap();
+    state.save(rig.h.store.get().unwrap(), &[]).unwrap();
+    rig.h.checkin(state);
+}
+
+fn seed_receipts(rig: &Rig, oldest_ms: u64, interrupted: bool) -> String {
+    let binding = rig.h.facade_binding(7).unwrap();
+    let scope = binding.scope.as_ref().unwrap();
+    let who = json!([
+        scope.owner,
+        scope.scope_ref,
+        scope.scope_epoch,
+        binding.principal.as_ref().unwrap()
+    ])
+    .to_string();
+    let calls: serde_json::Map<String, Value> = (0..1024).map(|n| {
+        let key = format!("receipt-{n:04}");
+        (key, json!({
+            "first": {"state":if interrupted {"accepted"} else {"done"}, "text":format!("first reply {n}"), "job":if interrupted {Some(format!("old-job-{n}"))} else {None}},
+            "incarnation":"previous-process", "terminal":!interrupted, "created_at_ms":oldest_ms+n,
+        }))
+    }).collect();
+    save_receipt_ledger(rig, json!({(who):{"calls":calls,"entries":[],"head":0}}));
+    "receipt-0000".into()
+}
+
+fn saved_receipts(rig: &Rig) -> serde_json::Map<String, Value> {
+    let ledger = serde_json::to_value(&rig.state().commands).unwrap();
+    ledger
+        .as_object()
+        .unwrap()
+        .values()
+        .flat_map(|log| log["calls"].as_object().unwrap().clone())
+        .collect()
+}
+
+#[tokio::test]
+async fn old_receipts_are_evicted_before_admitting_a_new_command() {
+    let dir = tempfile::tempdir().unwrap();
+    let rig = ready(dir.path()).await;
+    let oldest = seed_receipts(&rig, now_ms() as u64 - 25 * 60 * 60 * 1000, false);
+    assert_eq!(saved_receipts(&rig).len(), 1024);
+    let reply = response(invoke(&rig, "new-after-expiry", "ctx-status", "").await);
+    assert_eq!(reply["state"], "done");
+    let saved = saved_receipts(&rig);
+    assert!(!saved.contains_key(&oldest));
+    assert_eq!(saved.len(), 1);
+    assert!(saved.contains_key("new-after-expiry"));
+}
+
+#[tokio::test]
+async fn fresh_receipts_still_refuse_at_capacity() {
+    let dir = tempfile::tempdir().unwrap();
+    let rig = ready(dir.path()).await;
+    seed_receipts(&rig, now_ms() as u64 - 60 * 1000, false);
+    let (code, detail) = refusal(invoke(&rig, "new-at-capacity", "ctx-status", "").await);
+    assert_eq!(code, "user_command_capacity");
+    assert_eq!(detail["command"], "ctx-status");
+    let saved = saved_receipts(&rig);
+    assert_eq!(saved.len(), 1024);
+    assert!(!saved.contains_key("new-at-capacity"));
+}
+
+#[tokio::test]
+async fn replay_within_twenty_four_hours_returns_its_first_reply() {
+    let dir = tempfile::tempdir().unwrap();
+    let rig = ready(dir.path()).await;
+    let first = response(invoke(&rig, "recent-replay", "ctx-status", "").await);
+    let mut ledger = serde_json::to_value(&rig.state().commands).unwrap();
+    for log in ledger.as_object_mut().unwrap().values_mut() {
+        log["calls"]["recent-replay"]["created_at_ms"] =
+            json!(now_ms() as u64 - 23 * 60 * 60 * 1000);
+    }
+    save_receipt_ledger(&rig, ledger);
+    pending_history(&rig);
+    let before = rig.newest();
+    assert_eq!(
+        response(invoke(&rig, "recent-replay", "ctx-flush", "").await),
+        first
+    );
+    assert_eq!(rig.newest(), before);
+    assert_eq!(saved_receipts(&rig).len(), 1);
+}
+
+#[tokio::test]
+async fn interrupted_failed_receipts_expire_without_resetting_their_age() {
+    let dir = tempfile::tempdir().unwrap();
+    let rig = ready(dir.path()).await;
+    let oldest = seed_receipts(&rig, now_ms() as u64 - 25 * 60 * 60 * 1000, true);
+    let before = saved_receipts(&rig)[&oldest]["created_at_ms"].clone();
+    let late = pull(&rig).await;
+    assert_eq!(late["entries"][0]["result"]["state"], "failed");
+    let settled = saved_receipts(&rig);
+    assert!(settled.values().all(|receipt| receipt["terminal"] == true));
+    assert_eq!(settled[&oldest]["created_at_ms"], before);
+    assert_eq!(
+        response(invoke(&rig, "new-after-interruption", "ctx-status", "").await)["state"],
+        "done"
+    );
+    let saved = saved_receipts(&rig);
+    assert!(!saved.contains_key(&oldest));
+    assert_eq!(saved.len(), 1);
+}

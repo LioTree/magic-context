@@ -4,11 +4,42 @@ use cortexkit_role_tool_provider::{errors, late_results as late, user_command as
 use serde::{Deserialize, Serialize};
 use subc_protocol::{scope::ScopeKind, Principal};
 
+const RECEIPT_RETENTION_MS: u64 = 24 * 60 * 60 * 1_000;
+const MAX_RECEIPTS: usize = 1024;
+
 #[derive(Default, Serialize, Deserialize)]
 pub(super) struct Ledger(BTreeMap<String, Log>);
 impl Ledger {
     pub(super) fn is_empty(&self) -> bool {
         self.0.is_empty()
+    }
+
+    fn evict_expired(&mut self, now_ms: u64) -> bool {
+        let mut changed = false;
+        let mut expired = Vec::new();
+        for (who, log) in &mut self.0 {
+            for (key, receipt) in &mut log.calls {
+                // Older records have no timestamp. Start their retry window on
+                // first observation and persist it, rather than resetting it on restart.
+                let created_at_ms = *receipt.created_at_ms.get_or_insert_with(|| {
+                    changed = true;
+                    now_ms
+                });
+                if now_ms.saturating_sub(created_at_ms) > RECEIPT_RETENTION_MS {
+                    expired.push((created_at_ms, who.clone(), key.clone()));
+                }
+            }
+        }
+        expired.sort_unstable();
+        changed |= !expired.is_empty();
+        for (_, who, key) in expired {
+            self.0
+                .get_mut(&who)
+                .expect("recorded command log")
+                .calls
+                .remove(&key);
+        }
+        changed
     }
 }
 #[derive(Default, Serialize, Deserialize)]
@@ -22,6 +53,8 @@ struct Receipt {
     first: command::UserCommandReply,
     incarnation: String,
     terminal: bool,
+    #[serde(default)]
+    created_at_ms: Option<u64>,
 }
 
 fn incarnation(reference: &str) -> String {
@@ -203,6 +236,12 @@ impl McHandler {
         }
         let arguments = arguments.expect("validated invoke");
         let key = request["call_key"].as_str().expect("validated key");
+        let now = now_ms().max(0) as u64;
+        if state.commands.evict_expired(now) {
+            if let Err(error) = state.save(store, &[]) {
+                return error;
+            }
+        }
         if let Some(receipt) = state.commands.0.get(who).and_then(|log| log.calls.get(key)) {
             return respond(json!(receipt.first));
         }
@@ -221,7 +260,7 @@ impl McHandler {
             .values()
             .map(|log| log.calls.len())
             .sum::<usize>()
-            >= 1024
+            >= MAX_RECEIPTS
         {
             return refused("user_command_capacity", &arguments.command);
         }
@@ -258,6 +297,7 @@ impl McHandler {
                 first: reply.clone(),
                 incarnation: current,
                 terminal: !accepted,
+                created_at_ms: Some(now),
             },
         );
         if accepted {
