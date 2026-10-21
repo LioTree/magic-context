@@ -353,7 +353,7 @@ mod tests {
         assert_eq!(reply["more"], json!(false));
     }
 
-        #[test]
+    #[test]
     fn window_pages_through_5001_rows_below_before_cursors() {
         let conn = db();
         for _ in 0..5_001 {
@@ -371,7 +371,10 @@ mod tests {
             if reply["more"] == json!(false) {
                 break;
             }
-            before = Some(Cursor { ended_at: 150, id: last });
+            before = Some(Cursor {
+                ended_at: 150,
+                id: last,
+            });
         }
         assert_eq!(seen, (1..=5_001).rev().collect::<Vec<_>>());
     }
@@ -394,7 +397,10 @@ mod tests {
         let query = ReadQuery::Window {
             after: 100,
             until: 200,
-            before: Some(Cursor { ended_at: 150, id: 3 }),
+            before: Some(Cursor {
+                ended_at: 150,
+                id: 3,
+            }),
             limit: 2,
         };
         let reply = read_only(&conn, &query);
