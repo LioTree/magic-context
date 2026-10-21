@@ -1011,8 +1011,14 @@ async fn applied_reduction_survives(resync: Resync, pressure: bool) {
         pair.append(1);
         assert_eq!(ack_notice(&mut pair, 96_000, None, None).await, "ok");
     } else {
-        // Message 6 is a tool result whose only part carries tag 124.
-        let request = json!({"name":"ctx_reduce","arguments":{"drop":"124"}});
+        // Message 6 is a tool result; reduce its only part by the number the
+        // runner's read shows for it.
+        let number = {
+            let mut entries = pair.transcript.entries.lock().unwrap();
+            renumber(&mut entries);
+            tags::parse_tag(entries[6].tags[0].tag.as_deref().unwrap()).unwrap()
+        };
+        let request = json!({"name":"ctx_reduce","arguments":{"drop":number.to_string()}});
         pair.both("ctx_reduce", |side| {
             Box::pin(side.dispatch(request.clone()))
         })

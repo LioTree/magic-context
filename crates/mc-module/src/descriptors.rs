@@ -124,6 +124,49 @@ pub(crate) fn expose(message: &Value) -> Option<Value> {
     changed.then_some(exposed)
 }
 
+/// `value` with no ref left, for bytes ck-mc authors itself (a fold of
+/// covered messages): a ref that is a whole block in an array is left out,
+/// and one in a member's place becomes text saying what it stood for (an
+/// argument ref, an empty object, since tool inputs are objects). A large text
+/// already reached the engine as its stand-in and stays that text.
+pub(crate) fn without_refs(value: &Value) -> Value {
+    fn stand_in(reference: &Reference) -> Value {
+        match reference {
+            Reference::MediaRef {
+                kind, byte_size, ..
+            } => Value::String(format!("[ck-mc: {kind} of {byte_size} bytes not shown]")),
+            Reference::TextRef {
+                byte_size,
+                char_count,
+                head,
+                ..
+            } => Value::String(text_stand_in(head, *byte_size, *char_count)),
+            Reference::ReasoningRef { byte_size, .. } => {
+                Value::String(reasoning_stand_in(*byte_size))
+            }
+            _ => Value::Object(Default::default()),
+        }
+    }
+    match value {
+        Value::Array(items) => Value::Array(
+            items
+                .iter()
+                .filter(|item| reference(item).is_none())
+                .map(without_refs)
+                .collect(),
+        ),
+        Value::Object(map) => match reference(value) {
+            Some(reference) => stand_in(&reference),
+            None => Value::Object(
+                map.iter()
+                    .map(|(key, child)| (key.clone(), without_refs(child)))
+                    .collect(),
+            ),
+        },
+        other => other.clone(),
+    }
+}
+
 /// Tokens the payload behind a ref costs the model.
 ///
 /// - An image: from its pixel dimensions by the rule standalone applies on
@@ -295,6 +338,27 @@ mod tests {
             arc: None,
         });
         assert_eq!(block_tokens(&block), Some(2765));
+    }
+
+    /// Bytes ck-mc authors carry no ref: a whole-block ref is left out, a
+    /// member's ref becomes text, and nothing else changes.
+    #[test]
+    fn authored_bytes_never_carry_a_ref() {
+        let message = json!({"role":"user","content":[
+            {"type":"text","text":"see"},
+            image(Some(2), Some(2)),
+            {"type":"tool_result","tool_use_id":"c","content":[image(None, None)]},
+            {"type":"tool_use","id":"c","name":"read","input":{"type":"args_ref","byte_size":9,
+                "sha256":"0".repeat(64),"name":"read"}}
+        ]});
+        let clean = without_refs(&message);
+        assert!(!holds_descriptor(&clean), "{clean}");
+        assert_eq!(clean["content"].as_array().unwrap().len(), 3);
+        assert_eq!(clean["content"][0], json!({"type":"text","text":"see"}));
+        assert_eq!(clean["content"][1]["content"], json!([]));
+        assert_eq!(clean["content"][2]["input"], json!({}));
+        let plain = json!({"role":"user","content":"plain"});
+        assert_eq!(without_refs(&plain), plain);
     }
 
     /// A large text counts as its whole size, scaled from the carried head,

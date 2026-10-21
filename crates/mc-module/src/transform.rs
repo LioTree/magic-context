@@ -14901,10 +14901,11 @@ pub(crate) fn active_tags_for_nudge(
             out.push(ActiveTagForNudge {
                 tag_number: row.tag_number,
                 kind: row.kind.clone(),
+                // A large text the runner described counts as its whole size.
                 token_count: block
                     .runner_accounting_text
                     .as_deref()
-                    .map(|text| mc_tokenizer::estimate_tokens(text) as i64)
+                    .map(|text| crate::descriptors::text_tokens(text) as i64)
                     .unwrap_or(row.token_count.max(0)),
                 tool_name: match &block.wire_shape().kind {
                     ck_wire::CkKind::ToolResult { tool_name, .. } => tool_name.clone(),

@@ -2487,12 +2487,9 @@ fn ranges(
                 .and_then(|n| state.entries.get(&n))
         };
         let Some(original) = original else {
-            if crate::descriptors::holds_stand_in(message) {
-                return Err(transient(
-                    "async view would replace history with a payload descriptor",
-                ));
-            }
-            synthetic.push(message.clone());
+            // Messages ck-mc authors (a head, a fold of covered messages) are
+            // sent as written, so a ref inside one never reaches the model.
+            synthetic.push(crate::descriptors::without_refs(message));
             continue;
         };
         let original = original.read()?;
