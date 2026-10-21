@@ -114,7 +114,8 @@ export const OMITTED_BY_DESIGN: Readonly<Record<string, string>> = {
   "historian.disable": "advanced agent registration control; raw JSONC",
   "historian.expand_tools": "custom tool expansion templates; raw JSONC",
   "historian.host_runner": "advanced host runner ownership; raw JSONC",
-  "historian.broca": "ck-mc's Broca-specific model chain; raw JSONC because the dashboard's model catalogs cover OpenCode, Pi, and OMP",
+  "historian.broca":
+    "ck-mc's Broca-specific model chain; raw JSONC because the dashboard's model catalogs cover OpenCode, Pi, and OMP",
   "historian.two_pass": "advanced historian editor pass; raw JSONC",
   "historian.disallowed_tools": "legacy compatibility option; raw JSONC",
   ...Object.fromEntries(
