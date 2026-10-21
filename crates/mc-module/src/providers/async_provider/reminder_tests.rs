@@ -11,6 +11,24 @@ struct CaptureRunner {
 
 #[async_trait]
 impl session_resolver::ProviderRunner for CaptureRunner {
+    async fn call_for_identity(
+        &self,
+        _: &crate::route_targets::SessionRunnerRoute,
+        identity: &session_resolver::RunnerBindIdentity,
+        method: &str,
+        params: Value,
+        budget: Duration,
+    ) -> Result<Value, SessionResolveError> {
+        self.call(
+            &identity.project_root,
+            &identity.session,
+            method,
+            params,
+            budget,
+        )
+        .await
+    }
+
     async fn call(
         &self,
         _: &Path,

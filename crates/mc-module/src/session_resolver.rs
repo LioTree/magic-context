@@ -18,9 +18,19 @@ use subc_protocol::{BindIdentity, RouteTarget};
 use crate::route_targets::{RegisteredRoute, RouteTargetConfig};
 const SESSION_RESOLVE_DEADLINE: Duration = Duration::from_secs(2);
 
-/// Broca binds provider and tool routes as a runner, not as the caller's harness.
-/// The caller's harness travels separately in compaction and hook request bodies.
+/// Tool-provider and process-configured runner routes use the fixed `runner` harness.
+/// Conversation routes for compaction use the route project root and the harness and
+/// session reported in Setup.
 pub const RUNNER_BIND_HARNESS: &str = "runner";
+
+/// The bind identity for a conversation consists of the canonical project root from
+/// the route that accepted Setup and the harness and session in Setup's body.
+#[derive(Clone, Debug, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+pub struct RunnerBindIdentity {
+    pub project_root: PathBuf,
+    pub harness: String,
+    pub session: String,
+}
 
 /// The role versions every route this module opens to a runner declares:
 /// it speaks `llm-runner/v1` there. The declaration is part of the route's
@@ -47,6 +57,14 @@ pub trait ProviderRunner: Send + Sync {
         self.call(project_root, route.parent_session(), method, params, budget)
             .await
     }
+    async fn call_for_identity(
+        &self,
+        route: &crate::route_targets::SessionRunnerRoute,
+        identity: &RunnerBindIdentity,
+        method: &str,
+        params: Value,
+        budget: Duration,
+    ) -> Result<Value, SessionResolveError>;
     async fn call(
         &self,
         project_root: &Path,
@@ -83,13 +101,33 @@ impl ProviderRunner for RealProviderRunner {
     ) -> Result<Value, SessionResolveError> {
         self.call_target(
             route.target(),
-            project_root,
-            route.parent_session(),
+            &RunnerBindIdentity {
+                project_root: project_root.to_path_buf(),
+                harness: RUNNER_BIND_HARNESS.into(),
+                session: route.parent_session().into(),
+            },
             method,
             params,
             budget,
         )
         .await
+    }
+
+    async fn call_for_identity(
+        &self,
+        route: &crate::route_targets::SessionRunnerRoute,
+        identity: &RunnerBindIdentity,
+        method: &str,
+        params: Value,
+        budget: Duration,
+    ) -> Result<Value, SessionResolveError> {
+        if identity.session != route.parent_session() {
+            return Err(SessionResolveError::InvalidResponse(
+                "session runner route identity mismatch".into(),
+            ));
+        }
+        self.call_target(route.target(), identity, method, params, budget)
+            .await
     }
     async fn call(
         &self,
@@ -103,8 +141,18 @@ impl ProviderRunner for RealProviderRunner {
             .route_targets
             .target(RegisteredRoute::ProviderRunner)
             .expect("provider runner has a registered target");
-        self.call_target(target, project_root, session, method, params, budget)
-            .await
+        self.call_target(
+            target,
+            &RunnerBindIdentity {
+                project_root: project_root.to_path_buf(),
+                harness: RUNNER_BIND_HARNESS.into(),
+                session: session.into(),
+            },
+            method,
+            params,
+            budget,
+        )
+        .await
     }
 }
 
@@ -112,13 +160,16 @@ impl RealProviderRunner {
     async fn call_target(
         &self,
         target: RouteTarget,
-        project_root: &Path,
-        session: &str,
+        identity: &RunnerBindIdentity,
         method: &str,
         params: Value,
         budget: Duration,
     ) -> Result<Value, SessionResolveError> {
-        let identity = BindIdentity::new(project_root.to_path_buf(), RUNNER_BIND_HARNESS, session);
+        let bind_identity = BindIdentity::new(
+            identity.project_root.clone(),
+            identity.harness.as_str(),
+            identity.session.as_str(),
+        );
         let work = async {
             let mut options = consumer_options();
             options.handshake_timeout = budget;
@@ -129,7 +180,7 @@ impl RealProviderRunner {
             let response = consumer
                 .call(
                     target.clone(),
-                    identity.clone(),
+                    bind_identity.clone(),
                     serde_json::to_vec(&json!({"method": method, "params": params}))
                         .map_err(|e| SessionResolveError::Transport(e.to_string()))?,
                     CallOptions {
@@ -143,7 +194,7 @@ impl RealProviderRunner {
             consumer
                 .close_route(
                     target,
-                    identity,
+                    bind_identity,
                     CloseRouteOptions {
                         role_versions: Some(llm_runner_role_versions()),
                         ..CloseRouteOptions::default()
@@ -165,6 +216,19 @@ pub struct MissingProviderRunner;
 
 #[async_trait]
 impl ProviderRunner for MissingProviderRunner {
+    async fn call_for_identity(
+        &self,
+        _: &crate::route_targets::SessionRunnerRoute,
+        _: &RunnerBindIdentity,
+        _: &str,
+        _: Value,
+        _: Duration,
+    ) -> Result<Value, SessionResolveError> {
+        Err(SessionResolveError::Transport(
+            "provider runner connection is unavailable".into(),
+        ))
+    }
+
     async fn call(
         &self,
         _: &Path,
@@ -426,11 +490,12 @@ mod tests {
         );
     }
 
-    /// What a fake daemon saw of one runner route.open request: its target,
-    /// bind session and declared role versions.
+    /// What a fake daemon saw of one runner route.open request.
     #[derive(Debug, Default)]
     struct SeenRoute {
         target: Option<RouteTarget>,
+        project_root: String,
+        harness: String,
         session: String,
         role_versions: Option<std::collections::BTreeMap<String, String>>,
     }
@@ -497,6 +562,8 @@ mod tests {
                             let mut log = log.lock().unwrap();
                             log.push(SeenRoute {
                                 target: Some(target),
+                                project_root: identity.project_root.to_string_lossy().into(),
+                                harness: identity.harness,
                                 session: identity.session,
                                 role_versions,
                             });
@@ -552,9 +619,13 @@ mod tests {
         )
         .unwrap();
         runner
-            .call_for(
+            .call_for_identity(
                 &route,
-                project,
+                &RunnerBindIdentity {
+                    project_root: project.to_path_buf(),
+                    harness: "claude-code".into(),
+                    session: "parent".into(),
+                },
                 "session.read",
                 json!({}),
                 Duration::from_secs(5),
@@ -563,6 +634,12 @@ mod tests {
             .unwrap();
         let seen = seen.lock().unwrap();
         assert_eq!(seen.len(), 2, "{seen:?}");
+        assert_eq!(seen[0].project_root, project.to_string_lossy());
+        assert_eq!(seen[0].harness, RUNNER_BIND_HARNESS);
+        assert_eq!(seen[0].session, "s");
+        assert_eq!(seen[1].project_root, project.to_string_lossy());
+        assert_eq!(seen[1].harness, "claude-code");
+        assert_eq!(seen[1].session, "parent");
         let expected = Some(std::collections::BTreeMap::from([(
             "llm-runner".to_string(),
             "v1".to_string(),

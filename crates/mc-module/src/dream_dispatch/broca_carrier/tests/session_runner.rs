@@ -56,12 +56,12 @@ fn harness_default(f: &Fixture, tools: &'static [&'static str]) -> ChildRequest 
     request
 }
 
-/// On a runner lane the child needs no configured Broca runner: it runs on the
-/// session's own runner, which receives the parent, the read-only allowlist as a
-/// plan (no inline tools), the step limit and the runner's retention, and no input
-/// cap the runner did not advertise.
+/// On a runner lane, each child gets its own session and keeps the read-only allowlist as a
+/// plan (no inline tools), the step limit, and the runner's retention. The request omits
+/// a parent field because llm-runner does not define one, and omits an input cap because
+/// the runner does not advertise one.
 #[tokio::test]
-async fn a_session_runner_child_names_its_parent_and_keeps_the_carrier_limits() {
+async fn a_session_runner_child_omits_parent_and_keeps_the_carrier_limits() {
     let f = Fixture::new(BASE);
     f.script(vec![answer("done")]);
     let request = harness_default(&f, &["ctx_search"]);
@@ -76,7 +76,7 @@ async fn a_session_runner_child_names_its_parent_and_keeps_the_carrier_limits() 
     assert_eq!(completion.unwrap().text, "done");
     let sent = f.sent();
     assert_eq!(sent.len(), 1);
-    assert_eq!(sent[0]["parent"], "parent");
+    assert!(sent[0].get("parent").is_none(), "{}", sent[0]);
     assert!(
         sent[0].get("tools").is_none(),
         "plan tools are frozen at admission"

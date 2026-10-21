@@ -7,8 +7,10 @@ async fn fixture(dir: &Path) -> (Rig, Arc<FakeSessionRunner>) {
     let factory = child.factory();
     let rig = Rig::configured(
         dir,
-        "thalamus-harness",
-        "opencode",
+        "broca",
+        "broca",
+        "s",
+        "broca",
         json!({"serializer_profile":"opencode-aisdk"}),
         move |handler| {
             handler.producer_factory = factory;
@@ -27,7 +29,7 @@ async fn fixture(dir: &Path) -> (Rig, Arc<FakeSessionRunner>) {
                 .set_route_identity_for_test(&dir.to_string_lossy(), "git:wrapup-fixture");
             handler.provider_historian_budget =
                 super::super::super::historian_budget::Budget::new(1, 128);
-            handler.fixed_historian_settings = Some(json!({"historian":{"opencode":{
+            handler.fixed_historian_settings = Some(json!({"historian":{"broca":{
                 "model":"fixture/main", "fallback_models":["fixture/backup"]
             }}}));
         },
@@ -53,8 +55,8 @@ impl Rig {
             .unwrap()
     }
 
-    /// Exercise the provider's real person-command invocation and late-result routes.
-    async fn user_wrapup_command(&self, key: &str, input: &str) -> Value {
+    /// Invoke a provider user command with an attested person binding.
+    async fn user_command(&self, key: &str, command: &str, input: &str) -> Value {
         let mut binding = self.h.facade_binding(7).unwrap();
         binding.scope = Some(
             subc_protocol::scope::ScopeStamp::new(
@@ -75,11 +77,15 @@ impl Rig {
                     json!({
                         "name":"user_command.invoke",
                         "call_key":key,
-                        "arguments":{"command":"ctx-wrapup","input":input}
+                        "arguments":{"command":command,"input":input}
                     }),
                 )
                 .await,
         )
+    }
+
+    async fn user_wrapup_command(&self, key: &str, input: &str) -> Value {
+        self.user_command(key, "ctx-wrapup", input).await
     }
 
     async fn user_wrapup_late_results(&self) -> Value {
@@ -107,6 +113,25 @@ impl Rig {
         })
         .await
         .expect("user wrapup command result arrived")
+    }
+
+    async fn user_command_terminal(&self, key: &str) -> Value {
+        tokio::time::timeout(Duration::from_secs(10), async {
+            loop {
+                let late = self.user_wrapup_late_results().await;
+                if late["entries"]
+                    .as_array()
+                    .unwrap()
+                    .iter()
+                    .any(|entry| entry["kind"] == "result" && entry["call_key"] == key)
+                {
+                    return late;
+                }
+                tokio::time::sleep(Duration::from_millis(2)).await;
+            }
+        })
+        .await
+        .expect("user command result arrived")
     }
 
     fn narrative(&self, count: u64) {
@@ -184,7 +209,7 @@ async fn async_wrapup_command_runs_child_and_defers_identical_bytes_until_permit
     let send = tokio::time::timeout(Duration::from_secs(10), child.next_unfinished())
         .await
         .expect("summarizer child started");
-    assert_eq!(send.route.module_id(), "thalamus-harness");
+    assert_eq!(send.route.module_id(), "broca");
     assert_eq!(send.route.parent_session(), "s");
     assert_eq!(send.model, "fixture/main");
     assert!(
@@ -283,6 +308,30 @@ async fn async_wrapup_command_runs_child_and_defers_identical_bytes_until_permit
         "m25"
     );
     assert_eq!(child.sends().len(), 1);
+
+    rig.queue(&[103]).await;
+    let flush = rig.user_command("flush-broca", "ctx-flush", "").await;
+    assert_eq!(flush["state"], "accepted");
+    let flush_late = rig.user_command_terminal("flush-broca").await;
+    let flush_entries = flush_late["entries"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .filter(|entry| entry["call_key"] == "flush-broca")
+        .collect::<Vec<_>>();
+    assert_eq!(
+        flush_entries
+            .iter()
+            .map(|entry| entry["kind"].as_str().unwrap())
+            .collect::<Vec<_>>(),
+        ["progress", "result"]
+    );
+    assert_eq!(flush_entries[1]["result"]["state"], "done");
+    assert!(flush_entries[1]["result"]["text"]
+        .as_str()
+        .unwrap()
+        .contains("Flushed queued drops"));
+    assert!(rig.pending_targets().is_empty());
 }
 
 #[tokio::test]

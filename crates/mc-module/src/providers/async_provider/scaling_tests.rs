@@ -409,16 +409,22 @@ struct PagedRunner {
 
 #[async_trait]
 impl session_resolver::ProviderRunner for PagedRunner {
-    async fn call_for(
+    async fn call_for_identity(
         &self,
         route: &crate::route_targets::SessionRunnerRoute,
-        project: &Path,
+        identity: &session_resolver::RunnerBindIdentity,
         method: &str,
         params: Value,
         budget: Duration,
     ) -> Result<Value, SessionResolveError> {
-        self.call(project, route.parent_session(), method, params, budget)
-            .await
+        self.call(
+            &identity.project_root,
+            route.parent_session(),
+            method,
+            params,
+            budget,
+        )
+        .await
     }
     async fn call(
         &self,

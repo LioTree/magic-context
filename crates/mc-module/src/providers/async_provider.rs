@@ -70,9 +70,33 @@ struct Bus<S> {
 struct RoutedRunner<'a> {
     runner: &'a dyn session_resolver::ProviderRunner,
     route: crate::route_targets::SessionRunnerRoute,
+    identity: session_resolver::RunnerBindIdentity,
 }
 #[async_trait]
 impl session_resolver::ProviderRunner for RoutedRunner<'_> {
+    async fn call_for_identity(
+        &self,
+        route: &crate::route_targets::SessionRunnerRoute,
+        identity: &session_resolver::RunnerBindIdentity,
+        method: &str,
+        params: Value,
+        budget: Duration,
+    ) -> Result<Value, SessionResolveError> {
+        if route != &self.route || identity != &self.identity {
+            return Err(SessionResolveError::InvalidResponse(
+                "session runner route identity mismatch".into(),
+            ));
+        }
+        self.call(
+            &identity.project_root,
+            &identity.session,
+            method,
+            params,
+            budget,
+        )
+        .await
+    }
+
     async fn call(
         &self,
         project: &Path,
@@ -81,13 +105,16 @@ impl session_resolver::ProviderRunner for RoutedRunner<'_> {
         params: Value,
         budget: Duration,
     ) -> Result<Value, SessionResolveError> {
-        if session != self.route.parent_session() {
+        if session != self.route.parent_session()
+            || session != self.identity.session
+            || project != self.identity.project_root.as_path()
+        {
             return Err(SessionResolveError::InvalidResponse(
                 "session runner route mismatch".into(),
             ));
         }
         self.runner
-            .call_for(&self.route, project, method, params, budget)
+            .call_for_identity(&self.route, &self.identity, method, params, budget)
             .await
     }
 }
@@ -193,6 +220,8 @@ pub(crate) struct AsyncRecord {
     #[serde(default)]
     reminder_baseline_generation: Option<u64>,
     key: Key,
+    #[serde(default)]
+    runner_identity: Option<session_resolver::RunnerBindIdentity>,
     runner_module: String,
     setup: compact::setup::SetupRequest,
     initial: Value,
@@ -491,6 +520,18 @@ fn verified_descent(state: &State, header: &str) -> Option<u64> {
 }
 
 impl State {
+    fn runner_identity(&self) -> session_resolver::RunnerBindIdentity {
+        self.runner_identity.clone().unwrap_or_else(|| {
+            // For older records without a stored identity, rebuild it from the
+            // project key and the harness and session retained in Setup.
+            session_resolver::RunnerBindIdentity {
+                project_root: self.key.project.clone(),
+                harness: self.setup.harness.clone(),
+                session: self.setup.session.clone(),
+            }
+        })
+    }
+
     fn runner(&self) -> Result<crate::route_targets::SessionRunnerRoute, HandlerOutcome> {
         crate::route_targets::SessionRunnerRoute::for_principal(
             Some(&subc_protocol::Principal::Reserved {
@@ -1335,6 +1376,26 @@ impl McHandler {
         params: &Value,
     ) -> Result<Vec<u8>, HandlerOutcome> {
         let request: compact::setup::SetupRequest = decode(params)?;
+        let bound_session = binding.session.as_str();
+        let setup_session = request.session.trim();
+        if !bound_session.is_empty() && bound_session != setup_session {
+            return Err(HandlerOutcome::ErrorWithDetail {
+                code: "setup_identity_mismatch".into(),
+                message: "Setup session does not match the bound route session".into(),
+                detail: json!({
+                    "route_identity": {
+                        "project_root": binding.project_root,
+                        "harness": binding.harness,
+                        "session": binding.session,
+                    },
+                    "setup_identity": {
+                        "project_root": binding.project_root,
+                        "harness": request.harness,
+                        "session": request.session,
+                    },
+                }),
+            });
+        }
         let mut key = Key::new(binding, &request.session, &request.harness)?;
         key.session.clone_from(&request.session);
         let _serial = self.provider_serial.lock_for(&key).await;
@@ -1411,6 +1472,11 @@ impl McHandler {
             retired_frozen: Default::default(),
             reminder_baseline_generation: None,
             key,
+            runner_identity: Some(session_resolver::RunnerBindIdentity {
+                project_root: binding.project_root.clone(),
+                harness: request.harness.clone(),
+                session: request.session.trim().into(),
+            }),
             runner_module: match &binding.principal {
                 Some(subc_protocol::Principal::Reserved { module_id }) => module_id.clone(),
                 _ => {
@@ -2790,9 +2856,9 @@ impl McHandler {
             }
             let page = self
                 .provider_runner
-                .call_for(
+                .call_for_identity(
                     &state.runner()?,
-                    &state.key.project,
+                    &state.runner_identity(),
                     "session.read",
                     params,
                     deadline.saturating_duration_since(Instant::now()),
@@ -2998,9 +3064,11 @@ impl McHandler {
             gap_ms,
             ready_search_hint: None,
         };
+        let runner_identity = held.runner_identity();
         let runner = RoutedRunner {
             runner: self.provider_runner.as_ref(),
             route: held.runner()?,
+            identity: runner_identity.clone(),
         };
         #[cfg(test)]
         let meter = scaling_tests::save_meter::start_kind(&notice.session_ref, "rem:send");
@@ -3008,8 +3076,8 @@ impl McHandler {
         let outcome = if oracle {
             crate::runner_reminders::send_due_reminders_oracle(
                 &runner,
-                &held.key.project,
-                &held.key.session,
+                &runner_identity.project_root,
+                &runner_identity.session,
                 &mut cadence,
                 &conditions,
             )
@@ -3017,8 +3085,8 @@ impl McHandler {
         } else {
             crate::runner_reminders::send_due_reminders(
                 &runner,
-                &held.key.project,
-                &held.key.session,
+                &runner_identity.project_root,
+                &runner_identity.session,
                 &mut cadence,
                 &conditions,
             )
@@ -3027,8 +3095,8 @@ impl McHandler {
         #[cfg(not(test))]
         let outcome = crate::runner_reminders::send_due_reminders(
             &runner,
-            &held.key.project,
-            &held.key.session,
+            &runner_identity.project_root,
+            &runner_identity.session,
             &mut cadence,
             &conditions,
         )
@@ -3113,16 +3181,17 @@ impl McHandler {
     }
 
     fn async_binding(&self, state: &State) -> SessionBinding {
+        let identity = state.runner_identity();
         SessionBinding {
             principal: Some(subc_protocol::Principal::Reserved {
                 module_id: state.runner_module.clone(),
             }),
             scope: None,
-            project_root: state.key.project.clone(),
-            harness: session_resolver::RUNNER_BIND_HARNESS.into(),
-            session: state.key.session.clone(),
+            project_root: identity.project_root.clone(),
+            harness: identity.harness,
+            session: identity.session,
             model_key: None,
-            config: self.effective_config(&state.key.project).clone(),
+            config: self.effective_config(&identity.project_root).clone(),
             history_budget_tokens: 4_000.0,
         }
     }

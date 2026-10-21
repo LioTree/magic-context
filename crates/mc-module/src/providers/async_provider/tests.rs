@@ -17,6 +17,8 @@ struct Runner {
     read_unavailable: std::sync::atomic::AtomicBool,
     read_gate: Mutex<Option<Arc<ReadGate>>>,
     reads: Mutex<Vec<Value>>,
+    bind_identities: Mutex<Vec<session_resolver::RunnerBindIdentity>>,
+    expected_bind_identity: Mutex<Option<session_resolver::RunnerBindIdentity>>,
 }
 
 #[derive(Default)]
@@ -35,14 +37,49 @@ impl session_resolver::ProviderRunner for Runner {
         params: Value,
         budget: Duration,
     ) -> Result<Value, SessionResolveError> {
+        if method == "session.read" {
+            return Err(SessionResolveError::InvalidResponse(
+                "session.read requires the full bind identity".into(),
+            ));
+        }
+        self.call(project, route.parent_session(), method, params, budget)
+            .await
+    }
+
+    async fn call_for_identity(
+        &self,
+        route: &crate::route_targets::SessionRunnerRoute,
+        identity: &session_resolver::RunnerBindIdentity,
+        method: &str,
+        params: Value,
+        budget: Duration,
+    ) -> Result<Value, SessionResolveError> {
         assert_eq!(route.module_id(), self.module);
-        assert_eq!(route.parent_session(), "s");
+        assert_eq!(route.parent_session(), identity.session);
+        self.bind_identities.lock().unwrap().push(identity.clone());
+        if self
+            .expected_bind_identity
+            .lock()
+            .unwrap()
+            .as_ref()
+            .is_some_and(|expected| expected != identity)
+        {
+            return Err(SessionResolveError::InvalidResponse(
+                "runner bind identity mismatch".into(),
+            ));
+        }
         if method == "session.read" {
             self.routed_reads
                 .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
         }
-        self.call(project, route.parent_session(), method, params, budget)
-            .await
+        self.call(
+            &identity.project_root,
+            route.parent_session(),
+            method,
+            params,
+            budget,
+        )
+        .await
     }
     async fn call(
         &self,
@@ -166,17 +203,29 @@ impl Rig {
     /// A rig whose route is admitted under runner module `module` and whose
     /// conversation is set up for `harness` with plan `params`.
     async fn open(dir: &Path, module: &str, harness: &str, params: Value) -> Self {
-        Self::configured(dir, module, harness, params, |_| {}).await
+        Self::open_bound(dir, module, "runner", "s", harness, params).await
     }
 
     async fn configured(
         dir: &Path,
         module: &str,
+        bind_harness: &str,
+        bind_session: &str,
         harness: &str,
         params: Value,
         configure: impl FnOnce(&mut McHandler),
     ) -> Self {
-        Self::setup_with_model(dir, module, harness, "fixture", params, configure).await
+        Self::setup_with_model(
+            dir,
+            module,
+            bind_harness,
+            bind_session,
+            harness,
+            "fixture",
+            params,
+            configure,
+        )
+        .await
     }
 
     async fn open_with_model(
@@ -187,12 +236,37 @@ impl Rig {
         params: Value,
         configure: impl FnOnce(&mut McHandler),
     ) -> Self {
-        Self::setup_with_model(dir, module, harness, model, params, configure).await
+        Self::setup_with_model(
+            dir, module, "runner", "s", harness, model, params, configure,
+        )
+        .await
+    }
+
+    async fn open_bound(
+        dir: &Path,
+        module: &str,
+        bind_harness: &str,
+        bind_session: &str,
+        harness: &str,
+        params: Value,
+    ) -> Self {
+        Self::configured(
+            dir,
+            module,
+            bind_harness,
+            bind_session,
+            harness,
+            params,
+            |_| {},
+        )
+        .await
     }
 
     async fn setup_with_model(
         dir: &Path,
         module: &str,
+        bind_harness: &str,
+        bind_session: &str,
         harness: &str,
         model: &str,
         params: Value,
@@ -234,8 +308,8 @@ impl Rig {
                 }),
                 scope: None,
                 project_root: dir.into(),
-                harness: "runner".into(),
-                session: "s".into(),
+                harness: bind_harness.into(),
+                session: bind_session.into(),
                 model_key: None,
                 config,
                 history_budget_tokens: 4_000.0,
@@ -251,7 +325,7 @@ impl Rig {
             .start_compaction_bus(bus.clone(), "fixture".into())
             .await
             .unwrap();
-        let reference = session_ref(harness, &dir.to_string_lossy(), "s");
+        let reference = session_ref(harness, &dir.to_string_lossy(), bind_session);
         let rig = Self {
             h,
             resolver,
@@ -261,7 +335,7 @@ impl Rig {
             reference,
             module: module.into(),
         };
-        let answer=rig.op("compaction.setup",json!({"session":"s","harness":harness,"request_id":"setup","model":model,"context_window":100_000,"composition":{"render_tags":true},"params":params,"lineage_id":"L","now":1})).await;
+        let answer=rig.op("compaction.setup",json!({"session":bind_session,"harness":harness,"request_id":"setup","model":model,"context_window":100_000,"composition":{"render_tags":true},"params":params,"lineage_id":"L","now":1})).await;
         assert_eq!(answer["answer"], "ready", "{answer}");
         assert_eq!(answer["ceiling"]["at_share"], 0.95);
         rig
@@ -799,6 +873,51 @@ async fn versions_survive_provider_restart() {
 }
 
 #[tokio::test]
+async fn restored_conversations_keep_the_setup_identity_and_use_it_for_reads() {
+    let dir = tempfile::tempdir().unwrap();
+    let mut first = Rig::open_bound(
+        dir.path(),
+        "broca",
+        "broca",
+        "s",
+        "broca",
+        json!({"serializer_profile":"opencode-aisdk"}),
+    )
+    .await;
+    let expected = session_resolver::RunnerBindIdentity {
+        project_root: dir.path().to_path_buf(),
+        harness: "broca".into(),
+        session: "s".into(),
+    };
+    first.task.abort();
+    let _ = (&mut first.task).await;
+    drop(first);
+
+    let restored = Rig::open_bound(
+        dir.path(),
+        "broca",
+        "broca",
+        "s",
+        "broca",
+        json!({"serializer_profile":"opencode-aisdk"}),
+    )
+    .await;
+    assert_eq!(restored.state().runner_identity(), expected);
+    let mut old_record = restored.state();
+    old_record.runner_identity = None;
+    assert_eq!(old_record.runner_identity(), expected);
+    *restored.runner.expected_bind_identity.lock().unwrap() = Some(expected.clone());
+    restored.fill(10);
+    restored.notice(1, 1_000, None).await;
+    assert!(restored
+        .runner
+        .bind_identities
+        .lock()
+        .unwrap()
+        .contains(&expected));
+}
+
+#[tokio::test]
 async fn fork_descent_requires_recorded_digest() {
     let dir = tempfile::tempdir().unwrap();
     let rig = Rig::new(dir.path()).await;
@@ -1225,6 +1344,167 @@ async fn reads_use_the_admitted_runner_not_the_process_default() {
         "background-disabled conversations must not start a dream schedule"
     );
     assert_eq!(state.dream_target.unwrap()["route"]["parent_session"], "s");
+}
+
+#[tokio::test]
+async fn reverse_reads_use_the_setup_identity_for_all_runner_route_shapes() {
+    for (module, bind_harness, bind_session, setup_harness, profile) in [
+        ("broca", "runner", "", "opencode", "opencode-aisdk"),
+        (
+            "thalamus",
+            "runner",
+            "s",
+            "claude-code",
+            "anthropic-messages",
+        ),
+        ("broca", "broca", "s", "broca", "opencode-aisdk"),
+        ("broca", "runner", "s", "broca", "opencode-aisdk"),
+    ] {
+        let dir = tempfile::tempdir().unwrap();
+        let rig = Rig::open_bound(
+            dir.path(),
+            module,
+            bind_harness,
+            bind_session,
+            setup_harness,
+            json!({"serializer_profile":profile}),
+        )
+        .await;
+        let expected = session_resolver::RunnerBindIdentity {
+            project_root: dir.path().to_path_buf(),
+            harness: setup_harness.into(),
+            session: "s".into(),
+        };
+        *rig.runner.expected_bind_identity.lock().unwrap() = Some(expected.clone());
+        if setup_harness == "claude-code" {
+            *rig.runner.entries.lock().unwrap() = anthropic_transcript(12);
+        } else {
+            rig.fill(10);
+        }
+        rig.notice(1, 1_000, None).await;
+        let identities = rig.runner.bind_identities.lock().unwrap().clone();
+        assert!(
+            identities.iter().any(|identity| identity == &expected),
+            "reverse read did not bind the Setup identity for {bind_harness:?}/{bind_session:?} -> {setup_harness:?}: {identities:?}"
+        );
+        let state = rig.state();
+        assert_eq!(state.runner_identity(), expected);
+        let reverse_binding = rig.h.async_binding(&state);
+        assert_eq!(reverse_binding.project_root, expected.project_root);
+        assert_eq!(reverse_binding.harness, expected.harness);
+        assert_eq!(reverse_binding.session, expected.session);
+        assert_eq!(
+            state.dream_target.as_ref().unwrap()["directory"],
+            expected.project_root.to_string_lossy().as_ref()
+        );
+        assert_eq!(
+            state.dream_target.as_ref().unwrap()["harness"],
+            expected.harness
+        );
+    }
+}
+
+#[tokio::test]
+async fn broca_bound_async_lane_reads_and_publishes_with_the_setup_identity() {
+    let dir = tempfile::tempdir().unwrap();
+    let rig = Rig::open_bound(
+        dir.path(),
+        "broca",
+        "broca",
+        "s",
+        "broca",
+        json!({"serializer_profile":"opencode-aisdk"}),
+    )
+    .await;
+    let expected = session_resolver::RunnerBindIdentity {
+        project_root: dir.path().to_path_buf(),
+        harness: "broca".into(),
+        session: "s".into(),
+    };
+    *rig.runner.expected_bind_identity.lock().unwrap() = Some(expected.clone());
+    rig.fill(40);
+    rig.notice(1, 1_000, None).await;
+    assert_eq!(rig.state().entries.len(), 40);
+
+    rig.history(20, "initial historian summary");
+    rig.notice(2, 1_000, None).await;
+    let baseline = rig.newest().expect("initial history publication");
+    rig.queue(&[163, 166, 169]).await;
+    rig.notice(3, 90_000, Some(baseline)).await;
+    let published = rig.newest().expect("async view publication");
+    assert!(published > baseline);
+    assert_eq!(rig.get(published).await.lineage_id, "L");
+    assert!(rig
+        .runner
+        .bind_identities
+        .lock()
+        .unwrap()
+        .iter()
+        .all(|identity| identity == &expected));
+}
+
+#[tokio::test]
+async fn setup_accepts_allowed_runner_principals_and_rejects_other_principals() {
+    let dir = tempfile::tempdir().unwrap();
+    let rig = Rig::open_bound(
+        dir.path(),
+        "broca",
+        "broca",
+        "s",
+        "broca",
+        json!({"serializer_profile":"opencode-aisdk"}),
+    )
+    .await;
+    let mut binding = rig.h.facade_binding(7).unwrap();
+    binding.principal = Some(subc_protocol::Principal::Reserved {
+        module_id: "unlisted-runner".into(),
+    });
+    rig.h.bind_route(8, binding);
+    let refused = rig
+        .h
+        .dispatch_value(
+            8,
+            json!({"method":"compaction.setup","params":setup_request("s", "unlisted")}),
+        )
+        .await;
+    assert!(matches!(
+        refused,
+        HandlerOutcome::Error { ref code, .. } if code == "route_unbound"
+    ));
+}
+
+#[tokio::test]
+async fn setup_refuses_a_nonempty_route_session_that_contradicts_the_body() {
+    let dir = tempfile::tempdir().unwrap();
+    let rig = Rig::open(
+        dir.path(),
+        "broca",
+        "broca",
+        json!({"serializer_profile":"opencode-aisdk"}),
+    )
+    .await;
+    let mut binding = rig.h.facade_binding(7).unwrap();
+    binding.principal = Some(subc_protocol::Principal::Reserved {
+        module_id: "broca".into(),
+    });
+    binding.harness = "any-caller-harness".into();
+    binding.session = "other-session".into();
+    rig.h.bind_route(8, binding);
+    let refused = rig
+        .h
+        .dispatch_value(
+            8,
+            json!({"method":"compaction.setup","params":setup_request("s", "mismatch")}),
+        )
+        .await;
+    match refused {
+        HandlerOutcome::ErrorWithDetail { code, detail, .. } => {
+            assert_eq!(code, "setup_identity_mismatch");
+            assert_eq!(detail["route_identity"]["session"], "other-session");
+            assert_eq!(detail["setup_identity"]["session"], "s");
+        }
+        other => panic!("mismatched route session was not refused by name: {other:?}"),
+    }
 }
 
 #[tokio::test]
@@ -1758,6 +2038,20 @@ impl Rig {
         binding.principal = None;
         self.h.bind_route(channel, binding);
     }
+    fn bind_provider(&self, channel: u16, module: &str, harness: &str, session: &str) {
+        let mut binding = self.h.facade_binding(7).unwrap();
+        binding.principal = Some(subc_protocol::Principal::Reserved {
+            module_id: module.into(),
+        });
+        binding.harness = harness.into();
+        binding.session = session.into();
+        self.h.bind_route(channel, binding);
+    }
+    fn bind_shared_setup_route(&self) {
+        let mut binding = self.h.facade_binding(7).unwrap();
+        binding.session.clear();
+        self.h.bind_route(7, binding);
+    }
     async fn tool(&self, channel: u16, name: &str, arguments: Value) -> Value {
         outcome(
             self.h
@@ -1893,7 +2187,7 @@ async fn setup_echoes_the_accepted_serializer_profile_and_refuses_an_unknown_one
         json!({"serializer_profile":"anthropic-messages"}),
     )
     .await;
-    rig.bind(8, "runner", "other");
+    rig.bind_provider(8, "thalamus", "runner", "other");
     let refused = rig
         .h
         .dispatch_value(
@@ -1954,6 +2248,7 @@ fn finish_bus_attach(handler: &McHandler, publisher: Arc<dyn Publisher>) {
 async fn setup_waits_for_initial_async_bus_attach() {
     let dir = tempfile::tempdir().unwrap();
     let rig = Rig::new(dir.path()).await;
+    rig.bind_shared_setup_route();
     let publisher = pause_bus_for_attach(&rig);
     let handler = rig.h.clone();
     let waiting = tokio::spawn(async move {
@@ -1987,6 +2282,7 @@ async fn setup_waits_for_initial_async_bus_attach() {
 async fn setup_that_outlives_attach_wait_refuses_bus_not_ready() {
     let dir = tempfile::tempdir().unwrap();
     let rig = Rig::new(dir.path()).await;
+    rig.bind_shared_setup_route();
     let _publisher = pause_bus_for_attach(&rig);
     let handler = rig.h.clone();
     let started = tokio::time::Instant::now();
@@ -2016,6 +2312,7 @@ async fn setup_that_outlives_attach_wait_refuses_bus_not_ready() {
 async fn setup_during_bus_backoff_refuses_without_waiting_for_another_retry() {
     let dir = tempfile::tempdir().unwrap();
     let rig = Rig::new(dir.path()).await;
+    rig.bind_shared_setup_route();
     let _publisher = pause_bus_for_attach(&rig);
     rig.h.provider_store.async_runtime.bus_link.set(
         super::super::async_bus::LinkState::CkbusUnreachable,
@@ -2039,6 +2336,7 @@ async fn setup_during_bus_backoff_refuses_without_waiting_for_another_retry() {
 async fn concurrent_setup_for_another_conversation_completes_with_attach() {
     let dir = tempfile::tempdir().unwrap();
     let rig = Rig::new(dir.path()).await;
+    rig.bind_shared_setup_route();
     let publisher = pause_bus_for_attach(&rig);
     let first_handler = rig.h.clone();
     let second_handler = rig.h.clone();

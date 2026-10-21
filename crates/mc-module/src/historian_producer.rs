@@ -75,11 +75,6 @@ struct SendParams<'a> {
     generation: GenerationRequest,
     #[serde(skip_serializing_if = "str::is_empty")]
     system: &'a str,
-    /// Runner parameters for a send to a session's own runner
-    /// ([`SessionRunnerRoute`]). Absent on every other route, so sends to the
-    /// process-configured runner module keep their exact bytes.
-    #[serde(skip_serializing_if = "Option::is_none")]
-    parent: Option<&'a str>,
     #[serde(skip_serializing_if = "Option::is_none")]
     stop_when: Option<StopWhen>,
 }
@@ -101,11 +96,9 @@ pub(crate) struct SendRequest<'a> {
 }
 
 impl<'a> SendRequest<'a> {
-    /// Apply the historian's declared limits to either module transport. Only a
-    /// session-owned runner also receives the foreground parent identity.
+    /// Apply the runner's declared limits to this historian `session.send` request.
     pub(crate) fn for_session_runner(
         mut self,
-        route: Option<&'a SessionRunnerRoute>,
         limits: RunnerLimits,
     ) -> Result<Self, HistorianProducerError> {
         limits.require_historian()?;
@@ -121,9 +114,6 @@ impl<'a> SendRequest<'a> {
             if let Some(cap) = self.params.generation.max_output_tokens {
                 run = run.with_max_output_tokens(cap);
             }
-        }
-        if let Some(route) = route {
-            self.params.parent = Some(route.parent_session());
         }
         // Validate limits with the role builders, then copy their values into
         // SendParams to preserve the established wire-field order.
@@ -185,7 +175,6 @@ pub(crate) fn session_send_request<'a>(
                 temperature,
             },
             system,
-            parent: None,
             stop_when: None,
         },
     })
@@ -970,7 +959,7 @@ pub struct HistorianProducer {
     /// began without retention must not opt in on a later send.
     session_retention: Option<Option<u64>>,
     /// When set, every route opens to this session's own runner instead of the
-    /// configured runner module, and every send names the parent session.
+    /// configured runner module. The child session remains its own bind identity.
     session_runner: Option<SessionRunnerRoute>,
 }
 
@@ -1027,7 +1016,7 @@ impl HistorianProducer {
                 temperature,
                 None,
             )?
-            .for_session_runner(self.session_runner.as_ref(), self.route_limits)?,
+            .for_session_runner(self.route_limits)?,
         )?;
         match self.unary_json(route, &request).await {
             Ok(response) => match send_outcome(&response) {
@@ -1235,8 +1224,6 @@ impl HistorianProducer {
         // a distinct session id. Use that durable attempt identity as `send_id`, not a
         // connection nonce or frame correlation id: resending after a lost reply must
         // deduplicate, while a new attempt after a classified failure must start a new run.
-        // A local copy: the send body borrows it while the route is used mutably.
-        let session_runner = self.session_runner.clone();
         let body = session_send_request(
             session_id,
             system,
@@ -1247,7 +1234,7 @@ impl HistorianProducer {
             temperature,
             retention,
         )?
-        .for_session_runner(session_runner.as_ref(), self.route_limits)?;
+        .for_session_runner(self.route_limits)?;
         let response = self.unary_json(route, body).await?;
         match send_outcome(&response) {
             SendOutcome::Active(run_id) => Ok(RunHandle { run_id }),
@@ -2621,6 +2608,8 @@ pub(crate) mod tests {
 
     #[derive(Debug, Default)]
     struct ServerLog {
+        route_project_roots: Vec<String>,
+        route_harnesses: Vec<String>,
         route_sessions: Vec<String>,
         route_targets: Vec<subc_protocol::RouteTarget>,
         route_role_versions: Vec<Option<BTreeMap<String, String>>>,
@@ -2861,6 +2850,9 @@ pub(crate) mod tests {
                                 next_route += 1;
                                 route_sessions.insert(route, identity.session.clone());
                                 let mut log = log_task.lock().await;
+                                log.route_project_roots
+                                    .push(identity.project_root.to_string_lossy().into());
+                                log.route_harnesses.push(identity.harness);
                                 log.route_sessions.push(identity.session);
                                 log.route_targets.push(target);
                                 log.route_role_versions.push(role_versions);
@@ -3375,6 +3367,13 @@ pub(crate) mod tests {
     }
 
     async fn session_runner_client(server: &FakeServer) -> HistorianProducer {
+        session_runner_client_with_harness(server, "opencode").await
+    }
+
+    async fn session_runner_client_with_harness(
+        server: &FakeServer,
+        harness: &str,
+    ) -> HistorianProducer {
         HistorianProducer::connect_to_session_runner(
             HistorianProducerConfig {
                 request_timeout: Duration::from_secs(2),
@@ -3383,7 +3382,7 @@ pub(crate) mod tests {
                 ..HistorianProducerConfig::new(
                     server.connection_file.clone(),
                     std::env::current_dir().unwrap(),
-                    "opencode",
+                    harness,
                 )
             },
             SessionRunnerRoute::for_principal(
@@ -3398,12 +3397,12 @@ pub(crate) mod tests {
         .unwrap()
     }
 
-    /// A runner-lane historian reaches the conversation's own runner, not the
-    /// configured `broca` module, and every send names the parent session and the
-    /// one-step limit beside the empty tool list. Retention still follows the
-    /// runner's declared limits.
+    /// A runner-lane historian uses the conversation's runner rather than the configured
+    /// `broca` module. It creates the child with the harness value supplied in Setup and
+    /// omits `parent`, which the runner does not declare. The historian caps each child
+    /// run at one step; retention is applied within the limits declared by the runner.
     #[tokio::test]
-    async fn a_session_runner_send_reaches_the_sessions_runner_and_names_its_parent() {
+    async fn a_session_runner_child_uses_the_conversation_harness_without_parent_fields() {
         let server = fake_server_with_role_describe(
             json!({"state":"active","run_id":"run-1"}),
             Vec::new(),
@@ -3411,7 +3410,7 @@ pub(crate) mod tests {
             false,
         )
         .await;
-        let mut producer = session_runner_client(&server).await;
+        let mut producer = session_runner_client_with_harness(&server, "claude-code").await;
         producer
             .start("mc-hist-1", "system", "prompt", "provider/model")
             .await
@@ -3432,9 +3431,17 @@ pub(crate) mod tests {
             )]))],
             "a runner route declares it speaks llm-runner/v1"
         );
+        assert_eq!(
+            log.route_project_roots,
+            vec![std::env::current_dir()
+                .unwrap()
+                .to_string_lossy()
+                .into_owned()]
+        );
+        assert_eq!(log.route_harnesses, vec!["claude-code"]);
         assert_eq!(log.route_sessions, vec!["mc-hist-1".to_string()]);
         let send = &log.sends[0];
-        assert_eq!(send["parent"], "ses-parent");
+        assert!(send.get("parent").is_none(), "{send}");
         assert_eq!(send["tools"], json!([]));
         assert_eq!(send["stop_when"], json!({"max_steps": 1}));
         assert_eq!(send["retention"], 86_400);
@@ -3481,7 +3488,6 @@ pub(crate) mod tests {
                     "mask={mask}: {send}"
                 );
                 if mask == 7 {
-                    let route = producer.session_runner.as_ref();
                     let bytes = serde_json::to_string(
                         &session_send_request(
                             "child",
@@ -3494,17 +3500,17 @@ pub(crate) mod tests {
                             None,
                         )
                         .unwrap()
-                        .for_session_runner(route, limits)
+                        .for_session_runner(limits)
                         .unwrap(),
                     )
                     .unwrap();
                     assert_eq!(
                         bytes,
-                        r#"{"method":"session.send","params":{"prompt":"prompt","send_id":"child","model":{"provider":"provider","model":"model"},"tools":[],"generation":{"max_output_tokens":32000},"system":"system","parent":"ses-parent","stop_when":{"max_steps":1}}}"#
+                        r#"{"method":"session.send","params":{"prompt":"prompt","send_id":"child","model":{"provider":"provider","model":"model"},"tools":[],"generation":{"max_output_tokens":32000},"system":"system","stop_when":{"max_steps":1}}}"#
                     );
                     assert_eq!(
                         send,
-                        &json!({"prompt":"prompt","send_id":"child","model":{"provider":"provider","model":"model"},"tools":[],"generation":{"max_output_tokens":32000},"system":"system","parent":"ses-parent","stop_when":{"max_steps":1}})
+                        &json!({"prompt":"prompt","send_id":"child","model":{"provider":"provider","model":"model"},"tools":[],"generation":{"max_output_tokens":32000},"system":"system","stop_when":{"max_steps":1}})
                     );
                 }
             } else {
@@ -3541,8 +3547,8 @@ pub(crate) mod tests {
         assert!(server.log.lock().await.sends.is_empty());
     }
 
-    /// Configured runners omit the foreground parent but still enforce the
-    /// historian's one-step bound, just as session-owned runners do.
+    /// The configured `llm-runner` module route and the session-runner route both bind
+    /// each child to its own session, omit `parent`, and enforce a one-step limit.
     #[tokio::test]
     async fn a_configured_runner_send_has_no_parent_and_enforces_one_step() {
         let server = fake_server(json!({"state":"active","run_id":"run-1"}), Vec::new()).await;
@@ -4021,7 +4027,7 @@ pub(crate) mod tests {
     }
 
     #[tokio::test]
-    async fn broca_required_groups_omit_output_cap_on_both_module_transports() {
+    async fn both_module_transports_omit_the_undeclared_parent_field() {
         for session_owned in [false, true] {
             let server = fake_server_with_role_describe(
                 json!({"run_id":"run-1"}),
@@ -4044,7 +4050,7 @@ pub(crate) mod tests {
             assert_eq!(request.max_steps().unwrap(), Some(1));
             assert_eq!(request.no_tools().unwrap(), Some(true));
             assert_eq!(request.max_output_tokens().unwrap(), None);
-            assert_eq!(log.sends[0].get("parent").is_some(), session_owned);
+            assert!(log.sends[0].get("parent").is_none());
         }
     }
 

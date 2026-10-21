@@ -52,8 +52,8 @@ pub const TARGET_TTL_MS: i64 = 60 * 60_000;
 /// The longest one task may run before the dispatcher aborts it.
 pub const TASK_TIMEOUT: Duration = Duration::from_secs(30 * 60);
 
-/// The route a project was last seen on: where its children work and which
-/// session a Broca child names as its parent.
+/// The route a project was last seen on: where its child sessions run and which
+/// conversation's runner the dispatcher should use.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct DreamTarget {
     pub directory: PathBuf,

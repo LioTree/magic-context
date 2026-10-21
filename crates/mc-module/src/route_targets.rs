@@ -123,13 +123,10 @@ pub const SESSION_RUNNER_MODULE_IDS: [&str; 3] = [
 ];
 
 /// Where a runner-lane conversation's background model calls go: the llm-runner
-/// management surface of the module that runs the conversation, with the
-/// conversation's own session named as the parent of each hidden child.
-///
-/// The parent cannot ride the route's `BindIdentity` (it has no attribute field; its
-/// session slot names the child), so every send on this route carries it as the
-/// runner parameter `parent`. The runner uses it to admit `reserved:magic-context`
-/// only for sessions whose compaction provider is Magic Context.
+/// management surface of the module that runs the conversation. Child routes bind their
+/// own generated sessions; the child routes' project root and harness come from the
+/// conversation's recorded identity. Child sends currently omit the parent session
+/// from the payload.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct SessionRunnerRoute {
     module_id: String,

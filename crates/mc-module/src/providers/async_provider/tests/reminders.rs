@@ -79,13 +79,23 @@ async fn send(rig: &Rig, text: &str, notice: &str) {
         gap_ms: None,
         ready_search_hint: Some(text),
     };
+    let identity = state.runner_identity();
     let route = RoutedRunner {
         runner: rig.h.provider_runner.as_ref(),
         route: state.runner().unwrap(),
+        identity: identity.clone(),
     };
-    let outcome =
-        send_due_reminders(&route, &state.key.project, "s", &mut cadence, &conditions).await;
+    let outcome = send_due_reminders(
+        &route,
+        &identity.project_root,
+        &identity.session,
+        &mut cadence,
+        &conditions,
+    )
+    .await;
     assert_eq!(outcome.issued.len(), 1, "{outcome:?}");
+    let last_bind = rig.runner.bind_identities.lock().unwrap().last().cloned();
+    assert_eq!(last_bind, Some(identity));
     state.reminder_cadence = Some(cadence);
     state.save(store, &[]).unwrap();
     rig.h.checkin(state);

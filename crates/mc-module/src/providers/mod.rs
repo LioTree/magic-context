@@ -144,8 +144,16 @@ impl McHandler {
             Ok(binding) => binding,
             Err(_) => return error("route_unbound", "compaction requires a bound runner route"),
         };
-        if binding.harness != session_resolver::RUNNER_BIND_HARNESS {
-            return error("route_unbound", "compaction requires a runner bind");
+        if !matches!(
+            binding.principal.as_ref(),
+            Some(subc_protocol::Principal::Reserved { module_id })
+                if crate::route_targets::SESSION_RUNNER_MODULE_IDS
+                    .contains(&module_id.as_str())
+        ) {
+            return error(
+                "route_unbound",
+                "compaction requires an attested session runner",
+            );
         }
         if let Some(session) = params.get("session").and_then(Value::as_str) {
             if let Some(refusal) = self.provider_store.catalog_refusal(&binding, session) {

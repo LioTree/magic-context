@@ -23,19 +23,23 @@ async fn send_hint(rig: &Rig, n: u64, hint: &str) {
         gap_ms: None,
         ready_search_hint: Some(hint),
     };
+    let identity = state.runner_identity();
     let route = RoutedRunner {
         runner: rig.h.provider_runner.as_ref(),
         route: state.runner().unwrap(),
+        identity: identity.clone(),
     };
     let outcome = crate::runner_reminders::send_due_reminders(
         &route,
-        &state.key.project,
-        "s",
+        &identity.project_root,
+        &identity.session,
         &mut cadence,
         &conditions,
     )
     .await;
     assert_eq!(outcome.issued.len(), 1, "{outcome:?}");
+    let last_bind = rig.runner.bind_identities.lock().unwrap().last().cloned();
+    assert_eq!(last_bind, Some(identity));
     state.reminder_cadence = Some(cadence);
     state.save(store, &[]).unwrap();
     rig.h.checkin(state);
