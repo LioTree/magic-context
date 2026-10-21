@@ -76,7 +76,10 @@ fn manifest_declares_subagent_invocations_read_as_a_management_query() {
         .collect();
     assert_eq!(operations.len(), 1, "{operations:?}");
     assert_eq!(operations[0].name, "subagent_invocations.read");
-    assert_eq!(operations[0].kind, ManagementOperationKind::Query);
+    assert_eq!(
+        operations[0].kind,
+        subc_protocol::manifest::ManagementOperationKind::Query
+    );
     // Other tests in this crate read the tool provider as `provides[0]`, so it stays first.
     assert!(matches!(manifest.provides[0], ProviderRole::ToolProvider { .. }));
 }

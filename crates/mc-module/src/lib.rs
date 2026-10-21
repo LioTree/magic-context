@@ -448,10 +448,7 @@ use session_resolver::{
 #[cfg(test)]
 use subc_protocol::manifest::ExecutionMode;
 use subc_protocol::{
-    manifest::{
-        Concurrency, ConsumerRole, IdentityScope, ManagementOperation, ManagementOperationKind,
-        ModuleManifest, ProviderRole, TrustTier,
-    },
+    manifest::{Concurrency, ConsumerRole, IdentityScope, ModuleManifest, ProviderRole, TrustTier},
     ModuleHelloAckBody, PROTOCOL_VERSION,
 };
 #[cfg(test)]
@@ -21628,23 +21625,7 @@ pub fn manifest_with_route_targets_and_smart_notes(
             emits_push: false,
             sub_supervises: false,
         },
-        // basal grants a flow only ops its module marks as query or mutate, and
-        // reaches management ops on this surface. The subagent failure sentinel
-        // flow reads its rows here.
-        ProviderRole::ManagementSurface {
-            operations: vec![ManagementOperation {
-                name: subagent_invocations_read::METHOD.to_string(),
-                kind: ManagementOperationKind::Query,
-                description: Some(
-                    "Read finished subagent invocations after a cursor or inside a time window, in bounded pages"
-                        .to_string(),
-                ),
-            }],
-            config_schema: json!({ "type": "object" }),
-            observability: Vec::new(),
-            identity_scope: Vec::new(),
-            concurrency: Concurrency::ModuleManaged,
-        },
+        subagent_invocations_read::management_role(),
     ];
     if agent_data::ENABLED {
         capabilities.push(cortexkit_role_agent_data::PROVIDES.to_string());

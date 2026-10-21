@@ -38,6 +38,29 @@ pub(crate) const ERROR_MAX_BYTES: usize = 32 * 1024;
 const FIELDS: &str =
     "id, session_id, subagent, task, started_at, ended_at, status, error, parent_invocation_id";
 
+/// The management surface that serves [`METHOD`]. basal grants a flow only ops
+/// its module marks as query or mutate, and reaches management ops on this
+/// surface; the subagent failure sentinel flow reads its rows here.
+pub(crate) fn management_role() -> subc_protocol::manifest::ProviderRole {
+    use subc_protocol::manifest::{
+        Concurrency, ManagementOperation, ManagementOperationKind, ProviderRole,
+    };
+    ProviderRole::ManagementSurface {
+        operations: vec![ManagementOperation {
+            name: METHOD.to_string(),
+            kind: ManagementOperationKind::Query,
+            description: Some(
+                "Read finished subagent invocations after a cursor or inside a time window, in bounded pages"
+                    .to_string(),
+            ),
+        }],
+        config_schema: json!({ "type": "object" }),
+        observability: Vec::new(),
+        identity_scope: Vec::new(),
+        concurrency: Concurrency::ModuleManaged,
+    }
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) struct Cursor {
     pub ended_at: i64,

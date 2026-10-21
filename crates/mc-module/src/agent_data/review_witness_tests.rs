@@ -141,13 +141,18 @@ fn manifest_before_participant(
             .ok()
             .map(|p| p.with_launch_nonce_source(subc_client_rs::launch_nonce_source())),
     )
-    .provides(vec![ProviderRole::ToolProvider {
-        tools,
-        identity_scope: vec![IdentityScope::Project, IdentityScope::Session],
-        concurrency: Concurrency::ModuleManaged,
-        emits_push: false,
-        sub_supervises: false,
-    }])
+    .provides(vec![
+        ProviderRole::ToolProvider {
+            tools,
+            identity_scope: vec![IdentityScope::Project, IdentityScope::Session],
+            concurrency: Concurrency::ModuleManaged,
+            emits_push: false,
+            sub_supervises: false,
+        },
+        // Added after the participant and independent of it: the read-only
+        // management query basal flows call. The agent-data feature changes nothing here.
+        crate::subagent_invocations_read::management_role(),
+    ])
     .consumes(vec![ConsumerRole::ServiceClient { of: targets }])
     .build()
 }
