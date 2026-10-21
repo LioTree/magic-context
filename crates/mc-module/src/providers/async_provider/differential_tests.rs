@@ -10,6 +10,9 @@
 use super::*;
 use cortexkit_bus_inmemory::{InMemoryBus, InMemoryConfig};
 
+#[path = "stack24_cache_review.rs"]
+mod stack24_cache_review;
+
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum Profile {
     Broca,
@@ -259,6 +262,8 @@ fn timeless(mut value: Value) -> Value {
 struct Runner {
     transcript: Arc<Transcript>,
     sends: Mutex<Vec<String>>,
+    /// Unnormalised sends retain the clock fields needed to render runner echoes.
+    raw_sends: Mutex<Vec<Value>>,
 }
 
 #[async_trait]
@@ -283,6 +288,7 @@ impl session_resolver::ProviderRunner for Runner {
         _: Duration,
     ) -> Result<Value, SessionResolveError> {
         if method == "session.send" {
+            self.raw_sends.lock().unwrap().push(params.clone());
             self.sends
                 .lock()
                 .unwrap()
@@ -359,6 +365,7 @@ impl Side {
         let runner = Arc::new(Runner {
             transcript: Arc::clone(transcript),
             sends: Mutex::new(Vec::new()),
+            raw_sends: Mutex::new(Vec::new()),
         });
         let mut h = McHandler::new();
         h.store.set(store).ok().unwrap();
@@ -498,6 +505,8 @@ struct Pair {
     record_only: bool,
     mismatches: Vec<String>,
     immutable_views: std::cell::RefCell<BTreeMap<(bool, u64), String>>,
+    /// Served-edit and reminder-echo observations independent of oracle agreement.
+    review: std::cell::RefCell<stack24_cache_review::Review>,
     _project: tempfile::TempDir,
 }
 
@@ -552,6 +561,7 @@ impl Pair {
             record_only: false,
             mismatches: Vec::new(),
             immutable_views: Default::default(),
+            review: Default::default(),
             _project: project,
         };
         let mut setup = json!({"method":"compaction.setup","params":{"session":"s","harness":profile.harness(),"request_id":"setup","model":"fixture","context_window":100_000,"composition":{"render_tags":true},"params":{"serializer_profile":profile.wire()},"now":1}});
@@ -572,7 +582,12 @@ impl Pair {
     fn append_salted(&self, count: u64, salt: u64) {
         let mut entries = self.transcript.entries.lock().unwrap();
         let next = entries.last().map_or(0, |entry| entry.ordinal + 1);
-        entries.extend((next..next + count).map(|n| message(self.profile, n, salt)));
+        let mut review = self.review.borrow_mut();
+        entries.extend((next..next + count).map(|n| {
+            review
+                .message(self.profile, n, salt)
+                .unwrap_or_else(|| message(self.profile, n, salt))
+        }));
     }
 
     /// Run `op` on both sides, require identical answers and stores, and
@@ -581,6 +596,9 @@ impl Pair {
     where
         F: for<'a> Fn(&'a Side) -> Answer<'a>,
     {
+        if std::env::var_os("MC_REVIEW_TRACE").is_some() {
+            eprintln!("review trace: running {label} after {:?}", self.log.last());
+        }
         let resident = op(&self.resident).await;
         self.resident.settle().await;
         let oracle = op(&self.oracle).await;
@@ -608,6 +626,9 @@ impl Pair {
             self.log
         );
         self.compare(label);
+        self.review
+            .borrow_mut()
+            .collect_sends(&self.oracle.runner.raw_sends.lock().unwrap());
         resident
     }
 
@@ -669,6 +690,34 @@ impl Pair {
         );
         for ((version, left), (_, right)) in resident.iter().zip(&oracle) {
             let left_view: view::CompactionView = serde_json::from_str(left).unwrap();
+            if !self
+                .immutable_views
+                .borrow()
+                .contains_key(&(false, *version))
+            {
+                let head = load_head(self.resident.store(), &self.reference).unwrap();
+                let generation = head.as_ref().map_or(0, |head| head.generation);
+                let coverage = head.and_then(|head| {
+                    self.resident
+                        .store()
+                        .load_meta(&head.namespace())
+                        .ok()?
+                        .meta
+                        .coverage_ordinal
+                });
+                // Assemble before locking the transcript: assembly locks it too.
+                let model = String::from_utf8(self.model_bytes(&left_view)).unwrap();
+                self.review.borrow_mut().record_view(
+                    self.profile,
+                    *version,
+                    &left_view,
+                    &self.transcript.entries.lock().unwrap(),
+                    &self.log,
+                    coverage,
+                    generation,
+                    &model,
+                );
+            }
             let right_view: view::CompactionView = serde_json::from_str(right).unwrap();
             let left_model: Vec<Value> =
                 serde_json::from_slice(&self.model_bytes(&left_view)).unwrap();
@@ -900,6 +949,7 @@ impl Pair {
         .with_window(100_000);
         let versions = self.newest_versions();
         let mut events = Vec::new();
+        let mut acknowledged = None;
         if !versions.is_empty() && rng.chance(70) {
             let version = if rng.chance(70) {
                 *versions.last().unwrap()
@@ -907,6 +957,7 @@ impl Pair {
                 versions[rng.below(versions.len() as u64) as usize]
             };
             notice = notice.with_applied_view_version(version);
+            acknowledged = Some(version);
             match rng.below(8) {
                 0 => events.push(notice::Event::ViewCompanion {
                     view_version: version,
@@ -928,6 +979,17 @@ impl Pair {
                 view_version: *version,
                 reason: "structural".into(),
             });
+        }
+        // A version the same notice defers or refuses was not served.
+        if let Some(version) = acknowledged.filter(|version| {
+            !events.iter().any(|event| {
+                matches!(event, notice::Event::ViewDeferred { view_version, .. }
+                    | notice::Event::ViewRefused { view_version, .. } if view_version == version)
+            })
+        }) {
+            self.review
+                .borrow_mut()
+                .acknowledge(self.log.len(), version);
         }
         if !events.is_empty() {
             notice = notice.with_events(events);
@@ -972,6 +1034,13 @@ impl Pair {
                     drop.push("999999".into());
                 }
                 let request = json!({"name":"ctx_reduce","arguments":{"drop":drop.join(",")}});
+                if std::env::var_os("MC_REVIEW_TRACE").is_some() {
+                    eprintln!("review trace: ctx_reduce drop={}", drop.join(","));
+                }
+                self.review
+                    .borrow_mut()
+                    .requested
+                    .extend(drop.iter().filter_map(|tag| tag.parse::<u64>().ok()));
                 self.both("ctx_reduce", |side| {
                     Box::pin(side.dispatch(request.clone()))
                 })
@@ -1130,12 +1199,17 @@ async fn session(profile: Profile, seed: u64, steps: u64) -> usize {
 }
 
 async fn session_pair(profile: Profile, seed: u64, steps: u64) -> Pair {
+    session_pair_with(profile, seed, steps, false).await
+}
+
+async fn session_pair_with(profile: Profile, seed: u64, steps: u64, echoes: bool) -> Pair {
     let mut rng = Rng(seed.wrapping_mul(0x9E37_79B9_7F4A_7C15) | 1);
     let tiny_budget = rng.chance(10);
     // A runner with no lineage yet sends Setup without one.
     let setup_lineage = (!rng.chance(25)).then_some("L");
     let inject_docs = rng.chance(30);
     let mut pair = Pair::open(profile, tiny_budget, setup_lineage, inject_docs).await;
+    pair.review.borrow_mut().echoes = echoes;
     let mostly_covered = rng.chance(50);
     pair.append(if mostly_covered {
         192 + rng.below(40)
