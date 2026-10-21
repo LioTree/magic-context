@@ -3397,6 +3397,26 @@ pub(crate) mod tests {
         .unwrap()
     }
 
+    async fn session_runner_client_with_identity(
+        server: &FakeServer,
+        identity: &crate::session_resolver::RunnerBindIdentity,
+        route: SessionRunnerRoute,
+    ) -> HistorianProducer {
+        let config = HistorianProducerConfig {
+            request_timeout: Duration::from_secs(2),
+            await_timeout: Duration::from_secs(2),
+            route_targets: RouteTargetConfig::default(),
+            ..HistorianProducerConfig::new(
+                server.connection_file.clone(),
+                identity.project_root.clone(),
+                identity.harness.clone(),
+            )
+        };
+        HistorianProducer::connect_to_session_runner(config, route)
+            .await
+            .unwrap()
+    }
+
     /// A runner-lane historian uses the conversation's runner rather than the configured
     /// `broca` module. It creates the child with the harness value supplied in Setup and
     /// omits `parent`, which the runner does not declare. The historian caps each child
@@ -3446,6 +3466,68 @@ pub(crate) mod tests {
         assert_eq!(send["stop_when"], json!({"max_steps": 1}));
         assert_eq!(send["retention"], 86_400);
         assert!(send.get("budget").is_none(), "{send}");
+    }
+
+    #[tokio::test]
+    async fn published_route_identity_child_vector_uses_setup_root_harness_and_child_session() {
+        const VECTORS: &[u8] =
+            include_bytes!("../testdata/compaction-provider-v1/route-identity.json");
+        assert_eq!(
+            crate::sha256_hex(VECTORS),
+            "edbdc38f28373431f07b8e2e72c5f5c781d6b7fd48d6b2b6d8e20a8f5cea577a"
+        );
+        let vectors: Value = serde_json::from_slice(VECTORS).unwrap();
+        let case = vectors["identity_cases"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|case| case["child_session"].as_str().is_some())
+            .unwrap();
+        let setup = &case["setup"];
+        let child_bind = &case["expected"]["child_bind"];
+        let child_session = case["child_session"].as_str().unwrap();
+        let parent_session = setup["session"].as_str().unwrap();
+        let identity = crate::session_resolver::RunnerBindIdentity {
+            project_root: PathBuf::from(child_bind["project_root"].as_str().unwrap()),
+            harness: child_bind["harness"].as_str().unwrap().into(),
+            session: child_session.into(),
+        };
+        assert_eq!(identity.session, child_bind["session"]);
+        assert_ne!(identity.session, child_bind["forbidden_child_bind_session"]);
+        let route = SessionRunnerRoute::for_principal(
+            Some(&subc_protocol::Principal::Reserved {
+                module_id: "broca".into(),
+            }),
+            parent_session,
+        )
+        .unwrap();
+        assert_eq!(route.parent_session(), parent_session);
+        let server = fake_server_with_role_describe(
+            json!({"state":"active","run_id":"run-1"}),
+            Vec::new(),
+            json!({"capabilities":["retention","no_tools","max_steps","max_output_tokens"],"retention":{"max_seconds":2_592_000,"delete_within_ms":3_600_000}}),
+            false,
+        )
+        .await;
+        let mut producer = session_runner_client_with_identity(&server, &identity, route).await;
+        producer
+            .start(child_session, "system", "prompt", "provider/model")
+            .await
+            .unwrap();
+        let log = server.log.lock().await;
+        assert_eq!(
+            log.route_targets,
+            vec![subc_protocol::RouteTarget::ManagementSurface {
+                module_id: "broca".into()
+            }]
+        );
+        assert_eq!(
+            log.route_project_roots,
+            vec![identity.project_root.to_string_lossy().into_owned()]
+        );
+        assert_eq!(log.route_harnesses, vec![identity.harness.clone()]);
+        assert_eq!(log.route_sessions, vec![child_session.to_string()]);
+        assert!(log.sends[0].get("parent").is_none(), "{}", log.sends[0]);
     }
 
     #[tokio::test]

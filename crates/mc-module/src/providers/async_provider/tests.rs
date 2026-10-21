@@ -2,6 +2,7 @@ use super::*;
 use cortexkit_bus_inmemory::{InMemoryBus, InMemoryConfig};
 mod reminder_replay;
 mod reminders;
+mod route_identity_vectors;
 mod user_commands_tests;
 mod wrapup;
 
@@ -218,9 +219,8 @@ impl Rig {
         Self::setup_with_model(
             dir,
             module,
-            bind_harness,
-            bind_session,
-            harness,
+            (bind_harness, bind_session),
+            (harness, "s"),
             "fixture",
             params,
             configure,
@@ -237,7 +237,13 @@ impl Rig {
         configure: impl FnOnce(&mut McHandler),
     ) -> Self {
         Self::setup_with_model(
-            dir, module, "runner", "s", harness, model, params, configure,
+            dir,
+            module,
+            ("runner", "s"),
+            (harness, "s"),
+            model,
+            params,
+            configure,
         )
         .await
     }
@@ -265,13 +271,14 @@ impl Rig {
     async fn setup_with_model(
         dir: &Path,
         module: &str,
-        bind_harness: &str,
-        bind_session: &str,
-        harness: &str,
+        bind: (&str, &str),
+        setup: (&str, &str),
         model: &str,
         params: Value,
         configure: impl FnOnce(&mut McHandler),
     ) -> Self {
+        let (bind_harness, bind_session) = bind;
+        let (setup_harness, setup_session) = setup;
         let descriptor = StorageDescriptor {
             module_id: DEFAULT_MODULE_ID.into(),
             storage_namespace: "mc_cache".into(),
@@ -325,7 +332,7 @@ impl Rig {
             .start_compaction_bus(bus.clone(), "fixture".into())
             .await
             .unwrap();
-        let reference = session_ref(harness, &dir.to_string_lossy(), bind_session);
+        let reference = session_ref(setup_harness, &dir.to_string_lossy(), setup_session);
         let rig = Self {
             h,
             resolver,
@@ -335,7 +342,12 @@ impl Rig {
             reference,
             module: module.into(),
         };
-        let answer=rig.op("compaction.setup",json!({"session":bind_session,"harness":harness,"request_id":"setup","model":model,"context_window":100_000,"composition":{"render_tags":true},"params":params,"lineage_id":"L","now":1})).await;
+        let answer = rig
+            .op(
+                "compaction.setup",
+                json!({"session":setup_session,"harness":setup_harness,"request_id":"setup","model":model,"context_window":100_000,"composition":{"render_tags":true},"params":params,"lineage_id":"L","now":1}),
+            )
+            .await;
         assert_eq!(answer["answer"], "ready", "{answer}");
         assert_eq!(answer["ceiling"]["at_share"], 0.95);
         rig

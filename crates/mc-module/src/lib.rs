@@ -8129,7 +8129,8 @@ impl McHandler {
                 &binding.harness,
             ),
             host_runs: Arc::clone(&self.host_runs),
-            // Preserve the conversation's runner lane and bind it to the setup identity.
+            // Keep the conversation's runner route; use its Setup-derived project root,
+            // harness, and session when binding child routes.
             session_runner,
             runner_identity: runner_bind_identity(binding),
             model_chain_generation,

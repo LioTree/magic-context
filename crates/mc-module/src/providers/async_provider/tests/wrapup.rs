@@ -55,7 +55,7 @@ impl Rig {
             .unwrap()
     }
 
-    /// Invoke a provider user command with an attested person binding.
+    /// Invoke a provider user command with a binding marked owner-authorized for a person session.
     async fn user_command(&self, key: &str, command: &str, input: &str) -> Value {
         let mut binding = self.h.facade_binding(7).unwrap();
         binding.scope = Some(

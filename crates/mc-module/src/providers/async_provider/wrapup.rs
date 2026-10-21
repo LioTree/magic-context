@@ -57,7 +57,7 @@ impl McHandler {
         Ok(AsyncWrapupAdmission::Accepted)
     }
 
-    /// Run the user-command wrapup to completion, waiting for any publication wake before returning.
+    /// Run the user-command wrapup to completion, waiting for the publication notification before returning.
     pub(super) async fn execute_async_wrapup_command(
         &self,
         binding: &SessionBinding,

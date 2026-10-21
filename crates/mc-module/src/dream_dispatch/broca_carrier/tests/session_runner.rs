@@ -56,10 +56,10 @@ fn harness_default(f: &Fixture, tools: &'static [&'static str]) -> ChildRequest 
     request
 }
 
-/// On a runner lane, each child gets its own session and keeps the read-only allowlist as a
-/// plan (no inline tools), the step limit, and the runner's retention. The request omits
-/// a parent field because llm-runner does not define one, and omits an input cap because
-/// the runner does not advertise one.
+/// On a runner lane, each child uses its own session. The plan carries the
+/// read-only allowlist instead of inline tools; the request retains the step
+/// limit and runner retention. It omits a parent field because llm-runner has
+/// no parent field, and an input cap because the runner advertises none.
 #[tokio::test]
 async fn a_session_runner_child_omits_parent_and_keeps_the_carrier_limits() {
     let f = Fixture::new(BASE);
