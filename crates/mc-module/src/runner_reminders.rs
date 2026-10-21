@@ -415,6 +415,8 @@ impl PreparedSend {
     }
 }
 
+// Pass delivery inputs and both mutable results directly so each send's state changes are visible.
+#[allow(clippy::too_many_arguments)]
 async fn issue(
     runner: &dyn ProviderRunner,
     project: &Path,
