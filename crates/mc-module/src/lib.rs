@@ -368,6 +368,7 @@ pub mod single_store_reads;
 pub mod single_store_repair;
 mod stable_hash;
 mod state_sync_timing;
+mod subagent_invocations_read;
 mod tail_hygiene;
 mod tool_catalog;
 pub mod transform;
@@ -447,7 +448,10 @@ use session_resolver::{
 #[cfg(test)]
 use subc_protocol::manifest::ExecutionMode;
 use subc_protocol::{
-    manifest::{Concurrency, ConsumerRole, IdentityScope, ModuleManifest, ProviderRole, TrustTier},
+    manifest::{
+        Concurrency, ConsumerRole, IdentityScope, ManagementOperation, ManagementOperationKind,
+        ModuleManifest, ProviderRole, TrustTier,
+    },
     ModuleHelloAckBody, PROTOCOL_VERSION,
 };
 #[cfg(test)]
@@ -10029,6 +10033,30 @@ impl McHandler {
             .map(|route| route.key)
     }
 
+    /// `subagent_invocations.read {query, ...}`: the subagent failure sentinel
+    /// flow's read of `subagent_invocations`, served on the management surface.
+    /// The reply is the management envelope `{result: {rows, more}}`. See
+    /// [`subagent_invocations_read`] for the queries and their bounds.
+    fn handle_subagent_invocations_read(&self, request: &Value) -> HandlerOutcome {
+        let query =
+            match subagent_invocations_read::parse(request.get("params").unwrap_or(&Value::Null)) {
+                Ok(query) => query,
+                Err(message) => return invalid_params_error(message),
+            };
+        let store = match self.store.get() {
+            Some(store) => store,
+            None => return self.store_refusal(),
+        };
+        // The query-only context reader: the op never writes.
+        match store.with_context_read(|conn| subagent_invocations_read::run(conn, &query)) {
+            Ok(result) => respond(json!({ "result": result })),
+            Err(error) => HandlerOutcome::Error {
+                code: "store_load_failed".to_string(),
+                message: error.to_string(),
+            },
+        }
+    }
+
     /// `historian.pending {session_id?}` — runs waiting for a claimant.
     ///
     /// The plugin may omit `session_id` to discover every run in its own project.
@@ -16979,6 +17007,9 @@ impl McHandler {
                 "dream.ownership" => self.handle_dream_ownership(channel, &request),
                 "dream.run" => self.handle_dream_run(channel, &request),
                 "historian.pending" => self.handle_historian_pending_value(channel, &request),
+                subagent_invocations_read::METHOD => {
+                    self.handle_subagent_invocations_read(&request)
+                }
                 "historian.claim" => self.handle_historian_claim_value(channel, &request),
                 "historian.heartbeat" => self.handle_historian_heartbeat_value(channel, &request),
                 "historian.complete" => self.handle_historian_complete_value(channel, &request),
@@ -21589,13 +21620,32 @@ pub fn manifest_with_route_targets_and_smart_notes(
         cortexkit_role_compaction_provider::PROVIDES.to_string(),
         MCP_CONVERSATION_BINDING_V1.to_string(),
     ];
-    let mut provides = vec![ProviderRole::ToolProvider {
-        tools,
-        identity_scope: vec![IdentityScope::Project, IdentityScope::Session],
-        concurrency: Concurrency::ModuleManaged,
-        emits_push: false,
-        sub_supervises: false,
-    }];
+    let mut provides = vec![
+        ProviderRole::ToolProvider {
+            tools,
+            identity_scope: vec![IdentityScope::Project, IdentityScope::Session],
+            concurrency: Concurrency::ModuleManaged,
+            emits_push: false,
+            sub_supervises: false,
+        },
+        // basal grants a flow only ops its module marks as query or mutate, and
+        // reaches management ops on this surface. The subagent failure sentinel
+        // flow reads its rows here.
+        ProviderRole::ManagementSurface {
+            operations: vec![ManagementOperation {
+                name: subagent_invocations_read::METHOD.to_string(),
+                kind: ManagementOperationKind::Query,
+                description: Some(
+                    "Read finished subagent invocations after a cursor or inside a time window, in bounded pages"
+                        .to_string(),
+                ),
+            }],
+            config_schema: json!({ "type": "object" }),
+            observability: Vec::new(),
+            identity_scope: Vec::new(),
+            concurrency: Concurrency::ModuleManaged,
+        },
+    ];
     if agent_data::ENABLED {
         capabilities.push(cortexkit_role_agent_data::PROVIDES.to_string());
         provides.push(ProviderRole::InternalService {
@@ -21658,6 +21708,7 @@ pub fn manifest_with_route_targets_and_smart_notes(
 #[cfg(test)]
 mod tests {
     include!("tests/tool_attachment_memory_review.rs");
+    include!("tests/subagent_invocations_read.rs");
     use super::*;
     use std::collections::{HashMap, VecDeque};
     use std::sync::{
