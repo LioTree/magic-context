@@ -1,0 +1,10 @@
+{
+  "format": 1,
+  "id": "mc-subagent-failure-sentinel",
+  "version": 1,
+  "purpose": "Every five minutes, read Magic Context's finished subagent invocations through ck-mc's read-only op and wake MC when a new failure class appears, a task's failure share reaches 25% over at least 8 runs in 24 hours, or a failure class doubles against the preceding 24 hours. Quota failures recovered by a completed fallback are not counted, and a repeat alert is held for 6 hours unless its count grows by half.",
+  "trigger": { "schedule": { "interval": "5m", "missed": "once" } },
+  "sinks": [ { "agent": "MC", "digest_max": "wake" } ],
+  "ops": [ { "module": "magic-context", "op": "subagent_invocations.read" } ],
+  "deadline": "2m"
+}
