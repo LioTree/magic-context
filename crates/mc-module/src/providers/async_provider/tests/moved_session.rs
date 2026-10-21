@@ -83,7 +83,7 @@ fn served_entries(opencode_db: &Path, session: &str) -> Vec<ReadMessage> {
     served
 }
 
-async fn moved_rig(dir: &Path, run_move: bool) -> (Rig, Value) {
+pub(super) async fn moved_rig(dir: &Path, run_move: bool) -> (Rig, Value) {
     let session = fixture::fixture_session();
     let paths = fixture::write_stores(dir);
     // One standalone chunk embedding, which the import copies instead of
@@ -138,8 +138,10 @@ async fn moved_session_sets_up_from_the_import_and_carries_drops_onto_the_same_p
     let expected = &source["expected"];
     assert_eq!(answer["answer"], "ready", "{answer}");
     // The setup checkpoint: the highest standalone number and the cut.
-    assert_eq!(answer["tag_checkpoint"], 20);
-    assert_eq!(answer["cut"], expected["cut"]);
+    assert_eq!(
+        answer["checkpoint"],
+        json!({"tag_checkpoint": 20, "cut": expected["cut"]})
+    );
     rig.notice(1, 1_000, None).await;
     settle_historian(&rig).await;
     let state = rig.state();
@@ -320,8 +322,8 @@ async fn moved_session_sets_up_from_the_import_and_carries_drops_onto_the_same_p
         .await;
     assert_eq!(again["answer"], "ready", "{again}");
     assert_eq!(
-        (again["tag_checkpoint"].clone(), again["cut"].clone()),
-        (json!(20), expected["cut"].clone())
+        again["checkpoint"],
+        json!({"tag_checkpoint": 20, "cut": expected["cut"]})
     );
 }
 

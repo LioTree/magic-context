@@ -1,10 +1,14 @@
 use super::*;
 use cortexkit_bus_inmemory::{InMemoryBus, InMemoryConfig};
+mod descriptors_read;
 mod moved_session;
+mod read_outcomes;
 mod read_resume;
 mod reminder_replay;
 mod reminders;
+mod reply_shape;
 mod route_identity_vectors;
+mod setup_checkpoint;
 mod user_commands_tests;
 mod wrapup;
 
@@ -24,6 +28,12 @@ struct Runner {
     expected_bind_identity: Mutex<Option<session_resolver::RunnerBindIdentity>>,
     /// Messages per `session.read` page; 0 keeps the default of seven.
     page_size: std::sync::atomic::AtomicUsize,
+    /// Leave llm-runner's `tag_checkpoint` group out of `role.describe`.
+    withholds_tag_checkpoint: std::sync::atomic::AtomicBool,
+    /// Every `role.describe` this runner answered.
+    describes: std::sync::atomic::AtomicU64,
+    /// A page to answer every `session.read` with, verbatim.
+    page_override: Mutex<Option<Value>>,
 }
 
 #[derive(Default)]
@@ -99,12 +109,26 @@ impl session_resolver::ProviderRunner for Runner {
             return Ok(json!({"state":"pending","submission_id":"reminder"}));
         }
         if method == "role.describe" {
+            self.describes
+                .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+            // A THALAMUS-style runner hosting compaction declares the tags
+            // groups; `tag_checkpoint` only when this test leaves it in.
+            let mut capabilities = vec!["delivery_order", "compaction", "tags"];
+            if !self
+                .withholds_tag_checkpoint
+                .load(std::sync::atomic::Ordering::Relaxed)
+            {
+                capabilities.push("tag_checkpoint");
+            }
             return Ok(
-                json!({"majors":[{"version":"llm-runner/v1","ops":["role.describe","session.baseline","session.send"]}],"implementation_version":"fake","session_capabilities_from":"baseline","capabilities":["delivery_order"]}),
+                json!({"majors":[{"version":"llm-runner/v1","ops":["role.describe","session.baseline","session.send","session.read","session.resolve"]}],"implementation_version":"fake","session_capabilities_from":"baseline","capabilities":capabilities}),
             );
         }
         assert_eq!(method, "session.read");
         self.reads.lock().unwrap().push(params.clone());
+        if let Some(page) = self.page_override.lock().unwrap().clone() {
+            return Ok(page);
+        }
         if self
             .read_unavailable
             .load(std::sync::atomic::Ordering::Relaxed)
@@ -144,7 +168,7 @@ impl session_resolver::ProviderRunner for Runner {
                     size => size,
                 },
             )
-            .cloned()
+            .map(serve_descriptors)
             .collect::<Vec<_>>();
         let mut page = json!({"lineage_id":lineage,"messages":messages});
         if let Some(last) = messages

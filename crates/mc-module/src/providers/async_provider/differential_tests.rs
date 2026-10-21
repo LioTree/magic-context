@@ -326,7 +326,7 @@ impl session_resolver::ProviderRunner for Runner {
             .iter()
             .filter(|e| e.ordinal >= from)
             .take(9)
-            .cloned()
+            .map(serve_descriptors)
             .collect::<Vec<_>>();
         let mut page = json!({"lineage_id":lineage,"messages":messages});
         if let Some(last) = messages
@@ -649,9 +649,10 @@ impl Pair {
             self.log
         );
         self.compare(label);
-        self.review
-            .borrow_mut()
-            .collect_sends(&self.oracle.runner.raw_sends.lock().unwrap());
+        self.review.borrow_mut().collect_sends(
+            &self.oracle.runner.raw_sends.lock().unwrap(),
+            &self.transcript.entries.lock().unwrap(),
+        );
         resident
     }
 

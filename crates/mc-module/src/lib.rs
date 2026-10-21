@@ -318,6 +318,7 @@ pub mod background {
         }
     }
 }
+mod descriptors;
 pub mod healing;
 pub mod historian;
 pub mod historian_chunk;

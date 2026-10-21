@@ -32,8 +32,8 @@ use std::path::{Path, PathBuf};
 /// Key prefix of a moved record in `context.db`'s `schema_migrations_meta`.
 pub const MOVE_RECORD_PREFIX: &str = "mode3_move:opencode:";
 /// The setup refusal for a session that still has standalone state and was never
-/// moved. Defined here until llm-runner 0.4.0 publishes it.
-pub const STANDALONE_SESSION_NOT_MIGRATED: &str = "standalone_session_not_migrated";
+/// moved, as compaction-provider 0.4.0 publishes it.
+pub use cortexkit_role_compaction_provider::errors::refuse_codes::STANDALONE_SESSION_NOT_MIGRATED;
 /// Version of the moved record's JSON shape.
 pub const RECORD_VERSION: u32 = 1;
 const HARNESS: &str = "opencode";

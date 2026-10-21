@@ -233,8 +233,10 @@ fn is_drop_sentinel(content: &str) -> bool {
     head.starts_with("[dropped") || head.starts_with("[truncated")
 }
 
+/// Text tokens, counting a large text the runner described as its whole size
+/// (`crate::descriptors::text_tokens`).
 fn estimated_tokens(content: &str) -> i64 {
-    mc_tokenizer::estimate_tokens(content) as i64
+    crate::descriptors::text_tokens(content) as i64
 }
 
 fn media_content(media: &MediaBlock) -> String {
@@ -684,11 +686,15 @@ pub(crate) fn measure_tail_hygiene_with_pending_drops(
                 if content.is_empty() || is_drop_sentinel(content) {
                     excluded_part(key, content)
                 } else {
+                    // An output holding described media counts each ref as
+                    // the payload it stands for, not as the ref's JSON.
+                    let tokens = crate::descriptors::block_tokens(&block.wire_shape().kind)
+                        .map_or_else(|| estimated_tokens(content), |tokens| tokens as i64);
                     part_measurement(
                         key,
                         TailHygienePartKind::ToolOutput,
                         content,
-                        estimated_tokens(content),
+                        tokens,
                         tag_number,
                         protected,
                         queued_for_drop,
@@ -710,6 +716,19 @@ pub(crate) fn measure_tail_hygiene_with_pending_drops(
                         queued_for_drop,
                     )
                 }
+            }
+            // An image or file the runner described in place of a user
+            // message's part decodes as opaque; it costs what the ref says.
+            mc_store::CkKind::Opaque(opaque) if crate::descriptors::is_media_ref(&opaque.raw) => {
+                part_measurement(
+                    key,
+                    TailHygienePartKind::File,
+                    &block.bytes,
+                    crate::descriptors::value_tokens(&opaque.raw) as i64,
+                    tag_number,
+                    protected,
+                    queued_for_drop,
+                )
             }
             mc_store::CkKind::Reasoning { .. }
             | mc_store::CkKind::RedactedReasoning { .. }

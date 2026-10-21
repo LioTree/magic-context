@@ -2,7 +2,7 @@
 //! Synchronous provider hooks deliberately do not call this module.
 
 use cortexkit_role_llm_runner::delivery_order::{
-    self, DeliveryOrder, Mode, PlanSender, Slot, Template, TemplateUse,
+    self, DeliveryOrder, Mode, PartRef, PlanSender, Slot, Template, TemplateUse,
 };
 use cortexkit_role_llm_runner::send::SendRequest;
 use serde_json::{json, Map, Value};
@@ -48,6 +48,7 @@ const DELIVERY: [Mode; 3] = [Mode::TurnSystem, Mode::ToolResult, Mode::Steer];
 const SEARCH_DELIVERY: [Mode; 2] = [Mode::ToolResult, Mode::Steer];
 const NO_DELIVERY_MODE: &str = "not due: runner cannot land any delivery mode";
 const REFUSED_DELIVERY: &str = "not due: runner previously refused this delivery list";
+const FORK_REFUSED: &str = "not due: runner refused this session as a fork of a managed session";
 /// All reminder kinds expire five minutes after the observation that produced them.
 pub const REMINDER_TTL_MS: u64 = 300_000;
 /// Allow a queued delivery to appear on the next transcript read after expiry.
@@ -62,7 +63,9 @@ const BODIES: [(&str, &str); 5] = [
     ("channel2", "Your next step: call ctx_reduce on the outputs you've already used ({summary}). Then continue your task."),
 ];
 
-/// Fixed global plan templates. Hint slots are session-assigned tags, not tool names.
+/// Fixed global plan templates. A hint slot names a part by its host identity
+/// (`{mid, part}`), never by a number: the runner renders the number the
+/// request carrying the reminder shows for that part.
 /// The digest is computed over the role's `{id,text,slots}` object, without metadata.
 pub fn templates() -> Vec<Template> {
     let mut templates = Vec::new();
@@ -94,7 +97,7 @@ pub fn templates() -> Vec<Template> {
                             text.push_str(" · ");
                         }
                         text.push_str(&format!("{{tag{i}}}"));
-                        slots.insert(format!("tag{i}"), Slot::Tag);
+                        slots.insert(format!("tag{i}"), Slot::PartTag);
                     }
                     text.push('.');
                 }
@@ -153,7 +156,7 @@ fn template_use(id: &str, slots: Map<String, Value>) -> TemplateUse {
     TemplateUse::new(id, delivery_order::template_digest(template), slots)
 }
 
-fn reduce_use(kind: &str, tokens: i64, count: usize, tags: &[u64]) -> TemplateUse {
+fn reduce_use(kind: &str, tokens: i64, count: usize, tags: &[HintPart]) -> TemplateUse {
     // Clamp very large transcripts to the template bounds so every integer
     // remains exactly representable by JSON consumers and the send stays valid.
     let count_kind = match count {
@@ -169,8 +172,11 @@ fn reduce_use(kind: &str, tokens: i64, count: usize, tags: &[u64]) -> TemplateUs
     if count > 1 {
         slots.insert("count".into(), json!(count.min(MAX as usize)));
     }
-    for (i, tag) in tags.iter().take(4).enumerate() {
-        slots.insert(format!("tag{i}"), json!(format!("§{tag}§")));
+    for (i, hint) in tags.iter().take(4).enumerate() {
+        slots.insert(
+            format!("tag{i}"),
+            serde_json::to_value(&hint.part).expect("part reference serializes"),
+        );
     }
     template_use(
         &format!("mc.ctx_reduce.{kind}.{count_kind}.h{hints}.v1"),
@@ -220,6 +226,10 @@ pub struct ReminderState {
     delivery_refusals: DeliveryRefusals,
     #[serde(default)]
     pub(crate) ledger: DeliveryLedger,
+    /// The runner refused a send `fork_unsupported`: the session is a fork of
+    /// a managed session, so it is never sent another reminder.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub(crate) fork_refused: bool,
 }
 
 /// Keep refused mode lists only for the runner description under which they were recorded.
@@ -361,9 +371,28 @@ pub struct ReminderConditions<'a> {
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
 pub struct ReminderHints {
     /// Already filtered for protection, queued drops, tiny and control outputs.
-    pub oldest_reclaimable: Vec<u64>,
+    pub oldest_reclaimable: Vec<HintPart>,
     /// Separate channel-2 selection: unqueued, unprotected tool tags >=100 tokens.
-    pub channel2: Vec<u64>,
+    pub channel2: Vec<HintPart>,
+}
+
+/// One part a reminder names. The send carries only `part`, the part's host
+/// identity; `number` is the tag ck-mc's own read showed for it in the
+/// current lineage, used to render the text ck-mc expects the runner to
+/// deliver, so the delivered copy can be recognized in the transcript.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct HintPart {
+    pub number: u64,
+    pub part: PartRef,
+}
+
+impl HintPart {
+    pub fn new(number: u64, mid: impl Into<String>, part: impl Into<String>) -> Self {
+        Self {
+            number,
+            part: PartRef::new(mid, part),
+        }
+    }
 }
 
 #[derive(Debug, Default)]
@@ -378,6 +407,8 @@ pub struct ReminderOutcome {
 struct PreparedSend {
     kind: &'static str,
     template: Option<TemplateUse>,
+    /// The number ck-mc's read shows for each part a template slot names.
+    shown: Vec<HintPart>,
     prompt: String,
     sent_at_ms: u64,
     expires_at_ms: u64,
@@ -388,10 +419,24 @@ impl PreparedSend {
         Self {
             kind,
             template: Some(template),
+            shown: Vec::new(),
             prompt: String::new(),
             sent_at_ms: now_ms,
             expires_at_ms: now_ms.saturating_add(REMINDER_TTL_MS),
         }
+    }
+
+    fn naming(mut self, hints: &[HintPart]) -> Self {
+        self.shown = hints.to_vec();
+        self
+    }
+
+    /// The number this send expects the runner to render for `part`.
+    fn shown(&self, part: &PartRef) -> Option<u64> {
+        self.shown
+            .iter()
+            .find(|hint| &hint.part == part)
+            .map(|hint| hint.number)
     }
 
     fn request(&self, project: &Path, session: &str, notice: &str, modes: &[Mode]) -> Value {
@@ -453,13 +498,15 @@ async fn issue(
     // Use the role's renderer, including its digest and slot validation, rather
     // than a second interpolation implementation that could misidentify echoes.
     let text = match &send.template {
-        Some(template) => match delivery_order::render(&templates(), template, |_| true) {
-            Ok(text) => text,
-            Err(error) => {
-                outcome.errors.push(format!("{}: {error:?}", send.kind));
-                return false;
+        Some(template) => {
+            match delivery_order::render(&templates(), template, |part| send.shown(part)) {
+                Ok(text) => text,
+                Err(error) => {
+                    outcome.errors.push(format!("{}: {error:?}", send.kind));
+                    return false;
+                }
             }
-        },
+        }
         None => send.prompt.clone(),
     };
     let request = send.request(project, session, notice, modes);
@@ -479,24 +526,41 @@ async fn issue(
             true
         }
         Ok(reply) => {
-            if delivery_unsupported(&reply) {
-                state.delivery_refusals.record(modes);
-            }
+            note_refusal(refusal_code(&reply), modes, state);
             outcome.errors.push(format!("{}: {reply}", send.kind));
             false
         }
         Err(error) => {
+            if let crate::session_resolver::SessionResolveError::Refused { code, .. } = &error {
+                note_refusal(Some(code), modes, state);
+            }
             outcome.errors.push(format!("{}: {error}", send.kind));
             false
         }
     }
 }
 
-fn delivery_unsupported(reply: &Value) -> bool {
-    let body = reply.get("result").unwrap_or(reply);
-    let error = body.get("error").unwrap_or(body);
+/// The code of a refused send carried in the answer body. The runner's
+/// reply envelope is already removed (`session_resolver::read_runner_reply`).
+fn refusal_code(reply: &Value) -> Option<&str> {
+    let error = reply.get("error").unwrap_or(reply);
     error.get("code").and_then(Value::as_str)
-        == Some(cortexkit_role_llm_runner::errors::DELIVERY_UNSUPPORTED)
+}
+
+/// Act on a refused send: remember a mode list the runner cannot land, and
+/// stop sending into a session the runner knows is a fork. A part a template
+/// named that is no longer shown needs nothing: nothing was committed, so the
+/// next pass picks its hints again from the current read.
+fn note_refusal(code: Option<&str>, modes: &[Mode], state: &mut ReminderState) {
+    match code {
+        Some(cortexkit_role_llm_runner::errors::DELIVERY_UNSUPPORTED) => {
+            state.delivery_refusals.record(modes);
+        }
+        Some(cortexkit_role_llm_runner::errors::FORK_UNSUPPORTED) => {
+            state.fork_refused = true;
+        }
+        _ => {}
+    }
 }
 
 fn delivery_modes(
@@ -519,8 +583,7 @@ fn delivery_modes(
 
 fn accepted(reply: &Value) -> bool {
     use cortexkit_role_llm_runner::send::{SendReply, SendState};
-    let body = reply.get("result").unwrap_or(reply);
-    serde_json::from_value::<SendReply>(body.clone()).is_ok_and(|reply| {
+    serde_json::from_value::<SendReply>(reply.clone()).is_ok_and(|reply| {
         matches!(
             reply.send_state(),
             SendState::Pending | SendState::Active | SendState::Finished | SendState::Paused
@@ -619,6 +682,10 @@ async fn send_due_reminders_impl<const FULL_META: bool>(
     let _total = phase_meter::start("total");
     let mut outcome = ReminderOutcome::default();
     state.ledger.expire(conditions.now_ms);
+    if state.fork_refused {
+        outcome.not_due.push(FORK_REFUSED);
+        return outcome;
+    }
     // Older runners may ignore unknown fields and start an unwanted run. Never
     // send until discovery explicitly promises ordered, non-starting delivery.
     let description = match runner
@@ -637,15 +704,14 @@ async fn send_due_reminders_impl<const FULL_META: bool>(
             return outcome;
         }
     };
-    let description = description.get("result").unwrap_or(&description);
-    let describe = match cortexkit_role_llm_runner::describe::check_describe(description) {
+    let describe = match cortexkit_role_llm_runner::describe::check_describe(&description) {
         Ok(describe) if describe.declares("delivery_order") => describe,
         _ => {
             outcome.not_due.push("runner_missing_delivery_order");
             return outcome;
         }
     };
-    state.delivery_refusals.use_description(description);
+    state.delivery_refusals.use_description(&description);
 
     #[cfg(test)]
     let meter = phase_meter::start("meta_clone");
@@ -728,7 +794,8 @@ async fn send_due_reminders_impl<const FULL_META: bool>(
             project_root,
             session,
             conditions.notice_id,
-            PreparedSend::reminder("ctx_reduce", use_, conditions.now_ms),
+            PreparedSend::reminder("ctx_reduce", use_, conditions.now_ms)
+                .naming(&selected.oldest_reclaimable),
             &modes,
             state,
             &mut outcome,
@@ -794,7 +861,8 @@ async fn send_due_reminders_impl<const FULL_META: bool>(
             project_root,
             session,
             conditions.notice_id,
-            PreparedSend::reminder("ctx_reduce", use_, conditions.now_ms),
+            PreparedSend::reminder("ctx_reduce", use_, conditions.now_ms)
+                .naming(&selected.channel2),
             &modes,
             state,
             &mut outcome,
@@ -839,6 +907,7 @@ async fn send_due_reminders_impl<const FULL_META: bool>(
             let send = PreparedSend {
                 kind: "search_hint",
                 template: None,
+                shown: Vec::new(),
                 prompt: hint.into(),
                 sent_at_ms: conditions.now_ms,
                 expires_at_ms: conditions.now_ms.saturating_add(REMINDER_TTL_MS),
@@ -878,6 +947,7 @@ mod tests {
             let send = PreparedSend {
                 kind: "search_hint",
                 template: None,
+                shown: Vec::new(),
                 prompt: "identical text".into(),
                 sent_at_ms,
                 expires_at_ms: 1000,
@@ -922,7 +992,7 @@ mod tests {
         for send in outcome.issued {
             let expected = if send.get("template").is_some() {
                 let use_: TemplateUse = serde_json::from_value(send["template"].clone()).unwrap();
-                delivery_order::render(&templates(), &use_, |_| true).unwrap()
+                delivery_order::render(&templates(), &use_, test_number).unwrap()
             } else {
                 send["prompt"].as_str().unwrap().to_owned()
             };
@@ -1003,14 +1073,17 @@ mod tests {
         let mut covered = std::collections::BTreeSet::new();
         for case in fixture["reduce"].as_array().unwrap() {
             let tags: Vec<u64> = serde_json::from_value(case["tags"].clone()).unwrap();
+            let hints = tags.iter().map(|n| hint(*n)).collect::<Vec<_>>();
             let use_ = reduce_use(
                 case["kind"].as_str().unwrap(),
                 case["tokens"].as_i64().unwrap(),
                 case["count"].as_u64().unwrap() as usize,
-                &tags,
+                &hints,
             );
-            let rendered =
-                delivery_order::render(&templates, &use_, |n| tags.contains(&n)).unwrap();
+            let rendered = delivery_order::render(&templates, &use_, |part| {
+                test_number(part).filter(|n| tags.contains(n))
+            })
+            .unwrap();
             assert_eq!(rendered, case["expected"].as_str().unwrap(), "{}", use_.id);
             covered.insert(use_.id);
         }
@@ -1018,7 +1091,7 @@ mod tests {
             let use_ = time_use(case["gap_ms"].as_i64().unwrap());
             let rendered = use_
                 .as_ref()
-                .map(|use_| delivery_order::render(&templates, use_, |_| false).unwrap());
+                .map(|use_| delivery_order::render(&templates, use_, |_| None).unwrap());
             assert_eq!(rendered.as_deref(), case["expected"].as_str());
             if let Some(use_) = use_ {
                 covered.insert(use_.id);
@@ -1055,17 +1128,22 @@ mod tests {
             for slot in template.slots.values() {
                 assert!(matches!(
                     slot,
-                    Slot::Integer { .. } | Slot::Percentage | Slot::Tag | Slot::Enum { .. }
+                    Slot::Integer { .. } | Slot::Percentage | Slot::PartTag | Slot::Enum { .. }
                 ));
             }
         }
-        let use_ = reduce_use("gentle", 30_000, 7, &[12]);
+        let use_ = reduce_use("gentle", 30_000, 7, &[hint(12)]);
         let mut string_value = use_.clone();
         string_value.slots.insert("tokens_k".into(), json!("30"));
-        assert!(delivery_order::render(&templates(), &string_value, |_| true).is_err());
+        assert!(delivery_order::render(&templates(), &string_value, test_number).is_err());
+        // A tag slot carries the part's identity, never a number: a number in
+        // the slot does not render.
+        let mut number_value = use_.clone();
+        number_value.slots.insert("tag0".into(), json!("§12§"));
+        assert!(delivery_order::render(&templates(), &number_value, test_number).is_err());
         assert!(
-            delivery_order::render(&templates(), &use_, |_| false).is_err(),
-            "unassigned tags must not render"
+            delivery_order::render(&templates(), &use_, |_| None).is_err(),
+            "a part the request does not show must not render"
         );
     }
 
@@ -1078,10 +1156,10 @@ mod tests {
                 }
             }
         }
-        let reduction = reduce_use("urgent", i64::MAX, usize::MAX, &[12]);
+        let reduction = reduce_use("urgent", i64::MAX, usize::MAX, &[hint(12)]);
         assert_eq!(reduction.slots["tokens_k"], 100_000);
         assert_eq!(reduction.slots["count"], 100_000);
-        delivery_order::render(&templates(), &reduction, |tag| tag == 12).unwrap();
+        delivery_order::render(&templates(), &reduction, test_number).unwrap();
         let time = time_use(i64::MAX).unwrap();
         assert_eq!(time.slots["major"], 100_000);
         if let Some(minor) = time.slots.get("minor") {
@@ -1089,7 +1167,7 @@ mod tests {
                 .as_i64()
                 .is_some_and(|minor| (1..=59).contains(&minor)));
         }
-        delivery_order::render(&templates(), &time, |_| false).unwrap();
+        delivery_order::render(&templates(), &time, |_| None).unwrap();
     }
 
     #[test]
@@ -1190,7 +1268,7 @@ mod tests {
                     request.check_delivery_order(&["delivery_order"]).unwrap();
                     let order = request.delivery_order().unwrap().unwrap();
                     if let Some(template) = order.template {
-                        delivery_order::render(&templates(), &template, |_| true).unwrap();
+                        delivery_order::render(&templates(), &template, test_number).unwrap();
                     }
                     self.sends.lock().unwrap().push(params);
                     if self.delivery_unsupported {
@@ -1212,6 +1290,17 @@ mod tests {
         }
     }
 
+    /// A hint naming part `p{n}` of message `m{n}`, shown as tag `n`.
+    fn hint(n: u64) -> HintPart {
+        HintPart::new(n, format!("m{n}"), format!("p{n}"))
+    }
+
+    /// The tag a test part `{m{n}, p{n}}` is shown with.
+    fn test_number(part: &PartRef) -> Option<u64> {
+        let n = part.mid.strip_prefix('m')?.parse().ok()?;
+        (part.part == format!("p{n}")).then_some(n)
+    }
+
     fn baseline(u: i64, t: i64) -> mc_store::TailHygieneBaseline {
         mc_store::TailHygieneBaseline {
             baseline_u: u,
@@ -1230,8 +1319,8 @@ mod tests {
             newest_tool_tag: Some(21),
             hints: &|| {
                 Ok(ReminderHints {
-                    oldest_reclaimable: vec![12, 15],
-                    channel2: vec![12],
+                    oldest_reclaimable: vec![hint(12), hint(15)],
+                    channel2: vec![hint(12)],
                 })
             },
             drops_applied: false,
@@ -1406,7 +1495,7 @@ mod tests {
         );
         assert_eq!(
             sends[0]["template"]["slots"],
-            json!({"tokens_k":30,"tag0":"§12§","tag1":"§15§"})
+            json!({"tokens_k":30,"tag0":{"mid":"m12","part":"p12"},"tag1":{"mid":"m15","part":"p15"}})
         );
         assert_eq!(sends[1]["template"]["id"], "mc.time.compound.v1");
         assert_eq!(
@@ -1425,7 +1514,7 @@ mod tests {
             assert!(!send["send_id"].as_str().unwrap().is_empty());
             if let Some(template) = send.get("template") {
                 let use_: TemplateUse = serde_json::from_value(template.clone()).unwrap();
-                delivery_order::render(&templates(), &use_, |n| [12, 15].contains(&n)).unwrap();
+                delivery_order::render(&templates(), &use_, test_number).unwrap();
             }
         }
     }
@@ -1587,8 +1676,6 @@ mod tests {
         assert!(!accepted(&json!({})));
         assert!(!accepted(&json!({"state":"future_unknown_state"})));
         assert!(!accepted(&json!({"error":{"code":"invalid_params"}})));
-        assert!(accepted(
-            &json!({"result":{"state":"pending","submission_id":"q"}})
-        ));
+        assert!(accepted(&json!({"state":"pending","submission_id":"q"})));
     }
 }

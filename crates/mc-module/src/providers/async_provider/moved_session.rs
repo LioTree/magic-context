@@ -74,7 +74,25 @@ pub(super) fn setup_fence(
     })
 }
 
+/// Setup refusal for a moved session on a runner that does not declare
+/// llm-runner's `tag_checkpoint` group: without the Setup checkpoint it would
+/// number the session from zero. Terminal (compaction-provider §4).
+pub(super) fn tag_checkpoint_refusal(request_id: &str) -> Value {
+    json!({
+        "answer": "refuse",
+        "request_id": request_id,
+        "code": contract::errors::refuse_codes::TAG_CHECKPOINT_UNSUPPORTED,
+        "reason": "This session was moved from the standalone Magic Context plugin, and its \
+                   runner does not declare tag_checkpoint, so it cannot keep the session's tag numbers.",
+    })
+}
+
 impl StandaloneMove {
+    /// The Setup checkpoint every Setup answer for this session carries.
+    pub(super) fn checkpoint(&self) -> contract::setup::SetupCheckpoint {
+        contract::setup::SetupCheckpoint::new(self.tag_checkpoint, &self.cut)
+    }
+
     pub(super) fn from_record(record: MoveRecord) -> Self {
         Self {
             tag_checkpoint: record.tag_checkpoint,

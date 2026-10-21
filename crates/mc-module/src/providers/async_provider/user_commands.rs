@@ -442,7 +442,14 @@ impl McHandler {
             }
             None => "unknown (no advance notice yet)".into(),
         };
-        Ok(format!("Magic Context\nPressure: {pressure}\nQueued drops: {}\nRebuild: refresh_pending={}, resync={}, failed={}\nCache expiry: runner-owned; last applied view: {}\nHistory: {} compartments; coverage: {}; {}", snapshot.pending_drop_count, meta.soft_refresh_pending, state.resync, state.failed() || state.engine_failed, state.applied.map_or_else(|| "none".into(), |version| version.to_string()), snapshot.compartment_count, meta.coverage_ordinal.map_or_else(|| "none".into(), |n| n.to_string()), compact_status_detail(&historian_status_summary(&meta.historian))))
+        let mut status = format!("Magic Context\nPressure: {pressure}\nQueued drops: {}\nRebuild: refresh_pending={}, resync={}, failed={}\nCache expiry: runner-owned; last applied view: {}\nHistory: {} compartments; coverage: {}; {}", snapshot.pending_drop_count, meta.soft_refresh_pending, state.resync, state.failed() || state.engine_failed, state.applied.map_or_else(|| "none".into(), |version| version.to_string()), snapshot.compartment_count, meta.coverage_ordinal.map_or_else(|| "none".into(), |n| n.to_string()), compact_status_detail(&historian_status_summary(&meta.historian)));
+        if let Some(failure) = &state.failure {
+            status.push_str(&format!("\nFailure: {}: {}", failure.code, failure.reason));
+        }
+        if let Some(outcome) = &state.read_outcome {
+            status.push_str(&format!("\nTranscript read: {outcome}"));
+        }
+        Ok(status)
     }
 }
 

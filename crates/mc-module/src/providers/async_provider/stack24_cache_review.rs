@@ -57,7 +57,9 @@ pub(super) struct Review {
     pub(super) counts: BTreeMap<String, u64>,
 }
 
-fn rendered_send(params: &Value) -> Option<String> {
+/// The text the runner delivers for a reminder send: a template's part slots
+/// render the number the runner's transcript shows for the named part.
+fn rendered_send(params: &Value, entries: &[ReadMessage]) -> Option<String> {
     let request: cortexkit_role_llm_runner::send::SendRequest =
         serde_json::from_value(params.clone()).ok()?;
     let order = request.delivery_order().ok()??;
@@ -65,7 +67,15 @@ fn rendered_send(params: &Value) -> Option<String> {
         Some(template) => cortexkit_role_llm_runner::delivery_order::render(
             &crate::runner_reminders::templates(),
             &template,
-            |_| true,
+            |part| {
+                entries
+                    .iter()
+                    .filter(|entry| entry.mid == part.mid)
+                    .flat_map(|entry| &entry.tags)
+                    .find(|row| row.part == part.part)
+                    .and_then(|row| row.tag.as_deref())
+                    .and_then(tags::parse_tag)
+            },
         )
         .ok(),
         None => request.prompt.clone(),
@@ -98,10 +108,10 @@ fn is_user(profile: Profile, message: &Value) -> bool {
 }
 
 impl Review {
-    pub(super) fn collect_sends(&mut self, sends: &[Value]) {
+    pub(super) fn collect_sends(&mut self, sends: &[Value], entries: &[ReadMessage]) {
         for params in sends.iter().skip(self.consumed_sends) {
             *self.counts.entry("sends".into()).or_default() += 1;
-            if let Some(text) = rendered_send(params) {
+            if let Some(text) = rendered_send(params, entries) {
                 self.queue.push_back(text);
             }
         }
