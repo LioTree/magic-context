@@ -911,12 +911,73 @@ fn persist_historian_state_inner(
     }
 }
 
+/// What a fence's [`HistorianPublicationFence::admit`] hands to its own
+/// [`HistorianPublicationFence::publish_admitted`]: for example a lock guard taken
+/// while waiting asynchronously. Only the fence that produced it reads it.
+pub type PublicationAdmission = Box<dyn std::any::Any + Send + Sync>;
+
 pub trait HistorianPublicationFence: Send + Sync {
     fn publish(
         &self,
         store: &McStore,
         request: HistorianPublishRequest<'_>,
     ) -> Result<HistorianPublishResult, HistorianPublishError>;
+
+    /// Wait for whatever publication must hold, before the synchronous publish
+    /// path starts. `publish` runs on a runtime thread and cannot wait for a lock
+    /// that another task on the same thread holds, so a fence that needs one waits
+    /// for it here. The default fence needs nothing.
+    fn admit(
+        &self,
+    ) -> std::pin::Pin<
+        Box<dyn std::future::Future<Output = Option<PublicationAdmission>> + Send + '_>,
+    > {
+        Box::pin(std::future::ready(None))
+    }
+
+    /// Publish with what [`Self::admit`] returned. The default ignores it.
+    fn publish_admitted(
+        &self,
+        store: &McStore,
+        request: HistorianPublishRequest<'_>,
+        _admission: Option<&PublicationAdmission>,
+    ) -> Result<HistorianPublishResult, HistorianPublishError> {
+        self.publish(store, request)
+    }
+}
+
+/// A fence together with what its `admit` returned, presented to the synchronous
+/// publish path as an ordinary fence. Dropping it releases what admission took, so
+/// keep it only for the duration of one publication.
+struct AdmittedFence<'a> {
+    fence: &'a dyn HistorianPublicationFence,
+    admission: Option<PublicationAdmission>,
+}
+
+impl<'a> AdmittedFence<'a> {
+    async fn admit(fence: Option<&'a dyn HistorianPublicationFence>) -> Option<Self> {
+        let fence = fence?;
+        Some(Self {
+            fence,
+            admission: fence.admit().await,
+        })
+    }
+
+    fn as_fence(this: &Option<Self>) -> Option<&dyn HistorianPublicationFence> {
+        this.as_ref()
+            .map(|admitted| admitted as &dyn HistorianPublicationFence)
+    }
+}
+
+impl HistorianPublicationFence for AdmittedFence<'_> {
+    fn publish(
+        &self,
+        store: &McStore,
+        request: HistorianPublishRequest<'_>,
+    ) -> Result<HistorianPublishResult, HistorianPublishError> {
+        self.fence
+            .publish_admitted(store, request, self.admission.as_ref())
+    }
 }
 
 pub struct ValidatedPublishRequest<'a> {
@@ -3277,6 +3338,7 @@ where
             None,
             &mut parent_invocation_id,
         );
+        let admitted = AdmittedFence::admit(request.publication_fence).await;
         let publish_result = publish_output_from_awaiting(PublishOutputRequest {
             rust_background_enabled: request.rust_background_enabled,
             store: request.store,
@@ -3297,8 +3359,9 @@ where
             failure_started_at_ms: request.now_ms,
             failure_backoff_at_ms: request.failure_backoff_at_ms,
             completion_now_ms: request.completion_now_ms,
-            publication_fence: request.publication_fence,
+            publication_fence: AdmittedFence::as_fence(&admitted),
         });
+        drop(admitted);
         producer.close().await;
         let row_version = match publish_result {
             Ok(row_version) => row_version,
@@ -3593,6 +3656,7 @@ async fn drive_historian_on_host(
         text: output.text.clone(),
         length_capped: output.length_capped,
     };
+    let admitted = AdmittedFence::admit(request.publication_fence).await;
     let publish_result = publish_output_from_awaiting(PublishOutputRequest {
         rust_background_enabled: request.rust_background_enabled,
         store: request.store,
@@ -3613,8 +3677,9 @@ async fn drive_historian_on_host(
         failure_started_at_ms: request.now_ms,
         failure_backoff_at_ms: request.failure_backoff_at_ms,
         completion_now_ms: request.completion_now_ms,
-        publication_fence: request.publication_fence,
+        publication_fence: AdmittedFence::as_fence(&admitted),
     });
+    drop(admitted);
     if matches!(
         &publish_result,
         Err(HistorianDriveError::State(HistorianStateError::Publish(
@@ -4181,6 +4246,7 @@ where
 
     // Always release both routes, whether publish succeeds or errors — an early `?`
     // return would leak the command + subscribe routes for this reattached firing.
+    let admitted = AdmittedFence::admit(request.publication_fence).await;
     let publish_result = publish_output_from_awaiting(PublishOutputRequest {
         rust_background_enabled: request.rust_background_enabled,
         store: request.store,
@@ -4201,8 +4267,9 @@ where
         failure_started_at_ms: request.now_ms,
         failure_backoff_at_ms: request.failure_backoff_at_ms,
         completion_now_ms: request.completion_now_ms,
-        publication_fence: request.publication_fence,
+        publication_fence: AdmittedFence::as_fence(&admitted),
     });
+    drop(admitted);
     producer.close().await;
     let row_version = publish_result?;
     Ok(HistorianReattachOutcome::Published(HistorianRunSuccess {

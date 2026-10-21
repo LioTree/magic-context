@@ -1428,8 +1428,11 @@ impl McHandler {
     ) -> Result<Vec<u8>, HandlerOutcome> {
         let request: compact::setup::SetupRequest = decode(params)?;
         let bound_session = binding.session.as_str();
-        let setup_session = request.session.trim();
-        if !bound_session.is_empty() && bound_session != setup_session {
+        // The session handle is an opaque caller-chosen string (compaction-provider
+        // contract §1 and §4): compare, key and bind it as exact bytes, never trimmed, so
+        // the conversation key, its runner route and its reverse-call identity all
+        // name the one session the runner reported.
+        if !bound_session.is_empty() && bound_session != request.session {
             return Err(HandlerOutcome::ErrorWithDetail {
                 code: "setup_identity_mismatch".into(),
                 message: "Setup session does not match the bound route session".into(),
@@ -1540,7 +1543,7 @@ impl McHandler {
             runner_identity: Some(session_resolver::RunnerBindIdentity {
                 project_root: binding.project_root.clone(),
                 harness: request.harness.clone(),
-                session: request.session.trim().into(),
+                session: request.session.clone(),
             }),
             runner_module: match &binding.principal {
                 Some(subc_protocol::Principal::Reserved { module_id }) => module_id.clone(),
@@ -3851,21 +3854,89 @@ struct AsyncHistoryFence {
     key: Key,
     serial: Arc<ProviderSerial>,
 }
+/// How long a history publication waits for the conversation lock. Notices,
+/// `late_results` polls and `ctx_reduce` hold that lock briefly; a summary that
+/// took minutes to produce must not be thrown away because one of them was
+/// running at the moment it landed.
+const ASYNC_PUBLICATION_LOCK_WAIT: Duration = Duration::from_secs(30);
+
+/// What [`AsyncHistoryFence::admit`] obtained for the publication that follows.
+enum AsyncPublicationAdmission {
+    Held {
+        _guard: tokio::sync::OwnedMutexGuard<()>,
+    },
+    LockBusy,
+}
+
 impl crate::historian::HistorianPublicationFence for AsyncHistoryFence {
     fn publish(
         &self,
         store: &McStore,
         request: mc_store::HistorianPublishRequest<'_>,
     ) -> Result<mc_store::HistorianPublishResult, mc_store::HistorianPublishError> {
-        let reject = || mc_store::HistorianPublishError::FenceRejected {
-            reason: "async lineage sources changed".into(),
+        crate::historian::HistorianPublicationFence::publish_admitted(self, store, request, None)
+    }
+
+    fn admit(
+        &self,
+    ) -> std::pin::Pin<
+        Box<
+            dyn std::future::Future<Output = Option<crate::historian::PublicationAdmission>>
+                + Send
+                + '_,
+        >,
+    > {
+        Box::pin(async move {
+            let admission = match tokio::time::timeout(
+                ASYNC_PUBLICATION_LOCK_WAIT,
+                self.serial.lock_for(&self.key),
+            )
+            .await
+            {
+                Ok(guard) => AsyncPublicationAdmission::Held { _guard: guard },
+                Err(_) => AsyncPublicationAdmission::LockBusy,
+            };
+            Some(Box::new(admission) as crate::historian::PublicationAdmission)
+        })
+    }
+
+    fn publish_admitted(
+        &self,
+        store: &McStore,
+        request: mc_store::HistorianPublishRequest<'_>,
+        admission: Option<&crate::historian::PublicationAdmission>,
+    ) -> Result<mc_store::HistorianPublishResult, mc_store::HistorianPublishError> {
+        // Reasons stay short: the person sees them inside a status line that is
+        // cut at 120 characters.
+        let reject = |reason: String| mc_store::HistorianPublishError::FenceRejected { reason };
+        // The lock keeps a notice from resetting or forking the conversation
+        // between the check below and the write.
+        let _serial = match admission.and_then(|admission| admission.downcast_ref()) {
+            Some(AsyncPublicationAdmission::Held { .. }) => None,
+            Some(AsyncPublicationAdmission::LockBusy) => {
+                return Err(reject(format!(
+                    "conversation lock held over {}s",
+                    ASYNC_PUBLICATION_LOCK_WAIT.as_secs()
+                )));
+            }
+            // A caller that could not wait asynchronously gets one attempt.
+            None => Some(
+                self.serial
+                    .try_lock_for(&self.key)
+                    .map_err(|_| reject("conversation lock busy".into()))?,
+            ),
         };
-        let _serial = self.serial.try_lock_for(&self.key).map_err(|_| reject())?;
         let state = load_head(store, &self.reference)
-            .map_err(|_| reject())?
-            .ok_or_else(reject)?;
-        if state.resync || state.generation != self.generation {
-            return Err(reject());
+            .map_err(|error| reject(format!("conversation unreadable: {error:?}")))?
+            .ok_or_else(|| reject("conversation disappeared".into()))?;
+        if state.generation != self.generation {
+            return Err(reject(format!(
+                "lineage changed (generation {} to {})",
+                self.generation, state.generation
+            )));
+        }
+        if state.resync {
+            return Err(reject("conversation is resyncing".into()));
         }
         store.publish_historian_chunk(request)
     }

@@ -458,7 +458,21 @@ pub fn decode_message(
         "mc-provider".into(),
         BTreeMap::from([("native_message".into(), message.message.clone())]),
     );
-    let ck = CkWireMessage::from_parts(parsed.role, content, None, extras, HarnessMeta::default());
+    let ck = CkWireMessage::from_parts(
+        parsed.role,
+        content,
+        None,
+        extras,
+        // Broca's messages carry no id of their own, so a rendered view is
+        // matched back to its source messages by this ordinal. Without it
+        // every rendered message looks engine-authored and is served as a
+        // copy inside the view's replacement instead of as the runner's own
+        // message.
+        HarnessMeta {
+            ordinal: Some(message.ordinal),
+            ..HarnessMeta::default()
+        },
+    );
     Ok(ck_wire::CkIngressMessage {
         mid: message.mid.clone(),
         ordinal: message.ordinal,
@@ -625,6 +639,22 @@ mod dispatch_tests {
         let codec = Codec::from_params(&json!({"serializer_profile":"pi"})).unwrap();
         assert_eq!(codec, Codec::Pi);
         assert_eq!(codec.serializer_profile(), SerializerProfile::Pi);
+    }
+
+    #[test]
+    fn broca_decode_carries_the_source_ordinal() {
+        let entry = codec::InboundMessage {
+            mid: "m7".into(),
+            ordinal: 7,
+            message: json!({"role":"user","content":[{"type":"text","text":"hi"}]}),
+        };
+        let decoded = Codec::OwnedBroca.decode_message(&entry).unwrap();
+        assert_eq!(decoded.ck.meta.ordinal, Some(7));
+        assert_eq!(
+            bytes(&encode_message(&decoded.ck).unwrap()).unwrap(),
+            bytes(&entry.message).unwrap(),
+            "the ordinal is engine metadata and never reaches Broca's wire"
+        );
     }
 
     #[test]

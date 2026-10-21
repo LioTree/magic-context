@@ -567,11 +567,10 @@ async fn async_wrapup_refuses_an_already_running_historian() {
 /// conversation happens to hold the conversation lock when the summary is
 /// published. Here a held lock stands in for a `late_results` poll or an
 /// advance notice that is still running: both take that lock, and a host polls
-/// `late_results` while it shows the wrapup's progress. Today the publication
-/// fence only tries the lock once and refuses with "async lineage sources
-/// changed", although neither the lineage nor the generation changed.
+/// `late_results` while it shows the wrapup's progress. The publication fence
+/// waits for the lock instead of refusing, because neither the lineage nor the
+/// generation changed.
 #[tokio::test]
-#[ignore = "cache review finding: fails until fixed"]
 async fn stack26_wrapup_publication_survives_a_concurrent_conversation_call() {
     let dir = tempfile::tempdir().unwrap();
     let (rig, child) = fixture(dir.path()).await;
@@ -748,4 +747,81 @@ async fn a_fresh_mode3_opencode_session_is_never_refused_as_standalone_state() {
     restarted.narrative(45);
     restarted.notice(3, 1_000, None).await;
     assert!(!fence(&restarted), "{:?}", raw_session_rows(&restarted));
+}
+
+/// Waiting for the conversation lock must not weaken the fence: when the
+/// conversation is reset while the summary waits, its generation changes and
+/// the publication is refused with a reason naming that change.
+#[tokio::test]
+async fn wrapup_publication_waiting_for_the_lock_still_refuses_a_changed_generation() {
+    let dir = tempfile::tempdir().unwrap();
+    let (rig, child) = fixture(dir.path()).await;
+    rig.narrative(45);
+    rig.notice(1, 1_000, None).await;
+    rig.historian_evaluation_done().await;
+    let before = rig
+        .ride("ttl_expired")
+        .await
+        .expect("initial permitted view");
+    rig.notice(2, 1_000, Some(before.view_version)).await;
+    let accepted = rig.user_wrapup_command("wrapup", "keep-20").await;
+    assert_eq!(accepted["state"], "accepted");
+    let send = tokio::time::timeout(Duration::from_secs(10), child.next_unfinished())
+        .await
+        .expect("summarizer child started");
+    let generation = rig.state().generation;
+    let held = rig.h.provider_serial.lock_for(&rig.state().key).await;
+    // Reset the conversation while holding the lock, as happens in production
+    // when the runner reports that it lost its state.
+    let store = rig.h.store.get().unwrap();
+    let mut state = rig.h.checkout(store, &rig.reference).unwrap().unwrap();
+    state.reset(store).unwrap();
+    rig.h.checkin(state);
+    child.finish(
+        &send.run_id,
+        r#"<output><compartments>
+      <compartment start="0" end="24" title="history" episode_type="feature" importance="60"><p1>wrapup durable history</p1><p2>history</p2><p3>history</p3><p4 /></compartment>
+      </compartments><meta><messages_processed>0-24</messages_processed><unprocessed_from>25</unprocessed_from></meta></output>"#
+            .to_string(),
+    );
+    // Keep the lock held for a while after the summary lands: the wrapup must
+    // still be running then, waiting for the lock instead of having given up.
+    tokio::time::sleep(Duration::from_millis(300)).await;
+    assert!(
+        !rig.h.wrapup_sessions.lock().unwrap().is_empty(),
+        "the publication waits for the held lock"
+    );
+    drop(held);
+    let late = rig.user_wrapup_terminal().await;
+    let result = late["entries"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|entry| entry["kind"] == "result")
+        .unwrap()
+        .clone();
+    assert_ne!(
+        rig.state().generation,
+        generation,
+        "the reset moved the lineage"
+    );
+    assert_ne!(result["result"]["state"], "done");
+    let text = result["result"]["text"].as_str().unwrap();
+    assert!(
+        text.contains(&format!(
+            "lineage changed (generation {generation} to {})",
+            generation + 1
+        )),
+        "the refusal names the changed generation: {text}"
+    );
+    assert!(
+        rig.h
+            .store
+            .get()
+            .unwrap()
+            .load_compartments(&rig.state().namespace())
+            .unwrap()
+            .is_empty(),
+        "nothing was published under the old lineage"
+    );
 }

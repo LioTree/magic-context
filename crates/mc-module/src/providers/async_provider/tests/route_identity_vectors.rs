@@ -165,15 +165,14 @@ async fn published_route_identity_vectors_match_async_provider_setup_and_reverse
     }
 }
 
-/// Setup accepts a session id with surrounding whitespace (it compares the
-/// trimmed id with the route's bound session). The conversation's runner route
-/// and its bind identity must then still name the same session: the production
-/// runner refuses every `session.read` and `session.send` whose identity session
-/// differs from the route's parent session ("session runner route identity
-/// mismatch"). Today the bind identity keeps the trimmed id and the route keeps
-/// the untrimmed one.
+/// The compaction-provider contract makes Setup's session an opaque,
+/// caller-chosen string, and every conversation call uses "exactly that
+/// identity". So a session with surrounding whitespace is kept byte for byte:
+/// the conversation key, its runner route and its reverse-call identity all
+/// name the same padded session. The production runner refuses every
+/// `session.read` and `session.send` whose identity session differs from the
+/// route's parent session, so any disagreement here fails every such call.
 #[tokio::test]
-#[ignore = "cache review finding: fails until fixed"]
 async fn stack26_padded_setup_session_keeps_runner_route_and_identity_on_one_session() {
     let dir = tempfile::tempdir().unwrap();
     let rig = setup_vector_rig(
@@ -189,4 +188,45 @@ async fn stack26_padded_setup_session_keeps_runner_route_and_identity_on_one_ses
         state.runner_identity().session,
         "route and bind identity address different sessions"
     );
+    assert_eq!(state.runner_identity().session, "conversation-1 ");
+    assert_eq!(state.key.session, "conversation-1 ");
+    assert_eq!(rig.h.async_binding(&state).session, "conversation-1 ");
+}
+
+/// A route bound to one session accepts only a Setup naming that exact
+/// session: a Setup whose session differs only by surrounding whitespace is a
+/// different session and is refused by name, not quietly trimmed into a match.
+#[tokio::test]
+async fn padded_setup_session_is_refused_on_a_route_bound_to_the_unpadded_session() {
+    let dir = tempfile::tempdir().unwrap();
+    let rig = setup_vector_rig(
+        dir.path(),
+        &json!({"harness":"broca","session":"conversation-1"}),
+        &json!({"harness":"broca","session":"conversation-1"}),
+    )
+    .await;
+    let mut bound = rig.h.facade_binding(7).unwrap();
+    bound.session = "conversation-1".into();
+    rig.h.bind_route(8, bound);
+    let refused = rig
+        .h
+        .dispatch_value(
+            8,
+            json!({
+                "method":"compaction.setup",
+                "params":setup_params(
+                    &json!({"harness":"broca","session":"conversation-1 "}),
+                    "padded",
+                )
+            }),
+        )
+        .await;
+    match refused {
+        HandlerOutcome::ErrorWithDetail { code, detail, .. } => {
+            assert_eq!(code, "setup_identity_mismatch");
+            assert_eq!(detail["route_identity"]["session"], "conversation-1");
+            assert_eq!(detail["setup_identity"]["session"], "conversation-1 ");
+        }
+        other => panic!("expected setup_identity_mismatch, got {other:?}"),
+    }
 }
