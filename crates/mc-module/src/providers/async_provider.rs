@@ -8,6 +8,7 @@ use serde::Deserialize;
 #[cfg(test)]
 mod differential_tests;
 mod frozen_edits;
+mod held_entries;
 mod historian_tail;
 pub(crate) mod reminder_echoes;
 mod resident;
@@ -177,6 +178,8 @@ pub(crate) struct AsyncRecord {
     /// acknowledgement never advances this certificate.
     #[serde(default, deserialize_with = "deserialize_logical_prefix")]
     logical_prefix: Option<Arc<transform::compaction::LogicalPrefix>>,
+    #[serde(default)]
+    prefix_input_proof: Option<held_entries::InputProof>,
     /// Engine forms of this generation's retained published views, stored
     /// beside each view in `mc_async_compaction_views.engine_json`.
     #[serde(skip)]
@@ -193,7 +196,7 @@ pub(crate) struct AsyncRecord {
     /// The held transcript, stored one row per ordinal in
     /// `mc_async_compaction_entries`.
     #[serde(skip)]
-    entries: BTreeMap<u64, Arc<HeldEntry>>,
+    entries: held_entries::HeldEntries,
     /// Source identity lookup rebuilt from entry headers, never decoded history.
     #[serde(skip)]
     mid_index: BTreeMap<String, u64>,
@@ -1147,6 +1150,9 @@ fn load(store: &McStore, reference: &str) -> Result<Option<State>, HandlerOutcom
     }
     state.produced_view = produced;
     state.applied_view = applied;
+    if let Some(prefix) = &state.logical_prefix {
+        state.entries.proof_before(prefix.tail_from);
+    }
     let through = state.entries.last_key_value().map(|(n, _)| *n);
     state.journal = Journal {
         complete: true,
@@ -1361,6 +1367,7 @@ impl McHandler {
             tag_index: BTreeMap::new(),
             engine_baselines: EngineBaselines::default(),
             logical_prefix: None,
+            prefix_input_proof: None,
             journal: Journal::new_record(),
             usage_policy: None,
             todo_scan: None,
@@ -1390,7 +1397,7 @@ impl McHandler {
             produced_view: None,
             applied_view: None,
             lineage: request.lineage_id.clone(),
-            entries: BTreeMap::new(),
+            entries: Default::default(),
             mid_index: BTreeMap::new(),
             aggregates: Default::default(),
             entry_bytes: Default::default(),
@@ -1495,6 +1502,11 @@ impl McHandler {
             prefix
                 .matches(&status.lineage_id, state.generation, &loaded, &compartments)
                 .then_some(())
+                .filter(|_| {
+                    state
+                        .entries
+                        .matches(state.prefix_input_proof.as_ref(), prefix.tail_from)
+                })
                 .filter(|_| {
                     state.entries.first_key_value().map(|(ordinal, _)| *ordinal)
                         == Some(prefix.from)
@@ -3164,6 +3176,10 @@ impl McHandler {
                 }
             }
             state.logical_prefix = prefix.map(Arc::new);
+            state.prefix_input_proof = state
+                .logical_prefix
+                .as_ref()
+                .map(|prefix| state.entries.proof_before(prefix.tail_from));
         }
         let transform::compaction::Answer::Replacement(mut candidate) = output.answer else {
             state.adopt_engine(engine)?;

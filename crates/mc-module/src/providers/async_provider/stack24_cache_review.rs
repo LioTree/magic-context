@@ -743,7 +743,13 @@ async fn damaged_prefix_uses_full_input(damage: PrefixDamage) {
         );
     }
     assert!(!selected, "{damage:?}: stale prefix was accepted");
-    assert_eq!(input, held);
+    assert_eq!(
+        resident, oracle,
+        "{damage:?}: fallback must return the full-input answer or refusal"
+    );
+    if !resident.starts_with("error ") {
+        assert_eq!(input, held);
+    }
 }
 
 #[tokio::test]

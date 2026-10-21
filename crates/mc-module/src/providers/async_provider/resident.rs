@@ -27,6 +27,8 @@ pub(super) struct EntryFacts {
 /// One held transcript entry.
 pub(crate) struct HeldEntry {
     pub(super) mid: String,
+    /// Digest computed once from the immutable stored entry, including part order.
+    pub(super) input_digest: [u8; 32],
     /// `serde_json` of the runner's `ReadMessage`, byte-identical to the
     /// stored `mc_async_compaction_entries.entry_json`.
     raw: Box<str>,
@@ -36,9 +38,11 @@ pub(crate) struct HeldEntry {
 
 impl HeldEntry {
     pub(super) fn from_read(entry: &ReadMessage) -> Result<Self, HandlerOutcome> {
+        let raw = serde_json::to_string(entry).map_err(transient)?;
         Ok(Self {
             mid: entry.mid.clone(),
-            raw: serde_json::to_string(entry).map_err(transient)?.into(),
+            input_digest: Sha256::digest(raw.as_bytes()).into(),
+            raw: raw.into(),
             #[cfg(test)]
             reference: None,
         })
@@ -53,6 +57,7 @@ impl HeldEntry {
         let head: Head = serde_json::from_str(&raw).map_err(transient)?;
         Ok(Self {
             mid: head.mid,
+            input_digest: Sha256::digest(raw.as_bytes()).into(),
             raw: raw.into_boxed_str(),
             #[cfg(test)]
             reference: None,
