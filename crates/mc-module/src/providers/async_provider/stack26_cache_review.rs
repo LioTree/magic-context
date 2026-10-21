@@ -4,14 +4,14 @@
 //! ignored until its finding is fixed; run them with `--ignored`.
 use super::*;
 
-/// Differential seed 1008 (owned-broca), present already at 5db74d82: after
-/// a restore under a new lineage, view 3 covers the newest message, a user
-/// message at ordinal 232, but drops its only part, and the replacement head
-/// that carries copies of the other live messages does not carry its words.
-/// The model input then has no trace of the person's latest prompt. Views 4
-/// and 5 keep serving it that way.
+/// Differential seed 1008 (owned-broca): after a restore under a new lineage,
+/// view 3 covered the newest message, a user message at ordinal 232, but
+/// dropped its only part, and the replacement head that carried copies of the
+/// other live messages did not carry its words. Broca's codec gave the engine's
+/// messages no source ordinal, so no rendered message was matched to its
+/// source and every live message was served only as a copy in the head; the
+/// restored head then replaced those copies with older ones.
 #[tokio::test]
-#[ignore = "cache review finding: fails until fixed"]
 async fn stack26_seed_1008_restore_keeps_newest_broca_user_message() {
     let pair = session_pair_with(Profile::Broca, 1008, 24, false).await;
     let review = pair.review.borrow();
