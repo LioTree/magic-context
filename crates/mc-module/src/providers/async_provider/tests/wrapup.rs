@@ -626,9 +626,10 @@ async fn stack26_wrapup_publication_survives_a_concurrent_conversation_call() {
     );
 }
 
-/// The same fixture for a mode-3 OpenCode session: admitted under the OpenCode
-/// session runner and set up with harness `opencode`, the harness whose setup
-/// checks for standalone plugin state.
+/// The same fixture for an OpenCode session served by ck-mc's async lane (no
+/// standalone plugin involved): admitted under the OpenCode session runner and
+/// set up with harness `opencode`, the harness whose setup checks for standalone
+/// plugin state.
 async fn opencode_fixture(dir: &Path) -> (Rig, Arc<FakeSessionRunner>) {
     let child = FakeSessionRunner::for_project(dir);
     let factory = child.factory();
@@ -687,9 +688,10 @@ fn raw_session_rows(rig: &Rig) -> Vec<(String, i64)> {
         .unwrap()
 }
 
-/// ck-mc's own mode-3 OpenCode session goes through setup, notices, a real
-/// historian publish, `ctx_reduce`, a module restart and setup again, and
-/// never writes the raw-session rows the standalone fence looks for.
+/// A fresh OpenCode session served by ck-mc's async lane goes through setup,
+/// notices, a real historian publish, `ctx_reduce`, a module restart and setup
+/// again, and never writes the rows keyed by the raw session id that
+/// `has_standalone_state` counts as standalone plugin state.
 #[tokio::test]
 async fn a_fresh_mode3_opencode_session_is_never_refused_as_standalone_state() {
     let dir = tempfile::tempdir().unwrap();
