@@ -164,6 +164,15 @@ impl Rig {
     /// A rig whose route is admitted under runner module `module` and whose
     /// conversation is set up for `harness` with plan `params`.
     async fn open(dir: &Path, module: &str, harness: &str, params: Value) -> Self {
+        Self::open_with_model(dir, module, harness, "fixture", params).await
+    }
+    async fn open_with_model(
+        dir: &Path,
+        module: &str,
+        harness: &str,
+        model: &str,
+        params: Value,
+    ) -> Self {
         let descriptor = StorageDescriptor {
             module_id: DEFAULT_MODULE_ID.into(),
             storage_namespace: "mc_cache".into(),
@@ -179,6 +188,8 @@ impl Rig {
             ..Default::default()
         });
         let mut h = McHandler::new();
+        h.producer_factory =
+            crate::providers::session_runner_fake::FakeSessionRunner::for_project(dir).factory();
         h.store.set(store).ok().unwrap();
         h.provider_runner = runner.clone();
         let resolver = Arc::new(CountingResolver::default());
@@ -224,7 +235,7 @@ impl Rig {
             reference,
             module: module.into(),
         };
-        let answer=rig.op("compaction.setup",json!({"session":"s","harness":harness,"request_id":"setup","model":"fixture","context_window":100_000,"composition":{"render_tags":true},"params":params,"lineage_id":"L","now":1})).await;
+        let answer=rig.op("compaction.setup",json!({"session":"s","harness":harness,"request_id":"setup","model":model,"context_window":100_000,"composition":{"render_tags":true},"params":params,"lineage_id":"L","now":1})).await;
         assert_eq!(answer["answer"], "ready", "{answer}");
         assert_eq!(answer["ceiling"]["at_share"], 0.95);
         rig
@@ -2044,4 +2055,45 @@ async fn concurrent_setup_for_another_conversation_completes_with_attach() {
     assert_eq!(first["answer"], "ready", "{first}");
     assert_eq!(second["answer"], "ready", "{second}");
     assert!(started.elapsed() < ASYNC_BUS_SETUP_WAIT);
+}
+
+#[tokio::test]
+async fn broca_async_lane_fires_session_model_without_historian_block() {
+    let dir = tempfile::tempdir().unwrap();
+    let session_runner =
+        crate::providers::session_runner_fake::FakeSessionRunner::for_project(dir.path());
+    let rig = Rig::open_with_model(
+        dir.path(),
+        "broca",
+        "broca",
+        "provider/session-model",
+        json!({"serializer_profile":"opencode-aisdk"}),
+    )
+    .await;
+    let resolved_fields = rig.h.async_historian_fields(&rig.state());
+    assert_eq!(
+        resolved_fields["historian_model_chain"],
+        json!(["provider/session-model"])
+    );
+    rig.fill(40);
+    rig.notice(1, 99_000, None).await;
+    assert!(
+        rig.h
+            .provider_store
+            .async_runtime
+            .historian_evaluations
+            .load(std::sync::atomic::Ordering::Relaxed)
+            > 0,
+        "the notice must reach the real async historian scheduler"
+    );
+
+    let sent = tokio::time::timeout(Duration::from_secs(10), session_runner.next_unfinished())
+        .await
+        .expect("the async historian must send a request instead of recording no_models");
+
+    assert_eq!(sent.model, "provider/session-model");
+    assert_eq!(session_runner.sends().len(), 1);
+    assert_eq!(session_runner.connects().len(), 1);
+    assert_eq!(session_runner.fixed_connects(), 0);
+    session_runner.finish(&sent.run_id, "test response".into());
 }

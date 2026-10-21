@@ -168,6 +168,17 @@ struct FakeSessionRunnerDriver {
 
 #[async_trait]
 impl HistorianProducerDriver for FakeSessionRunnerDriver {
+    async fn session_runner_limits(
+        &mut self,
+        _child: &str,
+    ) -> Result<Option<crate::runner_limits::RunnerLimits>, HistorianProducerError> {
+        Ok(Some(crate::runner_limits::RunnerLimits {
+            max_steps: true,
+            max_output_tokens: true,
+            no_tools: true,
+        }))
+    }
+
     async fn bind_session(&mut self, _session_id: &str) -> Result<(), HistorianProducerError> {
         Ok(())
     }

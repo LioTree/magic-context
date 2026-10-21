@@ -27,6 +27,32 @@ fn bus_id(reference: &str, kind: &str, sequence: u64) -> String {
     format!("{reference}:{kind}:{sequence}")
 }
 
+fn log_session_model_fallback(
+    namespace: &str,
+    configured: &super::historian_config::ConfiguredHistorian,
+) {
+    if !configured.session_model_fallback {
+        return;
+    }
+    let Some(model) = configured.model_chain.last() else {
+        return;
+    };
+    static WARNED: std::sync::OnceLock<std::sync::Mutex<std::collections::HashSet<String>>> =
+        std::sync::OnceLock::new();
+    if WARNED
+        .get_or_init(Default::default)
+        .lock()
+        .expect("session model fallback log")
+        .insert(namespace.to_owned())
+    {
+        tracing::warn!(
+            session = namespace,
+            model,
+            "historian_session_model_fallback"
+        );
+    }
+}
+
 #[async_trait]
 trait Publisher: Send + Sync {
     async fn publish(&self, ready: &notice::ViewReady) -> Result<(), HandlerOutcome>;
@@ -3476,6 +3502,7 @@ impl McHandler {
         let reference = state.reference();
         let reference_for_rows = reference.clone();
         let namespace = state.namespace();
+        let session_model = state.setup.model.clone();
         let generation = state.generation;
         let cadence = state.historian_cadence.clone();
         let settings = self.historian_settings_loader()(&state.key.project);
@@ -3499,10 +3526,12 @@ impl McHandler {
             let configured = super::historian_config::resolve_with_model_catalog(
                 &settings,
                 &harness,
+                Some(&session_model),
                 &binding.project_root,
                 &worker.historian_model_catalog,
             )
             .await;
+            log_session_model_fallback(&namespace, &configured);
             parsed.historian_model_limits = configured.model_limits;
             let prepare = worker.clone();
             let result = tokio::task::spawn_blocking(move || {
@@ -3586,7 +3615,12 @@ impl McHandler {
     fn async_historian_fields(&self, state: &State) -> Value {
         let settings = self.historian_settings_loader()(&state.key.project);
         Value::Object(
-            super::historian_config::resolve(&settings, &state.key.harness).request_fields(),
+            super::historian_config::resolve_for_session(
+                &settings,
+                &state.key.harness,
+                Some(&state.setup.model),
+            )
+            .request_fields(),
         )
     }
 }

@@ -10,6 +10,8 @@
       "transform_mode": "ts",
       "rust_pipeline": "full_request",
       "signed_thinking_hold": "off",
+      "rust_provider_preparation": false,
+      "rust_background_enabled": false,
       "smart_notes": {
         "enabled": true,
         "retina_handoff": false
@@ -124,6 +126,19 @@
         "omp": {
           "model": "omp/model",
           "thinking_level": "xhigh"
+        },
+        "broca": {
+          "model": {
+            "model": "broca/model",
+            "variant": "high"
+          },
+          "fallback_models": [
+            {
+              "model": "broca/fallback",
+              "variant": "medium"
+            }
+          ],
+          "variant": "low"
         }
       }
     },
@@ -136,6 +151,8 @@
       "transform_mode": "ts",
       "rust_pipeline": "full_request",
       "signed_thinking_hold": "off",
+      "rust_provider_preparation": false,
+      "rust_background_enabled": false,
       "language": "tr",
       "historian": {
         "opencode": {
@@ -156,6 +173,19 @@
         "omp": {
           "model": "omp/model",
           "thinking_level": "xhigh"
+        },
+        "broca": {
+          "model": {
+            "model": "broca/model",
+            "variant": "high"
+          },
+          "fallback_models": [
+            {
+              "model": "broca/fallback",
+              "variant": "medium"
+            }
+          ],
+          "variant": "low"
         },
         "two_pass": false,
         "disallowed_tools": []
@@ -279,6 +309,8 @@
       "transform_mode": "ts",
       "rust_pipeline": "full_request",
       "signed_thinking_hold": "off",
+      "rust_provider_preparation": false,
+      "rust_background_enabled": false,
       "dreamer": {
         "pi": {
           "model": "pi/dreamer",
@@ -444,6 +476,13 @@
             "omp": {
               "model": "omp/work",
               "thinking_level": "max"
+            },
+            "broca": {
+              "model": "broca/work",
+              "variant": "high",
+              "fallback_models": [
+                "broca/work-fallback"
+              ]
             }
           },
           "dreamer": {
@@ -469,6 +508,8 @@
       "transform_mode": "ts",
       "rust_pipeline": "full_request",
       "signed_thinking_hold": "off",
+      "rust_provider_preparation": false,
+      "rust_background_enabled": false,
       "historian": {
         "opencode": {
           "model": "oc/work",
@@ -484,6 +525,13 @@
         "omp": {
           "model": "omp/work",
           "thinking_level": "max"
+        },
+        "broca": {
+          "model": "broca/work",
+          "fallback_models": [
+            "broca/work-fallback"
+          ],
+          "variant": "high"
         },
         "two_pass": false,
         "disallowed_tools": []
@@ -643,6 +691,8 @@
       "transform_mode": "ts",
       "rust_pipeline": "full_request",
       "signed_thinking_hold": "off",
+      "rust_provider_preparation": false,
+      "rust_background_enabled": false,
       "historian": {
         "pi": {
           "model": "pi/cheap"
@@ -748,6 +798,8 @@
       "transform_mode": "ts",
       "rust_pipeline": "full_request",
       "signed_thinking_hold": "off",
+      "rust_provider_preparation": false,
+      "rust_background_enabled": false,
       "smart_notes": {
         "enabled": true,
         "retina_handoff": false
@@ -856,6 +908,8 @@
       "transform_mode": "ts",
       "rust_pipeline": "full_request",
       "signed_thinking_hold": "off",
+      "rust_provider_preparation": false,
+      "rust_background_enabled": false,
       "smart_notes": {
         "enabled": true,
         "retina_handoff": false
@@ -971,6 +1025,8 @@
       "transform_mode": "ts",
       "rust_pipeline": "full_request",
       "signed_thinking_hold": "off",
+      "rust_provider_preparation": false,
+      "rust_background_enabled": false,
       "historian": {
         "pi": {
           "model": "pi/ok"
@@ -1088,6 +1144,8 @@
       "transform_mode": "ts",
       "rust_pipeline": "full_request",
       "signed_thinking_hold": "off",
+      "rust_provider_preparation": false,
+      "rust_background_enabled": false,
       "smart_notes": {
         "enabled": true,
         "retina_handoff": false
@@ -1194,6 +1252,8 @@
       "transform_mode": "ts",
       "rust_pipeline": "full_request",
       "signed_thinking_hold": "off",
+      "rust_provider_preparation": false,
+      "rust_background_enabled": false,
       "smart_notes": {
         "enabled": true,
         "retina_handoff": false
@@ -1299,6 +1359,8 @@
       "transform_mode": "ts",
       "rust_pipeline": "full_request",
       "signed_thinking_hold": "off",
+      "rust_provider_preparation": false,
+      "rust_background_enabled": false,
       "smart_notes": {
         "enabled": true,
         "retina_handoff": false
@@ -1404,6 +1466,8 @@
       "transform_mode": "ts",
       "rust_pipeline": "full_request",
       "signed_thinking_hold": "off",
+      "rust_provider_preparation": false,
+      "rust_background_enabled": false,
       "smart_notes": {
         "enabled": true,
         "retina_handoff": false
@@ -1509,6 +1573,8 @@
       "transform_mode": "ts",
       "rust_pipeline": "full_request",
       "signed_thinking_hold": "off",
+      "rust_provider_preparation": false,
+      "rust_background_enabled": false,
       "smart_notes": {
         "enabled": true,
         "retina_handoff": false
@@ -1610,6 +1676,8 @@
       "transform_mode": "ts",
       "rust_pipeline": "full_request",
       "signed_thinking_hold": "off",
+      "rust_provider_preparation": false,
+      "rust_background_enabled": false,
       "smart_notes": {
         "enabled": true,
         "retina_handoff": false
@@ -1715,6 +1783,8 @@
       "transform_mode": "ts",
       "rust_pipeline": "full_request",
       "signed_thinking_hold": "off",
+      "rust_provider_preparation": false,
+      "rust_background_enabled": false,
       "smart_notes": {
         "enabled": true,
         "retina_handoff": false
@@ -1723,7 +1793,9 @@
       "prompt_surface": {
         "default": "full"
       },
-      "models": {},
+      "models": {
+        "window_overlay_path": ""
+      },
       "toast_duration_ms": 5000,
       "execute_threshold_percentage": 65,
       "history_budget_percentage": 0.15,
@@ -1790,17 +1862,17 @@
       }
     },
     "warnings": [
-      "file_missing",
-      "invalid_leaf"
+      "deprecated",
+      "file_missing"
     ],
     "warningMessages": [
       "[user config] $ROOT/xdg/cortexkit/magic-context.jsonc: File not found for {file:absent.txt} (resolved to $ROOT/xdg/cortexkit/absent.txt); using empty string",
-      "[user config] \"models\": invalid nested field(s) \"models.window_overlay_path\", using defaults for those."
+      "[user config] models.window_overlay_path is deprecated and ignored; Fusiform no longer publishes window-overlay data, so this setting no longer changes model window geometry. Remove this key."
     ],
     "trust": {
       "user": "substitution-failure",
       "project": "ok",
-      "outcome": "schema-recovery",
+      "outcome": "substitution-failure",
       "trusted": false,
       "cacheTtlConfigured": false
     }
@@ -1831,6 +1903,8 @@
       "transform_mode": "ts",
       "rust_pipeline": "full_request",
       "signed_thinking_hold": "off",
+      "rust_provider_preparation": false,
+      "rust_background_enabled": false,
       "dreamer": {
         "pi": {
           "model": "{env:GOLDEN_SECRET}"
@@ -1993,6 +2067,8 @@
       "transform_mode": "ts",
       "rust_pipeline": "full_request",
       "signed_thinking_hold": "off",
+      "rust_provider_preparation": false,
+      "rust_background_enabled": false,
       "dreamer": {
         "pi": {
           "model": "{file:../../escape.txt}"
@@ -2121,7 +2197,7 @@
     ],
     "warningMessages": [
       "[project config] $ROOT/project/.cortexkit/magic-context.jsonc: Project-level config no longer supports {file:} tokens for security reasons; leaving tokens literal. Move secret expansion to user-level config.",
-      "[project config] Ignoring models.window_overlay_path from project config (security: only user-level config may select model geometry metadata).",
+      "[project config] Ignoring models.window_overlay_path from project config (deprecated; this setting no longer changes model window geometry).",
       "[project config] Ignoring prompt_surface.guidance_override_path from project config (security: repositories may select prompt presets but only user config may provide guidance or tool-description text)."
     ],
     "trust": {
@@ -2159,6 +2235,8 @@
       "transform_mode": "ts",
       "rust_pipeline": "full_request",
       "signed_thinking_hold": "off",
+      "rust_provider_preparation": false,
+      "rust_background_enabled": false,
       "dreamer": {
         "pi": {
           "model": "{file:~/key.txt}"
@@ -2308,6 +2386,8 @@
       "transform_mode": "ts",
       "rust_pipeline": "full_request",
       "signed_thinking_hold": "on",
+      "rust_provider_preparation": false,
+      "rust_background_enabled": false,
       "smart_notes": {
         "enabled": true,
         "retina_handoff": false
@@ -2469,6 +2549,13 @@
         "omp": {
           "model": "evil",
           "thinking_level": "max"
+        },
+        "broca": {
+          "model": "evil",
+          "variant": "max",
+          "fallback_models": [
+            "evil/fallback"
+          ]
         }
       },
       "dreamer": {
@@ -2484,11 +2571,14 @@
       "transform_mode": "ts",
       "rust_pipeline": "full_request",
       "signed_thinking_hold": "off",
+      "rust_provider_preparation": false,
+      "rust_background_enabled": false,
       "language": "en",
       "historian": {
         "opencode": {},
         "pi": {},
         "omp": {},
+        "broca": {},
         "two_pass": false,
         "disallowed_tools": []
       },
@@ -2634,7 +2724,7 @@
       "[project config] Ignoring subc from project config (security: daemon routing and developer-only embedding traffic are user-level settings).",
       "[project config] Ignoring shadow_embedding from project config (security: daemon routing and developer-only embedding traffic are user-level settings).",
       "[project config] Ignoring embedding.endpoint/provider/query_instruction/document_prefix from project config (security: a repository cannot choose where or how private text is embedded).",
-      "[project config] Ignoring historian.runner, historian.host_runner, historian.opencode.model, historian.opencode.fallback_models, historian.opencode.variant, historian.pi.model, historian.pi.thinking_level, historian.omp.model, historian.omp.thinking_level from project config (security: historian model selection is user-level only; a repository cannot force extra compaction cost).",
+      "[project config] Ignoring historian.runner, historian.host_runner, historian.opencode.model, historian.opencode.fallback_models, historian.opencode.variant, historian.pi.model, historian.pi.thinking_level, historian.omp.model, historian.omp.thinking_level, historian.broca.model, historian.broca.fallback_models, historian.broca.variant from project config (security: historian model selection is user-level only; a repository cannot force extra compaction cost).",
       "[project config] Ignoring dreamer.runner from project config (security: which process and provider account run dreamer completions is a user-level setting)."
     ],
     "trust": {
@@ -2708,6 +2798,8 @@
       "transform_mode": "ts",
       "rust_pipeline": "full_request",
       "signed_thinking_hold": "off",
+      "rust_provider_preparation": false,
+      "rust_background_enabled": false,
       "historian": {
         "pi": {},
         "two_pass": false,
@@ -2897,6 +2989,8 @@
       "transform_mode": "ts",
       "rust_pipeline": "full_request",
       "signed_thinking_hold": "off",
+      "rust_provider_preparation": false,
+      "rust_background_enabled": false,
       "smart_notes": {
         "enabled": true,
         "retina_handoff": false
@@ -3026,6 +3120,8 @@
       "transform_mode": "ts",
       "rust_pipeline": "full_request",
       "signed_thinking_hold": "off",
+      "rust_provider_preparation": false,
+      "rust_background_enabled": false,
       "smart_notes": {
         "enabled": true,
         "retina_handoff": false
@@ -3135,6 +3231,8 @@
       "transform_mode": "ts",
       "rust_pipeline": "full_request",
       "signed_thinking_hold": "off",
+      "rust_provider_preparation": false,
+      "rust_background_enabled": false,
       "smart_notes": {
         "enabled": true,
         "retina_handoff": false
@@ -3247,6 +3345,8 @@
       "transform_mode": "ts",
       "rust_pipeline": "full_request",
       "signed_thinking_hold": "off",
+      "rust_provider_preparation": false,
+      "rust_background_enabled": false,
       "smart_notes": {
         "enabled": true,
         "retina_handoff": false
@@ -3360,6 +3460,8 @@
       "transform_mode": "ts",
       "rust_pipeline": "full_request",
       "signed_thinking_hold": "off",
+      "rust_provider_preparation": false,
+      "rust_background_enabled": false,
       "smart_notes": {
         "enabled": true,
         "retina_handoff": false
@@ -3476,6 +3578,8 @@
       "transform_mode": "ts",
       "rust_pipeline": "full_request",
       "signed_thinking_hold": "off",
+      "rust_provider_preparation": false,
+      "rust_background_enabled": false,
       "historian": {
         "pi": {
           "model": "pi/model"
@@ -3582,6 +3686,8 @@
       "transform_mode": "ts",
       "rust_pipeline": "full_request",
       "signed_thinking_hold": "off",
+      "rust_provider_preparation": false,
+      "rust_background_enabled": false,
       "smart_notes": {
         "enabled": true,
         "retina_handoff": false
@@ -3683,6 +3789,8 @@
       "transform_mode": "ts",
       "rust_pipeline": "full_request",
       "signed_thinking_hold": "off",
+      "rust_provider_preparation": false,
+      "rust_background_enabled": false,
       "smart_notes": {
         "enabled": true,
         "retina_handoff": false
@@ -3782,6 +3890,8 @@
       "transform_mode": "ts",
       "rust_pipeline": "full_request",
       "signed_thinking_hold": "off",
+      "rust_provider_preparation": false,
+      "rust_background_enabled": false,
       "smart_notes": {
         "enabled": true,
         "retina_handoff": false
@@ -3881,6 +3991,8 @@
       "transform_mode": "ts",
       "rust_pipeline": "full_request",
       "signed_thinking_hold": "off",
+      "rust_provider_preparation": false,
+      "rust_background_enabled": false,
       "smart_notes": {
         "enabled": true,
         "retina_handoff": false
@@ -3985,6 +4097,8 @@
       "transform_mode": "ts",
       "rust_pipeline": "full_request",
       "signed_thinking_hold": "off",
+      "rust_provider_preparation": false,
+      "rust_background_enabled": false,
       "smart_notes": {
         "enabled": true,
         "retina_handoff": false
@@ -4082,6 +4196,8 @@
       "transform_mode": "ts",
       "rust_pipeline": "full_request",
       "signed_thinking_hold": "off",
+      "rust_provider_preparation": false,
+      "rust_background_enabled": false,
       "smart_notes": {
         "enabled": true,
         "retina_handoff": false
@@ -4183,6 +4299,8 @@
       "transform_mode": "ts",
       "rust_pipeline": "full_request",
       "signed_thinking_hold": "off",
+      "rust_provider_preparation": false,
+      "rust_background_enabled": false,
       "smart_notes": {
         "enabled": true,
         "retina_handoff": false
@@ -4294,6 +4412,8 @@
       "transform_mode": "ts",
       "rust_pipeline": "full_request",
       "signed_thinking_hold": "off",
+      "rust_provider_preparation": false,
+      "rust_background_enabled": false,
       "historian": {
         "opencode": {
           "model": "p/model",
@@ -4469,6 +4589,8 @@
       "transform_mode": "ts",
       "rust_pipeline": "full_request",
       "signed_thinking_hold": "off",
+      "rust_provider_preparation": false,
+      "rust_background_enabled": false,
       "smart_notes": {
         "enabled": true,
         "retina_handoff": false
@@ -4569,6 +4691,8 @@
       "transform_mode": "ts",
       "rust_pipeline": "full_request",
       "signed_thinking_hold": "off",
+      "rust_provider_preparation": false,
+      "rust_background_enabled": false,
       "smart_notes": {
         "enabled": true,
         "retina_handoff": false
@@ -4690,6 +4814,8 @@
       "transform_mode": "ts",
       "rust_pipeline": "full_request",
       "signed_thinking_hold": "off",
+      "rust_provider_preparation": false,
+      "rust_background_enabled": false,
       "historian": {
         "two_pass": false,
         "disallowed_tools": []
@@ -4800,6 +4926,8 @@
       "transform_mode": "ts",
       "rust_pipeline": "full_request",
       "signed_thinking_hold": "off",
+      "rust_provider_preparation": false,
+      "rust_background_enabled": false,
       "historian": {
         "opencode": {
           "model": "p/model"
@@ -4916,6 +5044,8 @@
       "transform_mode": "ts",
       "rust_pipeline": "full_request",
       "signed_thinking_hold": "off",
+      "rust_provider_preparation": false,
+      "rust_background_enabled": false,
       "historian": {
         "opencode": {
           "model": {
@@ -5029,6 +5159,8 @@
       "transform_mode": "ts",
       "rust_pipeline": "full_request",
       "signed_thinking_hold": "off",
+      "rust_provider_preparation": false,
+      "rust_background_enabled": false,
       "historian": {
         "opencode": {
           "model": "p/model"
@@ -5139,6 +5271,8 @@
       "transform_mode": "ts",
       "rust_pipeline": "full_request",
       "signed_thinking_hold": "off",
+      "rust_provider_preparation": false,
+      "rust_background_enabled": false,
       "smart_notes": {
         "enabled": true,
         "retina_handoff": false
@@ -5245,6 +5379,8 @@
       "transform_mode": "ts",
       "rust_pipeline": "full_request",
       "signed_thinking_hold": "off",
+      "rust_provider_preparation": false,
+      "rust_background_enabled": false,
       "smart_notes": {
         "enabled": true,
         "retina_handoff": false
@@ -5340,6 +5476,8 @@
       "transform_mode": "ts",
       "rust_pipeline": "full_request",
       "signed_thinking_hold": "off",
+      "rust_provider_preparation": false,
+      "rust_background_enabled": false,
       "smart_notes": {
         "enabled": true,
         "retina_handoff": false
@@ -5442,6 +5580,8 @@
       "transform_mode": "ts",
       "rust_pipeline": "full_request",
       "signed_thinking_hold": "off",
+      "rust_provider_preparation": false,
+      "rust_background_enabled": false,
       "smart_notes": {
         "enabled": true,
         "retina_handoff": false
@@ -5541,6 +5681,8 @@
       "transform_mode": "ts",
       "rust_pipeline": "full_request",
       "signed_thinking_hold": "off",
+      "rust_provider_preparation": false,
+      "rust_background_enabled": false,
       "smart_notes": {
         "enabled": true,
         "retina_handoff": false
@@ -5640,6 +5782,8 @@
       "transform_mode": "ts",
       "rust_pipeline": "full_request",
       "signed_thinking_hold": "off",
+      "rust_provider_preparation": false,
+      "rust_background_enabled": false,
       "smart_notes": {
         "enabled": true,
         "retina_handoff": false
@@ -5735,6 +5879,8 @@
       "transform_mode": "ts",
       "rust_pipeline": "full_request",
       "signed_thinking_hold": "off",
+      "rust_provider_preparation": false,
+      "rust_background_enabled": false,
       "smart_notes": {
         "enabled": true,
         "retina_handoff": false
@@ -5841,6 +5987,8 @@
       "transform_mode": "ts",
       "rust_pipeline": "full_request",
       "signed_thinking_hold": "off",
+      "rust_provider_preparation": false,
+      "rust_background_enabled": false,
       "smart_notes": {
         "enabled": true,
         "retina_handoff": false
@@ -5942,6 +6090,8 @@
       "transform_mode": "ts",
       "rust_pipeline": "full_request",
       "signed_thinking_hold": "off",
+      "rust_provider_preparation": false,
+      "rust_background_enabled": false,
       "smart_notes": {
         "enabled": true,
         "retina_handoff": false
@@ -6043,6 +6193,8 @@
       "transform_mode": "ts",
       "rust_pipeline": "full_request",
       "signed_thinking_hold": "off",
+      "rust_provider_preparation": false,
+      "rust_background_enabled": false,
       "smart_notes": {
         "enabled": true,
         "retina_handoff": false
@@ -6142,6 +6294,8 @@
       "transform_mode": "ts",
       "rust_pipeline": "full_request",
       "signed_thinking_hold": "off",
+      "rust_provider_preparation": false,
+      "rust_background_enabled": false,
       "smart_notes": {
         "enabled": true,
         "retina_handoff": false
@@ -6241,6 +6395,8 @@
       "transform_mode": "ts",
       "rust_pipeline": "full_request",
       "signed_thinking_hold": "off",
+      "rust_provider_preparation": false,
+      "rust_background_enabled": false,
       "smart_notes": {
         "enabled": true,
         "retina_handoff": false
@@ -6340,6 +6496,8 @@
       "transform_mode": "ts",
       "rust_pipeline": "full_request",
       "signed_thinking_hold": "off",
+      "rust_provider_preparation": false,
+      "rust_background_enabled": false,
       "smart_notes": {
         "enabled": true,
         "retina_handoff": false
@@ -6439,6 +6597,8 @@
       "transform_mode": "ts",
       "rust_pipeline": "full_request",
       "signed_thinking_hold": "off",
+      "rust_provider_preparation": false,
+      "rust_background_enabled": false,
       "smart_notes": {
         "enabled": true,
         "retina_handoff": false
@@ -6538,6 +6698,8 @@
       "transform_mode": "ts",
       "rust_pipeline": "full_request",
       "signed_thinking_hold": "off",
+      "rust_provider_preparation": false,
+      "rust_background_enabled": false,
       "smart_notes": {
         "enabled": true,
         "retina_handoff": false
@@ -6637,6 +6799,8 @@
       "transform_mode": "ts",
       "rust_pipeline": "full_request",
       "signed_thinking_hold": "off",
+      "rust_provider_preparation": false,
+      "rust_background_enabled": false,
       "smart_notes": {
         "enabled": true,
         "retina_handoff": false
@@ -6736,6 +6900,8 @@
       "transform_mode": "ts",
       "rust_pipeline": "full_request",
       "signed_thinking_hold": "off",
+      "rust_provider_preparation": false,
+      "rust_background_enabled": false,
       "smart_notes": {
         "enabled": true,
         "retina_handoff": false
@@ -6835,6 +7001,8 @@
       "transform_mode": "ts",
       "rust_pipeline": "full_request",
       "signed_thinking_hold": "off",
+      "rust_provider_preparation": false,
+      "rust_background_enabled": false,
       "smart_notes": {
         "enabled": true,
         "retina_handoff": false
@@ -6931,6 +7099,8 @@
       "transform_mode": "ts",
       "rust_pipeline": "full_request",
       "signed_thinking_hold": "off",
+      "rust_provider_preparation": false,
+      "rust_background_enabled": false,
       "smart_notes": {
         "enabled": true,
         "retina_handoff": false
@@ -7039,6 +7209,8 @@
       "transform_mode": "ts",
       "rust_pipeline": "full_request",
       "signed_thinking_hold": "off",
+      "rust_provider_preparation": false,
+      "rust_background_enabled": false,
       "smart_notes": {
         "enabled": true,
         "retina_handoff": false
@@ -7141,6 +7313,8 @@
       "transform_mode": "ts",
       "rust_pipeline": "full_request",
       "signed_thinking_hold": "off",
+      "rust_provider_preparation": false,
+      "rust_background_enabled": false,
       "smart_notes": {
         "enabled": true,
         "retina_handoff": false
@@ -7246,6 +7420,8 @@
       "transform_mode": "ts",
       "rust_pipeline": "full_request",
       "signed_thinking_hold": "off",
+      "rust_provider_preparation": false,
+      "rust_background_enabled": false,
       "smart_notes": {
         "enabled": true,
         "retina_handoff": false
@@ -7403,6 +7579,8 @@
       "transform_mode": "ts",
       "rust_pipeline": "full_request",
       "signed_thinking_hold": "off",
+      "rust_provider_preparation": false,
+      "rust_background_enabled": false,
       "auto_update": false,
       "smart_notes": {
         "enabled": true,
@@ -7521,9 +7699,11 @@
       "mural": {
         "enabled": false
       },
-      "transform_mode": "rust",
-      "rust_pipeline": "provider",
+      "transform_mode": "ts",
+      "rust_pipeline": "full_request",
       "signed_thinking_hold": "off",
+      "rust_provider_preparation": false,
+      "rust_background_enabled": false,
       "smart_notes": {
         "enabled": true,
         "retina_handoff": false
@@ -7624,6 +7804,8 @@
       "transform_mode": "ts",
       "rust_pipeline": "full_request",
       "signed_thinking_hold": "off",
+      "rust_provider_preparation": false,
+      "rust_background_enabled": false,
       "smart_notes": {
         "enabled": true,
         "retina_handoff": false
@@ -7697,12 +7879,8 @@
         }
       }
     },
-    "warnings": [
-      "transform_mode"
-    ],
-    "warningMessages": [
-      "[config] rust mode requires user-level subc configuration; running ts."
-    ],
+    "warnings": [],
+    "warningMessages": [],
     "trust": {
       "user": "ok",
       "project": "ok",
@@ -7731,6 +7909,8 @@
       "transform_mode": "ts",
       "rust_pipeline": "full_request",
       "signed_thinking_hold": "off",
+      "rust_provider_preparation": false,
+      "rust_background_enabled": false,
       "smart_notes": {
         "enabled": true,
         "retina_handoff": false
@@ -7807,12 +7987,8 @@
         }
       }
     },
-    "warnings": [
-      "transform_mode"
-    ],
-    "warningMessages": [
-      "[config] compaction-off mode does not support rust transform mode; using the TypeScript transform."
-    ],
+    "warnings": [],
+    "warningMessages": [],
     "trust": {
       "user": "ok",
       "project": "ok",
@@ -7839,6 +8015,8 @@
       "transform_mode": "ts",
       "rust_pipeline": "full_request",
       "signed_thinking_hold": "off",
+      "rust_provider_preparation": false,
+      "rust_background_enabled": false,
       "smart_notes": {
         "enabled": true,
         "retina_handoff": false
@@ -7940,6 +8118,8 @@
       "transform_mode": "ts",
       "rust_pipeline": "full_request",
       "signed_thinking_hold": "off",
+      "rust_provider_preparation": false,
+      "rust_background_enabled": false,
       "smart_notes": {
         "enabled": true,
         "retina_handoff": false
@@ -8044,6 +8224,8 @@
       "transform_mode": "ts",
       "rust_pipeline": "full_request",
       "signed_thinking_hold": "off",
+      "rust_provider_preparation": false,
+      "rust_background_enabled": false,
       "smart_notes": {
         "enabled": true,
         "retina_handoff": false
@@ -8155,6 +8337,8 @@
       "transform_mode": "ts",
       "rust_pipeline": "full_request",
       "signed_thinking_hold": "off",
+      "rust_provider_preparation": false,
+      "rust_background_enabled": false,
       "historian": {
         "expand_tools": {
           "read": "${input.paths[*].path.join(\"\\n\").truncate(200)}",
@@ -8268,6 +8452,8 @@
       "transform_mode": "ts",
       "rust_pipeline": "full_request",
       "signed_thinking_hold": "off",
+      "rust_provider_preparation": false,
+      "rust_background_enabled": false,
       "historian": {
         "expand_tools": {
           "okay": "${output}"
@@ -8386,6 +8572,8 @@
       "transform_mode": "ts",
       "rust_pipeline": "full_request",
       "signed_thinking_hold": "off",
+      "rust_provider_preparation": false,
+      "rust_background_enabled": false,
       "dreamer": {
         "tasks": {
           "map-memories": {
@@ -8540,6 +8728,8 @@
       "transform_mode": "ts",
       "rust_pipeline": "full_request",
       "signed_thinking_hold": "off",
+      "rust_provider_preparation": false,
+      "rust_background_enabled": false,
       "smart_notes": {
         "enabled": true,
         "retina_handoff": false
@@ -8669,6 +8859,8 @@
       "transform_mode": "ts",
       "rust_pipeline": "full_request",
       "signed_thinking_hold": "off",
+      "rust_provider_preparation": false,
+      "rust_background_enabled": false,
       "smart_notes": {
         "enabled": true,
         "retina_handoff": false
@@ -8791,6 +8983,8 @@
       "transform_mode": "ts",
       "rust_pipeline": "full_request",
       "signed_thinking_hold": "off",
+      "rust_provider_preparation": false,
+      "rust_background_enabled": false,
       "smart_notes": {
         "enabled": true,
         "retina_handoff": false
@@ -8910,6 +9104,8 @@
       "transform_mode": "ts",
       "rust_pipeline": "full_request",
       "signed_thinking_hold": "off",
+      "rust_provider_preparation": false,
+      "rust_background_enabled": false,
       "smart_notes": {
         "enabled": true,
         "retina_handoff": false
@@ -9020,6 +9216,8 @@
       "transform_mode": "ts",
       "rust_pipeline": "full_request",
       "signed_thinking_hold": "off",
+      "rust_provider_preparation": false,
+      "rust_background_enabled": false,
       "smart_notes": {
         "enabled": true,
         "retina_handoff": false
@@ -9126,6 +9324,8 @@
       "transform_mode": "ts",
       "rust_pipeline": "full_request",
       "signed_thinking_hold": "off",
+      "rust_provider_preparation": false,
+      "rust_background_enabled": false,
       "smart_notes": {
         "enabled": true,
         "retina_handoff": false
@@ -9243,6 +9443,8 @@
       "transform_mode": "ts",
       "rust_pipeline": "full_request",
       "signed_thinking_hold": "off",
+      "rust_provider_preparation": false,
+      "rust_background_enabled": false,
       "historian": {
         "pi": {
           "fallback_models": [
@@ -9366,6 +9568,8 @@
       "transform_mode": "ts",
       "rust_pipeline": "full_request",
       "signed_thinking_hold": "off",
+      "rust_provider_preparation": false,
+      "rust_background_enabled": false,
       "historian": {
         "opencode": {
           "model": "p/new"
@@ -9538,6 +9742,8 @@
       "transform_mode": "ts",
       "rust_pipeline": "full_request",
       "signed_thinking_hold": "off",
+      "rust_provider_preparation": false,
+      "rust_background_enabled": false,
       "smart_notes": {
         "enabled": true,
         "retina_handoff": false
@@ -9639,6 +9845,8 @@
       "transform_mode": "ts",
       "rust_pipeline": "full_request",
       "signed_thinking_hold": "off",
+      "rust_provider_preparation": false,
+      "rust_background_enabled": false,
       "smart_notes": {
         "enabled": true,
         "retina_handoff": false
@@ -9741,6 +9949,8 @@
       "transform_mode": "ts",
       "rust_pipeline": "full_request",
       "signed_thinking_hold": "off",
+      "rust_provider_preparation": false,
+      "rust_background_enabled": false,
       "smart_notes": {
         "enabled": true,
         "retina_handoff": false
@@ -9843,6 +10053,8 @@
       "transform_mode": "ts",
       "rust_pipeline": "full_request",
       "signed_thinking_hold": "off",
+      "rust_provider_preparation": false,
+      "rust_background_enabled": false,
       "smart_notes": {
         "enabled": true,
         "retina_handoff": false
@@ -9948,6 +10160,8 @@
       "transform_mode": "ts",
       "rust_pipeline": "full_request",
       "signed_thinking_hold": "off",
+      "rust_provider_preparation": false,
+      "rust_background_enabled": false,
       "smart_notes": {
         "enabled": true,
         "retina_handoff": false
@@ -10051,6 +10265,8 @@
       "transform_mode": "ts",
       "rust_pipeline": "full_request",
       "signed_thinking_hold": "off",
+      "rust_provider_preparation": false,
+      "rust_background_enabled": false,
       "smart_notes": {
         "enabled": true,
         "retina_handoff": false
@@ -10154,6 +10370,8 @@
       "transform_mode": "ts",
       "rust_pipeline": "full_request",
       "signed_thinking_hold": "off",
+      "rust_provider_preparation": false,
+      "rust_background_enabled": false,
       "dreamer": {
         "tasks": {
           "map-memories": {
@@ -10304,6 +10522,8 @@
       "transform_mode": "ts",
       "rust_pipeline": "full_request",
       "signed_thinking_hold": "off",
+      "rust_provider_preparation": false,
+      "rust_background_enabled": false,
       "dreamer": {
         "tasks": {
           "map-memories": {
@@ -10454,6 +10674,8 @@
       "transform_mode": "ts",
       "rust_pipeline": "full_request",
       "signed_thinking_hold": "off",
+      "rust_provider_preparation": false,
+      "rust_background_enabled": false,
       "dreamer": {
         "tasks": {
           "map-memories": {
@@ -10604,6 +10826,8 @@
       "transform_mode": "ts",
       "rust_pipeline": "full_request",
       "signed_thinking_hold": "off",
+      "rust_provider_preparation": false,
+      "rust_background_enabled": false,
       "dreamer": {
         "tasks": {
           "map-memories": {
@@ -10752,6 +10976,8 @@
       "transform_mode": "ts",
       "rust_pipeline": "full_request",
       "signed_thinking_hold": "off",
+      "rust_provider_preparation": false,
+      "rust_background_enabled": false,
       "dreamer": {
         "tasks": {
           "map-memories": {
@@ -10900,6 +11126,8 @@
       "transform_mode": "ts",
       "rust_pipeline": "full_request",
       "signed_thinking_hold": "off",
+      "rust_provider_preparation": false,
+      "rust_background_enabled": false,
       "dreamer": {
         "tasks": {
           "map-memories": {
@@ -11049,6 +11277,8 @@
       "transform_mode": "ts",
       "rust_pipeline": "full_request",
       "signed_thinking_hold": "off",
+      "rust_provider_preparation": false,
+      "rust_background_enabled": false,
       "dreamer": {
         "tasks": {
           "map-memories": {
@@ -11198,6 +11428,8 @@
       "transform_mode": "ts",
       "rust_pipeline": "full_request",
       "signed_thinking_hold": "off",
+      "rust_provider_preparation": false,
+      "rust_background_enabled": false,
       "dreamer": {
         "disable": true,
         "tasks": {
@@ -11347,6 +11579,8 @@
       "transform_mode": "ts",
       "rust_pipeline": "full_request",
       "signed_thinking_hold": "off",
+      "rust_provider_preparation": false,
+      "rust_background_enabled": false,
       "dreamer": {
         "tasks": {
           "map-memories": {
@@ -11491,6 +11725,8 @@
       "transform_mode": "ts",
       "rust_pipeline": "full_request",
       "signed_thinking_hold": "off",
+      "rust_provider_preparation": false,
+      "rust_background_enabled": false,
       "historian": {
         "two_pass": false,
         "disallowed_tools": []
@@ -11598,6 +11834,8 @@
       "transform_mode": "ts",
       "rust_pipeline": "full_request",
       "signed_thinking_hold": "off",
+      "rust_provider_preparation": false,
+      "rust_background_enabled": false,
       "dreamer": {
         "tasks": {
           "map-memories": {
@@ -11749,6 +11987,8 @@
       "transform_mode": "ts",
       "rust_pipeline": "full_request",
       "signed_thinking_hold": "off",
+      "rust_provider_preparation": false,
+      "rust_background_enabled": false,
       "dreamer": {
         "tasks": {
           "map-memories": {
@@ -11900,6 +12140,8 @@
       "transform_mode": "ts",
       "rust_pipeline": "full_request",
       "signed_thinking_hold": "off",
+      "rust_provider_preparation": false,
+      "rust_background_enabled": false,
       "dreamer": {
         "tasks": {
           "map-memories": {
@@ -12050,6 +12292,8 @@
       "transform_mode": "ts",
       "rust_pipeline": "full_request",
       "signed_thinking_hold": "off",
+      "rust_provider_preparation": false,
+      "rust_background_enabled": false,
       "dreamer": {
         "tasks": {
           "map-memories": {
@@ -12198,6 +12442,8 @@
       "transform_mode": "ts",
       "rust_pipeline": "full_request",
       "signed_thinking_hold": "off",
+      "rust_provider_preparation": false,
+      "rust_background_enabled": false,
       "smart_notes": {
         "enabled": true,
         "retina_handoff": false
@@ -12303,6 +12549,8 @@
       "transform_mode": "ts",
       "rust_pipeline": "full_request",
       "signed_thinking_hold": "off",
+      "rust_provider_preparation": false,
+      "rust_background_enabled": false,
       "dreamer": {
         "tasks": {
           "map-memories": {
@@ -12455,6 +12703,8 @@
       "transform_mode": "ts",
       "rust_pipeline": "full_request",
       "signed_thinking_hold": "off",
+      "rust_provider_preparation": false,
+      "rust_background_enabled": false,
       "dreamer": {
         "tasks": {
           "map-memories": {
@@ -12607,6 +12857,8 @@
       "transform_mode": "ts",
       "rust_pipeline": "full_request",
       "signed_thinking_hold": "off",
+      "rust_provider_preparation": false,
+      "rust_background_enabled": false,
       "dreamer": {
         "tasks": {
           "map-memories": {
@@ -12759,6 +13011,8 @@
       "transform_mode": "ts",
       "rust_pipeline": "full_request",
       "signed_thinking_hold": "off",
+      "rust_provider_preparation": false,
+      "rust_background_enabled": false,
       "dreamer": {
         "tasks": {
           "map-memories": {
@@ -12911,6 +13165,8 @@
       "transform_mode": "ts",
       "rust_pipeline": "full_request",
       "signed_thinking_hold": "off",
+      "rust_provider_preparation": false,
+      "rust_background_enabled": false,
       "dreamer": {
         "tasks": {
           "map-memories": {
@@ -13065,6 +13321,8 @@
       "transform_mode": "ts",
       "rust_pipeline": "full_request",
       "signed_thinking_hold": "off",
+      "rust_provider_preparation": false,
+      "rust_background_enabled": false,
       "dreamer": {
         "tasks": {
           "map-memories": {

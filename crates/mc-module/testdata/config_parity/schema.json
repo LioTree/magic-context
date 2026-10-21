@@ -73,6 +73,20 @@
         },
         "value": "off"
       },
+      "rust_provider_preparation": {
+        "type": "default",
+        "inner": {
+          "type": "boolean"
+        },
+        "value": false
+      },
+      "rust_background_enabled": {
+        "type": "default",
+        "inner": {
+          "type": "boolean"
+        },
+        "value": false
+      },
       "auto_update": {
         "type": "optional",
         "inner": {
@@ -416,6 +430,82 @@
                                 "inherit",
                                 "auto"
                               ]
+                            }
+                          }
+                        },
+                        "catchall": {
+                          "type": "never"
+                        }
+                      }
+                    },
+                    "broca": {
+                      "type": "optional",
+                      "inner": {
+                        "type": "object",
+                        "shape": {
+                          "model": {
+                            "type": "optional",
+                            "inner": {
+                              "type": "union",
+                              "options": [
+                                {
+                                  "type": "string"
+                                },
+                                {
+                                  "type": "object",
+                                  "shape": {
+                                    "model": {
+                                      "type": "string"
+                                    },
+                                    "variant": {
+                                      "type": "optional",
+                                      "inner": {
+                                        "type": "string"
+                                      }
+                                    }
+                                  },
+                                  "catchall": {
+                                    "type": "never"
+                                  }
+                                }
+                              ]
+                            }
+                          },
+                          "fallback_models": {
+                            "type": "optional",
+                            "inner": {
+                              "type": "array",
+                              "element": {
+                                "type": "union",
+                                "options": [
+                                  {
+                                    "type": "string"
+                                  },
+                                  {
+                                    "type": "object",
+                                    "shape": {
+                                      "model": {
+                                        "type": "string"
+                                      },
+                                      "variant": {
+                                        "type": "optional",
+                                        "inner": {
+                                          "type": "string"
+                                        }
+                                      }
+                                    },
+                                    "catchall": {
+                                      "type": "never"
+                                    }
+                                  }
+                                ]
+                              }
+                            }
+                          },
+                          "variant": {
+                            "type": "optional",
+                            "inner": {
+                              "type": "string"
                             }
                           }
                         },
@@ -1234,6 +1324,82 @@
                         "inherit",
                         "auto"
                       ]
+                    }
+                  }
+                },
+                "catchall": {
+                  "type": "never"
+                }
+              }
+            },
+            "broca": {
+              "type": "optional",
+              "inner": {
+                "type": "object",
+                "shape": {
+                  "model": {
+                    "type": "optional",
+                    "inner": {
+                      "type": "union",
+                      "options": [
+                        {
+                          "type": "string"
+                        },
+                        {
+                          "type": "object",
+                          "shape": {
+                            "model": {
+                              "type": "string"
+                            },
+                            "variant": {
+                              "type": "optional",
+                              "inner": {
+                                "type": "string"
+                              }
+                            }
+                          },
+                          "catchall": {
+                            "type": "never"
+                          }
+                        }
+                      ]
+                    }
+                  },
+                  "fallback_models": {
+                    "type": "optional",
+                    "inner": {
+                      "type": "array",
+                      "element": {
+                        "type": "union",
+                        "options": [
+                          {
+                            "type": "string"
+                          },
+                          {
+                            "type": "object",
+                            "shape": {
+                              "model": {
+                                "type": "string"
+                              },
+                              "variant": {
+                                "type": "optional",
+                                "inner": {
+                                  "type": "string"
+                                }
+                              }
+                            },
+                            "catchall": {
+                              "type": "never"
+                            }
+                          }
+                        ]
+                      }
+                    }
+                  },
+                  "variant": {
+                    "type": "optional",
+                    "inner": {
+                      "type": "string"
                     }
                   }
                 },
@@ -3004,16 +3170,7 @@
             "window_overlay_path": {
               "type": "optional",
               "inner": {
-                "type": "string",
-                "checks": [
-                  {
-                    "check": "trim"
-                  },
-                  {
-                    "check": "min_length",
-                    "minimum": 1
-                  }
-                ]
+                "type": "unknown"
               }
             }
           }
@@ -4293,6 +4450,82 @@
                     "type": "never"
                   }
                 }
+              },
+              "broca": {
+                "type": "optional",
+                "inner": {
+                  "type": "object",
+                  "shape": {
+                    "model": {
+                      "type": "optional",
+                      "inner": {
+                        "type": "union",
+                        "options": [
+                          {
+                            "type": "string"
+                          },
+                          {
+                            "type": "object",
+                            "shape": {
+                              "model": {
+                                "type": "string"
+                              },
+                              "variant": {
+                                "type": "optional",
+                                "inner": {
+                                  "type": "string"
+                                }
+                              }
+                            },
+                            "catchall": {
+                              "type": "never"
+                            }
+                          }
+                        ]
+                      }
+                    },
+                    "fallback_models": {
+                      "type": "optional",
+                      "inner": {
+                        "type": "array",
+                        "element": {
+                          "type": "union",
+                          "options": [
+                            {
+                              "type": "string"
+                            },
+                            {
+                              "type": "object",
+                              "shape": {
+                                "model": {
+                                  "type": "string"
+                                },
+                                "variant": {
+                                  "type": "optional",
+                                  "inner": {
+                                    "type": "string"
+                                  }
+                                }
+                              },
+                              "catchall": {
+                                "type": "never"
+                              }
+                            }
+                          ]
+                        }
+                      }
+                    },
+                    "variant": {
+                      "type": "optional",
+                      "inner": {
+                        "type": "string"
+                      }
+                    }
+                  },
+                  "catchall": {
+                    "type": "never"
+                  }
+                }
               }
             },
             "catchall": {
@@ -4800,6 +5033,7 @@
   "commands": [
     "ctx-status",
     "ctx-recomp",
+    "ctx-rescore",
     "ctx-wrapup",
     "ctx-flush",
     "ctx-dream",

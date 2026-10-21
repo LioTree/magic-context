@@ -257,6 +257,37 @@ export const OmpHarnessBlockSchema = z
     .describe("Strict OMP model-resolution block. It accepts no OpenCode vocabulary.");
 export type OmpHarnessBlock = z.infer<typeof OmpHarnessBlockSchema>;
 
+/** Strict model-resolution block used by historian.broca. */
+const BrocaEntryObjectSchema = z
+    .object({
+        model: z.string().describe("Broca model ID (for example, provider/model)."),
+        variant: z.string().optional().describe("Broca reasoning variant for this entry."),
+    })
+    .strict();
+const BrocaEntrySchema = z.union([
+    z.string().describe("Broca model ID (for example, provider/model)."),
+    BrocaEntryObjectSchema,
+]);
+export const BrocaHarnessBlockSchema = z
+    .object({
+        model: BrocaEntrySchema.optional().describe("Primary Broca model entry."),
+        fallback_models: z
+            .array(BrocaEntrySchema)
+            .optional()
+            .describe("Ordered fallback Broca entries."),
+        variant: z
+            .string()
+            .optional()
+            .describe(
+                "Broca reasoning variant for the primary entry when it declares none. Fallback entries declare variants per-entry.",
+            ),
+    })
+    .strict()
+    .describe(
+        "Strict user-level Broca model-resolution block for ck-mc sessions. Its free-form variant string is forwarded as model.variant in the Broca llm-runner session.send request. When no primary is configured, ck-mc tries the session model after configured fallbacks. TypeScript hosts validate this block but do not resolve models from it.",
+    );
+export type BrocaHarnessBlock = z.infer<typeof BrocaHarnessBlockSchema>;
+
 /** Strict OpenCode-only execution override for one dreamer task. */
 export const OpenCodeTaskExecutionSchema = z
     .object({
@@ -443,6 +474,7 @@ const ProfileHistorianSchema = z
         opencode: ProfileOpenCodeModelBlockSchema.optional(),
         pi: ProfilePiModelBlockSchema.optional(),
         omp: ProfileOmpModelBlockSchema.optional(),
+        broca: BrocaHarnessBlockSchema.optional(),
     })
     .strict();
 const ProfileDreamerSchema = z
@@ -672,8 +704,9 @@ export const DreamerConfigSchema = AgentMetadataSchema.extend({
 export type DreamerConfig = z.infer<typeof DreamerConfigSchema>;
 
 /**
- * Historian metadata remains harness-independent. Only model resolution moves to
- * the strict opencode, pi, and omp blocks; two_pass and disallowed_tools stay here.
+ * Historian metadata remains harness-independent. Model resolution moves to strict
+ * per-harness blocks; two_pass and disallowed_tools stay here. TypeScript hosts do
+  * not resolve models from historian.broca, but validate the block for ck-mc sessions.
  */
 export const HistorianConfigSchema = AgentMetadataSchema.extend({
     expand_tools: z
@@ -694,6 +727,7 @@ export const HistorianConfigSchema = AgentMetadataSchema.extend({
     opencode: OpenCodeHarnessBlockSchema.optional(),
     pi: PiHarnessBlockSchema.optional(),
     omp: OmpHarnessBlockSchema.optional(),
+    broca: BrocaHarnessBlockSchema.optional(),
     runner: z
         .enum(["broca", "host"])
         .optional()
@@ -1215,10 +1249,10 @@ export const MagicContextConfigSchema = z
                 "Select a named user-owned model profile. A valid project name overrides this user default; an empty string, null, or other non-string project value is ignored with a warning so the user selection still applies. Unknown names warn and use the base configuration.",
             ),
         profiles: ConfigProfilesSchema.optional().describe(
-            "User-level named model profiles. A profile may contain only historian/dreamer model, fallback_models, OpenCode variant, and Pi/OMP thinking_level fields; task execution policy (including timeout_minutes) is excluded. Project configs may select a name but cannot define profiles.",
+            "User-level named model profiles. Profiles may set model and fallback_models in historian and dreamer blocks, plus variant for OpenCode and Broca or thinking_level for Pi and OMP. They cannot set task execution policy, including timeout_minutes. Project configs may select a name but cannot define profiles.",
         ),
         historian: HistorianConfigSchema.describe(
-            "Historian metadata plus independent strict OpenCode, Pi, and OMP execution blocks. Retained metadata stays at historian; model, fallback_models, variant, and thinking_level belong only in historian.opencode, historian.pi, or historian.omp.",
+            "Historian metadata plus independent strict OpenCode, Pi, OMP, and Broca execution blocks. Other historian metadata remains at historian. TypeScript hosts do not resolve models from historian.broca, which configures ck-mc's Broca session runner. Model, fallback_models, variant, and thinking_level belong in the matching harness block.",
         ),
         dreamer: DreamerConfigSchema.optional().describe(
             "Dreamer metadata and scheduling plus independent strict OpenCode, Pi, and OMP execution blocks. schedule and promotion_threshold stay at dreamer.tasks; model, fallback_models, variant, thinking_level, and timeout_minutes belong only in the matching harness block. Each task follows the setting it serves: memory tasks need memory.enabled, evaluate-smart-notes needs smart_notes.enabled, review-user-memories needs its schedule, maintain-docs only a runnable dreamer.",
@@ -1664,6 +1698,9 @@ export const LIVE_RELOAD_CONFIG_PATHS = [
     "historian.omp.model",
     "historian.omp.fallback_models",
     "historian.omp.thinking_level",
+    "historian.broca.model",
+    "historian.broca.fallback_models",
+    "historian.broca.variant",
     "historian.two_pass",
     "historian.expand_tools",
     "historian.maxTokens",

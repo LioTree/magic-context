@@ -105,6 +105,29 @@ describe("MagicContextConfigSchema", () => {
     });
 
     describe("valid config", () => {
+        it("accepts the ck-mc historian.broca block with session.send variants", () => {
+            const result = MagicContextConfigSchema.parse({
+                historian: {
+                    broca: {
+                        model: { model: "provider/main", variant: "high" },
+                        fallback_models: [{ model: "provider/fallback", variant: "medium" }],
+                        variant: "low",
+                    },
+                },
+            });
+
+            expect(result.historian?.broca).toEqual({
+                model: { model: "provider/main", variant: "high" },
+                fallback_models: [{ model: "provider/fallback", variant: "medium" }],
+                variant: "low",
+            });
+            expect(
+                MagicContextConfigSchema.safeParse({
+                    historian: { broca: { model: "provider/main", thinking_level: "high" } },
+                }).success,
+            ).toBe(false);
+        });
+
         it("parses an enabled config without stale reduction-specific keys", () => {
             const input = {
                 enabled: true,
@@ -342,6 +365,13 @@ describe("MagicContextConfigSchema", () => {
                                 ],
                                 thinking_level: "max",
                             },
+                            broca: {
+                                model: { model: "openai/work-broca", variant: "high" },
+                                fallback_models: [
+                                    { model: "openai/work-broca-fallback", variant: "low" },
+                                ],
+                                variant: "medium",
+                            },
                         },
                         dreamer: {
                             opencode: {
@@ -381,6 +411,9 @@ describe("MagicContextConfigSchema", () => {
 
             expect(result.profiles?.work?.historian?.opencode?.fallback_models).toEqual([
                 { model: "openai/work-fallback", variant: "low" },
+            ]);
+            expect(result.profiles?.work?.historian?.broca?.fallback_models).toEqual([
+                { model: "openai/work-broca-fallback", variant: "low" },
             ]);
             expect(result.profiles?.work?.dreamer?.opencode).toEqual({
                 model: { model: "anthropic/work-dreamer", variant: "medium" },
