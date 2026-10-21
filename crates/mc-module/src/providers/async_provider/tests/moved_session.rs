@@ -371,3 +371,128 @@ async fn moved_session_import_refuses_a_read_that_starts_after_the_history() {
         "{message}"
     );
 }
+
+fn peak_rss_kib() -> Option<u64> {
+    std::fs::read_to_string("/proc/self/status")
+        .ok()?
+        .lines()
+        .find_map(|line| line.strip_prefix("VmHWM:"))?
+        .trim()
+        .trim_end_matches("kB")
+        .trim()
+        .parse()
+        .ok()
+}
+
+/// The one-time first read after the cutover, for a session shaped like a
+/// 175,000-message head read whole in about 500 pages, then the import binding.
+/// Peak memory is the whole test process, including the fake runner's own copy
+/// of the transcript.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+#[ignore = "cost measurement; run explicitly"]
+async fn moved_175k_first_read_cost() {
+    let dir = tempfile::tempdir().unwrap();
+    let shape = fixture::Synthetic {
+        messages: 175_000,
+        tail: 1_600,
+        text_bytes: 786,
+        compartments: 200,
+    };
+    let paths = fixture::write_synthetic_stores(dir.path(), &shape);
+    let session = fixture::SYNTHETIC_SESSION;
+    let move_started = Instant::now();
+    offline_move::run(&paths, session, false, &fixture::NoHolders, None).unwrap();
+    let move_ms = move_started.elapsed().as_millis();
+    let (rig, answer) = Rig::try_setup_with_model(
+        dir.path(),
+        MODULE,
+        ("runner", session),
+        ("opencode", session),
+        "fixture",
+        json!({"serializer_profile":"opencode-aisdk"}),
+        |_| {},
+    )
+    .await;
+    assert_eq!(answer["answer"], "ready", "{answer}");
+    let served = served_entries(&paths.opencode_db, session);
+    let bytes: usize = served
+        .iter()
+        .map(|entry| serde_json::to_vec(entry).unwrap().len())
+        .sum();
+    let count = served.len();
+    rig.runner
+        .page_size
+        .store(350, std::sync::atomic::Ordering::Relaxed);
+    *rig.runner.entries.lock().unwrap() = served;
+    let rss_before = peak_rss_kib();
+    // ck-mc's notice path reads with a 10-second budget and starts over when a
+    // read does not finish within it. Read here with no practical budget to see
+    // how long one whole read takes, then index and bind it as a notice does.
+    let store = rig.h.store.get().unwrap();
+    let mut state = rig.state();
+    let read_started = Instant::now();
+    rig.h
+        .read_async(&mut state, 0, Duration::from_secs(3_600))
+        .await
+        .unwrap();
+    let read_ms = read_started.elapsed().as_millis();
+    let pages = rig.runner.reads.lock().unwrap().len();
+    let ingest_started = Instant::now();
+    state
+        .ingest_read(store, codec::Codec::OpencodeAiSdk)
+        .unwrap();
+    let ingest_ms = ingest_started.elapsed().as_millis();
+    let held = state.entries.len();
+    let pending_import = state
+        .standalone_move
+        .as_ref()
+        .is_some_and(|moved| moved.pending.is_some());
+    drop(state);
+    // The first notice then finds every entry held and runs the engine pass.
+    let last = rig.runner.entries.lock().unwrap().last().cloned().unwrap();
+    let notice = notice::AdvanceNotice::new(
+        &rig.reference,
+        1,
+        "L",
+        last.ordinal,
+        contract::digest::content_digest(&last.message),
+        1_000,
+        "fixture",
+    )
+    .with_window(100_000);
+    let mut headers = notice.to_headers();
+    headers.insert("lineage_id".into(), "L".into());
+    let notice = notice::AdvanceNotice::from_headers(&headers).unwrap();
+    let started = Instant::now();
+    rig.bus
+        .publish(
+            &notice::event_subject("fixture", &rig.module, notice::ADVANCED_EVENT),
+            &bus_id(&rig.reference, "advanced", 1),
+            notice.digest().parse().unwrap(),
+            headers,
+        )
+        .await
+        .unwrap();
+    let outcome = tokio::time::timeout(Duration::from_secs(900), async {
+        loop {
+            let state = load_head(store, &rig.reference).unwrap().unwrap();
+            if state.completed_seq >= 1 {
+                return "completed";
+            }
+            if state.failure.is_some() {
+                return "failed";
+            }
+            tokio::time::sleep(Duration::from_millis(200)).await;
+        }
+    })
+    .await
+    .unwrap_or("timed out");
+    let notice_ms = started.elapsed().as_millis();
+    let state = rig.state();
+    println!(
+        "FIRST_READ read_ms={read_ms} pages={pages} messages={count} served_bytes={bytes} ingest_bind_ms={ingest_ms} held={held} pending_import_after_bind={pending_import} compartments={} first_notice={outcome} first_notice_ms={notice_ms} published_views={} move_ms={move_ms} peak_rss_kib={:?} rss_before_read_kib={rss_before:?}",
+        store.load_compartments(&state.namespace()).unwrap().len(),
+        state.published_engine.len(),
+        peak_rss_kib(),
+    );
+}

@@ -245,7 +245,8 @@ fn move_carries_summaries_cut_checkpoint_and_drops_after_the_cut() {
         expected["behind_cut"].as_array().unwrap().len()
     );
     assert!(plan.missing.is_empty(), "{:?}", plan.missing);
-    // The checkpoint key, in r2's shape, is the only change to opencode.db.
+    // The checkpoint key, `"cortexkit": {"tag_checkpoint": N, "session": S}`, is the only
+    // change to opencode.db.
     let marker = marker_data(&paths);
     assert_eq!(
         marker,
@@ -552,4 +553,284 @@ fn positional_resolution_follows_standalone_exact_then_ordinal_fallback() {
         Some(("msg_a", PositionalKind::File, 3))
     );
     assert_eq!(parse_positional("msg_a#3"), None);
+}
+
+/// Shape of a synthetic long session for the cost measurements.
+pub(crate) struct Synthetic {
+    pub messages: usize,
+    /// Messages from the cut to the end.
+    pub tail: usize,
+    pub text_bytes: usize,
+    pub compartments: usize,
+}
+
+pub(crate) const SYNTHETIC_SESSION: &str = "ses_synthetic_long";
+
+/// Write a standalone OpenCode 1 session shaped like a long head: user and
+/// assistant turns, every second assistant turn with a completed tool part,
+/// compartments covering everything before the cut and the first assistant turn
+/// after it, a standalone marker on the cut, one tag per text and tool part,
+/// applied drops on a tenth of the tags and fifty queued stamps after the cut.
+pub(crate) fn write_synthetic_stores(dir: &Path, shape: &Synthetic) -> StorePaths {
+    drop(mc_store::McStore::open_for_test(&store_descriptor(dir)).unwrap());
+    let session = SYNTHETIC_SESSION;
+    let mut opencode = Connection::open(dir.join("opencode.db")).unwrap();
+    opencode
+        .execute_batch(&format!(
+            "PRAGMA journal_mode=WAL; CREATE TABLE session (id text PRIMARY KEY); INSERT INTO session VALUES ('{session}'); {}",
+            fixture()["opencode"]["schema"].as_str().unwrap()
+        ))
+        .unwrap();
+    let mut context = Connection::open(dir.join("context.db")).unwrap();
+    let cut = shape.messages - shape.tail;
+    let cut = cut - cut % 2; // a user turn
+    let filler = "x".repeat(shape.text_bytes);
+    let tx = opencode.transaction().unwrap();
+    let ctx = context.transaction().unwrap();
+    let mut tag = 0u64;
+    {
+        let mut message = tx
+            .prepare("INSERT INTO message VALUES (?1, ?2, ?3, ?3, ?4)")
+            .unwrap();
+        let mut part = tx
+            .prepare("INSERT INTO part VALUES (?1, ?2, ?3, ?4, ?4, ?5)")
+            .unwrap();
+        let mut tags = ctx
+            .prepare(
+                "INSERT INTO tags(session_id,message_id,type,status,byte_size,tag_number,harness,tool_owner_message_id)
+                 VALUES (?1,?2,?3,?4,?5,?6,'opencode',?7)",
+            )
+            .unwrap();
+        let mut queued = ctx
+            .prepare("INSERT INTO pending_ops(session_id,tag_id,operation,queued_at,harness) VALUES (?1,?2,'drop',?3,'opencode')")
+            .unwrap();
+        let mut queued_count = 0;
+        for index in 0..shape.messages {
+            let mid = format!("msg_{index:07}");
+            let time = (index as i64) * 10;
+            let user = index % 2 == 0;
+            message
+                .execute(params![
+                    mid,
+                    session,
+                    time,
+                    json!({"role": if user {"user"} else {"assistant"}, "time": {"created": time}})
+                        .to_string()
+                ])
+                .unwrap();
+            let mut parts = vec![(
+                format!("prt_{index:07}_a"),
+                json!({"type":"text","text":format!("turn {index} {filler}")}),
+                None,
+            )];
+            if !user && index % 4 == 1 {
+                let call = format!("call_{index}");
+                parts.push((
+                    format!("prt_{index:07}_b"),
+                    json!({"type":"tool","callID":call,"tool":"read","state":{"status":"completed","input":{"filePath":format!("/f{index}")},"output":format!("output {index} {filler}"),"title":"f","metadata":{},"time":{"start":1,"end":2}}}),
+                    Some(call),
+                ));
+            }
+            if index == cut {
+                parts.push((
+                    "prt_0_compaction".into(),
+                    json!({"type":"compaction","auto":true}),
+                    None,
+                ));
+            }
+            for (position, (id, data, call)) in parts.iter().enumerate() {
+                part.execute(params![id, mid, session, time, data.to_string()])
+                    .unwrap();
+                if data["type"] == "compaction" {
+                    continue;
+                }
+                tag += 1;
+                let dropped = tag % 10 == 0;
+                let (address, kind, owner) = match call {
+                    Some(call) => (call.clone(), "tool", Some(mid.clone())),
+                    None => (format!("{mid}:p{position}"), "message", None),
+                };
+                tags.execute(params![
+                    session,
+                    address,
+                    kind,
+                    if dropped { "dropped" } else { "active" },
+                    shape.text_bytes as i64,
+                    tag as i64,
+                    owner
+                ])
+                .unwrap();
+                if index > cut && !dropped && queued_count < 50 && tag % 7 == 0 {
+                    queued
+                        .execute(params![session, tag as i64, 1_000 + tag as i64])
+                        .unwrap();
+                    queued_count += 1;
+                }
+            }
+            if index == cut {
+                message
+                    .execute(params![
+                        "msg_summary",
+                        session,
+                        time + 1,
+                        json!({"role":"assistant","parentID":mid,"summary":true,"finish":"stop","modelID":"magic-context","providerID":"magic-context","time":{"created":time+1,"completed":time+1}}).to_string()
+                    ])
+                    .unwrap();
+                part.execute(params![
+                    "prt_summary",
+                    "msg_summary",
+                    session,
+                    time + 1,
+                    json!({"type":"text","text":"[Compacted by Magic Context]"}).to_string()
+                ])
+                .unwrap();
+            }
+        }
+        // Compartments up to the first assistant turn after the cut.
+        let covered = cut + 2;
+        let per = covered.div_ceil(shape.compartments);
+        let mut compartment = ctx
+            .prepare(
+                "INSERT INTO compartments(session_id,sequence,start_message,end_message,start_message_id,end_message_id,title,content,p1,importance,legacy,created_at,harness)
+                 VALUES (?1,?2,?3,?4,?5,?6,?7,?8,?8,50,0,1,'opencode')",
+            )
+            .unwrap();
+        let mut start = 0;
+        let mut sequence = 1;
+        while start < covered {
+            let end = (start + per).min(covered) - 1;
+            compartment
+                .execute(params![
+                    session,
+                    sequence,
+                    start as i64 + 1,
+                    end as i64 + 1,
+                    format!("msg_{start:07}"),
+                    format!("msg_{end:07}"),
+                    format!("part {sequence}"),
+                    format!("Summary {sequence} of messages {start}..={end}. ").repeat(8)
+                ])
+                .unwrap();
+            start = end + 1;
+            sequence += 1;
+        }
+        ctx.execute(
+            // Tag inserts may already have created the row.
+            "INSERT INTO session_meta(session_id,harness,counter,compaction_marker_state) VALUES (?1,'opencode',?2,'')
+             ON CONFLICT(session_id) DO UPDATE SET counter=excluded.counter",
+            params![session, tag as i64],
+        )
+        .unwrap();
+    }
+    tx.commit().unwrap();
+    ctx.commit().unwrap();
+    StorePaths {
+        opencode_db: dir.join("opencode.db"),
+        context_db: dir.join("context.db"),
+        store_db: dir.join("store.db"),
+    }
+}
+
+fn peak_rss_kib() -> Option<u64> {
+    std::fs::read_to_string("/proc/self/status")
+        .ok()?
+        .lines()
+        .find_map(|line| line.strip_prefix("VmHWM:"))?
+        .trim()
+        .trim_end_matches("kB")
+        .trim()
+        .parse()
+        .ok()
+}
+
+/// The move alone, in a child process so its peak memory excludes the fixture.
+#[test]
+#[ignore = "child of move_175k_message_head_cost"]
+fn move_175k_child() {
+    let Some(dir) = std::env::var_os("MOVE_175K_DIR") else {
+        return;
+    };
+    let dir = PathBuf::from(dir);
+    let paths = StorePaths {
+        opencode_db: dir.join("opencode.db"),
+        context_db: dir.join("context.db"),
+        store_db: dir.join("store.db"),
+    };
+    let before = peak_rss_kib();
+    let started = std::time::Instant::now();
+    let outcome = run(&paths, SYNTHETIC_SESSION, false, &Lsof, None).unwrap();
+    let elapsed = started.elapsed();
+    let Outcome::Moved(plan) = outcome else {
+        panic!("not moved")
+    };
+    let record = record_of_session(&paths, SYNTHETIC_SESSION);
+    println!(
+        "MOVE_COST wall_ms={} peak_rss_kib={:?} rss_before_kib={:?} checkpoint={} compartments={} drops={} behind_cut={} missing={} record_bytes={}",
+        elapsed.as_millis(),
+        peak_rss_kib(),
+        before,
+        plan.record.tag_checkpoint,
+        plan.record.compartments.len(),
+        plan.record.drops.len(),
+        plan.behind_cut,
+        plan.missing.len(),
+        record.len()
+    );
+}
+
+fn record_of_session(paths: &StorePaths, session: &str) -> String {
+    let conn = Connection::open(&paths.context_db).unwrap();
+    read_move_record_raw(&conn, session).unwrap().unwrap()
+}
+
+/// Wall time and peak memory of the move on a session shaped like a
+/// 175,000-message head, mostly summarized, with about 2,000 visible parts.
+#[test]
+#[ignore = "cost measurement; run explicitly"]
+fn move_175k_message_head_cost() {
+    let dir = tempfile::tempdir().unwrap();
+    let started = std::time::Instant::now();
+    let paths = write_synthetic_stores(
+        dir.path(),
+        &Synthetic {
+            messages: 175_000,
+            tail: 1_600,
+            text_bytes: 786,
+            compartments: 200,
+        },
+    );
+    let sizes = database_files(&paths)
+        .iter()
+        .filter_map(|path| {
+            Some((
+                path.file_name()?.to_string_lossy().into_owned(),
+                std::fs::metadata(path).ok()?.len(),
+            ))
+        })
+        .collect::<Vec<_>>();
+    println!(
+        "FIXTURE built_ms={} files={sizes:?}",
+        started.elapsed().as_millis()
+    );
+    let output = std::process::Command::new(std::env::current_exe().unwrap())
+        .args([
+            "--exact",
+            "offline_move::tests::move_175k_child",
+            "--ignored",
+            "--nocapture",
+        ])
+        .env("MOVE_175K_DIR", dir.path())
+        .output()
+        .unwrap();
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    assert!(
+        output.status.success(),
+        "{stdout}{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let line = stdout
+        .lines()
+        .find(|line| line.starts_with("MOVE_COST"))
+        .expect("cost line");
+    println!("{line}");
 }

@@ -21,6 +21,8 @@ struct Runner {
     reads: Mutex<Vec<Value>>,
     bind_identities: Mutex<Vec<session_resolver::RunnerBindIdentity>>,
     expected_bind_identity: Mutex<Option<session_resolver::RunnerBindIdentity>>,
+    /// Messages per `session.read` page; 0 keeps the default of seven.
+    page_size: std::sync::atomic::AtomicUsize,
 }
 
 #[derive(Default)]
@@ -135,7 +137,12 @@ impl session_resolver::ProviderRunner for Runner {
         let messages = entries
             .iter()
             .filter(|e| e.ordinal >= from)
-            .take(7)
+            .take(
+                match self.page_size.load(std::sync::atomic::Ordering::Relaxed) {
+                    0 => 7,
+                    size => size,
+                },
+            )
             .cloned()
             .collect::<Vec<_>>();
         let mut page = json!({"lineage_id":lineage,"messages":messages});
