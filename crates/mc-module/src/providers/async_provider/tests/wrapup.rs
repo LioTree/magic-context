@@ -625,3 +625,125 @@ async fn stack26_wrapup_publication_survives_a_concurrent_conversation_call() {
         result["result"]["text"]
     );
 }
+
+/// The same fixture for a mode-3 OpenCode session: admitted under the OpenCode
+/// session runner and set up with harness `opencode`, the harness whose setup
+/// checks for standalone plugin state.
+async fn opencode_fixture(dir: &Path) -> (Rig, Arc<FakeSessionRunner>) {
+    let child = FakeSessionRunner::for_project(dir);
+    let factory = child.factory();
+    let rig = Rig::configured(
+        dir,
+        "thalamus-harness",
+        "runner",
+        "s",
+        "opencode",
+        json!({"serializer_profile":"opencode-aisdk"}),
+        move |handler| {
+            handler.producer_factory = factory;
+            handler
+                .fixed_config
+                .as_mut()
+                .unwrap()
+                .rust_background_enabled = true;
+            let mut binding = handler.facade_binding(7).unwrap();
+            binding.config.rust_background_enabled = true;
+            handler.bind_route(7, binding);
+            handler
+                .store
+                .get()
+                .unwrap()
+                .set_route_identity_for_test(&dir.to_string_lossy(), "git:wrapup-fixture");
+            handler.provider_historian_budget =
+                super::super::super::historian_budget::Budget::new(1, 128);
+            handler.fixed_historian_settings = Some(json!({"historian":{"opencode":{
+                "model":"fixture/main", "fallback_models":["fixture/backup"]
+            }}}));
+        },
+    )
+    .await;
+    (rig, child)
+}
+
+/// Rows `crate::offline_move::has_standalone_state` would count for session `s`.
+fn raw_session_rows(rig: &Rig) -> Vec<(String, i64)> {
+    rig.h
+        .store
+        .get()
+        .unwrap()
+        .with_context_read(|conn| {
+            ["session_meta", "tags", "compartments", "pending_ops"]
+                .iter()
+                .map(|table| {
+                    conn.query_row(
+                        &format!("SELECT COUNT(*) FROM {table} WHERE session_id='s'"),
+                        [],
+                        |row| row.get(0),
+                    )
+                    .map(|count| ((*table).to_owned(), count))
+                })
+                .collect()
+        })
+        .unwrap()
+}
+
+/// ck-mc's own mode-3 OpenCode session goes through setup, notices, a real
+/// historian publish, `ctx_reduce`, a module restart and setup again, and
+/// never writes the raw-session rows the standalone fence looks for.
+#[tokio::test]
+async fn a_fresh_mode3_opencode_session_is_never_refused_as_standalone_state() {
+    let dir = tempfile::tempdir().unwrap();
+    let (mut rig, child) = opencode_fixture(dir.path()).await;
+    rig.narrative(45);
+    rig.notice(1, 1_000, None).await;
+    rig.historian_evaluation_done().await;
+    let accepted = rig.user_wrapup_command("wrapup", "keep-20").await;
+    assert_eq!(accepted["state"], "accepted", "{accepted}");
+    let send = tokio::time::timeout(Duration::from_secs(10), child.next_unfinished())
+        .await
+        .expect("summarizer child started");
+    let output = r#"<output><compartments>
+      <compartment start="0" end="10" title="first" episode_type="feature" importance="60"><p1>first history</p1><p2>first</p2><p3>first</p3><p4 /></compartment>
+      <compartment start="11" end="24" title="last" episode_type="feature" importance="60"><p1>final history</p1><p2>last</p2><p3>last</p3><p4 /></compartment>
+      </compartments><facts></facts>
+      <meta><messages_processed>0-24</messages_processed><unprocessed_from>25</unprocessed_from></meta></output>"#.to_string();
+    child.finish(&send.run_id, output);
+    rig.wrapup_done().await;
+    let namespace = rig.state().namespace();
+    let store = rig.h.store.get().unwrap();
+    assert!(
+        !store.load_compartments(&namespace).unwrap().is_empty(),
+        "the historian published under the async namespace"
+    );
+    let reduced = rig.tool(7, "ctx_reduce", json!({"drop":"190"})).await;
+    assert_ne!(reduced["isError"], true, "{reduced}");
+    rig.notice(2, 1_000, None).await;
+    let fence = |rig: &Rig| {
+        rig.h
+            .store
+            .get()
+            .unwrap()
+            .with_context_read(|conn| crate::offline_move::has_standalone_state(conn, "s"))
+            .unwrap()
+    };
+    assert!(!fence(&rig), "{:?}", raw_session_rows(&rig));
+    assert!(raw_session_rows(&rig).iter().all(|(_, count)| *count == 0));
+
+    // A restart, then setup again from the restarted module.
+    rig.task.abort();
+    let _ = (&mut rig.task).await;
+    drop(rig);
+    let (restarted, _) = opencode_fixture(dir.path()).await;
+    let again = restarted
+        .op("compaction.setup", {
+            let mut request = setup_request("s", "again");
+            request["params"] = json!({"serializer_profile":"opencode-aisdk"});
+            request
+        })
+        .await;
+    assert_eq!(again["answer"], "ready", "{again}");
+    // The runner outlives the module restart and still serves the session.
+    restarted.narrative(45);
+    restarted.notice(3, 1_000, None).await;
+    assert!(!fence(&restarted), "{:?}", raw_session_rows(&restarted));
+}
