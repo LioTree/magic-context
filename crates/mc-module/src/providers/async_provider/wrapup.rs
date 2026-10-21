@@ -144,6 +144,7 @@ impl McHandler {
         let configured = super::super::historian_config::resolve_with_model_catalog(
             &settings,
             &drive.key.harness,
+            drive.parsed.model_key.as_deref(),
             &drive.key.project,
             &self.historian_model_catalog,
         )

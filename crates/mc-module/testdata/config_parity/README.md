@@ -48,12 +48,13 @@ and transform-mode refusal.
 
 ## Isolation and security coverage
 
-The golden covers user/project precedence, JSONC versus JSON discovery, absolute
-and relative XDG, same-harness legacy fallback and other-harness migration
-refusal, profile overlays in OpenCode/Pi/OMP blocks, all schema-marked deprecated
-keys and retained legacy migrations, user substitution origins and escaping,
-invalid leaves and recovering JSONC, unknown strict and stripping keys, model
-threshold floors, malformed project block restoration and command admission.
+The golden covers user/project precedence, JSONC versus JSON discovery, and
+absolute and relative XDG config paths. It also covers fallback to the same host's
+legacy config path; refusal to migrate legacy settings from another host; profile
+overlays in OpenCode/Pi/OMP blocks and Broca's historian block; schema-marked
+deprecated keys; retained legacy migrations; user substitution origins and escaping;
+invalid leaves and recovering JSONC; how strict and stripping schemas handle unknown keys; model
+threshold floors; malformed project block restoration; and command admission.
 Project substitution detection includes comments; it never reads env/file
 inputs. Hidden-agent executable payloads and all TypeScript user-only fields
 are removed before merge. Project profile definitions are stripped while named

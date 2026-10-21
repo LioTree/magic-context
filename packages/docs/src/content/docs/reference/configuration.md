@@ -84,7 +84,7 @@ Named user-owned model-selection overlays. A project may select a profile name b
 | Key | Type | Default | Description |
 |---|---|---|---|
 | `profile` | string | — | Select a named user-owned model profile. A valid project name overrides this user default; an empty string, null, or other non-string project value is ignored with a warning so the user selection still applies. Unknown names warn and use the base configuration. |
-| `profiles` | map<string, object> | — | User-level named model profiles. A profile may contain only historian/dreamer model, fallback_models, OpenCode variant, and Pi/OMP thinking_level fields; task execution policy (including timeout_minutes) is excluded. Project configs may select a name but cannot define profiles. |
+| `profiles` | map<string, object> | — | User-level named model profiles. Profiles may set model and fallback_models in historian and dreamer blocks, plus variant for OpenCode and Broca or thinking_level for Pi and OMP. They cannot set task execution policy, including timeout_minutes. Project configs may select a name but cannot define profiles. |
 
 ## Historian
 
@@ -92,7 +92,7 @@ The background agent that condenses old conversation into compact history.
 
 | Key | Type | Default | Description |
 |---|---|---|---|
-| `historian` | object | — | Historian metadata plus independent strict OpenCode, Pi, and OMP execution blocks. Retained metadata stays at historian; model, fallback_models, variant, and thinking_level belong only in historian.opencode, historian.pi, or historian.omp. |
+| `historian` | object | — | Historian metadata plus independent strict OpenCode, Pi, OMP, and Broca execution blocks. Other historian metadata remains at historian. TypeScript hosts do not resolve models from historian.broca, which configures ck-mc's Broca session runner. Model, fallback_models, variant, and thinking_level belong in the matching harness block. |
 | `historian.temperature` | number (0–2) | — | Sampling temperature (0-2) |
 | `historian.top_p` | number (0–1) | — | Nucleus sampling top_p (0-1) |
 | `historian.prompt` | string | — | Additional system prompt text |
@@ -122,6 +122,10 @@ The background agent that condenses old conversation into compact history.
 | `historian.omp.model` **Live** | string \| object | — | Primary OMP model entry. |
 | `historian.omp.fallback_models` **Live** | string \| object[] | — | Ordered fallback OMP entries. |
 | `historian.omp.thinking_level` **Live** | `"off"` \| `"minimal"` \| `"low"` \| `"medium"` \| `"high"` \| `"xhigh"` \| `"max"` \| `"inherit"` \| `"auto"` | — | OMP thinking level for the primary entry when it declares none. Fallback entries declare thinking levels per-entry. |
+| `historian.broca` | object | — | Strict user-level Broca model-resolution block for ck-mc sessions. Its free-form variant string is forwarded as model.variant in the Broca llm-runner session.send request. When no primary is configured, ck-mc tries the session model after configured fallbacks. TypeScript hosts validate this block but do not resolve models from it. |
+| `historian.broca.model` **Live** | string \| object | — | Primary Broca model entry. |
+| `historian.broca.fallback_models` **Live** | string \| object[] | — | Ordered fallback Broca entries. |
+| `historian.broca.variant` **Live** | string | — | Broca reasoning variant for the primary entry when it declares none. Fallback entries declare variants per-entry. |
 | `historian.runner` | `"broca"` \| `"host"` | — | Only for sessions the ck-mc module serves (through the CortexKit bridge, Broca or the Claude Code gateway): which side runs the historian completion. "host" queues it for a host process to run on the configured historian model, "broca" routes it to the Broca module. When unset the harness decides: OpenCode 1 and OpenCode 2 use "host", Claude Code (through the Thalamus gateway, which has no host to run a completion) uses "broca". The TypeScript historian runs in this process and does not read this setting. User-level config only — it decides whose provider account pays for the call. |
 | `historian.host_runner` | object | — | Controls for this process's historian pull loop, which answers runs the Rust module queues for the host runner (`historian.runner: "host"`, or unset on OpenCode 1 and OpenCode 2). User-level config only — it decides whether this machine's provider account is spent on folds. |
 | `historian.host_runner.enabled` | boolean | — | Whether this process answers historian runs queued for a claimant (default true). Setting it to false stops the pull loop without changing historian.runner, so an operator can take one machine out of the lane and leave the queued runs for another claimant or for the runner setting to be changed deliberately. |

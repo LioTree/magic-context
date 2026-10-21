@@ -71,8 +71,16 @@ impl FakeSessionRunner {
     }
 
     pub(crate) fn factory(self: &Arc<Self>) -> Arc<dyn HistorianProducerFactory> {
+        self.factory_with_max_output_tokens(false)
+    }
+
+    pub(crate) fn factory_with_max_output_tokens(
+        self: &Arc<Self>,
+        max_output_tokens: bool,
+    ) -> Arc<dyn HistorianProducerFactory> {
         Arc::new(FakeSessionRunnerFactory {
             runner: Arc::clone(self),
+            max_output_tokens,
         })
     }
 
@@ -125,6 +133,7 @@ impl FakeSessionRunner {
 
 struct FakeSessionRunnerFactory {
     runner: Arc<FakeSessionRunner>,
+    max_output_tokens: bool,
 }
 
 #[async_trait]
@@ -158,6 +167,7 @@ impl HistorianProducerFactory for FakeSessionRunnerFactory {
         Ok(Box::new(FakeSessionRunnerDriver {
             runner: Arc::clone(&self.runner),
             route: route.clone(),
+            max_output_tokens: self.max_output_tokens,
         }))
     }
 }
@@ -165,6 +175,7 @@ impl HistorianProducerFactory for FakeSessionRunnerFactory {
 struct FakeSessionRunnerDriver {
     runner: Arc<FakeSessionRunner>,
     route: SessionRunnerRoute,
+    max_output_tokens: bool,
 }
 
 #[async_trait]
@@ -176,7 +187,7 @@ impl HistorianProducerDriver for FakeSessionRunnerDriver {
         Ok(Some(crate::runner_limits::RunnerLimits {
             max_steps: true,
             no_tools: true,
-            max_output_tokens: false,
+            max_output_tokens: self.max_output_tokens,
         }))
     }
 

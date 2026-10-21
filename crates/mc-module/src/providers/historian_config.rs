@@ -34,6 +34,7 @@ pub(crate) struct ConfiguredHistorian {
     pub model_chain: Vec<String>,
     pub model_limits: BTreeMap<String, HistorianModelLimits>,
     pub model_variants: BTreeMap<String, String>,
+    pub session_model_fallback: bool,
     pub timeout_ms: u64,
     pub max_output_tokens: Option<u32>,
 }
@@ -347,15 +348,17 @@ impl HistorianModelCatalog {
     }
 }
 
-/// Resolve the configured chain, then add context/output values from the Fusiform
-/// model catalog before preparing a runner's background historian call.
+/// Resolve the configured chain and optional session-model fallback, then add
+/// context/output values from Fusiform before preparing a background historian call.
+/// `session_model` is the model recorded during conversation setup.
 pub(crate) async fn resolve_with_model_catalog(
     settings: &Value,
     harness: &str,
+    session_model: Option<&str>,
     project_root: &Path,
     catalog: &HistorianModelCatalog,
 ) -> ConfiguredHistorian {
-    let mut configured = resolve(settings, harness);
+    let mut configured = resolve_for_session(settings, harness, session_model);
     catalog
         .populate(&mut configured, project_root, harness)
         .await;
@@ -470,7 +473,7 @@ fn attempts(settings: &Value, harness: &str) -> (Option<Attempt>, Vec<Attempt>) 
     let Some(block) = record(selected) else {
         return (None, Vec::new());
     };
-    let qualifier_key = if harness == "opencode" {
+    let qualifier_key = if matches!(harness, "opencode" | "broca") {
         "variant"
     } else {
         "thinking_level"
@@ -505,12 +508,12 @@ fn attempts(settings: &Value, harness: &str) -> (Option<Attempt>, Vec<Attempt>) 
     (primary, fallbacks)
 }
 
-/// Resolve the historian chain, variants, timeout and output cap from trusted settings.
+/// Resolve the configured historian chain, variants, timeout and output cap from trusted settings.
 /// Per-model limits start empty and are filled by `resolve_with_model_catalog` when
 /// Fusiform is available.
 ///
 /// `settings` is the validated config object: `historian.<harness>.model`,
-/// `historian.<harness>.fallback_models`, the OpenCode `variant` or Pi/OMP
+/// `historian.<harness>.fallback_models`, the OpenCode/Broca `variant` or Pi/OMP
 /// `thinking_level`, `historian.maxTokens` and `historian_timeout_ms`.
 ///
 /// The chain is the primary followed by the fallbacks, each model once in its first
@@ -522,8 +525,6 @@ fn attempts(settings: &Value, harness: &str) -> (Option<Attempt>, Vec<Attempt>) 
 /// on a later attempt of the same model is dropped (same file, :119-127).
 ///
 /// This synchronous resolver builds the configured chain and its empty limit entries.
-/// `resolve_with_model_catalog` fills those entries from Fusiform when a route is
-/// available; host-synchronized chains do not use either resolver.
 pub(crate) fn resolve(settings: &Value, harness: &str) -> ConfiguredHistorian {
     // Both OpenCode hosts read the `opencode` block, as the dreamer's model
     // resolution does (dream_runner.rs `resolve_task_models`).
@@ -566,12 +567,47 @@ pub(crate) fn resolve(settings: &Value, harness: &str) -> ConfiguredHistorian {
     resolved
 }
 
+/// Append a valid, non-duplicate session model after configured fallbacks only when no
+/// primary model is configured.
+pub(crate) fn resolve_for_session(
+    settings: &Value,
+    harness: &str,
+    session_model: Option<&str>,
+) -> ConfiguredHistorian {
+    let mut resolved = resolve(settings, harness);
+    let harness = if harness == "opencode2" {
+        "opencode"
+    } else {
+        harness
+    };
+    let (primary, _) = attempts(settings, harness);
+    if primary.is_none() {
+        if let Some(model) = session_model
+            .map(str::trim)
+            .filter(|model| valid_reference(model))
+            .filter(|model| {
+                !resolved
+                    .model_chain
+                    .iter()
+                    .any(|configured| configured == model)
+            })
+        {
+            resolved
+                .model_limits
+                .insert(model.to_owned(), HistorianModelLimits::default());
+            resolved.model_chain.push(model.to_owned());
+            resolved.session_model_fallback = true;
+        }
+    }
+    resolved
+}
+
 /// The user's trusted effective settings for `project_root`, loaded the way the
 /// TypeScript plugin loads them (user tier with the selected profile, project tier
 /// under the trust rules; model choice stays user-tier only). A config that needed
 /// repair still yields its recovered settings, as the plugin runs on them too. When
-/// no config can be loaded at all the result is empty, so the chain is empty and the
-/// historian reports `no_models` rather than guessing.
+/// no config can be loaded at all the result is empty; a caller may separately supply
+/// the current session model as an explicit last-resort historian candidate.
 pub(crate) fn trusted_settings(resolver: &dyn CoreConfigResolver, project_root: &Path) -> Value {
     match resolver.resolve(&ConfigResolveRequest {
         user_config_path: String::new(),
@@ -780,6 +816,122 @@ mod tests {
     }
 
     #[test]
+    fn broca_historian_block_resolves_variant_and_fallback_chain() {
+        let settings = json!({"historian":{"broca":{
+            "model":"fixture-a/main",
+            "variant":"high",
+            "fallback_models":[{"model":"fixture-b/fallback","variant":"medium"}]
+        }}});
+
+        let resolved = resolve(&settings, "broca");
+        assert_eq!(
+            resolved.model_chain,
+            ["fixture-a/main", "fixture-b/fallback"]
+        );
+        assert_eq!(
+            resolved.model_variants,
+            BTreeMap::from([
+                ("fixture-a/main".into(), "high".into()),
+                ("fixture-b/fallback".into(), "medium".into()),
+            ])
+        );
+    }
+
+    #[test]
+    fn broca_without_historian_block_falls_back_to_session_model() {
+        let resolved = resolve_for_session(&json!({}), "broca", Some("provider/session-model"));
+
+        assert_eq!(resolved.model_chain, ["provider/session-model"]);
+        assert!(resolved.session_model_fallback);
+        assert!(resolved.model_variants.is_empty());
+    }
+
+    #[test]
+    fn session_model_fallback_follows_configured_fallbacks_without_a_primary() {
+        let settings = json!({"historian":{"broca":{
+            "fallback_models":["configured/first", "configured/second"]
+        }}});
+        let resolved = resolve_for_session(&settings, "broca", Some("provider/session-model"));
+
+        assert_eq!(
+            resolved.model_chain,
+            [
+                "configured/first",
+                "configured/second",
+                "provider/session-model"
+            ]
+        );
+        assert!(resolved.session_model_fallback);
+    }
+
+    #[test]
+    fn opencode_configured_chain_never_appends_session_model() {
+        let settings = json!({"historian":{"opencode":{
+            "model":"fixture-a/main",
+            "fallback_models":["fixture-b/fallback"]
+        }}});
+        let resolved = resolve_for_session(&settings, "opencode", Some("provider/session-model"));
+
+        assert_eq!(
+            resolved.model_chain,
+            ["fixture-a/main", "fixture-b/fallback"]
+        );
+        assert!(!resolved.session_model_fallback);
+    }
+
+    #[test]
+    fn omp_still_falls_back_to_pi_block() {
+        let settings = json!({"historian":{"pi":{
+            "model":"fixture-a/pi",
+            "thinking_level":"high",
+            "fallback_models":["fixture-b/fallback"]
+        }}});
+        let resolved = resolve_for_session(&settings, "omp", Some("provider/session-model"));
+
+        assert_eq!(resolved.model_chain, ["fixture-a/pi", "fixture-b/fallback"]);
+        assert_eq!(
+            resolved
+                .model_variants
+                .get("fixture-a/pi")
+                .map(String::as_str),
+            Some("high")
+        );
+        assert!(!resolved.session_model_fallback);
+    }
+
+    #[test]
+    fn configured_block_always_wins_over_session_model() {
+        let settings = json!({"historian":{"broca":{
+            "model":"configured/model",
+            "fallback_models":["configured/fallback"]
+        }}});
+        let resolved = resolve_for_session(&settings, "broca", Some("session/model"));
+
+        assert_eq!(
+            resolved.model_chain,
+            ["configured/model", "configured/fallback"]
+        );
+        assert!(!resolved.session_model_fallback);
+    }
+
+    #[test]
+    fn session_model_fallback_still_obeys_runner_run_limits() {
+        let resolved = resolve_for_session(&json!({}), "broca", Some("opencode/free"));
+        let mut chain = resolved.model_chain;
+        let limits = crate::runner_limits::RunnerLimits {
+            max_steps: true,
+            max_output_tokens: true,
+            no_tools: true,
+        };
+
+        let refusal = limits.historian_chain("session-model-fallback", &mut chain);
+
+        assert!(resolved.session_model_fallback);
+        assert!(refusal.is_err());
+        assert!(chain.is_empty());
+    }
+
+    #[test]
     fn opencode2_reads_the_opencode_block() {
         let fixture: Value = serde_json::from_str(FIXTURE).unwrap();
         for case in fixture["cases"].as_array().unwrap() {
@@ -879,6 +1031,7 @@ mod tests {
         let resolved = resolve_with_model_catalog(
             &settings,
             "opencode",
+            None,
             Path::new("/tmp/historian-limits-project"),
             &catalog,
         )
@@ -931,12 +1084,36 @@ mod tests {
         let cached = resolve_with_model_catalog(
             &settings,
             "opencode",
+            None,
             Path::new("/tmp/historian-limits-project"),
             &catalog,
         )
         .await;
         assert_eq!(cached.request_fields(), resolved.request_fields());
         assert_eq!(route.requests.lock().unwrap().len(), 5);
+    }
+
+    #[tokio::test]
+    async fn broca_session_model_fallback_gets_catalog_limits() {
+        let route = FakeFusiformRoute::start().await;
+        let catalog = HistorianModelCatalog::new(
+            Some(route.connection_file.clone()),
+            RouteTargetConfig::default(),
+        );
+
+        let resolved = resolve_with_model_catalog(
+            &json!({}),
+            "broca",
+            Some("google/main"),
+            Path::new("/tmp/historian-limits-project"),
+            &catalog,
+        )
+        .await;
+
+        assert_eq!(resolved.model_chain, ["google/main"]);
+        assert!(resolved.session_model_fallback);
+        assert_eq!(resolved.model_limits["google/main"].context, Some(200_000));
+        assert_eq!(resolved.model_limits["google/main"].output, Some(20_000));
     }
 
     #[tokio::test]
@@ -953,6 +1130,7 @@ mod tests {
         let resolved = resolve_with_model_catalog(
             &settings,
             "opencode",
+            None,
             Path::new("/tmp/historian-limits-project"),
             &catalog,
         )
@@ -981,6 +1159,7 @@ mod tests {
         let resolved = resolve_with_model_catalog(
             &settings,
             "opencode",
+            None,
             Path::new("/tmp/historian-limits-project"),
             &catalog,
         )

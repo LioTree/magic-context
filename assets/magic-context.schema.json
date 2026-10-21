@@ -86,7 +86,7 @@
       "minLength": 1
     },
     "profiles": {
-      "description": "User-level named model profiles. A profile may contain only historian/dreamer model, fallback_models, OpenCode variant, and Pi/OMP thinking_level fields; task execution policy (including timeout_minutes) is excluded. Project configs may select a name but cannot define profiles.",
+      "description": "User-level named model profiles. Profiles may set model and fallback_models in historian and dreamer blocks, plus variant for OpenCode and Broca or thinking_level for Pi and OMP. They cannot set task execution policy, including timeout_minutes. Project configs may select a name but cannot define profiles.",
       "type": "object",
       "propertyNames": {
         "type": "string",
@@ -349,6 +349,75 @@
                 },
                 "additionalProperties": false,
                 "description": "Strict profile-only OMP model-selection block."
+              },
+              "broca": {
+                "type": "object",
+                "properties": {
+                  "model": {
+                    "description": "Primary Broca model entry.",
+                    "x-mc-live-reload": true,
+                    "anyOf": [
+                      {
+                        "type": "string",
+                        "description": "Broca model ID (for example, provider/model)."
+                      },
+                      {
+                        "type": "object",
+                        "properties": {
+                          "model": {
+                            "type": "string",
+                            "description": "Broca model ID (for example, provider/model)."
+                          },
+                          "variant": {
+                            "description": "Broca reasoning variant for this entry.",
+                            "type": "string"
+                          }
+                        },
+                        "required": [
+                          "model"
+                        ],
+                        "additionalProperties": false
+                      }
+                    ]
+                  },
+                  "fallback_models": {
+                    "description": "Ordered fallback Broca entries.",
+                    "x-mc-live-reload": true,
+                    "type": "array",
+                    "items": {
+                      "anyOf": [
+                        {
+                          "type": "string",
+                          "description": "Broca model ID (for example, provider/model)."
+                        },
+                        {
+                          "type": "object",
+                          "properties": {
+                            "model": {
+                              "type": "string",
+                              "description": "Broca model ID (for example, provider/model)."
+                            },
+                            "variant": {
+                              "description": "Broca reasoning variant for this entry.",
+                              "type": "string"
+                            }
+                          },
+                          "required": [
+                            "model"
+                          ],
+                          "additionalProperties": false
+                        }
+                      ]
+                    }
+                  },
+                  "variant": {
+                    "description": "Broca reasoning variant for the primary entry when it declares none. Fallback entries declare variants per-entry.",
+                    "x-mc-live-reload": true,
+                    "type": "string"
+                  }
+                },
+                "additionalProperties": false,
+                "description": "Strict user-level Broca model-resolution block for ck-mc sessions. Its free-form variant string is forwarded as model.variant in the Broca llm-runner session.send request. When no primary is configured, ck-mc tries the session model after configured fallbacks. TypeScript hosts validate this block but do not resolve models from it."
               }
             },
             "additionalProperties": false
@@ -617,7 +686,7 @@
       }
     },
     "historian": {
-      "description": "Historian metadata plus independent strict OpenCode, Pi, and OMP execution blocks. Retained metadata stays at historian; model, fallback_models, variant, and thinking_level belong only in historian.opencode, historian.pi, or historian.omp.",
+      "description": "Historian metadata plus independent strict OpenCode, Pi, OMP, and Broca execution blocks. Other historian metadata remains at historian. TypeScript hosts do not resolve models from historian.broca, which configures ck-mc's Broca session runner. Model, fallback_models, variant, and thinking_level belong in the matching harness block.",
       "type": "object",
       "properties": {
         "temperature": {
@@ -1020,6 +1089,75 @@
           },
           "additionalProperties": false,
           "description": "Strict OMP model-resolution block. It accepts no OpenCode vocabulary."
+        },
+        "broca": {
+          "type": "object",
+          "properties": {
+            "model": {
+              "description": "Primary Broca model entry.",
+              "x-mc-live-reload": true,
+              "anyOf": [
+                {
+                  "type": "string",
+                  "description": "Broca model ID (for example, provider/model)."
+                },
+                {
+                  "type": "object",
+                  "properties": {
+                    "model": {
+                      "type": "string",
+                      "description": "Broca model ID (for example, provider/model)."
+                    },
+                    "variant": {
+                      "description": "Broca reasoning variant for this entry.",
+                      "type": "string"
+                    }
+                  },
+                  "required": [
+                    "model"
+                  ],
+                  "additionalProperties": false
+                }
+              ]
+            },
+            "fallback_models": {
+              "description": "Ordered fallback Broca entries.",
+              "x-mc-live-reload": true,
+              "type": "array",
+              "items": {
+                "anyOf": [
+                  {
+                    "type": "string",
+                    "description": "Broca model ID (for example, provider/model)."
+                  },
+                  {
+                    "type": "object",
+                    "properties": {
+                      "model": {
+                        "type": "string",
+                        "description": "Broca model ID (for example, provider/model)."
+                      },
+                      "variant": {
+                        "description": "Broca reasoning variant for this entry.",
+                        "type": "string"
+                      }
+                    },
+                    "required": [
+                      "model"
+                    ],
+                    "additionalProperties": false
+                  }
+                ]
+              }
+            },
+            "variant": {
+              "description": "Broca reasoning variant for the primary entry when it declares none. Fallback entries declare variants per-entry.",
+              "x-mc-live-reload": true,
+              "type": "string"
+            }
+          },
+          "additionalProperties": false,
+          "description": "Strict user-level Broca model-resolution block for ck-mc sessions. Its free-form variant string is forwarded as model.variant in the Broca llm-runner session.send request. When no primary is configured, ck-mc tries the session model after configured fallbacks. TypeScript hosts validate this block but do not resolve models from it."
         },
         "runner": {
           "description": "Only for sessions the ck-mc module serves (through the CortexKit bridge, Broca or the Claude Code gateway): which side runs the historian completion. \"host\" queues it for a host process to run on the configured historian model, \"broca\" routes it to the Broca module. When unset the harness decides: OpenCode 1 and OpenCode 2 use \"host\", Claude Code (through the Thalamus gateway, which has no host to run a completion) uses \"broca\". The TypeScript historian runs in this process and does not read this setting. User-level config only — it decides whose provider account pays for the call.",

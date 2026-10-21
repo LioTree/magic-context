@@ -343,18 +343,11 @@ impl TrustedConfigResolver {
         if let Some(profile) = profile {
             effective["profile"] = json!(profile);
         }
-        let user_subc = value_at(&user, "subc.connection_file")
-            .and_then(Value::as_str)
-            .is_some_and(|v| !v.trim().is_empty());
-        if effective["transform_mode"] == "rust"
-            && (effective["compaction"]["enabled"] == false || !user_subc)
-        {
-            effective["transform_mode"] = json!("ts");
-            warnings.push(Warning::new(
-                "transform_mode",
-                "Rust mode requires compaction and trusted user subc configuration.",
-            ));
-        }
+        // The plugin accepts these retired keys but ignores their values after parsing:
+        // `loadPluginConfigDetailed` always resolves transform_mode to TypeScript and
+        // rust_pipeline to full_request (packages/plugin/src/config/index.ts:788-894).
+        effective["transform_mode"] = json!("ts");
+        effective["rust_pipeline"] = json!("full_request");
         if let Some(value) = value_at(&effective, "subc.connection_file").and_then(Value::as_str) {
             if value == "~" {
                 let home = self.home.to_string_lossy().into_owned();
@@ -467,6 +460,16 @@ impl TrustedConfigResolver {
             &substituted
         };
         let (value, invalid, unsafe_keys, order) = variables::parse(parse_input, warnings);
+        // The TypeScript loader warns when the user config contains this key, even
+        // when a `{file:...}` substitution returns an empty string because its file is missing
+        // (`packages/plugin/src/config/index.ts:441`, `packages/plugin/src/config/deprecated-config.ts:29-43`). Project values are
+        // warned and removed separately by the trust sanitizer.
+        if !project && value_at(&value, "models.window_overlay_path").is_some() {
+            warnings.push(Warning::new(
+                "deprecated",
+                "models.window_overlay_path is deprecated and ignored.",
+            ));
+        }
         (
             value,
             if invalid {

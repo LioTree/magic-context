@@ -20,6 +20,7 @@ import {
 /** Hidden agents that run with elevated/autonomous capability. */
 const HIDDEN_AGENT_KEYS = ["historian", "dreamer"] as const;
 const HARNESS_KEYS = PER_HARNESS_MODEL_KEYS;
+const HISTORIAN_MODEL_HARNESS_KEYS = [...PER_HARNESS_MODEL_KEYS, "broca"] as const;
 /** Every historian model-resolution field, including per-harness qualifiers.
  *  Variant and thinking_level merge onto the user's historian model at resolve
  *  time, so leaving them would let a cloned repo force extra spend. */
@@ -346,9 +347,9 @@ function makeProjectThresholdWarning(field: string, reason: string): string {
  *  - `transform_mode` is accepted at project tier but ignored, like every other
  *    tier: every host runs the TypeScript transform. `rust_pipeline` is still
  *    stripped from project config below, although it no longer selects anything.
- *  - historian model-resolution fields (model, fallback_models, variant,
- *    thinking_level) and `runner`, including both per-harness blocks — historian
- *    model spend is user-level only. Qualifiers merge onto the user's historian
+ *  - historian model-resolution fields (`model`, `fallback_models`, `variant`,
+ *    `thinking_level`) and `runner` are stripped from every per-harness block.
+ *    Historian model spend is user-level only. Qualifiers merge onto the user's historian
  *    model at resolve time, so a cloned repo cannot force extra thinking or
  *    variant cost, and cannot move the completion to a different process or
  *    provider account. `host_runner` is stripped for the same reason in the other
@@ -592,7 +593,7 @@ export function stripUnsafeProjectConfigFields(projectRaw: Record<string, unknow
                 removed.push(field);
             }
         }
-        for (const harness of HARNESS_KEYS) {
+        for (const harness of HISTORIAN_MODEL_HARNESS_KEYS) {
             const harnessBlock = historian[harness];
             if (!isPlainObject(harnessBlock)) continue;
             for (const field of HISTORIAN_USER_ONLY_FIELDS) {

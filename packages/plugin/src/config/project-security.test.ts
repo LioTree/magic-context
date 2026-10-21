@@ -207,6 +207,11 @@ describe("stripUnsafeProjectConfigFields", () => {
                     fallback_models: ["pi/repo-fallback"],
                     thinking_level: "medium",
                 },
+                broca: {
+                    model: "broca/repo-model",
+                    fallback_models: ["broca/repo-fallback"],
+                    variant: "high",
+                },
                 temperature: 0.2,
             },
         };
@@ -215,6 +220,7 @@ describe("stripUnsafeProjectConfigFields", () => {
         expect(raw.historian).toEqual({
             opencode: {},
             pi: {},
+            broca: {},
             temperature: 0.2,
         });
         const warning = warnings.join("\n");
@@ -223,6 +229,9 @@ describe("stripUnsafeProjectConfigFields", () => {
         expect(warning).toContain("historian.opencode.variant");
         expect(warning).toContain("historian.pi.model");
         expect(warning).toContain("historian.pi.thinking_level");
+        expect(warning).toContain("historian.broca.model");
+        expect(warning).toContain("historian.broca.fallback_models");
+        expect(warning).toContain("historian.broca.variant");
     });
 
     it("strips the historian runner from project config so a repo cannot redirect the completion", () => {

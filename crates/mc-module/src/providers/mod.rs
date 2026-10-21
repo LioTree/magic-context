@@ -33,7 +33,7 @@ mod reduce;
 pub mod resident_bytes;
 pub(crate) mod runner_todo;
 #[cfg(test)]
-mod session_runner_fake;
+pub(crate) mod session_runner_fake;
 pub(crate) mod usage_policy;
 pub mod view_recipe;
 
