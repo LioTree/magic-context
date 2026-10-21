@@ -460,6 +460,16 @@ impl TrustedConfigResolver {
             &substituted
         };
         let (value, invalid, unsafe_keys, order) = variables::parse(parse_input, warnings);
+        // The TypeScript loader warns when the user config contains this key, even
+        // when a missing `{file:...}` value was replaced with an empty string
+        // (`packages/plugin/src/config/index.ts:441`, `packages/plugin/src/config/deprecated-config.ts:29-43`). Project values are
+        // warned and removed separately by the trust sanitizer.
+        if !project && value_at(&value, "models.window_overlay_path").is_some() {
+            warnings.push(Warning::new(
+                "deprecated",
+                "models.window_overlay_path is deprecated and ignored.",
+            ));
+        }
         (
             value,
             if invalid {
