@@ -189,8 +189,8 @@ async function step(now: number): Promise<Alert[]> {
     const flowed = await runFlow(now);
     const oldState = JSON.parse(readFileSync(join(root, "state.json"), "utf8"));
     expect(sharedState()).toEqual(oldState);
-    // Without a new failure the flow skips the evaluation the script made, so
-    // only then does `bounded` cover the same reads.
+    // `bounded` covers the same reads only when the flow evaluates, which it does
+    // when a new row failed; otherwise it skips the evaluation the script made.
     if (flowed.evaluated) expect(flowed.bounded).toBe(old.bounded);
     expect(flowed.alerts).toBe(old.alerts.length);
     expect(flowed.watermark).toEqual(oldState.cursor);
@@ -449,7 +449,8 @@ test("a corrupt stored state stops the run instead of resetting the cursor", asy
 
 const HOUR = 3_600_000;
 
-// Window reads that reach back past the stored records: only a cold start may make one.
+// Window reads spanning more than two days. Only a cold start makes one; the
+// tail read on an evaluating run spans just the rows after the new ones.
 function longWindowReads(since: number) {
     return opCalls.slice(since).filter((call) => call.query === "window" && (call.until as number) - (call.after as number) > 2 * DAY);
 }

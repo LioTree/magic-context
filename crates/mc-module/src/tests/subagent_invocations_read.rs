@@ -47,7 +47,7 @@ fn basal() -> Option<subc_protocol::Principal> {
     })
 }
 
-/// Channel 7 bound as MC's own sentinel flow, the one caller the op admits.
+/// Channel 7 bound as a flow MC authored, which passes the op's caller check.
 fn bind_mc_flow(handler: &McHandler) {
     rebind(
         handler,
@@ -270,7 +270,7 @@ async fn a_flow_scoped_route_reaches_only_the_flow_ops() {
     // The read op is admitted and answers.
     let reply = call_dispatch_request(&handler, serde_json::from_str(WINDOW_READ).unwrap()).await;
     assert_eq!(reply, json!({"result": {"rows": [], "more": false}}));
-    // Any flow scope is fenced, MC's or not: a foreign flow gets no further than the op's caller check.
+    // Any flow scope is fenced, MC's or not: the dispatcher refuses this foreign flow's `echo` too.
     rebind(&handler, basal(), Some(flow_stamp(Some("agent_0000000000000000"), Some("other"))));
     let (code, _) = error_frame(handler.dispatch_value(7, json!({"method": "echo"})).await);
     assert_eq!(code, "flow_route_not_admitted");

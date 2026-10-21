@@ -183,7 +183,8 @@ const STATE_VERSION = 2;
 const OLDER_KEY = 'older';
 const STATUSES = ['completed', 'failed', 'timed_out', 'empty', 'aborted'];
 // basal refuses a kv value over 64 KiB of JSON, so a stored list is split into
-// parts of at most this many UTF-8 bytes.
+// parts of about this many UTF-8 bytes. A single record larger than this gets
+// a part of its own (records are small: ids, times, a hash and a session id).
 const PART_BYTES = 48 * 1024;
 // basal keeps at most 1 MiB of kv per flow. Past these budgets the oldest
 // hours leave the records early and the oldest summary entries are forgotten;
@@ -303,8 +304,8 @@ function packParts(items, groupOf, encode) {
       const index = known === undefined ? part.g.length : known;
       const record = encode(item, index);
       const added = utf8Bytes(JSON.stringify(record)) + 1 + (known === undefined ? utf8Bytes(groupKey) + 1 : 0);
-      // A full part is closed and the item retried in a new one; a lone item
-      // always fits, so this ends.
+      // A part this item would overflow is closed and the item retried in a new
+      // one. An empty part takes any item, so the retry ends.
       if (part.r.length && bytes + added > PART_BYTES) {
         parts.push(part);
         part = null;
