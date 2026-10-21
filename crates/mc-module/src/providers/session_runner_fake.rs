@@ -143,11 +143,11 @@ impl HistorianProducerFactory for FakeSessionRunnerFactory {
         )))
     }
 
-    async fn connect_session_runner(
-        &self,
-        _project_root: &Path,
-        route: &SessionRunnerRoute,
-    ) -> Result<Box<dyn HistorianProducerDriver + Send>, HistorianProducerError> {
+        async fn connect_session_runner(
+            &self,
+            _identity: &crate::session_resolver::RunnerBindIdentity,
+            route: &SessionRunnerRoute,
+        ) -> Result<Box<dyn HistorianProducerDriver + Send>, HistorianProducerError> {
         self.runner
             .state
             .lock()

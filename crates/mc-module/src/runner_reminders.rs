@@ -998,6 +998,24 @@ mod tests {
 
     #[subc_client_rs::async_trait]
     impl ProviderRunner for FakeRunner {
+        async fn call_for_identity(
+            &self,
+            _: &crate::route_targets::SessionRunnerRoute,
+            identity: &crate::session_resolver::RunnerBindIdentity,
+            method: &str,
+            params: Value,
+            budget: Duration,
+        ) -> Result<Value, SessionResolveError> {
+            self.call(
+                &identity.project_root,
+                &identity.session,
+                method,
+                params,
+                budget,
+            )
+            .await
+        }
+
         async fn call(
             &self,
             _: &Path,

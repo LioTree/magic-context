@@ -96,10 +96,10 @@ pub trait BrocaPort {
     /// Release the session's routes. This is never a deletion: erasure is the
     /// runner's retention promise, fixed on the first send.
     async fn release(&mut self, session: &str);
-    /// The parent session when this port reaches a runner-lane conversation's own
-    /// runner rather than the configured Broca module. The carrier then admits the
-    /// child without a configured Broca runner and names this parent on every send,
-    /// because the runner admits the child only under a parent it runs.
+    /// Returns the parent session for a runner-lane conversation when this port uses
+    /// that conversation's runner instead of the configured Broca module. The carrier
+    /// uses it to reject child requests scoped to a different parent while keeping
+    /// each child route bound to its own session.
     fn session_runner_parent(&self) -> Option<&str> {
         None
     }
@@ -599,9 +599,6 @@ impl<P: BrocaPort> BrocaCarrier<P> {
         // A plan freezes the non-empty tool allowlist at admission. Even an empty
         // override would suppress those tools on a no_tools runner, and later
         // sends into a plan-admitted session must not carry a tools override.
-        if let Some(parent) = self.port.session_runner_parent() {
-            params.insert("parent".into(), json!(parent));
-        }
         let mut send = SendRequest::new(request.prompt.clone(), session)
             .with_runner_params(params)
             .with_max_steps(u64::from(request.max_steps))

@@ -488,6 +488,14 @@ pub struct SessionBinding {
     pub history_budget_tokens: f64,
 }
 
+fn runner_bind_identity(binding: &SessionBinding) -> session_resolver::RunnerBindIdentity {
+    session_resolver::RunnerBindIdentity {
+        project_root: binding.project_root.clone(),
+        harness: binding.harness.clone(),
+        session: binding.session.clone(),
+    }
+}
+
 fn apply_claude_code_config_controls(
     request: &mut TransformRequest,
     config: &McModuleConfig,
@@ -4294,13 +4302,13 @@ pub trait HistorianProducerFactory: Send + Sync {
         project_root: &Path,
     ) -> Result<Box<dyn HistorianProducerDriver + Send>, HistorianProducerError>;
 
-    /// Connect a producer whose runs go to a runner-lane conversation's own runner
-    /// (`route`), as hidden children of that conversation's session. A factory that
-    /// cannot reach session runners refuses rather than falling back to the
-    /// configured runner, which would run the call outside the session's host.
+    /// Connect a producer to the runner route selected for this conversation. Each run
+    /// uses a child session; `identity` supplies the conversation's project root and
+    /// Setup harness for binding that child. A factory that cannot reach the runner
+    /// must refuse rather than use the configured runner.
     async fn connect_session_runner(
         &self,
-        _project_root: &Path,
+        _identity: &session_resolver::RunnerBindIdentity,
         route: &SessionRunnerRoute,
     ) -> Result<Box<dyn HistorianProducerDriver + Send>, HistorianProducerError> {
         Err(HistorianProducerError::Subc(
@@ -4331,6 +4339,22 @@ struct RealHistorianProducerFactory {
     route_targets: RouteTargetConfig,
 }
 
+fn session_runner_historian_config(
+    connection_file: PathBuf,
+    route_targets: RouteTargetConfig,
+    identity: &session_resolver::RunnerBindIdentity,
+) -> HistorianProducerConfig {
+    HistorianProducerConfig {
+        handshake_timeout: Duration::from_secs(2),
+        route_targets,
+        ..HistorianProducerConfig::new(
+            connection_file,
+            identity.project_root.clone(),
+            identity.harness.clone(),
+        )
+    }
+}
+
 #[async_trait]
 impl HistorianProducerFactory for RealHistorianProducerFactory {
     async fn connect(
@@ -4353,20 +4377,16 @@ impl HistorianProducerFactory for RealHistorianProducerFactory {
 
     async fn connect_session_runner(
         &self,
-        project_root: &Path,
+        identity: &session_resolver::RunnerBindIdentity,
         route: &SessionRunnerRoute,
     ) -> Result<Box<dyn HistorianProducerDriver + Send>, HistorianProducerError> {
         Ok(Box::new(
             HistorianProducer::connect_to_session_runner(
-                HistorianProducerConfig {
-                    handshake_timeout: Duration::from_secs(2),
-                    route_targets: self.route_targets.clone(),
-                    ..HistorianProducerConfig::new(
-                        self.connection_file.clone(),
-                        project_root,
-                        "opencode",
-                    )
-                },
+                session_runner_historian_config(
+                    self.connection_file.clone(),
+                    self.route_targets.clone(),
+                    identity,
+                ),
                 route.clone(),
             )
             .await?,
@@ -4984,6 +5004,7 @@ struct HistorianFiringTask {
     /// conversation's own runner over llm-runner, never on the claim queue and
     /// never on the configured runner, whatever `runner` says.
     session_runner: Option<SessionRunnerRoute>,
+    runner_identity: session_resolver::RunnerBindIdentity,
     model_chain_generation: u64,
     runner_refusal_cache: Arc<HistorianRunnerRefusalCache>,
     live_guard: SessionSetGuard,
@@ -6846,6 +6867,7 @@ impl McHandler {
         } = guards;
         let project_path = binding.project_root.to_string_lossy().to_string();
         let harness = binding.harness.clone();
+        let runner_identity = runner_bind_identity(binding);
         let config = self.effective_config(&binding.project_root);
         let Ok(loaded) = store.load_meta(&parsed.session_id) else {
             return Some("recovery_load_failed");
@@ -7142,7 +7164,9 @@ impl McHandler {
                         // followed there; its run id means nothing to any other.
                         let mut producer = match &session_runner {
                             Some(route) => {
-                                factory.connect_session_runner(&project_root, route).await?
+                                factory
+                                    .connect_session_runner(&runner_identity, route)
+                                    .await?
                             }
                             None => factory.connect(&project_root).await?,
                         };
@@ -7910,6 +7934,7 @@ impl McHandler {
                 runner: self.record_historian_runner(&parsed.session_id, &cfg, &binding.harness),
                 host_runs: Arc::clone(&self.host_runs),
                 session_runner,
+                runner_identity: runner_bind_identity(binding),
                 model_chain_generation,
                 runner_refusal_cache: Arc::clone(&self.historian_runner_refusals),
                 live_guard,
@@ -8096,6 +8121,7 @@ impl McHandler {
             // Wrapup belongs to the request-driven transform path, which keeps the
             // configured runner.
             session_runner: None,
+            runner_identity: runner_bind_identity(binding),
             model_chain_generation,
             runner_refusal_cache: Arc::clone(&self.historian_runner_refusals),
             live_guard,
@@ -8201,6 +8227,7 @@ impl McHandler {
             runner,
             host_runs,
             session_runner,
+            runner_identity,
             model_chain_generation,
             runner_refusal_cache,
             live_guard,
@@ -8256,7 +8283,11 @@ impl McHandler {
             return result;
         }
         let connected = match &session_runner {
-            Some(route) => factory.connect_session_runner(&project_root, route).await,
+            Some(route) => {
+                factory
+                    .connect_session_runner(&runner_identity, route)
+                    .await
+            }
             None => factory.connect(&project_root).await,
         };
         let connected = match connected {
@@ -14129,6 +14160,7 @@ impl McHandler {
         // A runner-lane route runs the completion on its own runner, so it is never
         // asked to run and resend it as a host completion.
         let session_runner = session_runner_route(&binding, dreamer_runner);
+        let runner_identity = runner_bind_identity(&binding);
         if host_completion.is_none()
             && dreamer_runner.kind == HistorianRunnerKind::Host
             && session_runner.is_none()
@@ -14211,7 +14243,7 @@ impl McHandler {
             let connected = match &session_runner {
                 Some(route) => {
                     self.producer_factory
-                        .connect_session_runner(&binding.project_root, route)
+                        .connect_session_runner(&runner_identity, route)
                         .await
                 }
                 None => self.producer_factory.connect(&binding.project_root).await,
@@ -21628,6 +21660,24 @@ mod tests {
     };
     use tokio::sync::Notify;
 
+    #[test]
+    fn session_runner_historian_child_config_uses_setup_root_and_harness() {
+        let identity = session_resolver::RunnerBindIdentity {
+            project_root: PathBuf::from("/canonical/project"),
+            harness: "broca".into(),
+            session: "conversation".into(),
+        };
+
+        let config = session_runner_historian_config(
+            PathBuf::from("/connection.json"),
+            RouteTargetConfig::default(),
+            &identity,
+        );
+
+        assert_eq!(config.project_root, identity.project_root);
+        assert_eq!(config.harness, identity.harness);
+    }
+
     // Adversarial gate over the host-runner slice and the single-store marker
     // slice merged together. Kept in its own files so the sequences it executes
     // read as one argument instead of being scattered through this module.
@@ -25795,10 +25845,10 @@ mod tests {
 
         async fn connect_session_runner(
             &self,
-            project: &Path,
+            identity: &session_resolver::RunnerBindIdentity,
             _route: &SessionRunnerRoute,
         ) -> Result<Box<dyn HistorianProducerDriver + Send>, HistorianProducerError> {
-            self.connect(project).await
+            self.connect(&identity.project_root).await
         }
     }
 

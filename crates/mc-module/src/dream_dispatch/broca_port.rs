@@ -9,8 +9,9 @@
 //! promise fixed on the first send.
 //!
 //! For a runner-lane conversation the same ops go to that conversation's own runner
-//! instead ([`SessionRunnerRoute`]), and the carrier names the parent session on
-//! every send.
+//! instead ([`SessionRunnerRoute`]). Each child route stays bound to its child
+//! session; the parent relationship is used to validate the task scope, not sent in
+//! a field the runner does not declare.
 
 use super::broca_carrier::{BrocaPort, PortError};
 use super::executor::BrocaPorts;
@@ -221,5 +222,39 @@ impl Drop for SubcBrocaPort {
         if let Some((_, subscription)) = self.subscription.take() {
             let _ = subscription.unsubscribe();
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn session_runner_child_uses_recorded_root_and_harness_with_child_session() {
+        let root = PathBuf::from("/canonical/project");
+        let principal = subc_protocol::Principal::Reserved {
+            module_id: "broca".into(),
+        };
+        let runner = SubcBroca {
+            connection_file: PathBuf::new(),
+            route_targets: RouteTargetConfig::default(),
+            project_root: root.clone(),
+            harness: "claude-code".into(),
+            session_runner: Some(
+                SessionRunnerRoute::for_principal(Some(&principal), "conversation").unwrap(),
+            ),
+        };
+
+        let (target, identity) = runner.port().route("dream-child").unwrap();
+
+        assert_eq!(
+            target,
+            RouteTarget::ManagementSurface {
+                module_id: "broca".into()
+            }
+        );
+        assert_eq!(identity.project_root, root);
+        assert_eq!(identity.harness, "claude-code");
+        assert_eq!(identity.session, "dream-child");
     }
 }
