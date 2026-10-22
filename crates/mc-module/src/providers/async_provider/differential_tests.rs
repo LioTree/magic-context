@@ -16,6 +16,9 @@ mod stack24_cache_review;
 #[path = "stack26_cache_review.rs"]
 mod stack26_cache_review;
 
+#[path = "card_cache_review.rs"]
+mod card_cache_review;
+
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum Profile {
     Broca,
