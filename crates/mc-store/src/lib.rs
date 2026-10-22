@@ -630,6 +630,23 @@ fn current_time_ms() -> i64 {
         .unwrap_or(0)
 }
 
+/// The smallest string greater than every string that starts with `prefix`, for a
+/// primary-key range read: the prefix with its last character advanced, dropping
+/// trailing characters that cannot advance. SQLite compares text by its UTF-8 bytes,
+/// which order the same way as code points. `None` when no such bound exists (an
+/// empty prefix, or one made only of `char::MAX`); the caller then filters without
+/// an upper bound.
+fn session_prefix_upper_bound(prefix: &str) -> Option<String> {
+    let mut chars: Vec<char> = prefix.chars().collect();
+    while let Some(last) = chars.pop() {
+        if let Some(next) = (u32::from(last) + 1..=u32::from(char::MAX)).find_map(char::from_u32) {
+            chars.push(next);
+            return Some(chars.into_iter().collect());
+        }
+    }
+    None
+}
+
 const MIGRATIONS: &[Migration] = &[
     Migration {
         version: 1,
@@ -10591,6 +10608,40 @@ impl McStore {
             )
             .optional()
             .map(|summary| summary.unwrap_or_default())
+        })?)
+    }
+
+    /// The highest tag number stored under each session id that equals `exact` or
+    /// starts with `prefix`, in session-id order; sessions with no tag rows are absent.
+    ///
+    /// The full-array allocator numbers a session's next tag one above its highest
+    /// stored row (see `mint_or_get_tags`), and tag rows are never deleted outside a
+    /// lineage descent that copies its source's rows, so each value is that session's
+    /// allocation high-water. The prefix is matched as a primary-key range, so the read
+    /// never scans other sessions' rows.
+    pub fn tag_high_water_by_session_prefix(
+        &self,
+        exact: &str,
+        prefix: &str,
+    ) -> Result<Vec<(String, i64)>, McStoreError> {
+        let upper = session_prefix_upper_bound(prefix);
+        Ok(self.inner.with_conn(|conn| {
+            let mut stmt = conn.prepare(
+                "SELECT session_id, MAX(tag_number) FROM mc_tags
+                  WHERE session_id = ?1
+                  GROUP BY session_id
+                 UNION
+                 SELECT session_id, MAX(tag_number) FROM mc_tags
+                  WHERE session_id >= ?2
+                    AND (?3 IS NULL OR session_id < ?3)
+                    AND substr(session_id, 1, length(?2)) = ?2
+                  GROUP BY session_id
+                 ORDER BY 1",
+            )?;
+            let rows = stmt.query_map(params![exact, prefix, upper], |row| {
+                Ok((row.get::<_, String>(0)?, row.get::<_, i64>(1)?))
+            })?;
+            rows.collect::<Result<Vec<_>, _>>()
         })?)
     }
 
@@ -21660,6 +21711,58 @@ mod tests {
             plan.contains("INDEX") && plan.contains("block_id"),
             "{plan}"
         );
+    }
+
+    #[test]
+    fn tag_high_water_by_session_prefix_reads_each_matching_session_and_nothing_else() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = McStore::open_for_test(&descriptor(dir.path())).unwrap();
+        let mint = |session: &str, blocks: usize| {
+            let inputs = (0..blocks)
+                .map(|n| TagMintInput {
+                    block_id: format!("m{n}#0"),
+                    kind: "message".to_string(),
+                    token_count: 1,
+                    source_bytes: Vec::new(),
+                })
+                .collect::<Vec<_>>();
+            store.mint_or_get_tags(session, &inputs, 1).unwrap();
+        };
+        mint("s", 3);
+        mint("s\u{241f}1", 5);
+        mint("s\u{241f}a\u{241f}0", 2);
+        // Neighbours on either side of the prefix range, and a longer id that
+        // merely starts with the exact id.
+        mint("s\u{241e}1", 9);
+        mint("s\u{2420}1", 9);
+        mint("sx", 9);
+        assert_eq!(
+            store
+                .tag_high_water_by_session_prefix("s", "s\u{241f}")
+                .unwrap(),
+            vec![
+                ("s".to_string(), 3),
+                ("s\u{241f}1".to_string(), 5),
+                ("s\u{241f}a\u{241f}0".to_string(), 2),
+            ]
+        );
+        assert!(store
+            .tag_high_water_by_session_prefix("none", "none\u{241f}")
+            .unwrap()
+            .is_empty());
+        assert_eq!(
+            session_prefix_upper_bound("a\u{241f}").as_deref(),
+            Some("a\u{2420}")
+        );
+        assert_eq!(
+            session_prefix_upper_bound("a\u{d7ff}").as_deref(),
+            Some("a\u{e000}")
+        );
+        assert_eq!(
+            session_prefix_upper_bound("a\u{10ffff}").as_deref(),
+            Some("b")
+        );
+        assert_eq!(session_prefix_upper_bound(""), None);
     }
 
     #[test]

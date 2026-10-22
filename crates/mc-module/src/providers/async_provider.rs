@@ -9,6 +9,7 @@ use serde::Deserialize;
 mod differential_tests;
 mod emptied_messages;
 mod frozen_edits;
+mod full_array_floor;
 mod held_entries;
 mod historian_tail;
 mod moved_session;
@@ -22,6 +23,7 @@ mod tests;
 mod tool_arcs;
 mod user_commands;
 pub(super) mod wrapup;
+use moved_session::CheckpointSource;
 use resident::{EngineView, HeldEntry};
 #[cfg(test)]
 use scaling_tests::reminder_work;
@@ -196,6 +198,10 @@ pub(crate) struct AsyncRecord {
     /// OpenCode 1 plugin; see `moved_session`.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     standalone_move: Option<moved_session::StandaloneMove>,
+    /// Set for a Claude Code conversation ck-mc served on the full-array
+    /// route before; see `full_array_floor`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    full_array_floor: Option<full_array_floor::FullArrayFloor>,
     /// The named outcome of the last transcript read when it was not an
     /// ordinary page: `never_written` (see `ReadProgress::NeverWritten`).
     /// Shown by `ctx-status`; cleared by the next read that names a lineage.
@@ -1737,6 +1743,10 @@ impl McHandler {
                 .map(|reason| (state.generation, reason));
             live_describe = Some(describe);
         }
+        // A record discarded for a fresh generation keeps the floor it stored.
+        let stored_floor = existing
+            .as_ref()
+            .and_then(|state| state.full_array_floor.clone());
         if let Some(state) = existing.filter(|_| discarded.is_none()) {
             self.authorize_async(binding, &state)?;
             let project = self.historian_lane_project(channel, binding, store)?;
@@ -1761,9 +1771,17 @@ impl McHandler {
                         contract::setup::SetupCheckpoint::new(record.tag_checkpoint, &record.cut)
                     })
                 });
+            // A conversation set up with a full-array floor answers the floor
+            // it stored; the full-array state is never read again.
+            let (checkpoint, why) = match (checkpoint, &state.full_array_floor) {
+                (Some(checkpoint), _) => (Some(checkpoint), CheckpointSource::StandaloneMove),
+                (None, Some(floor)) => (Some(floor.checkpoint()), CheckpointSource::FullArray),
+                (None, None) => (None, CheckpointSource::StandaloneMove),
+            };
             if let Some(refusal) = self
                 .refuse_checkpoint_unsupported(
                     checkpoint.as_ref(),
+                    why,
                     &state.runner()?,
                     &state.runner_identity(),
                     &request.request_id,
@@ -1780,6 +1798,28 @@ impl McHandler {
         let checkpoint = standalone_move.as_ref().map(|record| {
             contract::setup::SetupCheckpoint::new(record.tag_checkpoint, &record.cut)
         });
+        // A Claude Code conversation ck-mc served on the full-array route
+        // numbers its parts above every number that route allocated for it.
+        // Read once, here, and stored with the record.
+        let full_array_floor = match (&checkpoint, stored_floor) {
+            (Some(_), _) => None,
+            (None, Some(floor)) => Some(floor),
+            (None, None) => match full_array_floor::setup_floor(
+                store,
+                &request.harness,
+                &request.session,
+                &request.request_id,
+            ) {
+                full_array_floor::Floor::None => None,
+                full_array_floor::Floor::Carried(floor) => Some(floor),
+                full_array_floor::Floor::Refuse(answer) => return bytes(&answer),
+            },
+        };
+        let (checkpoint, why) = match (checkpoint, &full_array_floor) {
+            (Some(checkpoint), _) => (Some(checkpoint), CheckpointSource::StandaloneMove),
+            (None, Some(floor)) => (Some(floor.checkpoint()), CheckpointSource::FullArray),
+            (None, None) => (None, CheckpointSource::StandaloneMove),
+        };
         if let Some(checkpoint) = &checkpoint {
             // Refused before anything is stored, so a later Setup from a
             // runner that declares the group sets the session up afresh.
@@ -1796,6 +1836,7 @@ impl McHandler {
             if let Some(refusal) = self
                 .refuse_checkpoint_unsupported(
                     Some(checkpoint),
+                    why,
                     &route,
                     &identity,
                     &request.request_id,
@@ -1817,6 +1858,7 @@ impl McHandler {
         };
         let mut state =
             self.new_async_record(channel, binding, &request, key, standalone_move, generation)?;
+        state.full_array_floor = full_array_floor;
         if discarded.is_some() {
             state.forget_discarded_rows();
         }
@@ -1866,6 +1908,7 @@ impl McHandler {
             resync_sources: None,
             restored_head: None,
             standalone_move: standalone_move.map(moved_session::StandaloneMove::from_record),
+            full_array_floor: None,
             read_outcome: None,
             partial_read_seq: None,
             failure: None,
@@ -1987,7 +2030,8 @@ impl McHandler {
             .map_err(runner_error)
     }
 
-    /// For a moved session (`checkpoint` present), the terminal
+    /// For a session with a Setup checkpoint (`checkpoint` present: moved from
+    /// standalone, or carrying a full-array floor, as `why` says), the terminal
     /// `tag_checkpoint_unsupported` refusal when its runner does not declare
     /// llm-runner's `tag_checkpoint` group, read from the runner's own
     /// `role.describe` (`fetched` when this Setup already read it); `None`
@@ -1995,6 +2039,7 @@ impl McHandler {
     async fn refuse_checkpoint_unsupported(
         &self,
         checkpoint: Option<&contract::setup::SetupCheckpoint>,
+        why: CheckpointSource,
         route: &crate::route_targets::SessionRunnerRoute,
         identity: &session_resolver::RunnerBindIdentity,
         request_id: &str,
@@ -2011,7 +2056,7 @@ impl McHandler {
             .map_err(|problems| transient(format!("runner role.describe: {problems:?}")))?;
         Ok(
             (!describe.declares(cortexkit_role_llm_runner::capabilities::TAG_CHECKPOINT))
-                .then(|| moved_session::tag_checkpoint_refusal(request_id)),
+                .then(|| moved_session::tag_checkpoint_refusal(request_id, why)),
         )
     }
 
