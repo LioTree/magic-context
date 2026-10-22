@@ -10615,10 +10615,11 @@ impl McStore {
     /// starts with `prefix`, in session-id order; sessions with no tag rows are absent.
     ///
     /// The full-array allocator numbers a session's next tag one above its highest
-    /// stored row (see `mint_or_get_tags`), and tag rows are never deleted outside a
-    /// lineage descent that copies its source's rows, so each value is that session's
-    /// allocation high-water. The prefix is matched as a primary-key range, so the read
-    /// never scans other sessions' rows.
+    /// stored row (see `mint_or_get_tags`), so while a session's rows are kept each
+    /// value is its allocation high-water. A session whose rows were deleted
+    /// (`delete_session`, or a lineage descent replacing them with its source's rows)
+    /// may have allocated numbers above what is stored now. The prefix is matched as a
+    /// primary-key range, so the read never scans other sessions' rows.
     pub fn tag_high_water_by_session_prefix(
         &self,
         exact: &str,
