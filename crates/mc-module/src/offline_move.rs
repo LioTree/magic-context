@@ -122,7 +122,7 @@ pub struct Refusal {
 }
 
 impl Refusal {
-    fn new(code: &'static str, detail: impl Into<String>) -> Self {
+    pub(crate) fn new(code: &'static str, detail: impl Into<String>) -> Self {
         Self {
             code,
             detail: detail.into(),
@@ -237,7 +237,7 @@ pub fn check_holders(paths: &StorePaths, check: &dyn HolderCheck) -> Result<(), 
 /// and is opened immutable: a plain read-only open would create empty `-wal` and
 /// `-shm` files. Nothing else holds it open (the holder check ran first), as
 /// immutable requires; the restart window job reads its stores the same way.
-fn open_read_only(path: &Path) -> Result<Connection, Refusal> {
+pub(crate) fn open_read_only(path: &Path) -> Result<Connection, Refusal> {
     if !path.exists() {
         return Err(Refusal::new(
             "store_missing",
@@ -1247,6 +1247,9 @@ fn parse_args(args: &[String]) -> Result<(StorePaths, String, bool), String> {
 /// `ck-mc offline <args>`: prints one JSON object on stdout and a one-line verdict
 /// on stderr. Exit 0 when moved or planned, 2 when refused, 1 when interrupted.
 pub fn cli_main(args: &[String]) -> i32 {
+    if args.first().map(String::as_str) == Some("first-pass") {
+        return crate::offline_first_pass::cli_main(&args[1..]);
+    }
     let (paths, session, dry_run) = match parse_args(args) {
         Ok(parsed) => parsed,
         Err(usage) => {

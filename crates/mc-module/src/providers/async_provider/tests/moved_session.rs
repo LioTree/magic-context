@@ -9,7 +9,7 @@ use crate::offline_move::{self, tests as fixture};
 const MODULE: &str = "thalamus-harness";
 
 /// The session as the runner reads it from `opencode.db`.
-fn served_entries(opencode_db: &Path, session: &str) -> Vec<ReadMessage> {
+pub(super) fn served_entries(opencode_db: &Path, session: &str) -> Vec<ReadMessage> {
     let conn = rusqlite::Connection::open(opencode_db).unwrap();
     let messages = conn
         .prepare("SELECT id, data FROM message WHERE session_id=?1 ORDER BY time_created, id")

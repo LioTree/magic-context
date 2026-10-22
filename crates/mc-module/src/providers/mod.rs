@@ -8,6 +8,7 @@ mod async_bus;
 #[cfg(test)]
 mod async_contract_vectors;
 mod async_provider;
+pub(crate) use async_provider::offline_first_pass as offline_first_pass_engine;
 pub(crate) use async_provider::reminder_echoes::accounting as runner_accounting;
 pub(crate) use async_provider::reminder_echoes::origin as runner_origin;
 #[cfg(test)]

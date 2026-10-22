@@ -338,6 +338,7 @@ pub mod m1_compose;
 pub mod memory_render;
 pub mod memory_tool;
 mod memory_verification;
+pub mod offline_first_pass;
 pub mod offline_move;
 mod ops_facade;
 pub mod parity_contract;
@@ -21817,6 +21818,11 @@ mod tests {
     }
     pub(crate) fn per_pass_fixed_now_ms() -> Option<i64> {
         per_pass_cost::fixed_now_ms()
+    }
+    /// Fix `now_ms()` on this thread until the guard drops, for tests that
+    /// compare committed state from two runs.
+    pub(crate) fn fixed_clock() -> impl Drop {
+        per_pass_cost::fixed_clock()
     }
     mod catalog_startup;
     mod single_store_drill;
