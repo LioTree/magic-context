@@ -1,4 +1,4 @@
-//! Public-API async contract vectors pinned from commons 737490bbe9ee15f3c69c5781e461e6ef4e795dde.
+//! Public-API async contract vectors from published compaction-provider 0.5.1.
 //! Their expected digests come from the contract's independent implementation.
 use crate::sha256_hex;
 mod vectors {
@@ -205,7 +205,7 @@ fn the_largest_well_formed_notice_fits_the_header_bound() {
     let names: usize = notice::headers::NOTICE.iter().map(|n| n.len()).sum();
     let descent = 256 + 1 + 20 + 1 + 64;
     let widest = names + 1024 + 4 * 20 + 3 + 256 + 32 + 64 + 5 * 20 + 256 + descent;
-    assert_eq!(widest, 2280);
+    assert_eq!(widest, 2293);
     assert!(widest <= notice::MAX_NOTICE_HEADER_BYTES);
     assert!(notice::header_bytes(&encoded) <= widest);
 }
@@ -347,6 +347,7 @@ fn check_dispositions(outcomes: &[&str]) -> usize {
             &ready,
             case["current_version"].as_u64(),
             case["lineage_id"].as_str().unwrap(),
+            case["first_ordinal"].as_u64().unwrap_or(0),
             |ordinal| held.iter().find(|m| m.ordinal == ordinal).cloned(),
         );
         assert_eq!(disposition.name(), outcome, "{name}");
@@ -474,7 +475,7 @@ fn ride_vectors() {
         .iter()
         .map(|case| vectors::round_trip::<RideAnswer>(name(case), &case["answer"]))
         .collect();
-    assert!(matches!(&answers[0], RideAnswer::View { view } if view.check().is_ok()));
+    assert!(matches!(&answers[0], RideAnswer::View { view, .. } if view.check().is_ok()));
     assert_eq!(answers[1], RideAnswer::nothing());
     for case in vectors::cases(ride, "undecodable_answers") {
         vectors::refused::<RideAnswer>(name(case), &case["answer"]);
