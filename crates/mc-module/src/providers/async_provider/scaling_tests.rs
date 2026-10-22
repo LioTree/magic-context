@@ -1711,12 +1711,17 @@ async fn covered_tail_latency_benchmark() {
             let bytes = |value: &dyn erased_size::Sized| value.json_len();
             let total = serde_json::to_string(&seed).unwrap().len();
             eprintln!(
-                "BENCH cut_seed total={size} first={first} seed_bytes={total} head_bytes={} views_bytes={} certificate_bytes={} record_bytes={} context_bytes={} window_units={}",
+                "BENCH cut_seed total={size} first={first} seed_bytes={total} head_bytes={} views_bytes={} engine_views_bytes={} certificate_bytes={} record_bytes={} context_bytes={} protection_bytes={} pre_cut_tags_bytes={} frozen_edits_bytes={} window_units_bytes={} window_units={}",
                 bytes(&seed.window.head),
                 bytes(&seed.window.views),
+                bytes(&(&seed.window.produced_view, &seed.window.applied_view)),
                 bytes(&seed.window.certificate),
                 bytes(&seed.window.record),
                 bytes(&seed.context_sources),
+                bytes(&seed.protection),
+                bytes(&seed.pre_cut_tags),
+                bytes(&seed.window.frozen_edits),
+                bytes(&seed.window.frozen_units),
                 seed.window.head.as_ref().map_or(0, |head| head.core.frozen_units.len()),
             );
             total as u64

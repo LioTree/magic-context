@@ -385,7 +385,11 @@ impl LogicalPrefix {
     /// was made under, keeping its highest certified tag. For a namespace
     /// whose tag rows below a cut were removed (or never written), so that
     /// only tags appended after the certificate count as new.
-    pub(crate) fn rebase_tag_summary(&mut self, store: &McStore, session: &str) -> Result<(), TransformError> {
+    pub(crate) fn rebase_tag_summary(
+        &mut self,
+        store: &McStore,
+        session: &str,
+    ) -> Result<(), TransformError> {
         let summary = store.tag_cache_summary(session)?;
         self.tag_summary = (summary.generation, summary.count, self.tag_summary.2);
         Ok(())

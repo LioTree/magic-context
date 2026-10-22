@@ -97,9 +97,12 @@ pub(crate) struct CutSeed {
     /// window is computed over the window's tags only; tags below the cut
     /// have no live source either way.
     pub protection: Option<SeedProtection>,
-    /// Inclusive tag-number ranges that existed below the cut, so
-    /// `ctx_reduce` naming one answers that it is already in the history
-    /// summary. Fallback: empty, so such a number answers "not found".
+    /// The inclusive span of tag numbers below the cut (at most one range),
+    /// so `ctx_reduce` naming one answers that it is already in the history
+    /// summary. One span, not one range per run of numbers, so the seed does
+    /// not grow with the session when numbering has gaps; a number inside a
+    /// gap was never shown and answers the same way. Fallback: empty, so
+    /// such a number answers "not found".
     pub pre_cut_tags: Vec<(u64, u64)>,
     /// The highest tag number below the cut (0 when none).
     pub max_tag: u64,
@@ -227,19 +230,6 @@ impl CaptureRefusal {
             Self::Oversize => "cut_seed_oversize",
         }
     }
-}
-
-/// Compress sorted, deduplicated numbers into inclusive ranges.
-fn ranges(numbers: impl IntoIterator<Item = u64>) -> Vec<(u64, u64)> {
-    let mut out: Vec<(u64, u64)> = Vec::new();
-    for number in numbers {
-        match out.last_mut() {
-            Some((_, hi)) if number == *hi + 1 => *hi = number,
-            Some((_, hi)) if number <= *hi => {}
-            _ => out.push((number, number)),
-        }
-    }
-    out
 }
 
 /// The block's message id: the part before `#`, or the whole id.
@@ -701,12 +691,20 @@ impl AsyncRecord {
             .filter_map(|(tag, _)| tags::parse_tag(tag))
             .collect::<Vec<_>>();
         numbers.sort_unstable();
-        let mut pre_cut_tags = previous
+        let pre_cut_tags = previous
             .as_ref()
             .map(|seed| seed.pre_cut_tags.clone())
-            .unwrap_or_default();
-        pre_cut_tags.extend(ranges(numbers.iter().copied()));
-        pre_cut_tags.sort_unstable();
+            .unwrap_or_default()
+            .into_iter()
+            .chain(
+                numbers
+                    .first()
+                    .zip(numbers.last())
+                    .map(|(lo, hi)| (*lo, *hi)),
+            )
+            .reduce(|(lo, hi), (next_lo, next_hi)| (lo.min(next_lo), hi.max(next_hi)))
+            .into_iter()
+            .collect::<Vec<_>>();
         let max_tag = numbers
             .last()
             .copied()

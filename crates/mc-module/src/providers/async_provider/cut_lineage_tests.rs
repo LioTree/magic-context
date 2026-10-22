@@ -234,29 +234,6 @@ fn engine_state(side: &Side, reference: &str, first: u64) -> Value {
             fields.insert("publication_floor_ordinal".into(), json!(first));
         }
     }
-    // With runner-owned tags the hygiene numbers parts by their position in
-    // the engine's request (`tag_rows_for_hygiene` when no overlay tags
-    // them), so they and the signature over them differ between a full pass
-    // and a prefix pass of the same conversation; nothing renders them.
-    if let Some(baseline) = meta
-        .get_mut("tail_hygiene_baseline")
-        .and_then(Value::as_object_mut)
-    {
-        baseline.remove("content_signature");
-        // The generation counts re-measurements. A full pass's measurement
-        // is re-measured once when the conversation's passes take the
-        // prefix shape (the positional numbering above changes); a lineage
-        // that begins at a cut starts in that shape. The parts and totals
-        // are compared.
-        baseline.remove("baseline_generation");
-        for key in ["parts", "baseline_parts"] {
-            if let Some(parts) = baseline.get_mut(key).and_then(Value::as_array_mut) {
-                for part in parts.iter_mut().filter_map(Value::as_object_mut) {
-                    part.remove("tag_number");
-                }
-            }
-        }
-    }
     meta["tag_rows"] = json!(store
         .load_tags_after(&namespace, i64::MIN)
         .unwrap()
@@ -491,6 +468,17 @@ async fn cut_session_start(
         Box::pin(async move { publish_history(side, &reference, history_end) })
     })
     .await;
+    // A fresh start's seed comes from a third provider that reads
+    // everything; the pair's two sides then both start fresh at the cut.
+    let full_side = if mode == CutMode::BootstrapAtCut {
+        let side = Side::new(pair._project.path(), &pair.transcript, false, inject_docs).await;
+        let setup = json!({"method":"compaction.setup","params":{"session":"s","harness":profile.harness(),"request_id":"setup","model":"fixture","context_window":100_000,"composition":{"render_tags":true},"params":{"serializer_profile":profile.wire()},"now":1,"lineage_id":"L"}});
+        side.dispatch(setup).await;
+        publish_history(&side, &pair.reference, history_end);
+        Some(side)
+    } else {
+        None
+    };
     // The full side reads everything first; its rows give the seed. The cut
     // is taken once a view covering it is applied (coverage reaches it), as
     // a runner applies a cut only with the view that carries it.
@@ -508,10 +496,11 @@ async fn cut_session_start(
     let (codec, first) = loop {
         pair.seq += 1;
         let message = pair.notice_message(&mut rng, None);
-        full_answers.push(deliver(&pair.oracle, message.clone()).await);
-        pair.oracle.settle().await;
+        let source = full_side.as_ref().unwrap_or(&pair.oracle);
+        full_answers.push(deliver(source, message.clone()).await);
+        source.settle().await;
         opening.push(message);
-        let store = pair.oracle.store();
+        let store = source.store();
         let mut state = load(store, &pair.reference).unwrap().unwrap();
         let codec = codec::Codec::from_params(&Value::Object(state.setup.params.clone())).unwrap();
         state.fold_entries(codec, None).unwrap();
@@ -543,7 +532,24 @@ async fn cut_session_start(
     };
     let mut cut_answers = Vec::new();
     match mode {
-        CutMode::BeginAtCut | CutMode::BootstrapAtCut => {
+        CutMode::BootstrapAtCut => {
+            let full = full_side.as_ref().expect("a fresh start's source");
+            let mut state = load(full.store(), &pair.reference).unwrap().unwrap();
+            let seed = seed_from(&mut state, full.store());
+            for side in [&pair.resident, &pair.oracle] {
+                *side.runner.floor.lock().unwrap() = Some(first);
+                let mut cut = side
+                    .h
+                    .checkout(side.store(), &pair.reference)
+                    .unwrap()
+                    .unwrap();
+                cut.begin_at_cut(side.store(), seed.clone(), cut_seed::CutStart::Fresh)
+                    .unwrap();
+                side.h.checkin(cut);
+            }
+            cut_answers = full_answers.clone();
+        }
+        CutMode::BeginAtCut => {
             // Full processing has published and applied the view that
             // covers the cut; the lineage after the cut begins there, from
             // the compartments and the seed, and both sides take the same
@@ -559,7 +565,7 @@ async fn cut_session_start(
                 .unwrap();
             cut.engine.version_high_water = state.engine.version_high_water;
             let boundary = seed.boundary_id.clone();
-            let start = if mode == CutMode::BeginAtCut {
+            {
                 // Each store mints its own random generation for the same
                 // compartment history, and the m1 revisions hash it. The two
                 // sides hold the same history, so the cut side's store takes
@@ -583,11 +589,9 @@ async fn cut_session_start(
                         )
                     })
                     .unwrap();
-                cut_seed::CutStart::Descending
-            } else {
-                cut_seed::CutStart::Fresh
-            };
-            cut.begin_at_cut(side.store(), seed, start).unwrap();
+            }
+            cut.begin_at_cut(side.store(), seed, cut_seed::CutStart::Descending)
+                .unwrap();
             if std::env::var_os("MC_CUT_TRACE").is_some() {
                 let meta = side.store().load(&cut.namespace()).unwrap();
                 eprintln!(
@@ -599,21 +603,6 @@ async fn cut_session_start(
                 );
             }
             side.h.checkin(cut);
-            if mode == CutMode::BootstrapAtCut {
-                // A fresh start keeps none of the full side's views, so each
-                // side numbers its own from here.
-                let (_, high) = pair.oracle.views(&pair.reference);
-                let high = high.unwrap_or(0);
-                rusqlite::Connection::open(&side.db)
-                    .unwrap()
-                    .execute(
-                        "UPDATE mc_async_compaction SET version_high_water=?1 WHERE session_ref=?2",
-                        rusqlite::params![high, pair.reference],
-                    )
-                    .unwrap();
-                pair.compare_from_version = high as u64;
-                pair.cut_mode = true;
-            }
             for runner in [&pair.resident.runner, &pair.oracle.runner] {
                 runner.sends.lock().unwrap().clear();
                 runner.raw_sends.lock().unwrap().clear();
@@ -654,35 +643,36 @@ async fn cut_session_start(
     }
     if mode != CutMode::PruneInPlace {
         pair.record_only = std::env::var_os("MC_CUT_TRACE").is_some();
-        if mode == CutMode::BootstrapAtCut {
-            // The reference rebuilds at the same notice: a lineage that does
-            // not descend from the cut starts where the provider's cached
-            // head is gone, so full processing loses its cached m1 too and
-            // the differential compares every step from that rebuild.
-            let store = pair.oracle.store();
-            let head = load_head(store, &pair.reference).unwrap().unwrap();
-            let mut loaded = store.load(&head.namespace()).unwrap();
-            loaded.core.frozen_units.retain(|unit| unit.key != "m1");
-            store
-                .commit(
-                    &head.namespace(),
-                    loaded.row_version,
-                    &loaded.core,
-                    &loaded.meta,
-                )
-                .unwrap();
-        }
         for side in [&pair.oracle, &pair.resident] {
-            cut_seed::pass_trace::take(Arc::as_ptr(&side.h) as usize);
+            cut_seed::pass_trace::take(side.store() as *const McStore as usize);
         }
-        // The lineage after the cut starts with a notice, as a runner's does.
+        // The lineage after the cut starts with a notice, as a runner's does,
+        // after a completed turn: a range may not end inside a tool arc.
         pair.append(1);
-        pair.notice(&mut rng, None).await;
-        let first_pass = |side: &Side| {
-            let passes = cut_seed::pass_trace::take(Arc::as_ptr(&side.h) as usize);
+        while pair.profile != Profile::OpenCode
+            && pair
+                .transcript
+                .entries
+                .lock()
+                .unwrap()
+                .last()
+                .unwrap()
+                .ordinal
+                % 4
+                != 3
+        {
+            pair.append(1);
+        }
+        let answer = pair.notice(&mut rng, None).await;
+        let passes = |side: &Side| {
+            let passes = cut_seed::pass_trace::take(side.store() as *const McStore as usize);
             if std::env::var_os("MC_CUT_TRACE").is_some() {
                 eprintln!("REPLAY first passes {passes:?}");
             }
+            passes
+        };
+        let (full_passes, cut_passes) = (passes(&pair.oracle), passes(&pair.resident));
+        let first_pass = |passes: &[String]| {
             passes.first().map(|line| {
                 line.split_whitespace()
                     .next()
@@ -690,7 +680,7 @@ async fn cut_session_start(
                     .to_owned()
             })
         };
-        let (full, cut) = (first_pass(&pair.oracle), first_pass(&pair.resident));
+        let (full, cut) = (first_pass(&full_passes), first_pass(&cut_passes));
         if std::env::var_os("MC_CUT_TRACE").is_none() {
             assert_eq!(
                 full, cut,
@@ -700,7 +690,7 @@ async fn cut_session_start(
                 assert_eq!(
                     cut.as_deref(),
                     Some("action=HARD"),
-                    "{profile:?} seed {number}: a fresh start rebuilds"
+                    "{profile:?} seed {number}: a fresh start rebuilds; notice {answer}, passes {cut_passes:?}"
                 );
             }
         }
@@ -715,9 +705,14 @@ async fn cut_session(profile: Profile, seed: u64, steps: u64, mode: CutMode) {
     else {
         return;
     };
+    let mut fresh = (mode == CutMode::BootstrapAtCut).then(|| FreshStart::new(&pair));
     for _ in 0..steps {
+        let before = pair.log.len();
         pair.cut_step(&mut rng, first, &mut history_end).await;
         pair.check_cut(first);
+        if let Some(fresh) = &mut fresh {
+            fresh.after_step(&pair, first, before);
+        }
     }
     let mismatches = pair.engine_mismatches.borrow();
     assert!(
@@ -726,6 +721,98 @@ async fn cut_session(profile: Profile, seed: u64, steps: u64, mode: CutMode) {
         mismatches.values().collect::<Vec<_>>(),
         pair.log
     );
+}
+
+/// What a fresh start at a cut must keep to after its first view, which is
+/// its one full rebuild: a pass with no rebuild permission publishes no new
+/// view (the runner keeps serving the bytes it served), no pass rebuilds
+/// without a permission, and no view keeps or edits a row below the cut.
+struct FreshStart {
+    model: String,
+    /// A rebuild permission granted since the last rebuild: a historian
+    /// publication or a flush (both arm a refresh), a ride, context
+    /// pressure, or a model change. The engine may spend it on a later pass,
+    /// for instance after a signed turn ends.
+    pending: bool,
+    served: Option<Vec<u8>>,
+}
+
+impl FreshStart {
+    fn new(pair: &Pair) -> Self {
+        let served = Self::newest(pair, &pair.resident);
+        Self {
+            model: pair.model.clone(),
+            pending: false,
+            served,
+        }
+    }
+
+    /// The newest view the side would serve, as published.
+    fn newest(pair: &Pair, side: &Side) -> Option<Vec<u8>> {
+        side.views(&pair.reference)
+            .0
+            .last()
+            .map(|(version, json)| format!("{version} {json}").into_bytes())
+    }
+
+    fn after_step(&mut self, pair: &Pair, first: u64, before: usize) {
+        let labels = &pair.log[before..];
+        let passes = cut_seed::pass_trace::take(pair.resident.store() as *const McStore as usize);
+        cut_seed::pass_trace::take(pair.oracle.store() as *const McStore as usize);
+        let ride = labels.iter().any(|label| label.starts_with("ride"));
+        self.pending |= labels
+            .iter()
+            .any(|label| label == "historian publish" || label.contains("ctx-flush"));
+        self.pending |= ride;
+        for label in labels.iter().filter(|label| label.starts_with("notice")) {
+            let field = |name: &str| {
+                label
+                    .split_whitespace()
+                    .find_map(|word| word.strip_prefix(name))
+                    .unwrap_or_default()
+                    .to_owned()
+            };
+            let est = field("est=").parse::<u64>().unwrap_or(0);
+            let model = field("model=");
+            self.pending |= est >= 72_000 || model != self.model;
+            self.model = model;
+        }
+        let permitted = self.pending;
+        let rebuilt = passes
+            .iter()
+            .any(|pass| pass.starts_with("action=HARD") || pass.starts_with("action=SOFT "));
+        assert!(
+            !rebuilt || permitted,
+            "{:?}: a fresh start rebuilt without a permission at {labels:?}: {passes:?}; steps={:?}",
+            pair.profile,
+            pair.log
+        );
+        let served = Self::newest(pair, &pair.resident);
+        if !rebuilt && !ride && !labels.iter().any(|label| label.contains("ctx-flush")) {
+            assert!(
+                served == self.served,
+                "{:?}: a pass without a rebuild changed the served bytes at {labels:?}: {passes:?}; steps={:?}",
+                pair.profile,
+                pair.log
+            );
+        }
+        self.served = served;
+        if rebuilt {
+            self.pending = false;
+        }
+        for (_, json) in pair.resident.views(&pair.reference).0 {
+            let view: view::CompactionView = serde_json::from_str(&json).unwrap();
+            for range in &view.ranges {
+                if let view::ViewRange::Keep { from, edits, .. } = range {
+                    assert!(
+                        *from >= first && edits.iter().all(|edit| edit.ordinal >= first),
+                        "{:?}: a view keeps or edits a row below the cut {first}",
+                        pair.profile
+                    );
+                }
+            }
+        }
+    }
 }
 
 /// Sessions whose opening notices applied no view covering the history, so
@@ -1327,7 +1414,12 @@ async fn replay_cut_session() {
         let loaded = side.store().load(&head.namespace()).unwrap();
         let meta = &loaded.meta;
         format!(
-            "parts={:?} coverage={:?} execute={} floor={:?} hygiene_gen={:?} reds={:?} prefix={:?}",
+            "divergence={}/{:?} rendered={:?}/{:?} boundary={} parts={:?} coverage={:?} execute={} floor={:?} hygiene_gen={:?} reds={:?} prefix={:?}",
+            meta.boundary_divergence_pending_count,
+            meta.boundary_divergence_observed_compartment_seq,
+            meta.rendered_m0_coverage,
+            meta.rendered_m1_coverage,
+            loaded.core.boundary_id,
             meta.tail_hygiene_baseline.as_ref().map(|baseline| {
                 baseline
                     .baseline_parts
@@ -1358,7 +1450,7 @@ async fn replay_cut_session() {
             head.logical_prefix.as_ref().map(|prefix| prefix.tail_from)
         )
     };
-    let passes = |side: &Side| cut_seed::pass_trace::take(Arc::as_ptr(&side.h) as usize);
+    let passes = |side: &Side| cut_seed::pass_trace::take(side.store() as *const McStore as usize);
     {
         let full = engine_state(&pair.oracle, &pair.reference, first);
         let cut = engine_state(&pair.resident, &pair.reference, first);
@@ -1429,87 +1521,6 @@ async fn a_lineage_that_begins_at_a_cut_reads_nothing_below_it() {
             state.entries.first_key_value().map(|(n, _)| *n),
             Some(first),
             "{profile:?}"
-        );
-    }
-}
-
-impl Pair {
-    /// The cut-mode comparison after a step: the model bytes of the newest
-    /// view each side would serve, the record decisions that do not name
-    /// view versions, the queued drops and the reminder sends.
-    pub(super) fn compare_newest(&self, label: &str) {
-        let newest = |side: &Side| {
-            side.views(&self.reference)
-                .0
-                .last()
-                .map(|(_, json)| serde_json::from_str::<view::CompactionView>(json).unwrap())
-        };
-        let (cut, full) = (newest(&self.resident), newest(&self.oracle));
-        // The full side's newest view may predate the cut (it needed no
-        // new one); the cut side has one once it took its first notice.
-        if let (Some(cut), Some(full)) = (&cut, &full) {
-            let cut_model: Vec<Value> = serde_json::from_slice(&self.model_bytes(cut)).unwrap();
-            let full_model: Vec<Value> = serde_json::from_slice(&self.model_bytes(full)).unwrap();
-            if cut_model != full_model {
-                let first = cut_model
-                    .iter()
-                    .zip(&full_model)
-                    .position(|(a, b)| a != b)
-                    .unwrap_or(cut_model.len().min(full_model.len()));
-                panic!(
-                    "{:?} served bytes after {label}, first={first}, cut={:?}, full={:?}, steps={:?}",
-                    self.profile,
-                    cut_model.get(first),
-                    full_model.get(first),
-                    self.log
-                );
-            }
-        }
-        // Whether the latest notice completed, not the sequence it completed:
-        // the full side also completed notices from before the cut.
-        let decisions = |side: &Side| {
-            let state = load_head(side.store(), &self.reference).unwrap()?;
-            Some(format!(
-                "seq={} completed_latest={} generation={} resync={} lineage={:?}",
-                state.seq,
-                state.completed_seq == state.seq,
-                state.generation,
-                state.resync,
-                state.lineage
-            ))
-        };
-        assert_eq!(
-            decisions(&self.resident),
-            decisions(&self.oracle),
-            "{:?} record decisions diverged after {label}; steps: {:?}",
-            self.profile,
-            self.log
-        );
-        let pending = |side: &Side| {
-            let head = load_head(side.store(), &self.reference).unwrap().unwrap();
-            let mut targets = side
-                .store()
-                .load_pending_agent_drops(&head.namespace())
-                .unwrap()
-                .into_iter()
-                .map(|drop| drop.target_id)
-                .collect::<Vec<_>>();
-            targets.sort();
-            targets
-        };
-        assert_eq!(
-            pending(&self.resident),
-            pending(&self.oracle),
-            "{:?} pending target identities diverged after {label}; steps={:?}",
-            self.profile,
-            self.log
-        );
-        assert_eq!(
-            *self.resident.runner.sends.lock().unwrap(),
-            *self.oracle.runner.sends.lock().unwrap(),
-            "{:?} reminder sends diverged after {label}; steps: {:?}",
-            self.profile,
-            self.log
         );
     }
 }

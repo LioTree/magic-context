@@ -4026,7 +4026,7 @@ impl McHandler {
             self.async_engine(channel, &binding, state, codec, &status, &mut engine)?;
         #[cfg(test)]
         cut_seed::pass_trace::record(
-            self as *const Self as usize,
+            Arc::as_ptr(store) as usize,
             format!(
                 "action={} prefix={:?} cut_prefix={} messages={} first={:?}",
                 output.engine.response.action,

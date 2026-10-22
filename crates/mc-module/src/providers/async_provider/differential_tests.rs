@@ -291,28 +291,6 @@ fn orphan(profile: Profile, n: u64) -> Option<ReadMessage> {
     )
 }
 
-/// `answer` without its view version members: in cut mode each side numbers
-/// its own views, so the answers are compared without them.
-fn versionless(answer: &str) -> String {
-    fn strip(value: &mut Value) {
-        match value {
-            Value::Object(map) => {
-                map.remove("view_version");
-                map.values_mut().for_each(strip);
-            }
-            Value::Array(items) => items.iter_mut().for_each(strip),
-            _ => {}
-        }
-    }
-    match serde_json::from_str::<Value>(answer) {
-        Ok(mut value) => {
-            strip(&mut value);
-            value.to_string()
-        }
-        Err(_) => answer.to_owned(),
-    }
-}
-
 /// The runner both providers read: one shared transcript and lineage.
 #[derive(Default)]
 struct Transcript {
@@ -612,14 +590,6 @@ struct Pair {
     /// Engine state fields that differed between the two sides, by field,
     /// with the first difference; see `cut_lineage_tests`.
     engine_mismatches: std::cell::RefCell<BTreeMap<String, String>>,
-    /// Compare only views above this version: a conversation that began at
-    /// a cut has none of the full side's earlier views.
-    compare_from_version: u64,
-    /// The resident side is a conversation that began at a cut while the
-    /// other side kept its whole lineage: each side's runner acknowledges
-    /// that side's own newest view, and the views compared are the newest
-    /// each would serve (see `cut_lineage_tests`).
-    cut_mode: bool,
     _project: tempfile::TempDir,
 }
 
@@ -688,8 +658,6 @@ impl Pair {
             immutable_views: Default::default(),
             review: Default::default(),
             engine_mismatches: Default::default(),
-            compare_from_version: 0,
-            cut_mode: false,
             _project: project,
         };
         let mut setup = json!({"method":"compaction.setup","params":{"session":"s","harness":profile.harness(),"request_id":"setup","model":"fixture","context_window":100_000,"composition":{"render_tags":true},"params":{"serializer_profile":profile.wire()},"now":1}});
@@ -756,33 +724,6 @@ impl Pair {
             ));
             return resident;
         }
-        // Each side numbers its own views in cut mode.
-        let (resident, oracle) = if self.cut_mode {
-            (versionless(&resident), versionless(&oracle))
-        } else {
-            (resident, oracle)
-        };
-        if self.cut_mode && resident != oracle {
-            let at = resident
-                .chars()
-                .zip(oracle.chars())
-                .position(|(a, b)| a != b)
-                .unwrap_or(resident.len().min(oracle.len()));
-            let around = |text: &str| {
-                text.chars()
-                    .skip(at.saturating_sub(200))
-                    .take(600)
-                    .collect::<String>()
-            };
-            panic!(
-                "{:?} answer diverged at step {} ({label}) at char {at}\ncut  …{}\nfull …{}\nsteps: {:?}",
-                self.profile,
-                self.log.len() + 1,
-                around(&resident),
-                around(&oracle),
-                self.log
-            );
-        }
         assert_eq!(
             resident,
             oracle,
@@ -847,13 +788,8 @@ impl Pair {
     }
 
     fn compare(&self, label: &str) {
-        if self.cut_mode {
-            return self.compare_newest(label);
-        }
-        let (mut resident, resident_high) = self.resident.views(&self.reference);
-        let (mut oracle, oracle_high) = self.oracle.views(&self.reference);
-        resident.retain(|(version, _)| *version > self.compare_from_version);
-        oracle.retain(|(version, _)| *version > self.compare_from_version);
+        let (resident, resident_high) = self.resident.views(&self.reference);
+        let (oracle, oracle_high) = self.oracle.views(&self.reference);
         assert_eq!(
             resident.iter().map(|(v, _)| *v).collect::<Vec<_>>(),
             oracle.iter().map(|(v, _)| *v).collect::<Vec<_>>(),
@@ -1047,42 +983,12 @@ impl Pair {
     }
 
     fn newest_versions(&self) -> Vec<u64> {
-        let mut versions = self
-            .oracle
+        self.oracle
             .views(&self.reference)
             .0
             .into_iter()
             .map(|(version, _)| version)
-            .collect::<Vec<_>>();
-        if self.cut_mode {
-            versions.drain(..versions.len().saturating_sub(1));
-        }
-        versions
-    }
-
-    /// `message` for the resident side in cut mode: acknowledging the
-    /// resident's own newest view instead of the other side's.
-    fn resident_message(
-        &self,
-        message: &cortexkit_bus_trait::Message,
-    ) -> cortexkit_bus_trait::Message {
-        let mut message = message.clone();
-        if !self.cut_mode || !message.headers.contains_key("applied_view_version") {
-            return message;
-        }
-        match self.resident.views(&self.reference).0.last() {
-            Some((version, _)) => {
-                message
-                    .headers
-                    .insert("applied_view_version".into(), version.to_string());
-            }
-            None => {
-                message.headers.remove("applied_view_version");
-            }
-        }
-        let notice = notice::AdvanceNotice::from_headers(&message.headers).unwrap();
-        message.digest = notice.digest().parse().unwrap();
-        message
+            .collect()
     }
 
     async fn notice(&mut self, rng: &mut Rng, descent: Option<String>) -> String {
@@ -1099,14 +1005,8 @@ impl Pair {
             message.headers.get("est_tokens").map_or("", String::as_str),
             self.model
         );
-        let resident = self.resident_message(&message);
-        let resident_h = Arc::clone(&self.resident.h);
         self.both(&label, |side| {
-            let message = if Arc::ptr_eq(&side.h, &resident_h) {
-                resident.clone()
-            } else {
-                message.clone()
-            };
+            let message = message.clone();
             Box::pin(async move {
                 match side.h.advance_compaction("fixture", &message).await {
                     Ok(()) => "ok".to_owned(),
@@ -1199,10 +1099,6 @@ impl Pair {
             self.review
                 .borrow_mut()
                 .acknowledge(self.log.len(), version);
-        }
-        if self.cut_mode {
-            // Event versions name one side's views only.
-            events.clear();
         }
         if !events.is_empty() {
             notice = notice.with_events(events);
@@ -1398,21 +1294,13 @@ impl Pair {
             }
             _ => {
                 let versions = self.newest_versions();
-                let pick = rng.below(versions.len() as u64 + 1) as usize;
-                let version = versions.get(pick).copied().unwrap_or(9_999);
+                let version = versions
+                    .get(rng.below(versions.len() as u64 + 1) as usize)
+                    .copied()
+                    .unwrap_or(9_999);
                 let request = json!({"method":"view.get","params":{"session_ref":self.reference,"view_version":version}});
-                let reference = self.reference.clone();
-                let cut_mode = self.cut_mode;
-                self.both("view.get", |side| {
-                    let mut request = request.clone();
-                    if cut_mode && pick < versions.len() {
-                        // Each side's own newest view.
-                        let newest = side.views(&reference).0.last().map_or(9_999, |(v, _)| *v);
-                        request["params"]["view_version"] = json!(newest);
-                    }
-                    Box::pin(async move { side.dispatch(request).await })
-                })
-                .await;
+                self.both("view.get", |side| Box::pin(side.dispatch(request.clone())))
+                    .await;
             }
         }
     }

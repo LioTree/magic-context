@@ -8050,8 +8050,13 @@ fn apply_once(
     profile_end!(perf_overlay_maps);
     profile_start!(perf_hygiene, "evolution_hygiene");
     profile_start!(perf_hygiene_tags, "hygiene_tag_rows");
-    let hygiene_tag_rows =
-        tag_rows_for_hygiene(&projection, &tag_rows, &tag_overlay, !tagging_active);
+    let hygiene_tag_rows = tag_rows_for_hygiene(
+        &projection,
+        &tag_rows,
+        &tag_overlay,
+        !tagging_active,
+        req.runner_owned_reminders,
+    );
     profile_end!(perf_hygiene_tags);
     profile_start!(perf_hygiene_measure, "hygiene_measure");
     let adopted_tools_policy = if is_bust_pass || loaded.meta.tail_hygiene_baseline.is_none() {
@@ -14809,11 +14814,19 @@ fn prune_channel1_units(
     });
 }
 
+/// The tag rows hygiene measures with. `runner_numbers` is set on the runner
+/// lane (`runner_owned_reminders`), where the runner numbers every part itself
+/// and its numbers are stored per block id: those stored rows are the numbers
+/// the model sees, so they are kept for projected blocks too and nothing is
+/// numbered by position. A positional number would depend on which rows the
+/// request holds (a whole lineage or a certified tail) and could equal a
+/// persisted protected number of another part.
 fn tag_rows_for_hygiene(
     projection: &FlatProjection,
     stored_rows: &[McTagRow],
     overlay: &TagOverlayState,
     derive_when_empty: bool,
+    runner_numbers: bool,
 ) -> Vec<McTagRow> {
     let projected_ids = projection
         .blocks
@@ -14825,7 +14838,8 @@ fn tag_rows_for_hygiene(
     let mut rows = stored_rows
         .iter()
         .filter(|row| {
-            !projected_ids.contains(row.block_id.as_str())
+            runner_numbers
+                || !projected_ids.contains(row.block_id.as_str())
                 || overlay.tag_by_block_id.get(&row.block_id) == Some(&row.tag_number)
         })
         .map(|row| McTagRow {
@@ -14860,7 +14874,7 @@ fn tag_rows_for_hygiene(
             source_bytes: Default::default(),
         });
     }
-    if rows.is_empty() && derive_when_empty {
+    if rows.is_empty() && derive_when_empty && !runner_numbers {
         for (index, block) in projection
             .blocks
             .iter()
@@ -22563,6 +22577,46 @@ pub(crate) mod tests {
         }
     }
 
+    /// On the runner lane hygiene measures every part with the runner's own number,
+    /// whether the request holds the whole lineage or only a certified tail, so a
+    /// protected number can only ever mark the part that carries it.
+    #[test]
+    fn runner_lane_hygiene_keeps_runner_numbers_and_never_numbers_by_position() {
+        let tail =
+            project_messages(&[item("live-b", 2, "second"), item("live-c", 3, "third")]).unwrap();
+        let lineage = project_messages(&[
+            item("live-a", 1, "first"),
+            item("live-b", 2, "second"),
+            item("live-c", 3, "third"),
+        ])
+        .unwrap();
+        let stored = vec![
+            payload_tag(7, "live-a#0", "first"),
+            payload_tag(8, "live-b#0", "second"),
+            payload_tag(9, "live-c#0", "third"),
+        ];
+        let numbers = |projection: &FlatProjection, rows: &[McTagRow]| {
+            tag_rows_for_hygiene(projection, rows, &TagOverlayState::default(), true, true)
+                .into_iter()
+                .map(|row| (row.block_id, row.tag_number))
+                .collect::<BTreeMap<_, _>>()
+        };
+        let in_tail = numbers(&tail, &stored[1..]);
+        let in_lineage = numbers(&lineage, &stored);
+        assert_eq!(in_tail.get("live-b#0"), Some(&8));
+        assert_eq!(in_tail.get("live-c#0"), Some(&9));
+        assert_eq!(in_lineage.get("live-b#0"), Some(&8));
+        assert_eq!(in_lineage.get("live-c#0"), Some(&9));
+        // Without the runner's rows nothing is numbered by position.
+        assert!(numbers(&tail, &[]).is_empty());
+        // The host lane keeps its positional fallback.
+        let host = tag_rows_for_hygiene(&tail, &[], &TagOverlayState::default(), true, false);
+        assert_eq!(
+            host.iter().map(|row| row.tag_number).collect::<Vec<_>>(),
+            vec![1, 2]
+        );
+    }
+
     /// Hygiene preparation keeps exactly the rows, order and identities the cloning version
     /// kept, but none of their stored payload bytes.
     #[test]
@@ -22588,7 +22642,8 @@ pub(crate) mod tests {
             ..Default::default()
         };
         for derive_when_empty in [false, true] {
-            let view = tag_rows_for_hygiene(&projection, &stored, &overlay, derive_when_empty);
+            let view =
+                tag_rows_for_hygiene(&projection, &stored, &overlay, derive_when_empty, false);
             assert!(view.iter().all(|row| row.source_bytes.is_empty()));
             let identities = |rows: &[McTagRow]| {
                 rows.iter()
