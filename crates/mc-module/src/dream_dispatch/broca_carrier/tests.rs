@@ -136,6 +136,9 @@ struct Run {
 #[derive(Default)]
 struct State {
     describe: Value,
+    /// Answer every op bare instead of inside `{"result": ...}`, as a runner
+    /// off the pinned llm-runner reply shape would.
+    bare_replies: bool,
     open_controls: bool,
     quiet_stream: bool,
     quiet_active_probes: usize,
@@ -581,7 +584,29 @@ impl FakeBroca {
 }
 
 impl BrocaPort for FakeBroca {
+    /// The answer in the pinned llm-runner reply shape, `{"result": <answer>}`,
+    /// unless the test asked for bare replies.
     async fn call(&mut self, session: &str, op: &str, params: Value) -> Result<Value, PortError> {
+        let answer = self.answer(session, op, params).await?;
+        Ok(if self.state().bare_replies {
+            answer
+        } else {
+            json!({ "result": answer })
+        })
+    }
+
+    async fn next_unit(&mut self, session: &str) -> Result<Option<Value>, PortError> {
+        self.next_unit_of(session).await
+    }
+
+    async fn release(&mut self, session: &str) {
+        self.release_of(session).await;
+    }
+}
+
+impl FakeBroca {
+    /// The answer to one op, before the reply envelope.
+    async fn answer(&mut self, session: &str, op: &str, params: Value) -> Result<Value, PortError> {
         let gate = {
             let mut s = self.state();
             s.log.push((session.into(), op.into(), params.clone()));
@@ -657,7 +682,7 @@ impl BrocaPort for FakeBroca {
         }
     }
 
-    async fn next_unit(&mut self, _session: &str) -> Result<Option<Value>, PortError> {
+    async fn next_unit_of(&mut self, _session: &str) -> Result<Option<Value>, PortError> {
         if self.state().quiet_stream {
             return Ok(None);
         }
@@ -694,7 +719,7 @@ impl BrocaPort for FakeBroca {
         }
     }
 
-    async fn release(&mut self, session: &str) {
+    async fn release_of(&mut self, session: &str) {
         self.state().released.push(session.into());
     }
 }
@@ -1304,7 +1329,8 @@ async fn status(f: &Fixture) -> Value {
         .clone()
         .call("probe", "run.status", json!({"run_id": "run-1"}))
         .await
-        .unwrap()
+        .unwrap()["result"]
+        .clone()
 }
 
 #[tokio::test]
@@ -1655,4 +1681,41 @@ async fn broca_child_missing_follow_groups_are_refused_without_a_send() {
         assert!(error.message.contains(missing), "{error:?}");
         assert!(f.sent().is_empty());
     }
+}
+
+#[tokio::test]
+async fn broca_child_bare_describe_reply_is_refused_by_name_without_a_send() {
+    let f = Fixture::new(BASE);
+    f.broca.state().bare_replies = true;
+    let error = bounded(f.carrier(policy()).open(&f.request(&[], 3)))
+        .await
+        .unwrap_err();
+    assert!(
+        error
+            .message
+            .starts_with("role.describe: runner_reply_shape"),
+        "{error:?}"
+    );
+    assert!(f.sent().is_empty(), "no prompt may leave Rust");
+}
+
+#[tokio::test]
+async fn broca_child_bare_send_reply_is_refused_by_name() {
+    let f = Fixture::new(BASE);
+    f.script(vec![answer("done")]);
+    let request = f.request(&[], 3);
+    let mut carrier = f.carrier(policy());
+    let child = bounded(carrier.open(&request)).await.expect("open");
+    // Discovery was answered wrapped; the send's reply comes back bare.
+    f.broca.state().bare_replies = true;
+    let error = bounded(carrier.complete(&child, &request))
+        .await
+        .unwrap_err();
+    assert!(
+        error
+            .message
+            .starts_with("session.send: runner_reply_shape"),
+        "{error:?}"
+    );
+    assert_eq!(f.sent().len(), 1);
 }

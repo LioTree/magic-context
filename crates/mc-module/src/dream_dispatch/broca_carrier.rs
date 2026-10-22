@@ -88,7 +88,8 @@ pub struct PortError {
 #[allow(async_fn_in_trait)]
 pub trait BrocaPort {
     /// One unary op (`role.describe`, `session.send`, `run.status`, `run.result`, `run.cancel`,
-    /// `session.retract`) with its role params; answers the reply body.
+    /// `session.retract`) with its role params; answers the reply body as sent,
+    /// envelope included (the carrier reads the envelope, strictly).
     async fn call(&mut self, session: &str, op: &str, params: Value) -> Result<Value, PortError>;
     /// The next unit of the session's `session.subscribe` stream from its start,
     /// or `None` when no unit is ready yet.
@@ -383,11 +384,13 @@ fn port_error(op: &str, e: PortError) -> CarrierError {
     error(format!("{op}: {}: {}", e.code, e.message))
 }
 
-fn body(answer: &Value) -> &Value {
-    answer
-        .get("result")
-        .filter(|v| v.is_object())
-        .unwrap_or(answer)
+/// The answer inside the reply to llm-runner op `op`. Every llm-runner reply
+/// is exactly `{"result": <answer>}`; any other shape is refused as
+/// `runner_reply_shape` by `session_resolver::read_runner_reply`, the one
+/// decoder of that envelope, and never read either way.
+fn reply_answer(op: &str, reply: Value) -> Result<Value, CarrierError> {
+    crate::session_resolver::read_runner_reply(reply)
+        .map_err(|shape| error(format!("{op}: {shape}")))
 }
 
 struct Attempt {
@@ -757,7 +760,8 @@ impl<P: BrocaPort> BrocaCarrier<P> {
             .await
             .map_err(|e| port_error(ops::RUN_STATUS, e))?;
         let status: cortexkit_role_llm_runner::run::RunStatus =
-            serde_json::from_value(body(&answer).clone()).map_err(|e| error(e.to_string()))?;
+            serde_json::from_value(reply_answer(ops::RUN_STATUS, answer)?)
+                .map_err(|e| error(e.to_string()))?;
         if let Some(usage) = status
             .usage
             .as_ref()
@@ -773,8 +777,8 @@ impl<P: BrocaPort> BrocaCarrier<P> {
             .call(session, ops::RUN_RESULT, json!({"run_id": run}))
             .await
             .map_err(|e| port_error(ops::RUN_RESULT, e))?;
-        let result: RunResult =
-            serde_json::from_value(body(&answer).clone()).map_err(|e| error(e.to_string()))?;
+        let result: RunResult = serde_json::from_value(reply_answer(ops::RUN_RESULT, answer)?)
+            .map_err(|e| error(e.to_string()))?;
         if result.run_id != run
             || result.state != status.state
             || !result.final_message_consistent()
@@ -811,7 +815,7 @@ impl<P: BrocaPort> BrocaCarrier<P> {
             .await
             .map_err(|e| port_error(ops::RUN_CANCEL, e))?;
         // An ack accepts the cancel; only run.result says which terminal won.
-        match serde_json::from_value::<RunCancelReply>(body(&answer).clone()) {
+        match serde_json::from_value::<RunCancelReply>(reply_answer(ops::RUN_CANCEL, answer)?) {
             Ok(RunCancelReply::Ack | RunCancelReply::NotActive) => {
                 if let Some(attempt) = self.attempt.as_mut() {
                     attempt.cancel_sent = true;
@@ -857,8 +861,8 @@ impl<P: BrocaPort> BrocaCarrier<P> {
         }
         loop {
             let answer = reply.ok_or_else(|| error("send_outcome_unknown"))?;
-            let sent: SendReply =
-                serde_json::from_value(body(&answer).clone()).map_err(|e| error(e.to_string()))?;
+            let sent: SendReply = serde_json::from_value(reply_answer(ops::SESSION_SEND, answer)?)
+                .map_err(|e| error(e.to_string()))?;
             let attempt = self.attempt.as_mut().ok_or_else(|| error("not_opened"))?;
             match sent.send_state() {
                 SendState::Active | SendState::Finished | SendState::Paused => {
@@ -970,7 +974,10 @@ impl<P: BrocaPort> BrocaCarrier<P> {
                     )
                     .await
                     .map_err(|e| port_error(ops::SESSION_RETRACT, e))?;
-                match serde_json::from_value::<RetractReply>(body(&answer).clone()) {
+                match serde_json::from_value::<RetractReply>(reply_answer(
+                    ops::SESSION_RETRACT,
+                    answer,
+                )?) {
                     Ok(RetractReply::Retracted) => return Ok(()),
                     _ => return Err(error("cleanup_unknown")),
                 }
@@ -1054,7 +1061,7 @@ impl<P: BrocaPort> DreamCarrier for BrocaCarrier<P> {
             .call(&session, ops::ROLE_DESCRIBE, json!({}))
             .await
             .map_err(|e| port_error(ops::ROLE_DESCRIBE, e))?;
-        let describe = check_describe(body(&answer))
+        let describe = check_describe(&reply_answer(ops::ROLE_DESCRIBE, answer)?)
             .map_err(|problems| error(format!("unavailable: describe {problems:?}")))?;
         // The task may have been cancelled or lost its lease while discovery ran.
         self.context
