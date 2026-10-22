@@ -15,9 +15,9 @@
 //! example a host marker written before ck-mc served the session, found
 //! again only by the cut message's id). `CutSeed::without_rows` builds that
 //! seed; each fallback and its effect is documented on the field.
-// Capture, pruning and the lineage that begins at a cut are driven by the
-// cut descent and the Setups of later work; until those call them, only
-// tests do.
+// No production path calls capture, pruning or `begin_at_cut` yet: the
+// notice that applies a cut and the Setup of a session that already has
+// history will. Until then only tests exercise them.
 #![cfg_attr(not(test), allow(dead_code))]
 use super::*;
 use std::collections::HashSet;
@@ -841,7 +841,12 @@ impl AsyncRecord {
             .map_err(transient)?;
         let mut pruned = false;
         for _ in 0..4 {
-            let mut loaded = store.load(&namespace).map_err(transient)?;
+            // The logical snapshot and commit, as prefix hygiene uses them:
+            // module code never rewrites the whole cache state.
+            let mut loaded = store
+                .load_logical_transform_snapshot(&namespace, &[])
+                .map_err(transient)?
+                .loaded;
             if loaded.row_version.is_none() {
                 pruned = true;
                 break;
@@ -862,7 +867,36 @@ impl AsyncRecord {
             }
             meta.reclassified_synthetic_mids
                 .retain(|mid| !below.contains(mid));
-            match store.commit(&namespace, loaded.row_version, &loaded.core, &loaded.meta) {
+            let committed = store.commit_logical_transform_with_provider_policy(
+                &namespace,
+                mc_store::TransformCommit {
+                    expected: loaded.row_version,
+                    core: &loaded.core,
+                    meta: &loaded.meta,
+                    sections: mc_store::SectionsCommit {
+                        base: loaded.sections.as_ref(),
+                        meta_only_steps: 0,
+                        frozen_clear: mc_store::FrozenClear::Explicit,
+                    },
+                    consumed_drop_ids: &[],
+                    first_applied_command_ids: &[],
+                    memory_revision: None,
+                    compartment_max_seq: None,
+                    project_root: None,
+                    first_divergence: None,
+                    scheduler_observation: None,
+                    scheduler_request_observed_at_ms: None,
+                    scheduler_full_array_fingerprint: None,
+                    scheduler_eligible_supersession_count: None,
+                    scheduler_withheld_by_tag_window: None,
+                    scheduler_withheld_by_exempt_message: None,
+                    scheduler_applied_supersession_count: None,
+                    scheduler_applied_reductions: false,
+                    overlays: mc_store::TransformOverlayBatch::default(),
+                },
+                None,
+            );
+            match committed {
                 Ok(_) => {
                     pruned = true;
                     break;

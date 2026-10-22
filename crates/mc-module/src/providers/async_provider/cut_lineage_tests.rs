@@ -351,9 +351,9 @@ impl Pair {
     }
 
     /// One randomized step of the cut differential. Steps that rewrite or
-    /// cut the transcript below the cut, change lineage or rewind the
-    /// history (later slices: descent, revert and restore) are replaced by
-    /// an ordinary append; historian publications only move coverage
+    /// cut the transcript, change lineage or rewind the history are replaced
+    /// by an ordinary append, because a conversation that begins at a cut
+    /// does not handle them yet; historian publications only move coverage
     /// forward; `ctx_reduce` names window tags.
     async fn cut_step(&mut self, rng: &mut Rng, first: u64, history_end: &mut u64) {
         let roll = rng.below(100);
@@ -656,7 +656,7 @@ fn env_u64(name: &str, default: u64) -> u64 {
         .unwrap_or(default)
 }
 
-/// Red: a lineage that begins at a cut does not yet carry the engine state
+/// Known limitation: a lineage that begins at a cut does not yet carry the engine state
 /// full processing holds for rows at or after the cut when it makes the cut
 /// (reductions frozen on window blocks, the emergency latches, queued drops
 /// and acknowledged native edits), so under pressure it serves outputs full
