@@ -628,6 +628,11 @@ pub enum HistorianProducerError {
 }
 
 impl HistorianProducerError {
+    /// An llm-runner reply in the wrong envelope (`runner_reply_shape`).
+    pub(crate) fn is_runner_reply_shape(&self) -> bool {
+        matches!(self, Self::Subc(body) if body.code == crate::session_resolver::RUNNER_REPLY_SHAPE)
+    }
+
     pub(crate) fn unknown_send_outcome(&self) -> bool {
         matches!(
             self,
@@ -1003,7 +1008,7 @@ impl HistorianProducer {
         // does not record a retention. Giving stage sessions a retention would first require
         // persisting it in that stage request. Stage sends happen only while
         // `historian_stage::RUST_LIFECYCLE_ENABLED` is on, which it is not in production.
-        self.retention_for_route(route).await;
+        self.retention_for_route(route).await?;
         self.require_follow()?;
         let request = serde_json::to_value(
             session_send_request(
@@ -1202,7 +1207,7 @@ impl HistorianProducer {
         // Check `role.describe` before building this send; include retention only when
         // the runner advertises support. Its first accepted send fixes the session's
         // lifetime, so repeat sends must keep that initial policy.
-        let declared_retention = self.retention_for_route(route).await;
+        let declared_retention = self.retention_for_route(route).await?;
         self.require_follow()?;
         let retention = select_session_retention(&mut self.session_retention, declared_retention);
         // The route identity is the session. Keeping `session` out of this body avoids
@@ -1309,7 +1314,7 @@ impl HistorianProducer {
             return Ok(RunState::Active);
         }
         let route = self.ensure_command_route().await?;
-        self.retention_for_route(route).await;
+        self.retention_for_route(route).await?;
         self.require_follow()?;
         let response = self
             .unary_json(
@@ -1364,9 +1369,16 @@ impl HistorianProducer {
         self.control_pending = false;
     }
 
-    async fn retention_for_route(&mut self, route: OpenedRoute) -> Option<u64> {
+    /// Read and cache the route runner's `role.describe`: its retention, run
+    /// limits and follow groups. A reply in the wrong envelope is returned as
+    /// `runner_reply_shape` and nothing is cached; any other failure reads as a
+    /// runner declaring no groups, which `require_follow` then names.
+    async fn retention_for_route(
+        &mut self,
+        route: OpenedRoute,
+    ) -> Result<Option<u64>, HistorianProducerError> {
         if let Some(retention) = self.route_retention {
-            return retention;
+            return Ok(retention);
         }
 
         let described = self
@@ -1378,6 +1390,7 @@ impl HistorianProducer {
                 self.route_follow = FollowCapabilities::from_describe(&answer);
                 retention_from_role_describe(&answer)
             }
+            Err(error) if error.is_runner_reply_shape() => return Err(error),
             Err(_) => None,
         };
         if retention.is_none() {
@@ -1387,7 +1400,7 @@ impl HistorianProducer {
             });
         }
         self.route_retention = Some(retention);
-        retention
+        Ok(retention)
     }
 
     /// Reuse the route-local describe cache for both configured and session-owned
@@ -1398,7 +1411,7 @@ impl HistorianProducer {
     ) -> Result<Option<RunnerLimits>, HistorianProducerError> {
         self.bind_session(child.to_string());
         let route = self.ensure_command_route().await?;
-        self.retention_for_route(route).await;
+        self.retention_for_route(route).await?;
         self.require_follow()?;
         Ok(Some(self.route_limits))
     }
@@ -1422,7 +1435,7 @@ impl HistorianProducer {
                 run_id.to_string()
             };
             let route = self.ensure_command_route().await?;
-            self.retention_for_route(route).await;
+            self.retention_for_route(route).await?;
             self.require_follow()?;
             let subscription = if self.route_follow.streaming {
                 let route = self.ensure_subscribe_route().await?;
@@ -1521,6 +1534,10 @@ impl HistorianProducer {
         }
     }
 
+    /// One llm-runner op on `route`, returning the answer inside its reply.
+    /// Every llm-runner reply is exactly `{"result": <answer>}`; a reply in any
+    /// other shape is refused as `runner_reply_shape` by
+    /// `session_resolver::read_runner_reply`, the one decoder of that envelope.
     async fn unary_json(
         &mut self,
         route: OpenedRoute,
@@ -1531,7 +1548,15 @@ impl HistorianProducer {
             .read_terminal_for(route, corr, self.config.request_timeout)
             .await?;
         match frame.header.ty {
-            FrameType::Response => Ok(serde_json::from_slice(&frame.body)?),
+            FrameType::Response => {
+                crate::session_resolver::read_runner_reply(serde_json::from_slice(&frame.body)?)
+                    .map_err(|shape| {
+                        HistorianProducerError::Subc(ProducerErrorBody::untagged(
+                            crate::session_resolver::RUNNER_REPLY_SHAPE,
+                            shape.to_string(),
+                        ))
+                    })
+            }
             FrameType::StreamEnd => Ok(Value::Null),
             FrameType::Error => Err(HistorianProducerError::Subc(error_body(&frame.body))),
             _ => Err(HistorianProducerError::UnexpectedControlResponse),
@@ -1563,8 +1588,7 @@ impl HistorianProducer {
                     json!({"method":"run.status", "params":{"run_id":run_id}}),
                 )
                 .await?;
-            let status: RoleRunStatus =
-                serde_json::from_value(answer.get("result").unwrap_or(&answer).clone())?;
+            let status: RoleRunStatus = serde_json::from_value(answer)?;
             if status.run_state().is_terminal() {
                 let answer = self
                     .unary_json(
@@ -1572,8 +1596,7 @@ impl HistorianProducer {
                         json!({"method":"run.result", "params":{"run_id":run_id}}),
                     )
                     .await?;
-                let result: RoleRunResult =
-                    serde_json::from_value(answer.get("result").unwrap_or(&answer).clone())?;
+                let result: RoleRunResult = serde_json::from_value(answer)?;
                 if result.run_id != run_id
                     || result.state != status.state
                     || !result.final_message_consistent()
@@ -1710,9 +1733,9 @@ impl HistorianProducer {
 
 /// Return a policy only when `role.describe` names `retention` and provides positive
 /// limits. Older runners may not support the field, so omitting it when the group is
-/// absent keeps their `session.send` requests valid.
+/// absent keeps their `session.send` requests valid. `answer` is the answer inside
+/// the runner's reply envelope (see `unary_json`).
 fn retention_from_role_describe(answer: &Value) -> Option<u64> {
-    let answer = answer.get("result").unwrap_or(answer);
     let declares_retention = answer
         .get("capabilities")
         .and_then(Value::as_array)
@@ -1769,18 +1792,15 @@ enum SendOutcome {
     Unrecognized,
 }
 
-/// Decode a `session.send` reply.
+/// Decode a `session.send` answer (the answer inside the reply envelope, which
+/// `unary_json` has already removed).
 ///
-/// The runner answers with a `state`-tagged result inside a `result` envelope: `active`
-/// carries the run that started, `pending` means the session already had an active run and
-/// this prompt was durably QUEUED behind it under a submission id. Reading only `run_id`
+/// The runner answers with a `state`-tagged result. Any answer carrying a `run_id`
+/// names the run that started (`active`); `pending` with a `submission_id` means the session already had an active run and this prompt
+/// was durably QUEUED behind it under a submission id. Reading only `run_id`
 /// collapses those two into "no run id", which reports a queued (accepted) prompt as a
 /// malformed reply and hides the one fact that explains it — the session was busy.
-fn send_outcome(response: &Value) -> SendOutcome {
-    let body = match response.get("result") {
-        Some(result) if result.is_object() => result,
-        _ => response,
-    };
+fn send_outcome(body: &Value) -> SendOutcome {
     if let Some(run_id) = body.get("run_id").and_then(Value::as_str) {
         return SendOutcome::Active(run_id.to_string());
     }
@@ -1794,8 +1814,8 @@ fn send_outcome(response: &Value) -> SendOutcome {
     }
 }
 
+/// Classify a `run.status` answer (the answer inside the reply envelope).
 fn classify_run_state(_run_id: &str, value: &Value) -> RunState {
-    let value = value.get("result").unwrap_or(value);
     match serde_json::from_value::<RoleRunStatus>(value.clone()) {
         Ok(status) if status.run_state().is_terminal() => RunState::Terminal,
         Ok(_) => RunState::Active,
@@ -2410,24 +2430,25 @@ pub(crate) mod tests {
 
     #[test]
     fn send_outcome_reads_the_runner_send_contract() {
-        // Both shapes ride a `result` envelope and are tagged by `state`.
+        // `send_outcome` reads the answer inside the reply envelope, which
+        // `unary_json` removes strictly; both shapes are tagged by `state`.
         assert_eq!(
-            send_outcome(&json!({"result":{"state":"active","run_id":"run-9"}})),
+            send_outcome(&json!({"state":"active","run_id":"run-9"})),
             SendOutcome::Active("run-9".to_string())
         );
         assert_eq!(
-            send_outcome(&json!({"result":{"state":"pending","submission_id":"sub-3"}})),
+            send_outcome(&json!({"state":"pending","submission_id":"sub-3"})),
             SendOutcome::Queued("sub-3".to_string()),
             "a queued prompt was ACCEPTED behind a busy session, not malformed"
         );
-        // An un-enveloped reply carrying the run directly stays readable.
+        // A second envelope inside the answer is not peeled: there is exactly one.
         assert_eq!(
-            send_outcome(&json!({"state":"active","run_id":"run-flat"})),
-            SendOutcome::Active("run-flat".to_string())
+            send_outcome(&json!({"result":{"state":"active","run_id":"run-9"}})),
+            SendOutcome::Unrecognized
         );
         // A submission id without the pending state is not a queue acknowledgement.
         assert_eq!(
-            send_outcome(&json!({"result":{"submission_id":"sub-4"}})),
+            send_outcome(&json!({"submission_id":"sub-4"})),
             SendOutcome::Unrecognized
         );
         assert_eq!(send_outcome(&json!({})), SendOutcome::Unrecognized);
@@ -2483,8 +2504,8 @@ pub(crate) mod tests {
         ];
         let server = fake_server(
             json!([
-                {"result":{"state":"pending","submission_id":"queued-1"}},
-                {"result":{"state":"active","run_id":"run-1"}}
+                {"state":"pending","submission_id":"queued-1"},
+                {"state":"active","run_id":"run-1"}
             ]),
             events,
         )
@@ -2627,6 +2648,9 @@ pub(crate) mod tests {
         statuses: VecDeque<Value>,
         result: Option<Value>,
         describe: Option<Value>,
+        /// Answer every llm-runner op bare instead of inside `{"result": ...}`,
+        /// as a runner off the pinned reply shape would.
+        bare: bool,
     }
 
     fn result_for_script(events: &[Value]) -> Value {
@@ -2887,7 +2911,7 @@ pub(crate) mod tests {
                                         frame.header.channel,
                                         frame.header.epoch,
                                         frame.header.corr,
-                                        serde_json::to_vec(&described).unwrap(),
+                                        runner_reply(&answers_task, described).await,
                                     )
                                     .await;
                                 }
@@ -2907,7 +2931,7 @@ pub(crate) mod tests {
                                         frame.header.channel,
                                         frame.header.epoch,
                                         frame.header.corr,
-                                        serde_json::to_vec(&response).unwrap(),
+                                        runner_reply(&answers_task, response).await,
                                     )
                                     .await;
                                 }
@@ -2942,12 +2966,13 @@ pub(crate) mod tests {
                                                 || json!({"state":run_result["state"]}),
                                             )
                                         };
+                                    drop(answers);
                                     send_response_frame(
                                         &mut stream,
                                         frame.header.channel,
                                         frame.header.epoch,
                                         frame.header.corr,
-                                        serde_json::to_vec(&status).unwrap(),
+                                        runner_reply(&answers_task, status).await,
                                     )
                                     .await;
                                 }
@@ -2962,7 +2987,7 @@ pub(crate) mod tests {
                                         frame.header.channel,
                                         frame.header.epoch,
                                         frame.header.corr,
-                                        serde_json::to_vec(&result).unwrap(),
+                                        runner_reply(&answers_task, result).await,
                                     )
                                     .await;
                                 }
@@ -2972,7 +2997,7 @@ pub(crate) mod tests {
                                         frame.header.channel,
                                         frame.header.epoch,
                                         frame.header.corr,
-                                        serde_json::to_vec(&json!({"ack":true})).unwrap(),
+                                        runner_reply(&answers_task, json!({"ack":true})).await,
                                     )
                                     .await;
                                 }
@@ -2983,7 +3008,8 @@ pub(crate) mod tests {
                                         frame.header.channel,
                                         frame.header.epoch,
                                         frame.header.corr,
-                                        serde_json::to_vec(&json!({"result":"retracted"})).unwrap(),
+                                        runner_reply(&answers_task, json!({"state":"retracted"}))
+                                            .await,
                                     )
                                     .await;
                                 }
@@ -3004,6 +3030,17 @@ pub(crate) mod tests {
             answers,
             _temp: temp,
         }
+    }
+
+    /// The fake runner's reply body for `answer`: `{"result": answer}`, the
+    /// pinned llm-runner reply shape, unless the test asked for bare replies.
+    async fn runner_reply(answers: &Mutex<FakeAnswers>, answer: Value) -> Vec<u8> {
+        let reply = if answers.lock().await.bare {
+            answer
+        } else {
+            json!({ "result": answer })
+        };
+        serde_json::to_vec(&reply).unwrap()
     }
 
     async fn send_response_frame(
@@ -3330,7 +3367,7 @@ pub(crate) mod tests {
     #[tokio::test]
     async fn a_queued_send_is_named_as_such_and_its_submission_is_withdrawn() {
         let server = fake_server(
-            json!({"result":{"state":"pending","submission_id":"sub-77"}}),
+            json!({"state":"pending","submission_id":"sub-77"}),
             Vec::new(),
         )
         .await;
@@ -4134,6 +4171,64 @@ pub(crate) mod tests {
             assert_eq!(request.max_output_tokens().unwrap(), None);
             assert!(log.sends[0].get("parent").is_none());
         }
+    }
+
+    /// The error a bare llm-runner reply must produce.
+    fn assert_reply_shape(error: &HistorianProducerError) {
+        assert!(error.is_runner_reply_shape(), "{error:?}");
+        assert!(
+            error.to_string().contains("runner_reply_shape"),
+            "named in the message: {error}"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_bare_role_describe_reply_is_refused_by_name_before_any_send() {
+        // `role.describe` feeds `RunnerLimits::from_describe`,
+        // `FollowCapabilities::from_describe` and the retention policy.
+        let server = fake_server(json!({"state":"active","run_id":"run-1"}), vec![]).await;
+        server.answers.lock().await.bare = true;
+        let mut producer = client(&server).await;
+        let error = producer
+            .start("child", "", "prompt", "provider/model")
+            .await
+            .unwrap_err();
+        assert_reply_shape(&error);
+        let error = producer.session_runner_limits("child").await.unwrap_err();
+        assert_reply_shape(&error);
+        assert!(server.log.lock().await.sends.is_empty());
+        producer.close().await;
+    }
+
+    #[tokio::test]
+    async fn a_bare_send_reply_is_refused_by_name() {
+        let server = fake_server(json!({"state":"active","run_id":"run-1"}), vec![]).await;
+        let mut producer = client(&server).await;
+        // The describe is read wrapped; only the send's reply comes back bare.
+        producer.session_runner_limits("child").await.unwrap();
+        server.answers.lock().await.bare = true;
+        let error = producer
+            .start("child", "", "prompt", "provider/model")
+            .await
+            .unwrap_err();
+        assert_reply_shape(&error);
+        assert_eq!(server.log.lock().await.sends.len(), 1);
+        producer.close().await;
+    }
+
+    #[tokio::test]
+    async fn bare_run_status_and_result_replies_are_refused_by_name() {
+        let server = fake_server(json!({"state":"active","run_id":"run-1"}), vec![]).await;
+        let mut producer = client(&server).await;
+        let handle = producer
+            .start("child", "", "prompt", "provider/model")
+            .await
+            .unwrap();
+        server.answers.lock().await.bare = true;
+        assert_reply_shape(&producer.status(&handle.run_id).await.unwrap_err());
+        assert_reply_shape(&producer.await_output(&handle.run_id).await.unwrap_err());
+        assert_reply_shape(&producer.cancel(&handle.run_id).await.unwrap_err());
+        producer.close().await;
     }
 
     #[tokio::test]

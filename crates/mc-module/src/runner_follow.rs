@@ -23,8 +23,10 @@ pub(crate) struct FollowCapabilities {
 }
 
 impl FollowCapabilities {
+    /// The follow groups `answer` declares. `answer` is the `role.describe`
+    /// answer inside the runner's reply envelope: the envelope is read, strictly,
+    /// by `session_resolver::read_runner_reply` before this.
     pub fn from_describe(answer: &Value) -> Self {
-        let answer = answer.get("result").unwrap_or(answer);
         let declares = |name| {
             answer["capabilities"]
                 .as_array()
@@ -46,5 +48,28 @@ impl FollowCapabilities {
         } else {
             None
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use serde_json::json;
+
+    /// The groups are read from the answer only. A reply envelope is removed,
+    /// strictly, before this (a bare reply never gets here: see
+    /// `historian_producer`'s `a_bare_role_describe_reply_is_refused_by_name_before_any_send`),
+    /// so an envelope that reaches this reader is not peeled.
+    #[test]
+    fn follow_groups_are_read_from_the_answer_and_an_envelope_is_not_peeled() {
+        let answer = json!({"capabilities":["run_ops","run_status","streaming","run_usage"]});
+        let read = FollowCapabilities::from_describe(&answer);
+        assert!(read.run_ops && read.run_status && read.streaming && read.run_usage);
+        assert_eq!(read.missing(), None);
+        let enveloped = FollowCapabilities::from_describe(&json!({ "result": answer }));
+        assert_eq!(
+            enveloped.missing(),
+            Some("background_runner_missing_groups: run_ops")
+        );
     }
 }

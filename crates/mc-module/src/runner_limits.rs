@@ -14,8 +14,10 @@ pub struct RunnerLimits {
 }
 
 impl RunnerLimits {
+    /// The run-limit groups `answer` declares. `answer` is the `role.describe`
+    /// answer inside the runner's reply envelope: the envelope is read, strictly,
+    /// by `session_resolver::read_runner_reply` before this.
     pub(crate) fn from_describe(answer: &Value) -> Self {
-        let answer = answer.get("result").unwrap_or(answer);
         let declares = |name| {
             answer["capabilities"]
                 .as_array()
@@ -182,6 +184,28 @@ mod tests {
         assert!(error
             .to_string()
             .contains("historian_zen_no_eligible_models"));
+    }
+
+    /// The groups are read from the answer only. A reply envelope is removed,
+    /// strictly, before this (a bare reply never gets here: see
+    /// `historian_producer`'s `a_bare_role_describe_reply_is_refused_by_name_before_any_send`),
+    /// so an envelope that reaches this reader is not peeled.
+    #[test]
+    fn limits_are_read_from_the_answer_and_an_envelope_is_not_peeled() {
+        let answer =
+            serde_json::json!({"capabilities":["max_steps","max_output_tokens","no_tools"]});
+        assert_eq!(
+            RunnerLimits::from_describe(&answer),
+            RunnerLimits {
+                max_steps: true,
+                max_output_tokens: true,
+                no_tools: true,
+            }
+        );
+        assert_eq!(
+            RunnerLimits::from_describe(&serde_json::json!({ "result": answer })),
+            RunnerLimits::default()
+        );
     }
 
     #[test]
