@@ -24827,8 +24827,7 @@ mod tests {
                     // A near-deadline peer answers 50 ms inside the resolve deadline. A
                     // 5 ms margin let a loaded runner deliver the answer after the deadline,
                     // where the bind correctly falls back to the directory identity.
-                    let near_deadline_ms =
-                        entorhinal_resolve::ENTORHINAL_RESOLVE_DEADLINE_MS - 50;
+                    let near_deadline_ms = entorhinal_resolve::ENTORHINAL_RESOLVE_DEADLINE_MS - 50;
                     if mode == "near-deadline" {
                         *fake.reply_at.lock().unwrap() =
                             Some(started + Duration::from_millis(near_deadline_ms));
