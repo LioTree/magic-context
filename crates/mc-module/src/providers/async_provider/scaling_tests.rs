@@ -1690,21 +1690,14 @@ async fn covered_tail_latency_benchmark() {
         // the state kept, with no runner call and nothing that grows with the
         // session. Measured last, so the conversation is not moved before the
         // other operations.
-        let (newest, digest) = {
-            let entries = rig.runner.entries.lock().unwrap();
-            let (last, _) = entries.last().unwrap();
-            (
-                last.ordinal,
-                contract::digest::content_digest(&last.message),
-            )
-        };
+        let newest = rig.runner.entries.lock().unwrap().last().unwrap().0.ordinal;
         let calls_before = rig.runner.calls.load(std::sync::atomic::Ordering::Relaxed);
         let mut setups = Vec::new();
         for attempt in 0..5 {
             let wall = Instant::now();
             let thread = cpu_time::ThreadTime::now();
             let process = cpu_time::ProcessTime::now();
-            let answer = rig.op("compaction.setup",json!({"session":"s","harness":"opencode","request_id":format!("descending-setup-{attempt}"),"model":"fixture","context_window":100_000,"composition":{"render_tags":true},"params":{"serializer_profile":"opencode-aisdk"},"lineage_id":"L2","descends_from":format!("L:{newest}:{digest}"),"first_ordinal":newest + 1,"now":1})).await;
+            let answer = rig.op("compaction.setup",json!({"session":"s","harness":"opencode","request_id":format!("descending-setup-{attempt}"),"model":"fixture","context_window":100_000,"composition":{"render_tags":true},"params":{"serializer_profile":"opencode-aisdk"},"lineage_id":"L2","descends_from":{"lineage_id":"L","through_ordinal":newest},"first_ordinal":newest + 1,"now":1})).await;
             setups.push((
                 wall.elapsed().as_secs_f64() * 1e3,
                 thread.elapsed().as_secs_f64() * 1e3,
