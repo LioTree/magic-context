@@ -5,18 +5,21 @@
 //! The full side, a provider that reads every row, takes notices until it
 //! has published and applied a view covering the history. The cut is put at
 //! the newest historian restart point at or below that coverage. The other
-//! side then either begins its conversation at that cut, from the
-//! compartments and the seed the full side's rows give (it never reads a row
-//! below the cut), or reads the same notices and prunes every row below the
-//! cut. Both sides then receive the same randomized steps: notices, folds,
-//! `ctx_reduce` drops, rides, flushes, commands, restarts and the reminders
-//! the notices send. After every step the views published after the cut
-//! (every byte), answers, reminder sends, the historian's next input and the
-//! engine state that is not keyed to a row below the cut must be identical.
+//! side then either begins a lineage that descends from that cut, adopting
+//! the folded head, the window's state and the record's cadence state from
+//! the seed the full side gives (it never reads a row below the cut), or
+//! reads the same notices and prunes every row below the cut. Both sides
+//! then receive the same randomized steps: notices, folds, `ctx_reduce`
+//! drops, rides, flushes, commands, restarts and the reminders the notices
+//! send. After every step the views (every byte), answers, reminder sends,
+//! the historian's next input and the engine state that is not keyed to a
+//! row below the cut must be identical.
 //!
 //! The reference is full processing at the moment its fold made the cut, not
 //! a from-scratch pass over the whole lineage: a lineage begins at a cut only
-//! because such a fold committed coverage through it.
+//! because such a fold committed coverage through it. A start that does not
+//! descend from the cut has no such twin; it is checked separately
+//! (`CutMode::BootstrapAtCut`).
 //!
 //! One case is excluded on purpose: `ctx_reduce` naming a tag from below
 //! the cut, which a conversation that begins at the cut answers as already
@@ -30,9 +33,11 @@ enum CutMode {
     /// The cut side begins its conversation at the cut as a lineage that
     /// descends from it: it adopts the folded head.
     BeginAtCut,
-    /// The cut side begins its conversation at the cut without descending
-    /// (a moved session, say): its first pass is the bootstrap fold, and the
-    /// full side is made to rebuild at the same notice.
+    /// Both sides begin their conversation at the cut without descending from
+    /// it (a moved session, say), from a seed a third provider gives: their
+    /// first pass is the bootstrap fold. A fresh start has no full-processing
+    /// twin, so the two are compared with each other and against the cache
+    /// rules (`FreshStart`).
     BootstrapAtCut,
     /// The cut side reads everything, then prunes below the cut.
     PruneInPlace,
@@ -880,11 +885,12 @@ async fn a_lineage_that_begins_at_a_cut_serves_what_full_processing_serves() {
     cut_differential(8, 20, 7_000, CutMode::BeginAtCut).await;
 }
 
-/// A lineage that begins at a cut without descending from it starts with a
-/// full rebuild, and from that rebuild serves what full processing serves
-/// when it rebuilds at the same notice.
+/// A lineage that begins at a cut without descending from it starts with
+/// one full rebuild and then keeps the cache rules: two fresh starts from the
+/// same seed stay identical, a pass without a rebuild permission publishes
+/// nothing, and nothing rebuilds without a permission (`FreshStart`).
 #[tokio::test(flavor = "multi_thread", worker_threads = 8)]
-async fn a_fresh_start_at_a_cut_rebuilds_and_then_serves_what_full_processing_serves() {
+async fn a_fresh_start_at_a_cut_rebuilds_once_and_keeps_the_cache_rules() {
     cut_differential(8, 20, 9_000, CutMode::BootstrapAtCut).await;
 }
 
