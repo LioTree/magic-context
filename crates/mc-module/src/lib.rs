@@ -24893,8 +24893,14 @@ mod tests {
                         .duration_since(std::time::UNIX_EPOCH)
                         .unwrap()
                         .as_micros();
+                    // A near-deadline peer answers 50 ms inside the resolve deadline. A
+                    // 5 ms margin let a loaded runner deliver the answer after the deadline,
+                    // where the bind correctly falls back to the directory identity.
+                    let near_deadline_ms =
+                        entorhinal_resolve::ENTORHINAL_RESOLVE_DEADLINE_MS - 50;
                     if mode == "near-deadline" {
-                        *fake.reply_at.lock().unwrap() = Some(started + Duration::from_millis(495));
+                        *fake.reply_at.lock().unwrap() =
+                            Some(started + Duration::from_millis(near_deadline_ms));
                     }
                     let bind_future = bind(&handler, &project, 7);
                     if mode == "never" {
@@ -24910,7 +24916,7 @@ mod tests {
                     }
                     if mode == "near-deadline" {
                         assert!(
-                            elapsed >= 495.0,
+                            elapsed >= near_deadline_ms as f64,
                             "near-deadline peer answered early: {elapsed}"
                         );
                     }
@@ -24933,7 +24939,8 @@ mod tests {
                                 .project_identities
                                 .pinned_identity(&project)
                                 .as_deref(),
-                            Some(expected.as_str())
+                            Some(expected.as_str()),
+                            "{mode} iteration {iteration}: answered bind did not pin after {elapsed:.3} ms"
                         );
                         assert_eq!(served(&handler, &store, 7), expected);
                         assert!(elapsed < 10_000.0, "bind failed to return: {elapsed}");
