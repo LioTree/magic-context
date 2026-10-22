@@ -15,8 +15,10 @@
 //! - **The engine and the summarizer** see a text ref as its carried head and a
 //!   notice of how much more there is ([`expose`]). Media refs stay as written
 //!   and decode as opaque parts, which every codec renders back byte for byte.
-//! - **Views** never send a ref's stand-in to the model: a part holding a ref
-//!   is kept as written or dropped whole (`providers::async_provider::ranges`).
+//! - **Views** never send a ref or its stand-in to the model: an edit to a
+//!   part holding one is sent only when the new bytes hold neither
+//!   (`providers::async_provider::ranges`), and bytes ck-mc authors drop refs
+//!   ([`without_refs`]).
 use cortexkit_role_llm_runner::read::descriptors::Reference;
 use serde_json::Value;
 

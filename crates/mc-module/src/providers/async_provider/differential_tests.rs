@@ -203,14 +203,14 @@ fn message(profile: Profile, n: u64, salt: u64) -> ReadMessage {
     };
     let mut entry = ReadMessage::new(n, format!("m{n}"), message).with_tags(rows);
     // A screenshot the person attached: read as a `media_ref`, never counted.
-    if n % 31 == 0 {
+    if n.is_multiple_of(31) {
         let data = "iVBORw0KGgoAAAANSUhEUgAAB4AAAAQ4CAYAAADo08FD";
         let image = match profile {
             Profile::OpenCode => Some((
                 "/parts",
                 json!({"id":format!("p{n}i"),"type":"file","mime":"image/png","url":format!("data:image/png;base64,{data}")}),
             )),
-            Profile::Pi if n % 4 == 0 => Some((
+            Profile::Pi if n.is_multiple_of(4) => Some((
                 "/message/content",
                 json!({"type":"image","data":data,"mimeType":"image/png"}),
             )),

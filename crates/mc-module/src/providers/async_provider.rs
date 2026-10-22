@@ -645,7 +645,7 @@ fn log_read_identity_once(state: &State, lineageless: Option<(&[String], usize, 
     READ_LOG.with(|log| log.borrow_mut().push(line));
 }
 
-/// The read-identity lines this thread logged, for tests.
+// The read-identity lines this thread logged, for tests.
 #[cfg(test)]
 thread_local! {
     static READ_LOG: std::cell::RefCell<Vec<String>> = const { std::cell::RefCell::new(Vec::new()) };
@@ -2541,9 +2541,9 @@ fn ranges(
                     &original.mid,
                     &row.part,
                 )),
-                // A part holding a ref is kept as written or dropped whole: an
-                // edit derived from its stand-in would send the model ck-mc's
-                // placeholder in place of the runner's payload.
+                // An edit that still holds a ref or ck-mc's stand-in for one is
+                // not sent, and the part stays as written: otherwise the model
+                // would get ck-mc's placeholder in place of the runner's payload.
                 Some(value)
                     if value != &expected
                         && value != part

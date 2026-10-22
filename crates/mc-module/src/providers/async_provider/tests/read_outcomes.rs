@@ -18,7 +18,8 @@ async fn publish_notice(rig: &Rig, seq: u64) {
     )
     .with_window(100_000);
     let headers = notice.to_headers();
-    rig.bus
+    let _ = rig
+        .bus
         .publish(
             &notice::event_subject("fixture", &rig.module, notice::ADVANCED_EVENT),
             &bus_id(&rig.reference, "advanced", seq),

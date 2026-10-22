@@ -53,8 +53,8 @@ async fn a_moved_session_answers_setup_with_its_checkpoint_and_the_runner_anchor
     assert_eq!(numbers, vec![Some(21), Some(22)]);
 }
 
-/// Every later Setup answer for the session repeats the same checkpoint, and
-/// one from a runner that stops declaring `tag_checkpoint` is refused, typed.
+/// A later Setup for a moved session is refused, with the typed terminal
+/// code, once its runner stops declaring `tag_checkpoint`.
 #[tokio::test]
 async fn a_runner_without_tag_checkpoint_never_gets_the_checkpoint() {
     let dir = tempfile::tempdir().unwrap();
