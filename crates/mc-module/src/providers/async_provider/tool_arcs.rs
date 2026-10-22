@@ -31,11 +31,17 @@ struct ArcSide {
 }
 
 /// What publication needs to know about one transcript message a view keeps:
-/// its id, its part keys in order, and the tool-arc sides it carries.
+/// its id, role and part keys in order, and the tool-arc sides it carries.
 #[derive(Clone, Debug)]
 pub(super) struct KeptMessage {
-    mid: String,
-    parts: Vec<String>,
+    pub(super) mid: String,
+    pub(super) parts: Vec<String>,
+    /// The message's role in the runner's schema (`role`, OpenCode's
+    /// `info.role`, or the role of a Pi journal entry's `message`).
+    pub(super) role: Option<String>,
+    /// An Anthropic message whose content is one string, not a block array:
+    /// its one part is that string.
+    pub(super) string_content: bool,
     sides: Vec<ArcSide>,
     /// A Pi `toolResult` message. Its call id is a message field, so the
     /// message still names its call when every part is dropped; only removing
@@ -67,10 +73,21 @@ impl KeptMessage {
         Ok(Self {
             mid: mid.to_owned(),
             parts,
+            role: role(message).map(str::to_owned),
+            string_content: message.get("content").is_some_and(Value::is_string),
             sides,
             tool_result_message,
         })
     }
+}
+
+/// The role of a message in any of the runners' schemas.
+pub(super) fn role(message: &Value) -> Option<&str> {
+    message
+        .get("role")
+        .or_else(|| message.pointer("/info/role"))
+        .or_else(|| message.pointer("/message/role"))
+        .and_then(Value::as_str)
 }
 
 /// The tool-arc sides of one native message, and whether it is a Pi
@@ -161,7 +178,7 @@ fn arcs(kept: &KeptMessages) -> Vec<ToolArc> {
 }
 
 /// Every Keep edit by `(ordinal, part key)`.
-fn edits_by_part(ranges: &[view::ViewRange]) -> HashMap<(u64, &str), &view::PartEdit> {
+pub(super) fn edits_by_part(ranges: &[view::ViewRange]) -> HashMap<(u64, &str), &view::PartEdit> {
     let mut by_part = HashMap::new();
     for range in ranges {
         if let view::ViewRange::Keep { edits, .. } = range {
@@ -204,6 +221,9 @@ fn side_dropped(
 /// reduction is undone and the bytes stay what the runner already holds. The
 /// other resolution, serving the call again, would restore content an
 /// acknowledged view removed.
+///
+/// A drop added for a part the range did not edit yet goes at the end of the
+/// range's edits; the caller puts them in part order afterwards (`sort_edits`).
 pub(super) fn complete_dropped_arcs(kept: &KeptMessages, ranges: &mut [view::ViewRange]) {
     let mut drops: BTreeMap<u64, BTreeSet<usize>> = BTreeMap::new();
     {
@@ -235,7 +255,6 @@ pub(super) fn complete_dropped_arcs(kept: &KeptMessages, ranges: &mut [view::Vie
         let view::ViewRange::Keep { from, to, edits } = range else {
             continue;
         };
-        let mut changed = false;
         for (ordinal, parts) in drops.range(*from..*to) {
             let message = &kept[ordinal];
             for part in parts {
@@ -250,22 +269,28 @@ pub(super) fn complete_dropped_arcs(kept: &KeptMessages, ranges: &mut [view::Vie
                     Some(edit) => *edit = drop,
                     None => edits.push(drop),
                 }
-                changed = true;
             }
-        }
-        if changed {
-            // Edits follow the parts' order within each message.
-            edits.sort_by_key(|edit| {
-                let position = kept
-                    .get(&edit.ordinal)
-                    .and_then(|message| message.parts.iter().position(|part| *part == edit.part));
-                (edit.ordinal, position)
-            });
         }
     }
 }
 
-/// Serve a fully dropped Pi `toolResult` message by removing the message.
+/// Sort one keep range's edits as the contract requires: by ordinal, then by
+/// the part's position in its message (the order of the message's part keys).
+/// Part keys are opaque strings, so their string order is not the part order:
+/// with keys `"0"` to `"11"`, `"10"` sorts before `"2"`. An edit whose key
+/// the kept message does not list sorts first within its message, by key;
+/// publication never builds such an edit.
+pub(super) fn sort_edits(kept: &KeptMessages, edits: &mut [view::PartEdit]) {
+    edits.sort_by_cached_key(|edit| {
+        let position = kept
+            .get(&edit.ordinal)
+            .and_then(|message| message.parts.iter().position(|part| *part == edit.part));
+        (edit.ordinal, position, edit.part.clone())
+    });
+}
+
+/// The Pi `toolResult` messages a view must remove whole because their arc
+/// is dropped (`emptied_messages::shape` removes them).
 ///
 /// Part edits cannot remove the `toolCallId` a Pi `toolResult` carries on the
 /// message, so dropping every part would still serve a result for a dropped
@@ -279,77 +304,30 @@ pub(super) fn complete_dropped_arcs(kept: &KeptMessages, ranges: &mut [view::Vie
 /// capture records the call's drop from the keep range, and
 /// `complete_dropped_arcs` drops the result's parts again from it, so a later
 /// pass serves the same bytes even after the engine forgot the reduction.
-pub(super) fn remove_dropped_tool_results(
+pub(super) fn dropped_tool_results(
     kept: &KeptMessages,
-    ranges: Vec<view::ViewRange>,
-) -> Vec<view::ViewRange> {
-    let removed: BTreeSet<u64> = {
-        let edits = edits_by_part(&ranges);
-        let mut removed = BTreeSet::new();
-        for arc in arcs(kept) {
-            let calls_dropped = !arc.calls.is_empty()
-                && arc
-                    .calls
-                    .iter()
-                    .all(|call| side_dropped(kept, *call, &edits));
-            for (ordinal, index) in &arc.results {
-                let message = &kept[ordinal];
-                if !message.tool_result_message {
-                    continue;
-                }
-                let empty = message.sides[*index].parts.is_empty();
-                if (empty && calls_dropped)
-                    || (!empty && side_dropped(kept, (*ordinal, *index), &edits))
-                {
-                    removed.insert(*ordinal);
-                }
+    edits: &HashMap<(u64, &str), &view::PartEdit>,
+) -> BTreeSet<u64> {
+    let mut removed = BTreeSet::new();
+    for arc in arcs(kept) {
+        let calls_dropped = !arc.calls.is_empty()
+            && arc
+                .calls
+                .iter()
+                .all(|call| side_dropped(kept, *call, edits));
+        for (ordinal, index) in &arc.results {
+            let message = &kept[ordinal];
+            if !message.tool_result_message {
+                continue;
+            }
+            let empty = message.sides[*index].parts.is_empty();
+            if (empty && calls_dropped) || (!empty && side_dropped(kept, (*ordinal, *index), edits))
+            {
+                removed.insert(*ordinal);
             }
         }
-        removed
-    };
-    if removed.is_empty() {
-        return ranges;
     }
-    let mut out = Vec::with_capacity(ranges.len() + removed.len() * 2);
-    for range in ranges {
-        let view::ViewRange::Keep { from, to, edits } = &range else {
-            out.push(range);
-            continue;
-        };
-        let (from, to) = (*from, *to);
-        if removed.range(from..to).next().is_none() {
-            out.push(range);
-            continue;
-        }
-        let mut start = from;
-        for ordinal in removed.range(from..to).copied().collect::<Vec<_>>() {
-            if start < ordinal {
-                out.push(view::ViewRange::keep_with_edits(
-                    start,
-                    ordinal,
-                    keep_edits(edits, start, ordinal),
-                ));
-            }
-            out.push(view::ViewRange::replace(ordinal, ordinal + 1, "[]"));
-            start = ordinal + 1;
-        }
-        if start < to {
-            out.push(view::ViewRange::keep_with_edits(
-                start,
-                to,
-                keep_edits(edits, start, to),
-            ));
-        }
-    }
-    out
-}
-
-fn keep_edits(edits: &[view::PartEdit], from: u64, to: u64) -> Vec<view::PartEdit> {
-    edits
-        .iter()
-        .filter(|edit| edit.ordinal >= from && edit.ordinal < to)
-        .cloned()
-        .collect()
+    removed
 }
 
 /// The tool arcs of the kept messages that `ranges` serve on one side only.
@@ -496,6 +474,13 @@ mod tests {
 
     fn keep(ordinal: u64, edits: Vec<view::PartEdit>) -> view::ViewRange {
         view::ViewRange::keep_with_edits(ordinal, ordinal + 1, edits)
+    }
+
+    /// The ranges after `emptied_messages::shape` for Pi, with nothing
+    /// acknowledged.
+    fn remove_emptied(kept: &KeptMessages, ranges: Vec<view::ViewRange>) -> Vec<view::ViewRange> {
+        super::super::emptied_messages::shape(codec::Codec::Pi, kept, &Default::default(), ranges)
+            .ranges
     }
 
     fn drop(ordinal: u64, part: usize) -> view::PartEdit {
@@ -654,7 +639,7 @@ mod tests {
     #[test]
     fn a_fully_dropped_pi_result_message_is_removed_whole() {
         let kept = kept_of(codec::Codec::Pi, &pi());
-        let ranges = remove_dropped_tool_results(
+        let ranges = remove_emptied(
             &kept,
             vec![keep(0, vec![drop(0, 1)]), keep(1, vec![drop(1, 0)])],
         );
@@ -670,7 +655,7 @@ mod tests {
         messages
             .push(json!({"id":"m2","type":"message","message":{"role":"user","content":[{"type":"text","text":"next"}]}}));
         let kept = kept_of(codec::Codec::Pi, &messages);
-        let ranges = remove_dropped_tool_results(
+        let ranges = remove_emptied(
             &kept,
             vec![view::ViewRange::keep_with_edits(
                 0,
@@ -695,6 +680,6 @@ mod tests {
         let placeholder =
             view::PartEdit::replace(1, "m1", "0", r#"{"type":"text","text":"[dropped]"}"#);
         let ranges = vec![keep(0, vec![]), keep(1, vec![placeholder])];
-        assert_eq!(remove_dropped_tool_results(&kept, ranges.clone()), ranges);
+        assert_eq!(remove_emptied(&kept, ranges.clone()), ranges);
     }
 }

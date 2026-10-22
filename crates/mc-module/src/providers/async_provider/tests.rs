@@ -1833,10 +1833,17 @@ async fn restored_lineage_reuses_history_embeddings_and_reanchors_only_surviving
         "restored history head must remain byte-identical"
     );
     assert!(after.tag_index.contains_key("§9063§"));
+    // m21's only part is that tool part, so the view either drops the part
+    // or removes the emptied message whole (`emptied_messages::shape`).
     let dropped = restored.ranges.iter().any(|range| match range {
         view::ViewRange::Keep { edits, .. } => edits
             .iter()
             .any(|edit| edit.mid == "m21" && edit.part == "0" && edit.drop),
+        view::ViewRange::Replace {
+            from: 21,
+            to: 22,
+            bytes,
+        } => bytes == "[]",
         _ => false,
     });
     assert!(

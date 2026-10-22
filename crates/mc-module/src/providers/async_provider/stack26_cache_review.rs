@@ -32,7 +32,7 @@ async fn stack26_seed_1008_restore_keeps_newest_broca_user_message() {
 /// Tool-call ids and tool-result ids in model-format messages (owned-broca,
 /// Pi journal bodies, Anthropic Messages). OpenCode tool parts carry the call
 /// and its output together, so they never split.
-fn tool_ids(messages: &[Value]) -> (BTreeSet<String>, BTreeSet<String>) {
+pub(super) fn tool_ids(messages: &[Value]) -> (BTreeSet<String>, BTreeSet<String>) {
     let mut calls = BTreeSet::new();
     let mut results = BTreeSet::new();
     for message in messages {
@@ -137,7 +137,7 @@ async fn stack26_seed_1199_anthropic_views_keep_tool_results_with_their_calls() 
 /// dropped. Dropping every part of the `toolResult` message left it served
 /// with empty content and its `toolCallId`, a message field a part edit cannot
 /// remove, so the history kept a result whose call was gone. The view now
-/// removes the whole message (`tool_arcs::remove_dropped_tool_results`).
+/// removes the whole message (`emptied_messages::shape`).
 #[tokio::test]
 async fn stack26_seed_1070_pi_views_keep_tool_results_with_their_calls() {
     let (splits, log) = split_tool_pairs(Profile::Pi, 1070).await;
@@ -146,5 +146,36 @@ async fn stack26_seed_1070_pi_views_keep_tool_results_with_their_calls() {
         "{} views split a tool pair; first: {:?}; steps {log:?}",
         splits.len(),
         splits.first()
+    );
+}
+
+/// Differential seed 1199 (anthropic-messages): views 6 and 7 dropped
+/// call181's arc whole and served the `tool_result`'s user message with
+/// empty content, which Anthropic rejects with HTTP 400. The message is now
+/// removed, or kept as a `[dropped]` shell where removing it would make two
+/// assistant messages adjacent (`emptied_messages::shape`).
+#[tokio::test]
+async fn stack26_seed_1199_anthropic_views_serve_no_empty_or_adjacent_messages() {
+    let pair = session_pair_with(Profile::Anthropic, 1199, 24, false).await;
+    let review = pair.review.borrow();
+    let invalid: Vec<_> = review
+        .violations
+        .iter()
+        .filter(|violation| violation.starts_with("EMPTY") || violation.starts_with("ADJACENT"))
+        .collect();
+    assert!(
+        review
+            .counts
+            .get("views_Anthropic")
+            .is_some_and(|views| *views > 0),
+        "the session publishes views: {:?}",
+        review.counts
+    );
+    assert!(
+        invalid.is_empty(),
+        "{} invalid messages served; first: {:?}; steps {:?}",
+        invalid.len(),
+        invalid.first(),
+        pair.log
     );
 }
