@@ -49,7 +49,7 @@ pub(crate) struct SeedTodo {
     pub state_hash: String,
 }
 
-#[derive(Clone, Debug, Serialize, Deserialize, PartialEq)]
+#[derive(Clone, Debug, Serialize, Deserialize)]
 pub(crate) struct CutSeed {
     /// The first ordinal of the lineage after the cut (F); the cut is F - 1.
     pub first_ordinal: u64,
@@ -106,6 +106,99 @@ pub(crate) struct CutSeed {
     /// The newest todo state when the seed was taken. Fallback: none, so no
     /// synthetic todo pair shows until the next `todowrite` in the window.
     pub todo: Option<SeedTodo>,
+    /// State of the messages at or after the cut, as the conversation held
+    /// it when the cut was taken. It is not derived from rows below the cut,
+    /// but a lineage that begins at the cut cannot recompute it either: the
+    /// engine froze it on passes that saw those rows. Fallback: empty, so the
+    /// window starts with no reductions, no queued drops and no latches.
+    #[serde(default)]
+    pub window: CutWindow,
+}
+
+/// The window's engine and record state carried into a lineage that begins
+/// at a cut; see `CutSeed::window`.
+#[derive(Clone, Debug, Default, Serialize, Deserialize)]
+pub(crate) struct CutWindow {
+    /// Frozen reduction, caveman and strip units whose target message is at
+    /// or after the cut, verbatim: their payloads are the bytes already
+    /// served.
+    pub frozen_units: Vec<mc_core::FrozenUnit>,
+    /// `(last_emergency_input_sample, has_prior_emergency_drop,
+    /// last_execute_ordinal)`.
+    pub emergency: Option<(f64, bool, u64)>,
+    /// Queued `ctx_reduce` drops on window blocks: `(block id, queued at ms)`.
+    pub pending_drops: Vec<(String, i64)>,
+    /// Native edits the runner acknowledged on window parts (`FrozenEdits`
+    /// JSON).
+    pub frozen_edits: Option<String>,
+    /// For a lineage that descends from this cut: the engine namespace's
+    /// folded head as it stands (frozen m0, m1, history and mural units,
+    /// coverage and boundary, the tail-hygiene baseline, the m1 revisions)
+    /// with the per-message state of the window and the context sources. Its
+    /// size is bounded by the history budget, the frozen units and the
+    /// window, not by the session's length.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub head: Option<mc_store::NamespaceHead>,
+    /// The record's certificate for the rows it omits when its tail starts
+    /// at or after the cut, with the content proof of the window rows
+    /// before that tail.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub(super) certificate: Option<(
+        transform::compaction::LogicalPrefix,
+        held_entries::InputProof,
+    )>,
+    /// The record's fixed-size cadence and policy state (`RECORD_KEEP`).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub record: Option<serde_json::Map<String, Value>>,
+    /// The engine's produced and applied views, serialized. They hold the
+    /// head and window rows only.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub produced_view: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub applied_view: Option<String>,
+    /// The views the conversation retains (the applied one and any newer):
+    /// `(version, view_json, engine_json, announced)`. A descending lineage
+    /// keeps serving them; their kept ranges are the window's.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub views: Vec<(u64, String, Option<String>, bool)>,
+    /// The stored version high-water the views are numbered under.
+    #[serde(default)]
+    pub views_high_water: u64,
+    /// The engine's version high-water and rebuild epoch.
+    #[serde(default)]
+    pub engine_versions: (u64, u64),
+}
+
+/// Record members a lineage that descends from a cut keeps as they are:
+/// fixed-size cadence, policy and reminder state.
+const RECORD_KEEP: [&str; 12] = [
+    "seq",
+    "completed_seq",
+    "applied",
+    "acknowledgements",
+    "marker_outcomes",
+    "frozen_edits_version",
+    "usage_policy",
+    "reminder_cadence",
+    "reminder_baseline_generation",
+    "historian_cadence",
+    "historian_pending",
+    "reminder_echoes",
+];
+
+/// How a conversation begins at a cut. It is decided only by whether the
+/// Setup descends from a cut this conversation published (`cut_start`).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(super) enum CutStart {
+    /// The runner just applied the view that made the cut, so the provider's
+    /// cached prefix is that view's head: the folded head is adopted as it
+    /// stands, and the first pass is whatever the next pass would have been.
+    Descending,
+    /// Not descending from a cut this conversation published (a moved
+    /// session, a conversation coming off another route, a runner that lost
+    /// its state): the first pass is the engine's own bootstrap fold, a full
+    /// rebuild.
+    Fresh,
 }
 
 /// One named refusal to capture a seed. The cut is then not taken.
@@ -187,6 +280,7 @@ impl CutSeed {
             pre_cut_tags: Vec::new(),
             max_tag: 0,
             todo: None,
+            window: CutWindow::default(),
         }
     }
 
@@ -632,7 +726,97 @@ impl AsyncRecord {
             }),
             _ => None,
         };
+        // The window's state, keyed by the window's messages.
+        let window_mids: HashSet<&str> = self
+            .entries
+            .range(first..)
+            .map(|(_, entry)| entry.mid.as_str())
+            .collect();
+        let in_window = |block: &str| window_mids.contains(block_mid(block));
+        let window = CutWindow {
+            frozen_units: loaded
+                .core
+                .frozen_units
+                .iter()
+                .filter(|unit| {
+                    frozen_unit_mid(&unit.key).is_some_and(|mid| window_mids.contains(mid))
+                })
+                .cloned()
+                .collect(),
+            emergency: Some((
+                loaded.meta.last_emergency_input_sample,
+                loaded.meta.has_prior_emergency_drop,
+                loaded.meta.last_execute_ordinal,
+            )),
+            pending_drops: store
+                .load_pending_agent_drops(&namespace)
+                .map_err(transient)?
+                .into_iter()
+                .filter(|drop| in_window(&drop.target_id))
+                .map(|drop| (drop.target_id, drop.queued_at_ms))
+                .collect(),
+            frozen_edits: Some(
+                self.frozen_edits
+                    .only_mids(&window_mids.iter().map(|mid| (*mid).to_owned()).collect())
+                    .json()?,
+            ),
+            ..CutWindow::default()
+        };
+        let mut window = window;
+        // The folded head, keeping the per-message state of the window and of
+        // the context sources (which still render).
+        let context_mids: HashSet<String> = context_sources
+            .values()
+            .map(|source| source.mid.clone())
+            .collect();
+        let keep = |mid: &str| window_mids.contains(mid) || context_mids.contains(mid);
+        window.head = store
+            .load_namespace_head(&namespace)
+            .map_err(transient)?
+            .map(|mut head| {
+                for units in [&mut head.core.frozen_units, &mut head.core.pending_changes] {
+                    units.retain(|unit| frozen_unit_mid(&unit.key).is_none_or(|mid| keep(mid)));
+                }
+                head.retain_messages(keep);
+                head
+            });
+        if let Some(prefix) = self
+            .logical_prefix
+            .as_ref()
+            .filter(|prefix| !prefix.is_cut() && prefix.tail_from >= first)
+            .filter(|prefix| {
+                self.entries
+                    .matches(self.prefix_input_proof.as_ref(), prefix.tail_from)
+            })
+        {
+            let mut held = held_entries::HeldEntries::default();
+            held.proof_before(prefix.tail_from);
+            for (ordinal, entry) in self.entries.range(first..prefix.tail_from) {
+                held.insert(*ordinal, Arc::clone(entry));
+            }
+            window.certificate =
+                Some((prefix.as_ref().clone(), held.proof_before(prefix.tail_from)));
+        }
+        let record = serde_json::to_value(&*self).map_err(transient)?;
+        window.record = Some(
+            RECORD_KEEP
+                .iter()
+                .filter_map(|key| Some(((*key).to_owned(), record.get(*key)?.clone())))
+                .collect(),
+        );
+        window.produced_view = self
+            .produced_view
+            .as_ref()
+            .map(|view| view.json.to_string());
+        window.applied_view = self.applied_view.as_ref().map(|view| view.json.to_string());
+        let (views, high) = store
+            .load_async_compaction_views(&self.reference())
+            .map_err(transient)?;
+        window.views = views;
+        window.views_high_water = high;
+        window.engine_versions = (self.engine.version_high_water, self.engine.rebuild_epoch);
         Ok(Ok(CutSeed {
+            window,
             first_ordinal: first,
             lineage_from,
             cut_mid: cut_entry.mid.clone(),
@@ -705,11 +889,15 @@ impl AsyncRecord {
         &mut self,
         store: &McStore,
         seed: CutSeed,
+        start: CutStart,
     ) -> Result<(), HandlerOutcome> {
         if !self.entries.is_empty() {
             return Err(invalid(
                 "a conversation begins at a cut only before it holds rows",
             ));
+        }
+        if start == CutStart::Descending {
+            return self.adopt_folded_head(store, seed);
         }
         // Commit the history's coverage through the cut in the engine
         // namespace first, as the fold that made the cut did: the seeded
@@ -729,6 +917,22 @@ impl AsyncRecord {
                     .commit_meta(&namespace, loaded.row_version, &meta)
                     .map_err(transient)?;
             }
+            let seq_before = store
+                .load_meta(&namespace)
+                .map_err(transient)?
+                .meta
+                .shadow_seq;
+            let pending_drops = seed
+                .window
+                .pending_drops
+                .iter()
+                .map(
+                    |(block_id, queued_at_ms)| mc_store::PendingAgentDropSeedRow {
+                        block_id: block_id.clone(),
+                        queued_at_ms: *queued_at_ms,
+                    },
+                )
+                .collect::<Vec<_>>();
             store
                 .apply_authority_state_sync(mc_store::ModuleStateSyncRequest {
                     resolved_compartment_boundaries: &[],
@@ -743,20 +947,44 @@ impl AsyncRecord {
                     strip_seed_skipped: 0,
                     reasoning_cleared_through_tag: None,
                     last_todo_state: None,
-                    pending_agent_drops: &[],
+                    pending_agent_drops: &pending_drops,
                     pending_agent_drops_skipped: 0,
                     user_hint_seeds: &[],
                     auto_search_hint_skipped: 0,
                     note_nudge_anchors: None,
                     todo_synthetic_anchor: None,
                     todo_synthetic_anchor_present: false,
-                    emergency_latches: None,
+                    emergency_latches: seed.window.emergency,
                     pending_compaction_marker: None,
                     deferred_execute_state: None,
                     channel2_nudge_state: None,
                     acked_watermarks: Value::Null,
                 })
                 .map_err(|error| transient(format!("{error:?}")))?;
+            // The window's frozen units, verbatim: the drop-seed slot would
+            // rebuild reductions as generic drops and has no caveman form,
+            // while these hold the exact bytes already served. The state
+            // sync also counts itself in `shadow_seq`; the async lane has no
+            // host shadow, so the count is put back to what the namespace
+            // had, as if the fold that made the cut had committed directly.
+            let units = seed.window.frozen_units.clone();
+            commit_cache_state(store, &namespace, |loaded| {
+                for unit in &units {
+                    if !loaded
+                        .core
+                        .frozen_units
+                        .iter()
+                        .any(|held| held.key == unit.key)
+                    {
+                        loaded.core.frozen_units.push(unit.clone());
+                    }
+                }
+                loaded.meta.shadow_seq = seq_before;
+            })?;
+        }
+        if let Some(json) = &seed.window.frozen_edits {
+            self.frozen_edits = frozen_edits::FrozenEdits::from_json(json)?;
+            self.frozen_edits.dirty = true;
         }
         if let Some(todo) = &seed.todo {
             store
@@ -773,6 +1001,153 @@ impl AsyncRecord {
             .as_deref()
             .map(|lineage| seed.todo_scan(lineage));
         self.cut_first_ordinal = Some(seed.first_ordinal);
+        self.cut_seed = Some(Arc::new(seed));
+        self.aggregates = self.base_aggregates();
+        self.journal.cut_seed_dirty = true;
+        self.save(store, &[])
+    }
+
+    /// Whether a Setup that names `descends_from` continues from a cut this
+    /// conversation published and the runner applied: the same lineage, and
+    /// a retained view whose cut (with an `applied` marker outcome) ends at
+    /// the named ordinal. Anything else is a fresh start.
+    pub(super) fn cut_start(
+        &self,
+        store: &McStore,
+        descends_from: Option<&compact::lineage::DescendsFrom>,
+    ) -> Result<CutStart, HandlerOutcome> {
+        let Some(descends) = descends_from else {
+            return Ok(CutStart::Fresh);
+        };
+        if self.lineage.as_deref() != Some(descends.lineage_id.as_str()) {
+            return Ok(CutStart::Fresh);
+        }
+        for (cut_id, outcome) in &self.marker_outcomes {
+            let Some(version) = cut_id
+                .strip_prefix('v')
+                .and_then(|version| version.parse::<u64>().ok())
+                .filter(|_| outcome == "applied")
+            else {
+                continue;
+            };
+            let Some(raw) = store
+                .load_async_compaction_view(&self.reference(), version)
+                .map_err(transient)?
+            else {
+                continue;
+            };
+            let view: view::CompactionView = serde_json::from_str(&raw).map_err(transient)?;
+            if view.cut.as_ref().is_some_and(|cut| {
+                cut.cut_id == *cut_id && cut.through_ordinal == descends.through_ordinal
+            }) {
+                return Ok(CutStart::Descending);
+            }
+        }
+        Ok(CutStart::Fresh)
+    }
+
+    /// Begin a lineage that descends from a cut this conversation published:
+    /// adopt the namespace's folded head and the record's cadence state as
+    /// they stand, with the window's state, so nothing is rebuilt.
+    fn adopt_folded_head(&mut self, store: &McStore, seed: CutSeed) -> Result<(), HandlerOutcome> {
+        let first = seed.first_ordinal;
+        let head = seed
+            .window
+            .head
+            .as_ref()
+            .ok_or_else(|| invalid("a descending cut needs the namespace's folded head"))?;
+        store
+            .adopt_namespace_head(&self.namespace(), head)
+            .map_err(transient)?;
+        for (key, value) in seed.window.record.iter().flatten() {
+            let value = value.clone();
+            match key.as_str() {
+                "seq" => self.seq = serde_json::from_value(value).map_err(transient)?,
+                "completed_seq" => {
+                    self.completed_seq = serde_json::from_value(value).map_err(transient)?
+                }
+                "applied" => self.applied = serde_json::from_value(value).map_err(transient)?,
+                "acknowledgements" => {
+                    self.acknowledgements = serde_json::from_value(value).map_err(transient)?
+                }
+                "marker_outcomes" => {
+                    self.marker_outcomes = serde_json::from_value(value).map_err(transient)?
+                }
+                "frozen_edits_version" => {
+                    self.frozen_edits_version = serde_json::from_value(value).map_err(transient)?
+                }
+                "usage_policy" => {
+                    self.usage_policy = serde_json::from_value(value).map_err(transient)?
+                }
+                "reminder_cadence" => {
+                    self.reminder_cadence = serde_json::from_value(value).map_err(transient)?
+                }
+                "reminder_baseline_generation" => {
+                    self.reminder_baseline_generation =
+                        serde_json::from_value(value).map_err(transient)?
+                }
+                "historian_cadence" => {
+                    self.historian_cadence = serde_json::from_value(value).map_err(transient)?
+                }
+                "historian_pending" => {
+                    self.historian_pending = serde_json::from_value(value).map_err(transient)?
+                }
+                "reminder_echoes" => {
+                    let mut echoes: reminder_echoes::ReminderEchoes =
+                        serde_json::from_value(value).map_err(transient)?;
+                    echoes.truncate_below(first);
+                    self.reminder_echoes = echoes;
+                }
+                _ => {}
+            }
+        }
+        if let Some(json) = &seed.window.frozen_edits {
+            self.frozen_edits = frozen_edits::FrozenEdits::from_json(json)?;
+            self.frozen_edits.dirty = true;
+        }
+        let (high, epoch) = seed.window.engine_versions;
+        self.engine.version_high_water = self.engine.version_high_water.max(high);
+        self.engine.rebuild_epoch = epoch;
+        store
+            .adopt_async_compaction_views(
+                &self.reference(),
+                &seed.window.views,
+                seed.window.views_high_water,
+            )
+            .map_err(transient)?;
+        for (version, _, engine, _) in &seed.window.views {
+            if let Some(engine) = engine {
+                self.published_engine
+                    .insert(*version, EngineView::parse(engine.clone())?);
+            }
+        }
+        self.produced_view = seed
+            .window
+            .produced_view
+            .clone()
+            .map(EngineView::parse)
+            .transpose()?;
+        self.applied_view = seed
+            .window
+            .applied_view
+            .clone()
+            .map(EngineView::parse)
+            .transpose()?;
+        if let Some((prefix, proof)) = &seed.window.certificate {
+            let mut prefix = prefix.clone();
+            prefix.generation = self.generation;
+            prefix
+                .rebase_tag_summary(store, &self.namespace())
+                .map_err(engine_error)?;
+            self.entries.proof_before(prefix.tail_from);
+            self.logical_prefix = Some(Arc::new(prefix));
+            self.prefix_input_proof = Some(proof.clone());
+        }
+        self.todo_scan = self
+            .lineage
+            .as_deref()
+            .map(|lineage| seed.todo_scan(lineage));
+        self.cut_first_ordinal = Some(first);
         self.cut_seed = Some(Arc::new(seed));
         self.aggregates = self.base_aggregates();
         self.journal.cut_seed_dirty = true;
@@ -839,18 +1214,14 @@ impl AsyncRecord {
         store
             .prune_namespace_messages(&namespace, &mids)
             .map_err(transient)?;
-        let mut pruned = false;
-        for _ in 0..4 {
-            // The logical snapshot and commit, as prefix hygiene uses them:
-            // module code never rewrites the whole cache state.
-            let mut loaded = store
-                .load_logical_transform_snapshot(&namespace, &[])
-                .map_err(transient)?
-                .loaded;
-            if loaded.row_version.is_none() {
-                pruned = true;
-                break;
-            }
+        // The removed tag rows moved the namespace's tag summary; the kept
+        // certificate's protection rows still stand for them.
+        if let Some(prefix) = &mut self.logical_prefix {
+            Arc::make_mut(prefix)
+                .rebase_tag_summary(store, &namespace)
+                .map_err(engine_error)?;
+        }
+        commit_cache_state(store, &namespace, |loaded| {
             loaded
                 .core
                 .frozen_units
@@ -867,49 +1238,7 @@ impl AsyncRecord {
             }
             meta.reclassified_synthetic_mids
                 .retain(|mid| !below.contains(mid));
-            let committed = store.commit_logical_transform_with_provider_policy(
-                &namespace,
-                mc_store::TransformCommit {
-                    expected: loaded.row_version,
-                    core: &loaded.core,
-                    meta: &loaded.meta,
-                    sections: mc_store::SectionsCommit {
-                        base: loaded.sections.as_ref(),
-                        meta_only_steps: 0,
-                        frozen_clear: mc_store::FrozenClear::Explicit,
-                    },
-                    consumed_drop_ids: &[],
-                    first_applied_command_ids: &[],
-                    memory_revision: None,
-                    compartment_max_seq: None,
-                    project_root: None,
-                    first_divergence: None,
-                    scheduler_observation: None,
-                    scheduler_request_observed_at_ms: None,
-                    scheduler_full_array_fingerprint: None,
-                    scheduler_eligible_supersession_count: None,
-                    scheduler_withheld_by_tag_window: None,
-                    scheduler_withheld_by_exempt_message: None,
-                    scheduler_applied_supersession_count: None,
-                    scheduler_applied_reductions: false,
-                    overlays: mc_store::TransformOverlayBatch::default(),
-                },
-                None,
-            );
-            match committed {
-                Ok(_) => {
-                    pruned = true;
-                    break;
-                }
-                Err(mc_store::McStoreError::CasConflict { .. }) => continue,
-                Err(error) => return Err(transient(error)),
-            }
-        }
-        if !pruned {
-            return Err(transient(
-                "engine state kept changing while pruning below a cut",
-            ));
-        }
+        })?;
         self.journal.truncate_below = Some(first);
         self.journal.persisted_through = self.entries.last_key_value().map(|(n, _)| *n);
         self.cut_first_ordinal = Some(first);
@@ -959,4 +1288,60 @@ pub(super) mod pass_trace {
         *passes = kept;
         taken.into_iter().map(|(_, line)| line).collect()
     }
+}
+
+/// Edit a namespace's cache state and commit it, retrying on a concurrent
+/// write. Uses the logical snapshot and commit, as prefix hygiene does:
+/// module code never rewrites the whole cache state. A namespace that was
+/// never written is left alone.
+fn commit_cache_state(
+    store: &McStore,
+    namespace: &str,
+    mut edit: impl FnMut(&mut mc_store::LoadedState),
+) -> Result<(), HandlerOutcome> {
+    for _ in 0..4 {
+        let mut loaded = store
+            .load_logical_transform_snapshot(namespace, &[])
+            .map_err(transient)?
+            .loaded;
+        if loaded.row_version.is_none() {
+            return Ok(());
+        }
+        edit(&mut loaded);
+        let committed = store.commit_logical_transform_with_provider_policy(
+            namespace,
+            mc_store::TransformCommit {
+                expected: loaded.row_version,
+                core: &loaded.core,
+                meta: &loaded.meta,
+                sections: mc_store::SectionsCommit {
+                    base: loaded.sections.as_ref(),
+                    meta_only_steps: 0,
+                    frozen_clear: mc_store::FrozenClear::Explicit,
+                },
+                consumed_drop_ids: &[],
+                first_applied_command_ids: &[],
+                memory_revision: None,
+                compartment_max_seq: None,
+                project_root: None,
+                first_divergence: None,
+                scheduler_observation: None,
+                scheduler_request_observed_at_ms: None,
+                scheduler_full_array_fingerprint: None,
+                scheduler_eligible_supersession_count: None,
+                scheduler_withheld_by_tag_window: None,
+                scheduler_withheld_by_exempt_message: None,
+                scheduler_applied_supersession_count: None,
+                scheduler_applied_reductions: false,
+                overlays: mc_store::TransformOverlayBatch::default(),
+            },
+            None,
+        );
+        match committed {
+            Ok(_) => return Ok(()),
+            Err(mc_store::McStoreError::CasConflict { .. }) => continue,
+            Err(error) => return Err(transient(error)),
+        }
+    }
+    Err(transient("engine state kept changing while it was edited"))
 }

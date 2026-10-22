@@ -762,6 +762,27 @@ impl Pair {
         } else {
             (resident, oracle)
         };
+        if self.cut_mode && resident != oracle {
+            let at = resident
+                .chars()
+                .zip(oracle.chars())
+                .position(|(a, b)| a != b)
+                .unwrap_or(resident.len().min(oracle.len()));
+            let around = |text: &str| {
+                text.chars()
+                    .skip(at.saturating_sub(200))
+                    .take(600)
+                    .collect::<String>()
+            };
+            panic!(
+                "{:?} answer diverged at step {} ({label}) at char {at}\ncut  …{}\nfull …{}\nsteps: {:?}",
+                self.profile,
+                self.log.len() + 1,
+                around(&resident),
+                around(&oracle),
+                self.log
+            );
+        }
         assert_eq!(
             resident,
             oracle,

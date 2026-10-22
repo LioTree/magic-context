@@ -384,6 +384,59 @@ impl McStore {
             .map_err(Into::into)
     }
 
+    /// The conversation's retained views: `(version, view_json, engine_json,
+    /// announced)` in version order, and its version high-water.
+    #[allow(clippy::type_complexity)]
+    pub fn load_async_compaction_views(
+        &self,
+        session_ref: &str,
+    ) -> Result<(Vec<(u64, String, Option<String>, bool)>, u64), McStoreError> {
+        self.inner
+            .with_read(|conn| {
+                let views = conn
+                    .prepare("SELECT version,view_json,engine_json,announced FROM mc_async_compaction_views WHERE session_ref=?1 ORDER BY version")?
+                    .query_map([session_ref], |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get::<_, i64>(3)? != 0)))?
+                    .collect::<rusqlite::Result<Vec<_>>>()?;
+                let high = conn
+                    .query_row(
+                        "SELECT version_high_water FROM mc_async_compaction WHERE session_ref=?1",
+                        [session_ref],
+                        |row| row.get(0),
+                    )
+                    .optional()?
+                    .unwrap_or(0);
+                Ok((views, high))
+            })
+            .map_err(Into::into)
+    }
+
+    /// Store views a conversation keeps from the lineage it descends from,
+    /// with their announcement state, and raise its version high-water to at
+    /// least `high`. The conversation's record must exist.
+    pub fn adopt_async_compaction_views(
+        &self,
+        session_ref: &str,
+        views: &[(u64, String, Option<String>, bool)],
+        high: u64,
+    ) -> Result<(), McStoreError> {
+        self.inner
+            .with_conn_fenced(|conn| {
+                for (version, view, engine, announced) in views {
+                    conn.execute(
+                        "INSERT OR REPLACE INTO mc_async_compaction_views(session_ref,session,version,view_json,engine_json,announced)
+                            SELECT ?1,session,?2,?3,?4,?5 FROM mc_async_compaction WHERE session_ref=?1",
+                        params![session_ref, version, view, engine, *announced as i64],
+                    )?;
+                }
+                conn.execute(
+                    "UPDATE mc_async_compaction SET version_high_water=max(version_high_water,?2) WHERE session_ref=?1",
+                    params![session_ref, high],
+                )?;
+                Ok(())
+            })
+            .map_err(Into::into)
+    }
+
     pub fn pending_async_compaction_views(
         &self,
     ) -> Result<Vec<(String, u64, String)>, McStoreError> {

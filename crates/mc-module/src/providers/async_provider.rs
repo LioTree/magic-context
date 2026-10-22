@@ -2167,6 +2167,27 @@ impl McHandler {
         } else {
             None
         };
+        #[cfg(test)]
+        if std::env::var_os("MC_CUT_TRACE").is_some() && prefix.is_none() {
+            if let Some(held) = &state.logical_prefix {
+                let loaded = store
+                    .load_logical_transform_snapshot(&state.namespace(), &[])
+                    .map_err(transient)?
+                    .loaded;
+                let compartments = store
+                    .load_compartments(&state.namespace())
+                    .map_err(transient)?;
+                eprintln!(
+                    "TRACE certificate refused: matches={} proof={} (held {:?} expected {:?}) from={}/{}",
+                    held.matches(&status.lineage_id, state.generation, &loaded, &compartments),
+                    state.entries.matches(state.prefix_input_proof.as_ref(), held.tail_from),
+                    state.entries.proof_before_peek(),
+                    state.prefix_input_proof,
+                    state.lineage_from(),
+                    held.from
+                );
+            }
+        }
         // A conversation that begins at a cut has no rows below it to fall
         // back on: without a matching certificate, its cut seed stands for
         // them.

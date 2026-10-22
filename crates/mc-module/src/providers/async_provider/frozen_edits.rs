@@ -81,6 +81,17 @@ impl FrozenEdits {
         }
     }
 
+    /// Only the edits of the messages `mids`: a window's acknowledged edits,
+    /// carried into a lineage that begins at a cut.
+    #[cfg_attr(not(test), allow(dead_code))]
+    pub(super) fn only_mids(&self, mids: &std::collections::HashSet<String>) -> Self {
+        let mut kept = Self::default();
+        for part in self.parts.values().filter(|part| mids.contains(&part.mid)) {
+            kept.insert(part.clone());
+        }
+        kept
+    }
+
     /// Forget the edits of the messages `mids`: rows below a cut, which no
     /// view renders again.
     // Only cut capture and pruning (`cut_seed`) call this; only tests drive them so far.

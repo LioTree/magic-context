@@ -27,8 +27,13 @@ use subc_protocol::scope::{ScopeKind, ScopeStamp};
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum CutMode {
-    /// The cut side begins its conversation at the cut.
+    /// The cut side begins its conversation at the cut as a lineage that
+    /// descends from it: it adopts the folded head.
     BeginAtCut,
+    /// The cut side begins its conversation at the cut without descending
+    /// (a moved session, say): its first pass is the bootstrap fold, and the
+    /// full side is made to rebuild at the same notice.
+    BootstrapAtCut,
     /// The cut side reads everything, then prunes below the cut.
     PruneInPlace,
 }
@@ -142,6 +147,38 @@ fn first_difference(full: &Value, cut: &Value, path: String) -> String {
         },
         (x, y) => format!("{path}: full={x} cut={y}"),
     }
+}
+
+/// The settled result of the accepted user command `key` on `side`, from
+/// its late results, waiting while it runs.
+async fn command_result(side: &Side, key: &str) -> String {
+    for _ in 0..5_000 {
+        let pulled = side
+            .dispatch(json!({"name":"late_results","arguments":{"since":null}}))
+            .await;
+        let value: Value = serde_json::from_str(&pulled).unwrap_or(Value::Null);
+        let entries = value
+            .pointer("/result/structuredContent/entries")
+            .or_else(|| value.get("entries"))
+            .and_then(Value::as_array)
+            .cloned()
+            .unwrap_or_default();
+        let mine = entries
+            .iter()
+            .filter(|entry| {
+                entry["call_key"]
+                    .as_str()
+                    .is_some_and(|call| call == key || call.ends_with(&format!(":{key}")))
+            })
+            .collect::<Vec<_>>();
+        if let Some(result) = mine.iter().find(|entry| entry["kind"] == "result") {
+            // The entry's settle time is the clock's; its result and outcome
+            // are compared.
+            return json!([result["result"], result["outcome"]]).to_string();
+        }
+        tokio::time::sleep(Duration::from_millis(2)).await;
+    }
+    panic!("user command {key} did not settle");
 }
 
 /// The engine state the differential compares: the namespace's meta, its
@@ -401,9 +438,23 @@ impl Pair {
                 } else {
                     "ctx-flush"
                 };
-                let request = json!({"name":"user_command.invoke","call_key":format!("command-{}-{}", self.seq, self.log.len()),"arguments":{"command":command,"input":""}});
+                let key = format!("command-{}-{}", self.seq, self.log.len());
+                let request = json!({"name":"user_command.invoke","call_key":key,"arguments":{"command":command,"input":""}});
                 self.both(&format!("command {command}"), |side| {
-                    Box::pin(side.dispatch(request.clone()))
+                    let request = request.clone();
+                    let key = key.clone();
+                    Box::pin(async move {
+                        let accepted = side.dispatch(request).await;
+                        // A command that is still running finishes in the
+                        // background; wait for its result, so the next step
+                        // sees the same state on both sides.
+                        let result = if accepted.contains("accepted") {
+                            command_result(side, &key).await
+                        } else {
+                            String::new()
+                        };
+                        format!("{accepted} => {result}")
+                    })
                 })
                 .await;
             }
@@ -492,7 +543,7 @@ async fn cut_session_start(
     };
     let mut cut_answers = Vec::new();
     match mode {
-        CutMode::BeginAtCut => {
+        CutMode::BeginAtCut | CutMode::BootstrapAtCut => {
             // Full processing has published and applied the view that
             // covers the cut; the lineage after the cut begins there, from
             // the compartments and the seed, and both sides take the same
@@ -508,7 +559,35 @@ async fn cut_session_start(
                 .unwrap();
             cut.engine.version_high_water = state.engine.version_high_water;
             let boundary = seed.boundary_id.clone();
-            cut.begin_at_cut(side.store(), seed).unwrap();
+            let start = if mode == CutMode::BeginAtCut {
+                // Each store mints its own random generation for the same
+                // compartment history, and the m1 revisions hash it. The two
+                // sides hold the same history, so the cut side's store takes
+                // the full side's generation, as it would sharing one store.
+                let generation = pair
+                    .oracle
+                    .store()
+                    .with_context_conn_for_test(|conn| {
+                        conn.query_row(
+                            "SELECT generation, version, rewrite_version, seeded FROM compartment_history_versions WHERE session_id=?1",
+                            [cut.namespace()],
+                            |row| Ok((row.get::<_, String>(0)?, row.get::<_, i64>(1)?, row.get::<_, i64>(2)?, row.get::<_, i64>(3)?)),
+                        )
+                    })
+                    .unwrap();
+                side.store()
+                    .with_context_conn_for_test(|conn| {
+                        conn.execute(
+                            "UPDATE compartment_history_versions SET generation=?2, version=?3, rewrite_version=?4, seeded=?5 WHERE session_id=?1",
+                            rusqlite::params![cut.namespace(), generation.0, generation.1, generation.2, generation.3],
+                        )
+                    })
+                    .unwrap();
+                cut_seed::CutStart::Descending
+            } else {
+                cut_seed::CutStart::Fresh
+            };
+            cut.begin_at_cut(side.store(), seed, start).unwrap();
             if std::env::var_os("MC_CUT_TRACE").is_some() {
                 let meta = side.store().load(&cut.namespace()).unwrap();
                 eprintln!(
@@ -520,17 +599,21 @@ async fn cut_session_start(
                 );
             }
             side.h.checkin(cut);
-            let (_, high) = pair.oracle.views(&pair.reference);
-            let high = high.unwrap_or(0);
-            rusqlite::Connection::open(&side.db)
-                .unwrap()
-                .execute(
-                    "UPDATE mc_async_compaction SET version_high_water=?1 WHERE session_ref=?2",
-                    rusqlite::params![high, pair.reference],
-                )
-                .unwrap();
-            pair.compare_from_version = high as u64;
-            pair.cut_mode = true;
+            if mode == CutMode::BootstrapAtCut {
+                // A fresh start keeps none of the full side's views, so each
+                // side numbers its own from here.
+                let (_, high) = pair.oracle.views(&pair.reference);
+                let high = high.unwrap_or(0);
+                rusqlite::Connection::open(&side.db)
+                    .unwrap()
+                    .execute(
+                        "UPDATE mc_async_compaction SET version_high_water=?1 WHERE session_ref=?2",
+                        rusqlite::params![high, pair.reference],
+                    )
+                    .unwrap();
+                pair.compare_from_version = high as u64;
+                pair.cut_mode = true;
+            }
             for runner in [&pair.resident.runner, &pair.oracle.runner] {
                 runner.sends.lock().unwrap().clear();
                 runner.raw_sends.lock().unwrap().clear();
@@ -569,11 +652,53 @@ async fn cut_session_start(
         pair.compare("opening notices");
         pair.check_cut(first);
     }
-    if mode == CutMode::BeginAtCut {
+    if mode != CutMode::PruneInPlace {
         pair.record_only = std::env::var_os("MC_CUT_TRACE").is_some();
+        if mode == CutMode::BootstrapAtCut {
+            // The reference rebuilds at the same notice: a lineage that does
+            // not descend from the cut starts with a full rebuild, and the
+            // differential compares every step from that rebuild.
+            let store = pair.oracle.store();
+            let head = load_head(store, &pair.reference).unwrap().unwrap();
+            let loaded = store.load_meta(&head.namespace()).unwrap();
+            let mut meta = loaded.meta;
+            meta.bootstrap_seed_fold_pending = true;
+            store
+                .commit_meta(&head.namespace(), loaded.row_version, &meta)
+                .unwrap();
+        }
+        for side in [&pair.oracle, &pair.resident] {
+            cut_seed::pass_trace::take(Arc::as_ptr(&side.h) as usize);
+        }
         // The lineage after the cut starts with a notice, as a runner's does.
         pair.append(1);
         pair.notice(&mut rng, None).await;
+        let first_pass = |side: &Side| {
+            let passes = cut_seed::pass_trace::take(Arc::as_ptr(&side.h) as usize);
+            if std::env::var_os("MC_CUT_TRACE").is_some() {
+                eprintln!("REPLAY first passes {passes:?}");
+            }
+            passes.first().map(|line| {
+                line.split_whitespace()
+                    .next()
+                    .unwrap_or_default()
+                    .to_owned()
+            })
+        };
+        let (full, cut) = (first_pass(&pair.oracle), first_pass(&pair.resident));
+        if std::env::var_os("MC_CUT_TRACE").is_none() {
+            assert_eq!(
+                full, cut,
+                "{profile:?} seed {number}: the first pass after the cut"
+            );
+            if mode == CutMode::BootstrapAtCut {
+                assert_eq!(
+                    cut.as_deref(),
+                    Some("action=HARD"),
+                    "{profile:?} seed {number}: a fresh start rebuilds"
+                );
+            }
+        }
         pair.check_cut(first);
     }
     Some((pair, rng, first, history_end))
@@ -667,6 +792,14 @@ async fn a_lineage_that_begins_at_a_cut_serves_what_full_processing_serves() {
     cut_differential(8, 20, 7_000, CutMode::BeginAtCut).await;
 }
 
+/// A lineage that begins at a cut without descending from it starts with a
+/// full rebuild, and from that rebuild serves what full processing serves
+/// when it rebuilds at the same notice.
+#[tokio::test(flavor = "multi_thread", worker_threads = 8)]
+async fn a_fresh_start_at_a_cut_rebuilds_and_then_serves_what_full_processing_serves() {
+    cut_differential(8, 20, 9_000, CutMode::BootstrapAtCut).await;
+}
+
 #[tokio::test(flavor = "multi_thread", worker_threads = 8)]
 async fn a_conversation_pruned_below_its_cut_serves_what_full_processing_serves() {
     cut_differential(8, 20, 8_000, CutMode::PruneInPlace).await;
@@ -681,13 +814,17 @@ async fn cut_lineages_serve_what_full_processing_serves_over_many_sessions() {
     let sessions = env_u64("MC_CUT_DIFFERENTIAL_SESSIONS", 300);
     let steps = env_u64("MC_CUT_DIFFERENTIAL_STEPS", 24);
     let first = env_u64("MC_CUT_DIFFERENTIAL_FIRST_SEED", 10_000);
-    // `MC_CUT_DIFFERENTIAL_MODE`: `begin`, `prune` or both (default).
+    // `MC_CUT_DIFFERENTIAL_MODE`: `begin`, `prune`, `bootstrap`, or begin and
+    // prune (default).
     let mode = std::env::var("MC_CUT_DIFFERENTIAL_MODE").unwrap_or_default();
-    if mode != "prune" {
+    if mode != "prune" && mode != "bootstrap" {
         cut_differential(sessions, steps, first, CutMode::BeginAtCut).await;
     }
-    if mode != "begin" {
+    if mode != "begin" && mode != "bootstrap" {
         cut_differential(sessions, steps, first + 100_000, CutMode::PruneInPlace).await;
+    }
+    if mode == "bootstrap" {
+        cut_differential(sessions, steps, first + 200_000, CutMode::BootstrapAtCut).await;
     }
 }
 
@@ -1188,7 +1325,21 @@ async fn replay_cut_session() {
         let loaded = side.store().load(&head.namespace()).unwrap();
         let meta = &loaded.meta;
         format!(
-            "coverage={:?} execute={} floor={:?} hygiene_gen={:?} reds={:?} prefix={:?}",
+            "parts={:?} coverage={:?} execute={} floor={:?} hygiene_gen={:?} reds={:?} prefix={:?}",
+            meta.tail_hygiene_baseline.as_ref().map(|baseline| {
+                baseline
+                    .baseline_parts
+                    .iter()
+                    .take(6)
+                    .map(|part| {
+                        format!(
+                            "{}={}",
+                            part.key.replace('\0', "/"),
+                            &part.content_hash[..8]
+                        )
+                    })
+                    .collect::<Vec<_>>()
+            }),
             meta.coverage_ordinal,
             meta.last_execute_ordinal,
             meta.publication_floor_ordinal,
@@ -1359,4 +1510,67 @@ impl Pair {
             self.log
         );
     }
+}
+
+/// Whether a lineage begins at a cut by adopting the folded head or by a
+/// fresh rebuild is decided only by the Setup's `descends_from`: it must
+/// name this conversation's lineage and the end of a cut this conversation
+/// published and the runner reported applied.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_setup_descends_only_from_a_cut_this_conversation_published() {
+    use compact::lineage::DescendsFrom;
+    let (pair, _, _) = covered_pair(Profile::Broca, 760).await;
+    let store = pair.resident.store();
+    let mut state = load(store, &pair.reference).unwrap().unwrap();
+    let (version, cut) = pair
+        .resident
+        .views(&pair.reference)
+        .0
+        .into_iter()
+        .rev()
+        .find_map(|(version, json)| {
+            let view: view::CompactionView = serde_json::from_str(&json).ok()?;
+            Some((version, view.cut?))
+        })
+        .expect("a published view with a cut");
+    assert_eq!(cut.cut_id, format!("v{version}"));
+    let start = |state: &State, descends: Option<DescendsFrom>| {
+        state.cut_start(store, descends.as_ref()).unwrap()
+    };
+    let at = |through| Some(DescendsFrom::new("L", through));
+    state.marker_outcomes.remove(&cut.cut_id);
+    assert_eq!(
+        start(&state, at(cut.through_ordinal)),
+        cut_seed::CutStart::Fresh,
+        "a cut the runner has not reported applied"
+    );
+    state
+        .marker_outcomes
+        .insert(cut.cut_id.clone(), "applied".into());
+    assert_eq!(
+        start(&state, at(cut.through_ordinal)),
+        cut_seed::CutStart::Descending
+    );
+    assert_eq!(start(&state, None), cut_seed::CutStart::Fresh, "no descent");
+    assert_eq!(
+        start(&state, at(cut.through_ordinal + 1)),
+        cut_seed::CutStart::Fresh,
+        "another ordinal"
+    );
+    assert_eq!(
+        start(
+            &state,
+            Some(DescendsFrom::new("other", cut.through_ordinal))
+        ),
+        cut_seed::CutStart::Fresh,
+        "another lineage"
+    );
+    state
+        .marker_outcomes
+        .insert(cut.cut_id.clone(), "refused".into());
+    assert_eq!(
+        start(&state, at(cut.through_ordinal)),
+        cut_seed::CutStart::Fresh,
+        "a refused marker"
+    );
 }

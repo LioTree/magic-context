@@ -39,6 +39,8 @@ pub use historian_claim::with_historian_claim_fixture_entropy;
 mod historian_telemetry;
 pub use historian_telemetry::{HistorianInvocation, HistorianRunTelemetry};
 mod async_compaction;
+mod cut_head;
+pub use cut_head::NamespaceHead;
 pub mod memory_history;
 pub mod memory_lifecycle;
 pub mod memory_projection;
