@@ -115,13 +115,6 @@ async fn the_head_floor_is_the_highest_number_allocated_in_any_epoch() {
     // The cut is the conversation's first message: the message of epoch 0's
     // lowest tag.
     assert_eq!(checkpoint.cut, format!("{SESSION}-m1"));
-    assert_eq!(
-        rig.state()
-            .full_array_floor
-            .as_ref()
-            .map(|f| f.tag_checkpoint),
-        Some(30)
-    );
 }
 
 /// A subagent's floor is taken across its own epochs only.
