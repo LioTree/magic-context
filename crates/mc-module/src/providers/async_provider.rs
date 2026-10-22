@@ -5,6 +5,8 @@ use compact::{self as contract, ceiling::CeilingPolicy, notice, ride, view};
 use cortexkit_bus_trait::{ContentDigest, DurableOwner, Stream, StreamCursor};
 use cortexkit_role_llm_runner::{read::ReadMessage, session_ref, tags};
 use serde::Deserialize;
+mod contract_policy;
+mod cut_runtime;
 mod cut_seed;
 #[cfg(test)]
 mod differential_tests;
@@ -13,6 +15,7 @@ mod frozen_edits;
 mod full_array_floor;
 mod held_entries;
 mod historian_tail;
+mod history_expand;
 mod moved_session;
 pub(crate) mod offline_first_pass;
 pub(crate) mod reminder_echoes;
@@ -266,6 +269,8 @@ pub(crate) struct AsyncRecord {
     runner_module: String,
     setup: compact::setup::SetupRequest,
     initial: Value,
+    #[serde(default)]
+    cache_policy: contract_policy::CachePolicy,
     /// Only the engine's fixed-size counters are in this record; its produced
     /// and applied baselines are named by `engine_baselines`.
     #[serde(with = "engine_header")]
@@ -337,6 +342,12 @@ pub(crate) struct AsyncRecord {
     /// What the conversation keeps of the transcript below its cut.
     #[serde(skip)]
     cut_seed: Option<Arc<cut_seed::CutSeed>>,
+    #[serde(default)]
+    lineage_first_ordinal: u64,
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+    published_cuts: BTreeMap<u64, cut_runtime::PublishedCut>,
+    #[serde(skip)]
+    pending_cut_seeds: BTreeMap<u64, cut_seed::CutSeed>,
 }
 
 fn deserialize_logical_prefix<'de, D: serde::Deserializer<'de>>(
@@ -863,6 +874,7 @@ impl State {
         });
         if let Some(floor) = retain_from {
             self.retired_frozen.retain_from(floor);
+            self.published_cuts.retain(|_, cut| cut.version >= floor);
         }
         let mut appended = Vec::new();
         for (ordinal, entry) in self.unsaved_entries() {
@@ -889,6 +901,12 @@ impl State {
             save.baseline(
                 cut_seed::CutSeed::slot(seed.first_ordinal),
                 Some(serde_json::to_string(seed.as_ref()).map_err(transient)?),
+            );
+        }
+        for (first, seed) in &self.pending_cut_seeds {
+            save.baseline(
+                format!("published-cut:{first}"),
+                Some(serde_json::to_string(seed).map_err(transient)?),
             );
         }
         for (ordinal, entry, index) in appended {
@@ -918,6 +936,7 @@ impl State {
         self.journal.truncate = None;
         self.journal.truncate_below = None;
         self.journal.cut_seed_dirty = false;
+        self.pending_cut_seeds.clear();
         self.journal.forget_tags_of.clear();
         self.frozen_edits.dirty = false;
         self.retired_frozen.dirty = false;
@@ -1435,26 +1454,30 @@ impl State {
 /// on none for a session that was never moved. Records stored before the
 /// checkpoint had its own member kept it as two top-level members; those are
 /// not part of the published answer and are dropped.
-fn with_checkpoint(
-    mut answer: Value,
-    checkpoint: Option<contract::setup::SetupCheckpoint>,
-) -> Value {
-    if let Some(answer) = answer.as_object_mut() {
-        answer.remove("tag_checkpoint");
-        answer.remove("cut");
-        match checkpoint {
-            Some(checkpoint) => {
-                answer.insert(
-                    "checkpoint".into(),
-                    serde_json::to_value(checkpoint).expect("checkpoint serializes"),
-                );
-            }
-            None => {
-                answer.remove("checkpoint");
-            }
-        }
+fn with_checkpoint(answer: Value, checkpoint: Option<contract::setup::SetupCheckpoint>) -> Value {
+    let decoded: compact::setup::SetupAnswer =
+        serde_json::from_value(answer.clone()).expect("stored Setup answer decodes");
+    let mut built = compact::setup::SetupAnswer::ready(
+        decoded.request_id(),
+        decoded.initial().expect("ready answer").clone(),
+    );
+    if let Some(ceiling) = decoded.ceiling() {
+        built = built.with_ceiling(ceiling.clone());
     }
-    answer
+    if let Some(ttl) = decoded.cache_ttl() {
+        built = built.with_cache_ttl(ttl.clone());
+    }
+    if let Some(wait) = decoded.ride_wait_ms() {
+        built = built.with_ride_wait_ms(wait);
+    }
+    if let Some(checkpoint) = checkpoint {
+        built = built.with_checkpoint(checkpoint);
+    }
+    let mut result = serde_json::to_value(built).expect("Setup answer serializes");
+    if let Some(profile) = answer.get("serializer_profile") {
+        result["serializer_profile"] = profile.clone();
+    }
+    result
 }
 
 /// Load a conversation with its held transcript, tag index and engine
@@ -1746,7 +1769,12 @@ impl McHandler {
                 self.provider_store.async_runtime.bus_link.describe()
             );
             return bytes(
-                &json!({"answer":"refuse","request_id":request.request_id,"code":"provider_busy","provider_code":"bus_not_ready","reason":reason}),
+                &compact::setup::SetupAnswer::refuse(
+                    &request.request_id,
+                    compact::errors::RefuseCode::from_code("provider_busy"),
+                    reason,
+                )
+                .with_provider_code("bus_not_ready"),
             );
         }
         // Checked before an existing record is answered: a session the standalone
@@ -1763,6 +1791,42 @@ impl McHandler {
         };
         let reference = session_ref(&key.harness, &key.project.to_string_lossy(), &key.session);
         let existing = load_head(store, &reference)?;
+        if request.descends_from.is_some() {
+            return self
+                .setup_cut_descent(binding, &request, existing, store)
+                .await;
+        }
+        if let Some(old) = existing
+            .as_ref()
+            .filter(|old| old.lineage != request.lineage_id)
+        {
+            self.authorize_async(binding, old)?;
+            let generation = old
+                .generation
+                .checked_add(old.engine.version_high_water)
+                .and_then(|v| v.checked_add(2))
+                .ok_or_else(|| transient("async generation exhausted"))?;
+            let history = store
+                .load_compartments(&old.namespace())
+                .map_err(transient)?;
+            let mut state =
+                self.new_async_record(channel, binding, &request, key, None, generation)?;
+            state.cache_policy = old.cache_policy.clone();
+            store
+                .replace_compartments(&state.namespace(), &history)
+                .map_err(transient)?;
+            self.ensure_lineage_window(&mut state, Duration::from_secs(10))
+                .await?;
+            state.journal.truncate = Some(None);
+            state.save(store, &[])?;
+            self.provider_store
+                .async_runtime
+                .resident
+                .lock()
+                .expect("async resident cache")
+                .forget(&reference);
+            return bytes(&state.initial);
+        }
         // A record the offline first pass prepared is kept only for the exact
         // Setup it was prepared under; any other Setup discards it and sets the
         // conversation up fresh in the next generation.
@@ -1990,6 +2054,9 @@ impl McHandler {
             },
             setup: request.clone(),
             initial: Value::Null,
+            cache_policy: contract_policy::CachePolicy::freeze(
+                &self.effective_config(&binding.project_root),
+            ),
             engine: engine.clone(),
             published_engine: BTreeMap::new(),
             produced_view: None,
@@ -2012,6 +2079,9 @@ impl McHandler {
             record_version: cut_seed::RECORD_VERSION,
             cut_first_ordinal: None,
             cut_seed: None,
+            lineage_first_ordinal: 0,
+            published_cuts: BTreeMap::new(),
+            pending_cut_seeds: BTreeMap::new(),
         };
         let route = state.runner()?;
         state.runner_route =
@@ -2053,7 +2123,20 @@ impl McHandler {
         state.adopt_engine(engine)?;
         // `serializer_profile` is a ck-mc extension member: the profile this
         // Setup accepted, so the runner can confirm ck-mc reads its schema.
-        state.initial = json!({"answer":"ready","request_id":request.request_id,"initial":wire, "ceiling":CeilingPolicy::new(0.95,300_000).with_on_overflow(),"serializer_profile":codec.wire_id()});
+        let mut answer = compact::setup::SetupAnswer::ready(
+            &request.request_id,
+            decode(&serde_json::to_value(wire).map_err(transient)?)?,
+        )
+        .with_ceiling(CeilingPolicy::new(0.95, 300_000).with_on_overflow())
+        .with_cache_ttl(state.cache_policy.resolve(&request.model));
+        if let Some(cap) = request.ride_wait_max_ms {
+            if cap == 0 {
+                return Err(invalid_field("ride_wait_max_ms", "must be positive"));
+            }
+            answer = answer.with_ride_wait_ms(10_000.min(cap));
+        }
+        state.initial = serde_json::to_value(answer).map_err(transient)?;
+        state.initial["serializer_profile"] = json!(codec.wire_id());
         Ok(state)
     }
 
@@ -2703,7 +2786,7 @@ fn ranges(
     let mut ranges = Vec::new();
     let mut kept = tool_arcs::KeptMessages::new();
     let mut synthetic = Vec::new();
-    let mut next = 0;
+    let mut next = state.lineage_first_ordinal;
     let history_end = history_through
         .map_or(0, |through| through.saturating_add(1))
         .max(
@@ -3332,6 +3415,42 @@ impl McHandler {
         state = self
             .checkout(store, &notice.session_ref)?
             .ok_or_else(|| transient("async session disappeared"))?;
+        if notice
+            .first_ordinal
+            .is_some_and(|first| first > state.lineage_first_ordinal)
+        {
+            let Some(descent) = &notice.descends_from else {
+                return Err(error(
+                    "unknown_cut",
+                    "a cut notice must name its published parent",
+                ));
+            };
+            let mut request = state.setup.clone();
+            request.lineage_id = Some(notice.lineage_id.clone());
+            request.descends_from = Some(compact::lineage::DescendsFrom::new(
+                &descent.lineage_id,
+                descent.through_ordinal,
+            ));
+            let binding = self.async_binding(&state);
+            self.checkin(state);
+            let answer: Value = serde_json::from_slice(
+                &self
+                    .setup_cut_descent(
+                        &binding,
+                        &request,
+                        load_head(store, &notice.session_ref)?,
+                        store,
+                    )
+                    .await?,
+            )
+            .map_err(transient)?;
+            if answer["answer"] != "ready" {
+                return Err(error("unknown_cut", "the notice names an unknown cut"));
+            }
+            state = self
+                .checkout(store, &notice.session_ref)?
+                .ok_or_else(|| transient("async session disappeared"))?;
+        }
         #[cfg(test)]
         drop(phase);
         // A record from before cut seeds existed is rebuilt, not migrated.
@@ -3616,6 +3735,8 @@ impl McHandler {
     ) -> Result<ReadProgress, HandlerOutcome> {
         let started = Instant::now();
         let deadline = started + budget;
+        self.ensure_lineage_window(state, budget).await?;
+        from = from.max(state.cut_first_ordinal.unwrap_or(0));
         // Stop before a page that the remaining budget could cut short: a page
         // call cut by its timeout is a failed read, not a resumable one.
         let mut slowest_page = Duration::ZERO;
@@ -4205,11 +4326,18 @@ impl McHandler {
         }
         // The cut covers the leading replace ranges the history head made, not
         // a removed message that may follow them.
-        let cut_through = ranges
-            .iter()
-            .take_while(|range| matches!(range, view::ViewRange::Replace { .. }))
-            .last()
-            .and_then(|range| range.to().checked_sub(1));
+        state.fold_entries(codec, None)?;
+        let cut_first = coverage
+            .and_then(|through| {
+                state
+                    .aggregates
+                    .historian_input
+                    .restart_at_or_below(through)
+            })
+            .filter(|first| *first > state.lineage_first_ordinal);
+        if let Some(first) = cut_first {
+            cut_runtime::split_head_at(&mut ranges, first);
+        }
         let shaped = emptied_messages::shape(codec, &kept, &state.frozen_edits, ranges);
         let ranges = shaped.ranges;
         let version = store
@@ -4225,9 +4353,10 @@ impl McHandler {
                 mid: last.mid.clone(),
             },
             ranges,
-        );
-        if let Some(through) = cut_through {
-            view = view.with_cut(view::ViewCut::new(format!("v{version}"), through));
+        )
+        .with_cache_ttl(state.cache_ttl());
+        if let Some(first) = cut_first {
+            view = view.with_cut(view::ViewCut::new(format!("v{version}"), first - 1));
         }
         let view = match checked_async_view(view, codec, &kept)? {
             Ok(view) => view,
@@ -4275,6 +4404,9 @@ impl McHandler {
         // The produced baseline is this published view; adopting after the
         // insert shares its serialized form instead of serializing it again.
         state.adopt_engine(engine)?;
+        if let Some(first) = cut_first {
+            state.keep_published_cut(store, codec, first, &view)?;
+        }
         Ok(Some(view))
     }
 
@@ -4338,6 +4470,13 @@ impl McHandler {
         }
         let started = Instant::now();
         let budget = Duration::from_millis(request.deadline_ms);
+        let fallback_ttl = self
+            .store
+            .get()
+            .map(|store| load_head(store, &request.session_ref))
+            .transpose()?
+            .flatten()
+            .map(|state| state.cache_ttl());
         let work = async {
             let store = self
                 .store
@@ -4354,21 +4493,30 @@ impl McHandler {
                     detail: serde_json::to_value(failure).map_err(transient)?,
                 });
             }
-            let _serial = self.provider_serial.lock_for(&state.key).await;
+            let _serial = if matches!(request.cause, ride::RideCause::Ceiling) {
+                self.provider_serial.lock_for(&state.key).await
+            } else {
+                let Ok(guard) = self.provider_serial.try_lock_for(&state.key) else {
+                    return bytes(&ride::RideAnswer::nothing().with_cache_ttl(state.cache_ttl()));
+                };
+                guard
+            };
             state = self
                 .checkout(store, &request.session_ref)?
                 .ok_or_else(|| transient("async session disappeared"))?;
             // An offline-prepared record serves nothing until a notice has
             // checked it against the runner's transcript.
             if state.resync || state.offline_first_pass.is_some() {
+                let answer = ride::RideAnswer::nothing().with_cache_ttl(state.cache_ttl());
                 self.checkin(state);
-                return bytes(&ride::RideAnswer::nothing());
+                return bytes(&answer);
             }
             let from = state.read_from();
-            if self
-                .read_async(&mut state, from, budget.saturating_sub(started.elapsed()))
-                .await
-                .is_err()
+            if matches!(request.cause, ride::RideCause::Ceiling)
+                && self
+                    .read_async(&mut state, from, budget.saturating_sub(started.elapsed()))
+                    .await
+                    .is_err()
             {
                 state.reset(store)?;
                 state.save(store, &[])?;
@@ -4384,6 +4532,7 @@ impl McHandler {
             let rows = state.unsaved_tag_rows(codec)?;
             state.save(store, &rows)?;
             let worker = self.provider_historian_worker();
+            let cache_ttl = state.cache_ttl();
             let store = Arc::clone(store);
             let reference = request.session_ref.clone();
             let view = tokio::task::spawn_blocking(move || {
@@ -4405,13 +4554,18 @@ impl McHandler {
             .map_err(transient)??;
             self.announce_async_views().await?;
             match view {
-                Some(view) => bytes(&ride::RideAnswer::view(view)),
-                None => bytes(&ride::RideAnswer::nothing()),
+                Some(view) => bytes(&ride::RideAnswer::view(view).with_cache_ttl(cache_ttl)),
+                None => bytes(&ride::RideAnswer::nothing().with_cache_ttl(cache_ttl)),
             }
         };
         tokio::time::timeout(budget, work)
             .await
-            .unwrap_or_else(|_| bytes(&ride::RideAnswer::nothing()))
+            .unwrap_or_else(|_| {
+                bytes(&match fallback_ttl {
+                    Some(ttl) => ride::RideAnswer::nothing().with_cache_ttl(ttl),
+                    None => ride::RideAnswer::nothing(),
+                })
+            })
     }
 }
 

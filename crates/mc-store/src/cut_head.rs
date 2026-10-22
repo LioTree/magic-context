@@ -58,6 +58,22 @@ impl NamespaceHead {
 }
 
 impl McStore {
+    /// A staged cut has exactly its parent's compartments. Preserve their
+    /// identity so adopting the stage does not look like a history rewrite.
+    pub fn adopt_compartment_history_identity(
+        &self,
+        source: &str,
+        target: &str,
+    ) -> Result<(), McStoreError> {
+        self.context_write(&["compartment_history_versions"], |tx| {
+            tx.execute("UPDATE compartment_history_versions SET (generation, version, rewrite_version, seeded) =
+                (SELECT generation, version, rewrite_version, seeded FROM compartment_history_versions WHERE session_id=?1)
+                WHERE session_id=?2 AND EXISTS(SELECT 1 FROM compartment_history_versions WHERE session_id=?1)", params![source,target])?;
+            Ok(())
+        })?;
+        Ok(())
+    }
+
     /// The namespace's whole state, or `None` for a namespace never written.
     pub fn load_namespace_head(
         &self,

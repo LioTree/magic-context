@@ -90,6 +90,19 @@ macro_rules! metered {
 }
 
 impl McStore {
+    /// Read one kept baseline without hydrating the session's transcript.
+    pub fn load_async_compaction_baseline(
+        &self,
+        reference: &str,
+        slot: &str,
+    ) -> Result<Option<String>, McStoreError> {
+        Ok(self.inner.with_conn(|conn| {
+            conn.query_row(
+            "SELECT view_json FROM mc_async_compaction_baselines WHERE session_ref=?1 AND slot=?2",
+            params![reference, slot], |row| row.get(0),
+        ).optional()
+        })?)
+    }
     /// Start counting this conversation's async-table writes (test builds only).
     #[cfg(feature = "test-support")]
     pub fn arm_async_write_meter(&self, session_ref: &str) {

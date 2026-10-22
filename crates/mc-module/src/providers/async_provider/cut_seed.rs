@@ -15,9 +15,9 @@
 //! example a host marker written before ck-mc served the session, found
 //! again only by the cut message's id). `CutSeed::without_rows` builds that
 //! seed; each fallback and its effect is documented on the field.
-// No production path calls capture, pruning or `begin_at_cut` yet: the
-// notice that applies a cut and the Setup of a session that already has
-// history will. Until then only tests exercise them.
+// Production captures a seed when publishing a cut and adopts it on the
+// descending Setup. The in-place pruning helper is also exercised separately
+// against full processing by the differential tests.
 #![cfg_attr(not(test), allow(dead_code))]
 use super::*;
 use std::collections::HashSet;
