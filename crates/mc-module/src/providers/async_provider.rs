@@ -2797,9 +2797,10 @@ impl McHandler {
         // runner serves now, once, before anything else: it is either adopted
         // whole or discarded for a fresh record.
         if state.offline_first_pass.is_some() {
-            state = self
-                .settle_offline_first_pass(state, store, &message.headers)
-                .await?;
+            // Boxed: this one-time check reads the whole transcript, and an
+            // inline future of that size would grow every notice's future.
+            state =
+                Box::pin(self.settle_offline_first_pass(state, store, &message.headers)).await?;
         }
         // A retry of the notice whose read the budget cut short continues that
         // read. The lineage held then was taken from the runner's own pages
