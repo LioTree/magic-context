@@ -132,7 +132,7 @@ impl McStore {
         let mut meta = head.meta.clone();
         meta.block_identity_by_mid = head.identities.clone();
         meta.served_output_fingerprint = head.served.clone();
-        self.commit_transform(
+        self.commit_transform_scoped(
             namespace,
             TransformCommit {
                 expected,
@@ -155,58 +155,117 @@ impl McStore {
                 scheduler_applied_reductions: false,
                 overlays: TransformOverlayBatch::default(),
             },
+            None,
+            false,
+            Some(head),
         )?;
-        self.inner.with_conn_fenced(|conn| {
-            for table in [
-                "mc_temporal_marks",
-                "mc_user_hints",
-                "mc_channel1_appends",
-                "mc_overlay_frontiers",
-                "pending_agent_drops",
-            ] {
-                conn.execute(&format!("DELETE FROM {table} WHERE session_id=?1"), [namespace])?;
-            }
+        Ok(())
+    }
+}
+
+impl NamespaceHead {
+    pub(crate) fn write_overlays_tx(
+        &self,
+        conn: &rusqlite::Transaction<'_>,
+        namespace: &str,
+    ) -> rusqlite::Result<()> {
+        #[cfg(test)]
+        if FAIL_ADOPTION_BEFORE_OVERLAYS.with(|flag| flag.replace(false)) {
+            return Err(rusqlite::Error::InvalidQuery);
+        }
+        for table in [
+            "mc_temporal_marks",
+            "mc_user_hints",
+            "mc_channel1_appends",
+            "mc_overlay_frontiers",
+            "pending_agent_drops",
+        ] {
             conn.execute(
-                "DELETE FROM mc_provider_consumed_tags_v1 WHERE engine_namespace=?1",
+                &format!("DELETE FROM {table} WHERE session_id=?1"),
                 [namespace],
             )?;
-            for (table, text) in [
-                ("mc_temporal_marks", "marker_text, created_at"),
-                ("mc_user_hints", "hint_text, created_at"),
-                ("mc_channel1_appends", "reminder_text, fired_at_ms"),
-            ] {
-                let rows = match table {
-                    "mc_temporal_marks" => &head.temporal_marks,
-                    "mc_user_hints" => &head.user_hints,
-                    _ => &head.channel1_appends,
-                };
-                let mut insert = conn.prepare(&format!(
-                    "INSERT INTO {table} (session_id, block_id, {text}) VALUES (?1, ?2, ?3, ?4)"
-                ))?;
-                for (block, body, at) in rows {
-                    insert.execute(params![namespace, block, body, at])?;
-                }
+        }
+        conn.execute(
+            "DELETE FROM mc_provider_consumed_tags_v1 WHERE engine_namespace=?1",
+            [namespace],
+        )?;
+        for (table, text) in [
+            ("mc_temporal_marks", "marker_text, created_at"),
+            ("mc_user_hints", "hint_text, created_at"),
+            ("mc_channel1_appends", "reminder_text, fired_at_ms"),
+        ] {
+            let rows = match table {
+                "mc_temporal_marks" => &self.temporal_marks,
+                "mc_user_hints" => &self.user_hints,
+                _ => &self.channel1_appends,
+            };
+            let mut insert = conn.prepare(&format!(
+                "INSERT INTO {table} (session_id, block_id, {text}) VALUES (?1, ?2, ?3, ?4)"
+            ))?;
+            for (block, body, at) in rows {
+                insert.execute(params![namespace, block, body, at])?;
             }
-            if let Some(frontier) = head.overlay_frontier {
-                conn.execute(
-                    "INSERT INTO mc_overlay_frontiers (session_id, max_seen_ordinal) VALUES (?1, ?2)",
-                    params![namespace, frontier],
-                )?;
-            }
-            for (target, queued) in &head.pending_drops {
-                conn.execute(
+        }
+        if let Some(frontier) = self.overlay_frontier {
+            conn.execute(
+                "INSERT INTO mc_overlay_frontiers (session_id, max_seen_ordinal) VALUES (?1, ?2)",
+                params![namespace, frontier],
+            )?;
+        }
+        for (target, queued) in &self.pending_drops {
+            conn.execute(
                     "INSERT INTO pending_agent_drops (session_id, target_id, queued_at) VALUES (?1, ?2, ?3)",
                     params![namespace, target, queued],
                 )?;
-            }
-            for (tag, session) in &head.consumed_tags {
-                conn.execute(
+        }
+        for (tag, session) in &self.consumed_tags {
+            conn.execute(
                     "INSERT OR IGNORE INTO mc_provider_consumed_tags_v1 (engine_namespace, tag_number, session) VALUES (?1, ?2, ?3)",
                     params![namespace, tag, session],
                 )?;
-            }
-            Ok(())
-        })?;
+        }
         Ok(())
+    }
+}
+
+#[cfg(test)]
+thread_local! {
+    static FAIL_ADOPTION_BEFORE_OVERLAYS: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn adoption_failure_between_cache_and_overlays_rolls_back() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = McStore::open_for_test(&cortexkit_store_types::StorageDescriptor {
+            module_id: "magic-context-test".into(),
+            storage_namespace: "mc_cache".into(),
+            isolation: cortexkit_store_types::Isolation::Module,
+            backend: cortexkit_store_types::StorageBackend::Sqlite {
+                path: dir.path().join("store.db").to_string_lossy().into(),
+            },
+        })
+        .unwrap();
+        let original = NamespaceHead::default();
+        store.adopt_namespace_head("s", &original).unwrap();
+        let before = store.load_namespace_head("s").unwrap().unwrap();
+        let version = store.load_meta("s").unwrap().row_version;
+        let mut replacement = before.clone();
+        replacement.core.boundary_id = "new-head".into();
+        replacement
+            .temporal_marks
+            .push(("m#0".into(), "new mark".into(), 1));
+        FAIL_ADOPTION_BEFORE_OVERLAYS.with(|flag| flag.set(true));
+        assert!(store.adopt_namespace_head("s", &replacement).is_err());
+        assert_eq!(store.load_namespace_head("s").unwrap().unwrap(), before);
+        assert_eq!(store.load_meta("s").unwrap().row_version, version);
+        store.adopt_namespace_head("s", &replacement).unwrap();
+        assert_eq!(
+            store.load_namespace_head("s").unwrap().unwrap(),
+            replacement
+        );
     }
 }

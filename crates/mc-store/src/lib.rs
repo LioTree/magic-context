@@ -11723,7 +11723,7 @@ impl McStore {
         request: TransformCommit<'_>,
         provider_policy: Option<&provider_records::ProviderEnginePolicy>,
     ) -> Result<u64, McStoreError> {
-        self.commit_transform_scoped(session_id, request, provider_policy, false)
+        self.commit_transform_scoped(session_id, request, provider_policy, false, None)
     }
 
     /// A certified logical-prefix pass read only its live identities. Preserve
@@ -11734,7 +11734,7 @@ impl McStore {
         request: TransformCommit<'_>,
         provider_policy: Option<&provider_records::ProviderEnginePolicy>,
     ) -> Result<u64, McStoreError> {
-        self.commit_transform_scoped(session_id, request, provider_policy, true)
+        self.commit_transform_scoped(session_id, request, provider_policy, true, None)
     }
 
     fn commit_transform_scoped(
@@ -11743,6 +11743,7 @@ impl McStore {
         request: TransformCommit<'_>,
         provider_policy: Option<&provider_records::ProviderEnginePolicy>,
         partial_identities: bool,
+        adopted_head: Option<&cut_head::NamespaceHead>,
     ) -> Result<u64, McStoreError> {
         let TransformCommit {
             expected,
@@ -12033,6 +12034,9 @@ impl McStore {
                 }
                 current.max(0) as u64
             };
+            if let Some(head) = adopted_head {
+                head.write_overlays_tx(tx, session_id)?;
+            }
             // Every accepted transform owns the current-pass value: stable passes write NULL
             // rather than leaving an older divergence looking like a present observation.
             tx.execute(
