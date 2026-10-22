@@ -19,6 +19,9 @@ mod stack26_cache_review;
 #[path = "card_cache_review.rs"]
 mod card_cache_review;
 
+#[path = "cut_lineage_tests.rs"]
+mod cut_lineage_tests;
+
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum Profile {
     Broca,
@@ -288,6 +291,28 @@ fn orphan(profile: Profile, n: u64) -> Option<ReadMessage> {
     )
 }
 
+/// `answer` without its view version members: in cut mode each side numbers
+/// its own views, so the answers are compared without them.
+fn versionless(answer: &str) -> String {
+    fn strip(value: &mut Value) {
+        match value {
+            Value::Object(map) => {
+                map.remove("view_version");
+                map.values_mut().for_each(strip);
+            }
+            Value::Array(items) => items.iter_mut().for_each(strip),
+            _ => {}
+        }
+    }
+    match serde_json::from_str::<Value>(answer) {
+        Ok(mut value) => {
+            strip(&mut value);
+            value.to_string()
+        }
+        Err(_) => answer.to_owned(),
+    }
+}
+
 /// The runner both providers read: one shared transcript and lineage.
 #[derive(Default)]
 struct Transcript {
@@ -321,6 +346,10 @@ struct Runner {
     /// The same sends with their clock-dependent members, for rendering the
     /// reminder text a runner would deliver.
     raw_sends: Mutex<Vec<Value>>,
+    /// The first ordinal of a lineage that begins at a cut: a read from
+    /// below it is refused (`before_lineage_start`) and recorded.
+    floor: Mutex<Option<u64>>,
+    reads_below_floor: Mutex<Vec<u64>>,
 }
 
 #[async_trait]
@@ -374,6 +403,12 @@ impl session_resolver::ProviderRunner for Runner {
             ));
         }
         let from = params["from_ordinal"].as_u64().unwrap();
+        if self.floor.lock().unwrap().is_some_and(|floor| from < floor) {
+            self.reads_below_floor.lock().unwrap().push(from);
+            return Err(SessionResolveError::InvalidResponse(
+                "before_lineage_start".into(),
+            ));
+        }
         let mut entries = self.transcript.entries.lock().unwrap();
         renumber(&mut entries);
         let messages = entries
@@ -430,6 +465,8 @@ impl Side {
             transcript: Arc::clone(transcript),
             sends: Mutex::new(Vec::new()),
             raw_sends: Mutex::new(Vec::new()),
+            floor: Mutex::new(None),
+            reads_below_floor: Mutex::new(Vec::new()),
         });
         let mut h = McHandler::new();
         h.store.set(store).ok().unwrap();
@@ -572,6 +609,17 @@ struct Pair {
     /// Independent served-edit and reminder-echo observations; see
     /// `stack24_cache_review::Review`.
     review: std::cell::RefCell<stack24_cache_review::Review>,
+    /// Engine state fields that differed between the two sides, by field,
+    /// with the first difference; see `cut_lineage_tests`.
+    engine_mismatches: std::cell::RefCell<BTreeMap<String, String>>,
+    /// Compare only views above this version: a conversation that began at
+    /// a cut has none of the full side's earlier views.
+    compare_from_version: u64,
+    /// The resident side is a conversation that began at a cut while the
+    /// other side kept its whole lineage: each side's runner acknowledges
+    /// that side's own newest view, and the views compared are the newest
+    /// each would serve (see `cut_lineage_tests`).
+    cut_mode: bool,
     _project: tempfile::TempDir,
 }
 
@@ -588,6 +636,18 @@ impl Pair {
         setup_lineage: Option<&str>,
         inject_docs: bool,
     ) -> Self {
+        Self::open_with(profile, tiny_budget, setup_lineage, inject_docs, true).await
+    }
+
+    /// `open`, with the second side the full-recompute oracle or, when
+    /// `oracle` is false, a second resident provider.
+    async fn open_with(
+        profile: Profile,
+        tiny_budget: bool,
+        setup_lineage: Option<&str>,
+        inject_docs: bool,
+        oracle: bool,
+    ) -> Self {
         let project = tempfile::tempdir().unwrap();
         let transcript = Arc::new(Transcript {
             lineage: Mutex::new("L".into()),
@@ -601,7 +661,7 @@ impl Pair {
             .unwrap();
         }
         let resident = Side::new(project.path(), &transcript, false, inject_docs).await;
-        let oracle = Side::new(project.path(), &transcript, true, inject_docs).await;
+        let oracle = Side::new(project.path(), &transcript, oracle, inject_docs).await;
         if tiny_budget {
             resident
                 .h
@@ -627,6 +687,9 @@ impl Pair {
             mismatches: Vec::new(),
             immutable_views: Default::default(),
             review: Default::default(),
+            engine_mismatches: Default::default(),
+            compare_from_version: 0,
+            cut_mode: false,
             _project: project,
         };
         let mut setup = json!({"method":"compaction.setup","params":{"session":"s","harness":profile.harness(),"request_id":"setup","model":"fixture","context_window":100_000,"composition":{"render_tags":true},"params":{"serializer_profile":profile.wire()},"now":1}});
@@ -693,6 +756,12 @@ impl Pair {
             ));
             return resident;
         }
+        // Each side numbers its own views in cut mode.
+        let (resident, oracle) = if self.cut_mode {
+            (versionless(&resident), versionless(&oracle))
+        } else {
+            (resident, oracle)
+        };
         assert_eq!(
             resident,
             oracle,
@@ -757,8 +826,13 @@ impl Pair {
     }
 
     fn compare(&self, label: &str) {
-        let (resident, resident_high) = self.resident.views(&self.reference);
-        let (oracle, oracle_high) = self.oracle.views(&self.reference);
+        if self.cut_mode {
+            return self.compare_newest(label);
+        }
+        let (mut resident, resident_high) = self.resident.views(&self.reference);
+        let (mut oracle, oracle_high) = self.oracle.views(&self.reference);
+        resident.retain(|(version, _)| *version > self.compare_from_version);
+        oracle.retain(|(version, _)| *version > self.compare_from_version);
         assert_eq!(
             resident.iter().map(|(v, _)| *v).collect::<Vec<_>>(),
             oracle.iter().map(|(v, _)| *v).collect::<Vec<_>>(),
@@ -952,12 +1026,42 @@ impl Pair {
     }
 
     fn newest_versions(&self) -> Vec<u64> {
-        self.oracle
+        let mut versions = self
+            .oracle
             .views(&self.reference)
             .0
             .into_iter()
             .map(|(version, _)| version)
-            .collect()
+            .collect::<Vec<_>>();
+        if self.cut_mode {
+            versions.drain(..versions.len().saturating_sub(1));
+        }
+        versions
+    }
+
+    /// `message` for the resident side in cut mode: acknowledging the
+    /// resident's own newest view instead of the other side's.
+    fn resident_message(
+        &self,
+        message: &cortexkit_bus_trait::Message,
+    ) -> cortexkit_bus_trait::Message {
+        let mut message = message.clone();
+        if !self.cut_mode || !message.headers.contains_key("applied_view_version") {
+            return message;
+        }
+        match self.resident.views(&self.reference).0.last() {
+            Some((version, _)) => {
+                message
+                    .headers
+                    .insert("applied_view_version".into(), version.to_string());
+            }
+            None => {
+                message.headers.remove("applied_view_version");
+            }
+        }
+        let notice = notice::AdvanceNotice::from_headers(&message.headers).unwrap();
+        message.digest = notice.digest().parse().unwrap();
+        message
     }
 
     async fn notice(&mut self, rng: &mut Rng, descent: Option<String>) -> String {
@@ -974,8 +1078,14 @@ impl Pair {
             message.headers.get("est_tokens").map_or("", String::as_str),
             self.model
         );
+        let resident = self.resident_message(&message);
+        let resident_h = Arc::clone(&self.resident.h);
         self.both(&label, |side| {
-            let message = message.clone();
+            let message = if Arc::ptr_eq(&side.h, &resident_h) {
+                resident.clone()
+            } else {
+                message.clone()
+            };
             Box::pin(async move {
                 match side.h.advance_compaction("fixture", &message).await {
                     Ok(()) => "ok".to_owned(),
@@ -1069,6 +1179,10 @@ impl Pair {
                 .borrow_mut()
                 .acknowledge(self.log.len(), version);
         }
+        if self.cut_mode {
+            // Event versions name one side's views only.
+            events.clear();
+        }
         if !events.is_empty() {
             notice = notice.with_events(events);
         }
@@ -1096,7 +1210,13 @@ impl Pair {
     }
 
     async fn step(&mut self, rng: &mut Rng) {
-        match rng.below(100) {
+        let roll = rng.below(100);
+        self.step_roll(rng, roll).await;
+    }
+
+    /// One randomized step of kind `roll` (0 to 99).
+    async fn step_roll(&mut self, rng: &mut Rng, roll: u64) {
+        match roll {
             0..=44 => {
                 let count = 1 + rng.below(5);
                 self.append(count);
@@ -1257,13 +1377,21 @@ impl Pair {
             }
             _ => {
                 let versions = self.newest_versions();
-                let version = versions
-                    .get(rng.below(versions.len() as u64 + 1) as usize)
-                    .copied()
-                    .unwrap_or(9_999);
+                let pick = rng.below(versions.len() as u64 + 1) as usize;
+                let version = versions.get(pick).copied().unwrap_or(9_999);
                 let request = json!({"method":"view.get","params":{"session_ref":self.reference,"view_version":version}});
-                self.both("view.get", |side| Box::pin(side.dispatch(request.clone())))
-                    .await;
+                let reference = self.reference.clone();
+                let cut_mode = self.cut_mode;
+                self.both("view.get", |side| {
+                    let mut request = request.clone();
+                    if cut_mode && pick < versions.len() {
+                        // Each side's own newest view.
+                        let newest = side.views(&reference).0.last().map_or(9_999, |(v, _)| *v);
+                        request["params"]["view_version"] = json!(newest);
+                    }
+                    Box::pin(async move { side.dispatch(request).await })
+                })
+                .await;
             }
         }
     }

@@ -5,6 +5,7 @@ use compact::{self as contract, ceiling::CeilingPolicy, notice, ride, view};
 use cortexkit_bus_trait::{ContentDigest, DurableOwner, Stream, StreamCursor};
 use cortexkit_role_llm_runner::{read::ReadMessage, session_ref, tags};
 use serde::Deserialize;
+mod cut_seed;
 #[cfg(test)]
 mod differential_tests;
 mod emptied_messages;
@@ -324,6 +325,18 @@ pub(crate) struct AsyncRecord {
     /// live notice adopts or discards it; see `offline_first_pass`.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     offline_first_pass: Option<offline_first_pass::OfflineFirstPass>,
+    /// The record format; see `cut_seed::RECORD_VERSION`. Absent on records
+    /// written before cut seeds existed.
+    #[serde(default)]
+    record_version: u32,
+    /// The first ordinal of a lineage that begins at a cut: the slot
+    /// (`cut:<F>`) its seed is stored in. The seed itself is a baseline row,
+    /// so quiet notices never rewrite it.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    cut_first_ordinal: Option<u64>,
+    /// What the conversation keeps of the transcript below its cut.
+    #[serde(skip)]
+    cut_seed: Option<Arc<cut_seed::CutSeed>>,
 }
 
 fn deserialize_logical_prefix<'de, D: serde::Deserializer<'de>>(
@@ -441,6 +454,10 @@ struct Journal {
     /// on the next save, because the next lineage may show their numbers on
     /// other parts.
     forget_tags_of: Vec<String>,
+    /// Stored entries below this ordinal go on the next save (a cut).
+    truncate_below: Option<u64>,
+    /// The cut seed changed and is written on the next save.
+    cut_seed_dirty: bool,
     /// Identities of the baselines as last stored.
     produced: Option<ViewIdentity>,
     applied: Option<ViewIdentity>,
@@ -865,6 +882,15 @@ impl State {
         if let Some(through) = self.journal.truncate {
             save.truncate_entries(through);
         }
+        if let Some(first) = self.journal.truncate_below {
+            save.truncate_below(first);
+        }
+        if let (true, Some(seed)) = (self.journal.cut_seed_dirty, &self.cut_seed) {
+            save.baseline(
+                cut_seed::CutSeed::slot(seed.first_ordinal),
+                Some(serde_json::to_string(seed.as_ref()).map_err(transient)?),
+            );
+        }
         for (ordinal, entry, index) in appended {
             save.append_entry(ordinal, entry, index);
         }
@@ -890,6 +916,8 @@ impl State {
             return Err(transient(error));
         }
         self.journal.truncate = None;
+        self.journal.truncate_below = None;
+        self.journal.cut_seed_dirty = false;
         self.journal.forget_tags_of.clear();
         self.frozen_edits.dirty = false;
         self.retired_frozen.dirty = false;
@@ -1104,8 +1132,9 @@ impl State {
             }
         }
         // A cut is rare (a fork descent or a resync): the next notice folds
-        // the remaining entries again from the first.
-        self.aggregates = resident::Aggregates::default();
+        // the remaining entries again from the first, on top of what a cut
+        // seed stands for.
+        self.aggregates = self.base_aggregates();
         self.entry_bytes = (None, 0);
         let journal = &mut self.journal;
         journal.truncate = Some(match (journal.truncate, through) {
@@ -1227,6 +1256,10 @@ impl State {
                 .as_ref()
                 .map_or(0, |json| json.len())
             + self.aggregates.historian_input.retained_bytes()
+            + self
+                .cut_seed
+                .as_ref()
+                .map_or(0, |seed| seed.retained_bytes())
             + self
                 .reminder_hint_state
                 .as_ref()
@@ -1487,6 +1520,13 @@ fn load(store: &McStore, reference: &str) -> Result<Option<State>, HandlerOutcom
     if let Some(json) = stored.remove("retired_native_edits") {
         state.retired_frozen = frozen_edits::RetiredViews::from_json(&json)?;
     }
+    if let Some(first) = state.cut_first_ordinal {
+        let json = stored
+            .remove(&cut_seed::CutSeed::slot(first))
+            .ok_or_else(|| transient("async cut seed row missing"))?;
+        state.cut_seed = Some(Arc::new(serde_json::from_str(&json).map_err(transient)?));
+        state.aggregates = state.base_aggregates();
+    }
     state.produced_view = produced;
     state.applied_view = applied;
     if let Some(prefix) = &state.logical_prefix {
@@ -1498,6 +1538,8 @@ fn load(store: &McStore, reference: &str) -> Result<Option<State>, HandlerOutcom
         persisted_through: through,
         indexed_through: through,
         truncate: None,
+        truncate_below: None,
+        cut_seed_dirty: false,
         clear_published: false,
         forget_tags_of: Vec::new(),
         produced: state
@@ -1967,6 +2009,9 @@ impl McHandler {
             resync: false,
             generation,
             offline_first_pass: None,
+            record_version: cut_seed::RECORD_VERSION,
+            cut_first_ordinal: None,
+            cut_seed: None,
         };
         let route = state.runner()?;
         state.runner_route =
@@ -2103,21 +2148,49 @@ impl McHandler {
                         .entries
                         .matches(state.prefix_input_proof.as_ref(), prefix.tail_from)
                 })
-                .filter(|_| {
-                    state.entries.first_key_value().map(|(ordinal, _)| *ordinal)
-                        == Some(prefix.from)
-                })
+                .filter(|_| state.lineage_from() == prefix.from)
                 .filter(|_| {
                     prefix.context_sources.iter().all(|(ordinal, source)| {
-                        state.entries.get(ordinal).is_some_and(|entry| {
-                            entry.mid == source.mid && source.ordinal == *ordinal
-                        })
+                        source.ordinal == *ordinal
+                            && (state
+                                .entries
+                                .get(ordinal)
+                                .is_some_and(|entry| entry.mid == source.mid)
+                                || state.cut_seed.as_ref().is_some_and(|seed| {
+                                    seed.context_sources
+                                        .get(ordinal)
+                                        .is_some_and(|held| held.mid == source.mid)
+                                }))
                     })
                 })
                 .map(|_| prefix.clone())
         } else {
             None
         };
+        // A conversation that begins at a cut has no rows below it to fall
+        // back on: without a matching certificate, its cut seed stands for
+        // them.
+        let seeded_prefix = |state: &State| -> Result<_, HandlerOutcome> {
+            state
+                .cut_seed
+                .as_ref()
+                .map(|seed| {
+                    let epoch = store
+                        .load_meta(&state.namespace())
+                        .map_err(transient)?
+                        .meta
+                        .revert_epoch;
+                    Ok(Arc::new(seed.prefix(
+                        &status.lineage_id,
+                        state.generation,
+                        epoch,
+                    )))
+                })
+                .transpose()
+        };
+        if prefix.is_none() {
+            prefix = seeded_prefix(state)?;
+        }
         let mut membership_unavailable = false;
         if let Some(prefix) = &mut prefix {
             let prefix = Arc::make_mut(prefix);
@@ -2140,7 +2213,7 @@ impl McHandler {
             }
         }
         if membership_unavailable {
-            prefix = None;
+            prefix = seeded_prefix(state)?;
         }
         let messages = if let Some(prefix) = &prefix {
             let mut messages = prefix.context_sources.values().cloned().collect::<Vec<_>>();
@@ -2156,10 +2229,9 @@ impl McHandler {
         };
         #[cfg(test)]
         scaling_tests::view_work::engine(&state.reference(), messages.len());
-        let source_from = state
-            .entries
-            .first_key_value()
-            .map_or(0, |(ordinal, _)| *ordinal);
+        // Positions count from the lineage's first ordinal, also in a
+        // lineage that begins at a cut (Pi derives fallback tool ids from them).
+        let source_from = state.lineage_from();
         state.reminder_echoes.prepare_with(
             codec,
             &mut template,
@@ -2202,11 +2274,22 @@ impl McHandler {
         };
         let output = match output {
             Ok(output) => output,
-            Err(_) if template.logical_prefix.is_some() => {
+            Err(_)
+                if template
+                    .logical_prefix
+                    .as_ref()
+                    .is_some_and(|prefix| !prefix.is_cut()) =>
+            {
                 // If a prefix-based pass fails, retry with every held inbound
-                // message; do not guess at the omitted source bytes.
+                // message (behind the cut seed, for a conversation that
+                // begins at a cut); do not guess at the omitted source bytes.
                 *engine = previous_engine;
-                let messages = inbound_messages(state.entries.values())?;
+                let fallback = seeded_prefix(state)?;
+                let mut messages = fallback
+                    .as_ref()
+                    .map(|prefix| prefix.context_sources.values().cloned().collect::<Vec<_>>())
+                    .unwrap_or_default();
+                messages.extend(inbound_messages(state.entries.values())?);
                 #[cfg(test)]
                 scaling_tests::view_work::engine(&state.reference(), messages.len());
                 state.reminder_echoes.prepare_with(
@@ -2216,7 +2299,7 @@ impl McHandler {
                     false,
                     |request, entries| codec.prepare_request_from(request, entries, source_from),
                 )?;
-                template.logical_prefix = None;
+                template.logical_prefix = fallback;
                 if engine.last_applied.is_none() {
                     transform::compaction::setup_with(
                         store, &template, &context, status, engine, signed,
@@ -2421,6 +2504,17 @@ fn compact_prefix_hygiene_once(
         None,
     )?;
     Ok(())
+}
+
+/// The `ctx_reduce` detail for tags from below the conversation's cut.
+fn ctx_reduce_summarized_details(summarized: &[u64]) -> String {
+    if summarized.is_empty() {
+        return String::new();
+    }
+    format!(
+        "tags {} already in the history summary, nothing to drop",
+        format_plain_tag_numbers(summarized)
+    )
 }
 
 /// The part as the runner renders it to the model under `render_tags`: a
@@ -3219,6 +3313,8 @@ impl McHandler {
             .ok_or_else(|| transient("async session disappeared"))?;
         #[cfg(test)]
         drop(phase);
+        // A record from before cut seeds existed is rebuilt, not migrated.
+        cut_seed::discard_older_record(&mut state, store)?;
         // A record the offline first pass prepared is checked against what the
         // runner serves now, once, before anything else: it is either adopted
         // whole or discarded for a fresh record.
@@ -3332,7 +3428,7 @@ impl McHandler {
         #[cfg(test)]
         let phase = scaling_tests::save_meter::start_kind(&notice.session_ref, "phase:read");
         for attempt in 0..2 {
-            let from = state.entries.last_key_value().map_or(0, |(n, _)| *n);
+            let from = state.read_from();
             let read = self
                 .read_async_resumable(&mut state, from, self.notice_read_budget())
                 .await;
@@ -3908,6 +4004,24 @@ impl McHandler {
         let (template, output) =
             self.async_engine(channel, &binding, state, codec, &status, &mut engine)?;
         #[cfg(test)]
+        cut_seed::pass_trace::record(
+            self as *const Self as usize,
+            format!(
+                "action={} prefix={:?} cut_prefix={} messages={} first={:?}",
+                output.engine.response.action,
+                template
+                    .logical_prefix
+                    .as_ref()
+                    .map(|prefix| prefix.tail_from),
+                template
+                    .logical_prefix
+                    .as_ref()
+                    .is_some_and(|prefix| prefix.is_cut()),
+                template.messages.len(),
+                template.messages.first().map(|message| message.ordinal)
+            ),
+        );
+        #[cfg(test)]
         drop(meter);
         #[cfg(test)]
         let meter = scaling_tests::save_meter::start_kind(&state.reference(), "pub:certify");
@@ -3931,7 +4045,7 @@ impl McHandler {
                 state.generation,
             );
             if let Some(prefix) = &mut prefix {
-                prefix.context_sources = inbound_messages(
+                let mut sources: BTreeMap<u64, InboundMessage> = inbound_messages(
                     prefix
                         .context_ordinals
                         .iter()
@@ -3940,6 +4054,15 @@ impl McHandler {
                 .into_iter()
                 .map(|source| (source.ordinal, source))
                 .collect();
+                // Context sources below a cut are kept by its seed.
+                if let Some(seed) = &state.cut_seed {
+                    for ordinal in &prefix.context_ordinals {
+                        if let Some(source) = seed.context_sources.get(ordinal) {
+                            sources.entry(*ordinal).or_insert_with(|| source.clone());
+                        }
+                    }
+                }
+                prefix.context_sources = sources;
             }
             if let Some(candidate) = &prefix {
                 if let Err(error) =
@@ -4220,7 +4343,7 @@ impl McHandler {
                 self.checkin(state);
                 return bytes(&ride::RideAnswer::nothing());
             }
-            let from = state.entries.last_key_value().map_or(0, |(n, _)| *n);
+            let from = state.read_from();
             if self
                 .read_async(&mut state, from, budget.saturating_sub(started.elapsed()))
                 .await
@@ -4315,12 +4438,23 @@ impl McHandler {
             Ok((targets, unknown))
         };
         let (mut targets, mut unknown) = resolve(&state)?;
+        // A tag from below the conversation's cut is already in the history
+        // summary: its content is out of the model's context, so there is
+        // nothing to drop and nothing is queued.
+        let summarized = state.cut_seed.as_ref().map_or_else(Vec::new, |seed| {
+            unknown
+                .iter()
+                .copied()
+                .filter(|number| seed.tagged_below(*number))
+                .collect::<Vec<_>>()
+        });
+        unknown.retain(|number| !summarized.contains(number));
         let mut catch_up_failed = false;
         if !unknown.is_empty() {
             // A tag can reach the model before its change notice reaches us.
             // Re-read the inclusive tail under the same serial as notices so
             // the cursor, lineage checks and persisted indexes move together.
-            let from = state.entries.last_key_value().map_or(0, |(n, _)| *n);
+            let from = state.read_from();
             let budget = Duration::from_secs(2);
             catch_up_failed = state.resync
                 || !matches!(
@@ -4330,6 +4464,7 @@ impl McHandler {
                 || state.ingest_read(store, codec).is_err();
             if !catch_up_failed {
                 (targets, unknown) = resolve(&state)?;
+                unknown.retain(|number| !summarized.contains(number));
             }
         }
         let namespace = state.namespace();
@@ -4344,8 +4479,24 @@ impl McHandler {
                 format_plain_tag_numbers(&unknown)
             )
         } else {
-            ctx_reduce_ack_details(&unknown)
+            [
+                ctx_reduce_ack_details(&unknown),
+                ctx_reduce_summarized_details(&summarized),
+            ]
+            .into_iter()
+            .filter(|detail| !detail.is_empty())
+            .collect::<Vec<_>>()
+            .join("; ")
         };
+        if targets.is_empty() && unknown.is_empty() && !summarized.is_empty() && !catch_up_failed {
+            return Ok(mcp_text_result(
+                format!(
+                    "Nothing to drop: tags {} are already in the history summary.",
+                    format_plain_tag_numbers(&summarized)
+                ),
+                false,
+            ));
+        }
         if targets.is_empty() {
             return Ok(tool_error_result(if catch_up_failed {
                 details

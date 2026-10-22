@@ -18,7 +18,7 @@ impl FrozenPart {
     }
 }
 
-#[derive(Default)]
+#[derive(Default, Clone)]
 pub(super) struct FrozenEdits {
     parts: BTreeMap<(String, String, String), FrozenPart>,
     pub(super) retained_bytes: usize,
@@ -78,6 +78,23 @@ impl FrozenEdits {
     pub(super) fn merge(&mut self, acknowledged: &Self) {
         for part in acknowledged.parts.values() {
             self.insert(part.clone());
+        }
+    }
+
+    /// Forget the edits of the messages `mids`: rows below a cut, which no
+    /// view renders again.
+    // Only cut capture and pruning (`cut_seed`) call this; only tests drive them so far.
+    #[cfg_attr(not(test), allow(dead_code))]
+    pub(super) fn forget_mids(&mut self, mids: &std::collections::HashSet<String>) {
+        let before = self.parts.len();
+        self.parts.retain(|(mid, _, _), _| !mids.contains(mid));
+        if self.parts.len() != before {
+            self.retained_bytes = self
+                .parts
+                .values()
+                .map(|part| part.retained_bytes() + part.digest.len())
+                .sum();
+            self.dirty = true;
         }
     }
 
@@ -241,6 +258,18 @@ impl RetiredViews {
         let before = self.views.len();
         self.views.retain(|version, _| *version >= floor);
         self.dirty |= self.views.len() != before;
+    }
+
+    /// Forget edits of the messages `mids` in every retired view.
+    // Only cut capture and pruning (`cut_seed`) call this; only tests drive them so far.
+    #[cfg_attr(not(test), allow(dead_code))]
+    pub(super) fn forget_mids(&mut self, mids: &std::collections::HashSet<String>) {
+        for edits in self.views.values_mut() {
+            if edits.parts.keys().any(|(mid, _, _)| mids.contains(mid)) {
+                Arc::make_mut(edits).forget_mids(mids);
+                self.dirty = true;
+            }
+        }
     }
 }
 

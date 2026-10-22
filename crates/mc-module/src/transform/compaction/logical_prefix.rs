@@ -36,6 +36,9 @@ fn coverage_preserved(old: &[Coverage], current: &[StoredCompartment]) -> bool {
     })
 }
 
+/// A persisted protected tag row: number, block id, kind, tokens, created at.
+pub(crate) type ProtectionTag = (i64, String, String, i64, i64);
+
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub(crate) struct LogicalPrefix {
     pub(crate) lineage: String,
@@ -70,6 +73,53 @@ pub(crate) struct LogicalPrefix {
     /// Global newest tool-tag suffix, including protected tags whose sources
     /// are no longer live. Protection is based on persisted tags, not messages.
     protection_tags: Vec<(i64, String, String, i64, i64)>,
+    /// Set on a prefix built from a cut seed (`for_cut`): the rows below
+    /// `tail_from` are gone from the transcript for good, not merely omitted,
+    /// and this is the highest tag number any of them carried. See `for_cut`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    cut_max_tag: Option<i64>,
+    /// For a cut prefix, the creation and completion times of the message
+    /// just below `tail_from`, which the temporal walk compares the first
+    /// window message against.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub(crate) cut_time_basis: Option<(Option<i64>, Option<i64>)>,
+}
+
+/// What a lineage that begins at a cut keeps of the rows below its first
+/// ordinal, in the form the engine reads through a logical prefix. The
+/// provider builds it from its cut seed; see `LogicalPrefix::for_cut`.
+#[derive(Clone, Debug)]
+pub(crate) struct CutPrefixFacts {
+    /// The ordinal the engine's ranges start at: the first ordinal of the
+    /// lineage the cut was taken from, so the engine's view of the
+    /// conversation is the one full processing would hold.
+    pub lineage_from: u64,
+    /// The first ordinal the transcript still has (one past the cut).
+    pub first_ordinal: u64,
+    pub covered_user_turns: u64,
+    pub context_sources: BTreeMap<u64, crate::providers::codec::InboundMessage>,
+    pub compartment_seq: i64,
+    pub boundary: String,
+    /// The revert epoch of the namespace the prefix is used with.
+    pub revert_epoch: u64,
+    pub protection_floor: u64,
+    pub protection_ratio: f64,
+    pub protection_tags: Vec<(i64, String, String, i64, i64)>,
+    pub max_tag: i64,
+    pub time_basis: Option<(Option<i64>, Option<i64>)>,
+}
+
+/// Distinct authored user messages among `blocks` below `before`, outside
+/// `context`: the count a logical prefix carries as `covered_user_turns`.
+pub(crate) fn user_turns_below(blocks: &[FlatBlock], before: u64, context: &BTreeSet<u64>) -> u64 {
+    blocks
+        .iter()
+        .filter(|b| {
+            b.ordinal < before && !context.contains(&b.ordinal) && b.role == "user" && !b.synthetic
+        })
+        .map(|b| b.mid.as_str())
+        .collect::<HashSet<_>>()
+        .len() as u64
 }
 
 impl LogicalPrefix {
@@ -80,6 +130,23 @@ impl LogicalPrefix {
         loaded: &mc_store::LoadedState,
         compartments: &[StoredCompartment],
     ) -> bool {
+        if self.cut_max_tag.is_some() {
+            // The rows below the cut no longer exist, so there is no certified
+            // tail to protect: the prefix holds while the compartments still
+            // cover everything below the cut and no revert happened since.
+            // The namespace may not be folded yet (a lineage that begins at
+            // the cut), or folded past the cut.
+            return self.lineage == lineage
+                && self.generation == generation
+                && loaded.meta.revert_epoch == self.revert_epoch
+                && self.from < self.tail_from
+                && self.context_sources.keys().eq(self.context_ordinals.iter())
+                && loaded
+                    .meta
+                    .coverage_ordinal
+                    .is_none_or(|coverage| coverage.saturating_add(1) >= self.tail_from)
+                && coverage_preserved(&self.compartments, compartments);
+        }
         self.lineage == lineage
             && self.generation == generation
             && loaded.core.boundary_id == self.boundary
@@ -196,20 +263,11 @@ impl LogicalPrefix {
             .logical_prefix
             .as_ref()
             .map_or(0, |p| p.covered_user_turns)
-            .saturating_add(
-                projection
-                    .blocks
-                    .iter()
-                    .filter(|b| {
-                        b.ordinal < tail_from
-                            && !context_ordinals.contains(&b.ordinal)
-                            && b.role == "user"
-                            && !b.synthetic
-                    })
-                    .map(|b| b.mid.as_str())
-                    .collect::<HashSet<_>>()
-                    .len() as u64,
-            );
+            .saturating_add(user_turns_below(
+                &projection.blocks,
+                tail_from,
+                &context_ordinals,
+            ));
         let required_targets = loaded
             .core
             .frozen_units
@@ -278,7 +336,66 @@ impl LogicalPrefix {
                     )
                 })
                 .collect(),
+            cut_max_tag: None,
+            cut_time_basis: None,
         })
+    }
+
+    /// A prefix standing for the rows below a cut, which the transcript no
+    /// longer has. The engine reads it like a certificate: the context sources
+    /// render as before, `covered_user_turns` carries the Channel-1 count and
+    /// the protection rows carry the protected tags below the cut. A pass
+    /// over the window with it certifies an ordinary prefix in turn (`certify`
+    /// accumulates from it), so the cut prefix is needed again only when that
+    /// certificate goes stale.
+    pub(crate) fn for_cut(facts: CutPrefixFacts, lineage: &str, generation: u64) -> Self {
+        let first = facts.first_ordinal;
+        let coverage = first.saturating_sub(1);
+        Self {
+            lineage: lineage.into(),
+            generation,
+            from: facts.lineage_from,
+            tail_from: first,
+            covered_user_turns: facts.covered_user_turns,
+            certified_through: first,
+            coverage,
+            boundary: facts.boundary.clone(),
+            sequence: facts.compartment_seq,
+            revert_epoch: facts.revert_epoch,
+            compartments: vec![Coverage {
+                sequence: facts.compartment_seq,
+                from: facts.lineage_from as i64,
+                to: coverage as i64,
+                boundary: facts.boundary,
+            }],
+            context_ordinals: facts.context_sources.keys().copied().collect(),
+            context_sources: facts.context_sources,
+            covered_targets: BTreeSet::new(),
+            crossing_arcs: Vec::new(),
+            tag_summary: (0, 0, facts.max_tag),
+            protection_floor: facts.protection_floor,
+            protection_ratio: facts.protection_ratio,
+            protection_tags: facts.protection_tags,
+            cut_max_tag: Some(facts.max_tag),
+            cut_time_basis: facts.time_basis,
+        }
+    }
+
+    /// True for a prefix built by `for_cut`.
+    pub(crate) fn is_cut(&self) -> bool {
+        self.cut_max_tag.is_some()
+    }
+
+    /// The protected tool-tag rows this certificate recorded, with the floor
+    /// and calibration ratio they were computed at.
+    // Only cut capture and pruning (`cut_seed`) call this; only tests drive them so far.
+    #[cfg_attr(not(test), allow(dead_code))]
+    pub(crate) fn protection(&self) -> (u64, f64, &[ProtectionTag]) {
+        (
+            self.protection_floor,
+            self.protection_ratio,
+            &self.protection_tags,
+        )
     }
 
     pub(crate) fn protection_rows(
@@ -288,6 +405,17 @@ impl LogicalPrefix {
         floor: u64,
         ratio: f64,
     ) -> Result<Option<Vec<mc_store::McTagRow>>, TransformError> {
+        if let Some(max) = self.cut_max_tag {
+            // Every tag row the namespace holds was numbered after the cut, so
+            // the protected rows below it plus the rows after them are the
+            // whole persisted set full processing would read.
+            if floor > self.protection_floor || ratio < self.protection_ratio {
+                return Ok(None);
+            }
+            let mut rows = self.persisted_protection_rows();
+            rows.extend(store.load_tags_after(session, max)?);
+            return Ok(Some(rows));
+        }
         let summary = store.tag_cache_summary(session)?;
         let (generation, count, max) = self.tag_summary;
         if floor > self.protection_floor
@@ -300,8 +428,15 @@ impl LogicalPrefix {
         {
             return Ok(None);
         }
-        let mut rows = self
-            .protection_tags
+        let mut rows = self.persisted_protection_rows();
+        if summary.generation != generation {
+            rows.extend(store.load_tags_after(session, max)?);
+        }
+        Ok(Some(rows))
+    }
+
+    fn persisted_protection_rows(&self) -> Vec<mc_store::McTagRow> {
+        self.protection_tags
             .iter()
             .map(|(number, id, kind, tokens, created)| mc_store::McTagRow {
                 tag_number: *number,
@@ -311,11 +446,7 @@ impl LogicalPrefix {
                 created_at_ms: *created,
                 source_bytes: Arc::from([]),
             })
-            .collect::<Vec<_>>();
-        if summary.generation != generation {
-            rows.extend(store.load_tags_after(session, max)?);
-        }
-        Ok(Some(rows))
+            .collect()
     }
 
     pub(super) fn working_range(

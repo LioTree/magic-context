@@ -2438,7 +2438,7 @@ pub fn transform_with_projection(
 /// this engine seam neither resolves handles nor calls a gateway.
 pub mod compaction {
     mod logical_prefix;
-    pub(crate) use logical_prefix::LogicalPrefix;
+    pub(crate) use logical_prefix::{user_turns_below, CutPrefixFacts, LogicalPrefix};
     #[cfg(test)]
     thread_local! {
         // Observe the exact request passed to the real engine, not a separate
@@ -12897,19 +12897,26 @@ fn timestamp_temporal_marks(
     lineage_anchor_mid: Option<&str>,
 ) -> Vec<TemporalMarkInput> {
     let first_text_blocks = first_text_block_by_message(projection);
-    let mut previous = None;
+    // A lineage that begins at a cut has no message below its first one; the
+    // cut prefix carries that message's times, so the first window message is
+    // compared against the same predecessor full processing would use.
+    let cut_basis = req
+        .logical_prefix
+        .as_ref()
+        .filter(|prefix| prefix.is_cut())
+        .and_then(|prefix| Some((prefix.tail_from, prefix.cut_time_basis?)));
+    let mut previous: Option<(Option<i64>, Option<i64>)> = None;
     let mut marks = Vec::new();
     for message in &req.messages {
+        if let Some((_, basis)) = cut_basis.filter(|(first, _)| *first == message.ordinal) {
+            previous = Some(basis);
+        }
         if is_authored_user_message(message)
             && mutation_exempt_mid != Some(message.mid.as_str())
             && lineage_anchor_mid != Some(message.mid.as_str())
         {
-            let marker_text = previous.and_then(|prior: &CkIngressMessage| {
-                temporal_marker_from_timestamps(
-                    prior.ck.meta.created_at_ms,
-                    prior.ck.meta.completed_at_ms,
-                    message.ck.meta.created_at_ms,
-                )
+            let marker_text = previous.and_then(|(created, completed)| {
+                temporal_marker_from_timestamps(created, completed, message.ck.meta.created_at_ms)
             });
             if let Some(marker_text) = marker_text {
                 if let Some(block_id) = first_text_blocks.get(message.mid.as_str()) {
@@ -12921,7 +12928,10 @@ fn timestamp_temporal_marks(
                 }
             }
         }
-        previous = Some(message);
+        previous = Some((
+            message.ck.meta.created_at_ms,
+            message.ck.meta.completed_at_ms,
+        ));
     }
     marks
 }

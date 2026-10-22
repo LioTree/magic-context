@@ -438,6 +438,9 @@ pub(super) mod save_meter {
 #[derive(Default)]
 struct PagedRunner {
     entries: Mutex<Vec<(ReadMessage, usize)>>,
+    /// Every call the provider made, for checks that an operation calls no
+    /// runner method.
+    calls: std::sync::atomic::AtomicU64,
 }
 
 #[async_trait]
@@ -467,6 +470,8 @@ impl session_resolver::ProviderRunner for PagedRunner {
         params: Value,
         _: Duration,
     ) -> Result<Value, SessionResolveError> {
+        self.calls
+            .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
         if method == "session.send" {
             return Ok(json!({"state":"pending","submission_id":"reminder"}));
         }
@@ -1680,6 +1685,39 @@ async fn covered_tail_latency_benchmark() {
         let entry_rows =
             rig.scalar("SELECT count(*) FROM mc_async_compaction_entries WHERE session_ref=?1");
         eprintln!("BENCH store total={size} resident_held_bytes={held} state_json_bytes={record} entry_rows={entry_rows} entry_bytes={entry_bytes}");
+        // Setup for a lineage that descends from this one at its newest
+        // message, as a runner sends it at a cut: it must be answered from
+        // the state kept, with no runner call and nothing that grows with the
+        // session. Measured last, so the conversation is not moved before the
+        // other operations.
+        let (newest, digest) = {
+            let entries = rig.runner.entries.lock().unwrap();
+            let (last, _) = entries.last().unwrap();
+            (
+                last.ordinal,
+                contract::digest::content_digest(&last.message),
+            )
+        };
+        let calls_before = rig.runner.calls.load(std::sync::atomic::Ordering::Relaxed);
+        let mut setups = Vec::new();
+        for attempt in 0..5 {
+            let wall = Instant::now();
+            let thread = cpu_time::ThreadTime::now();
+            let process = cpu_time::ProcessTime::now();
+            let answer = rig.op("compaction.setup",json!({"session":"s","harness":"opencode","request_id":format!("descending-setup-{attempt}"),"model":"fixture","context_window":100_000,"composition":{"render_tags":true},"params":{"serializer_profile":"opencode-aisdk"},"lineage_id":"L2","descends_from":format!("L:{newest}:{digest}"),"first_ordinal":newest + 1,"now":1})).await;
+            setups.push((
+                wall.elapsed().as_secs_f64() * 1e3,
+                thread.elapsed().as_secs_f64() * 1e3,
+                process.elapsed().as_secs_f64() * 1e3,
+            ));
+            if attempt == 0 {
+                eprintln!("descending setup answer={}", answer["answer"]);
+            }
+        }
+        let setup_runner_calls =
+            rig.runner.calls.load(std::sync::atomic::Ordering::Relaxed) - calls_before;
+        percentiles("setup for a descending lineage", size, &mut setups);
+        eprintln!("descending setup runner calls={setup_runner_calls}");
         // One machine-readable line per size, read by `cost_rule_150k_vs_1k`.
         // The peak is net of the RSS before the first notice: that baseline is
         // the test fixture and the fake runner's own copy of the transcript,
@@ -1692,6 +1730,8 @@ async fn covered_tail_latency_benchmark() {
             publish_p50_ms: publish_p50,
             peak_rss_net_bytes: peak.saturating_sub(rss_before),
             resident_held_bytes: held as u64,
+            descending_setup_p50_ms: median_wall(&setups),
+            descending_setup_runner_calls: setup_runner_calls,
         };
         eprintln!("{COST_LINE}{}", serde_json::to_string(&cost).unwrap());
     }
@@ -1710,6 +1750,8 @@ struct CostSample {
     publish_p50_ms: f64,
     peak_rss_net_bytes: u64,
     resident_held_bytes: u64,
+    descending_setup_p50_ms: f64,
+    descending_setup_runner_calls: u64,
 }
 
 fn median_wall(samples: &[(f64, f64, f64)]) -> f64 {
@@ -1803,8 +1845,13 @@ fn cost_rule_150k_vs_1k() {
             small.resident_held_bytes as f64,
             large.resident_held_bytes as f64,
         ),
+        (
+            "setup for a descending lineage p50 ms",
+            small.descending_setup_p50_ms,
+            large.descending_setup_p50_ms,
+        ),
     ];
-    let failures = checks
+    let mut failures = checks
         .iter()
         .map(|(name, small, large)| {
             let ratio = large / small;
@@ -1814,6 +1861,14 @@ fn cost_rule_150k_vs_1k() {
         .filter(|(_, ratio)| !ratio.is_finite() || *ratio > 2.0)
         .map(|(name, ratio)| format!("{name} {ratio:.2}x"))
         .collect::<Vec<_>>();
+    for sample in [&small, &large] {
+        if sample.descending_setup_runner_calls != 0 {
+            failures.push(format!(
+                "setup for a descending lineage at {} made {} runner calls",
+                sample.size, sample.descending_setup_runner_calls
+            ));
+        }
+    }
     assert!(
         failures.is_empty(),
         "150k vs 1k above 2x: {}",
