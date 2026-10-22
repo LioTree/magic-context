@@ -656,15 +656,20 @@ async fn cut_session_start(
         pair.record_only = std::env::var_os("MC_CUT_TRACE").is_some();
         if mode == CutMode::BootstrapAtCut {
             // The reference rebuilds at the same notice: a lineage that does
-            // not descend from the cut starts with a full rebuild, and the
-            // differential compares every step from that rebuild.
+            // not descend from the cut starts where the provider's cached
+            // head is gone, so full processing loses its cached m1 too and
+            // the differential compares every step from that rebuild.
             let store = pair.oracle.store();
             let head = load_head(store, &pair.reference).unwrap().unwrap();
-            let loaded = store.load_meta(&head.namespace()).unwrap();
-            let mut meta = loaded.meta;
-            meta.bootstrap_seed_fold_pending = true;
+            let mut loaded = store.load(&head.namespace()).unwrap();
+            loaded.core.frozen_units.retain(|unit| unit.key != "m1");
             store
-                .commit_meta(&head.namespace(), loaded.row_version, &meta)
+                .commit(
+                    &head.namespace(),
+                    loaded.row_version,
+                    &loaded.core,
+                    &loaded.meta,
+                )
                 .unwrap();
         }
         for side in [&pair.oracle, &pair.resident] {
@@ -781,13 +786,9 @@ fn env_u64(name: &str, default: u64) -> u64 {
         .unwrap_or(default)
 }
 
-/// Known limitation: a lineage that begins at a cut does not yet carry the engine state
-/// full processing holds for rows at or after the cut when it makes the cut
-/// (reductions frozen on window blocks, the emergency latches, queued drops
-/// and acknowledged native edits), so under pressure it serves outputs full
-/// processing has dropped. Ignored until that state is carried.
+/// A lineage that descends from a cut adopts the folded head and serves
+/// what full processing serves from the fold that made the cut.
 #[tokio::test(flavor = "multi_thread", worker_threads = 8)]
-#[ignore = "red until the window's engine state is carried into a lineage that begins at a cut"]
 async fn a_lineage_that_begins_at_a_cut_serves_what_full_processing_serves() {
     cut_differential(8, 20, 7_000, CutMode::BeginAtCut).await;
 }
@@ -1237,17 +1238,18 @@ async fn ctx_reduce_naming_a_tag_below_the_cut_answers_it_is_already_summarized(
 }
 
 /// Replay one cut-differential session (`MC_CUT_SEED`, profile index
-/// `MC_CUT_PROFILE`, `MC_CUT_PRUNE=1` for the pruning mode), printing a
+/// `MC_CUT_PROFILE`, `MC_CUT_PRUNE=1` for the pruning mode and 2 for a fresh
+/// start), printing a
 /// line of engine state per side after every step. Diagnostic only.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 #[ignore = "diagnostic replay of one cut-differential session"]
 async fn replay_cut_session() {
     let seed = env_u64("MC_CUT_SEED", 7_007);
     let profile = PROFILES[env_u64("MC_CUT_PROFILE", 3) as usize];
-    let mode = if env_u64("MC_CUT_PRUNE", 0) == 1 {
-        CutMode::PruneInPlace
-    } else {
-        CutMode::BeginAtCut
+    let mode = match env_u64("MC_CUT_PRUNE", 0) {
+        1 => CutMode::PruneInPlace,
+        2 => CutMode::BootstrapAtCut,
+        _ => CutMode::BeginAtCut,
     };
     let Some((mut pair, mut rng, first, mut history_end)) =
         cut_session_start(profile, seed, mode).await

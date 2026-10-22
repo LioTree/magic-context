@@ -1685,6 +1685,42 @@ async fn covered_tail_latency_benchmark() {
         let entry_rows =
             rig.scalar("SELECT count(*) FROM mc_async_compaction_entries WHERE session_ref=?1");
         eprintln!("BENCH store total={size} resident_held_bytes={held} state_json_bytes={record} entry_rows={entry_rows} entry_bytes={entry_bytes}");
+        // What a lineage that descends from a cut at the newest historian
+        // restart point would keep: the cut seed with the folded head, the
+        // record's cadence state, its retained views and its certificate.
+        // Bounded by the history, the frozen units and the window, so it must
+        // not grow with the session.
+        let cut_seed_bytes = {
+            let mut state = rig.state();
+            let codec =
+                codec::Codec::from_params(&Value::Object(state.setup.params.clone())).unwrap();
+            state.fold_entries(codec, None).unwrap();
+            let first = meta
+                .coverage_ordinal
+                .and_then(|coverage| {
+                    state
+                        .aggregates
+                        .historian_input
+                        .restart_at_or_below(coverage)
+                })
+                .expect("a restart point at or below coverage");
+            let seed = state
+                .capture_cut_seed(rig.store(), codec, first)
+                .unwrap()
+                .unwrap_or_else(|refusal| panic!("cut seed refused: {}", refusal.code()));
+            let bytes = |value: &dyn erased_size::Sized| value.json_len();
+            let total = serde_json::to_string(&seed).unwrap().len();
+            eprintln!(
+                "BENCH cut_seed total={size} first={first} seed_bytes={total} head_bytes={} views_bytes={} certificate_bytes={} record_bytes={} context_bytes={} window_units={}",
+                bytes(&seed.window.head),
+                bytes(&seed.window.views),
+                bytes(&seed.window.certificate),
+                bytes(&seed.window.record),
+                bytes(&seed.context_sources),
+                seed.window.head.as_ref().map_or(0, |head| head.core.frozen_units.len()),
+            );
+            total as u64
+        };
         // Setup for a lineage that descends from this one at its newest
         // message, as a runner sends it at a cut: it must be answered from
         // the state kept, with no runner call and nothing that grows with the
@@ -1724,9 +1760,22 @@ async fn covered_tail_latency_benchmark() {
             peak_rss_net_bytes: peak.saturating_sub(rss_before),
             resident_held_bytes: held as u64,
             descending_setup_p50_ms: median_wall(&setups),
+            cut_seed_bytes,
             descending_setup_runner_calls: setup_runner_calls,
         };
         eprintln!("{COST_LINE}{}", serde_json::to_string(&cost).unwrap());
+    }
+}
+
+/// Serialized size, for the benchmark's cut-seed breakdown.
+mod erased_size {
+    pub trait Sized {
+        fn json_len(&self) -> usize;
+    }
+    impl<T: serde::Serialize> Sized for T {
+        fn json_len(&self) -> usize {
+            serde_json::to_string(self).map_or(0, |json| json.len())
+        }
     }
 }
 
@@ -1744,6 +1793,7 @@ struct CostSample {
     peak_rss_net_bytes: u64,
     resident_held_bytes: u64,
     descending_setup_p50_ms: f64,
+    cut_seed_bytes: u64,
     descending_setup_runner_calls: u64,
 }
 
@@ -1837,6 +1887,11 @@ fn cost_rule_150k_vs_1k() {
             "resident record bytes",
             small.resident_held_bytes as f64,
             large.resident_held_bytes as f64,
+        ),
+        (
+            "cut seed bytes",
+            small.cut_seed_bytes as f64,
+            large.cut_seed_bytes as f64,
         ),
         (
             "setup for a descending lineage p50 ms",
