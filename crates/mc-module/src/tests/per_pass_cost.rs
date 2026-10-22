@@ -22,6 +22,11 @@ pub(super) fn fixed_now_ms() -> Option<i64> {
     FIXED_NOW_MS.get()
 }
 
+/// The fixed clock as a guard other test modules can hold.
+pub(super) fn fixed_clock() -> impl Drop {
+    FixedClock::new()
+}
+
 struct FixedClock {
     previous: Option<i64>,
     _thread_bound: PhantomData<Rc<()>>,

@@ -1,6 +1,7 @@
 use super::*;
 use cortexkit_bus_inmemory::{InMemoryBus, InMemoryConfig};
 mod moved_session;
+mod offline_first_pass;
 mod read_resume;
 mod reminder_replay;
 mod reminders;
