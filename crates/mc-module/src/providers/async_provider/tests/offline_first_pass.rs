@@ -1859,3 +1859,144 @@ fn offline_first_pass_175k_cost() {
         println!("{line}");
     }
 }
+
+// ── Offline-first-pass adoption at live usage (run with MC_REVIEW_CARD=1) ──
+
+/// Whether these optional adoption tests run; they are skipped by default.
+fn review_card() -> bool {
+    std::env::var("MC_REVIEW_CARD").is_ok_and(|value| value == "1")
+}
+
+/// The first live notice of a moved session usually reports real usage: a
+/// moved session is long. The offline pass runs at zero usage (see
+/// `offline_first_pass`, which builds its notice with `est_tokens` 0), so
+/// adoption is byte-identical to the ordinary first pass only if the adopting
+/// notice then publishes exactly what an ordinary first pass at the notice's
+/// usage would. Compares everything observable after that one notice on both
+/// arms.
+async fn first_notice_at(
+    label: &str,
+    write: impl Fn(&Path) -> (StorePaths, String),
+    est: u64,
+) -> Result<(), String> {
+    let _clock = crate::tests::fixed_clock();
+    let project = tempfile::tempdir().unwrap();
+    let (offline_dir, live_dir) = (tempfile::tempdir().unwrap(), tempfile::tempdir().unwrap());
+    let (_prep, outcome) = prepared(offline_dir.path(), project.path(), &write).await;
+    assert!(
+        matches!(outcome, OfflineOutcome::Prepared(_)),
+        "{label}: {outcome:?}"
+    );
+    let (live_paths, session, served) = moved_stores(live_dir.path(), &write);
+    pin_history_generation(&live_paths.context_db, project.path(), &session, &[0, 1]);
+    let live = Arm::open(
+        live_dir.path(),
+        project.path(),
+        &session,
+        Served::new(served.clone(), 7),
+        config(),
+    );
+    let offline = Arm::open(
+        offline_dir.path(),
+        project.path(),
+        &session,
+        Served::new(served.clone(), 7),
+        config(),
+    );
+    live.setup(setup_request(&session, "fixture")).await;
+    offline.setup(setup_request(&session, "fixture")).await;
+    let live_outcome = live.notice(1, est, None, Vec::new()).await;
+    let offline_outcome = offline.notice(1, est, None, Vec::new()).await;
+    if live_outcome != offline_outcome {
+        return Err(format!(
+            "{label} est={est}: outcomes differ: offline {offline_outcome} live {live_outcome}"
+        ));
+    }
+    if offline.state().offline_first_pass.is_some() {
+        return Err(format!("{label} est={est}: not adopted"));
+    }
+    let (offline_seen, live_seen) = (observed(&offline), observed(&live));
+    if offline_seen == live_seen {
+        return Ok(());
+    }
+    let keys = offline_seen
+        .as_object()
+        .unwrap()
+        .keys()
+        .filter(|key| offline_seen[*key] != live_seen[*key])
+        .cloned()
+        .collect::<Vec<_>>();
+    let versions = |seen: &Value| {
+        seen["views"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|view| view[0].clone())
+            .collect::<Vec<_>>()
+    };
+    let newest_view = |seen: &Value| {
+        seen["views"]
+            .as_array()
+            .unwrap()
+            .last()
+            .map(|view| view[1].as_str().unwrap_or("").to_owned())
+            .unwrap_or_default()
+    };
+    Err(format!(
+        "{label} est={est}: adopted state differs from the ordinary first pass in {keys:?}; views offline {:?} live {:?}; newest view equal: {}; engine fields {:?}",
+        versions(&offline_seen),
+        versions(&live_seen),
+        newest_view(&offline_seen) == newest_view(&live_seen),
+        differing(&offline_seen["engine"], &live_seen["engine"])
+            .iter()
+            .map(|field| field.chars().take(400).collect::<String>())
+            .collect::<Vec<_>>()
+    ))
+}
+
+/// Witness: adoption at the first live notice equals the ordinary first pass
+/// when that notice reports usage of 0, 30,000, 72,000, 87,000 or 96,000
+/// tokens of a 100,000-token window.
+#[tokio::test]
+async fn card_review_adoption_matches_the_ordinary_first_pass_at_live_usage() {
+    if !review_card() {
+        return;
+    }
+    let mut failures = Vec::new();
+    for est in [0, 30_000, 72_000, 87_000, 96_000] {
+        if let Err(failure) = first_notice_at("fixture", fixture_stores, est).await {
+            failures.push(failure);
+        }
+        for seed in [3, 17, 41] {
+            if let Err(failure) =
+                first_notice_at(&format!("seed {seed}"), seeded_stores(seed), est).await
+            {
+                failures.push(failure);
+            }
+        }
+    }
+    assert!(failures.is_empty(), "{}", failures.join("\n"));
+}
+
+/// The seeded offline differential at other seeds:
+/// `MC_REVIEW_CARD_OFFLINE_FIRST` (default 1000) and
+/// `MC_REVIEW_CARD_OFFLINE_SEEDS` (default 50) sessions.
+#[tokio::test]
+async fn card_review_offline_differential_at_new_seeds() {
+    if !review_card() {
+        return;
+    }
+    let var = |name: &str, default: u64| {
+        std::env::var(name)
+            .ok()
+            .and_then(|value| value.parse().ok())
+            .unwrap_or(default)
+    };
+    let first = var("MC_REVIEW_CARD_OFFLINE_FIRST", 1_000);
+    let count = var("MC_REVIEW_CARD_OFFLINE_SEEDS", 50);
+    seeded(first..first + count).await;
+    eprintln!(
+        "card review: offline differential over seeds {first}..{}",
+        first + count
+    );
+}
