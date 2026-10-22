@@ -773,7 +773,7 @@ impl AsyncRecord {
             .map_err(transient)?
             .map(|mut head| {
                 for units in [&mut head.core.frozen_units, &mut head.core.pending_changes] {
-                    units.retain(|unit| frozen_unit_mid(&unit.key).is_none_or(|mid| keep(mid)));
+                    units.retain(|unit| frozen_unit_mid(&unit.key).is_none_or(keep));
                 }
                 head.retain_messages(keep);
                 head
@@ -1265,29 +1265,6 @@ pub(super) fn discard_older_record(
     Ok(true)
 }
 
-/// Engine passes by provider instance, for tests that compare how two
-/// providers handled the same notices.
-#[cfg(test)]
-pub(super) mod pass_trace {
-    use std::sync::Mutex;
-
-    static PASSES: Mutex<Vec<(usize, String)>> = Mutex::new(Vec::new());
-
-    pub fn record(provider: usize, line: String) {
-        PASSES.lock().unwrap().push((provider, line));
-    }
-
-    /// The passes `provider` ran since the last call, in order.
-    pub fn take(provider: usize) -> Vec<String> {
-        let mut passes = PASSES.lock().unwrap();
-        let (taken, kept) = std::mem::take(&mut *passes)
-            .into_iter()
-            .partition::<Vec<_>, _>(|(owner, _)| *owner == provider);
-        *passes = kept;
-        taken.into_iter().map(|(_, line)| line).collect()
-    }
-}
-
 /// Edit a namespace's cache state and commit it, retrying on a concurrent
 /// write. Uses the logical snapshot and commit, as prefix hygiene does:
 /// module code never rewrites the whole cache state. A namespace that was
@@ -1342,4 +1319,27 @@ fn commit_cache_state(
         }
     }
     Err(transient("engine state kept changing while it was edited"))
+}
+
+/// Engine passes by provider store, for tests that compare how two
+/// providers handled the same notices.
+#[cfg(test)]
+pub(super) mod pass_trace {
+    use std::sync::Mutex;
+
+    static PASSES: Mutex<Vec<(usize, String)>> = Mutex::new(Vec::new());
+
+    pub fn record(provider: usize, line: String) {
+        PASSES.lock().unwrap().push((provider, line));
+    }
+
+    /// The passes `provider` ran since the last call, in order.
+    pub fn take(provider: usize) -> Vec<String> {
+        let mut passes = PASSES.lock().unwrap();
+        let (taken, kept) = std::mem::take(&mut *passes)
+            .into_iter()
+            .partition::<Vec<_>, _>(|(owner, _)| *owner == provider);
+        *passes = kept;
+        taken.into_iter().map(|(_, line)| line).collect()
+    }
 }
