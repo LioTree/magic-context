@@ -1018,7 +1018,7 @@ fn row(label: &str, size: u64, sample: &Sample) -> String {
     line
 }
 
-const PHASES: [&str; 17] = [
+const PHASES: [&str; 21] = [
     "load",
     "rem:base",
     "rem:last",
@@ -1036,6 +1036,10 @@ const PHASES: [&str; 17] = [
     "phase:historian",
     "phase:checkin",
     "save",
+    "pub:engine",
+    "pub:certify",
+    "pub:render",
+    "pub:ranges",
 ];
 
 fn phase_stats(reference: &str) -> Vec<save_meter::SaveStats> {
@@ -1505,7 +1509,13 @@ async fn covered_tail_latency_benchmark() {
         assert!(tail > 0 && (tail as u64) < size);
         let covered = size - tail as u64 - 1;
         rig.history(covered, "completed history covering the old prefix");
+        let (peak, current) = rss();
+        let rss_before = current;
+        eprintln!("BENCH before_bootstrap total={size} RSS_bytes={current} peak_RSS_bytes={peak}");
+        let boot_phases = phase_stats(&rig.reference);
         let bootstrap = rig.try_timed_notice(0, None, est_tokens).await;
+        let (peak, current) = rss();
+        eprintln!("BENCH bootstrap total={size} wall_ms={:.1} RSS_bytes={current} peak_RSS_bytes={peak} phases: {}", bootstrap.0.0, phases(&rig.reference, &boot_phases));
         eprintln!("shape total={size} uncovered={tail} serialized_tail_tokens={tokens} compartment_end={covered} bootstrap={:?} elapsed_ms={:.1}", bootstrap.2, bootstrap.0.0);
         if bootstrap.2.is_err() {
             eprintln!("Bootstrap failed; retrying before ordinary-notice sampling.");
@@ -1563,6 +1573,7 @@ async fn covered_tail_latency_benchmark() {
             }
         }
         percentiles("quiet notice (+4 msgs)", size, &mut notices);
+        let quiet_p50 = median_wall(&notices);
         if !historian.is_empty() {
             percentiles(
                 "historian evaluation (process CPU after notice)",
@@ -1598,6 +1609,7 @@ async fn covered_tail_latency_benchmark() {
         let mut publish_errors = 0;
         for index in 0..views {
             rig.history(covered + 1 + index as u64 * 2, "a newer completed summary");
+            let ride_phases = phase_stats(&rig.reference);
             let wall = Instant::now();
             let thread = cpu_time::ThreadTime::now();
             let process = cpu_time::ProcessTime::now();
@@ -1612,6 +1624,10 @@ async fn covered_tail_latency_benchmark() {
                 thread.elapsed().as_secs_f64() * 1e3,
                 process.elapsed().as_secs_f64() * 1e3,
             ));
+            eprintln!(
+                "BENCH ride total={size} phases: {}",
+                phases(&rig.reference, &ride_phases)
+            );
             if answer["answer"] == "view" {
                 version = answer["view"]["view_version"].as_u64();
                 eprintln!(
@@ -1626,7 +1642,13 @@ async fn covered_tail_latency_benchmark() {
             let ack = rig.try_timed_notice(0, version, est_tokens).await;
             eprintln!("acknowledging notice outcome={:?}", ack.2);
             rig.history(covered + 2 + index as u64 * 2, "another completed summary");
+            let publish_phases = phase_stats(&rig.reference);
             let (sample, _, outcome) = rig.try_timed_notice(0, version, est_tokens).await;
+            eprintln!(
+                "BENCH publish total={size} wall_ms={:.1} phases: {}",
+                sample.0,
+                phases(&rig.reference, &publish_phases)
+            );
             publishes.push(sample);
             if let Err(error) = outcome {
                 publish_errors += 1;
@@ -1636,6 +1658,7 @@ async fn covered_tail_latency_benchmark() {
         }
         percentiles("ride attempt", size, &mut rides);
         percentiles("publishing notice attempt", size, &mut publishes);
+        let (ride_p50, publish_p50) = (median_wall(&rides), median_wall(&publishes));
         eprintln!(
             "ride errors={ride_errors}/{views}, publishing notice errors={publish_errors}/{views}"
         );
@@ -1644,5 +1667,156 @@ async fn covered_tail_latency_benchmark() {
         let compartment_end = rig.store().max_compartment_end_ordinal(&namespace).unwrap();
         let (peak, current) = rss();
         eprintln!("memory total={size} RSS_bytes={current} peak_RSS_bytes={peak} persisted_compartment_end={compartment_end} applied_coverage={:?}", meta.coverage_ordinal);
+        let held = rig
+            .h
+            .provider_store
+            .async_runtime
+            .resident
+            .lock()
+            .unwrap()
+            .held_bytes(&rig.reference)
+            .unwrap_or(0);
+        let (record, entry_bytes) = rig.record_bytes();
+        let entry_rows =
+            rig.scalar("SELECT count(*) FROM mc_async_compaction_entries WHERE session_ref=?1");
+        eprintln!("BENCH store total={size} resident_held_bytes={held} state_json_bytes={record} entry_rows={entry_rows} entry_bytes={entry_bytes}");
+        // One machine-readable line per size, read by `cost_rule_150k_vs_1k`.
+        // The peak is net of the RSS before the first notice: that baseline is
+        // the test fixture and the fake runner's own copy of the transcript,
+        // which the provider does not own.
+        let cost = CostSample {
+            size,
+            first_notice_ms: bootstrap.0 .0,
+            quiet_p50_ms: quiet_p50,
+            ride_p50_ms: ride_p50,
+            publish_p50_ms: publish_p50,
+            peak_rss_net_bytes: peak.saturating_sub(rss_before),
+            resident_held_bytes: held as u64,
+        };
+        eprintln!("{COST_LINE}{}", serde_json::to_string(&cost).unwrap());
     }
+}
+
+/// Prefix of the line `covered_tail_latency_benchmark` prints with one size's
+/// cost summary.
+const COST_LINE: &str = "COST_RULE ";
+
+#[derive(Serialize, Deserialize, Debug, Clone, Copy)]
+struct CostSample {
+    size: u64,
+    first_notice_ms: f64,
+    quiet_p50_ms: f64,
+    ride_p50_ms: f64,
+    publish_p50_ms: f64,
+    peak_rss_net_bytes: u64,
+    resident_held_bytes: u64,
+}
+
+fn median_wall(samples: &[(f64, f64, f64)]) -> f64 {
+    let mut walls = samples.iter().map(|sample| sample.0).collect::<Vec<_>>();
+    walls.sort_by(f64::total_cmp);
+    walls.get(walls.len() / 2).copied().unwrap_or(f64::NAN)
+}
+
+/// The cost rule as an assertion: per-step work scales with new messages and
+/// resident memory with the window, so a 150,000-message session whose
+/// compartments cover all but the same ~40k-token tail must cost no more than
+/// twice a 1,000-message one on every measured step, and hold no more than
+/// twice the memory.
+///
+/// Each size runs `covered_tail_latency_benchmark` in its own child process
+/// of this test binary, because the peak resident set (VmHWM) of a process
+/// never decreases. Linux only (RSS comes from /proc). Run with:
+///
+/// ```sh
+/// cargo test --release -p mc-module --lib cost_rule_150k_vs_1k -- --ignored --nocapture
+/// ```
+///
+/// `MC_ASYNC_NOTICES` and `MC_ASYNC_VIEWS` pass through (defaults 50 and 5).
+#[test]
+#[ignore = "cost-rule benchmark assertion; run explicitly with --release --ignored --nocapture"]
+fn cost_rule_150k_vs_1k() {
+    let run = |size: u64| -> CostSample {
+        let exe = std::env::current_exe().unwrap();
+        let output = std::process::Command::new(exe)
+            .args([
+                "--exact",
+                "providers::async_provider::scaling_tests::covered_tail_latency_benchmark",
+                "--ignored",
+                "--nocapture",
+                "--test-threads=1",
+            ])
+            .env("MC_ASYNC_SCALING_SIZES", size.to_string())
+            .env(
+                "MC_ASYNC_NOTICES",
+                std::env::var("MC_ASYNC_NOTICES").unwrap_or_else(|_| "50".into()),
+            )
+            .env(
+                "MC_ASYNC_VIEWS",
+                std::env::var("MC_ASYNC_VIEWS").unwrap_or_else(|_| "5".into()),
+            )
+            .output()
+            .unwrap();
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        let stdout = String::from_utf8_lossy(&output.stdout);
+        for line in stderr.lines().filter(|line| line.starts_with("BENCH ")) {
+            eprintln!("{line}");
+        }
+        assert!(
+            output.status.success(),
+            "benchmark at {size} failed:\n{stdout}\n{stderr}"
+        );
+        let line = stderr
+            .lines()
+            .find_map(|line| line.strip_prefix(COST_LINE))
+            .unwrap_or_else(|| panic!("no cost line at {size}:\n{stdout}\n{stderr}"));
+        serde_json::from_str(line).unwrap()
+    };
+    let small = run(1_000);
+    let large = run(150_000);
+    eprintln!("cost rule 1k: {small:?}");
+    eprintln!("cost rule 150k: {large:?}");
+    let checks = [
+        (
+            "first notice ms",
+            small.first_notice_ms,
+            large.first_notice_ms,
+        ),
+        (
+            "quiet notice p50 ms",
+            small.quiet_p50_ms,
+            large.quiet_p50_ms,
+        ),
+        ("ride p50 ms", small.ride_p50_ms, large.ride_p50_ms),
+        (
+            "publishing notice p50 ms",
+            small.publish_p50_ms,
+            large.publish_p50_ms,
+        ),
+        (
+            "peak RSS net of the fixture, bytes",
+            small.peak_rss_net_bytes as f64,
+            large.peak_rss_net_bytes as f64,
+        ),
+        (
+            "resident record bytes",
+            small.resident_held_bytes as f64,
+            large.resident_held_bytes as f64,
+        ),
+    ];
+    let failures = checks
+        .iter()
+        .map(|(name, small, large)| {
+            let ratio = large / small;
+            eprintln!("cost rule {name}: 1k {small:.1} 150k {large:.1} ratio {ratio:.2}");
+            (name, ratio)
+        })
+        .filter(|(_, ratio)| !ratio.is_finite() || *ratio > 2.0)
+        .map(|(name, ratio)| format!("{name} {ratio:.2}x"))
+        .collect::<Vec<_>>();
+    assert!(
+        failures.is_empty(),
+        "150k vs 1k above 2x: {}",
+        failures.join(", ")
+    );
 }
