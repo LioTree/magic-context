@@ -105,17 +105,16 @@ impl FrozenEdits {
                 let Some(entry) = source.as_ref().filter(|entry| entry.mid == edit.mid) else {
                     continue;
                 };
-                let Some(index) = entry.tags.iter().position(|row| row.part == edit.part) else {
+                if !entry.tags.iter().any(|row| row.part == edit.part) {
                     continue;
-                };
-                let native = parts(&entry.message)?;
-                let Some(part) = native.get(index) else {
+                }
+                let Ok(digest) = served_part_digest(entry, &edit.part) else {
                     continue;
                 };
                 let part = FrozenPart {
                     mid: edit.mid.clone(),
                     part: edit.part.clone(),
-                    digest: contract::digest::content_digest(part),
+                    digest,
                     bytes: edit.bytes.clone(),
                 };
                 self.insert(part);
@@ -145,13 +144,8 @@ impl FrozenEdits {
                 sources.insert(*ordinal, state.entries[ordinal].read()?);
             }
             let entry = &sources[ordinal];
-            let Some(index) = entry.tags.iter().position(|row| row.part == part.part) else {
-                continue;
-            };
-            let native = parts(&entry.message)?;
-            if native
-                .get(index)
-                .is_none_or(|source| contract::digest::content_digest(source) != part.digest)
+            if !entry.tags.iter().any(|row| row.part == part.part)
+                || served_part_digest(entry, &part.part).ok().as_ref() != Some(&part.digest)
             {
                 continue;
             }

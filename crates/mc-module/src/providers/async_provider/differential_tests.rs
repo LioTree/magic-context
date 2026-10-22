@@ -81,6 +81,31 @@ fn tag(n: u64, part: u64) -> String {
     format!("§{}§", 100 + n * 4 + part)
 }
 
+/// Number the transcript as an llm-runner 0.4.0 runner with no anchor does:
+/// each counted part (a row the fixture tags) is numbered from zero by its
+/// position (`tags::number_parts`), whatever number the fixture wrote. The
+/// fixtures never reshape a message the runner already served, so a part's
+/// number changes only when the transcript before it does, which they pair
+/// with a new lineage or a cut.
+fn renumber(entries: &mut [ReadMessage]) {
+    let counted = entries
+        .iter()
+        .flat_map(|entry| &entry.tags)
+        .filter(|row| row.tag.is_some())
+        .count();
+    let parts = (0..counted as u64)
+        .map(|at| tags::RenderedPart::new(tags::PartKind::ToolResultText, at))
+        .collect::<Vec<_>>();
+    let mut numbers = tags::number_parts(0, &parts).into_iter();
+    for row in entries
+        .iter_mut()
+        .flat_map(|entry| entry.tags.iter_mut())
+        .filter(|row| row.tag.is_some())
+    {
+        row.tag = numbers.next().flatten().and_then(tags::format_tag);
+    }
+}
+
 /// Message `n` of a transcript in `profile`'s schema. `salt` changes its
 /// bytes (a rewritten message) without changing its shape. Non-OpenCode
 /// schemas repeat a four-message turn: a user prompt, an assistant message
@@ -177,6 +202,31 @@ fn message(profile: Profile, n: u64, salt: u64) -> ReadMessage {
         },
     };
     let mut entry = ReadMessage::new(n, format!("m{n}"), message).with_tags(rows);
+    // A screenshot the person attached: read as a `media_ref`, never counted.
+    if n.is_multiple_of(31) {
+        let data = "iVBORw0KGgoAAAANSUhEUgAAB4AAAAQ4CAYAAADo08FD";
+        let image = match profile {
+            Profile::OpenCode => Some((
+                "/parts",
+                json!({"id":format!("p{n}i"),"type":"file","mime":"image/png","url":format!("data:image/png;base64,{data}")}),
+            )),
+            Profile::Pi if n.is_multiple_of(4) => Some((
+                "/message/content",
+                json!({"type":"image","data":data,"mimeType":"image/png"}),
+            )),
+            _ => None,
+        };
+        if let Some((parts, image)) = image {
+            if let Some(parts) = entry
+                .message
+                .pointer_mut(parts)
+                .and_then(Value::as_array_mut)
+            {
+                parts.push(image);
+                entry.tags.push(untagged(entry.tags.len() as u64));
+            }
+        }
+    }
     if profile == Profile::Pi && n % 16 == 1 {
         entry.message["message"]["content"][1]
             .as_object_mut()
@@ -321,12 +371,13 @@ impl session_resolver::ProviderRunner for Runner {
             ));
         }
         let from = params["from_ordinal"].as_u64().unwrap();
-        let entries = self.transcript.entries.lock().unwrap();
+        let mut entries = self.transcript.entries.lock().unwrap();
+        renumber(&mut entries);
         let messages = entries
             .iter()
             .filter(|e| e.ordinal >= from)
             .take(9)
-            .cloned()
+            .map(serve_descriptors)
             .collect::<Vec<_>>();
         let mut page = json!({"lineage_id":lineage,"messages":messages});
         if let Some(last) = messages
@@ -649,9 +700,10 @@ impl Pair {
             self.log
         );
         self.compare(label);
-        self.review
-            .borrow_mut()
-            .collect_sends(&self.oracle.runner.raw_sends.lock().unwrap());
+        self.review.borrow_mut().collect_sends(
+            &self.oracle.runner.raw_sends.lock().unwrap(),
+            &self.transcript.entries.lock().unwrap(),
+        );
         resident
     }
 
@@ -1448,7 +1500,13 @@ async fn covered_tool_result_drop_uses_prefix_membership_without_projecting_an_o
     .await;
     let mut rng = Rng(12);
     assert_eq!(pair.notice(&mut rng, None).await, "ok");
-    let request = json!({"name":"ctx_reduce","arguments":{"drop":(100 + 6 * 4).to_string()}});
+    // The number the runner's read shows for message 6's first part.
+    let number = {
+        let mut entries = pair.transcript.entries.lock().unwrap();
+        renumber(&mut entries);
+        tags::parse_tag(entries[6].tags[0].tag.as_deref().unwrap()).unwrap()
+    };
+    let request = json!({"name":"ctx_reduce","arguments":{"drop":number.to_string()}});
     pair.both("covered result drop", |side| {
         Box::pin(side.dispatch(request.clone()))
     })

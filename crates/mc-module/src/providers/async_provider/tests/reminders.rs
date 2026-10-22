@@ -392,8 +392,11 @@ async fn delivered_reminders_d_tags_are_not_reclaimable_mass_or_hint_targets_but
         100_000,
     )
     .unwrap();
-    assert!(!hints.oldest_reclaimable.contains(&1009));
-    assert!(!hints.channel2.contains(&1009));
+    assert!(!hints
+        .oldest_reclaimable
+        .iter()
+        .any(|hint| hint.number == 1009));
+    assert!(!hints.channel2.iter().any(|hint| hint.number == 1009));
     assert!(
         !hints.oldest_reclaimable.is_empty(),
         "control tool output must be reclaimable"

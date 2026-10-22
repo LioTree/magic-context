@@ -85,12 +85,15 @@ impl HeldEntry {
         self
     }
 
+    /// The entry as the engine and the summarizer see it: a large text the
+    /// runner described is its carried head and a notice of its size
+    /// (`crate::descriptors::expose`).
     pub(super) fn inbound(&self) -> Result<InboundMessage, HandlerOutcome> {
         let entry = self.read()?;
         Ok(InboundMessage {
             ordinal: entry.ordinal,
             mid: entry.mid,
-            message: entry.message,
+            message: crate::descriptors::expose(&entry.message).unwrap_or(entry.message),
         })
     }
 

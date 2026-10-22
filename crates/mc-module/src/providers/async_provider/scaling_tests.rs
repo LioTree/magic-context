@@ -533,6 +533,8 @@ fn message(n: u64) -> (ReadMessage, usize) {
         json!({"info":{"id":format!("m{n}"),"role":role,"time":{"created":1}},"parts":parts}),
     )
     .with_tags(tags);
+    // Served once, as a descriptors-mode runner holds it.
+    let entry = serve_descriptors(&entry);
     let size = serde_json::to_vec(&entry).unwrap().len();
     (entry, size)
 }

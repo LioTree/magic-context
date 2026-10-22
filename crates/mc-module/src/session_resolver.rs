@@ -202,9 +202,10 @@ impl RealProviderRunner {
                 )
                 .await;
             consumer.close().await;
-            let bytes = response.map_err(call_error_to_resolve_error)?;
-            serde_json::from_slice(&bytes)
-                .map_err(|e| SessionResolveError::InvalidResponse(e.to_string()))
+            let bytes = response.map_err(runner_call_error)?;
+            let reply = serde_json::from_slice(&bytes)
+                .map_err(|e| SessionResolveError::InvalidResponse(e.to_string()))?;
+            read_runner_reply(reply)
         };
         tokio::time::timeout(budget, work)
             .await
@@ -256,6 +257,14 @@ pub enum SessionResolveError {
     Timeout,
     Transport(String),
     InvalidResponse(String),
+    /// An llm-runner reply that is not exactly `{"result": <answer>}`; the
+    /// detail names what arrived. See [`read_runner_reply`].
+    ReplyShape(String),
+    /// The runner refused the call with an ERROR frame: its role `code`.
+    Refused {
+        code: String,
+        message: String,
+    },
 }
 
 impl fmt::Display for SessionResolveError {
@@ -266,6 +275,11 @@ impl fmt::Display for SessionResolveError {
             Self::InvalidResponse(message) => {
                 write!(f, "session.resolve returned an invalid response: {message}")
             }
+            Self::ReplyShape(detail) => write!(
+                f,
+                "{RUNNER_REPLY_SHAPE}: llm-runner requires a reply of exactly {{\"result\": <answer>}}; {detail}"
+            ),
+            Self::Refused { code, message } => write!(f, "runner refused {code}: {message}"),
         }
     }
 }
@@ -416,6 +430,51 @@ fn call_options() -> CallOptions {
     }
 }
 
+/// The contract error for an llm-runner reply in any shape but
+/// `{"result": <answer>}`.
+pub const RUNNER_REPLY_SHAPE: &str = "runner_reply_shape";
+
+/// The answer inside an llm-runner reply. Every llm-runner op reply ck-mc
+/// reads is exactly `{"result": <answer>}`, an object with that one key
+/// (pinned for llm-runner 0.4.1). A bare answer, or a `result` beside other
+/// keys, is refused by name rather than read either way, so a runner that
+/// drifts from the pinned shape is seen at once instead of being misread.
+/// This is the one place ck-mc decodes the runner reply envelope.
+pub fn read_runner_reply(reply: Value) -> Result<Value, SessionResolveError> {
+    match reply {
+        Value::Object(mut map) if map.len() == 1 && map.contains_key("result") => {
+            Ok(map.remove("result").expect("checked result key"))
+        }
+        Value::Object(map) => Err(SessionResolveError::ReplyShape(format!(
+            "got an object with keys {:?}",
+            map.keys().collect::<Vec<_>>()
+        ))),
+        other => Err(SessionResolveError::ReplyShape(format!(
+            "got a JSON {}",
+            match other {
+                Value::Null => "null",
+                Value::Bool(_) => "boolean",
+                Value::Number(_) => "number",
+                Value::String(_) => "string",
+                Value::Array(_) => "array",
+                Value::Object(_) => unreachable!(),
+            }
+        ))),
+    }
+}
+
+/// A runner call's failure: an ERROR frame keeps the runner's own code, so
+/// a caller can act on a named refusal (`fork_unsupported`, say).
+fn runner_call_error(error: CallError) -> SessionResolveError {
+    match error {
+        CallError::Module(body) => SessionResolveError::Refused {
+            code: body.code,
+            message: body.message,
+        },
+        other => SessionResolveError::Transport(other.to_string()),
+    }
+}
+
 fn call_error_to_resolve_error(error: CallError) -> SessionResolveError {
     match error {
         CallError::Module(body) if body.code == "session_resolve_timeout" => {
@@ -506,6 +565,17 @@ mod tests {
         PathBuf,
         std::sync::Arc<std::sync::Mutex<Vec<SeenRoute>>>,
     ) {
+        fake_daemon_answering(br#"{"result":{}}"#.to_vec()).await
+    }
+
+    /// A daemon whose every routed request is answered with `reply`.
+    async fn fake_daemon_answering(
+        reply: Vec<u8>,
+    ) -> (
+        tempfile::TempDir,
+        PathBuf,
+        std::sync::Arc<std::sync::Mutex<Vec<SeenRoute>>>,
+    ) {
         use subc_control::{ClientControlRequest, ClientControlResponse};
         use subc_protocol::{Flags, Frame, FrameType, Priority};
         use subc_transport::{
@@ -573,7 +643,7 @@ mod tests {
                             })
                             .unwrap()
                         }
-                        FrameType::Request => b"{}".to_vec(),
+                        FrameType::Request => reply.clone(),
                         _ => continue,
                     };
                     let response = Frame::build(
@@ -590,6 +660,77 @@ mod tests {
             }
         });
         (temp, connection_file, seen)
+    }
+
+    /// The one place ck-mc decodes an llm-runner reply: exactly
+    /// `{"result": <answer>}`. A bare answer and a `result` beside other keys
+    /// are both refused by name, never read either way.
+    #[test]
+    fn runner_replies_are_read_only_in_the_pinned_wrapped_shape() {
+        let page = json!({"lineage_id":"L","messages":[]});
+        assert_eq!(
+            read_runner_reply(json!({"result": page.clone()})).unwrap(),
+            page
+        );
+        let refused = |reply: Value| match read_runner_reply(reply.clone()) {
+            Err(error @ SessionResolveError::ReplyShape(_)) => {
+                assert!(error.to_string().starts_with(RUNNER_REPLY_SHAPE), "{error}");
+            }
+            other => panic!("{reply} was not refused by shape: {other:?}"),
+        };
+        refused(page.clone());
+        refused(json!({"result": page.clone(), "lineage_id": "L"}));
+        refused(json!({"result": page, "error": null}));
+        refused(json!({}));
+        refused(json!(null));
+        refused(json!([{"result": {}}]));
+    }
+
+    /// Through the real runner client: a wrapped `session.read` page and a
+    /// wrapped `session.send` reply come back as their answers; a bare page
+    /// is refused by name.
+    #[tokio::test]
+    async fn the_runner_client_reads_wrapped_replies_and_refuses_bare_ones() {
+        let route = crate::route_targets::SessionRunnerRoute::for_principal(
+            Some(&subc_protocol::Principal::Reserved {
+                module_id: "broca".into(),
+            }),
+            "s",
+        )
+        .unwrap();
+        let identity = RunnerBindIdentity {
+            project_root: "/project".into(),
+            harness: "broca".into(),
+            session: "s".into(),
+        };
+        let page = json!({"lineage_id":"L","messages":[]});
+        let send = json!({"state":"pending","submission_id":"q"});
+        for (reply, method, expected) in [
+            (
+                json!({"result": page.clone()}),
+                "session.read",
+                Some(page.clone()),
+            ),
+            (
+                json!({"result": send.clone()}),
+                "session.send",
+                Some(send.clone()),
+            ),
+            (page.clone(), "session.read", None),
+        ] {
+            let (_temp, connection_file, _) =
+                fake_daemon_answering(serde_json::to_vec(&reply).unwrap()).await;
+            let runner =
+                RealProviderRunner::new(connection_file, RouteTargetConfig::runner_module("broca"));
+            let answer = runner
+                .call_for_identity(&route, &identity, method, json!({}), Duration::from_secs(5))
+                .await;
+            match (answer, expected) {
+                (Ok(answer), Some(expected)) => assert_eq!(answer, expected),
+                (Err(SessionResolveError::ReplyShape(_)), None) => {}
+                (other, expected) => panic!("{method} {reply}: {other:?}, expected {expected:?}"),
+            }
+        }
     }
 
     /// Both runner paths, the process-configured provider runner and a

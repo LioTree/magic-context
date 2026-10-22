@@ -644,6 +644,14 @@ impl McHandler {
             .map_err(interrupted)?
         {
             ReadProgress::Complete => {}
+            // `parse_pages` refuses a page without a lineage, so the export
+            // cannot serve the runner's page for a session it never wrote.
+            ReadProgress::NeverWritten => {
+                return Err(OfflineError::Refused(
+                    "pages_not_chained",
+                    "the pages name no lineage".into(),
+                ))
+            }
             ReadProgress::Incomplete { next } => {
                 return Err(OfflineError::Interrupted(format!(
                     "the page read stopped at ordinal {next}"

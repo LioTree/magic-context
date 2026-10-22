@@ -204,6 +204,7 @@ impl McStore {
             state,
             namespace: "",
             tags: &[],
+            forget_tags_of: Vec::new(),
             truncate_entries: None,
             entries: Vec::new(),
             baselines: Vec::new(),
@@ -388,6 +389,7 @@ pub struct AsyncCompactionSave<'a> {
     state: &'a str,
     namespace: &'a str,
     tags: &'a [McTagRow],
+    forget_tags_of: Vec<String>,
     truncate_entries: Option<Option<u64>>,
     entries: Vec<(u64, String, String)>,
     baselines: Vec<(&'static str, Option<String>)>,
@@ -400,6 +402,15 @@ impl<'a> AsyncCompactionSave<'a> {
     pub fn tags(&mut self, namespace: &'a str, tags: &'a [McTagRow]) -> &mut Self {
         self.namespace = namespace;
         self.tags = tags;
+        self
+    }
+
+    /// Forget the namespace's tag rows of these message ids, and their
+    /// consumed marks, before this save's new rows are imported. A tag number
+    /// names a part only within one lineage: after a cut, the new lineage may
+    /// show the same number on another part, which must not find the old row.
+    pub fn forget_tags_of(&mut self, mids: Vec<String>) -> &mut Self {
+        self.forget_tags_of.extend(mids);
         self
     }
 
@@ -455,6 +466,7 @@ impl<'a> AsyncCompactionSave<'a> {
             state,
             namespace,
             tags,
+            ref forget_tags_of,
             truncate_entries,
             ref entries,
             ref baselines,
@@ -504,6 +516,18 @@ impl<'a> AsyncCompactionSave<'a> {
                     "DELETE FROM mc_async_compaction_views WHERE session_ref=?1 AND version<?2
                         AND version<(SELECT max(version) FROM mc_async_compaction_views WHERE session_ref=?1)",
                     params![session_ref, floor],
+                )? as u64;
+            }
+            for mid in forget_tags_of {
+                let prefix = format!("{mid}#");
+                rows += conn.execute(
+                    "DELETE FROM mc_provider_consumed_tags_v1 WHERE engine_namespace=?1 AND tag_number IN
+                        (SELECT tag_number FROM mc_tags WHERE session_id=?1 AND substr(block_id,1,length(?2))=?2)",
+                    params![namespace, prefix],
+                )? as u64;
+                rows += conn.execute(
+                    "DELETE FROM mc_tags WHERE session_id=?1 AND substr(block_id,1,length(?2))=?2",
+                    params![namespace, prefix],
                 )? as u64;
             }
             crate::provider_log::insert_tags_tx(conn, namespace, tags)?;

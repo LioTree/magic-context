@@ -143,6 +143,10 @@ impl<S: Stream + 'static> Publisher for Bus<S> {
 /// How far one budgeted transcript read got.
 enum ReadProgress {
     Complete,
+    /// The runner answered the read with its page for a session it never
+    /// wrote: empty, with no `lineage_id` and no next page (llm-runner §4.2).
+    /// There is nothing to read until the runner writes the session.
+    NeverWritten,
     /// Every page read was valid, but the budget ran out before the runner's
     /// last page; `next` is the first ordinal not read.
     Incomplete {
@@ -191,6 +195,11 @@ pub(crate) struct AsyncRecord {
     /// OpenCode 1 plugin; see `moved_session`.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     standalone_move: Option<moved_session::StandaloneMove>,
+    /// The named outcome of the last transcript read when it was not an
+    /// ordinary page: `never_written` (see `ReadProgress::NeverWritten`).
+    /// Shown by `ctx-status`; cleared by the next read that names a lineage.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub(crate) read_outcome: Option<String>,
     /// The notice whose transcript read ran out of budget and is continued on
     /// its retry; see `read_async_resumable`.
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -421,6 +430,10 @@ struct Journal {
     truncate: Option<Option<u64>>,
     /// The published views' engine forms belong to a discarded generation.
     clear_published: bool,
+    /// Messages a cut removed: their rows in the namespace's tag table go
+    /// on the next save, because the next lineage may show their numbers on
+    /// other parts.
+    forget_tags_of: Vec<String>,
     /// Identities of the baselines as last stored.
     produced: Option<ViewIdentity>,
     applied: Option<ViewIdentity>,
@@ -544,7 +557,179 @@ fn verified_descent(state: &State, header: &str) -> Option<u64> {
         return None;
     }
     let entry = state.entries.get(&through)?.read().ok()?;
-    (contract::digest::content_digest(&entry.message) == digest).then_some(through)
+    (served_digest(&entry).ok()? == digest).then_some(through)
+}
+
+/// A failed call to the session's runner. A reply in the wrong envelope is a
+/// contract violation counted as a protocol error (and so recorded on the
+/// conversation, logged and shown by `ctx-status`), never a transient retry.
+fn runner_error(failure: SessionResolveError) -> HandlerOutcome {
+    match failure {
+        SessionResolveError::ReplyShape(_) => error(PROTOCOL_ERROR, failure.to_string()),
+        other => transient(other),
+    }
+}
+
+/// The named outcome of a read the runner answered with its page for a
+/// session it never wrote.
+const NEVER_WRITTEN: &str = "never_written";
+/// The protocol-error reason prefix for any other page without a lineage.
+const LINEAGELESS_PAGE: &str = "lineageless_page";
+
+/// A `session.read` page with no `lineage_id`. The contract allows exactly
+/// one: a session the runner never wrote answers an empty page with no
+/// lineage and no next page (llm-runner §4.2). Any other page without a
+/// lineage, including that page for a session ck-mc already holds messages
+/// of, is a contract violation refused by name.
+fn lineageless_page(state: &State, page: &Value) -> Result<ReadProgress, HandlerOutcome> {
+    let messages = page.get("messages").and_then(Value::as_array);
+    let count = messages.map_or(0, Vec::len);
+    let keys = page
+        .as_object()
+        .map(|page| page.keys().cloned().collect::<Vec<_>>())
+        .unwrap_or_default();
+    let never_written = messages.is_some_and(Vec::is_empty)
+        && page.get("next_from_ordinal").is_none_or(Value::is_null)
+        && state.entries.is_empty();
+    log_read_identity_once(state, Some((&keys, count, never_written)));
+    if never_written {
+        return Ok(ReadProgress::NeverWritten);
+    }
+    Err(error(
+        PROTOCOL_ERROR,
+        format!(
+            "{LINEAGELESS_PAGE}: a page without a lineage must be empty, with no next page, \
+             and only for a session never written; got keys {keys:?}, {count} messages, \
+             {} held",
+            state.entries.len()
+        ),
+    ))
+}
+
+/// Log, once per conversation, the identity ck-mc's reads use (the project,
+/// harness and session from `runner_identity`), and, once per conversation
+/// and outcome, a page without a lineage with its top-level keys and message
+/// count. One line then shows a read whose identity names no session the
+/// runner wrote.
+fn log_read_identity_once(state: &State, lineageless: Option<(&[String], usize, bool)>) {
+    static LOGGED: std::sync::OnceLock<std::sync::Mutex<std::collections::HashSet<String>>> =
+        std::sync::OnceLock::new();
+    let reference = state.reference();
+    let key = match lineageless {
+        None => format!("{reference}:identity"),
+        Some((_, _, true)) => format!("{reference}:{NEVER_WRITTEN}"),
+        Some((_, _, false)) => format!("{reference}:{LINEAGELESS_PAGE}"),
+    };
+    if !LOGGED
+        .get_or_init(Default::default)
+        .lock()
+        .expect("read identity log")
+        .insert(key)
+    {
+        return;
+    }
+    let identity = state.runner_identity();
+    let fields = format!(
+        "session_ref={reference} project={} harness={} session={}",
+        identity.project_root.to_string_lossy(),
+        identity.harness,
+        identity.session
+    );
+    let line = match lineageless {
+        None => format!("async_read_identity {fields}"),
+        Some((keys, messages, never_written)) => format!(
+            "async_read_lineageless_page {fields} page_keys={keys:?} messages={messages} outcome={}",
+            if never_written { NEVER_WRITTEN } else { LINEAGELESS_PAGE }
+        ),
+    };
+    if lineageless.is_some() {
+        tracing::warn!("{line}");
+    } else {
+        tracing::info!("{line}");
+    }
+    #[cfg(test)]
+    READ_LOG.with(|log| log.borrow_mut().push(line));
+}
+
+// The read-identity lines this thread logged, for tests.
+#[cfg(test)]
+thread_local! {
+    static READ_LOG: std::cell::RefCell<Vec<String>> = const { std::cell::RefCell::new(Vec::new()) };
+}
+
+/// The protocol-error reason prefix for a descriptors-mode read whose message
+/// lacks the runner's content digests.
+const SERVED_DIGEST_MISSING: &str = "served_digest_missing";
+
+fn missing_served_digest(entry: &ReadMessage, reason: impl std::fmt::Display) -> HandlerOutcome {
+    error(
+        PROTOCOL_ERROR,
+        format!(
+            "{SERVED_DIGEST_MISSING}: message {} at ordinal {}: {reason}",
+            entry.mid, entry.ordinal
+        ),
+    )
+}
+
+/// Check a newly read message carries the runner's content identity:
+/// a message `digest` and one `part_digests` row per exposed part, keyed as
+/// its tag rows are. A runner that serves none in descriptors mode is
+/// refused by name; ck-mc never hashes a descriptor in its place.
+fn check_served_identity(entry: &ReadMessage) -> Result<(), HandlerOutcome> {
+    let keys = entry
+        .tags
+        .iter()
+        .map(|row| row.part.clone())
+        .collect::<Vec<_>>();
+    entry
+        .check_descriptors(&keys)
+        .map_err(|reason| missing_served_digest(entry, reason))
+}
+
+/// The runner's content digest of a held message (compaction-provider §5).
+///
+/// A message read in descriptors mode carries it (checked when it was
+/// read). A message held from before ck-mc read in descriptors mode was read
+/// inline, so its stored body is the full inline message the digest is
+/// defined over; only such a body, one holding no ref, is hashed here.
+fn served_digest(entry: &ReadMessage) -> Result<String, HandlerOutcome> {
+    match &entry.digest {
+        Some(digest) => Ok(digest.clone()),
+        None => inline_digest(entry, &entry.message),
+    }
+}
+
+/// The runner's content digest of the part keyed `part` in a held message,
+/// from its `part_digests` row; for a message held from an inline read, the
+/// digest of that part's inline body (see [`served_digest`]).
+fn served_part_digest(entry: &ReadMessage, part: &str) -> Result<String, HandlerOutcome> {
+    if let Some(rows) = &entry.part_digests {
+        return rows
+            .iter()
+            .find(|row| row.part == part)
+            .map(|row| row.digest.clone())
+            .ok_or_else(|| missing_served_digest(entry, format!("no digest for part {part}")));
+    }
+    let index = entry
+        .tags
+        .iter()
+        .position(|row| row.part == part)
+        .ok_or_else(|| missing_served_digest(entry, format!("no part {part}")))?;
+    let native = parts(&entry.message)?;
+    let body = native
+        .get(index)
+        .ok_or_else(|| missing_served_digest(entry, format!("no body for part {part}")))?;
+    inline_digest(entry, body)
+}
+
+fn inline_digest(entry: &ReadMessage, body: &Value) -> Result<String, HandlerOutcome> {
+    if crate::descriptors::holds_descriptor(body) {
+        return Err(missing_served_digest(
+            entry,
+            "a described message has no served digest",
+        ));
+    }
+    Ok(contract::digest::content_digest(body))
 }
 
 impl State {
@@ -669,6 +854,7 @@ impl State {
         let state = serde_json::to_string(self).map_err(transient)?;
         let mut save = store.async_compaction_save(&reference, &key, &self.key.session, &state);
         save.tags(&namespace, tag_rows);
+        save.forget_tags_of(self.journal.forget_tags_of.clone());
         if let Some(through) = self.journal.truncate {
             save.truncate_entries(through);
         }
@@ -697,6 +883,7 @@ impl State {
             return Err(transient(error));
         }
         self.journal.truncate = None;
+        self.journal.forget_tags_of.clear();
         self.frozen_edits.dirty = false;
         self.retired_frozen.dirty = false;
         self.journal.clear_published = false;
@@ -892,6 +1079,14 @@ impl State {
         self.reminder_echoes.truncate(through);
         match through {
             Some(through) => {
+                self.journal.forget_tags_of.extend(
+                    self.entries
+                        .range((
+                            std::ops::Bound::Excluded(through),
+                            std::ops::Bound::Unbounded,
+                        ))
+                        .map(|(_, entry)| entry.mid.clone()),
+                );
                 self.entries.retain(|ordinal, _| *ordinal <= through);
                 self.tag_index
                     .retain(|_, address| address.ordinal <= through);
@@ -1062,12 +1257,7 @@ impl State {
             let digests = self
                 .entries
                 .iter()
-                .map(|(ordinal, entry)| {
-                    Ok((
-                        *ordinal,
-                        contract::digest::content_digest(&entry.read()?.message),
-                    ))
-                })
+                .map(|(ordinal, entry)| Ok((*ordinal, served_digest(&entry.read()?)?)))
                 .collect::<Result<BTreeMap<u64, String>, HandlerOutcome>>()?;
             let source = |ordinal: &u64, entry: &Arc<HeldEntry>| SourceMessage {
                 mid: entry.mid.clone(),
@@ -1200,6 +1390,33 @@ impl State {
     }
 }
 
+/// A `ready` Setup answer carrying a moved session's Setup checkpoint
+/// (compaction-provider §4): on every answer for that session, unchanged, and
+/// on none for a session that was never moved. Records stored before the
+/// checkpoint had its own member kept it as two top-level members; those are
+/// not part of the published answer and are dropped.
+fn with_checkpoint(
+    mut answer: Value,
+    checkpoint: Option<contract::setup::SetupCheckpoint>,
+) -> Value {
+    if let Some(answer) = answer.as_object_mut() {
+        answer.remove("tag_checkpoint");
+        answer.remove("cut");
+        match checkpoint {
+            Some(checkpoint) => {
+                answer.insert(
+                    "checkpoint".into(),
+                    serde_json::to_value(checkpoint).expect("checkpoint serializes"),
+                );
+            }
+            None => {
+                answer.remove("checkpoint");
+            }
+        }
+    }
+    answer
+}
+
 /// Load a conversation with its held transcript, tag index and engine
 /// baselines: everything a notice, ride or save needs.
 fn load(store: &McStore, reference: &str) -> Result<Option<State>, HandlerOutcome> {
@@ -1275,6 +1492,7 @@ fn load(store: &McStore, reference: &str) -> Result<Option<State>, HandlerOutcom
         indexed_through: through,
         truncate: None,
         clear_published: false,
+        forget_tags_of: Vec::new(),
         produced: state
             .produced_view
             .as_ref()
@@ -1518,9 +1736,57 @@ impl McHandler {
             {
                 return Err(invalid_field("params", "async setup plan is frozen"));
             }
+            let checkpoint = state
+                .standalone_move
+                .as_ref()
+                .map(moved_session::StandaloneMove::checkpoint)
+                .or_else(|| {
+                    standalone_move.as_ref().map(|record| {
+                        contract::setup::SetupCheckpoint::new(record.tag_checkpoint, &record.cut)
+                    })
+                });
+            if let Some(refusal) = self
+                .refuse_checkpoint_unsupported(
+                    checkpoint.as_ref(),
+                    &state.runner()?,
+                    &state.runner_identity(),
+                    &request.request_id,
+                )
+                .await?
+            {
+                return bytes(&refusal);
+            }
             let mut answer = state.initial;
             answer["request_id"] = json!(request.request_id);
-            return bytes(&answer);
+            return bytes(&with_checkpoint(answer, checkpoint));
+        }
+        let checkpoint = standalone_move.as_ref().map(|record| {
+            contract::setup::SetupCheckpoint::new(record.tag_checkpoint, &record.cut)
+        });
+        if let Some(checkpoint) = &checkpoint {
+            // Refused before anything is stored, so a later Setup from a
+            // runner that declares the group sets the session up afresh.
+            let route = crate::route_targets::SessionRunnerRoute::for_principal(
+                binding.principal.as_ref(),
+                &request.session,
+            )
+            .ok_or_else(|| invalid_field("runner", "unsupported session runner principal"))?;
+            let identity = session_resolver::RunnerBindIdentity {
+                project_root: binding.project_root.clone(),
+                harness: request.harness.clone(),
+                session: request.session.clone(),
+            };
+            if let Some(refusal) = self
+                .refuse_checkpoint_unsupported(
+                    Some(checkpoint),
+                    &route,
+                    &identity,
+                    &request.request_id,
+                )
+                .await?
+            {
+                return bytes(&refusal);
+            }
         }
         let generation = match discarded {
             Some((generation, reason)) => {
@@ -1550,7 +1816,7 @@ impl McHandler {
                 .retire_unannounced_async_views(&reference)
                 .map_err(transient)?;
         }
-        bytes(&state.initial)
+        bytes(&with_checkpoint(state.initial.clone(), checkpoint))
     }
 
     /// A new conversation record for `request`, with Setup's engine pass run
@@ -1582,6 +1848,7 @@ impl McHandler {
             resync_sources: None,
             restored_head: None,
             standalone_move: standalone_move.map(moved_session::StandaloneMove::from_record),
+            read_outcome: None,
             partial_read_seq: None,
             failure: None,
             engine_failed: false,
@@ -1681,13 +1948,40 @@ impl McHandler {
         // `serializer_profile` is a ck-mc extension member: the profile this
         // Setup accepted, so the runner can confirm ck-mc reads its schema.
         state.initial = json!({"answer":"ready","request_id":request.request_id,"initial":wire, "ceiling":CeilingPolicy::new(0.95,300_000).with_on_overflow(),"serializer_profile":codec.wire_id()});
-        // The setup checkpoint of a moved session: `initial` is repeated on every
-        // later setup, so the runner always gets the same checkpoint and cut.
-        if let Some(moved) = &state.standalone_move {
-            state.initial["tag_checkpoint"] = json!(moved.tag_checkpoint);
-            state.initial["cut"] = json!(moved.cut);
-        }
         Ok(state)
+    }
+
+    /// For a moved session (`checkpoint` present), the terminal
+    /// `tag_checkpoint_unsupported` refusal when its runner does not declare
+    /// llm-runner's `tag_checkpoint` group, read from the runner's own
+    /// `role.describe`; `None` when Setup may answer.
+    async fn refuse_checkpoint_unsupported(
+        &self,
+        checkpoint: Option<&contract::setup::SetupCheckpoint>,
+        route: &crate::route_targets::SessionRunnerRoute,
+        identity: &session_resolver::RunnerBindIdentity,
+        request_id: &str,
+    ) -> Result<Option<Value>, HandlerOutcome> {
+        if checkpoint.is_none() {
+            return Ok(None);
+        }
+        let reply = self
+            .provider_runner
+            .call_for_identity(
+                route,
+                identity,
+                "role.describe",
+                json!({}),
+                Duration::from_millis(1_500),
+            )
+            .await
+            .map_err(runner_error)?;
+        let describe = cortexkit_role_llm_runner::describe::check_describe(&reply)
+            .map_err(|problems| transient(format!("runner role.describe: {problems:?}")))?;
+        Ok(
+            (!describe.declares(cortexkit_role_llm_runner::capabilities::TAG_CHECKPOINT))
+                .then(|| moved_session::tag_checkpoint_refusal(request_id)),
+        )
     }
 
     fn async_engine(
@@ -1894,6 +2188,18 @@ fn decoded_entry(
 ) -> Result<ck_wire::CkIngressMessage, HandlerOutcome> {
     #[cfg(test)]
     resident::counters::decoded(1);
+    let exposed;
+    let entry = match crate::descriptors::expose(&entry.message) {
+        Some(message) => {
+            exposed = InboundMessage {
+                ordinal: entry.ordinal,
+                mid: entry.mid.clone(),
+                message,
+            };
+            &exposed
+        }
+        None => entry,
+    };
     codec
         .decode_entries(std::slice::from_ref(entry))?
         .pop()
@@ -2041,17 +2347,18 @@ fn compact_prefix_hygiene_once(
     Ok(())
 }
 
+/// The part as the runner renders it to the model under `render_tags`: a
+/// numbered part's text gets its `§N§ ` prefix (`tags::render_part`), so a
+/// rendered part the engine left alone compares equal to it.
 fn render_part(part: &Value, tag: Option<&str>, render: bool) -> Value {
     let mut part = part.clone();
     if !render {
         return part;
     }
+    let number = tag.and_then(tags::parse_tag);
+    let render_text = |text: &str| tags::render_part(tags::PartKind::ToolResultText, number, text);
     if let Value::String(text) = &part {
-        return json!(tags::render_text(
-            tags::RenderKind::ToolResultText,
-            tag,
-            text
-        ));
+        return json!(render_text(text));
     }
     // An Anthropic `tool_result` may carry its output as a plain `content` string.
     let anthropic_result = (part["type"] == "tool_result").then_some("/content");
@@ -2060,11 +2367,7 @@ fn render_part(part: &Value, tag: Option<&str>, render: bool) -> Value {
         .chain(anthropic_result)
     {
         if let Some(value) = part.pointer_mut(pointer).filter(|v| v.is_string()) {
-            *value = json!(tags::render_text(
-                tags::RenderKind::ToolResultText,
-                tag,
-                value.as_str().unwrap()
-            ));
+            *value = json!(render_text(value.as_str().unwrap()));
             break;
         }
     }
@@ -2075,6 +2378,8 @@ fn stable_entry(left: &ReadMessage, right: &ReadMessage) -> bool {
     left.ordinal == right.ordinal
         && left.mid == right.mid
         && left.message == right.message
+        && left.digest == right.digest
+        && left.part_digests == right.part_digests
         && left.tags == right.tags
         && left.role == right.role
         && left.written_at == right.written_at
@@ -2149,10 +2454,21 @@ fn tag_rows_for<'a>(
             let number = tags::parse_tag(tag)
                 .ok_or_else(|| invalid_field("tags", "malformed runner tag"))?;
             let (kind, text) = match &block.kind {
-                ck_wire::CkKind::Text { text } => ("message", text.as_str()),
+                ck_wire::CkKind::Text { text } => {
+                    ("message", std::borrow::Cow::Borrowed(text.as_str()))
+                }
                 ck_wire::CkKind::ToolResult { output, .. } => match &output.kind {
                     ck_wire::CkOutputKind::Text { text }
-                    | ck_wire::CkOutputKind::ErrorText { text } => ("tool_result", text.as_str()),
+                    | ck_wire::CkOutputKind::ErrorText { text } => {
+                        ("tool_result", std::borrow::Cow::Borrowed(text.as_str()))
+                    }
+                    // A tool result holding only images is numbered too
+                    // (llm-runner §9.6), so `ctx_reduce` can reach a screenshot.
+                    ck_wire::CkOutputKind::Json { value }
+                    | ck_wire::CkOutputKind::ErrorJson { value } => (
+                        "tool_result",
+                        std::borrow::Cow::Owned(serde_json::to_string(value).map_err(transient)?),
+                    ),
                     _ => continue,
                 },
                 _ => continue,
@@ -2164,7 +2480,10 @@ fn tag_rows_for<'a>(
                 tag_number: i64::try_from(number).map_err(invalid)?,
                 block_id: format!("{}#{index}", entry.mid),
                 kind: kind.into(),
-                token_count: mc_tokenizer::estimate_tokens(text) as i64,
+                // A described payload counts as the payload it stands for.
+                token_count: crate::descriptors::block_tokens(&block.kind)
+                    .unwrap_or_else(|| mc_tokenizer::estimate_tokens(&text))
+                    as i64,
                 created_at_ms: now_ms(),
                 source_bytes: text.as_bytes().into(),
             });
@@ -2245,7 +2564,9 @@ fn ranges(
                 .and_then(|n| state.entries.get(&n))
         };
         let Some(original) = original else {
-            synthetic.push(message.clone());
+            // Messages ck-mc authors (a head, a fold of covered messages) are
+            // sent as written, so a ref inside one never reaches the model.
+            synthetic.push(crate::descriptors::without_refs(message));
             continue;
         };
         let original = original.read()?;
@@ -2275,7 +2596,12 @@ fn ranges(
             .and_then(|ck| codec.part_origins(ck, message));
         let mut edits = Vec::new();
         for (index, (part, row)) in before.iter().zip(&original.tags).enumerate() {
-            let expected = render_part(part, row.tag.as_deref(), render);
+            // A part the runner described reached the engine as its stand-in
+            // (`crate::descriptors::expose`); rendering that stand-in back is
+            // the part unchanged.
+            let exposed = crate::descriptors::expose(part);
+            let seen = exposed.as_ref().unwrap_or(part);
+            let expected = render_part(seen, row.tag.as_deref(), render);
             let changed = if let Some(origins) = &origins {
                 origins
                     .iter()
@@ -2294,7 +2620,15 @@ fn ranges(
                     &original.mid,
                     &row.part,
                 )),
-                Some(value) if value != &expected && value != part => {
+                // An edit that still holds a ref or ck-mc's stand-in for one is
+                // not sent, and the part stays as written: otherwise the model
+                // would get ck-mc's placeholder in place of the runner's payload.
+                Some(value)
+                    if value != &expected
+                        && value != part
+                        && value != seen
+                        && !crate::descriptors::holds_stand_in(value) =>
+                {
                     edits.push(view::PartEdit::replace(
                         original.ordinal,
                         &original.mid,
@@ -2491,6 +2825,19 @@ fn reminder_protection(
     Ok(crate::protection_window::ProtectionWindow::from_persisted_rows(&rows, floor))
 }
 
+/// A reminder hint for the part the current lineage's read numbered
+/// `number`: the reminder names the part by its host identity, and the
+/// number only renders the text ck-mc expects the runner to deliver.
+fn hint_part(state: &State, number: i64) -> Option<crate::runner_reminders::HintPart> {
+    let number = u64::try_from(number).ok()?;
+    let address = state.tag_index.get(&tags::format_tag(number)?)?;
+    Some(crate::runner_reminders::HintPart::new(
+        number,
+        &address.mid,
+        &address.part,
+    ))
+}
+
 /// Hint membership needs live block identity and tool names, not tool-arc projection.
 /// Decode only uncovered entries; covered invocations need not be reconstructed for
 /// a tool result whose call crossed the coverage boundary.
@@ -2597,11 +2944,11 @@ fn async_reminder_hints(
             &queued,
         )
         .into_iter()
-        .filter_map(|(number, _)| u64::try_from(number).ok())
+        .filter_map(|(number, _)| hint_part(state, number))
         .collect(),
         channel2: transform::oldest_channel2_hint(&active, &protection.cutoff, &queued)
             .into_iter()
-            .filter_map(|(number, _)| u64::try_from(number).ok())
+            .filter_map(|(number, _)| hint_part(state, number))
             .collect(),
     })
 }
@@ -2655,11 +3002,11 @@ fn async_reminder_hints_oracle(
             &queued,
         )
         .into_iter()
-        .filter_map(|(number, _)| u64::try_from(number).ok())
+        .filter_map(|(number, _)| hint_part(state, number))
         .collect(),
         channel2: transform::oldest_channel2_hint(&active, &protection.cutoff, &queued)
             .into_iter()
-            .filter_map(|(number, _)| u64::try_from(number).ok())
+            .filter_map(|(number, _)| hint_part(state, number))
             .collect(),
     })
 }
@@ -2926,6 +3273,17 @@ impl McHandler {
                     "async read incomplete; resuming from ordinal {next}"
                 )));
             }
+            if let Ok(ReadProgress::NeverWritten) = read {
+                // Not a failure to retry: the runner has written nothing for
+                // this session. The notice is acknowledged; the next notice or
+                // Setup reads again.
+                tracing::info!(session_ref=%notice.session_ref, outcome=NEVER_WRITTEN, "async read: the runner has never written this session");
+                state.read_outcome = Some(NEVER_WRITTEN.into());
+                state.partial_read_seq = None;
+                state.save(store, &[])?;
+                self.checkin(state);
+                return Ok(());
+            }
             let read = read.map(|_| ());
             let verified = read.is_ok()
                 && state
@@ -2933,9 +3291,9 @@ impl McHandler {
                     .get(&notice.through_ordinal)
                     .map(|entry| entry.read())
                     .transpose()?
-                    .is_some_and(|entry| {
-                        contract::digest::content_digest(&entry.message) == notice.through_digest
-                    });
+                    .map(|entry| served_digest(&entry))
+                    .transpose()?
+                    .is_some_and(|digest| digest == notice.through_digest);
             if verified {
                 state.partial_read_seq = None;
                 state.resync = false;
@@ -3045,7 +3403,8 @@ impl McHandler {
         budget: Duration,
     ) -> Result<(), HandlerOutcome> {
         match self.read_async_resumable(state, from, budget).await? {
-            ReadProgress::Complete => Ok(()),
+            // A session the runner never wrote has nothing to catch up on.
+            ReadProgress::Complete | ReadProgress::NeverWritten => Ok(()),
             ReadProgress::Incomplete { .. } => {
                 Err(transient("async paging did not advance within deadline"))
             }
@@ -3073,7 +3432,10 @@ impl McHandler {
             if pages > 0 && deadline.saturating_duration_since(page_started) <= slowest_page {
                 return Ok(ReadProgress::Incomplete { next: from });
             }
-            let mut params = json!({"from_ordinal":from,"max_bytes":1_048_576});
+            // Descriptors mode (compaction-provider §3): payloads arrive as refs
+            // and every message carries the runner's own content digests.
+            let mut params =
+                json!({"from_ordinal":from,"max_bytes":1_048_576,"media":"descriptors"});
             if let Some(lineage) = &state.lineage {
                 params["lineage_id"] = json!(lineage);
             }
@@ -3087,10 +3449,12 @@ impl McHandler {
                     deadline.saturating_duration_since(Instant::now()),
                 )
                 .await
-                .map_err(transient)?;
-            let lineage = page["lineage_id"]
-                .as_str()
-                .ok_or_else(|| transient("async read has no lineage"))?;
+                .map_err(runner_error)?;
+            log_read_identity_once(state, None);
+            let Some(lineage) = page["lineage_id"].as_str() else {
+                return lineageless_page(state, &page);
+            };
+            state.read_outcome = None;
             if state.lineage.as_deref().is_some_and(|held| held != lineage) {
                 return Err(transient("async lineage changed"));
             }
@@ -3124,6 +3488,7 @@ impl McHandler {
                         return Err(transient("async entry changed on re-read"));
                     }
                 } else {
+                    check_served_identity(&entry)?;
                     if let Some(cadence) = &mut state.reminder_cadence {
                         state.reminder_echoes.ingest(
                             &entry,
@@ -4298,7 +4663,7 @@ impl AsyncRecord {
                 ));
             }
             let mut keys = BTreeSet::new();
-            for (part, row) in native.iter().zip(&entry.tags) {
+            for row in &entry.tags {
                 if row.part.is_empty() || row.part.len() > 256 || !keys.insert(&row.part) {
                     return Err(invalid_field(
                         "tags",
@@ -4313,7 +4678,7 @@ impl AsyncRecord {
                         ordinal: entry.ordinal,
                         mid: entry.mid.clone(),
                         part: row.part.clone(),
-                        digest: contract::digest::content_digest(part),
+                        digest: served_part_digest(&entry, &row.part)?,
                     };
                     if self.tag_index.contains_key(tag)
                         || index.insert(tag.clone(), address).is_some()
@@ -4677,9 +5042,10 @@ impl AsyncRecord {
                 .messages
                 .iter()
                 .map(|old| {
-                    by_mid.get(old.mid.as_str()).copied().filter(|entry| {
-                        contract::digest::content_digest(&entry.message) == old.digest
-                    })
+                    by_mid
+                        .get(old.mid.as_str())
+                        .copied()
+                        .filter(|entry| served_digest(entry).is_ok_and(|d| d == old.digest))
                 })
                 .collect::<Option<Vec<_>>>();
             let Some(mapped) = mapped.filter(|mapped| {
@@ -4772,9 +5138,10 @@ impl AsyncRecord {
                 .messages
                 .iter()
                 .map(|old| {
-                    by_mid.get(old.mid.as_str()).copied().filter(|entry| {
-                        contract::digest::content_digest(&entry.message) == old.digest
-                    })
+                    by_mid
+                        .get(old.mid.as_str())
+                        .copied()
+                        .filter(|entry| served_digest(entry).is_ok_and(|d| d == old.digest))
                 })
                 .collect::<Option<Vec<_>>>();
             if let Some(mapped) = mapped.filter(|mapped| {
@@ -4810,9 +5177,9 @@ impl AsyncRecord {
             .collect::<BTreeMap<_, _>>();
         self.restored_no_new_content = retained.len() == source.history.len()
             && held.iter().all(|entry| {
-                old_messages.get(entry.mid.as_str()).is_some_and(|digest| {
-                    *digest == contract::digest::content_digest(&entry.message)
-                })
+                old_messages
+                    .get(entry.mid.as_str())
+                    .is_some_and(|digest| served_digest(entry).is_ok_and(|d| *digest == d))
             });
         if !self.restored_no_new_content {
             self.historian_pending = true;
@@ -4904,4 +5271,140 @@ impl McHandler {
         self.checkin(state);
         Ok(())
     }
+}
+
+/// What a runner serves for `entry` in descriptors mode, for the test runners
+/// ck-mc reads: the runner's content digests over the full inline message and
+/// each part, and every byte-backed image or file and every text over
+/// `PART_INLINE_MAX` replaced by a ref in place (llm-runner §4.2), selected by
+/// the crate's own `read::descriptors::describe`.
+#[cfg(test)]
+pub(crate) fn serve_descriptors(entry: &ReadMessage) -> ReadMessage {
+    use base64::Engine as _;
+    use cortexkit_role_llm_runner::read::descriptors::{
+        describe, PartDigest, Payload, Reference, DESCRIPTOR_MESSAGE_MAX, PART_INLINE_MAX,
+    };
+    fn pointer_of(base: &str, key: &str) -> String {
+        format!("{base}/{}", key.replace('~', "~0").replace('/', "~1"))
+    }
+    fn media(value: &Value) -> Option<(String, String)> {
+        let source = value.get("source");
+        if let Some(source) =
+            source.filter(|source| source.get("type").and_then(Value::as_str) == Some("base64"))
+        {
+            return Some((
+                source.get("media_type")?.as_str()?.into(),
+                source.get("data")?.as_str()?.into(),
+            ));
+        }
+        if value.get("type").and_then(Value::as_str) == Some("file") {
+            let url = value.get("url")?.as_str()?;
+            let (header, data) = url.strip_prefix("data:")?.split_once(',')?;
+            return Some((header.strip_suffix(";base64")?.into(), data.into()));
+        }
+        if value.get("type").and_then(Value::as_str) == Some("image") {
+            return Some((
+                value.get("mimeType")?.as_str()?.into(),
+                value.get("data")?.as_str()?.into(),
+            ));
+        }
+        None
+    }
+    fn collect(
+        value: &Value,
+        pointer: &str,
+        tops: &BTreeMap<String, String>,
+        payloads: &mut Vec<Payload>,
+    ) {
+        let part = tops.get(pointer).cloned();
+        if let Some((mime, data)) = media(value) {
+            let bytes = base64::engine::general_purpose::STANDARD
+                .decode(data.as_bytes())
+                .expect("test media is base64");
+            let kind = if mime.starts_with("image/") {
+                "image"
+            } else if mime == "application/pdf" {
+                "pdf"
+            } else {
+                "file"
+            };
+            let dimensions = (kind == "image")
+                .then(|| crate::image_tokens::base64_image_dimensions(&mime, &data))
+                .flatten();
+            payloads.push(Payload {
+                pointer: pointer.into(),
+                reference: Reference::media(part, kind, mime, &bytes, dimensions),
+                required: true,
+            });
+            return;
+        }
+        match value {
+            Value::String(text) if text.len() > PART_INLINE_MAX => payloads.push(Payload {
+                pointer: pointer.into(),
+                reference: Reference::text(part, text),
+                required: false,
+            }),
+            Value::Object(map) => {
+                for (key, child) in map {
+                    collect(child, &pointer_of(pointer, key), tops, payloads);
+                }
+            }
+            Value::Array(items) => {
+                for (index, child) in items.iter().enumerate() {
+                    collect(
+                        child,
+                        &pointer_of(pointer, &index.to_string()),
+                        tops,
+                        payloads,
+                    );
+                }
+            }
+            _ => {}
+        }
+    }
+    let mut served = entry.clone();
+    served.digest = Some(contract::digest::content_digest(&entry.message));
+    let Ok(native) = parts(&entry.message) else {
+        return served;
+    };
+    served.part_digests = Some(
+        entry
+            .tags
+            .iter()
+            .zip(native.iter())
+            .map(|(row, part)| PartDigest::new(&row.part, part))
+            .collect(),
+    );
+    let base = if entry.message.get("parts").is_some() {
+        "/parts"
+    } else if entry.message.get("content").is_some() {
+        "/content"
+    } else {
+        "/message/content"
+    };
+    let tops = if entry.message.pointer(base).is_some_and(Value::is_string) {
+        BTreeMap::from_iter(
+            entry
+                .tags
+                .first()
+                .map(|row| (base.to_owned(), row.part.clone())),
+        )
+    } else {
+        entry
+            .tags
+            .iter()
+            .enumerate()
+            .map(|(index, row)| (format!("{base}/{index}"), row.part.clone()))
+            .collect()
+    };
+    let mut payloads = Vec::new();
+    collect(&entry.message, "", &tops, &mut payloads);
+    if payloads.is_empty() {
+        return served;
+    }
+    let mut envelope = served.clone();
+    envelope.message = Value::Null;
+    let budget = DESCRIPTOR_MESSAGE_MAX - serde_json::to_vec(&envelope).unwrap().len();
+    served.message = describe(&entry.message, &payloads, budget).expect("describable test message");
+    served
 }

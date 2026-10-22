@@ -82,7 +82,7 @@ impl ReminderEchoes {
         now: u64,
     ) -> Result<(), HandlerOutcome> {
         ledger.expire(now);
-        let digest = contract::digest::content_digest(&entry.message);
+        let digest = served_digest(entry)?;
         let mut restored = false;
         self.awaiting_resync.retain_mut(|echo| {
             if echo.mid == entry.mid && echo.digest == digest {

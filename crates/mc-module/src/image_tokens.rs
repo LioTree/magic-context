@@ -209,9 +209,31 @@ pub(crate) fn estimate_image_tokens_from_parts(header: &str, payload: &str) -> i
     let Some((width, height)) = dimensions else {
         return IMAGE_FALLBACK_TOKENS;
     };
+    image_tokens_for_dimensions(width, height)
+}
+
+/// Provider token cost of an image of `width` x `height` pixels: one token per 750 pixels,
+/// rounded up and clamped to 1..=4,500. Standalone applies this one rule on every provider
+/// (`packages/plugin/src/hooks/magic-context/image-token-estimate.ts`, Anthropic's published
+/// vision formula), and so does ck-mc, whether the dimensions come from an inline image's
+/// header or from a runner's `media_ref` descriptor.
+pub(crate) fn image_tokens_for_dimensions(width: u64, height: u64) -> i64 {
     let pixels = width.saturating_mul(height);
     let tokens = pixels.saturating_add(IMAGE_TOKEN_DIVISOR - 1) / IMAGE_TOKEN_DIVISOR;
     (tokens as i64).clamp(1, IMAGE_TOKEN_CAP)
+}
+
+/// Pixel dimensions of a base64 image of `media_type`, read from its header the same way
+/// [`estimate_image_tokens_from_parts`] reads them; `None` when the header cannot be read.
+#[cfg(test)]
+pub(crate) fn base64_image_dimensions(media_type: &str, payload: &str) -> Option<(u64, u64)> {
+    let header = format!("data:{media_type};base64");
+    let bytes = decode_base64_preview(payload)?;
+    if header.contains("image/jpeg") || header.contains("image/jpg") {
+        jpeg_dimensions(&mut Base64ByteReader::new(payload, &bytes))
+    } else {
+        image_dimensions(&header, &bytes)
+    }
 }
 
 /// Provider token cost of an image media block, or `None` for non-image media (whose cost the
