@@ -339,17 +339,24 @@ impl ReminderEchoes {
 
     /// Called only after the engine has granted a rebuild. No notice or clock
     /// observation alone advances the frozen strip set.
+    ///
+    /// A strip on a part with no edit yet is a new edit; a keep range that
+    /// gains one is sorted again by part position (`tool_arcs::sort_edits`),
+    /// because the contract rejects a message whose edits are out of part
+    /// order (`edit_order`) and the new edit may belong before an existing one.
     pub(super) fn apply(
         &mut self,
         ledger: &DeliveryLedger,
         now: u64,
         entries: &BTreeMap<u64, Arc<HeldEntry>>,
+        kept: &tool_arcs::KeptMessages,
         ranges: &mut [view::ViewRange],
     ) -> Result<(), HandlerOutcome> {
         for range in ranges {
             let view::ViewRange::Keep { from, to, edits } = range else {
                 continue;
             };
+            let mut added = false;
             for (ordinal, entry) in entries.range(*from..*to) {
                 if !self
                     .blocks
@@ -407,8 +414,12 @@ impl ReminderEchoes {
                         edits[at] = edit;
                     } else {
                         edits.push(edit);
+                        added = true;
                     }
                 }
+            }
+            if added {
+                tool_arcs::sort_edits(kept, edits);
             }
         }
         Ok(())
@@ -450,5 +461,89 @@ fn possible_echo(value: &Value, ledger: &DeliveryLedger) -> bool {
         Value::Array(values) => values.iter().any(|value| possible_echo(value, ledger)),
         Value::Object(values) => values.values().any(|value| possible_echo(value, ledger)),
         _ => false,
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// A frozen whole-part echo on part "0" of a message whose part "2" the
+    /// view already drops: the strip's new drop must come before the existing
+    /// one, or the runner rejects the message's edits as out of part order.
+    #[test]
+    fn a_strip_on_an_earlier_part_than_an_existing_edit_keeps_part_order() {
+        let entry = ReadMessage::new(
+            0,
+            "m0",
+            json!({"role":"user","content":[
+                {"type":"text","text":"reminder echo"},
+                {"type":"text","text":"kept"},
+                {"type":"text","text":"dropped"}
+            ]}),
+        )
+        .with_tags(
+            ["0", "1", "2"]
+                .map(cortexkit_role_llm_runner::tags::PartTag::untagged)
+                .to_vec(),
+        );
+        let entries = BTreeMap::from([(0, Arc::new(HeldEntry::from_read(&entry).unwrap()))]);
+        let kept = BTreeMap::from([(
+            0,
+            tool_arcs::KeptMessage::new(codec::Codec::AnthropicMessages, &entry).unwrap(),
+        )]);
+        let sent: SentReminder = serde_json::from_value(json!({
+            "text":"reminder echo","kind":"test","sent_at_ms":0,"expires_at_ms":0,"serial":1
+        }))
+        .unwrap();
+        let mut echoes = ReminderEchoes {
+            blocks: vec![Echo {
+                ordinal: 0,
+                mid: "m0".into(),
+                digest: String::new(),
+                part: 0,
+                container: None,
+                index: None,
+                ck_index: None,
+                sent,
+                frozen: true,
+            }],
+            awaiting_resync: Vec::new(),
+        };
+        let mut ranges = vec![view::ViewRange::keep_with_edits(
+            0,
+            1,
+            vec![view::PartEdit::drop(0, "m0", "2")],
+        )];
+        echoes
+            .apply(&DeliveryLedger::default(), 0, &entries, &kept, &mut ranges)
+            .unwrap();
+        assert_eq!(
+            ranges,
+            vec![view::ViewRange::keep_with_edits(
+                0,
+                1,
+                vec![
+                    view::PartEdit::drop(0, "m0", "0"),
+                    view::PartEdit::drop(0, "m0", "2"),
+                ]
+            )]
+        );
+        // The contract's own part-order check, as the runner applies it.
+        let view = view::CompactionView::new(
+            "00000000000000000000000000000000",
+            1,
+            "L",
+            compact::lineage::MessageRef {
+                ordinal: 0,
+                mid: "m0".into(),
+            },
+            ranges,
+        );
+        view.check().unwrap();
+        assert_eq!(
+            view.check_parts(|_| Some(vec!["0".into(), "1".into(), "2".into()])),
+            Ok(())
+        );
     }
 }

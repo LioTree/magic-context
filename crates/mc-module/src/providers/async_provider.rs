@@ -3959,6 +3959,7 @@ impl McHandler {
                 &cadence.ledger,
                 now_ms().max(0) as u64,
                 &state.entries,
+                &kept,
                 &mut ranges,
             )?;
         }
