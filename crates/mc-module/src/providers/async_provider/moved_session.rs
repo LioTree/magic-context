@@ -74,16 +74,36 @@ pub(super) fn setup_fence(
     })
 }
 
-/// Setup refusal for a moved session on a runner that does not declare
-/// llm-runner's `tag_checkpoint` group: without the Setup checkpoint it would
-/// number the session from zero. Terminal (compaction-provider §4).
-pub(super) fn tag_checkpoint_refusal(request_id: &str) -> Value {
+/// Why a Setup answer carries a checkpoint, for the refusal's reason.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(super) enum CheckpointSource {
+    /// The session was moved from the standalone plugin.
+    StandaloneMove,
+    /// The Claude Code conversation was served on the full-array route
+    /// (`full_array_floor`).
+    FullArray,
+}
+
+/// Setup refusal for a session with a Setup checkpoint on a runner that does
+/// not declare llm-runner's `tag_checkpoint` group: without the checkpoint it
+/// would number the session from zero. Terminal (compaction-provider §4).
+pub(super) fn tag_checkpoint_refusal(request_id: &str, why: CheckpointSource) -> Value {
+    let reason = match why {
+        CheckpointSource::StandaloneMove => {
+            "This session was moved from the standalone Magic Context plugin, and its \
+             runner does not declare tag_checkpoint, so it cannot keep the session's tag numbers."
+        }
+        CheckpointSource::FullArray => {
+            "Magic Context numbered this conversation's parts on the full-array route before, \
+             and its runner does not declare tag_checkpoint, so it cannot keep new numbers \
+             above the ones the model has seen."
+        }
+    };
     json!({
         "answer": "refuse",
         "request_id": request_id,
         "code": contract::errors::refuse_codes::TAG_CHECKPOINT_UNSUPPORTED,
-        "reason": "This session was moved from the standalone Magic Context plugin, and its \
-                   runner does not declare tag_checkpoint, so it cannot keep the session's tag numbers.",
+        "reason": reason,
     })
 }
 
