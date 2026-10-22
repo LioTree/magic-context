@@ -1480,7 +1480,7 @@ impl McHandler {
         let standalone_move = match moved_session::setup_fence(
             store,
             &request.harness,
-            setup_session,
+            &request.session,
             &request.request_id,
         )? {
             moved_session::Fence::Fresh => None,
