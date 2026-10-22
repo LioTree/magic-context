@@ -1796,8 +1796,9 @@ enum SendOutcome {
 /// `unary_json` has already removed).
 ///
 /// The runner answers with a `state`-tagged result. Any answer carrying a `run_id`
-/// names the run that started (`active`); `pending` with a `submission_id` means the session already had an active run and this prompt
-/// was durably QUEUED behind it under a submission id. Reading only `run_id`
+/// names the run that started (`active`); `pending` with a `submission_id` means
+/// the session already had an active run and this prompt was durably QUEUED
+/// behind it under that submission id. Reading only `run_id`
 /// collapses those two into "no run id", which reports a queued (accepted) prompt as a
 /// malformed reply and hides the one fact that explains it — the session was busy.
 fn send_outcome(body: &Value) -> SendOutcome {
