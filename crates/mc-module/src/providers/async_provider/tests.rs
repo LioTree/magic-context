@@ -4,6 +4,7 @@ mod descriptors_read;
 mod full_array_setup;
 mod moved_session;
 mod offline_first_pass;
+mod published_contract;
 mod read_outcomes;
 mod read_resume;
 mod reminder_replay;
@@ -36,6 +37,7 @@ struct Runner {
     describes: std::sync::atomic::AtomicU64,
     /// A page to answer every `session.read` with, verbatim.
     page_override: Mutex<Option<Value>>,
+    history_requests: Mutex<Vec<Value>>,
 }
 
 #[derive(Default)]
@@ -125,6 +127,35 @@ impl session_resolver::ProviderRunner for Runner {
             return Ok(
                 json!({"majors":[{"version":"llm-runner/v1","ops":["role.describe","session.baseline","session.send","session.read","session.resolve"]}],"implementation_version":"fake","session_capabilities_from":"baseline","capabilities":capabilities}),
             );
+        }
+        if method == "session.head" {
+            return Ok(json!({"first_ordinal":0}));
+        }
+        if method == "session.history" {
+            self.history_requests.lock().unwrap().push(params.clone());
+            let entries = self.entries.lock().unwrap();
+            let start = if let Some(mid) = params["from_mid"].as_str() {
+                entries
+                    .iter()
+                    .position(|entry| entry.mid == mid)
+                    .ok_or_else(|| SessionResolveError::Refused {
+                        code: "unknown_mid".into(),
+                        message: "unknown history id".into(),
+                    })?
+            } else {
+                params["cursor"].as_str().unwrap().parse::<usize>().unwrap()
+            };
+            let messages = entries
+                .iter()
+                .skip(start)
+                .take(2)
+                .map(|entry| json!({"mid":entry.mid,"written_at":1,"message":entry.message}))
+                .collect::<Vec<_>>();
+            let mut page = json!({"messages":messages,"lineage_id":"L"});
+            if start + 2 < entries.len() {
+                page["newer"] = json!((start + 2).to_string());
+            }
+            return Ok(page);
         }
         assert_eq!(method, "session.read");
         self.reads.lock().unwrap().push(params.clone());
@@ -687,6 +718,14 @@ fn independent_digest(view: &view::CompactionView) -> String {
             "cut".into(),
             cut.cut_id.clone(),
             cut.through_ordinal.to_string(),
+        ]);
+    }
+    if let Some(ttl) = &view.cache_ttl {
+        fields.extend([
+            "cache_ttl".into(),
+            ttl.model.clone(),
+            ttl.ms.map_or_else(|| "null".into(), |ms| ms.to_string()),
+            ttl.configured.to_string(),
         ]);
     }
     let mut hash = sha2::Sha256::new();
@@ -1746,7 +1785,13 @@ async fn restored_lineage_reuses_history_embeddings_and_reanchors_only_surviving
     rig.notice(3, 1_000, Some(old_version)).await;
     let old_view = rig.get(old_version).await;
     assert_eq!(
-        old_view.ranges[0].to(),
+        old_view
+            .ranges
+            .iter()
+            .take_while(|r| matches!(r, view::ViewRange::Replace { .. }))
+            .last()
+            .unwrap()
+            .to(),
         21,
         "the history replacement must remove its covered raw prefix"
     );

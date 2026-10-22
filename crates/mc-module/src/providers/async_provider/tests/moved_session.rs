@@ -175,10 +175,19 @@ async fn moved_session_sets_up_from_the_import_and_carries_drops_onto_the_same_p
     // The first view replaces the summarized messages with the imported head,
     // and drops exactly the parts standalone had dropped.
     let view = rig.get(rig.newest().expect("a published view")).await;
-    let view::ViewRange::Replace { to, bytes, .. } = &view.ranges[0] else {
+    let view::ViewRange::Replace { bytes, .. } = &view.ranges[0] else {
         panic!("history head first: {:?}", view.ranges[0]);
     };
-    assert_eq!(*to, 6, "the head covers m001..m006");
+    assert_eq!(
+        view.ranges
+            .iter()
+            .take_while(|r| matches!(r, view::ViewRange::Replace { .. }))
+            .last()
+            .unwrap()
+            .to(),
+        6,
+        "the head covers m001..m006, split at the cut"
+    );
     for compartment in standalone {
         assert!(bytes.contains(compartment["content"].as_str().unwrap()));
     }

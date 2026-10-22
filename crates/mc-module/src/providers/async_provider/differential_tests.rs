@@ -370,6 +370,9 @@ impl session_resolver::ProviderRunner for Runner {
                 json!({"majors":[{"version":"llm-runner/v1","ops":["role.describe","session.baseline","session.send"]}],"implementation_version":"fake","session_capabilities_from":"baseline","capabilities":["delivery_order"]}),
             );
         }
+        if method == "session.head" {
+            return Ok(json!({"first_ordinal":0}));
+        }
         assert_eq!(method, "session.read");
         let lineage = self.transcript.lineage.lock().unwrap().clone();
         if params["lineage_id"]

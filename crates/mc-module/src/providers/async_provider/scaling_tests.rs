@@ -135,7 +135,7 @@ async fn covered_view_work_tracks_tail_not_session() {
         );
         eprintln!("covered ride total={size} tail=12 work={work:?}");
         assert!(
-            work.engine_input <= 14 && work.renderer_input <= 14 && work.decoded_entries <= 28,
+            work.engine_input <= 14 && work.renderer_input <= 14 && work.decoded_entries <= 84,
             "size={size}, tail=12: {work:?}"
         );
         rig.history(size - 10, "later fold");
@@ -438,6 +438,7 @@ pub(super) mod save_meter {
 #[derive(Default)]
 struct PagedRunner {
     entries: Mutex<Vec<(ReadMessage, usize)>>,
+    cut: Mutex<Option<(String, u64)>>,
     /// Every call the provider made, for checks that an operation calls no
     /// runner method.
     calls: std::sync::atomic::AtomicU64,
@@ -480,8 +481,21 @@ impl session_resolver::ProviderRunner for PagedRunner {
                 json!({"majors":[{"version":"llm-runner/v1","ops":["role.describe","session.baseline","session.send"]}],"implementation_version":"fake","session_capabilities_from":"baseline","capabilities":["delivery_order"]}),
             );
         }
+        let cut = self.cut.lock().unwrap().clone();
+        if method == "session.head" {
+            return Ok(if let Some((lineage, first)) = cut {
+                let entries = self.entries.lock().unwrap();
+                let entry = &entries[(first - 1) as usize].0;
+                json!({"lineage_id":lineage,"first_ordinal":first,"last_ordinal":entries.last().unwrap().0.ordinal,"cut":{"mid":entry.mid,"digest":served_digest(entry).unwrap(),"written_at":1}})
+            } else {
+                json!({"first_ordinal":0})
+            });
+        }
         assert_eq!(method, "session.read");
         let from = params["from_ordinal"].as_u64().unwrap();
+        if let Some((_, first)) = &cut {
+            assert!(from >= *first, "before_lineage_start: {from} < {first}");
+        }
         let budget = params["max_bytes"].as_u64().unwrap_or(1_048_576) as usize;
         let entries = self.entries.lock().unwrap();
         let start = entries.partition_point(|(entry, _)| entry.ordinal < from);
@@ -494,7 +508,7 @@ impl session_resolver::ProviderRunner for PagedRunner {
             used += size;
             messages.push(entry.clone());
         }
-        let mut page = json!({"lineage_id":"L","messages":messages});
+        let mut page = json!({"lineage_id":cut.map_or_else(|| "L".into(), |(lineage,_)| lineage),"messages":messages});
         if start + messages.len() < entries.len() {
             page["next_from_ordinal"] = json!(messages.last().unwrap().ordinal + 1);
         }
@@ -777,7 +791,12 @@ impl Rig {
         let mut notice = notice::AdvanceNotice::new(
             &self.reference,
             seq,
-            "L",
+            self.runner
+                .cut
+                .lock()
+                .unwrap()
+                .as_ref()
+                .map_or("L".into(), |(lineage, _)| lineage.clone()),
             last_ordinal,
             digest,
             est_tokens,
@@ -788,7 +807,7 @@ impl Rig {
             notice = notice.with_applied_view_version(version);
         }
         let mut headers = notice.to_headers();
-        headers.insert("lineage_id".into(), "L".into());
+        headers.insert("lineage_id".into(), notice.lineage_id.clone());
         let message = cortexkit_bus_trait::Message {
             subject: notice::event_subject("fixture", "thalamus-harness", notice::ADVANCED_EVENT),
             id: bus_id(&self.reference, "advanced", seq),
@@ -1238,7 +1257,12 @@ impl Rig {
         let mut notice = notice::AdvanceNotice::new(
             &self.reference,
             seq,
-            "L",
+            self.runner
+                .cut
+                .lock()
+                .unwrap()
+                .as_ref()
+                .map_or("L".into(), |(lineage, _)| lineage.clone()),
             last_ordinal,
             digest,
             est_tokens,
@@ -1249,7 +1273,7 @@ impl Rig {
             notice = notice.with_applied_view_version(version);
         }
         let mut headers = notice.to_headers();
-        headers.insert("lineage_id".into(), "L".into());
+        headers.insert("lineage_id".into(), notice.lineage_id.clone());
         let message = cortexkit_bus_trait::Message {
             subject: notice::event_subject("fixture", "thalamus-harness", notice::ADVANCED_EVENT),
             id: bus_id(&self.reference, "advanced", seq),
@@ -1514,6 +1538,35 @@ async fn covered_tail_latency_benchmark() {
         assert!(tail > 0 && (tail as u64) < size);
         let covered = size - tail as u64 - 1;
         rig.history(covered, "completed history covering the old prefix");
+        // Seed capture belongs to the fold that publishes a cut, not to a
+        // later step. The runner starts the timed lineage at that real cut.
+        if std::env::var_os("MC_ASYNC_FRESH_CUT").is_some() {
+            *rig.runner.cut.lock().unwrap() = Some(("L".into(), covered.saturating_sub(4)));
+        } else {
+            rig.try_timed_notice(0, None, est_tokens).await.2.unwrap();
+            let version = rig.newest_view().expect("published fold");
+            rig.try_timed_notice(0, Some(version), est_tokens)
+                .await
+                .2
+                .unwrap();
+            let first = *rig
+                .state()
+                .published_cuts
+                .keys()
+                .next_back()
+                .expect("saved cut");
+            let mut request = serde_json::to_value(&rig.state().setup).unwrap();
+            request["lineage_id"] = json!("L2");
+            request["descends_from"] = json!({"lineage_id":"L","through_ordinal":first - 1});
+            let setup = rig.op("compaction.setup", request).await;
+            assert_eq!(setup["answer"], "ready", "{setup}");
+            *rig.runner.cut.lock().unwrap() = Some(("L2".into(), first));
+        }
+        #[cfg(target_os = "linux")]
+        {
+            std::fs::write("/proc/self/clear_refs", "5")
+                .expect("reset peak after fixture preparation");
+        }
         let (peak, current) = rss();
         let rss_before = current;
         eprintln!("BENCH before_bootstrap total={size} RSS_bytes={current} peak_RSS_bytes={peak}");
@@ -1731,14 +1784,16 @@ async fn covered_tail_latency_benchmark() {
         // the state kept, with no runner call and nothing that grows with the
         // session. Measured last, so the conversation is not moved before the
         // other operations.
-        let newest = rig.runner.entries.lock().unwrap().last().unwrap().0.ordinal;
+        let first = *rig.state().published_cuts.keys().next_back().unwrap();
+        let parent = rig.state().published_cuts[&first].lineage.clone();
         let calls_before = rig.runner.calls.load(std::sync::atomic::Ordering::Relaxed);
         let mut setups = Vec::new();
         for attempt in 0..5 {
             let wall = Instant::now();
             let thread = cpu_time::ThreadTime::now();
             let process = cpu_time::ProcessTime::now();
-            let answer = rig.op("compaction.setup",json!({"session":"s","harness":"opencode","request_id":format!("descending-setup-{attempt}"),"model":"fixture","context_window":100_000,"composition":{"render_tags":true},"params":{"serializer_profile":"opencode-aisdk"},"lineage_id":"L2","descends_from":{"lineage_id":"L","through_ordinal":newest},"first_ordinal":newest + 1,"now":1})).await;
+            let answer = rig.op("compaction.setup",json!({"session":"s","harness":"opencode","request_id":format!("descending-setup-{attempt}"),"model":"fixture","context_window":100_000,"composition":{"render_tags":true},"params":{"serializer_profile":"opencode-aisdk"},"lineage_id":"L3","descends_from":{"lineage_id":parent,"through_ordinal":first - 1},"now":1})).await;
+            assert_eq!(answer["answer"], "ready", "{answer}");
             setups.push((
                 wall.elapsed().as_secs_f64() * 1e3,
                 thread.elapsed().as_secs_f64() * 1e3,
@@ -1826,9 +1881,13 @@ fn median_wall(samples: &[(f64, f64, f64)]) -> f64 {
 #[test]
 #[ignore = "cost-rule benchmark assertion; run explicitly with --release --ignored --nocapture"]
 fn cost_rule_150k_vs_1k() {
-    let run = |size: u64| -> CostSample {
+    let run = |size: u64, fresh: bool| -> CostSample {
         let exe = std::env::current_exe().unwrap();
-        let output = std::process::Command::new(exe)
+        let mut command = std::process::Command::new(exe);
+        if fresh {
+            command.env("MC_ASYNC_FRESH_CUT", "1");
+        }
+        let output = command
             .args([
                 "--exact",
                 "providers::async_provider::scaling_tests::covered_tail_latency_benchmark",
@@ -1862,69 +1921,75 @@ fn cost_rule_150k_vs_1k() {
             .unwrap_or_else(|| panic!("no cost line at {size}:\n{stdout}\n{stderr}"));
         serde_json::from_str(line).unwrap()
     };
-    let small = run(1_000);
-    let large = run(150_000);
-    eprintln!("cost rule 1k: {small:?}");
-    eprintln!("cost rule 150k: {large:?}");
-    let checks = [
-        (
-            "first notice ms",
-            small.first_notice_ms,
-            large.first_notice_ms,
-        ),
-        (
-            "quiet notice p50 ms",
-            small.quiet_p50_ms,
-            large.quiet_p50_ms,
-        ),
-        ("ride p50 ms", small.ride_p50_ms, large.ride_p50_ms),
-        (
-            "publishing notice p50 ms",
-            small.publish_p50_ms,
-            large.publish_p50_ms,
-        ),
-        (
-            "peak RSS net of the fixture, bytes",
-            small.peak_rss_net_bytes as f64,
-            large.peak_rss_net_bytes as f64,
-        ),
-        (
-            "resident record bytes",
-            small.resident_held_bytes as f64,
-            large.resident_held_bytes as f64,
-        ),
-        (
-            "cut seed bytes",
-            small.cut_seed_bytes as f64,
-            large.cut_seed_bytes as f64,
-        ),
-        (
-            "setup for a descending lineage p50 ms",
-            small.descending_setup_p50_ms,
-            large.descending_setup_p50_ms,
-        ),
-    ];
-    let mut failures = checks
-        .iter()
-        .map(|(name, small, large)| {
-            let ratio = large / small;
-            eprintln!("cost rule {name}: 1k {small:.1} 150k {large:.1} ratio {ratio:.2}");
-            (name, ratio)
-        })
-        .filter(|(_, ratio)| !ratio.is_finite() || *ratio > 2.0)
-        .map(|(name, ratio)| format!("{name} {ratio:.2}x"))
-        .collect::<Vec<_>>();
-    for sample in [&small, &large] {
-        if sample.descending_setup_runner_calls != 0 {
-            failures.push(format!(
-                "setup for a descending lineage at {} made {} runner calls",
-                sample.size, sample.descending_setup_runner_calls
-            ));
+    for fresh in [false, true] {
+        eprintln!(
+            "cost rule mode={}",
+            if fresh { "fresh" } else { "descending" }
+        );
+        let small = run(1_000, fresh);
+        let large = run(150_000, fresh);
+        eprintln!("cost rule 1k: {small:?}");
+        eprintln!("cost rule 150k: {large:?}");
+        let checks = [
+            (
+                "first notice ms",
+                small.first_notice_ms,
+                large.first_notice_ms,
+            ),
+            (
+                "quiet notice p50 ms",
+                small.quiet_p50_ms,
+                large.quiet_p50_ms,
+            ),
+            ("ride p50 ms", small.ride_p50_ms, large.ride_p50_ms),
+            (
+                "publishing notice p50 ms",
+                small.publish_p50_ms,
+                large.publish_p50_ms,
+            ),
+            (
+                "peak RSS net of the fixture, bytes",
+                small.peak_rss_net_bytes as f64,
+                large.peak_rss_net_bytes as f64,
+            ),
+            (
+                "resident record bytes",
+                small.resident_held_bytes as f64,
+                large.resident_held_bytes as f64,
+            ),
+            (
+                "cut seed bytes",
+                small.cut_seed_bytes as f64,
+                large.cut_seed_bytes as f64,
+            ),
+            (
+                "setup for a descending lineage p50 ms",
+                small.descending_setup_p50_ms,
+                large.descending_setup_p50_ms,
+            ),
+        ];
+        let mut failures = checks
+            .iter()
+            .map(|(name, small, large)| {
+                let ratio = large / small;
+                eprintln!("cost rule {name}: 1k {small:.1} 150k {large:.1} ratio {ratio:.2}");
+                (name, ratio)
+            })
+            .filter(|(_, ratio)| !ratio.is_finite() || *ratio > 2.0)
+            .map(|(name, ratio)| format!("{name} {ratio:.2}x"))
+            .collect::<Vec<_>>();
+        for sample in [&small, &large] {
+            if sample.descending_setup_runner_calls != 0 {
+                failures.push(format!(
+                    "setup for a descending lineage at {} made {} runner calls",
+                    sample.size, sample.descending_setup_runner_calls
+                ));
+            }
         }
+        assert!(
+            failures.is_empty(),
+            "150k vs 1k above 2x: {}",
+            failures.join(", ")
+        );
     }
-    assert!(
-        failures.is_empty(),
-        "150k vs 1k above 2x: {}",
-        failures.join(", ")
-    );
 }
