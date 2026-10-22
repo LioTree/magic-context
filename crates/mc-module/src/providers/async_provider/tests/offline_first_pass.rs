@@ -4,7 +4,8 @@
 //! The pages come from ck-mc's own fake-runner shape: `served_entries` reads the
 //! moved session from `opencode.db` the way THALAMUS's OpenCode 1 runner serves
 //! it, and [`export`] writes them one `ReadPage` per line, built and
-//! serialised exactly as [`Served`] answers `session.read`.
+//! serialised exactly as [`Served`] answers a descriptors-mode `session.read`:
+//! every message as `serve_descriptors` serves it, with the runner's digests.
 use super::moved_session::served_entries;
 use super::*;
 use crate::offline_first_pass as command;
@@ -16,14 +17,14 @@ const MODULE: &str = "thalamus-harness";
 const LINEAGE: &str = "L";
 const CHANNEL: u16 = 7;
 
-/// One page of `entries` from `from`, as the fake runner serves it and as the
-/// export writes it.
+/// One page of `entries` from `from`, as the fake runner serves it in
+/// descriptors mode and as the export writes it.
 fn page_from(entries: &[ReadMessage], lineage: &str, from: u64, size: usize) -> ReadPage {
     let messages = entries
         .iter()
         .filter(|entry| entry.ordinal >= from)
         .take(size)
-        .cloned()
+        .map(serve_descriptors)
         .collect::<Vec<_>>();
     let next = messages
         .last()
@@ -51,6 +52,12 @@ fn export(entries: &[ReadMessage], lineage: &str, size: usize) -> String {
     }
 }
 
+/// The `role.describe` answer of a THALAMUS-style runner hosting compaction
+/// for moved sessions: the tags groups with `tag_checkpoint`.
+fn runner_describe() -> Value {
+    json!({"majors":[{"version":"llm-runner/v1","ops":["role.describe","session.baseline","session.send","session.read","session.resolve"]}],"implementation_version":"fake","session_capabilities_from":"baseline","capabilities":["delivery_order","compaction","tags","tag_checkpoint"]})
+}
+
 /// A runner serving `entries` in pages of `page` messages.
 struct Served {
     entries: Mutex<Vec<ReadMessage>>,
@@ -58,6 +65,8 @@ struct Served {
     page: usize,
     reads: std::sync::atomic::AtomicU64,
     sends: Mutex<Vec<Value>>,
+    /// The `role.describe` answer; [`runner_describe`] unless a test changes it.
+    describe: Mutex<Value>,
 }
 
 impl Served {
@@ -68,6 +77,7 @@ impl Served {
             page,
             reads: Default::default(),
             sends: Mutex::new(Vec::new()),
+            describe: Mutex::new(runner_describe()),
         })
     }
 }
@@ -104,11 +114,7 @@ impl session_resolver::ProviderRunner for Served {
                 self.sends.lock().unwrap().push(params);
                 return Ok(json!({"state":"pending","submission_id":"reminder"}));
             }
-            "role.describe" => {
-                return Ok(
-                    json!({"majors":[{"version":"llm-runner/v1","ops":["role.describe","session.baseline","session.send"]}],"implementation_version":"fake","session_capabilities_from":"baseline","capabilities":["delivery_order"]}),
-                )
-            }
+            "role.describe" => return Ok(self.describe.lock().unwrap().clone()),
             _ => assert_eq!(method, "session.read"),
         }
         self.reads
@@ -491,7 +497,7 @@ fn command_args(
 }
 
 fn setup_file(project: &Path, request: &Value) -> Value {
-    json!({"project_root":project,"runner_module":MODULE,"request":request})
+    json!({"project_root":project,"runner_module":MODULE,"runner_describe":runner_describe(),"request":request})
 }
 
 /// Run `ck-mc offline first-pass` as the CLI does, on a test handler: the
@@ -503,7 +509,10 @@ async fn first_pass(
 ) -> Result<OfflineOutcome, command::RunError> {
     let mut checked = command::check(args, holders)?;
     let store_dir = args.paths.store_db.parent().unwrap();
-    let runner = Arc::new(PagesRunner::new(std::mem::take(&mut checked.pages.served)));
+    let runner = Arc::new(PagesRunner::new(
+        std::mem::take(&mut checked.pages.served),
+        checked.setup.runner_describe.clone(),
+    ));
     let h = handler(store_dir, project, &args.session, runner, &config());
     command::execute(&h, &checked).await
 }
@@ -548,12 +557,13 @@ async fn prepared(
     )
 }
 
+/// The proof of `served` as the runner serves it in descriptors mode.
 fn proof_of(served: &[ReadMessage]) -> EntryInputProof {
     let mut entries = held_entries::HeldEntries::default();
     for entry in served {
         entries.insert(
             entry.ordinal,
-            Arc::new(HeldEntry::from_read(entry).unwrap()),
+            Arc::new(HeldEntry::from_read(&serve_descriptors(entry)).unwrap()),
         );
     }
     EntryInputProof::of(&entries, LINEAGE, None)
@@ -655,7 +665,7 @@ async fn offline_first_pass_is_adopted_by_the_first_live_notice_without_a_first_
     // The same Setup gets the stored answer and adopts nothing yet.
     let answer = arm.setup(setup_request(&prep.session, "fixture")).await;
     assert_eq!(answer["answer"], "ready", "{answer}");
-    assert_eq!(answer["tag_checkpoint"], 20);
+    assert_eq!(answer["checkpoint"]["tag_checkpoint"], 20, "{answer}");
     assert!(load_head(arm.store(), &arm.reference())
         .unwrap()
         .unwrap()
@@ -808,7 +818,7 @@ async fn a_changed_entry_discards_the_offline_first_pass_and_runs_the_ordinary_o
     for entry in &changed {
         assert!(stable_entry(
             &state.entries[&entry.ordinal].read().unwrap(),
-            entry
+            &serve_descriptors(entry)
         ));
     }
     let views = arm.views();
@@ -1115,6 +1125,28 @@ async fn the_command_refuses_each_case_by_name_without_writing() {
         setup["request"]["session"] = json!("ses_other");
         setup
     };
+    // The same session handle with a trailing space: handles are exact bytes.
+    let padded_session = {
+        let mut setup = setup.clone();
+        setup["request"]["session"] = json!(format!("{session} "));
+        setup
+    };
+    // A page whose second message lacks the runner's digests, as an inline
+    // (not descriptors-mode) read would serve it.
+    let undigested = {
+        let mut lines = lines.clone();
+        let mut page: Value = serde_json::from_str(&lines[0]).unwrap();
+        let message = page["messages"][1].as_object_mut().unwrap();
+        message.remove("digest");
+        message.remove("part_digests");
+        lines[0] = page.to_string();
+        lines
+    };
+    let unreadable_describe = {
+        let mut setup = setup.clone();
+        setup["runner_describe"] = json!({"capabilities":["tag_checkpoint"]});
+        setup
+    };
     let before = store_rows(&paths);
     let cases: Vec<(&str, String, Value, &dyn HolderCheck)> = vec![
         (
@@ -1172,6 +1204,24 @@ async fn the_command_refuses_each_case_by_name_without_writing() {
             &fixture::NoHolders,
         ),
         (
+            "setup_session_mismatch",
+            pages.clone(),
+            padded_session,
+            &fixture::NoHolders,
+        ),
+        (
+            "served_digest_missing",
+            joined(&undigested),
+            setup.clone(),
+            &fixture::NoHolders,
+        ),
+        (
+            "setup_unreadable",
+            pages.clone(),
+            unreadable_describe,
+            &fixture::NoHolders,
+        ),
+        (
             "setup_unreadable",
             pages.clone(),
             json!({"project_root":"relative","runner_module":MODULE,"request":setup["request"]}),
@@ -1199,6 +1249,116 @@ async fn the_command_refuses_each_case_by_name_without_writing() {
         "session_not_moved"
     );
     assert!(store_rows(&unmoved_paths) == before);
+}
+
+#[tokio::test]
+async fn a_runner_describe_without_tag_checkpoint_is_refused_offline_by_name() {
+    let _clock = crate::tests::fixed_clock();
+    let project = tempfile::tempdir().unwrap();
+    let store = tempfile::tempdir().unwrap();
+    let (paths, session, served) = moved_stores(store.path(), fixture_stores);
+    let mut setup = setup_file(project.path(), &setup_request(&session, "fixture"));
+    setup["runner_describe"]["capabilities"] = json!(["delivery_order", "compaction", "tags"]);
+    let work = tempfile::tempdir().unwrap();
+    let args = command_args(
+        work.path(),
+        &paths,
+        &session,
+        &export(&served, LINEAGE, 3),
+        &setup,
+    );
+    assert_eq!(
+        refusal_code(first_pass(&args, project.path(), &fixture::NoHolders).await),
+        "tag_checkpoint_unsupported"
+    );
+    let reference = session_ref("opencode", &project.path().to_string_lossy(), &session);
+    let store = McStore::open_for_test(&fixture::store_descriptor(store.path())).unwrap();
+    assert!(
+        load_head(&store, &reference).unwrap().is_none(),
+        "the refused Setup stored no record"
+    );
+}
+
+/// The proof reads the runner's served digests and never computes one in
+/// their place: an entry held without them (an inline read) has no proof.
+#[test]
+fn the_entry_proof_refuses_an_entry_without_served_digests() {
+    let entry = appended("ses", 0, 1);
+    let mut entries = held_entries::HeldEntries::default();
+    entries.insert(0, Arc::new(HeldEntry::from_read(&entry).unwrap()));
+    let error = EntryInputProof::of(&entries, LINEAGE, None).unwrap_err();
+    assert!(
+        format!("{error:?}").contains("served_digest_missing"),
+        "{error:?}"
+    );
+    let mut served = held_entries::HeldEntries::default();
+    served.insert(
+        0,
+        Arc::new(HeldEntry::from_read(&serve_descriptors(&entry)).unwrap()),
+    );
+    assert!(EntryInputProof::of(&served, LINEAGE, None)
+        .unwrap()
+        .is_some());
+}
+
+/// A runner whose `role.describe` changed since the export, as a THALAMUS
+/// upgrade in the restart window would.
+fn changed_describe() -> Value {
+    let mut describe = runner_describe();
+    describe["implementation_version"] = json!("fake-2");
+    describe
+}
+
+#[tokio::test]
+async fn a_live_runner_describe_that_differs_discards_the_offline_first_pass_at_setup() {
+    let _clock = crate::tests::fixed_clock();
+    let (store, project) = (tempfile::tempdir().unwrap(), tempfile::tempdir().unwrap());
+    let (prep, _) = prepared(store.path(), project.path(), fixture_stores).await;
+    let runner = Served::new(prep.served.clone(), 7);
+    *runner.describe.lock().unwrap() = changed_describe();
+    let arm = Arm::open(
+        store.path(),
+        project.path(),
+        &prep.session,
+        runner,
+        config(),
+    );
+    let answer = arm.setup(setup_request(&prep.session, "fixture")).await;
+    assert_eq!(answer["answer"], "ready", "{answer}");
+    assert_eq!(answer["checkpoint"]["tag_checkpoint"], 20, "{answer}");
+    let state = arm.state();
+    assert!(state.offline_first_pass.is_none());
+    assert_eq!(
+        state.generation, 1,
+        "the stored pass was discarded at Setup"
+    );
+    assert!(state.entries.is_empty(), "no offline entry survives");
+    assert_eq!(arm.notice(1, 0, None, Vec::new()).await, "ok");
+    assert_eq!(arm.state().entries.len(), prep.served.len());
+}
+
+#[tokio::test]
+async fn a_live_runner_describe_that_differs_discards_the_offline_first_pass_at_the_first_notice() {
+    let _clock = crate::tests::fixed_clock();
+    let (store, project) = (tempfile::tempdir().unwrap(), tempfile::tempdir().unwrap());
+    let (prep, _) = prepared(store.path(), project.path(), fixture_stores).await;
+    let runner = Served::new(prep.served.clone(), 7);
+    *runner.describe.lock().unwrap() = changed_describe();
+    let arm = Arm::open(
+        store.path(),
+        project.path(),
+        &prep.session,
+        runner,
+        config(),
+    );
+    // No Setup on this module first: the notice's own check must catch it.
+    assert_eq!(arm.notice(1, 0, None, Vec::new()).await, "ok");
+    let state = arm.state();
+    assert!(state.offline_first_pass.is_none());
+    assert_eq!(
+        state.generation, 1,
+        "a changed runner describe discards the pass"
+    );
 }
 
 // ── Differential: offline first pass against the live full first pass ──

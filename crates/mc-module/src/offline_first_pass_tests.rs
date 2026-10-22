@@ -2,8 +2,11 @@
 //! refusals on real moved stores and the live adoption are tested in
 //! `providers::async_provider::tests::offline_first_pass`.
 use super::*;
+use crate::providers::serve_descriptors;
 use cortexkit_role_llm_runner::read::ReadMessage;
 
+/// A page of `ordinals` as a descriptors-mode read serves it, with the
+/// runner's digests on every message.
 fn page(ordinals: std::ops::Range<u64>, next: Option<u64>) -> String {
     let messages = ordinals
         .map(|n| {
@@ -17,6 +20,7 @@ fn page(ordinals: std::ops::Range<u64>, next: Option<u64>) -> String {
                 format!("§{}§", 21 + n),
             )])
         })
+        .map(|message| serve_descriptors(&message))
         .collect::<Vec<_>>();
     let page = ReadPage::new("L", messages);
     let page = match next {
@@ -93,6 +97,25 @@ fn a_wrapped_page_is_a_bare_wrapped_mismatch() {
         code(&[bare, String::new(), page(2..3, None)]),
         "pages_unreadable"
     );
+}
+
+#[test]
+fn a_message_without_the_runners_digests_is_refused_by_name() {
+    let served = page(0..2, None);
+    for member in ["digest", "part_digests"] {
+        let mut value: Value = serde_json::from_str(&served).unwrap();
+        value["messages"][1].as_object_mut().unwrap().remove(member);
+        assert_eq!(
+            code(&[value.to_string()]),
+            "served_digest_missing",
+            "{member}"
+        );
+    }
+    // A part_digests row keyed to another part than the tag rows.
+    let mut value: Value = serde_json::from_str(&served).unwrap();
+    value["messages"][0]["part_digests"][0]["part"] = json!("other");
+    assert_eq!(code(&[value.to_string()]), "served_digest_missing");
+    assert!(parse(&[served]).is_ok());
 }
 
 #[test]

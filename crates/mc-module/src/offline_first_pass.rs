@@ -14,14 +14,17 @@
 //!
 //! **Inputs.**
 //! - `--pages`: THALAMUS's export, one `session.read` page per line. Each line
-//!   is the bare `ReadPage` body (`cortexkit-role-llm-runner` 0.3.9
-//!   `read::ReadPage`) that `session.read` would answer, never wrapped in a
-//!   reply envelope, and the pages chain from ordinal 0 to the end of the
-//!   transcript.
+//!   is the bare `ReadPage` body (`cortexkit-role-llm-runner` 0.4.0
+//!   `read::ReadPage`) that a descriptors-mode `session.read` would answer,
+//!   never wrapped in a reply envelope, and the pages chain from ordinal 0 to
+//!   the end of the transcript. Every message carries the runner's `digest`
+//!   and `part_digests`.
 //! - `--setup`: `{"project_root": <abs path>, "runner_module": <module id>,
+//!   "runner_describe": <the runner's role.describe answer>,
 //!   "request": <the exact compaction.setup request the runner will send>}`.
 //!   The first live Setup must equal `request` (ignoring `request_id` and
-//!   `now`) and arrive from `runner_module` on `project_root`, or the prepared
+//!   `now`) and arrive from `runner_module` on `project_root`, and the live
+//!   runner's `role.describe` must equal `runner_describe`, or the prepared
 //!   state is discarded.
 //!
 //! The format contract, with every input the pass reads, is
@@ -29,8 +32,8 @@
 //!
 //! **What it does.** It checks that no other process holds a store (the same
 //! `lsof` check as the move), that the session was moved, that the pages chain
-//! and are bare, and that their tag numbers start right above the moved
-//! checkpoint. Then it opens the stores as ck-mc does and drives ck-mc's own
+//! and are bare, that every message carries the runner's digests, and that
+//! their tag numbers start right above the moved checkpoint. Then it opens the stores as ck-mc does and drives ck-mc's own
 //! lane: Setup, the read of the pages, ingest with the moved-session binding,
 //! and the engine's first pass and commit. The record's last save stores the
 //! entry input proof (`providers::async_provider::offline_first_pass`).
@@ -43,8 +46,9 @@
 //! `store_missing`, `store_unreadable`, `session_not_moved`,
 //! `moved_session_record_unreadable`, `setup_unreadable`,
 //! `setup_session_mismatch`, `pages_unreadable`,
-//! `pages_bare_wrapped_mismatch`, `pages_not_chained`, `checkpoint_mismatch`,
-//! `setup_refused`, `first_pass_refused`, `async_record_exists`,
+//! `pages_bare_wrapped_mismatch`, `pages_not_chained`, `served_digest_missing`,
+//! `checkpoint_mismatch`, `tag_checkpoint_unsupported`, `setup_refused`,
+//! `first_pass_refused`, `async_record_exists`,
 //! `offline_run_incomplete`, `offline_state_differs`.
 
 use crate::offline_move::{
@@ -77,6 +81,10 @@ pub struct Args {
 struct SetupFile {
     project_root: PathBuf,
     runner_module: String,
+    /// The runner's own `role.describe` answer (the answer inside its reply
+    /// envelope). The offline Setup reads it where a live Setup asks the
+    /// runner, so a moved session's `tag_checkpoint` check runs offline too.
+    runner_describe: Value,
     request: Value,
 }
 
@@ -95,7 +103,11 @@ fn refusal(code: &'static str, detail: impl Into<String>) -> Refusal {
 
 /// Parse and check the export. Each line must be a bare `ReadPage`: a line
 /// that holds its page inside another object (a reply envelope) is refused as
-/// `pages_bare_wrapped_mismatch`. The pages must chain: the first starts at
+/// `pages_bare_wrapped_mismatch`. Every message must carry the runner's
+/// content digests, one `part_digests` row per tag row in the same order, as
+/// a live descriptors-mode read requires; a message without them is refused
+/// as `served_digest_missing`, because ck-mc never computes them in the
+/// runner's place. The pages must chain: the first starts at
 /// ordinal 0, ordinals are contiguous inside and across pages, every page but
 /// the last names the next page's first ordinal in `next_from_ordinal`, the
 /// last names none, and every page carries the same lineage.
@@ -184,6 +196,20 @@ pub(crate) fn parse_pages(reader: impl BufRead) -> Result<Pages, Refusal> {
                 )));
             }
             expected += 1;
+            let keys = message
+                .tags
+                .iter()
+                .map(|row| row.part.clone())
+                .collect::<Vec<_>>();
+            message.check_descriptors(&keys).map_err(|reason| {
+                refusal(
+                    "served_digest_missing",
+                    format!(
+                        "line {number}: message {} at ordinal {}: {reason}",
+                        message.mid, message.ordinal
+                    ),
+                )
+            })?;
             for row in &message.tags {
                 if let Some(tag) = &row.tag {
                     let number = tags::parse_tag(tag).ok_or_else(|| {
@@ -257,18 +283,24 @@ fn read_setup(path: &Path, session: &str) -> Result<OfflineSetup, Refusal> {
     if file.runner_module.trim().is_empty() {
         return Err(refusal("setup_unreadable", "runner_module is empty"));
     }
-    if request.session.trim() != session {
+    // Session handles are compared as exact bytes, as a live Setup compares
+    // them with its route.
+    if request.session != session {
         return Err(refusal(
             "setup_session_mismatch",
             format!(
-                "--session is {session}, but the Setup request names {}",
-                request.session.trim()
+                "--session is {session:?}, but the Setup request names {:?}",
+                request.session
             ),
         ));
     }
+    cortexkit_role_llm_runner::describe::check_describe(&file.runner_describe).map_err(
+        |problems| refusal("setup_unreadable", format!("runner_describe: {problems:?}")),
+    )?;
     Ok(OfflineSetup {
         project_root: file.project_root,
         runner_module: file.runner_module,
+        runner_describe: file.runner_describe,
         request,
     })
 }
@@ -384,7 +416,10 @@ pub fn run(args: &Args, holders: &dyn HolderCheck) -> Result<Value, RunError> {
         .map_err(|reason| RunError::Refused(refusal("store_unreadable", reason)))?;
     let mut handler = crate::McHandler::new();
     handler.store.set(Arc::new(store)).ok();
-    handler.provider_runner = Arc::new(PagesRunner::new(std::mem::take(&mut checked.pages.served)));
+    handler.provider_runner = Arc::new(PagesRunner::new(
+        std::mem::take(&mut checked.pages.served),
+        checked.setup.runner_describe.clone(),
+    ));
     // The engine pass is synchronous work inside async functions; a runtime of
     // its own on its own thread keeps it apart from the caller's.
     let outcome = std::thread::scope(|scope| {

@@ -1717,10 +1717,25 @@ impl McHandler {
         // A record the offline first pass prepared is kept only for the exact
         // Setup it was prepared under; any other Setup discards it and sets the
         // conversation up fresh in the next generation.
-        let discarded = existing.as_ref().and_then(|state| {
+        let mut discarded = existing.as_ref().and_then(|state| {
             offline_first_pass::setup_mismatch(state, binding, &request)
                 .map(|reason| (state.generation, reason))
         });
+        // It is also kept only for the runner `role.describe` it was prepared
+        // against. The answer read here serves the moved session's checkpoint
+        // check below as well, so this Setup asks the runner once.
+        let mut live_describe = None;
+        if let Some(state) = existing
+            .as_ref()
+            .filter(|state| discarded.is_none() && state.offline_first_pass.is_some())
+        {
+            let describe = self
+                .runner_describe(&state.runner()?, &state.runner_identity())
+                .await?;
+            discarded = offline_first_pass::describe_mismatch(state, &describe)
+                .map(|reason| (state.generation, reason));
+            live_describe = Some(describe);
+        }
         if let Some(state) = existing.filter(|_| discarded.is_none()) {
             self.authorize_async(binding, &state)?;
             let project = self.historian_lane_project(channel, binding, store)?;
@@ -1751,6 +1766,7 @@ impl McHandler {
                     &state.runner()?,
                     &state.runner_identity(),
                     &request.request_id,
+                    live_describe,
                 )
                 .await?
             {
@@ -1782,6 +1798,7 @@ impl McHandler {
                     &route,
                     &identity,
                     &request.request_id,
+                    live_describe,
                 )
                 .await?
             {
@@ -1951,22 +1968,13 @@ impl McHandler {
         Ok(state)
     }
 
-    /// For a moved session (`checkpoint` present), the terminal
-    /// `tag_checkpoint_unsupported` refusal when its runner does not declare
-    /// llm-runner's `tag_checkpoint` group, read from the runner's own
-    /// `role.describe`; `None` when Setup may answer.
-    async fn refuse_checkpoint_unsupported(
+    /// The session runner's `role.describe` answer.
+    async fn runner_describe(
         &self,
-        checkpoint: Option<&contract::setup::SetupCheckpoint>,
         route: &crate::route_targets::SessionRunnerRoute,
         identity: &session_resolver::RunnerBindIdentity,
-        request_id: &str,
-    ) -> Result<Option<Value>, HandlerOutcome> {
-        if checkpoint.is_none() {
-            return Ok(None);
-        }
-        let reply = self
-            .provider_runner
+    ) -> Result<Value, HandlerOutcome> {
+        self.provider_runner
             .call_for_identity(
                 route,
                 identity,
@@ -1975,7 +1983,29 @@ impl McHandler {
                 Duration::from_millis(1_500),
             )
             .await
-            .map_err(runner_error)?;
+            .map_err(runner_error)
+    }
+
+    /// For a moved session (`checkpoint` present), the terminal
+    /// `tag_checkpoint_unsupported` refusal when its runner does not declare
+    /// llm-runner's `tag_checkpoint` group, read from the runner's own
+    /// `role.describe` (`fetched` when this Setup already read it); `None`
+    /// when Setup may answer.
+    async fn refuse_checkpoint_unsupported(
+        &self,
+        checkpoint: Option<&contract::setup::SetupCheckpoint>,
+        route: &crate::route_targets::SessionRunnerRoute,
+        identity: &session_resolver::RunnerBindIdentity,
+        request_id: &str,
+        fetched: Option<Value>,
+    ) -> Result<Option<Value>, HandlerOutcome> {
+        if checkpoint.is_none() {
+            return Ok(None);
+        }
+        let reply = match fetched {
+            Some(reply) => reply,
+            None => self.runner_describe(route, identity).await?,
+        };
         let describe = cortexkit_role_llm_runner::describe::check_describe(&reply)
             .map_err(|problems| transient(format!("runner role.describe: {problems:?}")))?;
         Ok(

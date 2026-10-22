@@ -12,6 +12,8 @@ pub(crate) use async_provider::offline_first_pass as offline_first_pass_engine;
 pub(crate) use async_provider::reminder_echoes::accounting as runner_accounting;
 pub(crate) use async_provider::reminder_echoes::origin as runner_origin;
 #[cfg(test)]
+pub(crate) use async_provider::serve_descriptors;
+#[cfg(test)]
 mod describe_fixture_tests;
 
 pub mod codec;

@@ -11,10 +11,10 @@
 //!
 //! The last save of that run stores [`OfflineFirstPass`] on the record with an
 //! entry input proof over every held entry. The proof covers the entry's
-//! ordinal, its content digest, the digest of its whole served form, and each
-//! part's key, tag and digest. Page boundaries are not part of it. The same
-//! save also persists the certificate, its input proof and the published
-//! view.
+//! ordinal, the runner's served content digest, the digest of its whole served
+//! form, and each part's key, tag and served digest. Page boundaries are not
+//! part of it. The same save also persists the certificate, its input proof
+//! and the published view.
 //!
 //! While the marker is on the record, rides answer nothing and its views are
 //! not announced. The first live notice then checks it once
@@ -30,12 +30,15 @@
 //!   ordinary first pass.
 //!
 //! A live Setup that differs from the one the run was prepared under discards
-//! the same way (`setup_mismatch`, called from `async_setup`).
+//! the same way (`setup_mismatch`, called from `async_setup`), and so does a
+//! live runner whose `role.describe` differs from the one the run read
+//! (`describe_mismatch`, at that Setup and again at the first notice).
 use super::*;
 use std::path::PathBuf;
 
-/// Version of the [`OfflineFirstPass`] marker's shape.
-const MARKER_VERSION: u32 = 1;
+/// Version of the [`OfflineFirstPass`] marker's shape. Version 2 proves the
+/// runner's served digests and records the runner's `role.describe`.
+const MARKER_VERSION: u32 = 2;
 /// The time the one verification read of an offline-prepared record may take.
 /// It reads the whole transcript once, so it gets far more than a notice's
 /// read budget; a runner that cannot serve it in time leaves the notice to be
@@ -55,6 +58,11 @@ pub(crate) struct OfflineFirstPass {
     /// Digest of the Setup request and route identity the run used; see
     /// [`setup_identity_digest`].
     pub setup: String,
+    /// Digest of the runner's `role.describe` answer the run was prepared
+    /// against; see [`runner_describe_digest`]. A marker without it is never
+    /// adopted.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub describe: Option<String>,
     /// Digest of every other input the pass read; see `offline_inputs_digest`.
     /// Written with `proof`.
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -82,12 +90,15 @@ fn framed(hash: &mut Sha256, bytes: &[u8]) {
 impl EntryInputProof {
     /// The proof over the held entries `0..count` (every held entry for
     /// `None`), or `None` when those ordinals are not all held. Each entry
-    /// adds its ordinal, mid, contract content digest, the SHA-256 of its whole
-    /// served form (which also covers role, timestamps and attributions), and
-    /// for every part its key, its tag (empty when untagged) and its content
-    /// digest. The offline run and the live check both compute it from
-    /// `HeldEntry`s built by `HeldEntry::from_read`, the same decode a live read
-    /// uses.
+    /// adds its ordinal, mid, the runner's served content digest, the SHA-256
+    /// of its whole served form (which also covers role, timestamps and
+    /// attributions), and for every part its key, its tag (empty when
+    /// untagged) and the runner's served digest of that part. The digests are
+    /// the ones the runner served (`digest`, `part_digests`), never recomputed
+    /// here: an entry without them fails as `served_digest_missing`, as the
+    /// live read refuses it. The offline run and the live check both compute
+    /// the proof from `HeldEntry`s built by `HeldEntry::from_read`, the same
+    /// decode a live read uses.
     pub(super) fn of(
         entries: &held_entries::HeldEntries,
         lineage: &str,
@@ -98,27 +109,27 @@ impl EntryInputProof {
             None => entries.last_key_value().map_or(0, |(last, _)| last + 1),
         };
         let mut hash = Sha256::new();
-        framed(&mut hash, b"mc-offline-entry-proof/v1");
+        framed(&mut hash, b"mc-offline-entry-proof/v2");
         framed(&mut hash, lineage.as_bytes());
         for ordinal in 0..count {
             let Some(held) = entries.get(&ordinal) else {
                 return Ok(None);
             };
             let entry = held.read()?;
+            // Strict: an entry held from an inline read has no served digest,
+            // and the proof never hashes one in the runner's place.
+            check_served_identity(&entry)?;
             hash.update(ordinal.to_le_bytes());
             framed(&mut hash, entry.mid.as_bytes());
-            framed(
-                &mut hash,
-                contract::digest::content_digest(&entry.message).as_bytes(),
-            );
+            framed(&mut hash, served_digest(&entry)?.as_bytes());
             hash.update(held.input_digest);
             let native = parts(&entry.message)?;
             hash.update((native.len() as u64).to_le_bytes());
             hash.update((entry.tags.len() as u64).to_le_bytes());
-            for (part, row) in native.iter().zip(&entry.tags) {
+            for row in &entry.tags {
                 framed(&mut hash, row.part.as_bytes());
                 framed(&mut hash, row.tag.as_deref().unwrap_or("").as_bytes());
-                framed(&mut hash, contract::digest::content_digest(part).as_bytes());
+                framed(&mut hash, served_part_digest(&entry, &row.part)?.as_bytes());
             }
         }
         Ok(Some(Self {
@@ -157,6 +168,28 @@ pub(crate) fn setup_identity_digest(
     Ok(hex(&hash.finalize()))
 }
 
+/// Digest of a runner's `role.describe` answer, as RFC 8785 canonical JSON
+/// (the same canonical form the Setup comparison uses).
+pub(crate) fn runner_describe_digest(describe: &Value) -> Result<String, HandlerOutcome> {
+    let canonical = serde_jcs::to_string(describe).map_err(transient)?;
+    let mut hash = Sha256::new();
+    framed(&mut hash, b"mc-offline-runner-describe/v1");
+    framed(&mut hash, canonical.as_bytes());
+    Ok(hex(&hash.finalize()))
+}
+
+/// `runner_describe_differs` when `describe`, the live runner's
+/// `role.describe` answer, is not the one an offline-prepared record was
+/// prepared against (or the record names none); `None` when it is, or when
+/// the record was not prepared offline.
+pub(super) fn describe_mismatch(state: &State, describe: &Value) -> Option<&'static str> {
+    let offline = state.offline_first_pass.as_ref()?;
+    match (&offline.describe, runner_describe_digest(describe)) {
+        (Some(prepared), Ok(live)) if *prepared == live => None,
+        _ => Some("runner_describe_differs"),
+    }
+}
+
 /// Why a live Setup discards an offline-prepared record, or `None` when the
 /// record was not prepared offline or the Setup is the one it was prepared
 /// under.
@@ -166,6 +199,9 @@ pub(super) fn setup_mismatch(
     request: &compact::setup::SetupRequest,
 ) -> Option<&'static str> {
     let offline = state.offline_first_pass.as_ref()?;
+    if offline.version != MARKER_VERSION {
+        return Some("marker_version_differs");
+    }
     let module = match &binding.principal {
         Some(subc_protocol::Principal::Reserved { module_id }) => module_id.as_str(),
         _ => return Some("setup_differs"),
@@ -203,9 +239,11 @@ impl AsyncRecord {
 /// the line it came from and decoded again when served, so the read sees
 /// exactly the `ReadPage` the export holds. A read that starts inside a page
 /// is answered from that page's later messages, with the page's own
-/// `next_from_ordinal`.
+/// `next_from_ordinal`. `role.describe` is answered with the runner's own
+/// answer from the `--setup` file, verbatim.
 pub(crate) struct PagesRunner {
     pages: Vec<ServedPage>,
+    describe: Value,
 }
 
 /// One exported page: its first and last ordinals and its line.
@@ -216,8 +254,8 @@ pub(crate) struct ServedPage {
 }
 
 impl PagesRunner {
-    pub(crate) fn new(pages: Vec<ServedPage>) -> Self {
-        Self { pages }
+    pub(crate) fn new(pages: Vec<ServedPage>, describe: Value) -> Self {
+        Self { pages, describe }
     }
 }
 
@@ -249,10 +287,20 @@ impl session_resolver::ProviderRunner for PagesRunner {
         params: Value,
         _: Duration,
     ) -> Result<Value, SessionResolveError> {
+        if method == "role.describe" {
+            return Ok(self.describe.clone());
+        }
         if method != "session.read" {
             return Err(SessionResolveError::InvalidResponse(format!(
-                "the offline first pass serves session.read only, not {method}"
+                "the offline first pass serves session.read and role.describe only, not {method}"
             )));
+        }
+        // The export holds descriptors-mode pages, so only a descriptors-mode
+        // read may be answered from it.
+        if params["media"] != "descriptors" {
+            return Err(SessionResolveError::InvalidResponse(
+                "the offline pages answer descriptors-mode reads only".into(),
+            ));
         }
         let from = params["from_ordinal"].as_u64().ok_or_else(|| {
             SessionResolveError::InvalidResponse("offline reads are range reads".into())
@@ -300,6 +348,8 @@ impl Publisher for NullPublisher {
 pub(crate) struct OfflineSetup {
     pub project_root: PathBuf,
     pub runner_module: String,
+    /// The runner's `role.describe` answer the export came with.
+    pub runner_describe: Value,
     pub request: compact::setup::SetupRequest,
 }
 
@@ -492,6 +542,7 @@ impl McHandler {
         };
         let reason = match &offline.proof {
             None => Some("offline_run_incomplete"),
+            Some(_) if offline.version != MARKER_VERSION => Some("marker_version_differs"),
             Some(proof)
                 if headers
                     .get("lineage_id")
@@ -501,6 +552,19 @@ impl McHandler {
             }
             Some(_) if offline.inputs != Some(self.offline_inputs_digest(&state)?) => {
                 Some("inputs_differ")
+            }
+            // Checked at Setup too; checked again here so adoption never
+            // depends on a Setup having arrived first.
+            Some(_)
+                if describe_mismatch(
+                    &state,
+                    &self
+                        .runner_describe(&state.runner()?, &state.runner_identity())
+                        .await?,
+                )
+                .is_some() =>
+            {
+                Some("runner_describe_differs")
             }
             Some(proof) => {
                 let served = self
@@ -519,7 +583,7 @@ impl McHandler {
         let moved = match moved_session::setup_fence(
             store,
             &state.setup.harness,
-            state.setup.session.trim(),
+            &state.setup.session,
             &state.setup.request_id,
         )? {
             moved_session::Fence::Moved(record) => Some(record),
@@ -589,7 +653,7 @@ impl McHandler {
             scope: None,
             project_root: setup.project_root.clone(),
             harness: request.harness.clone(),
-            session: request.session.trim().to_owned(),
+            session: request.session.clone(),
             model_key: None,
             config: self.effective_config(&setup.project_root),
             history_budget_tokens: 4_000.0,
@@ -600,9 +664,11 @@ impl McHandler {
         let setup_digest =
             setup_identity_digest(request, &setup.project_root, &setup.runner_module)
                 .map_err(interrupted)?;
+        let describe_digest =
+            runner_describe_digest(&setup.runner_describe).map_err(interrupted)?;
         if load_head(store, &reference).map_err(interrupted)?.is_some() {
             return self
-                .offline_rerun(store, &key, &reference, &setup_digest)
+                .offline_rerun(store, &key, &reference, &setup_digest, &describe_digest)
                 .await;
         }
         let answer = self
@@ -616,6 +682,14 @@ impl McHandler {
             .map_err(interrupted)?;
         let answer: Value = serde_json::from_slice(&answer)
             .map_err(|e| OfflineError::Interrupted(e.to_string()))?;
+        if answer["code"] == contract::errors::refuse_codes::TAG_CHECKPOINT_UNSUPPORTED {
+            return Err(OfflineError::Refused(
+                contract::errors::refuse_codes::TAG_CHECKPOINT_UNSUPPORTED,
+                format!(
+                    "the runner_describe does not declare tag_checkpoint; Setup answered {answer}"
+                ),
+            ));
+        }
         if answer["answer"] != "ready" {
             return Err(OfflineError::Refused(
                 "setup_refused",
@@ -632,6 +706,7 @@ impl McHandler {
         state.offline_first_pass = Some(OfflineFirstPass {
             version: MARKER_VERSION,
             setup: setup_digest,
+            describe: Some(describe_digest),
             inputs: None,
             proof: None,
         });
@@ -675,7 +750,7 @@ impl McHandler {
             1,
             lineage.clone(),
             last_ordinal,
-            contract::digest::content_digest(&last.message),
+            served_digest(&last).map_err(interrupted)?,
             0,
             request.model.clone(),
         );
@@ -728,6 +803,7 @@ impl McHandler {
         key: &Key,
         reference: &str,
         setup_digest: &str,
+        describe_digest: &str,
     ) -> Result<OfflineOutcome, OfflineError> {
         let _serial = self.provider_serial.lock_for(key).await;
         let mut state = self
@@ -750,6 +826,12 @@ impl McHandler {
             return Err(OfflineError::Refused(
                 "offline_state_differs",
                 "the stored first pass was prepared under another Setup".into(),
+            ));
+        }
+        if offline.describe.as_deref() != Some(describe_digest) {
+            return Err(OfflineError::Refused(
+                "offline_state_differs",
+                "the stored first pass was prepared against another runner_describe".into(),
             ));
         }
         let served = self
