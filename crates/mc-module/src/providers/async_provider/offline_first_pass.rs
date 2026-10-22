@@ -365,8 +365,7 @@ impl McHandler {
     /// transcript nor the Setup request, as the store and filesystem hold it
     /// now. The offline run records it after its pass; the live check
     /// recomputes it, so any change in between discards the stored pass. The
-    /// inputs, and where the pass reads them, are also listed in the offline
-    /// first-pass contract (`crate::offline_first_pass`):
+    /// inputs are:
     /// - the effective configuration of the project root (its `Debug` form;
     ///   every map in it is ordered);
     /// - the route's project identity and whether its memory is paused;
