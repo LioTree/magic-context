@@ -182,6 +182,27 @@ async fn first_certified_notice_renders_only_the_view_sources() {
     }
 }
 
+fn legacy_covered_hygiene_row(rig: &Rig) {
+    // Older baselines retained zero-weight covered rows. Insert one so trimming
+    // still exercises the version-checked metadata update and conflict retry;
+    // new measurements already omit these rows.
+    let namespace = rig.state().namespace();
+    let mut loaded = rig.store().load(&namespace).unwrap();
+    loaded
+        .meta
+        .tail_hygiene_baseline
+        .as_mut()
+        .unwrap()
+        .baseline_parts
+        .insert(
+            0,
+            crate::tail_hygiene::excluded_part("m0#0\0text".into(), "covered"),
+        );
+    rig.store()
+        .commit_meta(&namespace, loaded.row_version, &loaded.meta)
+        .unwrap();
+}
+
 #[tokio::test]
 async fn covered_ride_keeps_prefix_during_historian_meta_write() {
     // One conflict exercises the fresh-snapshot retry; two exhaust the retry
@@ -197,6 +218,7 @@ async fn covered_ride_keeps_prefix_during_historian_meta_write() {
         rig.settle().await;
         view_work::take(&rig.reference);
         rig.history(788, "new completed prefix for the ride");
+        legacy_covered_hygiene_row(&rig);
         let hooks = (0..writes)
             .map(|write| {
                 let h = rig.h.clone();
@@ -293,6 +315,7 @@ async fn covered_ride_rejects_prefix_when_hygiene_conflict_changes_certificate()
     rig.settle().await;
     view_work::take(&rig.reference);
     rig.history(68, "new completed prefix for the ride");
+    legacy_covered_hygiene_row(&rig);
     let store = rig.h.store.get().unwrap().clone();
     let namespace = rig.state().namespace();
     let interleaving = hygiene_interleaving::install(

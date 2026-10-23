@@ -74,6 +74,10 @@ pub(crate) struct CutSeed {
     /// The cut message's `(created_at_ms, completed_at_ms)`. Fallback:
     /// unknown, so the first window message gets no temporal-gap marker.
     pub time_basis: Option<(Option<i64>, Option<i64>)>,
+    /// Exact hygiene hash continuation for covered source parts. Unknown when
+    /// the rows were never held; that fresh lineage hashes only known input.
+    #[serde(default)]
+    pub signature_prefix: Option<crate::tail_hygiene::signature::SignaturePrefix>,
     /// Authored user turns below the cut as the engine counts them
     /// (`LogicalPrefix::covered_user_turns`), for Channel-1 cadence.
     /// Fallback: 0, so that cadence counts as if the conversation began at
@@ -260,6 +264,7 @@ impl CutSeed {
             boundary_id,
             context_sources: BTreeMap::new(),
             time_basis: None,
+            signature_prefix: None,
             covered_user_turns: 0,
             real_users: 0,
             tool_results: 0,
@@ -331,6 +336,7 @@ impl CutSeed {
                 protection_tags: rows,
                 max_tag: self.max_tag as i64,
                 time_basis: self.time_basis,
+                signature_prefix: self.signature_prefix.clone(),
             },
             lineage,
             generation,
@@ -355,6 +361,10 @@ impl CutSeed {
                     .sum()
             })
             + self.pre_cut_tags.len() * 16
+            + self
+                .signature_prefix
+                .as_ref()
+                .map_or(0, |prefix| prefix.heap_bytes())
             + self
                 .todo
                 .as_ref()
@@ -829,6 +839,32 @@ impl AsyncRecord {
             },
             context_sources,
             time_basis,
+            signature_prefix: if let Some(signature) = self
+                .cut_signature
+                .as_ref()
+                .filter(|prefix| prefix.first == first)
+            {
+                Some(signature.clone())
+            } else {
+                let previous_signature = self
+                    .cut_signature
+                    .as_ref()
+                    .filter(|prefix| prefix.first <= first)
+                    .or_else(|| {
+                        previous
+                            .as_ref()
+                            .and_then(|seed| seed.signature_prefix.as_ref())
+                    });
+                let signature_base = previous_signature.map_or(base, |prefix| prefix.first);
+                crate::tail_hygiene::signature::SignaturePrefix::capture(
+                    first,
+                    previous_signature,
+                    &ck_wire::project_messages(
+                        &prepared(self, codec, signature_base..first, lineage_from)?.messages,
+                    )
+                    .map_err(transient)?,
+                )
+            },
             covered_user_turns,
             real_users,
             tool_results,

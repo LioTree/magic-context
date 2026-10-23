@@ -350,6 +350,8 @@ pub(crate) struct AsyncRecord {
     pending_cut_seeds: BTreeMap<u64, cut_seed::CutSeed>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pending_parent_history: Option<cut_runtime::ParentHistory>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    cut_signature: Option<crate::tail_hygiene::signature::SignaturePrefix>,
 }
 
 fn deserialize_logical_prefix<'de, D: serde::Deserializer<'de>>(
@@ -1132,6 +1134,7 @@ impl State {
     /// Drop held entries after `through`, or all of them for `None`, with
     /// their tag addresses; the next save deletes the stored rows.
     fn truncate_entries(&mut self, through: Option<u64>) {
+        self.cut_signature = None;
         self.logical_prefix = None;
         self.mid_index
             .retain(|_, ordinal| through.is_some_and(|end| *ordinal <= end));
@@ -2088,6 +2091,7 @@ impl McHandler {
             published_cuts: BTreeMap::new(),
             pending_cut_seeds: BTreeMap::new(),
             pending_parent_history: None,
+            cut_signature: None,
         };
         let route = state.runner()?;
         state.runner_route =
@@ -4350,6 +4354,16 @@ impl McHandler {
             })
             .filter(|first| *first > state.lineage_first_ordinal);
         if let Some(first) = cut_first {
+            if let Some(signature) = crate::tail_hygiene::signature::SignaturePrefix::capture(
+                first,
+                template
+                    .logical_prefix
+                    .as_ref()
+                    .and_then(|prefix| prefix.signature_prefix.as_ref()),
+                &output.engine.projection,
+            ) {
+                state.cut_signature = Some(signature);
+            }
             cut_runtime::split_head_at(&mut ranges, first);
         }
         let shaped = emptied_messages::shape(codec, &kept, &state.frozen_edits, ranges);

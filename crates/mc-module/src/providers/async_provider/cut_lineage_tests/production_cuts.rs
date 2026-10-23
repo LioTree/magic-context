@@ -62,7 +62,7 @@ async fn descend_pair(pair: &mut Pair, first: u64, child: &str) {
 
 async fn session(profile: Profile, number: u64, steps: u64) {
     let mut rng = Rng(number.wrapping_mul(0x9E37_79B9_7F4A_7C15) | 1);
-    let mut pair = Pair::open_with(profile, false, Some("L"), false, false).await;
+    let mut pair = Pair::open_with(profile, false, Some("L"), false, true).await;
     attest(&pair.resident);
     attest(&pair.oracle);
     pair.append(208 + rng.below(5) * 4);
@@ -100,9 +100,35 @@ async fn session(profile: Profile, number: u64, steps: u64) {
             "each session must descend at two advancing cuts"
         );
         descend_pair(&mut pair, first, &format!("child-{cut}")).await;
+        let mut telemetry_stale = false;
         for _ in 0..steps {
+            for side in [&pair.resident, &pair.oracle] {
+                cut_seed::pass_trace::take(side.store() as *const McStore as usize);
+            }
+            let earlier = pair.engine_mismatches.borrow().clone();
             pair.cut_step(&mut rng, first, &mut history_end).await;
             pair.check_cut(first);
+            let resident_passes =
+                cut_seed::pass_trace::take(pair.resident.store() as *const McStore as usize);
+            let oracle_passes =
+                cut_seed::pass_trace::take(pair.oracle.store() as *const McStore as usize);
+            if oracle_passes.len() > resident_passes.len() {
+                telemetry_stale = true;
+            } else if !resident_passes.is_empty() {
+                telemetry_stale = false;
+            }
+            if telemetry_stale {
+                // These fields describe the last engine pass, not the latest
+                // runner notice. A deliberately skipped pass leaves them stale;
+                // current usage policy, hygiene signatures and every decision
+                // field still have to match the full-input oracle.
+                let mut mismatches = pair.engine_mismatches.borrow_mut();
+                for field in ["last_usage", "newest_live_block_id", "newest_live_ordinal"] {
+                    if !earlier.contains_key(field) {
+                        mismatches.remove(field);
+                    }
+                }
+            }
         }
         previous = first;
     }
@@ -121,8 +147,18 @@ async fn session(profile: Profile, number: u64, steps: u64) {
 }
 
 async fn differential(sessions: u64, steps: u64) {
+    let mut tasks = Vec::new();
     for index in 0..sessions {
-        session(PROFILES[(index % 4) as usize], 70_000 + index, steps).await;
+        tasks.push(tokio::spawn(session(
+            PROFILES[(index % 4) as usize],
+            70_000 + index,
+            steps,
+        )));
+        if tasks.len() == 4 || index + 1 == sessions {
+            for task in std::mem::take(&mut tasks) {
+                task.await.unwrap();
+            }
+        }
     }
     eprintln!("production differential: {sessions} sessions x 2 advancing cuts x {steps} steps over 4 formats; 0 divergences");
 }
@@ -132,7 +168,7 @@ async fn successive_production_cuts_match_full_processing() {
     differential(4, 6).await;
 }
 
-#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 #[ignore = "long two-cut production differential; run explicitly"]
 async fn successive_production_cuts_match_full_processing_over_many_sessions() {
     let sessions = std::env::var("MC_PRODUCTION_CUT_SESSIONS")

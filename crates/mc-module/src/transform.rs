@@ -8138,6 +8138,21 @@ fn apply_once(
     }
     if let Some(prefix) = &req.native_fold_prefix {
         hygiene_measurement.content_signature = prefix.signature(&hygiene_measurement.parts);
+    } else if let Some(prefix) = req
+        .logical_prefix
+        .as_ref()
+        .and_then(|prefix| prefix.signature_prefix.as_ref())
+    {
+        hygiene_measurement.content_signature =
+            prefix.signature(&projection, &hygiene_measurement.parts);
+    }
+    if req.runner_owned_reminders {
+        hygiene_measurement.omit_excluded_baseline_parts();
+        if let Some(baseline) = &mut meta.tail_hygiene_baseline {
+            baseline
+                .baseline_parts
+                .retain(|part| part.kind != mc_store::TailHygienePartKind::Excluded);
+        }
     }
     profile_end!(perf_hygiene_measure);
     profile_start!(perf_hygiene_refresh, "hygiene_refresh");

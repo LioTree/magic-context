@@ -83,6 +83,8 @@ pub(crate) struct LogicalPrefix {
     /// window message against.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub(crate) cut_time_basis: Option<(Option<i64>, Option<i64>)>,
+    #[serde(default)]
+    pub(crate) signature_prefix: Option<crate::tail_hygiene::signature::SignaturePrefix>,
 }
 
 /// What a lineage that begins at a cut keeps of the rows below its first
@@ -90,6 +92,7 @@ pub(crate) struct LogicalPrefix {
 /// provider builds it from its cut seed; see `LogicalPrefix::for_cut`.
 #[derive(Clone, Debug)]
 pub(crate) struct CutPrefixFacts {
+    pub(crate) signature_prefix: Option<crate::tail_hygiene::signature::SignaturePrefix>,
     /// The ordinal the engine's ranges start at: the first ordinal of the
     /// lineage the cut was taken from, so the engine's view of the
     /// conversation is the one full processing would hold.
@@ -338,6 +341,13 @@ impl LogicalPrefix {
                 .collect(),
             cut_max_tag: None,
             cut_time_basis: None,
+            signature_prefix: crate::tail_hygiene::signature::SignaturePrefix::capture(
+                tail_from,
+                req.logical_prefix
+                    .as_ref()
+                    .and_then(|prefix| prefix.signature_prefix.as_ref()),
+                projection,
+            ),
         })
     }
 
@@ -378,6 +388,7 @@ impl LogicalPrefix {
             protection_tags: facts.protection_tags,
             cut_max_tag: Some(facts.max_tag),
             cut_time_basis: facts.time_basis,
+            signature_prefix: facts.signature_prefix,
         }
     }
 
