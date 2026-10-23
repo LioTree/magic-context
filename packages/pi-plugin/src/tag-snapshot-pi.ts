@@ -512,15 +512,58 @@ export function createPiTagSnapshotReader(db: Database) {
 		clearChanged.run(sessionId);
 		return snapshot;
 	};
+	// A paired thinking edit owns the writer while tags and their companion
+	// omissions change together. Overlay only its journaled rows on the hydrated
+	// base; never publish uncommitted rows or consume a journal that may roll back.
+	const transactionView = (sessionId: string): SnapshotTag[] => {
+		const snapshot = cache.get(sessionId);
+		if (!snapshot)
+			throw new PiTagHydrationError(
+				"tag snapshot is not ready; turn not sent, retry",
+			);
+		const stamp = versionStamp.get(sessionId, sessionId) as {
+			durable: number;
+			own: number;
+		};
+		const row = revision.get(sessionId, tagRevisionKey(sessionId)) as {
+			local: string;
+			foreign_revision: string;
+		};
+		const ownVersionAdvance =
+			stamp.durable - snapshot.durableVersion ===
+			stamp.own - snapshot.ownVersion;
+		const firstOwnAllocation =
+			snapshot.firstAllocationPending &&
+			snapshot.revision !== row.local &&
+			ownFirstAllocation.get(sessionId, row.foreign_revision);
+		if (
+			!ownVersionAdvance ||
+			(snapshot.foreignRevision !== row.foreign_revision && !firstOwnAllocation)
+		)
+			throw new PiTagHydrationError(
+				"tag snapshot changed before paired edit; turn not sent, retry",
+			);
+		const numbers = (changed.all(sessionId) as { tag_number: number }[]).map(
+			(entry) => entry.tag_number,
+		);
+		if (!numbers.every(Number.isSafeInteger))
+			throw new PiTagHydrationError(
+				"tag journal has no stable number; turn not sent, retry",
+			);
+		if (numbers.length === 0) return snapshot.tags;
+		const replacements = getTagsByNumbers(db, sessionId, numbers);
+		for (const tag of replacements) Object.freeze(tag);
+		return mergeChangedRows(snapshot.tags, new Set(numbers), replacements);
+	};
 	const read = (
 		sessionId: string,
 		borrowed = false,
 	): ReturnType<typeof getTagsBySession> => {
 		const snapshot = sync(sessionId);
-		if (!snapshot && managed.has(sessionId))
-			throw new PiTagHydrationError(
-				"managed snapshot read inside a transaction",
-			);
+		if (!snapshot && managed.has(sessionId)) {
+			const tags = transactionView(sessionId);
+			return borrowed ? tags : tags.map((tag) => ({ ...tag }));
+		}
 		if (!snapshot) return getTagsBySession(db, sessionId);
 		// Heuristics can edit their working entries; never expose the cached objects.
 		return borrowed ? snapshot.tags : snapshot.tags.map((tag) => ({ ...tag }));

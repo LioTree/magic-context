@@ -263,7 +263,10 @@ import {
 	prefixRecordProblem,
 	readServedPrefix,
 } from "@magic-context/core/hooks/magic-context/served-prefix";
-import { decideSignedThinkingHold } from "@magic-context/core/hooks/magic-context/signed-thinking-hold";
+import {
+	decideSignedThinkingHold,
+	resolveSignedThinkingHoldPolicy,
+} from "@magic-context/core/hooks/magic-context/signed-thinking-hold";
 import { servedPrefixMatches } from "@magic-context/core/hooks/magic-context/strict-thinking-prefix";
 import {
 	buildEditSupersessionReclaim,
@@ -5805,8 +5808,10 @@ export function registerPiContextHandler(
 				isPrefixBoundThinkingModel(ctx.model?.provider, ctx.model?.id)
 			)
 				assertPiThinkingEntryIds(event.messages, lkgEntryIds ?? []);
-			if (!options.compactionOff)
+			if (!options.compactionOff) {
 				assertPiTagSnapshotReady(options.db, sessionId);
+				getPiTagSnapshotView(options.db, sessionId);
+			}
 			let result = await budget.waitMandatory(runPipeline(pipelineArgs));
 			const historyRefreshThisPass = result.historyRefreshPermitted;
 			observePipelineResultForTests(sessionId, result);
@@ -8664,7 +8669,14 @@ async function runCompactionOffPipeline(
 		args.resolvedProviderID,
 		args.resolvedModelID,
 	);
+	const signedThinkingPolicy = resolveSignedThinkingHoldPolicy(
+		args.signedThinkingHoldPolicy ??
+			(typeof args.signedThinkingHold === "string"
+				? args.signedThinkingHold
+				: undefined),
+	);
 	const prefixPass =
+		signedThinkingPolicy.strict &&
 		args.injection &&
 		isPrefixBoundThinkingModel(args.resolvedProviderID, args.resolvedModelID)
 			? new PiPrefixPass(
@@ -9221,7 +9233,15 @@ function piPassMayRewritePrefix(args: RunPipelineArgs): boolean {
 			if (!plan || plan.entryIds.length > 0) return true;
 		}
 	}
-	if (args.signedThinkingHold === "on" || args.signedThinkingHold === true)
+	if (
+		resolveSignedThinkingHoldPolicy(
+			args.signedThinkingHoldPolicy ??
+				(typeof args.signedThinkingHold === "string"
+					? args.signedThinkingHold
+					: undefined),
+		).strict ||
+		args.signedThinkingHold === true
+	)
 		return false;
 	if (args.contextUsage.percentage >= 95) return true;
 	const meta = getOrCreateSessionMeta(args.db, args.sessionId);
@@ -9378,11 +9398,18 @@ function runSynchronousPipeline(
 								(part as { type?: unknown })?.type === "redacted_thinking",
 						),
 				)));
-	let protectedSignedPrefix =
-		signedTurnOnPrefixBoundModel &&
-		(args.signedThinkingHold === true || args.signedThinkingHold === "on");
-	const holdEnabled =
-		args.signedThinkingHoldPolicy === "on" || args.signedThinkingHold === "on";
+	const signedThinkingPolicy = resolveSignedThinkingHoldPolicy(
+		args.signedThinkingHoldPolicy ??
+			(typeof args.signedThinkingHold === "string"
+				? args.signedThinkingHold
+				: undefined),
+	);
+	let protectedSignedPrefix = signedThinkingPolicy.holdsPrefix(
+		signedTurnOnPrefixBoundModel,
+		false,
+		args.signedThinkingHold === true,
+	);
+	const holdEnabled = signedThinkingPolicy.strict;
 	const coldParkedTriggers = !parkedBustTriggersBySession.has(args.sessionId);
 	const parkedTriggers = holdEnabled
 		? ParkedBustTriggers.load(args.db, args.sessionId)
@@ -9478,10 +9505,13 @@ function runSynchronousPipeline(
 		activeThinkingTurn = false;
 		protectedSignedPrefix = false;
 	};
-	// A fit rebuild strips an open signed turn whether or not it is held.
+	// The bounded policy can release an open turn for a fit rebuild. The
+	// explicit strict policy keeps its prefix and must refuse if it cannot fit.
 	if (
 		args.recoveryRebuildReason ||
-		(args.forceSignedRebuildForFit && signedTurnOnPrefixBoundModel)
+		(signedThinkingPolicy.mayRebuildForFit &&
+			args.forceSignedRebuildForFit &&
+			signedTurnOnPrefixBoundModel)
 	)
 		stripForPrefixRewrite(isCacheBustingPass);
 	// An unheld bust invalidates the signed thinking still kept in the turn.

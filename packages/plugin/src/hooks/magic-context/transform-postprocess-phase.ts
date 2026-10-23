@@ -199,6 +199,7 @@ import {
     validateServedPrefix,
     writeServedPrefix,
 } from "./served-prefix";
+import { resolveSignedThinkingHoldPolicy } from "./signed-thinking-hold";
 import { servedPrefixMatches } from "./strict-thinking-prefix";
 import {
     applyFrozenTrailingBlankDecisions,
@@ -2134,7 +2135,8 @@ export async function runPostTransformPhase(
 ): Promise<PostTransformPhaseResult> {
     const tPostprocessSetup = performance.now();
     const compactionOff = args.compactionOff === true;
-    const holdEnabled = args.signedThinkingHold === "on";
+    const signedThinkingPolicy = resolveSignedThinkingHoldPolicy(args.signedThinkingHold);
+    const holdEnabled = signedThinkingPolicy.strict;
     const coldParkedTriggers = !parkedBustTriggersBySession.has(args.sessionId);
     const parkedTriggers =
         holdEnabled && !compactionOff
@@ -2527,6 +2529,7 @@ export async function runPostTransformPhase(
     // without pretending the protected tool window has reached 95% usage.
     if (
         args.forceSignedRebuildForFit &&
+        signedThinkingPolicy.mayRebuildForFit &&
         (activeThinkingPrefixHold ||
             (activeThinkingTurn && args.thinkingBindingRecoveryEnabledForModel === true))
     ) {
@@ -2822,12 +2825,14 @@ export async function runPostTransformPhase(
     const hasPendingUserOps = pendingOps.length > 0;
     // Preserve the requested application opportunity when thinking safety, not
     // cache policy, prevents this batch. The next real user releases the veto.
-    // Prefix-bound models request nothing: their queued drops ride the next
-    // bust of the turn, which strips the signed thinking that protected them,
-    // so a request here would originate a bust no other model takes.
+    // The bounded policy's queued drops ride its next unheld bust, which strips
+    // the turn's thinking. Strict admission instead parks the held execute
+    // opportunity so it survives until that turn ends.
     if (
         args.schedulerDecision === "execute" &&
-        args.thinkingBindingRecoveryEnabledForModel !== true &&
+        (holdEnabled
+            ? !emergencyDropEligible
+            : args.thinkingBindingRecoveryEnabledForModel !== true) &&
         pendingOps.some((op) => newTargets.get(op.tagId)?.thinkingDropProtected)
     ) {
         requestPendingMaterialization(

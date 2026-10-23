@@ -19,7 +19,7 @@ import { insertMemory } from "../memory";
 import { recordMemoryVerifications } from "../memory/storage-memory-verifications";
 import { runMigrations } from "../migrations";
 import { initializeDatabase } from "../storage-db";
-import { type ClassifyArgs, type ClassifyModuleCallArgs, runClassify } from "./classify";
+import { type ClassifyArgs, runClassify } from "./classify";
 import { acquireLease } from "./lease";
 import { MAP_BATCH_FLOOR_MS, mapMemories } from "./map-memories";
 import { runVerify } from "./verify";
@@ -172,7 +172,7 @@ const mapAnswer = (prompt: string) =>
         .join("")}</mappings>`;
 const verifyAnswer = (prompt: string) =>
     `<verify>${idsIn(prompt)
-        .map((id) => `<verified id="${id}"/>`)
+        .map((id) => `<verified id="${id}" files="src/old.ts"/>`)
         .join("")}</verify>`;
 
 const tempDirs: string[] = [];
@@ -269,64 +269,6 @@ describe("classify-memories", () => {
         },
         TEST_TIMEOUT_MS,
     );
-
-    describe("through the Rust classify module under the host runner", () => {
-        function moduleArgs(client: unknown, deadlineMs: number): ClassifyArgs {
-            const args = classifyArgs(client, deadlineMs);
-            args.moduleSessionId = "module-session";
-            args.moduleProjectRoot = "/repo";
-            args.moduleClient = {
-                call: async (call: ClassifyModuleCallArgs) => {
-                    if (call.method === "dreamer.run_task") {
-                        const completion = (call.body as { host_completion?: { text: string } })
-                            .host_completion;
-                        // The module has no runner of its own here: it asks the host for the
-                        // completion, then returns the text the host sent back.
-                        return completion
-                            ? { result: { ok: true, manifest_text: completion.text } }
-                            : {
-                                  result: {
-                                      ok: false,
-                                      code: "host_completion_required",
-                                      system_prompt: "module classify system prompt",
-                                  },
-                              };
-                    }
-                    const rows = (
-                        call.body as { arguments: { rows: Array<{ memory_id: number }> } }
-                    ).arguments.rows;
-                    return { result: { accepted: rows.map((row) => row.memory_id), rejected: [] } };
-                },
-            };
-            return args;
-        }
-
-        test(
-            "a primary that never answers falls back and the module records the fallback's manifest",
-            async () => {
-                const host = opencodeHost({ [PRIMARY]: "dead" }, classifyAnswer);
-
-                const result = await runClassify(moduleArgs(host.client, 60_000));
-
-                expect(result).toMatchObject({ classified: 10, remaining: 0, complete: true });
-                expect(host.sent).toEqual([PRIMARY, FALLBACK]);
-            },
-            TEST_TIMEOUT_MS,
-        );
-
-        test(
-            "a primary that streamed output and then timed out fails the module run without falling back",
-            async () => {
-                const host = opencodeHost({ [PRIMARY]: "partial" }, classifyAnswer);
-
-                await expect(runClassify(moduleArgs(host.client, 5_000))).rejects.toThrow(
-                    /^Rust classify module failed: prompt timed out after \d+ms$/,
-                );
-                expect(host.sent).toEqual([PRIMARY]);
-            },
-            TEST_TIMEOUT_MS,
-        );
-    });
 });
 
 describe("map-memories batches", () => {

@@ -201,7 +201,11 @@ import {
 import { createM0RenderOptions } from "./render-options";
 import { sendStatusNotification } from "./send-session-notification";
 import { isAnthropicFamilyRoute, modelAcceptsEmptyContent } from "./sentinel";
-import { decideSignedThinkingHold, type SignedThinkingHoldDecision } from "./signed-thinking-hold";
+import {
+    decideSignedThinkingHold,
+    resolveSignedThinkingHoldPolicy,
+    type SignedThinkingHoldDecision,
+} from "./signed-thinking-hold";
 import {
     replayClearedReasoning,
     replayStrippedInlineThinking,
@@ -762,6 +766,7 @@ export function resolveTransformHostSeams(
 const SIGNED_FIT_REFUSED_MARKER = "signed_fit:refused:v1";
 
 export function createTransform(deps: TransformDeps) {
+    const signedThinkingPolicy = resolveSignedThinkingHoldPolicy(deps.signedThinkingHold);
     registerSystemDateRefresh(deps.historyRefreshSessions);
     const finalWireUsage = createFinalWireUsageTracker();
     const host = resolveTransformHostSeams(deps);
@@ -1781,8 +1786,11 @@ export function createTransform(deps: TransformDeps) {
         // m[0] there). It keeps the blanket hold for every open signed turn, as
         // before the hold was bounded; it has no history reclaim for the hold to
         // delay.
-        activeThinkingPrefixHold =
-            signedThinkingPrefixBound && (compactionOff || signedThinkingHold?.held === true);
+        activeThinkingPrefixHold = signedThinkingPolicy.holdsPrefix(
+            signedThinkingPrefixBound,
+            compactionOff,
+            signedThinkingHold?.held === true,
+        );
         freezeM0M1 ||= activeThinkingPrefixHold;
         const prefixHoldLogKey = signedThinkingHold
             ? `${currentTurnId}:${signedThinkingHold.reason}:${signedThinkingHold.heavyStepsBack ?? "none"}`
@@ -2435,7 +2443,7 @@ export function createTransform(deps: TransformDeps) {
                   );
                   const tagged = tagMessages(sessionId, tail, deps.tagger, db, {
                       protectedThinkingMessages:
-                          deps.signedThinkingHold === "on" && activeThinkingPrefixHold
+                          signedThinkingPolicy.strict && activeThinkingPrefixHold
                               ? protectedThinkingMessages
                               : undefined,
                       skipPrefixInjection: !ctxReduceCallable,
@@ -2506,7 +2514,7 @@ export function createTransform(deps: TransformDeps) {
                         // Tagging can associate a preceding assistant's thinking with the next
                         // call, so protect every assistant in the turn, not just the call owner.
                         protectedThinkingMessages:
-                            deps.signedThinkingHold === "on" && activeThinkingPrefixHold
+                            signedThinkingPolicy.strict && activeThinkingPrefixHold
                                 ? protectedThinkingMessages
                                 : undefined,
                         skipPrefixInjection,
@@ -2630,7 +2638,7 @@ export function createTransform(deps: TransformDeps) {
             canUseEmptySentinels && !compactionOff
                 ? stripStructuralNoise(messages, {
                       preserveNativeSteps:
-                          deps.signedThinkingHold === "on" &&
+                          signedThinkingPolicy.strict &&
                           isPrefixBoundThinkingModel(resolvedProviderID, modelForBudget?.modelID),
                   })
                 : 0;

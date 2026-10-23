@@ -801,3 +801,77 @@ it("hydration accepts packets for the current lifetime", async () => {
 	});
 	expect(candidate?.tags).toEqual([]);
 });
+
+it("paired edits read journaled tags without publishing uncommitted snapshot rows", async () => {
+	const { db, close } = fixture();
+	try {
+		seed(db);
+		await ensurePiTagSnapshotReady(db, "s", new PiContextBudget());
+		const before = getPiTagSnapshotView(db, "s");
+		const changed = before.find((row) => row.tagNumber === 8)!;
+		const unchanged = before.find((row) => row.tagNumber === 5)!;
+		expect(() =>
+			db
+				.transaction(() => {
+					db.exec(
+						"UPDATE tags SET status = 'dropped', byte_size = 81 WHERE session_id = 's' AND tag_number = 8",
+					);
+					db.exec("DELETE FROM tags WHERE session_id = 's' AND tag_number = 2");
+					const during = getPiTagSnapshotView(db, "s");
+					expect(during.find((row) => row.tagNumber === 8)).toMatchObject({
+						status: "dropped",
+						byteSize: 81,
+					});
+					expect(during.find((row) => row.tagNumber === 8)).not.toBe(changed);
+					expect(during.find((row) => row.tagNumber === 5)).toBe(unchanged);
+					expect(during.some((row) => row.tagNumber === 2)).toBe(false);
+					throw new Error("rollback paired edit");
+				})
+				.immediate(),
+		).toThrow("rollback paired edit");
+		expect(getPiTagSnapshotView(db, "s")).toEqual(before);
+		expect(
+			getPiTagSnapshotView(db, "s").find((row) => row.tagNumber === 8),
+		).toBe(changed);
+		db.transaction(() => {
+			db.exec(
+				"UPDATE tags SET status = 'dropped' WHERE session_id = 's' AND tag_number = 8",
+			);
+			expect(
+				getPiTagSnapshotView(db, "s").find((row) => row.tagNumber === 8)
+					?.status,
+			).toBe("dropped");
+		}).immediate();
+		expect(getPiTagSnapshotView(db, "s")).toEqual(getTagsBySession(db, "s"));
+	} finally {
+		await drainPiTagSnapshotSession("s");
+		close();
+	}
+});
+
+it("paired tag views admit own first allocation but refuse an unhydrated foreign commit", async () => {
+	const { db, foreign, close } = fixture();
+	try {
+		await ensurePiTagSnapshotReady(db, "s", new PiContextBudget());
+		db.transaction(() => {
+			db.exec(
+				"INSERT INTO tags (session_id,tag_number,message_id,type,status,byte_size) VALUES ('s',1,'first','message','active',10)",
+			);
+			expect(getPiTagSnapshotView(db, "s").map((row) => row.messageId)).toEqual(
+				["first"],
+			);
+		}).immediate();
+		expect(getPiTagSnapshotView(db, "s")).toEqual(getTagsBySession(db, "s"));
+		foreign.exec(
+			"UPDATE tags SET byte_size = 42 WHERE session_id = 's' AND tag_number = 1",
+		);
+		expect(() =>
+			db.transaction(() => getPiTagSnapshotView(db, "s")).immediate(),
+		).toThrow("tag snapshot changed before paired edit");
+		await ensurePiTagSnapshotReady(db, "s", new PiContextBudget());
+		expect(getPiTagSnapshotView(db, "s")[0]?.byteSize).toBe(42);
+	} finally {
+		await drainPiTagSnapshotSession("s");
+		close();
+	}
+});

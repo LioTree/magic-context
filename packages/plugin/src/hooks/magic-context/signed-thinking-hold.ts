@@ -31,6 +31,34 @@ export const HOLD_CAP_POINTS = 10;
 
 const REASONING_TYPES = new Set(["reasoning", "thinking"]);
 
+interface SignedThinkingHoldPolicy {
+    readonly strict: boolean;
+    readonly mayRebuildForFit: boolean;
+    holdsPrefix(activeSignedPrefix: boolean, compactionOff: boolean, boundedHold: boolean): boolean;
+}
+
+const boundedPolicy: SignedThinkingHoldPolicy = {
+    strict: false,
+    mayRebuildForFit: true,
+    holdsPrefix: (active, compactionOff, boundedHold) => active && (compactionOff || boundedHold),
+};
+const strictPolicy: SignedThinkingHoldPolicy = {
+    strict: true,
+    mayRebuildForFit: false,
+    holdsPrefix: (active) => active,
+};
+
+/**
+ * The default keeps the shipped bounded hold. An explicit strict hold keeps
+ * the current turn's signed prefix intact, including under fit pressure, and
+ * enables durable trigger parking. Both hosts select their policy here.
+ */
+export function resolveSignedThinkingHoldPolicy(
+    setting: "off" | "on" | undefined,
+): SignedThinkingHoldPolicy {
+    return setting === "on" ? strictPolicy : boundedPolicy;
+}
+
 export interface SignedThinkingHoldDecision {
     held: boolean;
     reason: "heavy_reasoning" | "no_recent_heavy_reasoning" | "above_cap";

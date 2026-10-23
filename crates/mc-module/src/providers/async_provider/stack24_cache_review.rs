@@ -1103,6 +1103,18 @@ fn kept_edits(pair: &Pair, version: u64, below: u64) -> (BTreeSet<u64>, PartEdit
 async fn applied_reduction_survives(resync: Resync, pressure: bool) {
     let mut pair = Pair::new(Profile::Broca, false).await;
     pair.append(64);
+    if pressure {
+        // Emergency reclaim must have a reachable fixed floor: reported usage
+        // alone cannot justify deleting small results when overhead already
+        // exceeds the working ceiling. Keep real tool mass in this witness so
+        // it still tests preservation of reductions across a resynchronization.
+        let mut entries = pair.transcript.entries.lock().unwrap();
+        for entry in entries.iter_mut().filter(|entry| entry.ordinal % 4 == 2) {
+            entry.message["content"][0]["output"]["text"] = json!(
+                format!("output {} ", entry.ordinal) + &"spent tool output line ".repeat(1_000)
+            );
+        }
+    }
     assert_eq!(ack_notice(&mut pair, 5_000, None, None).await, "ok");
     if pressure {
         // As in differential seed 1005: a historian publication, then a

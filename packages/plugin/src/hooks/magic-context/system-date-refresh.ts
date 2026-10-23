@@ -272,7 +272,9 @@ export function finishSystemDateRefresh(
 ): void {
     const current = state(history, request);
     if (!current) return;
-    current.permitted = current.ambiguous ? false : permitted;
+    // Bust permission cannot authorize changing the system prefix of a signed
+    // block the messages hook actually kept on this same request.
+    current.permitted = current.ambiguous || signedThinkingKept === true ? false : permitted;
     current.signedThinkingKept = current.ambiguous ? undefined : signedThinkingKept;
     const apply = current.waiting;
     current.waiting = undefined;
