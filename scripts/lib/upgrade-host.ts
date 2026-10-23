@@ -1,6 +1,7 @@
 import { mkdirSync, readFileSync, writeFileSync } from "node:fs";
 import { join } from "node:path";
 import { NOW } from "./upgrade-audit";
+import { databaseSizes, resetPeak, peakKiB } from "./upgrade-metrics";
 import type { M0M1RenderOptions } from "../../packages/plugin/src/hooks/magic-context/inject-compartments";
 import type { Database } from "../../packages/plugin/src/shared/sqlite";
 
@@ -62,7 +63,7 @@ if (mode === "refuse") {
 	);
 } else {
 	const db =
-		mode === "render"
+		mode === "render" || mode === "measure-context"
 			? (new (
 					await import(join(tree, "packages/plugin/src/shared/sqlite.ts"))
 				).Database(join(root, "context.db")) as Database)
@@ -71,7 +72,21 @@ if (mode === "refuse") {
 		throw new Error(
 			`context.db opener refused: ${JSON.stringify(storage.getSchemaFenceRejection())}`,
 		);
-	if (mode === "seed") {
+	if (mode === "measure-context") {
+		const { MIGRATIONS, runMigrations } = await import(feature("migrations.ts")) as typeof import("../../packages/plugin/src/features/magic-context/migrations");
+		const chain = [...MIGRATIONS];
+		try {
+			for (const step of chain.filter((m) => m.version > 95)) {
+				// Expose one pending real migration at a time; runMigrations still owns its lock, ledger and commit.
+				MIGRATIONS.splice(0, MIGRATIONS.length, ...chain.filter((m) => m.version <= step.version));
+				const before = databaseSizes(join(root, "context.db"));
+				resetPeak();
+				const started = performance.now();
+				runMigrations(db);
+				console.log(`REHEARSAL_METRIC ${JSON.stringify({database: "context", version: step.version, seconds: (performance.now() - started) / 1000, peakKiB: peakKiB(), beforeMainWal: before, afterMainWal: databaseSizes(join(root, "context.db")), scope: "committed migration via real TypeScript runner; per-step process RSS"})}`);
+			}
+		} finally { MIGRATIONS.splice(0, MIGRATIONS.length, ...chain); }
+	} else if (mode === "seed") {
 		const { insertTag } = (await import(
 			feature("storage-tags.ts")
 		)) as typeof import("../../packages/plugin/src/features/magic-context/storage-tags");
@@ -103,7 +118,7 @@ if (mode === "refuse") {
 			recordSessionProjectIdentity(db, session, "git:upgrade-rehearsal");
 			const message = {
 				info: { id: `signed-${s}`, role: "assistant" },
-				parts: [{ type: "thinking", thinking: `Preserved reasoning ${s} 東京`, signature: `fixture-signature-${s}` }],
+				parts: [{ type: "thinking", thinking: `Preserved reasoning ${s} 東京`, signature: `fixture-signature-${s}` }, {type: "text", text: `Stored answer ${s} for tag continuity 東京`}],
 			};
 			const snapshot = messageContentSnapshot(message);
 			if (!saveLkgSlotToDb(db, session, {
