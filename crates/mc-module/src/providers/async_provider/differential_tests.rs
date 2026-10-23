@@ -384,6 +384,10 @@ struct Runner {
     /// below it is refused (`before_lineage_start`) and recorded.
     floor: Mutex<Option<u64>>,
     reads_below_floor: Mutex<Vec<u64>>,
+    /// A `session.head` answer to give instead of the default (a lineage
+    /// with no cut), for a test whose runner reports a lineage that begins
+    /// at a cut.
+    head: Mutex<Option<Value>>,
 }
 
 #[async_trait]
@@ -427,6 +431,9 @@ impl session_resolver::ProviderRunner for Runner {
             );
         }
         if method == "session.head" {
+            if let Some(head) = self.head.lock().unwrap().clone() {
+                return Ok(head);
+            }
             return Ok(json!({"first_ordinal":0}));
         }
         assert_eq!(method, "session.read");
@@ -504,6 +511,7 @@ impl Side {
             raw_sends: Mutex::new(Vec::new()),
             floor: Mutex::new(None),
             reads_below_floor: Mutex::new(Vec::new()),
+            head: Mutex::new(None),
         });
         let mut h = McHandler::new();
         h.store.set(store).ok().unwrap();

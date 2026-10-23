@@ -300,3 +300,7 @@ async fn successive_production_cuts_match_full_processing_over_many_sessions() {
         .unwrap_or(24);
     differential(sessions, steps).await;
 }
+
+/// An independent review's witnesses and campaign over the same fixtures.
+#[path = "slice4_review.rs"]
+mod slice4_review;
