@@ -189,6 +189,10 @@ impl NamespaceHead {
         if FAIL_ADOPTION_BEFORE_OVERLAYS.with(|flag| flag.replace(false)) {
             return Err(rusqlite::Error::InvalidQuery);
         }
+        #[cfg(test)]
+        if CRASH_ADOPTION_BEFORE_OVERLAYS.with(|flag| flag.get()) {
+            std::process::abort();
+        }
         for table in [
             "mc_temporal_marks",
             "mc_user_hints",
@@ -247,11 +251,69 @@ impl NamespaceHead {
 #[cfg(test)]
 thread_local! {
     static FAIL_ADOPTION_BEFORE_OVERLAYS: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+    static CRASH_ADOPTION_BEFORE_OVERLAYS: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn open(dir: &std::path::Path) -> McStore {
+        McStore::open_for_test(&cortexkit_store_types::StorageDescriptor {
+            module_id: "magic-context-test".into(),
+            storage_namespace: "mc_cache".into(),
+            isolation: cortexkit_store_types::Isolation::Module,
+            backend: cortexkit_store_types::StorageBackend::Sqlite {
+                path: dir.join("store.db").to_string_lossy().into(),
+            },
+        })
+        .unwrap()
+    }
+
+    #[test]
+    #[cfg(unix)]
+    fn adoption_crash_between_cache_and_overlays_is_atomic() {
+        use std::os::unix::process::ExitStatusExt;
+        let dir = tempfile::tempdir().unwrap();
+        let store = open(dir.path());
+        store
+            .adopt_namespace_head("s", &NamespaceHead::default())
+            .unwrap();
+        let before = store.load_namespace_head("s").unwrap().unwrap();
+        drop(store);
+        let status = std::process::Command::new(std::env::current_exe().unwrap())
+            .args([
+                "--exact",
+                "cut_head::tests::adoption_crash_worker",
+                "--ignored",
+                "--nocapture",
+            ])
+            .env("MC_TEST_ADOPTION_ROOT", dir.path())
+            .status()
+            .unwrap();
+        assert_eq!(
+            status.signal(),
+            Some(6),
+            "the child must abort at the write boundary, not fail an assertion"
+        );
+        let store = open(dir.path());
+        assert_eq!(store.load_namespace_head("s").unwrap().unwrap(), before);
+    }
+
+    #[test]
+    #[ignore = "crash helper; invoked only by adoption_crash_between_cache_and_overlays_is_atomic"]
+    fn adoption_crash_worker() {
+        let root =
+            std::env::var_os("MC_TEST_ADOPTION_ROOT").expect("parent supplies a private store");
+        let store = open(std::path::Path::new(&root));
+        let mut head = store.load_namespace_head("s").unwrap().unwrap();
+        head.core.boundary_id = "new head".into();
+        head.temporal_marks
+            .push(("m#0".into(), "new mark".into(), 1));
+        CRASH_ADOPTION_BEFORE_OVERLAYS.with(|flag| flag.set(true));
+        store.adopt_namespace_head("s", &head).unwrap();
+        panic!("the crash point did not execute");
+    }
 
     #[test]
     fn adoption_failure_between_cache_and_overlays_rolls_back() {

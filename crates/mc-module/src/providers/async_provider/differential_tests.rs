@@ -102,7 +102,7 @@ fn renumber(entries: &mut [ReadMessage]) {
     let parts = (0..counted as u64)
         .map(|at| tags::RenderedPart::new(tags::PartKind::ToolResultText, at))
         .collect::<Vec<_>>();
-    let mut numbers = tags::number_parts(0, &parts).into_iter();
+    let mut numbers = tags::try_number_parts(0, &parts).unwrap().into_iter();
     for row in entries
         .iter_mut()
         .flat_map(|entry| entry.tags.iter_mut())

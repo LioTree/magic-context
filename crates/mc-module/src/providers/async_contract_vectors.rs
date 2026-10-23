@@ -364,6 +364,7 @@ const OTHER_REJECTIONS: &[&str] = &[
     "rejected:not_requested",
     "rejected:gap",
     "rejected:edit_order",
+    "refused:ranges_start",
 ];
 
 #[test]
@@ -385,7 +386,7 @@ fn every_disposition_vector_is_checked_by_one_test() {
 
 #[test]
 fn fetched_view_applies_or_is_stale() {
-    assert_eq!(check_dispositions(APPLY_OR_STALE), 3);
+    assert_eq!(check_dispositions(APPLY_OR_STALE), 4);
 }
 
 #[test]
@@ -405,7 +406,7 @@ fn fetched_view_failing_its_digest_is_rejected() {
 
 #[test]
 fn fetched_view_not_requested_or_malformed_is_rejected() {
-    assert_eq!(check_dispositions(OTHER_REJECTIONS), 3);
+    assert_eq!(check_dispositions(OTHER_REJECTIONS), 6);
 }
 
 #[test]
@@ -624,7 +625,7 @@ fn check_descent(outcomes: &[&str]) -> usize {
 
 #[test]
 fn fork_descent_with_matching_digest_keeps_state() {
-    assert_eq!(check_descent(&["keep_through"]), 2);
+    assert_eq!(check_descent(&["keep_through"]), 3);
 }
 
 #[test]

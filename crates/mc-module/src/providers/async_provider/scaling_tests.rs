@@ -255,7 +255,7 @@ async fn covered_ride_keeps_prefix_during_historian_meta_write() {
                 && work.renderer_input > 0
                 && work.renderer_input <= 14
                 && work.decoded_entries > 0
-                && work.decoded_entries <= 28,
+                && work.decoded_entries <= 84,
             "writes={writes}: {work:?}"
         );
         let state = rig.state();

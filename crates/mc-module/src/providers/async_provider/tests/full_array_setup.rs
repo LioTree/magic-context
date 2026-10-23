@@ -183,7 +183,7 @@ async fn old_numbers_are_refused_and_new_parts_land_above_the_floor() {
             tags::RenderedPart::new(kind, n)
         })
         .collect::<Vec<_>>();
-    let numbers = tags::number_parts(checkpoint.tag_checkpoint, &kinds);
+    let numbers = tags::try_number_parts(checkpoint.tag_checkpoint, &kinds).unwrap();
     assert_eq!(numbers, vec![Some(31), Some(32), Some(33), Some(34)]);
     *rig.runner.entries.lock().unwrap() = numbers
         .iter()
