@@ -867,14 +867,21 @@ impl Pair {
             {
                 let head = load_head(self.resident.store(), &self.reference).unwrap();
                 let generation = head.as_ref().map_or(0, |head| head.generation);
-                let coverage = head.and_then(|head| {
-                    self.resident
-                        .store()
-                        .load_meta(&head.namespace())
-                        .ok()?
-                        .meta
-                        .coverage_ordinal
-                });
+                // Coverage is the publication's own snapshot. A later summary
+                // may have a different boundary by the time a view is observed.
+                let coverage = self
+                    .resident
+                    .store()
+                    .load_async_compaction_views(&self.reference)
+                    .unwrap()
+                    .0
+                    .into_iter()
+                    .find(|(published, _, _, _)| published == version)
+                    .and_then(|(_, _, engine, _)| engine)
+                    .map(|engine| {
+                        serde_json::from_str::<Value>(&engine).unwrap()["history_through"].as_u64()
+                    })
+                    .expect("each new view records its publication coverage");
                 // Assemble before locking the transcript: assembly locks it too.
                 let model = String::from_utf8(self.model_bytes(&left_view)).unwrap();
                 self.review.borrow_mut().record_view(

@@ -118,26 +118,6 @@ impl FrozenEdits {
         for range in &view.ranges {
             if let view::ViewRange::Keep { edits, .. } = range {
                 self.capture_edits(edits, entries)?;
-            } else if let view::ViewRange::Replace { from, to, bytes } = range {
-                if serde_json::from_str::<Vec<serde::de::IgnoredAny>>(bytes)
-                    .is_ok_and(|messages| messages.is_empty())
-                {
-                    // An empty replacement removes its source parts just as
-                    // explicit part drops do. A restart-point split can place
-                    // an empty replacement after the history head, so record
-                    // each removed part's digest at publication time; otherwise
-                    // a later history rewind can expose its raw source bytes.
-                    for (_, entry) in entries.range(*from..*to) {
-                        let source = entry.read()?;
-                        for tag in &source.tags {
-                            self.insert_drop(
-                                &source.mid,
-                                &tag.part,
-                                &served_part_digest(&source, &tag.part)?,
-                            );
-                        }
-                    }
-                }
             }
         }
         Ok(())
@@ -417,48 +397,6 @@ mod tests {
     /// Part keys "0" to "11": an acknowledged drop of part "10" re-anchored
     /// next to this pass's edit of part "2" must follow it, although "10"
     /// sorts before "2" as a string.
-    #[test]
-    fn acknowledged_empty_replacement_keeps_publication_source_provenance() {
-        let entry = message(0, 2, None);
-        let mut fixture = Fixture::new(std::slice::from_ref(&entry));
-        let published = view::CompactionView::new(
-            "reference",
-            1,
-            "L",
-            compact::lineage::MessageRef {
-                ordinal: 0,
-                mid: entry.mid.clone(),
-            },
-            vec![view::ViewRange::replace(0, 1, "[]")],
-        );
-        fixture
-            .frozen
-            .capture(&published, &fixture.entries)
-            .unwrap();
-        let mut ranges = vec![view::ViewRange::keep(0, 1)];
-        fixture.apply(&mut ranges);
-        let view::ViewRange::Keep { edits, .. } = &ranges[0] else {
-            unreachable!()
-        };
-        assert_eq!(edits.len(), entry.tags.len());
-        assert!(edits.iter().all(|edit| edit.drop));
-        let mut changed = entry.clone();
-        changed.message["content"][0]["text"] = json!("a different source part");
-        fixture
-            .entries
-            .insert(0, Arc::new(HeldEntry::from_read(&changed).unwrap()));
-        let mut ranges = vec![view::ViewRange::keep(0, 1)];
-        fixture.apply(&mut ranges);
-        let view::ViewRange::Keep { edits, .. } = &ranges[0] else {
-            unreachable!()
-        };
-        assert_eq!(
-            edits.len(),
-            entry.tags.len() - 1,
-            "new source bytes are not the dropped publication source"
-        );
-    }
-
     #[test]
     fn re_anchored_edits_follow_part_position_past_ten_parts() {
         let entry = message(0, 12, None);

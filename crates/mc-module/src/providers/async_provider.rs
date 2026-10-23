@@ -2445,10 +2445,17 @@ impl McHandler {
         let signed = transform::compaction::SignedReasoning::RunnerCompanion;
         let previous_engine = engine.clone();
         #[cfg(test)]
-        cut_seed::pass_trace::record(
-            Arc::as_ptr(store) as usize,
-            format!("engine_input rows={}", template.messages.len()),
-        );
+        if self
+            .provider_store
+            .async_runtime
+            .record_notice_decisions
+            .load(std::sync::atomic::Ordering::Relaxed)
+        {
+            cut_seed::pass_trace::record(
+                Arc::as_ptr(store) as usize,
+                format!("engine_input rows={}", template.messages.len()),
+            );
+        }
         let output = if engine.last_applied.is_none() {
             transform::compaction::setup_with(store, &template, &context, status, engine, signed)
         } else {
@@ -4499,10 +4506,12 @@ impl McHandler {
             #[serde(flatten)]
             view: &'a transform::compaction::View,
             native_frozen_edits: &'a frozen_edits::FrozenEdits,
+            history_through: Option<u64>,
         }
         let engine_json: Arc<str> = serde_json::to_string(&PublishedEngine {
             view: &candidate,
             native_frozen_edits: &frozen_edits,
+            history_through: coverage,
         })
         .map_err(transient)?
         .into();

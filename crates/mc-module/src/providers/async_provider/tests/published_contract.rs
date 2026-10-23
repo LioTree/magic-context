@@ -542,3 +542,49 @@ async fn reset_binds_a_split_history_head_to_every_replaced_source() {
     assert_eq!(source.messages.len(), end as usize);
     assert_eq!(source.messages.last().unwrap().mid, format!("m{}", end - 1));
 }
+
+#[tokio::test]
+async fn explicitly_dropped_then_summarized_part_stays_dropped_when_uncovered() {
+    let dir = tempfile::tempdir().unwrap();
+    let rig = Rig::new(dir.path()).await;
+    rig.fill(180);
+    rig.history(100, "initial completed history");
+    rig.notice(1, 1_000, None).await;
+    rig.queue(&[100 + 146 * 3]).await;
+    let dropped = rig.ride("ceiling").await.unwrap();
+    let removed = |view: &view::CompactionView| {
+        view.ranges.iter().any(|range| match range {
+            view::ViewRange::Replace { from, to, bytes } => {
+                *from <= 146 && 146 < *to && bytes == "[]"
+            }
+            view::ViewRange::Keep { edits, .. } => edits
+                .iter()
+                .any(|edit| edit.ordinal == 146 && edit.part == "0" && edit.drop),
+            _ => false,
+        })
+    };
+    assert!(
+        removed(&dropped),
+        "the fixture must explicitly drop m146 before it is summarized"
+    );
+    rig.notice(2, 1_000, Some(dropped.view_version)).await;
+    rig.history(160, "summary covering the explicitly dropped source");
+    let covered = rig.ride("ceiling").await.unwrap();
+    rig.notice(3, 1_000, Some(covered.view_version)).await;
+    rig.history(130, "shorter summary uncovering the same source");
+    let uncovered = rig.ride("ceiling").await.unwrap();
+    assert!(
+        removed(&uncovered),
+        "a shorter summary must not restore an explicitly acknowledged part drop"
+    );
+    assert!(rig
+        .h
+        .store
+        .get()
+        .unwrap()
+        .load_meta(&rig.state().namespace())
+        .unwrap()
+        .meta
+        .coverage_ordinal
+        .is_some_and(|through| through < 146));
+}

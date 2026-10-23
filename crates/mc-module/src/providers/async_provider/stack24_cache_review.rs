@@ -210,16 +210,18 @@ impl Review {
             .join(" <- ");
         let mut parts = BTreeMap::new();
         self.check_served_history(profile, version, &context, entries, model);
-        // A replace range of one message by no messages removes that message
-        // (`emptied_messages::shape`); for these observations it is a drop of
-        // each of the message's parts, as it was before such messages were
-        // removed.
+        // Outside this view's historian coverage, a one-message empty
+        // replacement is a whole-message cleanup drop. Inside its coverage,
+        // the same shape can be a summary segment split at a restart point;
+        // shorter later summaries may uncover those source bytes again.
         let removed: Vec<view::ViewRange> = view
             .ranges
             .iter()
             .filter_map(|range| match range {
                 view::ViewRange::Replace { from, to, bytes }
-                    if *to == from + 1 && bytes == "[]" =>
+                    if *to == from + 1
+                        && bytes == "[]"
+                        && coverage.is_none_or(|covered| *from > covered) =>
                 {
                     let entry = entries.iter().find(|entry| entry.ordinal == *from)?;
                     let drops = entry
@@ -1320,4 +1322,177 @@ async fn stack25_delayed_acknowledgements_keep_publication_source_identities() {
             "seed {seed} {profile:?}: {restored:?}; steps={log:?}"
         );
     }
+}
+
+#[test]
+fn covered_empty_history_segment_is_not_a_frozen_cleanup_edit() {
+    let entry = message(Profile::Broca, 0, 0);
+    let mut review = Review::default();
+    let published = view::CompactionView::new(
+        "fixture",
+        1,
+        "L",
+        contract::lineage::MessageRef {
+            ordinal: 0,
+            mid: entry.mid.clone(),
+        },
+        vec![view::ViewRange::replace(0, 1, "[]")],
+    );
+    review.record_view(
+        Profile::Broca,
+        1,
+        &published,
+        std::slice::from_ref(&entry),
+        &["summarized".into()],
+        Some(0),
+        0,
+        "[]",
+    );
+    review.acknowledge(1, 1);
+    let uncovered = view::CompactionView::new(
+        "fixture",
+        2,
+        "L",
+        contract::lineage::MessageRef {
+            ordinal: 0,
+            mid: entry.mid.clone(),
+        },
+        vec![view::ViewRange::keep(0, 1)],
+    );
+    review.record_view(
+        Profile::Broca,
+        2,
+        &uncovered,
+        std::slice::from_ref(&entry),
+        &["acknowledged".into(), "shorter summary".into()],
+        None,
+        0,
+        &json!([entry.message]).to_string(),
+    );
+    review.check_served_edits();
+    assert!(
+        review.snapshots[0].parts.is_empty(),
+        "covered summary rows must not be recorded as cleanup edits"
+    );
+    assert!(
+        review
+            .violations
+            .iter()
+            .all(|row| !row.starts_with("RESTORED")),
+        "coverage is fixed by the publishing view, not by the later uncovered boundary"
+    );
+}
+
+#[test]
+fn uncovered_empty_replacement_still_detects_a_restored_cleanup_drop() {
+    let entry = message(Profile::Broca, 0, 0);
+    let mut review = Review::default();
+    let published = view::CompactionView::new(
+        "fixture",
+        1,
+        "L",
+        contract::lineage::MessageRef {
+            ordinal: 0,
+            mid: entry.mid.clone(),
+        },
+        vec![view::ViewRange::replace(0, 1, "[]")],
+    );
+    review.record_view(
+        Profile::Broca,
+        1,
+        &published,
+        std::slice::from_ref(&entry),
+        &["cleanup".into()],
+        None,
+        0,
+        "[]",
+    );
+    review.acknowledge(1, 1);
+    let restored = view::CompactionView::new(
+        "fixture",
+        2,
+        "L",
+        contract::lineage::MessageRef {
+            ordinal: 0,
+            mid: entry.mid.clone(),
+        },
+        vec![view::ViewRange::keep(0, 1)],
+    );
+    review.record_view(
+        Profile::Broca,
+        2,
+        &restored,
+        std::slice::from_ref(&entry),
+        &["acknowledged".into(), "restored".into()],
+        None,
+        0,
+        &json!([entry.message]).to_string(),
+    );
+    review.check_served_edits();
+    assert!(
+        review
+            .violations
+            .iter()
+            .any(|row| row.starts_with("RESTORED")),
+        "uncovered cleanup removals remain frozen edits"
+    );
+}
+
+#[test]
+fn explicit_part_drop_remains_an_edit_even_inside_published_history_coverage() {
+    let entry = message(Profile::Broca, 0, 0);
+    let mut review = Review::default();
+    let published = view::CompactionView::new(
+        "fixture",
+        1,
+        "L",
+        contract::lineage::MessageRef {
+            ordinal: 0,
+            mid: entry.mid.clone(),
+        },
+        vec![view::ViewRange::keep_with_edits(
+            0,
+            1,
+            vec![view::PartEdit::drop(0, &entry.mid, "0")],
+        )],
+    );
+    review.record_view(
+        Profile::Broca,
+        1,
+        &published,
+        std::slice::from_ref(&entry),
+        &["explicit drop".into()],
+        Some(0),
+        0,
+        "[]",
+    );
+    review.acknowledge(1, 1);
+    let restored = view::CompactionView::new(
+        "fixture",
+        2,
+        "L",
+        contract::lineage::MessageRef {
+            ordinal: 0,
+            mid: entry.mid.clone(),
+        },
+        vec![view::ViewRange::keep(0, 1)],
+    );
+    review.record_view(
+        Profile::Broca,
+        2,
+        &restored,
+        std::slice::from_ref(&entry),
+        &["acknowledged".into(), "uncovered".into()],
+        None,
+        0,
+        &json!([entry.message]).to_string(),
+    );
+    review.check_served_edits();
+    assert!(
+        review
+            .violations
+            .iter()
+            .any(|row| row.starts_with("RESTORED")),
+        "explicit edits are independent of summary coverage"
+    );
 }
