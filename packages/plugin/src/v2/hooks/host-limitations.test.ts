@@ -1,4 +1,12 @@
-import { afterEach, beforeEach, describe, expect, it } from "bun:test";
+import { afterEach, beforeEach, describe, expect, it, spyOn } from "bun:test";
+import { mkdirSync, rmSync, writeFileSync } from "node:fs";
+import { tmpdir } from "node:os";
+import { join } from "node:path";
+import { loadPluginConfigDetailed } from "../../config";
+import {
+    resetTransformModeDeprecationWarningForTest,
+    TRANSFORM_MODE_DEPRECATION_WARNING,
+} from "../../config/transform-mode";
 import {
     __resetToolDefinitionMeasurements,
     getCurrentToolSetHash,
@@ -10,10 +18,11 @@ import {
     activeHostLimitations,
     declareHostLimitation,
 } from "../../shared/host-limitations";
+import * as logger from "../../shared/logger";
 import type { StatusDetail } from "../../shared/rpc-types";
 import { statusSummaryFromDetail } from "../../shared/status-summary";
+import { createTestTempDirFromPath } from "../../shared/test-temp-dir";
 import { recordV2ToolDefinitions } from "./context";
-import { resolveV2RustModeModuleClient } from "./rust-mode";
 import type { SessionContext } from "./types";
 
 function draft(overrides: Partial<SessionContext> = {}): SessionContext {
@@ -40,31 +49,42 @@ describe("v2 transform-mode resolution", () => {
         __resetHostLimitations();
     });
 
-    it("builds a module client for Rust mode and none for TypeScript mode", () => {
-        const directory = "/tmp/magic-context-v2-rust-mode";
-        expect(resolveV2RustModeModuleClient({ transform_mode: "ts" }, directory)).toBeUndefined();
-        expect(resolveV2RustModeModuleClient({}, directory)).toBeUndefined();
-        const client = resolveV2RustModeModuleClient({ transform_mode: "rust" }, directory);
-        expect(client).toBeDefined();
-        // Every method the RPC status handlers and the transform reach for must be
-        // present; a missing one reads as "Rust module status unavailable" at runtime.
-        for (const method of ["call", "stateSyncCapabilities", "deleteSession", "closeSession"]) {
-            expect(typeof (client as unknown as Record<string, unknown>)[method]).toBe("function");
-        }
-    });
-
-    it("declares no limitation for a Rust-mode session", () => {
-        const warnings: string[] = [];
-        const original = console.warn;
-        console.warn = (...args: unknown[]) => {
-            warnings.push(args.map(String).join(" "));
-        };
+    it("an OpenCode 2 seat config with transform_mode rust loads as ts", () => {
+        const xdg = createTestTempDirFromPath(join(tmpdir(), "mc-v2-seat-config-"));
+        const project = createTestTempDirFromPath(join(tmpdir(), "mc-v2-seat-project-"));
+        mkdirSync(join(xdg, "cortexkit"), { recursive: true });
+        writeFileSync(
+            join(xdg, "cortexkit", "magic-context.jsonc"),
+            JSON.stringify({
+                transform_mode: "rust",
+                rust_pipeline: "provider",
+                subc: { connection_file: "/tmp/magic-context-v2-seat/subc.json" },
+            }),
+        );
+        const original = process.env.XDG_CONFIG_HOME;
+        process.env.XDG_CONFIG_HOME = xdg;
+        resetTransformModeDeprecationWarningForTest();
+        const log = spyOn(logger, "log").mockImplementation(() => {});
         try {
-            resolveV2RustModeModuleClient({ transform_mode: "rust" }, "/tmp/magic-context-v2-rust");
-            expect(activeHostLimitations()).toEqual([]);
-            expect(warnings).toEqual([]);
+            // OpenCode 2 loads config in its server setup and again for each
+            // directory's context hook; the deprecation still logs once.
+            for (let load = 0; load < 3; load += 1) {
+                const config = loadPluginConfigDetailed(project, false).config;
+                expect(config.transform_mode).toBe("ts");
+                expect(config.rust_pipeline).toBe("full_request");
+            }
+            expect(
+                log.mock.calls.filter(
+                    (call) => call[0] === `[magic-context] ${TRANSFORM_MODE_DEPRECATION_WARNING}`,
+                ),
+            ).toHaveLength(1);
         } finally {
-            console.warn = original;
+            log.mockRestore();
+            resetTransformModeDeprecationWarningForTest();
+            if (original === undefined) delete process.env.XDG_CONFIG_HOME;
+            else process.env.XDG_CONFIG_HOME = original;
+            rmSync(xdg, { recursive: true, force: true });
+            rmSync(project, { recursive: true, force: true });
         }
     });
 

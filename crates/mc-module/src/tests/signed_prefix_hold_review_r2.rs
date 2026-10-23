@@ -82,6 +82,7 @@ fn review_r2_tail_soft_preserves_ordered_prefix_and_releases_once() {
             meta.soft_refresh_pending = true;
             meta.project_memory_epoch_pending = true;
         });
+        regate_mark_history_pending(sim.s(), &sim.session);
         sim.used = used;
         if idle {
             sim.ctx.observed_last_response_at_ms = Some(sim.ctx.now_ms + 1);
@@ -274,6 +275,7 @@ fn review_r2_witness_signed_loop_over_window_must_fit_or_refuse() {
         meta.soft_refresh_pending = true;
         meta.project_memory_epoch_pending = true;
     });
+    regate_mark_history_pending(sim.s(), &sim.session);
     sim.used = 95_000;
     let mut request = sim.request(false);
     let usage = request.usage.as_mut().unwrap();

@@ -4,6 +4,7 @@ import { getOrCreateSessionMeta } from "../../features/magic-context/storage";
 import { createTagger } from "../../features/magic-context/tagger";
 import {
     createProjectionFixture,
+    isDashboardPayloadRead,
     type ProjectionFixture,
 } from "../../shared/memory-projection-fixtures.test";
 import * as autoSearch from "./auto-search-runner";
@@ -14,7 +15,8 @@ import { runPostTransformPhase } from "./transform-postprocess-phase";
  * Automatic search is one of the two named memory readers outside the memory pair
  * (with explicit ctx_search). It reads current memory only while computing a new
  * hint for a new user message; a pass that replays an already-decided message reads
- * neither memories nor the mutation log, and no hint ever changes m[0]/m[1].
+ * no canonical memories or log heads. Authorized SOFTs may still load immutable
+ * dashboard payloads independently of search; no hint changes m[0]/m[1].
  */
 
 /** Record every executed statement that reads memories or the mutation log. */
@@ -161,14 +163,20 @@ for (const busting of [false, true])
             reads.stop();
             expect(replay.materialized).toBe(false);
             expect(search).toHaveBeenCalledTimes(1);
-            expect(reads.seen).toEqual([]);
+            expect(reads.seen.filter((sql) => !isDashboardPayloadRead(sql))).toEqual([]);
+            if (!busting) expect(reads.seen).toEqual([]);
 
             computeNewHint = true;
             reads.start();
             await runPostTransformPhase(postArgs(f, a, busting));
             reads.stop();
             expect(reads.seen.length).toBeGreaterThan(0);
-            expect(reads.seen.every((sql) => /FROM memories/i.test(sql))).toBe(true);
+            expect(reads.seen.some((sql) => /FROM memories/i.test(sql))).toBe(true);
+            expect(
+                reads.seen.every(
+                    (sql) => /FROM memories/i.test(sql) || isDashboardPayloadRead(sql),
+                ),
+            ).toBe(true);
             expect(getOrCreateSessionMeta(f.db, a).cachedM0Bytes).toEqual(m0);
         } finally {
             search.mockRestore();

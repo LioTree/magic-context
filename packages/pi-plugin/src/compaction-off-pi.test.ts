@@ -20,6 +20,7 @@ import {
 	recordOverflowDetected,
 } from "@magic-context/core/features/magic-context/storage-meta-persisted";
 import { closeQuietly } from "@magic-context/core/shared/sqlite-helpers";
+import { sessionRenderCacheSelect } from "../../plugin/src/features/magic-context/storage-session-cache";
 import { createTestTempDirFromPath } from "../../plugin/src/shared/test-temp-dir";
 
 import {
@@ -151,7 +152,10 @@ describe("Pi compaction-off mode", () => {
 			expect(
 				db
 					.prepare(
-						"SELECT pending_pi_compaction_marker_state, cached_m0_bytes, cached_m1_bytes FROM session_meta WHERE session_id = ?",
+						`SELECT pending_pi_compaction_marker_state,
+						    ${sessionRenderCacheSelect("cached_m0_bytes", "cached_m0_bytes", db)},
+						    ${sessionRenderCacheSelect("cached_m1_bytes", "cached_m1_bytes", db)}
+						FROM session_meta WHERE session_id = ?`,
 					)
 					.get(sessionId),
 			).toMatchObject({

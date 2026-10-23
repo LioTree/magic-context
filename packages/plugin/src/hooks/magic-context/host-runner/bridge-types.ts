@@ -1,6 +1,7 @@
 import type { PluginContext } from "../../../plugin/types";
 import type { V2Context } from "../../../v2/hooks/types";
 import { EmergencyFailClosedError } from "../emergency-fail-closed";
+import type { MarkerEnvelope } from "../marker-envelope";
 import type { MessageLike } from "../transform-operations";
 import type { BridgeReceipt } from "./bridge-receipt";
 import type { FallbackInputs } from "./fallback-admissibility";
@@ -65,6 +66,10 @@ export type BridgeHostFact = BridgeFactScope &
               usage?: { input: number; cacheRead: number; cacheWrite: number; output: number };
               /** Positive host-resolved usable input window, including auth/config route caps. */
               contextWindow: number;
+              /** System strings, visible tool definitions and unobserved tool names sent by requestId.
+               * Usage is reusable only for a matching model and envelope; a successful response's
+               * usage also derives the envelope reading that bounds unobserved tool schemas. */
+              material?: MarkerEnvelope;
           }
         | {
               kind: "system_prompt";
@@ -116,21 +121,41 @@ export type BridgeFallbackInputs = Omit<FallbackInputs, "messages"> & {
     messages: readonly MessageLike[];
 };
 
+export type BridgeMarkerInputs = Omit<
+    BridgeFallbackInputs,
+    "envelope" | "systemPromptTokens" | "toolDefinitionTokens" | "material"
+> & {
+    /** Final system-transform strings, the visible sent tool definitions and the names of
+     * sent tools whose schema is not visible, not host token estimates. */
+    material?: MarkerEnvelope;
+};
+
 export type BridgeRefusalReason =
     | NonNullable<Parameters<NonNullable<OpenCodeProviderOptions["fullRequest"]>>[5]>
     | "raw_history_provider_missing"
-    | "covered_range_changed";
+    | "covered_range_changed"
+    | "served_bytes_changed";
+
+const REFUSAL_MESSAGES: Partial<Record<BridgeRefusalReason, string>> = {
+    raw_history_provider_missing:
+        "OpenCode 2 bridge requires a registered per-session raw-history provider before run",
+    served_bytes_changed:
+        "Bridge refused the step: the new view would change Magic Context's bytes in messages already returned, or put them back to raw host text. Nothing was committed. Confirm delivery of requests that reached the provider (completeRequest with a clean end), then call run() again",
+};
 
 /** Refuse the native adapter's full-request execution path; callers must prove fallback admission before sending history. */
 export class BridgeRefusalError extends EmergencyFailClosedError {
+    /** True when the refused step committed nothing, so the host may call run() again
+     * after the fix the message names, without changing the session's history. */
+    readonly retryable: boolean;
     constructor(readonly reason: BridgeRefusalReason) {
         super(
-            reason === "raw_history_provider_missing"
-                ? "OpenCode 2 bridge requires a registered per-session raw-history provider before run"
-                : `Bridge provider handoff refused: ${reason}; check isFallbackAdmissible or refuse the step`,
+            REFUSAL_MESSAGES[reason] ??
+                `Bridge provider handoff refused: ${reason}; check isFallbackAdmissible or refuse the step`,
             { code: `bridge_${reason}` },
         );
         this.name = "BridgeRefusalError";
+        this.retryable = reason === "served_bytes_changed";
     }
 }
 

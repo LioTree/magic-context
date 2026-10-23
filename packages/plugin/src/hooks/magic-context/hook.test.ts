@@ -12,7 +12,6 @@ import { tmpdir } from "node:os";
 import { dirname, join } from "node:path";
 import { appendCompartments } from "../../features/magic-context/compartment-storage";
 import { writeTaskScheduleState } from "../../features/magic-context/dreamer/storage-task-schedule";
-import { ensureContextStoreUuid } from "../../features/magic-context/legacy-authority-fixture.test-support";
 import { insertMemory } from "../../features/magic-context/memory";
 import type {
     EmbeddingProvider,
@@ -1042,98 +1041,6 @@ describe("magic-context hook", () => {
         );
     });
 
-    it("routes manual classify through MODULE before any transform has run", async () => {
-        process.env.XDG_DATA_HOME = makeTempDir("hook-classify-module-manual-");
-        const promptMocks = createPromptMocks();
-        const deps = createMockDeps(promptMocks);
-        const projectPath = resolveProjectIdentity("/tmp");
-        deps.config = {
-            ...deps.config,
-            transform_mode: "rust",
-            dreamer: {
-                tasks: {
-                    "classify-memories": {
-                        schedule: "0 3 * * *",
-                        timeout_minutes: 10,
-                    },
-                },
-            },
-        } as never;
-
-        class StatefulModuleClient {
-            private readonly instanceState = "hook-transport";
-            readonly methods: string[] = [];
-
-            async authorityStatus() {
-                if (this.instanceState !== "hook-transport") throw new Error("lost transport this");
-                return { authority: { state: "MODULE", generation: 4 } };
-            }
-
-            async call(args: { method: string; body: unknown }) {
-                if (this.instanceState !== "hook-transport") throw new Error("lost transport this");
-                this.methods.push(args.method);
-                if (args.method === "dreamer.run_task") {
-                    const body = args.body as {
-                        payload: { items: Array<{ memory_id: number }> };
-                    };
-                    return {
-                        manifest_text: `<classify>${body.payload.items
-                            .map(
-                                ({ memory_id }) =>
-                                    `<memory id="${memory_id}" importance="75" scope="project" shareable="false"/>`,
-                            )
-                            .join("")}</classify>`,
-                        truncated: false,
-                    };
-                }
-                return {
-                    accepted: (
-                        args.body as { arguments: { rows: Array<{ memory_id: number }> } }
-                    ).arguments.rows.map((row) => row.memory_id),
-                    rejected: [],
-                };
-            }
-        }
-        const moduleClient = new StatefulModuleClient();
-        deps.rustModeModuleClient = moduleClient as never;
-        const hook = requireHook(createMagicContextHook(deps));
-        const db = openDatabase();
-        ensureContextStoreUuid(db);
-        const memories = [];
-        for (let i = 0; i < 12; i += 1) {
-            memories.push(
-                insertMemory(db, {
-                    projectPath,
-                    category: "ARCHITECTURE",
-                    content: `Manual classify memory ${i}.`,
-                }),
-            );
-        }
-        for (const [index, memory] of memories.entries()) {
-            db.prepare(
-                "INSERT INTO mirror_identity(domain, module_project, module_row_id, context_row_id) VALUES ('memories', ?, ?, ?)",
-            ).run(projectPath, 12000 + index, memory.id);
-            db.prepare(
-                "INSERT INTO mirror_live_memory_rows(module_project, module_row_id, category, normalized_hash) VALUES (?, ?, ?, ?)",
-            ).run(projectPath, 12000 + index, memory.category, memory.normalizedHash);
-        }
-
-        await expectSentinel(
-            hook["command.execute.before"]!(
-                {
-                    command: "ctx-dream",
-                    sessionID: "ses-classify-module-manual",
-                    arguments: "classify-memories",
-                },
-                { parts: [{ type: "text", text: "" }] },
-            ),
-            "__CONTEXT_MANAGEMENT_CTX-DREAM_HANDLED__",
-        );
-
-        expect(moduleClient.methods).toEqual(["dreamer.run_task", "memory.set_classification"]);
-        expect(promptMocks.createSession).not.toHaveBeenCalled();
-    });
-
     it("checks the dream schedule in the background after message updates", async () => {
         process.env.XDG_DATA_HOME = makeTempDir("hook-dream-schedule-");
         const promptMocks = createPromptMocks();
@@ -1230,6 +1137,76 @@ describe("magic-context hook", () => {
             Date.now = originalDateNow;
         }
     });
+
+    // This hook has no module client. The background switch alone cannot exclude
+    // TS tasks; the shared dream-domain lease still arbitrates with a Rust host.
+    for (const enabled of [true, false]) {
+        it(`scheduled dreaming runs classify without a module client when Rust background is ${enabled ? "on" : "off"}`, async () => {
+            process.env.XDG_DATA_HOME = makeTempDir("hook-classify-ownership-scheduled-");
+            const promptMocks = createPromptMocks();
+            const deps = createMockDeps(promptMocks);
+            deps.directory = "/repo/ownership";
+            deps.config = {
+                ...deps.config,
+                rust_background_enabled: enabled,
+                dreamer: {
+                    tasks: {
+                        "classify-memories": { schedule: "0 3 * * *", timeout_minutes: 10 },
+                    },
+                },
+            } as never;
+            const originalDateNow = Date.now;
+            Date.now = () => originalDateNow() + 2 * 60 * 60 * 1000;
+            try {
+                const hook = requireHook(createMagicContextHook(deps));
+                const db = openDatabase();
+                const projectPath = resolveProjectIdentity("/repo/ownership");
+                const due = Date.now() - 1000;
+                insertMemory(db, {
+                    projectPath,
+                    category: "ARCHITECTURE",
+                    content: "Ownership scheduled memory.",
+                });
+                writeTaskScheduleState(db, {
+                    projectPath,
+                    task: "classify-memories",
+                    lastRunAt: null,
+                    nextDueAt: due,
+                    schedule: "0 3 * * *",
+                    lastStatus: null,
+                    lastError: null,
+                    retryCount: 0,
+                });
+                await hook.event!({
+                    event: {
+                        type: "message.updated",
+                        properties: {
+                            info: {
+                                role: "assistant",
+                                finish: "stop",
+                                sessionID: "ses-ownership-schedule",
+                                providerID: "openai",
+                                modelID: "gpt-4o",
+                                tokens: { input: 10, output: 10, cache: { read: 0, write: 0 } },
+                            },
+                        },
+                    },
+                });
+                const row = () =>
+                    db
+                        .prepare(
+                            "SELECT next_due_at, last_status FROM task_schedule_state WHERE project_path = ? AND task = 'classify-memories'",
+                        )
+                        .get(projectPath) as { next_due_at: number; last_status: string | null };
+                for (let attempt = 0; attempt < 400 && row().last_status === null; attempt += 1) {
+                    await new Promise((resolve) => setTimeout(resolve, 5));
+                }
+                expect(row().last_status).not.toBeNull();
+            } finally {
+                Date.now = originalDateNow;
+            }
+        });
+    }
 
     it("clears the reasoning watermark when message.updated reports a model change", async () => {
         process.env.XDG_DATA_HOME = makeTempDir("hook-model-change-watermark-");

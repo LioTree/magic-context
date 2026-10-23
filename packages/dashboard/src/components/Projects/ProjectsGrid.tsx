@@ -1,5 +1,10 @@
 import { createMemo, createResource, createSignal, For, Show } from "solid-js";
-import { formatDateTime, formatRelativeTime, getProjectCards } from "../../lib/api";
+import {
+  formatDateTime,
+  formatRelativeTime,
+  getProjectCards,
+  refreshProjectNames,
+} from "../../lib/api";
 import type { ProjectCard } from "../../lib/types";
 import HarnessBadge from "../HarnessBadge";
 
@@ -36,7 +41,14 @@ export default function ProjectsGrid(props: Props) {
               {(cards() ?? []).length} tracked
             </span>
           </Show>
-          <button type="button" class="btn sm" onClick={() => refetch()}>
+          <button
+            type="button"
+            class="btn sm"
+            onClick={async () => {
+              await refreshProjectNames();
+              await refetch();
+            }}
+          >
             ↻ Refresh
           </button>
         </div>

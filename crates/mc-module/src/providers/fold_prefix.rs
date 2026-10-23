@@ -5,7 +5,7 @@ use mc_store::provider_records::ProviderPolicyPart;
 use sha2::{Digest, Sha256};
 
 #[derive(Clone, Debug)]
-pub(crate) struct FoldPrefix {
+pub struct FoldPrefix {
     pub cut_id: u64,
     pub through: u64,
     pub parts: usize,

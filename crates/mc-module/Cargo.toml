@@ -1,6 +1,6 @@
 [package]
 name = "mc-module"
-version = "0.1.0"
+version = "0.49.13"
 edition = "2021"
 publish = false
 description = "The Magic Context subc module: harness-agnostic cache-stability transform (CK-in/CK-out), backed by the single-writer mc-store, served over the subc wire."
@@ -43,15 +43,20 @@ chrono = { version = "0.4", default-features = false, features = ["clock"] }
 # unify with mc-store's and cortexkit-store's.
 rusqlite = { workspace = true }
 # subc-protocol is resolved from crates.io, matching the role crate's dependency.
-cortexkit-role-tool-provider = "=0.5.0"
-cortexkit-role-agent-data = "0.1"
-cortexkit-role-llm-runner = "=0.2.1"
-cortexkit-role-compaction-provider = { version = "=0.2.0", git = "https://github.com/cortexkit/commons", rev = "77f10f0fcfe465e6cab567dcf1a1bf8901c54547" }
-cortexkit-role-step-transform-provider = { version = "=0.2.0", git = "https://github.com/cortexkit/commons", rev = "77f10f0fcfe465e6cab567dcf1a1bf8901c54547" }
+cortexkit-role-tool-provider = "=0.10.0"
+cortexkit-role-agent-data = "0.2.2"
+# Runner-owned tags and context-ceiling details for async compaction.
+cortexkit-role-llm-runner = "=0.4.0"
+cortexkit-role-compaction-provider = "=0.4.0"
 # RFC 8785 (JCS) canonical JSON for tool.catalog's answer bytes and digests: the
 # same canonicaliser the role crate uses, so floats and non-ASCII keys in a
 # caller's composition hash exactly as the runner hashes them.
 serde_jcs = "0.2"
+cortexkit-bus-trait = "=0.3.0"
+cortexkit-bus-naming = "=0.2.5"
+cortexkit-bus-nats = "=0.3.0"
+async-nats = { version = "=0.50.0", default-features = false, features = ["ring"] }
+base64 = "=0.22.1"
 
 [target.'cfg(unix)'.dependencies]
 nix = { version = "0.31.3", features = ["fs"] }
@@ -86,11 +91,11 @@ drive-fault = []
 # Zlib decoding in tests compares stored message policy facts with the serving
 # snapshot without using the serving code's policy resolver.
 flate2 = { version = "1", default-features = false, features = ["rust_backend"] }
-cortexkit-role-agent-data = { version = "0.1", features = ["test-vectors"] }
+cortexkit-role-agent-data = { version = "0.2.2", features = ["test-vectors"] }
 cpu-time = "1"
 subc-core = { workspace = true }
 # Embedded real-daemon coverage of HELLO_ACK/open versus the first plan fetch.
-subc-daemon = "=0.31.4"
+subc-daemon = "=0.36.19"
 # Enable the store's seed helpers for mc-module's compose tests (populate memories +
 # mutations). The feature is gated so the writers never reach production builds.
 mc-store = { workspace = true, features = ["test-support"] }
@@ -103,7 +108,12 @@ syn = { version = "2", features = ["full", "visit"] }
 quote = "1"
 proc-macro2 = { version = "1", features = ["span-locations"] }
 async-trait = "0.1"
+cortexkit-bus-inmemory = "=0.3.0"
+# The bus link tests: tokio's paused clock for renewal timing, and nkeys to
+# mint the operator, account and user JWTs a private nats-server trusts.
+tokio = { workspace = true, features = ["test-util"] }
+nkeys = { version = "=0.4.5", default-features = false }
 # The role's conformance suite, run in-process against tool.catalog and
 # role.describe (src/tests/tool_catalog_conformance.rs).
-cortexkit-role-tool-provider-conformance = "=0.5.0"
-cortexkit-role-llm-runner-conformance = { version = "=0.2.1", git = "https://github.com/cortexkit/commons", rev = "77f10f0fcfe465e6cab567dcf1a1bf8901c54547" }
+cortexkit-role-tool-provider-conformance = "=0.10.0"
+cortexkit-role-llm-runner-conformance = "=0.9.0"

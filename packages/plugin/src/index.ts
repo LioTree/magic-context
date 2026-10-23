@@ -9,6 +9,7 @@ import { withContentLanguageDirective } from "./agents/language-directive";
 import { denyTaskRoutingToCallerAgents } from "./agents/permissions";
 import { loadPluginConfigDetailed } from "./config";
 import { isCompactionEnabled, isDreamerRunnable } from "./config/agent-disable";
+import { logConfigDependencyNotesOnce } from "./config/dependency-notes";
 import { createDreamerOutputCapSampler } from "./config/live-child-output-cap";
 import { dreamerRunConfig, historianRunConfig, pluginConfigReader } from "./config/live-run-config";
 import { migrateMagicContextConfigLocations } from "./config/migrate-config-location";
@@ -26,6 +27,7 @@ import {
     resolveProjectIdentityForSession,
     setHomeProjectPermission,
 } from "./features/magic-context/memory/project-identity";
+import { createMovedSessionCheck } from "./features/magic-context/mode3-move-record";
 import { backfillSessionActivity } from "./features/magic-context/session-activity";
 import { runSessionProjectBackfill } from "./features/magic-context/session-project-backfill";
 import { SMART_NOTE_COMPILER_SYSTEM_PROMPT } from "./features/magic-context/smart-notes/compiler-prompt";
@@ -50,8 +52,6 @@ import {
     SubcModuleTransport,
 } from "./hooks/magic-context/module-transport";
 import { preloadTokenizer } from "./hooks/magic-context/read-session-formatting";
-import type { RustLkgReplayParticipant } from "./hooks/magic-context/rust-lkg-freeze-registry";
-import type { RustModeModuleClient } from "./hooks/magic-context/rust-mode-transform";
 import {
     createBootBudget,
     emitBootEnteringBreadcrumb,
@@ -60,9 +60,13 @@ import {
     runBootPhaseWithinBudget,
 } from "./plugin/boot-deadline";
 import { beginBootQuietPeriod, scheduleAfterBootQuiet } from "./plugin/boot-quiet";
+import {
+    dropBridgedSessionCreatedRows,
+    guardBridgedSessionRpc,
+    standDownForBridgedSessions,
+} from "./plugin/bridged-session-guard";
 import { cleanupConflictWarnings, sendConflictWarning } from "./plugin/conflict-warning-hook";
 import { startDreamScheduleTimer } from "./plugin/dream-timer";
-import { createDreamTimerModuleClient } from "./plugin/dream-timer-module-client";
 import { ensureProjectRegisteredFromOpenCodeDirectory } from "./plugin/embedding-bootstrap";
 import { createEventHandler } from "./plugin/event";
 import { createSessionHooksAsync } from "./plugin/hooks/create-session-hooks";
@@ -74,6 +78,7 @@ import { isDebugRpcEnabled, registerRpcHandlers } from "./plugin/rpc-handlers";
 import { bindStaleBuildNotice } from "./plugin/stale-build-notice";
 import { primaryOnlyToolIds } from "./plugin/subagent-tool-policy";
 import { createToolRegistry } from "./plugin/tool-registry";
+import { isBridgedSession } from "./shared/bridged-sessions";
 import { getMagicContextBuiltinCommands } from "./shared/builtin-commands";
 import { claimConfigParseFailuresOnce } from "./shared/config-diagnostics";
 import { buildOpenCodeConfigWarningBanner } from "./shared/config-warning-surface";
@@ -82,7 +87,11 @@ import {
     detectConflicts,
     resolveCompactionForBoot,
 } from "./shared/conflict-detector";
-import { getMagicContextStorageDir } from "./shared/data-path";
+import {
+    claimStorageBackupWarningCheck,
+    getMagicContextStorageDir,
+    isMagicContextStorageOutsideEngram,
+} from "./shared/data-path";
 import { registerExitAbort, unregisterExitAbort } from "./shared/exit-abort-registry";
 import { setHarness } from "./shared/harness";
 import { shapeV1HiddenMessage } from "./shared/hidden-zen-read";
@@ -112,6 +121,16 @@ import { setup } from "./v2/server";
 
 const BOOT_SERVER_DEADLINE_MS = 15_000;
 const RESOLVED_CONFIG_TIMEOUT_MS = 2_000;
+
+function warnStorageBackupOnce(storageDir: string): void {
+    if (!claimStorageBackupWarningCheck()) return;
+    if (isMagicContextStorageOutsideEngram(storageDir)) {
+        log(
+            `[magic-context] Magic Context storage is at ${storageDir}, outside the folder Engram backs up (~/.local/share/cortexkit/magic-context). It is not included in CortexKit backups.`,
+        );
+        flushLogger();
+    }
+}
 
 registerStandalonePluginMarker(packageMetadata.version);
 
@@ -227,7 +246,9 @@ const server: Plugin = async (ctx) => {
                         clientWithSessions.session?.list?.(),
                     ).catch(() => null);
                     const sessionList = Array.isArray(sessions) ? sessions : sessions?.data;
-                    const sessionId = sessionList?.[0]?.id;
+                    // A session another product's bridge serves gets no Magic
+                    // Context notices; warn the first session we do serve.
+                    const sessionId = sessionList?.find((s) => !isBridgedSession(s?.id))?.id;
                     if (sessionId) {
                         await sendStatusNotification(ctx.client, sessionId, warningText, {});
                     }
@@ -236,6 +257,10 @@ const server: Plugin = async (ctx) => {
                 }
             }, 3000);
     }
+
+    // Settings that are on but inert because another section turns off what
+    // they rely on (for example smart notes with the dreamer disabled).
+    logConfigDependencyNotesOnce(pluginConfig, log);
 
     const openCodeDbResolution = resolveOpenCodeDbPath();
     if (
@@ -261,7 +286,7 @@ const server: Plugin = async (ctx) => {
                     () => null,
                 );
                 const sessionList = Array.isArray(sessions) ? sessions : sessions?.data;
-                const sessionId = sessionList?.[0]?.id;
+                const sessionId = sessionList?.find((s) => !isBridgedSession(s?.id))?.id;
                 if (sessionId)
                     await sendStatusNotification(ctx.client, sessionId, missingDbBanner, {});
             } catch {
@@ -315,20 +340,12 @@ const server: Plugin = async (ctx) => {
     conflictMs = performance.now() - conflictStartedAt;
 
     const liveSessionState = createLiveSessionState();
-    const rustModeModuleTransport =
-        pluginConfig.transform_mode === "rust"
-            ? new SubcModuleTransport(
-                  pluginConfig.subc?.connection_file ?? getDefaultSubcConnectionFile(),
-              )
-            : undefined;
-    const rustModeModuleClient: RustModeModuleClient | undefined = rustModeModuleTransport;
-    // A durable Rust-deletion retry can outlive a config flip back to TypeScript,
-    // so cleanup keeps a lazy transport even when new transforms no longer use Rust.
+    // A durable module session deletion queued by an earlier process can still be
+    // pending, so cleanup keeps a lazy transport to retry it.
     const sessionCleanupModuleClient = pluginConfig.enabled
-        ? (rustModeModuleTransport ??
-          new SubcModuleTransport(
+        ? new SubcModuleTransport(
               pluginConfig.subc?.connection_file ?? getDefaultSubcConnectionFile(),
-          ))
+          )
         : undefined;
 
     const hooksPhase = await runBootPhaseWithinBudget(
@@ -340,16 +357,12 @@ const server: Plugin = async (ctx) => {
                 pluginConfig,
                 liveConfigReader,
                 liveSessionState,
-                rustModeModuleClient,
                 promptSurfaceRuntime,
                 onStorageBootTimings: (timings) => Object.assign(storageBootTimings, timings),
             }),
         log,
     );
-    const hooks =
-        hooksPhase.status === "completed"
-            ? hooksPhase.value
-            : { magicContext: null, rustToolBackends: undefined };
+    const hooks = hooksPhase.status === "completed" ? hooksPhase.value : { magicContext: null };
     if (hooksPhase.status === "timed_out") {
         deadlinePhase = "hooks";
         hooksDeadlineReason = `boot hooks phase exhausted the whole-server ${BOOT_SERVER_DEADLINE_MS}ms budget`;
@@ -360,11 +373,17 @@ const server: Plugin = async (ctx) => {
     // rebuilding the outer messages-transform wrapper.
     const magicContextRuntime: {
         magicContext: typeof hooks.magicContext;
-        rustToolBackends: typeof hooks.rustToolBackends;
     } = {
         magicContext: hooks.magicContext,
-        rustToolBackends: hooks.rustToolBackends,
     };
+    // Sessions the offline move handed to mode 3 are refused at the shared hook
+    // gate below. The check reads context.db only once storage is open; a
+    // disabled plugin never opens (and so never creates) it.
+    const isMovedSession = createMovedSessionCheck(() => {
+        if (!pluginConfig.enabled || !magicContextRuntime.magicContext) return null;
+        const db = openDatabase();
+        return db && isDatabasePersisted(db) ? db : null;
+    });
 
     // Loud fail-closed gate: when the user enabled MC but storage cannot open
     // (schema fence / migration hard failure), block primary transforms instead
@@ -396,7 +415,6 @@ const server: Plugin = async (ctx) => {
         void hooksPhase.pending.then((late) => {
             if (magicContextRuntime.magicContext || !late.magicContext) return;
             magicContextRuntime.magicContext = late.magicContext;
-            magicContextRuntime.rustToolBackends = late.rustToolBackends;
             failClosed.clear();
             log(
                 "[magic-context] boot hooks phase settled after its deadline; Magic Context runtime installed and fail-closed cleared",
@@ -415,12 +433,10 @@ const server: Plugin = async (ctx) => {
                 pluginConfig,
                 liveConfigReader,
                 liveSessionState,
-                rustModeModuleClient,
                 promptSurfaceRuntime,
             });
             if (!reopened.magicContext) return false;
             magicContextRuntime.magicContext = reopened.magicContext;
-            magicContextRuntime.rustToolBackends = reopened.rustToolBackends;
             failClosed.clear();
             log("[magic-context] storage re-probe succeeded; Magic Context runtime restored");
             return true;
@@ -433,7 +449,6 @@ const server: Plugin = async (ctx) => {
     const tools = createToolRegistry({
         ctx,
         pluginConfig,
-        rustToolBackends: magicContextRuntime.rustToolBackends,
         promptSurfaceRuntime,
         registrationPromptSurface: loadedPluginConfig.registrationPromptSurface,
         includeDreamerOnlyTools: true,
@@ -529,6 +544,7 @@ const server: Plugin = async (ctx) => {
     // `enabled` block lets the auto-update checker still coordinate even
     // when the rest of the runtime is disabled by config or conflicts.
     const storageDir = getMagicContextStorageDir();
+    warnStorageBackupOnce(storageDir);
 
     // Per-instance process-resident handles, hoisted to function scope so the
     // server.instance.disposed cleanup (wired into the event handler below, which
@@ -540,7 +556,6 @@ const server: Plugin = async (ctx) => {
     // so overnight dreaming works even when the user isn't chatting.
     if (pluginConfig.enabled) {
         const dreamerRunnable = isDreamerRunnable(pluginConfig);
-        const classifyModuleClient = createDreamTimerModuleClient(rustModeModuleClient);
         const timerProjectIdentity = resolveProjectIdentityForSession(
             ctx.directory,
             pluginConfig.allow_home_project,
@@ -570,10 +585,11 @@ const server: Plugin = async (ctx) => {
                             keepSubagents: pluginConfig.keep_subagents === true,
                         },
                         gitCommitIndexing: dreaming.memory.git_commit_indexing,
+                        rustBackgroundEnabled: dreaming.rust_background_enabled === true,
                     };
                 },
                 language: pluginConfig.language,
-                transformMode: pluginConfig.transform_mode,
+                rustBackgroundEnabled: pluginConfig.rust_background_enabled === true,
                 embeddingConfig: pluginConfig.embedding,
                 memoryEnabled: pluginConfig.memory?.enabled === true,
                 memoryInjectionBudgetTokens: pluginConfig.memory?.injection_budget_tokens,
@@ -616,7 +632,6 @@ const server: Plugin = async (ctx) => {
                         liveSessionState.dreamerProgressByProject.delete(timerProjectIdentity);
                     }
                 },
-                moduleClient: classifyModuleClient,
                 sessionCleanupModuleClient,
             };
             // Best-effort background maintenance must not hold plugin startup. The
@@ -638,12 +653,14 @@ const server: Plugin = async (ctx) => {
         // Start RPC server for TUI↔server communication (replaces SQLite plugin_messages bus).
         // `storageDir` is hoisted above so the auto-update checker can also use it.
         rpcServer = new MagicContextRpcServer(storageDir, ctx.directory);
+        // Per-session RPC requests (sidebar, status, flush, recomp, ...) about a
+        // session another product's bridge serves are refused, not answered.
+        guardBridgedSessionRpc(rpcServer, isMovedSession);
         registerRpcHandlers(rpcServer, {
             directory: ctx.directory,
             config: pluginConfig,
             client: ctx.client,
             liveSessionState,
-            rustModeModuleClient,
             storageDir,
             getDebugMemoryHolders: () =>
                 magicContextRuntime.magicContext?.getDebugMemoryHolders?.(),
@@ -696,12 +713,14 @@ const server: Plugin = async (ctx) => {
     // disabled, allowing the hermetic A/B harness to sample the same host process.
     if (!pluginConfig.enabled && isDebugRpcEnabled(pluginConfig)) {
         rpcServer = new MagicContextRpcServer(storageDir, ctx.directory);
+        // Per-session RPC requests (sidebar, status, flush, recomp, ...) about a
+        // session another product's bridge serves are refused, not answered.
+        guardBridgedSessionRpc(rpcServer, isMovedSession);
         registerRpcHandlers(rpcServer, {
             directory: ctx.directory,
             config: pluginConfig,
             client: ctx.client,
             liveSessionState,
-            rustModeModuleClient,
             storageDir,
         });
         setTimeout(() => {
@@ -847,7 +866,7 @@ const server: Plugin = async (ctx) => {
         }),
     );
 
-    return {
+    const entryHooks: Hooks = {
         tool: tools,
         event: createEventHandler({
             magicContext: {
@@ -897,19 +916,8 @@ const server: Plugin = async (ctx) => {
                 } catch {
                     // best-effort
                 }
-                try {
-                    // Stop offering this instance's Rust adapter to the last-known-good
-                    // replay registry, which other instances in this process share.
-                    (
-                        magicContextRuntime.magicContext as {
-                            disposeRustAdapter?: () => void;
-                        } | null
-                    )?.disposeRustAdapter?.();
-                } catch {
-                    // best-effort
-                }
                 log(
-                    "[magic-context] instance disposed — stopped RPC server, dream timer, auto-update, Rust replay registration",
+                    "[magic-context] instance disposed — stopped RPC server, dream timer, auto-update",
                 );
             },
         }),
@@ -928,14 +936,6 @@ const server: Plugin = async (ctx) => {
             compactionOff: !isCompactionEnabled(pluginConfig),
             internalChildSessions: liveSessionState.internalChildSessions,
             tryReopenStorage,
-            // This instance's own Rust adapter (null in TypeScript mode), so a replay
-            // this wrapper serves is admitted and frozen by the adapter that runs it.
-            rustReplayParticipant: () =>
-                (
-                    magicContextRuntime.magicContext as {
-                        getRustReplayParticipant?: () => RustLkgReplayParticipant | null;
-                    } | null
-                )?.getRustReplayParticipant?.() ?? null,
             onStorageBusyRefusal: async (sessionId, message) => {
                 const { sendStatusNotification } = await importPluginModule(
                     () => import("./hooks/magic-context/send-session-notification"),
@@ -1158,6 +1158,20 @@ const server: Plugin = async (ctx) => {
             }
         },
     };
+
+    // Sessions another product's bridge has enrolled get none of these hooks'
+    // work; every other session reaches them unchanged.
+    return standDownForBridgedSessions(entryHooks, {
+        isMovedSession,
+        // When our session.created handler ran before the bridge enrolled the
+        // session, the two rows it wrote are the only ones to remove on deletion.
+        // Storage that never opened (disabled plugin, fail-closed) wrote none.
+        onBridgedSessionDeleted: (sessionId) => {
+            if (!pluginConfig.enabled || !magicContextRuntime.magicContext) return;
+            const db = openDatabase();
+            if (db && isDatabasePersisted(db)) dropBridgedSessionCreatedRows(db, sessionId);
+        },
+    });
 };
 
 // V1 plugin-object shape (`{ id, server }`), NOT a bare function. This is

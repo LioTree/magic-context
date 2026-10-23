@@ -5,6 +5,11 @@ import { createHash } from "node:crypto";
 import { mkdirSync, readFileSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { dirname, join } from "node:path";
+import { rejectSessionRenderCacheWrites } from "../../features/magic-context/__tests__/session-meta-faults";
+import {
+    patchSessionMeta,
+    sessionMetaFixtureRow,
+} from "../../features/magic-context/__tests__/session-meta-fixture";
 import {
     appendCompartments,
     replaceAllCompartmentState,
@@ -39,6 +44,8 @@ import {
     setProjectState,
 } from "../../features/magic-context/storage";
 import { initializeDatabase } from "../../features/magic-context/storage-db";
+import { sessionRenderCacheSelect } from "../../features/magic-context/storage-session-cache";
+import { sessionMetaCollectionSelect } from "../../features/magic-context/storage-session-collections";
 import { insertUserMemory } from "../../features/magic-context/user-memory/storage-user-memory";
 import { _resetHarnessForTesting, setHarness } from "../../shared/harness";
 import { Database } from "../../shared/sqlite";
@@ -149,7 +156,7 @@ for (const host of ["opencode", "opencode2"] as const) {
         let maxEntries = 0;
         let maxBytes = 0;
         const readBlob = db.prepare(
-            "SELECT auto_search_hint_decisions AS blob FROM session_meta WHERE session_id = ?",
+            `SELECT ${sessionMetaCollectionSelect("auto_search_hint_decisions", "blob", db)} FROM session_meta WHERE session_id = ?`,
         );
         try {
             for (let number = 1; number <= total; number++) {
@@ -1045,12 +1052,43 @@ describe("prepared prefix source-order trimming", () => {
         expect(result.prefixTrimStatus).toBe("applied");
         expect(live.map((entry) => entry.parts[0]?.text)).toEqual([
             "new prefix",
+            "covered instruction",
             "instruction row",
             "after",
         ]);
     });
 
-    it("orders id-less host system messages by their persisted neighbours", () => {
+    it("render review: shipped trim retains instruction bytes before a visible boundary", () => {
+        db = makeDb();
+        const source = [
+            message("covered", "user"),
+            hostSystem("covered instruction"),
+            message("served-boundary", "assistant"),
+            hostSystem("instruction row"),
+            message("after", "user"),
+        ];
+        const evidence = capturePrefixTrimSourceOrder(source);
+        const live = [...source];
+        const result = withServedBoundary({ "instruction-row": "served-boundary" }, () =>
+            injectM0M1({
+                db,
+                sessionId: SESSION_ID,
+                state: getOrCreateSessionMeta(db, SESSION_ID),
+                messages: live,
+                preparedPrefix: preparedPrefix("instruction-row"),
+                prefixTrimSourceOrder: evidence,
+            }),
+        );
+        expect(result.prefixTrimStatus).toBe("applied");
+        expect(live.map((entry) => entry.parts[0]?.text)).toEqual([
+            "new prefix",
+            "covered instruction",
+            "instruction row",
+            "after",
+        ]);
+    });
+
+    it("retains id-less host instructions even before a visible boundary", () => {
         db = makeDb();
         const source = [
             message("covered", "user"),
@@ -1077,6 +1115,7 @@ describe("prepared prefix source-order trimming", () => {
         expect(result.prefixTrimStatus).toBe("applied");
         expect(live.map((entry) => entry.parts[0]?.text)).toEqual([
             "new prefix",
+            "covered instruction",
             "instruction row",
             "after",
         ]);
@@ -1110,34 +1149,12 @@ describe("prepareCompartmentInjection — SQLITE_BUSY handling (issue #23)", () 
             content: "never run migrations manually",
         });
 
-        // Proxy the db to throw SQLITE_BUSY specifically on the UPDATE statement
-        // used by memory_block_cache. Other prepares pass through unchanged so
-        // the rest of prepareCompartmentInjection can complete normally.
-        const busyProxy: Database = new Proxy(db, {
-            get(target, prop, receiver) {
-                if (prop === "prepare") {
-                    return (sql: string) => {
-                        if (sql.includes("UPDATE session_meta SET memory_block_cache")) {
-                            return {
-                                run: () => {
-                                    const err = new Error("database is locked") as Error & {
-                                        code: string;
-                                        errno: number;
-                                    };
-                                    err.code = "SQLITE_BUSY";
-                                    err.errno = 5;
-                                    throw err;
-                                },
-                                get: () => null,
-                                all: () => [],
-                            };
-                        }
-                        return target.prepare(sql);
-                    };
-                }
-                return Reflect.get(target, prop, receiver);
-            },
+        getOrCreateSessionMeta(db, SESSION_ID);
+        rejectSessionRenderCacheWrites(db, "memory_block_cache", "optional-cache-busy", {
+            error: "database is locked",
+            code: "SQLITE_BUSY",
         });
+        const busyProxy = db;
 
         const messages: MessageLike[] = [userMessage("m1", "hello")];
         // Should not throw — the BUSY on the optional cache write must be swallowed.
@@ -1162,29 +1179,12 @@ describe("prepareCompartmentInjection — SQLITE_BUSY handling (issue #23)", () 
             content: "test directive",
         });
 
-        const errorProxy: Database = new Proxy(db, {
-            get(target, prop, receiver) {
-                if (prop === "prepare") {
-                    return (sql: string) => {
-                        if (sql.includes("UPDATE session_meta SET memory_block_cache")) {
-                            return {
-                                run: () => {
-                                    const err = new Error("schema mismatch") as Error & {
-                                        code: string;
-                                    };
-                                    err.code = "SQLITE_CORRUPT";
-                                    throw err;
-                                },
-                                get: () => null,
-                                all: () => [],
-                            };
-                        }
-                        return target.prepare(sql);
-                    };
-                }
-                return Reflect.get(target, prop, receiver);
-            },
+        getOrCreateSessionMeta(db, SESSION_ID);
+        rejectSessionRenderCacheWrites(db, "memory_block_cache", "optional-cache-corrupt", {
+            error: "schema mismatch",
+            code: "SQLITE_CORRUPT",
         });
+        const errorProxy = db;
 
         const messages: MessageLike[] = [userMessage("m1", "hello")];
         expect(() =>
@@ -1530,10 +1530,7 @@ describe("m[0]/m[1] materialization", () => {
         const first = injectM0M1({ ...options, state: readStateFromMeta() });
         const legacy =
             readStateFromMeta().cachedM0UpgradeState?.split("|rendered-budgets:")[0] ?? null;
-        db.prepare("UPDATE session_meta SET cached_m0_upgrade_state = ? WHERE session_id = ?").run(
-            legacy,
-            SESSION_ID,
-        );
+        patchSessionMeta(db, SESSION_ID, { cached_m0_upgrade_state: legacy });
         clearInjectionCache(SESSION_ID);
         expect(legacy).toContain("-h12000");
         const current = {
@@ -1902,13 +1899,12 @@ describe("m[0]/m[1] materialization", () => {
             projectPath: PROJECT_PATH,
             projectDirectory,
         });
-        db.prepare(
-            "UPDATE session_meta SET cached_m0_bytes = ?, cached_m0_upgrade_state = ? WHERE session_id = ?",
-        ).run(
-            Buffer.from("<session-history>legacy renderer bytes</session-history>"),
-            "ready",
-            SESSION_ID,
-        );
+        patchSessionMeta(db, SESSION_ID, {
+            cached_m0_bytes: Buffer.from(
+                "<session-history>legacy renderer bytes</session-history>",
+            ),
+            cached_m0_upgrade_state: "ready",
+        });
         const state = readStateFromMeta();
 
         expect(
@@ -2005,19 +2001,16 @@ describe("m[0]/m[1] materialization", () => {
         const oldM0 = Buffer.from(
             `<session-history></session-history>\n\n${renderMemoryBlockV2([oldMemory])}`,
         );
-        db.prepare(
-            "UPDATE session_meta SET cached_m0_bytes = ?, cached_m0_upgrade_state = ? WHERE session_id = ?",
-        ).run(
-            oldM0,
-            encodeCachedM0UpgradeIdentity(
+        patchSessionMeta(db, SESSION_ID, {
+            cached_m0_bytes: oldM0,
+            cached_m0_upgrade_state: encodeCachedM0UpgradeIdentity(
                 "ready",
                 COMPARTMENT_RENDER_EPOCH,
                 false,
                 `m${budget}-h60000`,
                 null,
             ),
-            SESSION_ID,
-        );
+        });
         const state = readStateFromMeta();
         const stableSignals = {
             systemHash: "system",
@@ -2086,7 +2079,7 @@ describe("m[0]/m[1] materialization", () => {
         expect(render(true)).toBe(render(false));
     });
 
-    it("mustMaterialize detects project_memory_epoch decreases after DB restore", () => {
+    it("mustMaterialize holds project_memory_epoch decreases after DB restore", () => {
         db = makeDb();
         setProjectState(db, PROJECT_PATH, { projectMemoryEpoch: 4 });
         const state = {
@@ -2116,16 +2109,11 @@ describe("m[0]/m[1] materialization", () => {
                 projectPath: PROJECT_PATH,
                 projectDirectory: makeProjectDir(),
             }).reason,
-        ).toBe("project_memory_epoch");
+        ).toBeNull();
     });
 
-    it("mustMaterialize folds when a cached WORKSPACED m[0] becomes single-project", () => {
-        // Transition guard: a cached union m[0] carries a non-null workspace
-        // fingerprint; if the session then LEAVES its workspace, the current pass
-        // is single-project (fingerprint null). Keying the HARD gate only on the
-        // current `isWorkspaced` would fall through to the integer-epoch compare
-        // and keep rendering the stale union if a membership bump were missed.
-        // The fix compares fingerprints whenever EITHER side is non-null.
+    it("mustMaterialize holds a cached WORKSPACED m[0] when it becomes single-project", () => {
+        // Workspace membership changes are held until a natural baseline rebuild.
         db = makeDb();
         const projectDirectory = makeProjectDir();
         materializeM0({
@@ -2151,8 +2139,8 @@ describe("m[0]/m[1] materialization", () => {
             projectDirectory,
         });
 
-        expect(decision.value).toBe(true);
-        expect(decision.reason).toBe("project_memory_epoch");
+        expect(decision.value).toBe(false);
+        expect(decision.reason).toBeNull();
     });
 
     it("mustMaterialize does NOT materialize m[0] on a new compartment (it rides m[1])", () => {
@@ -2755,13 +2743,19 @@ describe("m[0]/m[1] materialization", () => {
         });
         const row = db
             .prepare(
-                `SELECT cached_m0_bytes, cached_m1_bytes, cached_m0_project_memory_epoch,
-                        cached_m0_project_user_profile_version, cached_m0_max_compartment_seq,
-                        cached_m0_max_memory_id, cached_m0_max_mutation_id,
-                        cached_m0_max_memory_mutation_id, cached_m0_project_docs_hash,
-                        cached_m0_materialized_at, cached_m0_session_facts_version,
-                        cached_m0_upgrade_state
-                   FROM session_meta WHERE session_id = ?`,
+                `SELECT (SELECT value FROM session_render_cache WHERE session_id = session_meta.session_id AND cache_key = 'cached_m0_bytes') AS cached_m0_bytes,
+                    (SELECT value FROM session_render_cache WHERE session_id = session_meta.session_id AND cache_key = 'cached_m1_bytes') AS cached_m1_bytes,
+                    cached_m0_project_memory_epoch,
+                    cached_m0_project_user_profile_version,
+                    cached_m0_max_compartment_seq,
+                    cached_m0_max_memory_id,
+                    cached_m0_max_mutation_id,
+                    cached_m0_max_memory_mutation_id,
+                    cached_m0_project_docs_hash,
+                    cached_m0_materialized_at,
+                    cached_m0_session_facts_version,
+                    ${sessionRenderCacheSelect("cached_m0_upgrade_state", "cached_m0_upgrade_state", db)}
+                FROM session_meta WHERE session_id = ?`,
             )
             .get(SESSION_ID) as Record<string, unknown>;
 
@@ -2822,7 +2816,7 @@ describe("m[0]/m[1] materialization", () => {
         });
         const row = db
             .prepare(
-                "SELECT memory_block_count, memory_block_ids FROM session_meta WHERE session_id = ?",
+                `SELECT memory_block_count, ${sessionMetaCollectionSelect("memory_block_ids", "memory_block_ids", db)} FROM session_meta WHERE session_id = ?`,
             )
             .get(SESSION_ID) as { memory_block_count: number; memory_block_ids: string };
         expect(row.memory_block_count).toBe(2);
@@ -3071,9 +3065,7 @@ describe("m[0]/m[1] materialization", () => {
                 projectPath: PROJECT_PATH,
                 projectDirectory,
             });
-            const before = db
-                .prepare("SELECT * FROM session_meta WHERE session_id = ?")
-                .get(SESSION_ID);
+            const before = sessionMetaFixtureRow(db, SESSION_ID);
             const sibling = new Database(path);
             try {
                 const m0Before = state.cachedM0Bytes;
@@ -3126,9 +3118,7 @@ describe("m[0]/m[1] materialization", () => {
                         : "Concurrent refresh history",
                 );
                 expect(after.cachedM1Bytes?.toString("utf8")).toBe(refreshed.m1Text);
-                expect(
-                    db.prepare("SELECT * FROM session_meta WHERE session_id = ?").get(SESSION_ID),
-                ).not.toEqual(before);
+                expect(sessionMetaFixtureRow(db, SESSION_ID)).not.toEqual(before);
             } finally {
                 sibling.close();
             }
@@ -4523,7 +4513,7 @@ describe("m[0]/m[1] materialization", () => {
             newContent: "Reconciled content.",
             queuedAt: 10,
         });
-        setProjectState(db, PROJECT_PATH, { projectMemoryEpoch: 1 });
+        queueM0Mutation(db, { sessionId: SESSION_ID, mutationType: "compartment_delete" });
 
         const bust = [userMessage("m2", "bust")];
         const result = injectM0M1({
@@ -4554,14 +4544,14 @@ describe("m[0]/m[1] materialization", () => {
             projectDirectory,
             isCacheBustingPass: true,
         });
-        db.prepare(
-            "UPDATE session_meta SET cached_m0_bytes = ?, cached_m0_max_memory_id = ?, cached_m1_bytes = ? WHERE session_id = ?",
-        ).run(
-            Buffer.from(`<session-history>${"baseline ".repeat(300)}</session-history>`, "utf8"),
-            99,
-            Buffer.from("sibling cached m1", "utf8"),
-            SESSION_ID,
-        );
+        patchSessionMeta(db, SESSION_ID, {
+            cached_m0_bytes: Buffer.from(
+                `<session-history>${"baseline ".repeat(300)}</session-history>`,
+                "utf8",
+            ),
+            cached_m0_max_memory_id: 99,
+            cached_m1_bytes: Buffer.from("sibling cached m1", "utf8"),
+        });
 
         const bust = [userMessage("m2", "bust")];
         const result = injectM0M1({
@@ -4597,9 +4587,10 @@ describe("m[0]/m[1] materialization", () => {
             `<session-history>${"byte mismatch ".repeat(300)}</session-history>`,
             "utf8",
         );
-        db.prepare(
-            "UPDATE session_meta SET cached_m0_bytes = ?, cached_m1_bytes = ? WHERE session_id = ?",
-        ).run(siblingM0, Buffer.from("sibling cached m1 byte mismatch", "utf8"), SESSION_ID);
+        patchSessionMeta(db, SESSION_ID, {
+            cached_m0_bytes: siblingM0,
+            cached_m1_bytes: Buffer.from("sibling cached m1 byte mismatch", "utf8"),
+        });
 
         const bust = [userMessage("m2", "bust")];
         const result = injectM0M1({

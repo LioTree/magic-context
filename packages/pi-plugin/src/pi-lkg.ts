@@ -1,6 +1,9 @@
 import {
+	certifyDispatchedLkgSlot,
 	createDbLkgPersistence,
 	loadPersistedLkgSlot,
+	preparedLkgDispatchReceipt,
+	refuseUndispatchedLkgSlot,
 	saveLkgSlotToDb,
 } from "@magic-context/core/hooks/magic-context/lkg-persist";
 import {
@@ -38,6 +41,7 @@ import {
 	lkgFieldsMatchDigest,
 	lkgSlotRejection,
 	registerLkgPersistence,
+	restoreRefusedCapture,
 	signatureForFields,
 } from "@magic-context/core/hooks/magic-context/lkg-slot";
 import { moveMessageDigestFromFields } from "@magic-context/core/hooks/magic-context/move-inputs";
@@ -122,6 +126,27 @@ interface PiLkgSessionState {
 		envelopeSignature: string;
 		usage: { signature: string; inputTokens: number };
 	};
+	/**
+	 * The request this pass published durably but has not dispatched yet. Its
+	 * certificate is bound only when the context handler returns that request
+	 * to Pi; a pass refused after publishing leaves it uncertified.
+	 */
+	pendingDispatch?: {
+		/**
+		 * Names the pass that published. It holds no reference to that pass's
+		 * snapshot or inputs: whoever confirms or refuses the dispatch may outlive
+		 * the pass, and the conversation must stay collectable once a newer pass
+		 * supersedes it.
+		 */
+		ticket: PiLkgDispatchTicket;
+		servedCaptureId?: number;
+		receipt?: object;
+		/** The capture this pass installed in memory. */
+		capture: Pick<LkgSlot, "capturedAt" | "jsonPrefix">;
+		/** The in-memory capture served before it, restored if this pass is refused. */
+		prior: LkgSlot | undefined;
+		priorRecoveryPrefix: PiLkgRecoveryPrefix | undefined;
+	};
 }
 
 interface PiLkgCapturePlan {
@@ -136,6 +161,11 @@ interface PiLkgCapturePlan {
 }
 
 const piLkgSessionStates = new Map<string, PiLkgSessionState>();
+/**
+ * The dispatch ticket of each pass that published, keyed weakly by its snapshot
+ * so the ticket never keeps the pass alive.
+ */
+const dispatchTickets = new WeakMap<PiLkgPassSnapshot, PiLkgDispatchTicket>();
 const piLkgMemoSessions = new Map<string, PiLkgSessionState>();
 const defaultMemoLimits = {
 	sessionMaxBytes: LKG_ENTRY_CACHE_SESSION_BYTES,
@@ -431,6 +461,7 @@ export interface PiLkgCoordinator {
 	captureAppliedPass(args: {
 		/** Publish served identities inside the synchronous last-good request transaction. */
 		publishServedNumbers?: () => void;
+		prepareServedNumbers?: () => () => boolean;
 		assertCurrentPass?: () => void;
 		snapshot: PiLkgPassSnapshot;
 		outputMessages: readonly unknown[];
@@ -441,6 +472,39 @@ export interface PiLkgCoordinator {
 		releaseRecovery?: boolean;
 		hostEnvelopeSignature?: string;
 	}): PiLkgSerializedOutput | undefined;
+	/**
+	 * Call when the context handler returns this pass's request to Pi for
+	 * dispatch. Certifies the request its publication saved; until then that
+	 * request is durable but certifies nothing and is not hydrated after a
+	 * restart. Never throws.
+	 */
+	certifyDispatched(snapshot: PiLkgPassSnapshot): void;
+	/**
+	 * Call when the context handler throws instead of returning this pass's
+	 * request, so it is never dispatched. The request its publication saved stays
+	 * durable but is marked refused: it never certifies and is not hydrated after a
+	 * restart. Never throws.
+	 */
+	refuseDispatch(snapshot: PiLkgPassSnapshot): void;
+	/**
+	 * The ticket naming this pass's publication that awaits dispatch, or
+	 * undefined when the pass published nothing to certify. Holders that may
+	 * outlive the pass (the dispatch wrapper's certificate) keep the ticket
+	 * instead of the snapshot.
+	 */
+	dispatchTicket(snapshot: PiLkgPassSnapshot): PiLkgDispatchTicket | undefined;
+	/** `certifyDispatched` for a pass named by its ticket. Never throws. */
+	certifyDispatchTicket(ticket: PiLkgDispatchTicket): void;
+	/** `refuseDispatch` for a pass named by its ticket. Never throws. */
+	refuseDispatchTicket(ticket: PiLkgDispatchTicket): void;
+}
+
+/**
+ * Names one pass's publication awaiting dispatch, by identity, without holding
+ * the pass's snapshot or inputs.
+ */
+export interface PiLkgDispatchTicket {
+	readonly sessionId: string;
 }
 
 /** A request that cannot be saved for replay can still be served with its admitted tag numbers recorded. */
@@ -804,6 +868,13 @@ export function createPiLkgCoordinator(
 	onCaptureTiming?: (sample: PiLkgCaptureTiming) => void,
 ): PiLkgCoordinator {
 	registerLkgPersistence(createDbLkgPersistence(db));
+	// A newer pass may replace session state before an earlier handler reports
+	// dispatch or refusal. Keep each request's pending slot on its ticket until
+	// that request reports whether it was sent.
+	const pendingByTicket = new WeakMap<
+		PiLkgDispatchTicket,
+		NonNullable<PiLkgSessionState["pendingDispatch"]>
+	>();
 	const stateFor = (sessionId: string): PiLkgSessionState => {
 		let state = piLkgSessionStates.get(sessionId);
 		if (!state) {
@@ -1081,6 +1152,15 @@ export function createPiLkgCoordinator(
 		}
 		const slot = getSlot(snapshot.sessionId);
 		const start = slot?.inputIdSeq.indexOf(snapshot.inputs[0]?.id ?? "") ?? -1;
+		// A request saved just before its process stopped may never have been sent.
+		// Replaying it is safe only for exactly the input it was built from, where it
+		// equals rebuilding the same request; any other input could make it the anchor
+		// for bytes the provider never saw.
+		if (
+			slot?.dispatchUnconfirmed &&
+			(start !== 0 || snapshot.inputs.length !== slot.inputIdSeq.length)
+		)
+			return { ok: false, reason: "lkg_dispatch_unconfirmed" };
 		if (slot && start > 0) {
 			const ownership = slot.piOutputEntryIds;
 			if (!ownership)
@@ -1188,6 +1268,61 @@ export function createPiLkgCoordinator(
 		return result.ok && measuredPrefix ? { ...result, measuredPrefix } : result;
 	};
 
+	const certifyDispatchTicket = (ticket: PiLkgDispatchTicket): void => {
+		try {
+			const state = piLkgSessionStates.get(ticket.sessionId);
+			const pending = pendingByTicket.get(ticket);
+			if (!pending) return;
+			pendingByTicket.delete(ticket);
+			if (state?.pendingDispatch === pending) state.pendingDispatch = undefined;
+			if (pending.servedCaptureId !== undefined && pending.receipt)
+				certifyDispatchedLkgSlot(
+					db,
+					ticket.sessionId,
+					pending.servedCaptureId,
+					pending.receipt,
+				);
+		} catch (error) {
+			// Certification is optional; a dispatched request stays servable.
+			sessionLog(
+				ticket.sessionId,
+				"LKG dispatch certification skipped:",
+				error,
+			);
+		}
+	};
+
+	const refuseDispatchTicket = (ticket: PiLkgDispatchTicket): void => {
+		try {
+			const state = piLkgSessionStates.get(ticket.sessionId);
+			const pending = pendingByTicket.get(ticket);
+			if (!pending) return;
+			pendingByTicket.delete(ticket);
+			if (state?.pendingDispatch === pending) state.pendingDispatch = undefined;
+			// The refused request was never sent: replay and the next pass must
+			// work from the last request that was, so undo this pass's in-memory
+			// capture and the replay state it advanced.
+			if (
+				state &&
+				restoreRefusedCapture(ticket.sessionId, pending.capture, pending.prior)
+			) {
+				state.acceptedInputs = null;
+				state.acceptedSlot = null;
+				state.acceptedRecoverySlotKey = undefined;
+				state.recoveryPrefix = pending.priorRecoveryPrefix;
+			}
+			if (pending.servedCaptureId !== undefined && pending.receipt)
+				refuseUndispatchedLkgSlot(
+					db,
+					ticket.sessionId,
+					pending.servedCaptureId,
+					pending.receipt,
+				);
+		} catch (error) {
+			sessionLog(ticket.sessionId, "LKG dispatch refusal not recorded:", error);
+		}
+	};
+
 	const captureAppliedPass: PiLkgCoordinator["captureAppliedPass"] = (args) => {
 		args.assertCurrentPass?.();
 		const { snapshot } = args;
@@ -1200,6 +1335,9 @@ export function createPiLkgCoordinator(
 			return;
 		}
 		const state = stateFor(snapshot.sessionId);
+		// A newer pass supersedes any request an earlier pass published but never
+		// dispatched; only this pass's own publication may be certified now.
+		state.pendingDispatch = undefined;
 		let jsonPrefix: string;
 		try {
 			// Pi clones the host array between hooks, so reference identity cannot prove
@@ -1347,7 +1485,11 @@ export function createPiLkgCoordinator(
 			if (captureSlot(plan.sessionId, kept)) state.acceptedSlot = kept;
 			else state.syncCaptureRequired = true;
 		}
-		if (args.cacheBusting && !unchanged) {
+		if (
+			args.cacheBusting &&
+			!unchanged &&
+			(livePrior || loadPersistedLkgSlot(db, snapshot.sessionId))
+		) {
 			dropSlot(
 				snapshot.sessionId,
 				"lkg_cache_bust_pending_capture",
@@ -1363,7 +1505,10 @@ export function createPiLkgCoordinator(
 				? undefined
 				: unchanged &&
 						!state.syncCaptureRequired &&
-						livePrior.servedCaptureId !== undefined
+						livePrior.servedCaptureId !== undefined &&
+						// An id whose dispatch was never confirmed (loaded after a
+						// restart) belongs to the stopped process; take a fresh one.
+						!livePrior.dispatchUnconfirmed
 					? livePrior.servedCaptureId
 					: recordServedCapture(db, snapshot.sessionId, true);
 		// Keep all N stable inputs flattened before returning from this context handler.
@@ -1508,7 +1653,13 @@ export function createPiLkgCoordinator(
 							db,
 							plan.sessionId,
 							slot,
-							args.publishServedNumbers,
+							// The request is not dispatched yet: commit it durably, with its
+							// served numbers, but bind its certificate only at dispatch.
+							{
+								publishMetadata: args.publishServedNumbers,
+								prepareMetadata: args.prepareServedNumbers,
+								deferCertificate: true,
+							},
 							{
 								rebuild: args.releaseRecovery,
 								retainDirtyRevision: !args.releaseRecovery
@@ -1519,9 +1670,47 @@ export function createPiLkgCoordinator(
 					) {
 						throw new Error("Pi LKG/served publication failed");
 					}
+					// The request is durable but not dispatched: the dispatch wrapper binds
+					// its certificate when it hands the request on, and records a refusal
+					// otherwise. A refusal also puts back the in-memory capture served
+					// before this one. A cache-busting pass already dropped that capture as
+					// stale, so it has none to put back.
+					const ticket: PiLkgDispatchTicket = {
+						sessionId: snapshot.sessionId,
+					};
+					dispatchTickets.set(snapshot, ticket);
+					state.pendingDispatch = {
+						ticket,
+						servedCaptureId: plan.servedCaptureId,
+						receipt: preparedLkgDispatchReceipt(
+							db,
+							plan.sessionId,
+							plan.servedCaptureId,
+						),
+						capture: slot,
+						prior: args.cacheBusting && !unchanged ? undefined : livePrior,
+						priorRecoveryPrefix: state.recoveryPrefix,
+					};
+					pendingByTicket.set(ticket, state.pendingDispatch);
 					// SQLite can return after the outcome deadline. The request and identities
 					// are durable, but the handler must refuse rather than dispatch a late result.
-					args.assertCurrentPass?.();
+					// A pass past its deadline, cancelled or superseded is never dispatched, so
+					// record that refusal: a restarted process must not replay these bytes.
+					try {
+						args.assertCurrentPass?.();
+					} catch (error) {
+						pendingByTicket.delete(ticket);
+						const receipt = state.pendingDispatch?.receipt;
+						state.pendingDispatch = undefined;
+						if (plan.servedCaptureId !== undefined && receipt)
+							refuseUndispatchedLkgSlot(
+								db,
+								plan.sessionId,
+								plan.servedCaptureId,
+								receipt,
+							);
+						throw error;
+					}
 				}
 				if (!captureSlot(plan.sessionId, slot)) {
 					throw new Error("LKG slot rejected the Pi snapshot");
@@ -1660,6 +1849,25 @@ export function createPiLkgCoordinator(
 			return result;
 		},
 		captureAppliedPass,
+		certifyDispatched(snapshot) {
+			const ticket = dispatchTickets.get(snapshot);
+			if (ticket) certifyDispatchTicket(ticket);
+		},
+		refuseDispatch(snapshot) {
+			const ticket = dispatchTickets.get(snapshot);
+			if (ticket) refuseDispatchTicket(ticket);
+		},
+		dispatchTicket(snapshot) {
+			const ticket = dispatchTickets.get(snapshot);
+			// Only the publication still awaiting dispatch has a ticket to hand out.
+			return ticket &&
+				piLkgSessionStates.get(snapshot.sessionId)?.pendingDispatch?.ticket ===
+					ticket
+				? ticket
+				: undefined;
+		},
+		certifyDispatchTicket,
+		refuseDispatchTicket,
 		measureOutgoingPrefix(snapshot, messages, parentOf) {
 			try {
 				const slot = getSlot(snapshot.sessionId);

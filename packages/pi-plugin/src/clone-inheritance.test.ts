@@ -33,6 +33,8 @@ import {
 import { replayCavemanCompression } from "@magic-context/core/hooks/magic-context/caveman-cleanup";
 import type { TagTarget } from "@magic-context/core/hooks/magic-context/tag-messages";
 import type { Database } from "@magic-context/core/shared/sqlite";
+import { patchSessionMeta } from "../../plugin/src/features/magic-context/__tests__/session-meta-fixture";
+import { sessionMetaCollectionSelect } from "../../plugin/src/features/magic-context/storage-session-collections";
 import { createTestTempDirFromPath } from "../../plugin/src/shared/test-temp-dir";
 import {
 	__test,
@@ -284,20 +286,15 @@ describe("OMP clone transitions", () => {
 });
 
 function seedMeta(database: Database, values: Record<string, unknown>): void {
-	const columns = Object.keys(values);
-	const placeholders = columns.map(() => "?").join(", ");
-	// Upsert rather than insert: seeded tags fire migration v86's tags trigger, which
-	// creates the session's metadata row before this helper runs. Production never
-	// plain-inserts here either — every writer goes through the shared upsert helpers.
-	const assignments = columns
-		.map((column) => `${column} = excluded.${column}`)
-		.join(", ");
 	database
 		.prepare(
-			`INSERT INTO session_meta (session_id, harness, ${columns.join(", ")}) VALUES (?, ?, ${placeholders})
-			 ON CONFLICT(session_id) DO UPDATE SET harness = excluded.harness, ${assignments}`,
+			"INSERT OR IGNORE INTO session_meta(session_id,harness) VALUES ('source','pi')",
 		)
-		.run("source", "pi", ...Object.values(values));
+		.run();
+	patchSessionMeta(database, "source", {
+		harness: "pi",
+		...values,
+	} as Parameters<typeof patchSessionMeta>[2]);
 }
 
 function pending(
@@ -842,7 +839,7 @@ describe("Pi clone state inheritance", () => {
 		).toBe(true);
 		const row = database
 			.prepare(
-				"SELECT merged_reasoning_stripped_ids AS value FROM session_meta WHERE session_id = ?",
+				`SELECT ${sessionMetaCollectionSelect("merged_reasoning_stripped_ids", "value", database)} FROM session_meta WHERE session_id = ?`,
 			)
 			.get("source") as { value: string };
 		expect(JSON.parse(row.value).slice(0, 3)).toEqual(legacy);
@@ -878,9 +875,7 @@ describe("Pi clone state inheritance", () => {
 
 		const row = database
 			.prepare(
-				`SELECT stripped_placeholder_ids AS placeholders,
-				        processed_image_stripped_ids AS images
-				   FROM session_meta WHERE session_id = ?`,
+				`SELECT ${sessionMetaCollectionSelect("stripped_placeholder_ids", "placeholders", database)}, ${sessionMetaCollectionSelect("processed_image_stripped_ids", "images", database)} FROM session_meta WHERE session_id = ?`,
 			)
 			.get("clone") as { placeholders: string; images: string };
 		expect(JSON.parse(row.placeholders)).toEqual(["a1"]);
@@ -1000,7 +995,7 @@ describe("Pi clone state inheritance", () => {
 		expect(count(database, "session_meta")).toBe(0);
 		const sourceMeta = database
 			.prepare(
-				"SELECT trailing_blank_decisions FROM session_meta WHERE session_id = ?",
+				`SELECT ${sessionMetaCollectionSelect("trailing_blank_decisions", "trailing_blank_decisions", database)} FROM session_meta WHERE session_id = ?`,
 			)
 			.get("source") as { trailing_blank_decisions: string };
 		expect(sourceMeta.trailing_blank_decisions).toBe(malformedReplayDocument);
@@ -1030,9 +1025,12 @@ describe("Pi clone state inheritance", () => {
 		expect(decision).toEqual({ value: true, reason: "first_render" });
 		const cacheRow = database
 			.prepare(
-				`SELECT cached_m0_bytes, cached_m1_bytes, memory_block_cache,
-				        memory_block_ids, cached_m0_max_compartment_seq
-				   FROM session_meta WHERE session_id = ?`,
+				`SELECT (SELECT value FROM session_render_cache WHERE session_id = session_meta.session_id AND cache_key = 'cached_m0_bytes') AS cached_m0_bytes,
+				    (SELECT value FROM session_render_cache WHERE session_id = session_meta.session_id AND cache_key = 'cached_m1_bytes') AS cached_m1_bytes,
+				    COALESCE((SELECT value FROM session_render_cache WHERE session_id = session_meta.session_id AND cache_key = 'memory_block_cache'), '') AS memory_block_cache,
+				    ${sessionMetaCollectionSelect("memory_block_ids", "memory_block_ids", database)},
+				    cached_m0_max_compartment_seq
+				FROM session_meta WHERE session_id = ?`,
 			)
 			.get("clone");
 		expect(cacheRow).toEqual({

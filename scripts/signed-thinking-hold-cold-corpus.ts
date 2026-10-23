@@ -54,10 +54,19 @@ updateSessionMeta(db, sid, {
 	lastResponseTime: Date.now(),
 	piStableIdScheme: 1,
 });
-const rowBefore = db
-	.prepare(
-		"SELECT cached_m0_bytes, cached_m1_bytes FROM session_meta WHERE session_id = ?",
+// Context migration 103 moved the cached pair into session_render_cache. This driver is
+// also copied into an older checkout, which has no render-cache accessors and keeps the
+// pair in session_meta columns.
+const renderCache = await import(
+	"../packages/plugin/src/features/magic-context/storage-session-cache"
+).catch(() => undefined);
+const cachedPairSelect = (["cached_m0_bytes", "cached_m1_bytes"] as const)
+	.map((column) =>
+		renderCache ? renderCache.sessionRenderCacheSelect(column, column, db) : column,
 	)
+	.join(", ");
+const rowBefore = db
+	.prepare(`SELECT ${cachedPairSelect} FROM session_meta WHERE session_id = ?`)
 	.get(sid) as Record<string, unknown>;
 if (rowBefore.cached_m0_bytes !== null || rowBefore.cached_m1_bytes !== null)
 	throw new Error("cold bootstrap unexpectedly has a cached pair");

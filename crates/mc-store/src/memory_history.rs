@@ -827,6 +827,18 @@ fn apply_plan(
         evidence,
     );
     record_decision(conn, &decision)?;
+    // Keep the prompt delta in the canonical write transaction. The epoch remains
+    // a search-cache signal, not permission to rebuild a session's prefix.
+    for target in &plan.after {
+        let kind = if !target["supersededByMemoryId"].is_null() {
+            "superseded"
+        } else if target["status"] == "archived" {
+            "archive"
+        } else {
+            "update"
+        };
+        conn.execute("INSERT INTO memory_mutation_log(project_path,mutation_type,target_memory_id,superseded_by_id,category,new_content,queued_at,operation_id) VALUES(?1,?2,?3,?4,?5,?6,?7,?8)", params![project,kind,target["id"].as_i64(),target["supersededByMemoryId"].as_i64(),target["category"].as_str(),target["content"].as_str(),now,format!("dashboard:{key}")]).map_err(storage)?;
+    }
     let epoch_project = epoch_identity(project);
     let mut identities = BTreeSet::from([epoch_project.clone()]);
     if exists(conn, "workspace_members")? {
@@ -855,7 +867,7 @@ fn receipt(
     if let Some(original) = request.get("decisionKey") {
         value["decisionKey"] = original.clone();
         value["restoredDecisionKey"] = json!(key);
-        value["adoption"] = json!("dashboard_epoch_hard");
+        value["adoption"] = json!("next_allowed_bust");
     }
     value
 }
@@ -1032,7 +1044,7 @@ pub fn preview(
         }
     }
     Ok(
-        json!({"version":1,"state":plan.state,"projectPath":project,"decisionKey":key,"reason":plan.reason,"decision":decision,"expectedRevisions":current_rows.iter().map(|row|json!({"memoryId":row["id"],"revision":row["revision"]})).collect::<Vec<_>>(),"changes":plan.after.iter().zip(&plan.before).map(|(after,before)|json!({"memoryId":after["id"],"before":before,"after":after})).collect::<Vec<_>>(),"adoption":"dashboard_epoch_hard"}),
+        json!({"version":1,"state":plan.state,"projectPath":project,"decisionKey":key,"reason":plan.reason,"decision":decision,"expectedRevisions":current_rows.iter().map(|row|json!({"memoryId":row["id"],"revision":row["revision"]})).collect::<Vec<_>>(),"changes":plan.after.iter().zip(&plan.before).map(|(after,before)|json!({"memoryId":after["id"],"before":before,"after":after})).collect::<Vec<_>>(),"adoption":"next_allowed_bust"}),
     )
 }
 
@@ -1367,7 +1379,10 @@ pub fn valid_receipt(method: &str, request: &Value, value: &Value) -> bool {
     }
     let decision = if method == "memory.restore" {
         if value["decisionKey"] != request["decisionKey"]
-            || value["adoption"] != "dashboard_epoch_hard"
+            || !matches!(
+                value["adoption"].as_str(),
+                Some("next_allowed_bust" | "dashboard_epoch_hard")
+            )
         {
             return false;
         }

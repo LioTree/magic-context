@@ -1,4 +1,9 @@
 import type { DreamerConfig } from "../../config/schema/magic-context";
+import type { DreamModuleClient } from "../../features/magic-context/dreamer/rust-ownership";
+import {
+    createRustOwnedDreamRunner,
+    readRustOwnedDreamTasks,
+} from "../../features/magic-context/dreamer/rust-ownership";
 import { buildDreamTaskRuntimeConfigs } from "../../features/magic-context/dreamer/task-config";
 import { createDreamTaskExecutor } from "../../features/magic-context/dreamer/task-executor";
 import {
@@ -70,6 +75,7 @@ export async function runManualDreamNow(args: {
     db: ContextDatabase;
     dreamer: DreamerConfig;
     smartNotesEnabled?: boolean;
+    memoryEnabled?: boolean;
     projectIdentity: string;
     memoryInjectionBudgetTokens?: number;
     directory: string;
@@ -78,6 +84,10 @@ export async function runManualDreamNow(args: {
     executor: HiddenCompletionExecutor;
     sessionId: string;
     task?: DreamTaskName;
+    /** The live `rust_background_enabled` for this run. */
+    rustBackgroundEnabled?: boolean;
+    /** Present only when this host is attached to ck-mc; see rust-ownership.ts. */
+    moduleClient?: DreamModuleClient;
 }): Promise<ManualDreamOutcome> {
     const tasks = buildDreamTaskRuntimeConfigs(
         args.dreamer,
@@ -101,9 +111,28 @@ export async function runManualDreamNow(args: {
         toolsSupported: args.executor.capabilities.tools === true,
         ...(args.task !== undefined ? { requestedTask: args.task } : {}),
     });
+    const rustOwnedTasks = await readRustOwnedDreamTasks({
+        rustBackgroundEnabled: args.rustBackgroundEnabled,
+        moduleClient: args.moduleClient,
+        projectIdentity: args.projectIdentity,
+        projectRoot: args.directory,
+    });
     const summary = await runManualDream({
         db: args.db,
         projectIdentity: args.projectIdentity,
+        projectMemoryEnabled: args.memoryEnabled,
+        rustOwnedTasks,
+        // With a ck-mc module client (the Rust module), a task ck-mc owns is started there now.
+        ...(args.moduleClient
+            ? {
+                  runRustOwnedTask: createRustOwnedDreamRunner({
+                      moduleClient: args.moduleClient,
+                      projectIdentity: args.projectIdentity,
+                      projectRoot: args.directory,
+                  }),
+              }
+            : {}),
+        smartNotesEnabled: args.smartNotesEnabled,
         tasks: selection.runnable,
         executor,
         ...(args.task !== undefined ? { task: args.task } : {}),

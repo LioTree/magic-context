@@ -1,82 +1,118 @@
-import { describe, expect, it } from "bun:test";
+import { describe, expect, test } from "bun:test";
+import { saveLkgSlotToDb } from "../../hooks/magic-context/lkg-persist";
+import {
+    checkLkgDurability,
+    readServedMarker,
+    recordServedCapture,
+} from "../../hooks/magic-context/lkg-served-marker";
 import { Database } from "../../shared/sqlite";
 import { LATEST_MIGRATION_VERSION, MIGRATIONS, runMigrations } from "./migrations";
 import { enforceSchemaFence, initializeDatabase, LATEST_SUPPORTED_VERSION } from "./storage-db";
 
+const markerColumns = (db: Database) =>
+    db
+        .prepare(
+            "SELECT name, type, \"notnull\", dflt_value FROM pragma_table_info('lkg_served_markers') ORDER BY cid",
+        )
+        .all();
+
+const slot = (jsonPrefix: string, servedCaptureId?: number) => ({
+    jsonPrefix,
+    inputIdSeq: ["u"],
+    inputContentDigests: ["digest"],
+    inputMoveDigests: ["a".repeat(64)],
+    lastInputMessageId: "u",
+    modelKey: "m",
+    providerKey: "p",
+    capturedAt: 1,
+    rowVersion: 900,
+    captureSequence: 3,
+    servedCaptureId,
+    fullCoverage: true,
+});
+
 describe("migration 102", () => {
-    it("steps populated v101 through nullable safety assessment without losing tag retirement indexes", () => {
+    test("tolerates a sparse legacy database without served markers", () => {
+        const db = new Database(":memory:");
+        try {
+            MIGRATIONS.find((entry) => entry.version === 102)!.up(db);
+            expect(markerColumns(db)).toEqual([]);
+        } finally {
+            db.close();
+        }
+    });
+
+    test("a populated v101 store keeps its markers and slots, unbound until the next served save", () => {
         const db = new Database(":memory:");
         const fresh = new Database(":memory:");
         try {
             initializeDatabase(db);
-            db.exec("ALTER TABLE memories DROP COLUMN safety_critical");
-            db.exec(
-                "CREATE TABLE schema_migrations (version INTEGER PRIMARY KEY, description TEXT, applied_at INTEGER)",
-            );
-            for (const migration of MIGRATIONS.filter((entry) => entry.version <= 101)) {
-                migration.up(db);
-                db.prepare("INSERT INTO schema_migrations VALUES (?, ?, 0)").run(
-                    migration.version,
-                    migration.description,
-                );
-            }
-            db.exec(`INSERT INTO memories(project_path,category,content,normalized_hash,importance,scope,shareable,status,classified_at,first_seen_at,created_at,updated_at,last_seen_at)
-                VALUES ('git:upgrade','PROJECT_RULES','Never push without approval.','safety',40,'ecosystem',0,'active',7,1,2,3,4),
-                       ('git:upgrade','ARCHITECTURE','An archived fact.','ordinary',95,'project',1,'archived',NULL,1,2,3,4)`);
-            const before = db.prepare("SELECT * FROM memories ORDER BY id").all();
-            const indexes = () =>
-                db
-                    .prepare(
-                        "SELECT name,sql FROM sqlite_master WHERE name IN ('idx_tags_session_message_nocase','idx_tags_session_tool_owner') ORDER BY name",
-                    )
-                    .all();
-            const beforeIndexes = indexes();
-            expect(beforeIndexes).toHaveLength(2);
-            expect(db.prepare("SELECT MAX(version) version FROM schema_migrations").get()).toEqual({
-                version: 101,
-            });
-            expect(enforceSchemaFence(db, ":previous-binary:", 101)).toBe(true);
-
             runMigrations(db);
-
-            expect(LATEST_SUPPORTED_VERSION).toBe(102);
-            expect(LATEST_MIGRATION_VERSION).toBe(102);
-            expect(MIGRATIONS.slice(-3).map((entry) => entry.version)).toEqual([100, 101, 102]);
-            expect(db.prepare("SELECT MAX(version) version FROM schema_migrations").get()).toEqual({
-                version: 102,
+            // Rebuild the exact v101 shape: no digest column, one certified pair
+            // written by the previous release, ids matching.
+            db.exec(`ALTER TABLE lkg_served_markers DROP COLUMN served_digest;
+                DELETE FROM schema_migrations WHERE version >= 102;
+                INSERT INTO lkg_served_markers(session_id, served_capture_id, full_coverage, slot_state)
+                    VALUES ('legacy', 4, 1, 'captured'), ('dropped', 2, 0, 'lkg_refresh_declined');`);
+            expect(markerColumns(db).map((column) => (column as { name: string }).name)).toEqual([
+                "session_id",
+                "served_capture_id",
+                "full_coverage",
+                "slot_state",
+            ]);
+            expect(db.prepare("SELECT MAX(version) AS v FROM schema_migrations").get()).toEqual({
+                v: 101,
             });
-            expect(db.prepare("SELECT * FROM memories ORDER BY id").all()).toEqual(
-                before.map((row) => ({ ...row, safety_critical: null })),
+            const before = db.prepare("SELECT * FROM lkg_served_markers ORDER BY session_id").all();
+            runMigrations(db);
+            expect(LATEST_SUPPORTED_VERSION).toBe(LATEST_MIGRATION_VERSION);
+            expect(MIGRATIONS.filter((entry) => entry.version === 102)).toHaveLength(1);
+            expect(db.prepare("SELECT MAX(version) AS v FROM schema_migrations").get()).toEqual({
+                v: LATEST_MIGRATION_VERSION,
+            });
+            expect(
+                db.prepare("SELECT * FROM lkg_served_markers ORDER BY session_id").all(),
+            ).toEqual(
+                (before as Array<Record<string, unknown>>).map((row) => ({
+                    ...row,
+                    served_digest: null,
+                })),
             );
-            expect(indexes()).toEqual(beforeIndexes);
-            const safetyColumn = (database: Database) =>
-                database
-                    .prepare("PRAGMA table_info(memories)")
-                    .all()
-                    .find((column) => column.name === "safety_critical");
-            expect(safetyColumn(db)).toMatchObject({
-                name: "safety_critical",
-                type: "INTEGER",
-                notnull: 0,
-                dflt_value: null,
-            });
             initializeDatabase(fresh);
-            expect(safetyColumn(fresh)).toMatchObject({
-                name: "safety_critical",
-                type: "INTEGER",
+            runMigrations(fresh);
+            expect(markerColumns(db)).toEqual(markerColumns(fresh));
+            expect(markerColumns(db).at(-1)).toEqual({
+                name: "served_digest",
+                type: "TEXT",
                 notnull: 0,
                 dflt_value: null,
             });
-            expect(enforceSchemaFence(db, ":previous-binary:", 101)).toBe(false);
-            expect(enforceSchemaFence(db, ":current-binary:", 102)).toBe(true);
-            db.exec(
-                "UPDATE memories SET safety_critical=1 WHERE id=1; UPDATE memories SET safety_critical=0 WHERE id=2",
-            );
-            expect(() => db.exec("UPDATE memories SET safety_critical=2 WHERE id=1")).toThrow();
-            const assessed = db.prepare("SELECT * FROM memories ORDER BY id").all();
+            // Re-running the step is idempotent.
             MIGRATIONS.find((entry) => entry.version === 102)!.up(db);
-            runMigrations(db);
-            expect(db.prepare("SELECT * FROM memories ORDER BY id").all()).toEqual(assessed);
+            expect(markerColumns(db)).toEqual(markerColumns(fresh));
+
+            // A pre-upgrade slot and marker with matching capture ids are not certified:
+            // the marker has no digest naming the slot's bytes.
+            db.prepare(
+                `INSERT INTO lkg_slots (session_id, json_prefix_chars, json_prefix_chunks,
+                    json_prefix_hash, input_id_seq, input_content_digests, last_input_message_id,
+                    captured_at, served_capture_id)
+                 VALUES ('legacy', 0, 0, 'h', '["u"]', '["digest"]', 'u', 1, 4)`,
+            ).run();
+            expect(checkLkgDurability(db, "legacy")).toEqual({
+                durable: true,
+                servedCaptureId: null,
+                certified: false,
+            });
+            // The next real serve and save bind the marker and certify again.
+            const next = slot(
+                '[{"text":"served after upgrade"}]',
+                recordServedCapture(db, "legacy", true),
+            );
+            expect(next.servedCaptureId).toBe(5);
+            expect(saveLkgSlotToDb(db, "legacy", next)).toBe(true);
+            expect(checkLkgDurability(db, "legacy")).toEqual({ durable: true, servedCaptureId: 5 });
+            expect(readServedMarker(db, "legacy")?.servedDigest).toMatch(/^[0-9a-f]{64}$/);
             expect(db.prepare("PRAGMA quick_check").get()).toEqual({ quick_check: "ok" });
         } finally {
             db.close();
@@ -84,19 +120,13 @@ describe("migration 102", () => {
         }
     });
 
-    it("records the new version on a sparse v101 store without a memories table", () => {
+    test("the previous binary refuses the migrated context database", () => {
         const db = new Database(":memory:");
         try {
-            db.exec(
-                "CREATE TABLE schema_migrations (version INTEGER PRIMARY KEY, description TEXT, applied_at INTEGER); INSERT INTO schema_migrations VALUES (101,'sparse fixture',0)",
-            );
+            initializeDatabase(db);
             runMigrations(db);
-            expect(db.prepare("SELECT MAX(version) version FROM schema_migrations").get()).toEqual({
-                version: 102,
-            });
-            expect(
-                db.prepare("SELECT name FROM sqlite_master WHERE name='memories'").get(),
-            ).toBeNull();
+            expect(enforceSchemaFence(db, ":previous-binary:", 101)).toBe(false);
+            expect(enforceSchemaFence(db, ":current-binary:", LATEST_SUPPORTED_VERSION)).toBe(true);
         } finally {
             db.close();
         }

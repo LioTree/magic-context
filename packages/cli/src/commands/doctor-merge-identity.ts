@@ -350,8 +350,12 @@ function printSuggestion(db: Database, split: IdentitySplit, storageDir: string)
         console.log(`  ${identity} → ${target}`);
 }
 
-function observations(db: Database, hostPath: string, storageDir: string): IdentitySplit[] {
-    const host = openExistingDatabase(hostPath, { readonly: true });
+export function observations(
+    db: Database,
+    hostPath: string | null,
+    storageDir: string,
+): IdentitySplit[] {
+    const host = hostPath ? openExistingDatabase(hostPath, { readonly: true }) : null;
     let rows: IdentitySplit[] = [];
     try {
         rows = host ? findIdentitySplits(db, host, true) : [];

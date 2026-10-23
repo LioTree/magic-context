@@ -27,6 +27,7 @@ import {
 import { dirname, join, resolve } from "node:path";
 import { tmpdir } from "node:os";
 import { fileURLToPath } from "node:url";
+import { instrumentNativeFold } from "./provider-native-fold-profile";
 import { createScheduler } from "../../plugin/src/features/magic-context/scheduler";
 import { runMigrations } from "../../plugin/src/features/magic-context/migrations";
 import { initializeDatabase } from "../../plugin/src/features/magic-context/storage-db";
@@ -44,7 +45,7 @@ import {
     OPENCODE_PROVIDER_BOOTSTRAP_BUDGET_MS,
     type OpenCodeProviderOptions,
 } from "../../plugin/src/hooks/magic-context/host-runner/opencode-adapter";
-import type { createRustModeTransform } from "../../plugin/src/hooks/magic-context/rust-mode-transform";
+import type { createModuleSessionKernel } from "../../plugin/src/hooks/magic-context/module-session-kernel";
 import {
     createTransform,
     type TransformDeps,
@@ -166,7 +167,7 @@ fn provider_pipeline_driver() {
                 handler.store.set(store.clone()).ok().unwrap();
                 let binding = SessionBinding {
                     connection_incarnation: 0, native_generation: None,
-                    principal: matches!(cmd["harness"].as_str(), Some("opencode" | "opencode2")).then(|| subc_protocol::Principal::Reserved { module_id: "thalamus-harness".into() }),
+                    principal: if matches!(cmd["harness"].as_str(), Some("opencode" | "opencode2")) { Some(subc_protocol::Principal::Reserved { module_id: "thalamus-harness".into() }) } else { (cmd["attest_claude_code"] == true).then(||subc_protocol::Principal::Reserved { module_id: "thalamus".into() }) },
                     scope: matches!(cmd["harness"].as_str(), Some("opencode" | "opencode2")).then(|| serde_json::from_value(json!({"owner":subc_protocol::Principal::Reserved { module_id: "prefrontal-core".into() },"ref":"test-scope","scope_epoch":1,"kind":"head","owner_authorized":true})).unwrap()),
                     project_root: project, harness: cmd["harness"].as_str().unwrap().into(),
                     session: "session".into(), model_key: None, config,
@@ -658,16 +659,25 @@ export function buildDriver(directory: string): string {
     // compile the mutated source, not a cached source surrogate.
     const transformPath = join(generated, "src/transform.rs");
     if (existsSync(transformPath)) rmSync(transformPath);
+    const providersPath = join(generated, "src/providers");
+    if (existsSync(providersPath) && !lstatSync(providersPath).isSymbolicLink())
+        rmSync(providersPath, { recursive: true });
     for (const name of readdirSync(join(original, "src"))) {
         if (name !== "lib.rs") link(join(original, "src", name), join(generated, "src", name));
     }
     const lib = readFileSync(join(original, "src/lib.rs"), "utf8");
     assert.equal(lib.split("mod tests {").length, 2, "unique Rust test-module insertion seam");
     const driverPath = join(generated, "src/provider_pipeline_driver.rs");
-    writeCurrent(driverPath, DRIVER);
+    let driver = DRIVER;
+    if (process.env.MC_BROCA_HOOK_PROFILE) {
+        driver = driver.replace("let started = std::time::Instant::now();\n                        let mut result = transports", "let allocation_started = crate::native_fold_profile::allocated_bytes();\n                        let started = std::time::Instant::now();\n                        let mut result = transports")
+            .replace('let mut result = transports[usize::from(rig.resident_enabled)].call(&format!("{name}-{channel}"), request).await;', 'let mut result = transports[usize::from(rig.resident_enabled)].call(&format!("{name}-{channel}"), request).await;\n                        result["allocation_bytes"] = json!(crate::native_fold_profile::allocated_bytes() - allocation_started);');
+    }
+    writeCurrent(driverPath, driver);
     writeCurrent(
         join(generated, "src/lib.rs"),
-        lib.replace("mod tests {", `mod tests {\ninclude!(${JSON.stringify(driverPath)});`),
+        instrumentNativeFold(ROOT, generated,
+            lib.replace("mod tests {", `mod tests {\ninclude!(${JSON.stringify(driverPath)});`)),
     );
     const target = resolve(process.env.CARGO_TARGET_DIR ?? join(ROOT, "target"));
     const built = spawnSync(
@@ -688,7 +698,7 @@ export function buildDriver(directory: string): string {
             // optimized test executable avoids measuring debug-code overhead as a
             // provider outage; this oracle does not claim production timings.
             cwd: overlay,
-            env: { ...process.env, CARGO_TARGET_DIR: target, CARGO_PROFILE_TEST_OPT_LEVEL: "3" },
+            env: { ...process.env, CARGO_TARGET_DIR: target, CARGO_PROFILE_TEST_OPT_LEVEL: process.env.MC_PROVIDER_DRIVER_OPT_LEVEL ?? "3" },
             encoding: "utf8",
             maxBuffer: 64 * 1024 * 1024,
         },
@@ -1006,7 +1016,7 @@ export async function fixture(driver: Driver, host: Host, directory?: string, pr
         ordinalContinuationBase: 0,
     };
     const legacy = { getState: () => state } as unknown as ReturnType<
-        typeof createRustModeTransform
+        typeof createModuleSessionKernel
     >;
     const options: OpenCodeProviderOptions = {
         now: () => now,

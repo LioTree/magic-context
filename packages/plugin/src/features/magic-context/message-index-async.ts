@@ -192,10 +192,10 @@ function defer(fn: () => void): void {
     const immediate = (globalThis as { setImmediate?: (callback: () => void) => unknown })
         .setImmediate;
     if (typeof immediate === "function") {
-        immediate(fn);
+        inRootAsyncContext(() => immediate(fn));
         return;
     }
-    setTimeout(fn, 0);
+    inRootAsyncContext(() => setTimeout(fn, 0));
 }
 
 function yieldToEventLoop(): Promise<void> {
@@ -338,18 +338,22 @@ export function scheduleReconciliation(
                     );
                     if (ran) return;
                     // The source could not be prepared: try again later.
-                    setTimeout(() => {
-                        heapHolder.reconciliationScheduledSessions.delete(sessionId);
-                        scheduleReconciliation(db, sessionId, readMessages);
-                    }, PREPARE_RETRY_MS).unref?.();
+                    inRootAsyncContext(() =>
+                        setTimeout(() => {
+                            heapHolder.reconciliationScheduledSessions.delete(sessionId);
+                            scheduleReconciliation(db, sessionId, readMessages);
+                        }, PREPARE_RETRY_MS),
+                    ).unref?.();
                 })
                 .catch((error) => {
                     reconciliationSettledForTests?.(sessionId, "error");
                     logIndexingError(sessionId, "reconciliation", error);
                     if (isDatabaseLockedError(error))
-                        setTimeout(
-                            () => scheduleReconciliation(db, sessionId, readMessages),
-                            1000,
+                        inRootAsyncContext(() =>
+                            setTimeout(
+                                () => scheduleReconciliation(db, sessionId, readMessages),
+                                1000,
+                            ),
                         ).unref();
                 })
                 .finally(() => {
@@ -375,101 +379,106 @@ export function scheduleIncrementalIndex(
     // Restart the settle window for every update. OpenCode can repeat a terminal
     // message.updated event as its final parts land; a trailing debounce reads the
     // authoritative message once after that burst instead of once per timer window.
-    const timer = setTimeout(() => {
-        heapHolder.incrementalTimers.delete(schedulingKey);
-        heapHolder.pendingIncrementalKeys.add(schedulingKey);
-        let outcome: IncrementalIndexOutcome = {
-            status: "skipped",
-            reason: "session epoch changed before source preparation",
-        };
-        const indexMessage = async () => {
-            if (
-                (sessionEpochs.get(sessionId) ?? 0) !== epoch ||
-                !heapHolder.pendingIncrementalKeys.has(schedulingKey)
-            ) {
-                outcome = { status: "skipped", reason: "session epoch or pending key changed" };
-                return;
-            }
-            const message =
-                typeof messageSource === "function"
-                    ? messageSource(sessionId, messageId)
-                    : messageSource;
-            if (!message) {
-                outcome = { status: "skipped", reason: "source message unavailable" };
-                return;
-            }
+    const timer = inRootAsyncContext(() =>
+        setTimeout(() => {
+            heapHolder.incrementalTimers.delete(schedulingKey);
+            heapHolder.pendingIncrementalKeys.add(schedulingKey);
+            let outcome: IncrementalIndexOutcome = {
+                status: "skipped",
+                reason: "session epoch changed before source preparation",
+            };
+            const indexMessage = async () => {
+                if (
+                    (sessionEpochs.get(sessionId) ?? 0) !== epoch ||
+                    !heapHolder.pendingIncrementalKeys.has(schedulingKey)
+                ) {
+                    outcome = { status: "skipped", reason: "session epoch or pending key changed" };
+                    return;
+                }
+                const message =
+                    typeof messageSource === "function"
+                        ? messageSource(sessionId, messageId)
+                        : messageSource;
+                if (!message) {
+                    outcome = { status: "skipped", reason: "source message unavailable" };
+                    return;
+                }
 
-            const revisionKey = `${schedulingKey}\u0000${getMessageIndexSourceIdentity(message)}`;
-            if (heapHolder.completedIncrementalKeys.has(revisionKey)) {
-                outcome = { status: "skipped", reason: "source revision already completed" };
-                return;
-            }
+                const revisionKey = `${schedulingKey}\u0000${getMessageIndexSourceIdentity(message)}`;
+                if (heapHolder.completedIncrementalKeys.has(revisionKey)) {
+                    outcome = { status: "skipped", reason: "source revision already completed" };
+                    return;
+                }
 
-            const currentWatermark = getLastIndexedOrdinal(db, sessionId);
-            if (
-                message.ordinal <= currentWatermark &&
-                isMessageIndexSourceCurrent(db, sessionId, message)
-            ) {
+                const currentWatermark = getLastIndexedOrdinal(db, sessionId);
+                if (
+                    message.ordinal <= currentWatermark &&
+                    isMessageIndexSourceCurrent(db, sessionId, message)
+                ) {
+                    heapHolder.completedIncrementalKeys.add(revisionKey);
+                    outcome = { status: "skipped", reason: "source already current at watermark" };
+                    return;
+                }
+
+                const wasReconciled = heapHolder.reconciledSessions.delete(sessionId);
+                const inserted = await indexSingleMessageOffThread(db, sessionId, message);
+                outcome = inserted
+                    ? { status: "indexed" }
+                    : { status: "skipped", reason: "indexing worker returned inserted=false" };
+                if (
+                    (sessionEpochs.get(sessionId) ?? 0) !== epoch ||
+                    !heapHolder.pendingIncrementalKeys.has(schedulingKey)
+                ) {
+                    outcome = {
+                        status: "skipped",
+                        reason: "session epoch or pending key changed after indexing",
+                    };
+                    return;
+                }
+                const finalWatermark = getLastIndexedOrdinal(db, sessionId);
+                if (
+                    wasReconciled &&
+                    isMessageIndexReconciledThrough(db, sessionId, finalWatermark)
+                ) {
+                    heapHolder.reconciledSessions.add(sessionId);
+                }
                 heapHolder.completedIncrementalKeys.add(revisionKey);
-                outcome = { status: "skipped", reason: "source already current at watermark" };
-                return;
-            }
-
-            const wasReconciled = heapHolder.reconciledSessions.delete(sessionId);
-            const inserted = await indexSingleMessageOffThread(db, sessionId, message);
-            outcome = inserted
-                ? { status: "indexed" }
-                : { status: "skipped", reason: "indexing worker returned inserted=false" };
-            if (
-                (sessionEpochs.get(sessionId) ?? 0) !== epoch ||
-                !heapHolder.pendingIncrementalKeys.has(schedulingKey)
-            ) {
-                outcome = {
-                    status: "skipped",
-                    reason: "session epoch or pending key changed after indexing",
-                };
-                return;
-            }
-            const finalWatermark = getLastIndexedOrdinal(db, sessionId);
-            if (wasReconciled && isMessageIndexReconciledThrough(db, sessionId, finalWatermark)) {
-                heapHolder.reconciledSessions.add(sessionId);
-            }
-            heapHolder.completedIncrementalKeys.add(revisionKey);
-        };
-        void sourceReady(messageSource, sessionId)
-            .then((ready) => {
-                if ((sessionEpochs.get(sessionId) ?? 0) !== epoch) return;
-                if (ready) return runWithSessionLock(sessionId, indexMessage);
-                outcome = {
-                    status: "retry scheduled",
-                    reason: "source preparation returned false",
-                };
-                // Try again after PREPARE_RETRY_MS. A later reconciliation of the
-                // session also indexes this message.
-                setTimeout(
-                    () => scheduleIncrementalIndex(db, sessionId, messageId, messageSource),
-                    PREPARE_RETRY_MS,
-                ).unref?.();
-            })
-            .catch((error) => {
-                outcome = { status: "error", reason: String(error) };
-                if ((sessionEpochs.get(sessionId) ?? 0) !== epoch) return;
-                heapHolder.reconciledSessions.delete(sessionId);
-                logIndexingError(sessionId, `incremental index for ${messageId}`, error);
-                if (isDatabaseLockedError(error)) {
-                    outcome = { status: "retry scheduled", reason: String(error) };
+            };
+            void sourceReady(messageSource, sessionId)
+                .then((ready) => {
+                    if ((sessionEpochs.get(sessionId) ?? 0) !== epoch) return;
+                    if (ready) return runWithSessionLock(sessionId, indexMessage);
+                    outcome = {
+                        status: "retry scheduled",
+                        reason: "source preparation returned false",
+                    };
+                    // Try again after PREPARE_RETRY_MS. A later reconciliation of the
+                    // session also indexes this message.
                     setTimeout(
                         () => scheduleIncrementalIndex(db, sessionId, messageId, messageSource),
-                        1000,
-                    ).unref();
-                }
-            })
-            .finally(() => {
-                if ((sessionEpochs.get(sessionId) ?? 0) === epoch)
-                    heapHolder.pendingIncrementalKeys.delete(schedulingKey);
-                incrementalIndexSettledForTests?.(sessionId, messageId, outcome);
-            });
-    }, INCREMENTAL_DEBOUNCE_MS);
+                        PREPARE_RETRY_MS,
+                    ).unref?.();
+                })
+                .catch((error) => {
+                    outcome = { status: "error", reason: String(error) };
+                    if ((sessionEpochs.get(sessionId) ?? 0) !== epoch) return;
+                    heapHolder.reconciledSessions.delete(sessionId);
+                    logIndexingError(sessionId, `incremental index for ${messageId}`, error);
+                    if (isDatabaseLockedError(error)) {
+                        outcome = { status: "retry scheduled", reason: String(error) };
+                        setTimeout(
+                            () => scheduleIncrementalIndex(db, sessionId, messageId, messageSource),
+                            1000,
+                        ).unref();
+                    }
+                })
+                .finally(() => {
+                    if ((sessionEpochs.get(sessionId) ?? 0) === epoch)
+                        heapHolder.pendingIncrementalKeys.delete(schedulingKey);
+                    incrementalIndexSettledForTests?.(sessionId, messageId, outcome);
+                });
+        }, INCREMENTAL_DEBOUNCE_MS),
+    );
 
     heapHolder.incrementalTimers.set(schedulingKey, timer);
 }
@@ -676,3 +685,5 @@ export function __resetMessageIndexAsyncForTests(): void {
     heapHolder.completedIncrementalKeys.clear();
     heapHolder.activeReconcilerBuffers.clear();
 }
+
+import { inRootAsyncContext } from "../../shared/sqlite";

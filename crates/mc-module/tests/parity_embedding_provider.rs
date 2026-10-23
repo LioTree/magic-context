@@ -180,6 +180,27 @@ async fn requests_and_vectors_match_typescript_over_fake_http() {
         let texts: Vec<String> = serde_json::from_value(case["texts"].clone()).unwrap();
         let request = request(&provider, kind, &texts);
         let result = provider.embed_checked(&context(), &request).await;
+        // TypeScript treats HTTP 429 as back-pressure: the query comes back with
+        // no vectors and no failure class, and the endpoint enters a cooldown.
+        // The Rust provider has no partial-null result, so it must return its
+        // RateLimited error for exactly those cases.
+        if ts["results"][index]["rateLimited"].as_bool().unwrap() {
+            assert!(
+                ts["results"][index]["failure"].is_null(),
+                "a TypeScript rate limit is not a failure, case {index}"
+            );
+            assert_eq!(
+                result.unwrap_err(),
+                EmbeddingError::RateLimited,
+                "rate limit case {index}"
+            );
+            rust.push(Value::Null);
+            continue;
+        }
+        assert!(
+            !matches!(result, Err(EmbeddingError::RateLimited)),
+            "Rust rate limited a case TypeScript did not, case {index}"
+        );
         if !ts["results"][index]["failure"].is_null() {
             let error = result.unwrap_err();
             assert_eq!(
@@ -327,7 +348,7 @@ impl HttpTransport for Scripted {
 async fn failures_are_typed_never_empty_success_and_not_retried() {
     let cases = [
         (503, json!({}), EmbeddingError::Http { status: 503 }),
-        (429, json!({}), EmbeddingError::Http { status: 429 }),
+        (429, json!({}), EmbeddingError::RateLimited),
         (400, json!({}), EmbeddingError::Http { status: 400 }),
         (307, json!({}), EmbeddingError::Http { status: 307 }),
         (200, json!({"data":[]}), EmbeddingError::EmptyResult),
@@ -699,4 +720,147 @@ async fn missing_slots_reject_partial_success() {
         provider.embed(&context(), &req).await,
         CapabilityResult::Unavailable { .. }
     ));
+}
+
+/// One scripted reply: status, headers and JSON body.
+type Reply = (u16, Vec<(String, String)>, Value);
+
+/// Answers each POST with the next scripted response, then 503 once exhausted.
+struct Sequence {
+    responses: Mutex<std::collections::VecDeque<HttpResponse>>,
+    calls: AtomicUsize,
+}
+impl Sequence {
+    fn new(responses: Vec<Reply>) -> Self {
+        Self {
+            responses: Mutex::new(
+                responses
+                    .into_iter()
+                    .map(|(status, headers, body)| HttpResponse {
+                        status,
+                        headers,
+                        body: serde_json::to_vec(&body).unwrap(),
+                    })
+                    .collect(),
+            ),
+            calls: AtomicUsize::new(0),
+        }
+    }
+}
+impl HttpTransport for Sequence {
+    fn send<'a>(&'a self, _: HttpRequest, _: &'a CallbackControl, _: Duration) -> HttpFuture<'a> {
+        Box::pin(async move {
+            self.calls.fetch_add(1, Ordering::SeqCst);
+            Ok(self
+                .responses
+                .lock()
+                .unwrap()
+                .pop_front()
+                .unwrap_or(HttpResponse {
+                    status: 503,
+                    headers: vec![],
+                    body: vec![],
+                }))
+        })
+    }
+}
+fn retry_after(value: &str) -> Vec<(String, String)> {
+    vec![("Retry-After".into(), value.into())]
+}
+
+#[tokio::test]
+async fn query_rate_limit_is_back_pressure_not_a_circuit_failure() {
+    let transport = Arc::new(Sequence::new(vec![
+        (429, retry_after("0.05"), json!({})),
+        (429, retry_after("0.05"), json!({})),
+        (429, retry_after("0.05"), json!({})),
+        (200, vec![], json!({"data":[{"embedding":[3,4,0,1]}]})),
+    ]));
+    let (provider, _) = provider(
+        ResolvedEmbeddingConfig::OpenAiCompatible(config()),
+        Some(transport.clone()),
+    );
+    let req = single(&provider);
+    let error = provider.embed_checked(&context(), &req).await.unwrap_err();
+    assert_eq!(error, EmbeddingError::RateLimited);
+    assert_eq!(error.reason().code, "rate_limited");
+    assert!(error.retryable());
+    assert_eq!(
+        provider.embed_checked(&context(), &req).await.unwrap_err(),
+        EmbeddingError::RateLimited
+    );
+    assert_eq!(
+        transport.calls.load(Ordering::SeqCst),
+        1,
+        "a query during the cooldown sends nothing"
+    );
+    for _ in 0..2 {
+        tokio::time::sleep(Duration::from_millis(80)).await;
+        assert_eq!(
+            provider.embed_checked(&context(), &req).await.unwrap_err(),
+            EmbeddingError::RateLimited
+        );
+    }
+    assert_eq!(
+        provider.availability(),
+        Availability::Available,
+        "three 429s in a row never open the circuit"
+    );
+    tokio::time::sleep(Duration::from_millis(80)).await;
+    assert!(provider.embed_checked(&context(), &req).await.is_ok());
+    assert_eq!(transport.calls.load(Ordering::SeqCst), 4);
+}
+
+#[tokio::test]
+async fn passage_rate_limit_waits_out_the_cooldown_and_resends() {
+    let transport = Arc::new(Sequence::new(vec![
+        (429, retry_after("0.05"), json!({})),
+        (429, retry_after("0.05"), json!({})),
+        (200, vec![], json!({"data":[{"embedding":[3,4,0,1]}]})),
+    ]));
+    let (provider, _) = provider(
+        ResolvedEmbeddingConfig::OpenAiCompatible(config()),
+        Some(transport.clone()),
+    );
+    let req = request(&provider, EmbeddingInputKind::Passage, &["stored".into()]);
+    let started = std::time::Instant::now();
+    let result = provider.embed_checked(&context(), &req).await.unwrap();
+    assert_eq!(result.vectors.len(), 1);
+    assert_eq!(transport.calls.load(Ordering::SeqCst), 3);
+    assert!(
+        started.elapsed() >= Duration::from_millis(100),
+        "each resend waited for its Retry-After"
+    );
+}
+
+#[tokio::test]
+async fn passage_cooldown_wait_ends_on_cancellation_and_deadline() {
+    let transport = Arc::new(Sequence::new(vec![(429, retry_after("30"), json!({}))]));
+    let (provider, _) = provider(
+        ResolvedEmbeddingConfig::OpenAiCompatible(config()),
+        Some(transport.clone()),
+    );
+    let req = request(&provider, EmbeddingInputKind::Passage, &["stored".into()]);
+    let ctx = context();
+    let cancel = ctx.control.clone();
+    let cancellation = tokio::spawn(async move {
+        tokio::time::sleep(Duration::from_millis(50)).await;
+        cancel.cancel();
+    });
+    assert_eq!(
+        provider.embed_checked(&ctx, &req).await.unwrap_err(),
+        EmbeddingError::Cancelled
+    );
+    cancellation.await.unwrap();
+    let mut ctx = context();
+    ctx.control = CallbackControl::new(chrono::Utc::now().timestamp_millis() + 50);
+    assert_eq!(
+        provider.embed_checked(&ctx, &req).await.unwrap_err(),
+        EmbeddingError::Timeout
+    );
+    assert_eq!(
+        transport.calls.load(Ordering::SeqCst),
+        1,
+        "nothing is resent while the cooldown runs"
+    );
 }

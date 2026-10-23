@@ -12,8 +12,11 @@ import {
 	recordOverflowDetected,
 	THINKING_BINDING_RECOVERY_FROZEN_PREFIX,
 	THINKING_BINDING_STRIP_ORDER_END_MARKER,
+	thinkingBindingEntryOrderId,
 	thinkingBindingRecoveryFrozenId,
 } from "@magic-context/core/features/magic-context/storage-meta-persisted";
+import { DegradedPassRefusalError } from "@magic-context/core/hooks/magic-context/degraded-pass-refusal";
+import { EmergencyFailClosedError } from "@magic-context/core/hooks/magic-context/emergency-fail-closed";
 import { latestAssistantTurnMessages } from "@magic-context/core/hooks/magic-context/latest-assistant-turn";
 import {
 	armBindingRecoverySafely,
@@ -25,9 +28,13 @@ import { dropSlot } from "@magic-context/core/hooks/magic-context/lkg-slot";
 import { isAnthropicFamilyRoute } from "@magic-context/core/hooks/magic-context/sentinel";
 import { getHarness } from "@magic-context/core/shared/harness";
 import { log } from "@magic-context/core/shared/logger";
+import {
+	readSessionMetaCollection,
+	updateSessionMetaCollection,
+} from "../../plugin/src/features/magic-context/storage-session-collections";
 import { resetPiUpperEstimateReclaim } from "./pi-fit-reclaim";
 import { clearPiLkgSessionState } from "./pi-lkg";
-import { resolvePiStableId } from "./read-session-pi";
+import { piContentFallbackIds, resolvePiStableId } from "./read-session-pi";
 
 function reportBindingRecovery(
 	sessionId: string,
@@ -154,6 +161,11 @@ interface PiAssistantMessage {
 	content?: unknown;
 }
 
+/** Whether a Pi message is an assistant message carrying any thinking block. */
+export function piMessageHasThinking(message: unknown): boolean {
+	return hasThinkingPart(message);
+}
+
 function hasThinkingPart(message: unknown): boolean {
 	if (!message || typeof message !== "object") return false;
 	const assistant = message as PiAssistantMessage;
@@ -191,6 +203,34 @@ function stripThinkingParts(message: unknown): number {
 	return before - strippedContent.length;
 }
 
+/** Completed turns can use the transcript's content identities; an active turn still needs its host entry. */
+function completedThinkingEntryIds(
+	messages: readonly unknown[],
+	entryIds: readonly (string | undefined | null)[],
+): (string | undefined)[] {
+	const protectedMessages = latestAssistantTurnMessages(messages);
+	if (
+		!messages.some(
+			(message, index) =>
+				!entryIds[index] &&
+				!protectedMessages.has(message) &&
+				hasThinkingPart(message),
+		)
+	)
+		return entryIds.map((id) => id ?? undefined);
+	const fallback = piContentFallbackIds(
+		messages,
+		(_message, index) => entryIds[index] ?? undefined,
+	);
+	return messages.map(
+		(message, index) =>
+			entryIds[index] ??
+			(!protectedMessages.has(message) && hasThinkingPart(message)
+				? fallback[index]
+				: undefined),
+	);
+}
+
 export interface PiThinkingBindingApplication {
 	/** The flag value read, so the caller clears only that value. */
 	flagTarget: string;
@@ -198,14 +238,25 @@ export interface PiThinkingBindingApplication {
 	entryIds: string[];
 }
 
+export class PiThinkingBindingRecoveryRefusal extends EmergencyFailClosedError {
+	constructor() {
+		super(
+			"Pi thinking-binding recovery has no valid new strip shape; this turn was not sent. Send a new message or start a new session.",
+			{ code: "pi_thinking_binding_no_valid_shape" },
+		);
+		this.name = "PiThinkingBindingRecoveryRefusal";
+	}
+}
+
 /**
  * Apply an armed thinking-binding recovery and replay earlier ones.
  *
- * An armed flag freezes completed assistant entries that still carry thinking.
- * The entire active assistant turn is excluded across tool results: its signed
- * blocks must stay exactly as returned. The frozen set is persisted before
- * bytes change and replays on every later pass, so a removed block never comes
- * back; thinking in the current tool loop stays until a real user turn ends it.
+ * An armed flag strips every signed block, including the active assistant turn:
+ * keeping a later signature after removing older thinking invalidates its prefix.
+ * The frozen set is persisted before bytes change and replays on later passes.
+ * Once that shape has been rejected there is nothing left to strip; refuse rather
+ * than send the same rejected request again. A separate latest-thinking recovery
+ * handles providers that require the original thinking in a live tool loop.
  */
 export function applyPiThinkingBindingRecovery(args: {
 	db: ContextDatabase;
@@ -215,6 +266,8 @@ export function applyPiThinkingBindingRecovery(args: {
 	provider?: string;
 	model?: string;
 	report?: (message: string) => void;
+	/** Replay saved omissions without consuming a new provider-rejection flag. */
+	replayOnly?: boolean;
 	/**
 	 * The session strips thinking after the pipeline stages ran (see
 	 * resolvePiBindingStripOrder). New entries are then written together with
@@ -222,31 +275,43 @@ export function applyPiThinkingBindingRecovery(args: {
 	 * after the stages instead of reverting to stripping before them.
 	 */
 	endOfPassOrder?: boolean;
+	/** Replay removals before or after pipeline stages; an entry's own order overrides the session-wide marker. */
+	replayOrder?: "start" | "end";
+	/** The second replay phase must not create another removal decision from the same recovery request. */
+	freezeRecovery?: boolean;
 }): PiThinkingBindingApplication | null {
-	const protectedMessages = latestAssistantTurnMessages(args.messages);
-	const frozenEntryIds = frozenBindingEntryIds(args.db, args.sessionId);
-
-	const flagTargetCandidate = isPrefixBoundThinkingModel(
-		args.provider,
-		args.model,
-	)
-		? getThinkingBindingRecoveryTarget(args.db, args.sessionId)
-		: null;
+	const before = readPiOmissionLedger(args.db, args.sessionId);
+	const flagTargetCandidate =
+		!args.replayOnly &&
+		args.freezeRecovery !== false &&
+		isPrefixBoundThinkingModel(args.provider, args.model)
+			? getThinkingBindingRecoveryTarget(args.db, args.sessionId)
+			: null;
 	const flagTarget = flagTargetCandidate?.startsWith(LATEST_THINKING_RESTORE)
 		? null
 		: flagTargetCandidate;
+	// A phase with no recovery to freeze and no recorded omission replayed in it
+	// leaves the array as it is; skip its walks over the session.
+	if (!flagTarget && args.replayOrder && !before.phases[args.replayOrder])
+		return null;
+	const protectedMessages = latestAssistantTurnMessages(args.messages);
+	const resolvedEntryIds = completedThinkingEntryIds(
+		args.messages,
+		args.entryIds,
+	);
+	const frozenEntryIds = new Set(before.frozen);
 	let applied: PiThinkingBindingApplication | null = null;
 	if (flagTarget) {
 		const entryIds = new Set<string>();
 		for (let index = 0; index < args.messages.length; index += 1) {
-			if (protectedMessages.has(args.messages[index])) continue;
-			const entryId = args.entryIds[index];
-			if (entryId && hasThinkingPart(args.messages[index]))
-				entryIds.add(entryId);
+			if (!hasThinkingPart(args.messages[index])) continue;
+			const entryId = resolvedEntryIds[index];
+			if (!entryId) throw new PiThinkingBindingRecoveryRefusal();
+			entryIds.add(entryId);
 		}
 		const newEntryIds = [...entryIds].filter((id) => !frozenEntryIds.has(id));
+		if (newEntryIds.length === 0) throw new PiThinkingBindingRecoveryRefusal();
 		if (
-			newEntryIds.length === 0 ||
 			addMergedReasoningStrippedIds(args.db, args.sessionId, [
 				...newEntryIds.map(thinkingBindingRecoveryFrozenId),
 				...(args.endOfPassOrder
@@ -261,7 +326,7 @@ export function applyPiThinkingBindingRecovery(args: {
 				args.report,
 				`thinking-binding recovery consumed on context pass target=${flagTarget} entries=${applied.entryIds.length} [${applied.entryIds.join(",")}]`,
 			);
-		}
+		} else throw new PiThinkingBindingRecoveryRefusal();
 	}
 
 	// A provider rejection of this turn asks for its original thinking back.
@@ -274,10 +339,18 @@ export function applyPiThinkingBindingRecovery(args: {
 		messages: args.messages,
 		id: (message, index) => resolvePiStableId(message, index, args.entryIds),
 	});
+	// Re-read after the recovery above may have recorded omissions.
+	const ledger = readPiOmissionLedger(args.db, args.sessionId);
 	for (let index = 0; index < args.messages.length; index += 1) {
 		if (restoringActiveTurn && protectedMessages.has(args.messages[index]))
 			continue;
-		const entryId = args.entryIds[index];
+		const entryId = resolvedEntryIds[index];
+		if (
+			entryId &&
+			args.replayOrder &&
+			ledger.order(entryId) !== args.replayOrder
+		)
+			continue;
 		if (entryId && frozenEntryIds.has(entryId))
 			stripThinkingParts(args.messages[index]);
 	}
@@ -290,8 +363,28 @@ export interface PiProactiveThinkingStrip {
 	entryIds: string[];
 }
 
+/** Previously recorded omissions are replay, not a new reason to rewrite a saved request. */
+export function hasUnfrozenPiThinking(args: {
+	messages: readonly unknown[];
+	entryIds: readonly (string | undefined)[];
+	frozen: ReadonlySet<string>;
+	provider?: string;
+	model?: string;
+}): boolean {
+	const entryIds = completedThinkingEntryIds(args.messages, args.entryIds);
+	return (
+		isPrefixBoundThinkingModel(args.provider, args.model) &&
+		args.messages.some((message, index) => {
+			const entryId = entryIds[index];
+			return (
+				hasThinkingPart(message) && (!entryId || !args.frozen.has(entryId))
+			);
+		})
+	);
+}
+
 /**
- * Persist and replay thinking omissions when a prefix-bound model's prompt changes.
+ * Persist new thinking omissions when a prefix-bound model's prompt changes.
  *
  * Fable 5.1, Opus 5.5 and Sonnet 5.5 signatures bind every preceding byte.
  * Changing those bytes can make the provider discard thinking or reject the
@@ -303,11 +396,14 @@ export interface PiProactiveThinkingStrip {
  * omissions after transcript commit, so raw history cannot restore a removed
  * block or change the rendered drop shape. `persistOnly` records this decision
  * before the pipeline edits the transcript; otherwise `messages` is its final
- * output. Entries without stable IDs and failed writes leave thinking intact.
- * Provider-error recovery can handle a rejected request separately.
+ * output. Completed turns without host IDs use the same content identities as
+ * transcript tagging. Missing active-turn IDs and failed writes leave thinking
+ * intact. A caller changing earlier prompt bytes must require persistence and
+ * withhold that prompt edit if planning or writing the omissions fails.
  *
- * `cacheBustingPass` requires the shared prefix-edit permission; neither idle
- * expiry nor a scheduler label alone authorizes edits before kept thinking.
+ * Callers commit the prompt edit and its required omissions in one synchronous
+ * transaction. Permission to edit, idle expiry, or a scheduler's decision to run
+ * work is not proof that the prompt actually changed.
  */
 export function applyPiProactiveThinkingStrip(args: {
 	db: ContextDatabase;
@@ -330,19 +426,25 @@ export function applyPiProactiveThinkingStrip(args: {
 	const protectedMessages = args.stripActiveTurn
 		? new Set()
 		: latestAssistantTurnMessages(args.messages);
+	const resolvedEntryIds = completedThinkingEntryIds(
+		args.messages,
+		args.entryIds,
+	);
 	const entryIds: string[] = [];
 	const indices: number[] = [];
+	const existingIds = frozenBindingEntryIds(args.db, args.sessionId);
 	for (let index = 0; index < args.messages.length; index += 1) {
 		if (protectedMessages.has(args.messages[index])) continue;
-		const entryId = args.entryIds[index];
+		const entryId = resolvedEntryIds[index];
 		if (!hasThinkingPart(args.messages[index])) continue;
 		if (!entryId) {
 			if (args.requirePersistence)
 				throw new Error(
 					"Cannot persist thinking omission without a stable entry id",
 				);
-			continue;
+			return null;
 		}
+		if (existingIds.has(entryId)) continue;
 		entryIds.push(entryId);
 		indices.push(index);
 	}
@@ -354,7 +456,7 @@ export function applyPiProactiveThinkingStrip(args: {
 		// the stages too, instead of moving it earlier and rendering differently.
 		persisted = addMergedReasoningStrippedIds(args.db, args.sessionId, [
 			...entryIds.map(thinkingBindingRecoveryFrozenId),
-			THINKING_BINDING_STRIP_ORDER_END_MARKER,
+			...entryIds.map((id) => piThinkingOmissionOrderId(id, "end")),
 		]);
 	} catch {
 		persisted = false;
@@ -379,6 +481,200 @@ export function applyPiProactiveThinkingStrip(args: {
 		`proactive thinking strip: busting pass froze thinking of ${entryIds.length} entr${entryIds.length === 1 ? "y" : "ies"} [${entryIds.join(",")}]`,
 	);
 	return { entryIds };
+}
+
+/**
+ * Plan which entries in `args.messages` need their thinking removed when the
+ * caller changes earlier prompt bytes. Include every thinking-bearing message
+ * outside the latest assistant turn that the session has not already omitted.
+ * Completed turns without a SessionEntry ID use the transcript tagger's content
+ * hash and duplicate counter, so moving a message does not change its identity.
+ */
+export function planPiProactiveThinkingStrip(args: {
+	db: ContextDatabase;
+	sessionId: string;
+	messages: unknown[];
+	entryIds: readonly (string | undefined)[];
+}): { entryIds: string[] } | null {
+	const protectedMessages = latestAssistantTurnMessages(args.messages);
+	const existingIds = frozenBindingEntryIds(args.db, args.sessionId);
+	const resolvedEntryIds = completedThinkingEntryIds(
+		args.messages,
+		args.entryIds,
+	);
+	const entryIds: string[] = [];
+	for (let index = 0; index < args.messages.length; index += 1) {
+		const message = args.messages[index];
+		if (protectedMessages.has(message) || !hasThinkingPart(message)) continue;
+		const entryId = resolvedEntryIds[index];
+		if (!entryId) return null;
+		if (!existingIds.has(entryId)) entryIds.push(entryId);
+	}
+	return { entryIds };
+}
+
+/** Prepare the ledger merge before BEGIN; the lane only executes its CAS write. */
+export function preparePiThinkingStripWrite(
+	db: ContextDatabase,
+	sessionId: string,
+	plan: { entryIds: readonly string[] } | null,
+): () => void {
+	if (!plan)
+		return () => {
+			throw new Error(
+				"Cannot persist thinking omission without a stable entry id",
+			);
+		};
+	const row = {
+		merged_reasoning_stripped_ids: readSessionMetaCollection(
+			db,
+			sessionId,
+			"merged_reasoning_stripped_ids",
+		),
+	} as { merged_reasoning_stripped_ids: string | null } | undefined;
+	const raw = row?.merged_reasoning_stripped_ids ?? null;
+	let stored: unknown;
+	try {
+		stored = raw ? JSON.parse(raw) : [];
+	} catch {
+		stored = [];
+	}
+	const ids = new Set<string>(
+		Array.isArray(stored)
+			? stored.filter((id): id is string => typeof id === "string")
+			: [],
+	);
+	for (const id of plan.entryIds) ids.add(thinkingBindingRecoveryFrozenId(id));
+	for (const id of plan.entryIds) ids.add(piThinkingOmissionOrderId(id, "end"));
+	const next = JSON.stringify([...ids]);
+	return () => {
+		const result = updateSessionMetaCollection(
+			db,
+			sessionId,
+			"merged_reasoning_stripped_ids",
+			next,
+			{ value: raw },
+		);
+		// A peer changed the ledger after planning. Refuse this lane rather than
+		// overwrite the peer's choices or rerun a pipeline that allocated tags.
+		if (!(result.changes > 0))
+			throw new Error(
+				"Thinking omission plan changed before its edit committed",
+			);
+	};
+}
+
+/**
+ * Refuse an omission set that would leave a kept thinking block before an
+ * omitted one. On its own the provider accepts removing thinking only from the
+ * start of the history (or all of it), never from the middle.
+ */
+export function assertPiOldestThinkingRun(
+	messages: readonly unknown[],
+	entryIds: readonly (string | undefined)[],
+	omitted: ReadonlySet<string>,
+): void {
+	let keptBefore = false;
+	const resolvedEntryIds = completedThinkingEntryIds(messages, entryIds);
+	for (let index = 0; index < messages.length; index += 1) {
+		if (!hasThinkingPart(messages[index])) continue;
+		const entryId = resolvedEntryIds[index];
+		if (entryId && omitted.has(entryId)) {
+			if (keptBefore)
+				throw new DegradedPassRefusalError("pi-thinking-strip-middle-gap", {
+					cause: new Error(
+						`Omitting thinking of ${entryId} would leave earlier thinking kept`,
+					),
+				});
+		} else keptBefore = true;
+	}
+}
+
+export function piThinkingOmissionOrderId(
+	id: string,
+	order: "start" | "end",
+): string {
+	return thinkingBindingEntryOrderId(id, order);
+}
+
+/** Explicit orders belong only to new entries; legacy entries keep the global rule. */
+export function piThinkingOmissionOrder(
+	db: ContextDatabase,
+	sessionId: string,
+	id: string,
+): "start" | "end" {
+	return omissionOrderFromLedger(
+		getMergedReasoningStrippedIds(db, sessionId),
+		id,
+	);
+}
+
+/** One parse of a session's omission ledger, with each frozen entry's replay phase. */
+interface PiOmissionLedger {
+	readonly raw: string | null;
+	readonly ids: ReadonlySet<string>;
+	readonly frozen: ReadonlySet<string>;
+	/** Whether any frozen entry replays in that phase. */
+	readonly phases: { readonly start: boolean; readonly end: boolean };
+	order(id: string): "start" | "end";
+}
+
+const omissionLedgers = new WeakMap<
+	ContextDatabase,
+	Map<string, PiOmissionLedger>
+>();
+
+/**
+ * The session's omission ledger, parsed once per stored value. The stored
+ * column text is read on every call, so any write to the ledger (a recovery,
+ * a companion strip, a rewrite) yields a fresh view.
+ */
+function readPiOmissionLedger(
+	db: ContextDatabase,
+	sessionId: string,
+): PiOmissionLedger {
+	const row = {
+		merged_reasoning_stripped_ids: readSessionMetaCollection(
+			db,
+			sessionId,
+			"merged_reasoning_stripped_ids",
+		),
+	} as { merged_reasoning_stripped_ids?: string | null } | null;
+	const raw = row?.merged_reasoning_stripped_ids ?? null;
+	let views = omissionLedgers.get(db);
+	if (!views) {
+		views = new Map();
+		omissionLedgers.set(db, views);
+	}
+	const cached = views.get(sessionId);
+	if (cached && cached.raw === raw) return cached;
+	const ids: ReadonlySet<string> = getMergedReasoningStrippedIds(db, sessionId);
+	const frozen = new Set<string>();
+	for (const entry of ids) {
+		if (!entry.startsWith(THINKING_BINDING_RECOVERY_FROZEN_PREFIX)) continue;
+		const entryId = entry.slice(THINKING_BINDING_RECOVERY_FROZEN_PREFIX.length);
+		if (entryId.length > 0) frozen.add(entryId);
+	}
+	const phases = { start: false, end: false };
+	for (const id of frozen) phases[omissionOrderFromLedger(ids, id)] = true;
+	const view: PiOmissionLedger = {
+		raw,
+		ids,
+		frozen,
+		phases,
+		order: (id) => omissionOrderFromLedger(ids, id),
+	};
+	views.set(sessionId, view);
+	return view;
+}
+
+function omissionOrderFromLedger(
+	ledger: ReadonlySet<string>,
+	id: string,
+): "start" | "end" {
+	if (ledger.has(piThinkingOmissionOrderId(id, "end"))) return "end";
+	if (ledger.has(piThinkingOmissionOrderId(id, "start"))) return "start";
+	return ledger.has(THINKING_BINDING_STRIP_ORDER_END_MARKER) ? "end" : "start";
 }
 
 /** Branch entries whose thinking the binding-mismatch set removes on every pass. */
@@ -409,8 +705,8 @@ export function frozenBindingEntryIds(
  * bring them back on a later defer pass, which must still render them in the
  * start order. A session without strips uses the end order from the start.
  *
- * The proactive strip runs only in the end order, because it is decided on the
- * array the pass serves and must replay at that same point.
+ * This is the default for legacy entries only. New companion entries carry
+ * their own order and do not move the legacy entries between pipeline phases.
  */
 export function resolvePiBindingStripOrder(args: {
 	db: ContextDatabase;
@@ -420,9 +716,16 @@ export function resolvePiBindingStripOrder(args: {
 	/** Known before any stage runs: this pass is allowed to change served bytes. */
 	bustPermittedAtStart: boolean;
 }): "start" | "end" {
-	const ledger = getMergedReasoningStrippedIds(args.db, args.sessionId);
+	const view = readPiOmissionLedger(args.db, args.sessionId);
+	const ledger = view.ids;
 	if (ledger.has(THINKING_BINDING_STRIP_ORDER_END_MARKER)) return "end";
-	const frozen = frozenBindingEntryIds(args.db, args.sessionId);
+	const frozen = new Set(
+		[...view.frozen].filter(
+			(id) =>
+				!ledger.has(piThinkingOmissionOrderId(id, "start")) &&
+				!ledger.has(piThinkingOmissionOrderId(id, "end")),
+		),
+	);
 	if (frozen.size === 0) return "end";
 	let onBranch = false;
 	let carriesThinking = false;
@@ -461,4 +764,26 @@ export function shouldRunPiProactiveThinkingStrip(args: {
 	isSubagent: boolean;
 }): boolean {
 	return !args.compactionOff && args.bindingStripOrder === "end";
+}
+
+/**
+ * Rebuilding the cached prefix must record which messages lose thinking so a
+ * retry renders the same bytes. The current assistant turn needs Pi's entry ID;
+ * completed turns can instead use their transcript content identity.
+ */
+export function assertPiThinkingEntryIds(
+	messages: readonly unknown[],
+	entryIds: readonly (string | undefined | null)[],
+): void {
+	const protectedMessages = latestAssistantTurnMessages(messages);
+	for (let index = 0; index < messages.length; index++) {
+		if (
+			protectedMessages.has(messages[index]) &&
+			hasThinkingPart(messages[index]) &&
+			!entryIds[index]
+		)
+			throw new Error(
+				"Cannot persist thinking omission without a stable entry id",
+			);
+	}
 }

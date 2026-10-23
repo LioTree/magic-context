@@ -20,6 +20,8 @@ import {
 } from "@magic-context/core/hooks/magic-context/lkg-slot";
 import * as logger from "@magic-context/core/shared/logger";
 import type { Database } from "@magic-context/core/shared/sqlite";
+import { rejectSessionMetaCollectionWrites } from "../../plugin/src/features/magic-context/__tests__/session-meta-faults";
+import { updateSessionMetaCollection } from "../../plugin/src/features/magic-context/storage-session-collections";
 import {
 	__test,
 	clearContextHandlerSession,
@@ -147,14 +149,22 @@ async function turns(db: Database, id: string, count = 3) {
 	return { served, refused };
 }
 function ledger(db: Database, id: string, entries: string[] | string) {
-	db.prepare(
-		"UPDATE session_meta SET merged_reasoning_stripped_ids = ? WHERE session_id = ?",
-	).run(typeof entries === "string" ? entries : JSON.stringify(entries), id);
+	updateSessionMetaCollection(
+		db,
+		id,
+		"merged_reasoning_stripped_ids",
+		typeof entries === "string" ? entries : JSON.stringify(entries),
+	);
 }
 function blockDecisionWrite(db: Database, kind: string) {
-	// Inject an I/O failure only for the requested decision, not all session writes.
-	db.exec(
-		`CREATE TRIGGER fail_identity_decision BEFORE UPDATE OF merged_reasoning_stripped_ids ON session_meta WHEN NEW.merged_reasoning_stripped_ids LIKE '%${kind}%' BEGIN SELECT RAISE(FAIL, 'injected decision write failure'); END`,
+	rejectSessionMetaCollectionWrites(
+		db,
+		"merged_reasoning_stripped_ids",
+		"fail_identity_decision",
+		{
+			error: "injected decision write failure",
+			when: (value) => typeof value === "string" && value.includes(kind),
+		},
 	);
 }
 
@@ -530,8 +540,14 @@ for (const kind of [
 		const id = session(`busy-${kind}`);
 		try {
 			seedTool(db, id);
-			db.exec(
-				`CREATE TRIGGER busy_identity_decision BEFORE UPDATE OF merged_reasoning_stripped_ids ON session_meta WHEN NEW.merged_reasoning_stripped_ids LIKE '%${kind}%' BEGIN SELECT RAISE(FAIL, 'database is locked'); END`,
+			rejectSessionMetaCollectionWrites(
+				db,
+				"merged_reasoning_stripped_ids",
+				"busy_identity_decision",
+				{
+					error: "database is locked",
+					when: (value) => typeof value === "string" && value.includes(kind),
+				},
 			);
 			expect(adopt(db, id).rebuilds).toEqual([]);
 			expect(rows(db, id)).toEqual([{ tag_number: 8 }, { tag_number: 154 }]);

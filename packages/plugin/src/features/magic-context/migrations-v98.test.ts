@@ -2,8 +2,10 @@ import { describe, expect, test } from "bun:test";
 import { join } from "node:path";
 import { Database } from "../../shared/sqlite";
 import { cleanupTestTempDir, createTestTempDir } from "../../shared/test-temp-dir";
+import { sessionMetaFixtureRow } from "./__tests__/session-meta-fixture";
 import { installCompartmentRescoreSchema } from "./migration-v98-compartment-rescore";
 import { LATEST_MIGRATION_VERSION, MIGRATIONS, runMigrations } from "./migrations";
+import { restorePreV103SessionMetaLayout } from "./session-meta-pre-v103-test-support";
 import { initializeDatabase, LATEST_SUPPORTED_VERSION } from "./storage-db";
 import { deleteSessionScopedRows, SESSION_SCOPED_TABLES } from "./storage-session-tables";
 
@@ -30,6 +32,7 @@ function schema(db: Database): unknown[] {
 function populatedV97(): Database {
     const db = new Database(":memory:");
     initializeDatabase(db);
+    restorePreV103SessionMetaLayout(db);
     // Drop the tables and column created by fresh-store initialization so the
     // test verifies that migration v98 creates them on a populated older store.
     for (const table of [...scoreTables, ...projectTables]) db.exec(`DROP TABLE ${table}`);
@@ -135,7 +138,7 @@ describe("migration 98", () => {
             expect(history).toEqual(
                 expect.arrayContaining([expect.objectContaining({ rewrite_version: 1 })]),
             );
-            const meta = db.prepare("SELECT * FROM session_meta WHERE session_id='target'").get();
+            const meta = sessionMetaFixtureRow(db, "target");
             const unchangedSchema = db
                 .prepare(`SELECT name, sql FROM sqlite_master
                 WHERE tbl_name IN ('compartments', 'subagent_invocations') ORDER BY name`)
@@ -147,20 +150,17 @@ describe("migration 98", () => {
 
             runMigrations(db);
 
-            expect(LATEST_MIGRATION_VERSION).toBe(102);
-            expect(LATEST_SUPPORTED_VERSION).toBe(102);
+            expect(LATEST_SUPPORTED_VERSION).toBe(LATEST_MIGRATION_VERSION);
             expect(
                 db.prepare("SELECT MAX(version) AS version FROM schema_migrations").get(),
-            ).toEqual({ version: 102 });
+            ).toEqual({ version: LATEST_MIGRATION_VERSION });
             expect(db.prepare("SELECT * FROM compartments ORDER BY id").all()).toEqual(
                 compartments,
             );
             expect(
                 db.prepare("SELECT * FROM compartment_history_versions ORDER BY session_id").all(),
             ).toEqual(history);
-            expect(
-                db.prepare("SELECT * FROM session_meta WHERE session_id='target'").get(),
-            ).toEqual({
+            expect(sessionMetaFixtureRow(db, "target")).toEqual({
                 ...(meta as object),
                 cached_m0_score_selection_watermark: 0,
             });

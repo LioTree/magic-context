@@ -1,5 +1,6 @@
 import { describe, expect, it } from "bun:test";
 import {
+    emptyRustSelectionAllowed,
     filesForMode,
     validateManifestDocument,
     validateModeManifest,
@@ -21,7 +22,7 @@ describe("mode manifest validator", () => {
         // Bump this with the manifest whenever a tests/**/*.test.ts file is added or
         // removed. Moving a file between excluded and ts-only changes the invocation
         // counts and excluded list below, but not the total number of files.
-        expect(validation.files.length).toBe(195);
+        expect(validation.files.length).toBe(158);
         expect(validation.manifest.entries).toHaveLength(validation.files.length);
         expect(new Set(validation.manifest.entries.map((entry) => entry.path)).size).toBe(
             validation.files.length,
@@ -32,12 +33,13 @@ describe("mode manifest validator", () => {
     it("derives separate TS and Rust invocation lists", () => {
         const ts = filesForMode(validation, "ts");
         const rust = filesForMode(validation, "rust");
-        expect(ts).toHaveLength(74);
-        expect(rust).toHaveLength(59);
-        expect(rust).toContain("tests/rust-tool-attachments.test.ts");
-        expect(rust).toContain("tests/rust-tool-attachment-upgrade.test.ts");
-        expect(rust).toContain("tests/idle-ttl-restart.test.ts");
-        expect(rust).toContain("tests/subagent-behavior.test.ts");
+        expect(ts).toHaveLength(76);
+        // The Rust lane is retired with transform_mode: no entry has a rust
+        // invocation. Former both-modes files stay in the TypeScript list.
+        expect(validation.manifest.rust_lane).toBe("retired");
+        expect(rust).toEqual([]);
+        expect(ts).toContain("tests/idle-ttl-restart.test.ts");
+        expect(ts).toContain("tests/subagent-behavior.test.ts");
         expect(ts.filter((path) => path.startsWith("tests/pi-")).length).toBe(5);
         expect(filesForMode(validation, "ts", "opencode")).toHaveLength(47);
         expect(filesForMode(validation, "ts", "opencode")).toContain("tests/processed-images.test.ts");
@@ -54,12 +56,13 @@ describe("mode manifest validator", () => {
         expect(ts).toContain("tests/reasoning-token-budget.test.ts");
         expect(rust).not.toContain("tests/reasoning-token-budget.test.ts");
         expect(filesForMode(validation, "ts", "pi")).toHaveLength(30);
-        expect(filesForMode(validation, "ts", "opencode2")).toHaveLength(43);
+        expect(filesForMode(validation, "ts", "opencode2")).toHaveLength(45);
         // These OpenCode 2 files are ts-only with hosts ["opencode2"], so only the
         // OpenCode 2 host lane runs them; the other host lanes never select them.
         for (const path of [
             "tests/opencode2/error-result-compaction.test.ts",
             "tests/opencode2/latest-turn-thinking-recovery.test.ts",
+            "tests/opencode2/signed-drop-rebuild.test.ts",
             "tests/opencode2/adapters-s2-contracts.test.ts",
             "tests/opencode2/adapters-s3-marker-policy.test.ts",
             "tests/opencode2/pins.test.ts",
@@ -139,7 +142,10 @@ describe("mode manifest validator", () => {
             "tests/opencode2/rpc-s2-listener.test.ts",
             "tests/opencode2/runner.test.ts",
             "tests/opencode2/rust-mode-boundary-restart-gate.test.ts",
+            "tests/opencode2/rust-mode-fold-cadence.test.ts",
+            "tests/opencode2/rust-mode-host-runner-default.test.ts",
             "tests/opencode2/rust-mode-limitation.test.ts",
+            "tests/opencode2/rust-mode-module-served.test.ts",
             "tests/opencode2/session-api-cutover.test.ts",
             "tests/opencode2/session-project-binding.test.ts",
             "tests/opencode2/sidebar-component.test.ts",
@@ -153,11 +159,13 @@ describe("mode manifest validator", () => {
             "tests/opencode2/tool-result-image.test.ts",
             "tests/opencode2/ts-mode-on-migrated-real-store.test.ts",
             "tests/opencode2/v1-v2-reconversion.test.ts",
-            "tests/rust-classify-host-runner.test.ts",
-            "tests/rust-full-sync-frame-cap.test.ts",
-            "tests/rust-plugin-stage-cache.test.ts",
+            "tests/pi-rust-degradation-arc-1.test.ts",
+            "tests/pi-rust-degradation-arc-4.test.ts",
             "tests/rust-provider-pipeline-opencode1.test.ts",
             "tests/rust-provider-pipeline-opencode2.test.ts",
+            "tests/rust-smoke.test.ts",
+            "tests/rust-tool-attachment-upgrade.test.ts",
+            "tests/rust-tool-attachments.test.ts",
             "tests/system-prompt-change-order.test.ts",
             "tests/zen-primary-surface.test.ts",
         ]);
@@ -274,5 +282,45 @@ describe("mode manifest validator", () => {
                 validation.files,
             ),
         ).toThrow(/invocation disagrees with both-modes/);
+    });
+});
+
+describe("retired Rust lane marker", () => {
+    it("allows an empty Rust selection only when the manifest marks the lane retired", () => {
+        const entries = validation.manifest.entries;
+        const retired = validateManifestDocument(
+            { ...manifestWith(entries), rust_lane: "retired" },
+            validation.files,
+        );
+        const unmarked = validateManifestDocument(manifestWith(entries), validation.files);
+        expect(filesForMode(retired, "rust")).toEqual([]);
+        expect(filesForMode(unmarked, "rust")).toEqual([]);
+        expect(emptyRustSelectionAllowed(retired, [])).toBe(true);
+        // Without the marker, an empty selection still means something broke.
+        expect(emptyRustSelectionAllowed(unmarked, [])).toBe(false);
+        // A non-empty selection is never "allowed empty".
+        expect(emptyRustSelectionAllowed(retired, ["tests/smoke.test.ts"])).toBe(false);
+    });
+
+    it("rejects a retired lane that still has a rust invocation, and an unknown marker value", () => {
+        const entries = validation.manifest.entries;
+        const withRust = [
+            {
+                ...entries[0]!,
+                tier: "both-modes" as const,
+                invocation: { ts: true, rust: true },
+                contract_refs: ["PARITY.md"],
+            },
+            ...entries.slice(1),
+        ];
+        expect(() =>
+            validateManifestDocument({ ...manifestWith(withRust), rust_lane: "retired" }, validation.files),
+        ).toThrow(/rust_lane is retired but these entries still have a rust invocation/);
+        expect(() =>
+            validateManifestDocument(
+                { ...manifestWith(entries), rust_lane: "paused" } as unknown as ModeManifest,
+                validation.files,
+            ),
+        ).toThrow(/rust_lane must be "retired"/);
     });
 });

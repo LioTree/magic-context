@@ -16,6 +16,7 @@ import {
 	refreshModelLimitsFromApi,
 } from "@magic-context/core/shared/models-dev-cache";
 import { closeQuietly } from "@magic-context/core/shared/sqlite-helpers";
+import { patchSessionMeta } from "../../plugin/src/features/magic-context/__tests__/session-meta-fixture";
 import { createTestTempDirFromPath } from "../../plugin/src/shared/test-temp-dir";
 import { clearContextHandlerSession } from "./context-handler";
 import {
@@ -144,7 +145,7 @@ describe("Pi m[0] mural image fold (on-demand render → wire)", () => {
 					.replace(`${MEMORY_MURAL_GUIDANCE}\n`, ""),
 			);
 			db.prepare(
-				"UPDATE session_meta SET cached_m0_bytes = ? WHERE session_id = ?",
+				"INSERT INTO session_render_cache (session_id,cache_key,value) VALUES (?2, 'cached_m0_bytes', ?1) ON CONFLICT(session_id,cache_key) DO UPDATE SET value=excluded.value",
 			).run(legacy, SESSION_ID);
 			__test.clearPiMuralProcessCache(SESSION_ID);
 			const deferredMessages = [userMessage("defer")];
@@ -367,12 +368,15 @@ describe("Pi m[0] mural image fold (on-demand render → wire)", () => {
 			);
 
 			const siblingDataUrl = "data:image/png;base64,cGktc2libGluZy1tdXJhbA==";
-			db.prepare(
-				`UPDATE session_meta
-					SET cached_m0_mural_data_url = ?, cached_m0_mural_hash = ?,
-						cached_m0_materialized_at = cached_m0_materialized_at + 1
-				  WHERE session_id = ?`,
-			).run(siblingDataUrl, "pi-sibling-hash", SESSION_ID);
+			db.transaction(() => {
+				patchSessionMeta(db, SESSION_ID, {
+					cached_m0_mural_data_url: siblingDataUrl,
+					cached_m0_mural_hash: "pi-sibling-hash",
+				});
+				db.prepare(
+					"UPDATE session_meta SET cached_m0_materialized_at=cached_m0_materialized_at+1 WHERE session_id=?",
+				).run(SESSION_ID);
+			}).immediate();
 
 			const messages = [userMessage("soft")];
 			injectM0M1Pi(baseState(), db, messages as never, undefined, true);
@@ -397,11 +401,10 @@ describe("Pi m[0] mural image fold (on-demand render → wire)", () => {
 				true,
 			);
 			const currentManifestBase64 = replaceCurrentManifest(db);
-			db.prepare(
-				`UPDATE session_meta
-					SET cached_m0_mural_data_url = NULL, cached_m0_mural_hash = NULL
-				  WHERE session_id = ?`,
-			).run(SESSION_ID);
+			patchSessionMeta(db, SESSION_ID, {
+				cached_m0_mural_data_url: null,
+				cached_m0_mural_hash: null,
+			});
 			__test.clearPiMuralProcessCache(SESSION_ID);
 
 			const messages = [userMessage("defer")];

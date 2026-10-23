@@ -60,7 +60,7 @@ export const V2_MESSAGE_PAGE_SQL = `WITH bounds AS (
             SELECT seq FROM session_message
             WHERE session_id = ? AND type IN (${RAW_MESSAGE_TYPE_PARAMETERS})
             ORDER BY seq ASC LIMIT 1 OFFSET ?
-        ), -1) END AS after_seq,
+        ), (SELECT MAX(seq) FROM session_message WHERE session_id = ?), -1) END AS after_seq,
         COALESCE((
             SELECT seq FROM session_message
             WHERE session_id = ? AND type IN (${RAW_MESSAGE_TYPE_PARAMETERS})
@@ -507,11 +507,14 @@ export class V2StoreReader {
                 }
             }
             const maximumSeq = Number.MAX_SAFE_INTEGER;
+            // A cursor past the last ordinal must stay after the session's rows;
+            // falling back to -1 would replay the first message under that ordinal.
             const rows = this.prepare(V2_MESSAGE_PAGE_SQL).all(
                 afterOrdinal,
                 sessionID,
                 ...RAW_MESSAGE_TYPES,
                 Math.max(0, afterOrdinal - 1),
+                sessionID,
                 sessionID,
                 ...RAW_MESSAGE_TYPES,
                 finalWatermark - 1,
@@ -656,7 +659,12 @@ export class V2StoreReader {
             maxChars: number;
             truncationMarker: string;
         },
-    ): Array<{ seq: number; time_created: number; text: string }> {
+    ): Array<{
+        seq: number;
+        time_created: number;
+        text: string;
+        follows_assistant_reply: number;
+    }> {
         const { boundaryMs, before, limit, maxChars, truncationMarker } = options;
         if (!Number.isSafeInteger(limit) || limit < 1 || limit > 10000)
             throw new Error("Invalid page limit");
@@ -666,11 +674,12 @@ export class V2StoreReader {
         const head = Math.floor((maxChars - truncationMarker.length) / 2);
         const tail = maxChars - truncationMarker.length - head;
         return this.prepare(`WITH users AS (
-            SELECT seq, time_created, data FROM session_message
-            WHERE session_id = ? AND type = 'user' AND time_created ${before ? "<=" : ">"} ?
+            SELECT session_id, seq, time_created, data FROM session_message
+            WHERE session_id = ? AND type = 'user' AND time_created ${before ? "<=" : ">"}
+                ?
             ORDER BY time_created ${direction}, seq ${direction} LIMIT ?
         ), texts AS (
-            SELECT seq, time_created, CASE
+            SELECT session_id, seq, time_created, CASE
                 WHEN json_extract(data, '$.synthetic') = 1 OR json_extract(data, '$.ignored') = 1 THEN ''
                 WHEN json_type(data, '$.text') = 'text' THEN json_extract(data, '$.text')
                 ELSE COALESCE((SELECT group_concat(json_extract(value, '$.text'), char(10))
@@ -680,7 +689,19 @@ export class V2StoreReader {
                       AND COALESCE(json_extract(value, '$.ignored'), 0) <> 1), '') END AS text
             FROM users WHERE json_valid(data)
         ) SELECT seq, time_created, CASE WHEN length(text) > ?
-            THEN substr(text, 1, ?) || ? || substr(text, -?) ELSE text END AS text
+            THEN substr(text, 1, ?) || ? || substr(text, -?) ELSE text END AS text,
+            EXISTS (
+                SELECT 1 FROM session_message assistant_reply
+                 WHERE assistant_reply.session_id = texts.session_id
+                   AND assistant_reply.type = 'assistant'
+                   AND assistant_reply.seq < texts.seq
+                   AND EXISTS (
+                       SELECT 1 FROM session_message prior_user
+                        WHERE prior_user.session_id = texts.session_id
+                          AND prior_user.type = 'user'
+                          AND prior_user.seq < assistant_reply.seq
+                   )
+            ) AS follows_assistant_reply
           FROM texts ORDER BY time_created ${direction}, seq ${direction}`).all(
             sessionID,
             boundaryMs,
@@ -693,6 +714,7 @@ export class V2StoreReader {
             seq: number;
             time_created: number;
             text: string;
+            follows_assistant_reply: number;
         }>;
     }
 
@@ -726,6 +748,33 @@ export class V2StoreReader {
             ).get(sessionID, id, ...RAW_MESSAGE_TYPES) as RawRow | undefined;
             return row ? decode(row) : null;
         });
+    }
+
+    messageTimes(
+        sessionID: string,
+        ids: readonly string[],
+    ): Map<string, { created?: number; completed?: number }> {
+        const times = new Map<string, { created?: number; completed?: number }>();
+        // Read only timing metadata for the served draft, not full stored content
+        // or the session's archived history. Bound each query's parameter count.
+        for (let offset = 0; offset < ids.length; offset += 500) {
+            const batch = ids.slice(offset, offset + 500);
+            const rows = this.prepare(
+                `SELECT id, COALESCE(time_created, json_extract(data, '$.time.created')) AS created,
+                        json_extract(data, '$.time.completed') AS completed
+                 FROM session_message WHERE session_id = ? AND id IN (${batch.map(() => "?").join(",")})`,
+            ).all(sessionID, ...batch) as Array<{
+                id: string;
+                created: number | null;
+                completed: number | null;
+            }>;
+            for (const row of rows)
+                times.set(row.id, {
+                    created: typeof row.created === "number" ? row.created : undefined,
+                    completed: typeof row.completed === "number" ? row.completed : undefined,
+                });
+        }
+        return times;
     }
 
     messageExistsById(sessionID: string, id: string): boolean {

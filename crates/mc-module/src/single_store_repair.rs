@@ -763,6 +763,9 @@ fn apply_session(
         }
     }
 
+    // Vector/dims payloads are immutable at a rowid: refreshes delete/insert rows,
+    // while in-place repairs change window_index/project_path/harness. Restore the
+    // backup payload with INSERT rather than updating an existing vector in place.
     let embedding_columns = shared_columns(conn, "compartment_chunk_embeddings")?;
     let embedding_values = embedding_columns
         .iter()
@@ -850,6 +853,24 @@ fn apply_session(
             &format!("UPDATE main.session_meta SET {assignments} WHERE session_id = ?1"),
             params_from_iter(values.iter()),
         )?;
+    }
+
+    if conn.query_row(
+        "SELECT EXISTS(SELECT 1 FROM main.sqlite_master WHERE name='session_render_cache')",
+        [],
+        |row| row.get::<_, bool>(0),
+    )? {
+        conn.execute(
+            "DELETE FROM main.session_render_cache WHERE session_id=?1",
+            [session],
+        )?;
+    }
+    if conn.query_row(
+        "SELECT EXISTS(SELECT 1 FROM main.sqlite_master WHERE name='session_meta_chunks')",
+        [],
+        |row| row.get::<_, bool>(0),
+    )? {
+        conn.execute("DELETE FROM main.session_meta_chunks WHERE session_id=?1 AND column_name='memory_block_ids'", [session])?;
     }
 
     eprintln!("written in {:.2}s", step.elapsed().as_secs_f64());
@@ -969,7 +990,9 @@ fn reset_store_caches(options: &RepairOptions, work: &Work) -> Result<(), Engine
                 _ => json!({}),
             };
             let object = value.as_object_mut().expect("checked above");
-            object.insert("project_memory_epoch_pending".into(), true.into());
+            // Restored history invalidates the frozen baseline independently of
+            // any dashboard memory change counter.
+            object.insert("bootstrap_seed_fold_pending".into(), true.into());
             conn.execute(
                 "UPDATE mc_cache_state SET meta = ?2, row_version = row_version + 1 WHERE session_id = ?1",
                 params![session, value.to_string()],

@@ -115,33 +115,6 @@ fn rig() -> (
 }
 
 #[test]
-fn resident_rebuild_uses_policy_rows_not_stored_summary() {
-    let (_dir, store, key, sql, _settings) = rig();
-    sql.execute(
-        "UPDATE mc_provider_policy_summaries_v1 SET summary_json='{}'",
-        [],
-    )
-    .unwrap();
-    let rebuilt = store
-        .read_provider_resident_policy(&key, |index, counters| {
-            ResidentPolicy::rebuild(index, counters, 0, &BTreeMap::new())
-        })
-        .unwrap();
-    assert_eq!(
-        rebuilt.rebuilt_parts, 6,
-        "a cold cache must read authoritative rows"
-    );
-    assert_eq!(
-        rebuilt.summary.unwrap().totals.users,
-        3,
-        "stored summary is not an authority"
-    );
-    let cache = crate::providers::resident_hooks::ResidentHooks::enabled(true);
-    cache.load_for_test(&store, &key);
-    assert_eq!(cache.stats()["rebuilt_parts"], 6);
-}
-
-#[test]
 fn resident_delta_inputs_equal_full_policy_oracle() {
     let (_dir, store, key, sql, settings) = rig();
     let mut rebuilt = store

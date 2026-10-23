@@ -201,9 +201,13 @@ impl McStore {
         key: &ProviderSessionKey,
         version: u64,
     ) -> Result<bool, ProviderError> {
-        self.inner.with_conn(|conn| conn.query_row(
-            "SELECT EXISTS(SELECT 1 FROM mc_provider_views_v2 WHERE conv_key=?1 AND version=?2 UNION ALL SELECT 1 FROM mc_provider_views_v1 WHERE conv_key=?1 AND version=?2)",
-            params![key.conversation_key(), as_i64(version)?], |row| row.get(0))).map_err(|error| ProviderError::Storage(error.into()))
+        self.inner
+            .with_conn(|conn| {
+                conn.query_row(
+            "SELECT EXISTS(SELECT 1 FROM mc_provider_views_v2 WHERE conv_key=?1 AND version=?2)",
+            params![key.conversation_key(), as_i64(version)?], |row| row.get(0))
+            })
+            .map_err(|error| ProviderError::Storage(error.into()))
     }
 }
 
@@ -239,7 +243,7 @@ pub(crate) fn save_engine_policy_tx(
         // Every policy part is rewritten below. Dropping the summary first means
         // the change triggers log nothing, and the next hook rebuilds it.
         drop_policy_summary_tx(conn, &conv)?;
-        let native_v2=matches!(harness.as_str(),"opencode"|"opencode2") && conn.query_row("SELECT EXISTS(SELECT 1 FROM mc_provider_lineages_v1 WHERE conv_key=?1 AND lineage_id=?2)",params![conv,lineage],|r|r.get::<_,bool>(0))?;
+        let native_v2=(matches!(harness.as_str(),"opencode"|"opencode2") || policy.native_tail_section) && conn.query_row("SELECT EXISTS(SELECT 1 FROM mc_provider_lineages_v1 WHERE conv_key=?1 AND lineage_id=?2)",params![conv,lineage],|r|r.get::<_,bool>(0))?;
         let old_frozen = if native_v2 {
             conn.query_row("SELECT frozen_through_ordinal FROM mc_provider_policy_cuts_v1 WHERE conv_key=?1 ORDER BY cut_id DESC LIMIT 1",[&conv],|r|r.get::<_,Option<u64>>(0)).optional()?.flatten()
         } else {
@@ -266,6 +270,12 @@ pub(crate) fn save_engine_policy_tx(
         }
         let mut counters = parse(&raw)?;
         counters["engine_policy"] = policy.settings.clone();
+        // The compartment source revision detects edits to summarized history
+        // before reusing a cached prefix. Save it with the frozen baseline in
+        // the cut's policy_key, not in hook counters shared with uncached calls.
+        if let Some(settings) = counters["engine_policy"].as_object_mut() {
+            settings.remove("native_compartment_source_revision");
+        }
         if native_v2 {
             let mut parts = Vec::new();
             if let Some(coverage) = coverage {
@@ -276,7 +286,7 @@ pub(crate) fn save_engine_policy_tx(
                     parts.push(serde_json::from_str(&raw?).map_err(sql_json)?);
                 }
             }
-            let cut = crate::provider_policy_overlay::freeze_cut_tx(
+            crate::provider_policy_overlay::freeze_cut_tx(
                 conn,
                 &conv,
                 &lineage,
@@ -289,7 +299,6 @@ pub(crate) fn save_engine_policy_tx(
                     e.to_string(),
                 )))
             })?;
-            counters["engine_policy"]["baseline_cut_id"] = json!(cut);
         }
         conn.execute(
             "UPDATE mc_provider_conversations_v2 SET hook_counters_json=?2 WHERE conv_key=?1",
@@ -1215,21 +1224,21 @@ impl McStore {
         }
         let refusal = self.inner.with_conn_fenced(|conn| {
             let conv = key.conversation_key();
-            let held: Option<(String,bool)> = conn
+            let held: Option<String> = conn
                 .query_row(
-                    "SELECT state,1 FROM mc_provider_views_v2 WHERE conv_key=?1 AND version=?2 UNION ALL SELECT state,0 FROM mc_provider_views_v1 WHERE conv_key=?1 AND version=?2 LIMIT 1",
+                    "SELECT state FROM mc_provider_views_v2 WHERE conv_key=?1 AND version=?2",
                     params![conv, as_i64(version)?],
-                    |r| crate::provider_meters::read_row(|| Ok((r.get(0)?,r.get(1)?))),
+                    |r| crate::provider_meters::read_row(|| r.get(0)),
                 )
                 .optional()?;
-            let Some((held,v2)) = held else {
+            let Some(held) = held else {
                 return Ok(Some("version"));
             };
             if held == "not_applied" && state == "applied" {
                 return Ok(Some("state"));
             }
             conn.execute(
-                if v2 {"UPDATE mc_provider_views_v2 SET state=?3 WHERE conv_key=?1 AND version=?2"} else {"UPDATE mc_provider_views_v1 SET state=?3 WHERE conv_key=?1 AND version=?2"},
+                "UPDATE mc_provider_views_v2 SET state=?3 WHERE conv_key=?1 AND version=?2",
                 params![conv, as_i64(version)?, state],
             )?;
             Ok(None)
@@ -1688,55 +1697,7 @@ impl McStore {
     }
 }
 
-#[derive(Clone, Debug, PartialEq, Eq)]
-pub struct ProviderView {
-    pub version: u64,
-    pub lineage_id: String,
-    pub range_from: u64,
-    pub range_to: u64,
-    pub replacement_json: String,
-    pub state: String,
-}
 impl McStore {
-    /// View content is immutable at a version; only its application state moves.
-    pub fn save_provider_view(
-        &self,
-        key: &ProviderSessionKey,
-        view: &ProviderView,
-    ) -> Result<(), McStoreError> {
-        self.inner.with_conn_fenced(|conn| {
-            let conv=key.conversation_key();
-
-            parse(&view.replacement_json)?;
-            let held=conn.query_row("SELECT lineage_id,range_from,range_to,replacement_json FROM mc_provider_views_v1 WHERE conv_key=?1 AND version=?2", params![conv,as_i64(view.version)?], |r| crate::provider_meters::read_row(|| Ok((r.get::<_,String>(0)?,r.get::<_,u64>(1)?,r.get::<_,u64>(2)?,r.get::<_,String>(3)?)))).optional()?;
-            if held.is_some_and(|h|h!=(view.lineage_id.clone(),view.range_from,view.range_to,view.replacement_json.clone())) {return Err(rusqlite::Error::InvalidQuery)}
-            conn.execute("INSERT INTO mc_provider_views_v1 VALUES (?1,?2,?3,?4,?5,?6,?7,'{}',json_extract(?1,'$[1]')) ON CONFLICT(conv_key,version) DO UPDATE SET state=excluded.state",params![conv,as_i64(view.version)?,view.lineage_id,as_i64(view.range_from)?,as_i64(view.range_to)?,view.replacement_json,view.state])?;
-            Ok(())
-        })?;
-        Ok(())
-    }
-    pub fn load_provider_views(
-        &self,
-        key: &ProviderSessionKey,
-    ) -> Result<Vec<ProviderView>, McStoreError> {
-        Ok(self.inner.with_conn(|conn| {
-            let mut q=conn.prepare("SELECT version,lineage_id,range_from,range_to,replacement_json,state FROM mc_provider_views_v1 WHERE conv_key=?1 ORDER BY version")?;
-            let rows=q.query_map([key.conversation_key()], |r| crate::provider_meters::read_row(|| Ok(ProviderView {version:r.get(0)?,lineage_id:r.get(1)?,range_from:r.get(2)?,range_to:r.get(3)?,replacement_json:r.get(4)?,state:r.get(5)?})))?.collect();
-            rows
-        })?)
-    }
-    /// One provider view by version. Unlike `load_provider_views`, it does not
-    /// read every stored view: each holds a whole replacement, and they
-    /// accumulate with every rebuild.
-    pub fn load_provider_view(
-        &self,
-        key: &ProviderSessionKey,
-        version: u64,
-    ) -> Result<Option<ProviderView>, McStoreError> {
-        Ok(self.inner.with_conn(|conn| {
-            conn.query_row("SELECT version,lineage_id,range_from,range_to,replacement_json,state FROM mc_provider_views_v1 WHERE conv_key=?1 AND version=?2", params![key.conversation_key(), as_i64(version)?], |r| crate::provider_meters::read_row(|| Ok(ProviderView {version:r.get(0)?,lineage_id:r.get(1)?,range_from:r.get(2)?,range_to:r.get(3)?,replacement_json:r.get(4)?,state:r.get(5)?}))).optional()
-        })?)
-    }
     pub fn queue_provider_drops(
         &self,
         key: &ProviderSessionKey,

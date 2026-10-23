@@ -2,8 +2,10 @@ import { expect, test } from "bun:test";
 import { join } from "node:path";
 import { Database } from "../../../shared/sqlite";
 import { createTestTempDir } from "../../../shared/test-temp-dir";
+import { seedSessionMeta } from "../__tests__/session-meta-fixture";
 import { runMigrations } from "../migrations";
 import { initializeDatabase } from "../storage-db";
+import { sessionRenderCacheSelect } from "../storage-session-cache";
 import {
     getProjectEmbeddings,
     PROJECT_EMBEDDING_CACHE_EPOCH_SQL,
@@ -306,6 +308,42 @@ test("embedding project epoch lookup uses the project primary-key index and repo
             `project epoch lookup: projects=10000 checks=${samples.length} mean_us=${(mean * 1000).toFixed(2)} p50_us=${(samples[5000]! * 1000).toFixed(2)} p95_us=${(samples[9500]! * 1000).toFixed(2)} plan=${plan.map((row) => row.detail).join("; ")}`,
         );
         expect(samples).toHaveLength(10000);
+    } finally {
+        f.close();
+    }
+});
+
+test("embedding epoch invalidates after dashboard delta admission without clearing served prefix bytes", () => {
+    const f = fixture();
+    try {
+        seedSessionMeta(f.reader, {
+            session_id: "held-dashboard",
+            cached_m0_bytes: Buffer.from("frozen m0"),
+            cached_m1_bytes: Buffer.from("frozen m1"),
+        });
+        const warm = getProjectEmbeddings(f.reader, f.projectPath, "stamp:model");
+        const receipt = applyDashboardMemoryEdit(f.writer, {
+            projectPath: f.projectPath,
+            operationId: "delta-and-search",
+            expectedRevisions: [{ memoryId: f.first.id, revision: 1 }],
+            changes: [{ memoryId: f.first.id, content: "Dashboard correction." }],
+        });
+        expect(receipt.state).toBe("applied");
+        expect(
+            f.reader
+                .prepare(
+                    "SELECT new_content FROM memory_mutation_log WHERE operation_id LIKE 'dashboard:%'",
+                )
+                .all(),
+        ).toEqual([{ new_content: "Dashboard correction." }]);
+        expect(getProjectEmbeddings(f.reader, f.projectPath, "stamp:model")).not.toBe(warm);
+        const cache = f.reader
+            .prepare(
+                `SELECT ${sessionRenderCacheSelect("cached_m0_bytes", "cached_m0_bytes", f.reader)}, ${sessionRenderCacheSelect("cached_m1_bytes", "cached_m1_bytes", f.reader)} FROM session_meta WHERE session_id='held-dashboard'`,
+            )
+            .get() as { cached_m0_bytes: Uint8Array; cached_m1_bytes: Uint8Array };
+        expect(Buffer.from(cache.cached_m0_bytes).toString()).toBe("frozen m0");
+        expect(Buffer.from(cache.cached_m1_bytes).toString()).toBe("frozen m1");
     } finally {
         f.close();
     }

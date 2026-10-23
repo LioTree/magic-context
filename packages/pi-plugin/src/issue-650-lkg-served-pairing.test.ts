@@ -43,6 +43,8 @@ for (const overrun of [false, true]) {
 			const identityPath = getPiServedTagNumbersPath(sessionId, storageDir);
 			let now = 0;
 			let identityWrites = 0;
+			// Only the first pass overruns; the retry after it runs inside its budget.
+			let advanceClock = true;
 			const clock = spyOn(performance, "now").mockImplementation(() => now);
 			const write = storagePermissions.writeStorageFileSync;
 			const writer = spyOn(
@@ -54,7 +56,7 @@ for (const overrun of [false, true]) {
 					identityWrites++;
 					// A synchronous filesystem call cannot be preempted by the budget.
 					// Advance its clock only after the real append has reached disk.
-					if (overrun) now = 26_000;
+					if (overrun && advanceClock) now = 26_000;
 				}
 			});
 			try {
@@ -99,10 +101,39 @@ for (const overrun of [false, true]) {
 				// Either neither publication survived, or the actual numbered request
 				// is recoverable. A digest-only telemetry row is not an LKG.
 				if (persistedNumbers.length > 0) {
-					expect(slot).toBeDefined();
-					expect(durableSlot?.jsonPrefix).toBe(slot?.jsonPrefix);
-					expect(slot?.inputIdSeq).toEqual(["entry-1"]);
-					expect(slot?.jsonPrefix).toContain("§1§ pair this served request");
+					expect(durableSlot?.inputIdSeq).toEqual(["entry-1"]);
+					expect(durableSlot?.jsonPrefix).toContain(
+						"§1§ pair this served request",
+					);
+					if (!overrun) expect(durableSlot?.jsonPrefix).toBe(slot?.jsonPrefix);
+				}
+				if (overrun) {
+					// This fixture's overrun comes after the numbers' durable write.
+					expect(persistedNumbers).toEqual([1]);
+					// The refused request was never sent, so it is not the in-memory
+					// last-good request; it stays recoverable from storage only.
+					expect(slot?.jsonPrefix).not.toBe(durableSlot?.jsonPrefix);
+					// Durable served numbers never orphan: the next pass on the same input
+					// reuses them, allocates none, and sends every one of them.
+					advanceClock = false;
+					now = 0;
+					const retryRaw = [userMessage("pair this served request", 1)];
+					const retried = (await handler(
+						{ messages: retryRaw } as never,
+						fakeContext(sessionId, root, ["entry-1"], retryRaw) as never,
+					)) as { messages: unknown[] };
+					const sent = JSON.stringify(retried.messages);
+					for (const number of persistedNumbers)
+						expect(sent).toContain(`§${number}§`);
+					expect(sent).toContain("§1§ pair this served request");
+					flushPiServedArrayLedger();
+					clearContextHandlerSession(sessionId);
+					const afterRetry: number[] = existsSync(identityPath)
+						? JSON.parse(readFileSync(identityPath, "utf8")).tag_numbers
+						: [];
+					expect(afterRetry).toEqual(
+						persistedNumbers.length > 0 ? persistedNumbers : [1],
+					);
 				}
 			} finally {
 				writer.mockRestore();

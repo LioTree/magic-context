@@ -6,6 +6,12 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { Database } from "../../shared/sqlite";
 import { createTestTempDirFromPath } from "../../shared/test-temp-dir";
+import {
+    clearSessionMetaFixtureFault,
+    interleaveSessionMetaCollectionWrite,
+    rejectSessionMetaCollectionWrites,
+} from "./__tests__/session-meta-faults";
+import { seedSessionMeta } from "./__tests__/session-meta-fixture";
 import { runMigrations } from "./migrations";
 import { initializeDatabase, LATEST_SUPPORTED_VERSION } from "./storage-db";
 import {
@@ -25,6 +31,7 @@ import {
     readReplayDocument,
     serializeReplayDocument,
 } from "./storage-replay-document";
+import { sessionMetaCollectionSelect } from "./storage-session-collections";
 
 function createTestDb(): Database {
     const db = new Database(":memory:");
@@ -35,7 +42,9 @@ function createTestDb(): Database {
 
 function replayDocumentRaw(db: Database, sessionId: string): string | null {
     const row = db
-        .prepare("SELECT trailing_blank_decisions FROM session_meta WHERE session_id = ?")
+        .prepare(
+            `SELECT ${sessionMetaCollectionSelect("trailing_blank_decisions", "trailing_blank_decisions", db)} FROM session_meta WHERE session_id = ?`,
+        )
         .get(sessionId) as { trailing_blank_decisions?: string | null } | undefined;
     return row?.trailing_blank_decisions ?? null;
 }
@@ -51,13 +60,14 @@ function decisionRows(
         .all(sessionId) as Array<{ message_id: string; decision: string }>;
 }
 
-// Statements that write a trailing-blank decision (one row each) or the replay
-// envelope column (the native lanes and other namespaces).
+// Decision rows are intercepted by SQL prefix; replay-document writes use the
+// collection compare-and-swap API. Inject the competing update before the writer
+// transaction begins, not between chunk writes while the lock is held.
 const DECISION_WRITE_PREFIXES = [
     "INSERT INTO session_replay_decisions",
     "UPDATE session_replay_decisions",
 ];
-const ENVELOPE_WRITE_PREFIX = "UPDATE session_meta SET trailing_blank_decisions = ?";
+const ENVELOPE_WRITE_LANE = "replay-envelope";
 
 function interleaveFirstReplayWrite(
     db: Database,
@@ -68,7 +78,12 @@ function interleaveFirstReplayWrite(
     let interleaved = false;
     db.prepare = ((sql: string) => {
         const statement = originalPrepare.call(db, sql);
-        if (!interleaved && prefixes.some((prefix) => sql.trimStart().startsWith(prefix))) {
+        if (
+            !interleaved &&
+            prefixes.some(
+                (prefix) => prefix !== ENVELOPE_WRITE_LANE && sql.trimStart().startsWith(prefix),
+            )
+        ) {
             const mutableStatement = statement as unknown as {
                 run: (...args: unknown[]) => unknown;
             };
@@ -84,19 +99,28 @@ function interleaveFirstReplayWrite(
         return statement;
     }) as typeof db.prepare;
 
+    if (prefixes.includes(ENVELOPE_WRITE_LANE))
+        interleaveSessionMetaCollectionWrite(
+            db,
+            "trailing_blank_decisions",
+            "interleave-envelope",
+            () => {
+                if (!interleaved) {
+                    interleaved = true;
+                    interleave();
+                }
+            },
+        );
     return () => {
         db.prepare = originalPrepare;
+        clearSessionMetaFixtureFault(db, "interleave-envelope");
     };
 }
 function exhaustReplayDocumentCas(db: Database): () => void {
     const originalPrepare = db.prepare;
     db.prepare = ((sql: string) => {
         const statement = originalPrepare.call(db, sql);
-        if (
-            [ENVELOPE_WRITE_PREFIX, ...DECISION_WRITE_PREFIXES].some((prefix) =>
-                sql.trimStart().startsWith(prefix),
-            )
-        ) {
+        if (DECISION_WRITE_PREFIXES.some((prefix) => sql.trimStart().startsWith(prefix))) {
             const mutableStatement = statement as unknown as {
                 run: (...args: unknown[]) => unknown;
             };
@@ -105,8 +129,12 @@ function exhaustReplayDocumentCas(db: Database): () => void {
         return statement;
     }) as typeof db.prepare;
 
+    rejectSessionMetaCollectionWrites(db, "trailing_blank_decisions", "exhaust-envelope-cas", {
+        ignore: true,
+    });
     return () => {
         db.prepare = originalPrepare;
+        clearSessionMetaFixtureFault(db, "exhaust-envelope-cas");
     };
 }
 
@@ -127,9 +155,7 @@ describe("native replay storage", () => {
             reasoningIds: new Set(),
         });
 
-        db.prepare(
-            "INSERT INTO session_meta (session_id, trailing_blank_decisions) VALUES (?, NULL)",
-        ).run("null-state");
+        seedSessionMeta(db, { session_id: "null-state", trailing_blank_decisions: null });
         expect(getNativeReplayState(db, "null-state")).toEqual({
             toolInputs: new Map(),
             reasoningIds: new Set(),
@@ -201,9 +227,7 @@ describe("native replay storage", () => {
 
     it("reads historical flat decisions and keeps byte-identical no-op documents flat", () => {
         const flat = '{"assistant-keep":"keep","assistant-strip":"strip"}';
-        db.prepare(
-            "INSERT INTO session_meta (session_id, trailing_blank_decisions) VALUES (?, ?)",
-        ).run("flat", flat);
+        seedSessionMeta(db, { session_id: "flat", trailing_blank_decisions: flat });
 
         expect(getTrailingBlankDecisions(db, "flat")).toEqual(
             new Map([
@@ -291,9 +315,7 @@ describe("native replay storage", () => {
             },
             cloneExtension: { source: "future-writer" },
         });
-        db.prepare(
-            "INSERT INTO session_meta (session_id, trailing_blank_decisions) VALUES (?, ?)",
-        ).run("opaque", stored);
+        seedSessionMeta(db, { session_id: "opaque", trailing_blank_decisions: stored });
 
         saveNativeToolInputs(db, "opaque", new Map([["call-2", nextInput]]));
         addNativeReasoningIds(db, "opaque", ["assistant-2"]);
@@ -336,7 +358,7 @@ describe("native replay storage", () => {
 
     it("retries a stale native update after a blank update without losing either namespace", () => {
         saveNativeToolInputs(db, "session", new Map([["call-existing", '{"path":"src/old.ts"}']]));
-        const restore = interleaveFirstReplayWrite(db, [ENVELOPE_WRITE_PREFIX], () => {
+        const restore = interleaveFirstReplayWrite(db, [ENVELOPE_WRITE_LANE], () => {
             expect(addTrailingBlankDecisions(db, "session", [["blank", "keep"]])).toBe(true);
         });
         try {
@@ -379,9 +401,7 @@ describe("native replay storage", () => {
     it("fails closed on unknown envelopes and malformed native state without erasing stored data", () => {
         const unknown =
             '{"version":99,"trailingBlank":{"assistant":"keep"},"piNative":{"toolInputs":{},"reasoningIds":[]}}';
-        db.prepare(
-            "INSERT INTO session_meta (session_id, trailing_blank_decisions) VALUES (?, ?)",
-        ).run("unknown", unknown);
+        seedSessionMeta(db, { session_id: "unknown", trailing_blank_decisions: unknown });
 
         expect(getTrailingBlankDecisions(db, "unknown")).toEqual(new Map());
         expect(addTrailingBlankDecisions(db, "unknown", [["later", "strip"]])).toBe(false);
@@ -394,9 +414,7 @@ describe("native replay storage", () => {
 
         const malformed =
             '{"version":2,"trailingBlank":{"assistant":"keep"},"piNative":{"toolInputs":"{","reasoningIds":[]}}';
-        db.prepare(
-            "INSERT INTO session_meta (session_id, trailing_blank_decisions) VALUES (?, ?)",
-        ).run("malformed", malformed);
+        seedSessionMeta(db, { session_id: "malformed", trailing_blank_decisions: malformed });
 
         expect(getTrailingBlankDecisions(db, "malformed")).toEqual(
             new Map([["assistant", "keep"]]),
@@ -422,9 +440,10 @@ describe("native replay storage", () => {
         expect(afterBlankWrite.piNative).toEqual({ toolInputs: "{", reasoningIds: [] });
         const malformedReasoning =
             '{"version":2,"trailingBlank":{},"piNative":{"toolInputs":{"call":"{}"},"reasoningIds":[""]}}';
-        db.prepare(
-            "INSERT INTO session_meta (session_id, trailing_blank_decisions) VALUES (?, ?)",
-        ).run("malformed-reasoning", malformedReasoning);
+        seedSessionMeta(db, {
+            session_id: "malformed-reasoning",
+            trailing_blank_decisions: malformedReasoning,
+        });
         expect(() => getNativeToolInputs(db, "malformed-reasoning")).toThrow(
             "invalid persisted native reasoning ids state",
         );
@@ -468,14 +487,12 @@ describe("native replay storage", () => {
         saveNativeToolInputs(db, "session", new Map([["call-1", firstInput]]));
         addNativeReasoningIds(db, "session", ["assistant-1"]);
         const before = replayDocumentRaw(db, "session");
-        db.exec(`
-            CREATE TRIGGER fail_native_replay_update
-            BEFORE UPDATE OF trailing_blank_decisions ON session_meta
-            WHEN NEW.session_id = 'session'
-            BEGIN
-                SELECT RAISE(ABORT, 'injected native replay write failure');
-            END;
-        `);
+        rejectSessionMetaCollectionWrites(
+            db,
+            "trailing_blank_decisions",
+            "fail_native_replay_update",
+            { error: "injected native replay write failure", sessionId: "session" },
+        );
 
         expect(() =>
             saveNativeToolInputs(db, "session", new Map([["call-2", '{"path":"src/second.ts"}']])),

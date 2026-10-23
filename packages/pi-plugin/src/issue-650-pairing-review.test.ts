@@ -9,6 +9,10 @@ import {
 import * as persistence from "@magic-context/core/hooks/magic-context/lkg-persist";
 import { resetLkgSlotsForTest } from "@magic-context/core/hooks/magic-context/lkg-slot";
 import * as storagePermissions from "@magic-context/core/shared/storage-permissions";
+import {
+	readSessionMetaCollection,
+	updateSessionMetaCollection,
+} from "../../plugin/src/features/magic-context/storage-session-collections";
 import { createTestTempDir } from "../../plugin/src/shared/test-temp-dir";
 import {
 	clearContextHandlerSession,
@@ -88,13 +92,20 @@ function setup(root: string) {
 		if (!handler) throw new Error(`missing ${name} handler`);
 		return handler(payload as never, ctx as never);
 	};
-	const serve = () =>
-		event("context", { messages: structuredClone(raw) }) as Promise<{
-			messages: unknown[];
-		}>;
+	event("agent_start");
+	let providerMessages: unknown[] = structuredClone(raw);
+	const serve = async () => {
+		const served = (await event("context", {
+			messages: structuredClone(raw),
+		})) as { messages: unknown[] };
+		providerMessages = served.messages;
+		return served;
+	};
 	const dispatch = () => {
 		const before = aborts;
-		event("before_provider_request");
+		event("before_provider_request", {
+			payload: { messages: providerMessages },
+		});
 		if (aborts === before) dispatches++;
 	};
 	return {
@@ -310,24 +321,25 @@ describe.skipIf(!enabled)("issue 650 publication review", () => {
 		test(`review control: OMP dispatches while preserving unreadable envelope ${envelope}`, async () => {
 			await fixture(async (f) => {
 				expect(updateReplayDocument(f.db, f.sessionId, () => false)).toBe(true);
-				f.db
-					.prepare(
-						"UPDATE session_meta SET trailing_blank_decisions=? WHERE session_id=?",
-					)
-					.run(envelope, f.sessionId);
+				updateSessionMetaCollection(
+					f.db,
+					f.sessionId,
+					"trailing_blank_decisions",
+					envelope,
+				);
 				const served = await f.serve();
 				f.dispatch();
 				expect(f.dispatches()).toBe(1);
 				expect(JSON.stringify(served.messages)).toContain(
 					"§1§ review served bytes",
 				);
-				expect(
-					f.db
-						.prepare(
-							"SELECT trailing_blank_decisions FROM session_meta WHERE session_id=?",
-						)
-						.get(f.sessionId),
-				).toEqual({ trailing_blank_decisions: envelope });
+				expect({
+					trailing_blank_decisions: readSessionMetaCollection(
+						f.db,
+						f.sessionId,
+						"trailing_blank_decisions",
+					),
+				}).toEqual({ trailing_blank_decisions: envelope });
 				expect(
 					f.db
 						.prepare("SELECT session_id FROM lkg_slots WHERE session_id=?")

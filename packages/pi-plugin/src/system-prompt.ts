@@ -8,7 +8,6 @@
  * by the m[0]/m[1] message materializer instead.
  */
 
-import { createHash } from "node:crypto";
 import { buildMagicContextSection } from "@magic-context/core/agents/magic-context-prompt";
 import { computeHardCacheExpired } from "@magic-context/core/features/magic-context/scheduler";
 import {
@@ -20,7 +19,7 @@ import { estimateTokens } from "@magic-context/core/hooks/magic-context/read-ses
 import { systemPromptDates } from "@magic-context/core/hooks/magic-context/system-prompt-dates";
 import { sessionLog } from "@magic-context/core/shared/logger";
 import type { PromptSurfacePreset } from "@magic-context/core/shared/prompt-surface";
-import { promptSurfaceHashMaterial } from "@magic-context/core/shared/prompt-surface-runtime";
+import { systemPromptFingerprint } from "@magic-context/core/shared/prompt-surface-runtime";
 import { clearPiSystemPromptDelivery } from "./system-prompt-delivery-pi";
 
 const PROJECT_DOCS_MARKER = "<project-docs>";
@@ -32,7 +31,7 @@ const MAGIC_CONTEXT_MARKER = "## Magic Context";
  * Sticky date cache. Module-scoped so clearPiSystemPromptSession can release
  * entries when Pi shuts down or switches sessions.
  */
-const stickyDateBySession = new Map<string, string>();
+const stickyDateBySessionDefault = new Map<string, string>();
 
 export interface BuildMagicContextBlockOptions {
 	db: ContextDatabase;
@@ -127,8 +126,11 @@ export function processSystemPromptForCache(args: {
 	/** When true, the caller has already determined this turn is busting cache. */
 	isCacheBusting: boolean;
 	promptSurfacePreset?: PromptSurfacePreset;
+	/** Bridge instances own their date state rather than sharing standalone sessions. */
+	stickyDates?: Map<string, string>;
 }): SystemPromptHashResult {
 	const { db, sessionId, systemPrompt, isCacheBusting } = args;
+	const stickyDateBySession = args.stickyDates ?? stickyDateBySessionDefault;
 
 	// Step 1: hash detection vs persisted value.
 	let sessionMeta:
@@ -155,11 +157,10 @@ export function processSystemPromptForCache(args: {
 	const dates = systemPromptDates(systemPrompt, stickyDate);
 	const liveDate = dates.live;
 	const stableCandidate = dates.stable;
-	const stableCandidateHash = createHash("md5")
-		.update(
-			promptSurfaceHashMaterial(stableCandidate, args.promptSurfacePreset),
-		)
-		.digest("hex");
+	const stableCandidateHash = systemPromptFingerprint(
+		stableCandidate,
+		args.promptSurfacePreset,
+	);
 	const contentOrPresetChanged =
 		!isFirstHash && stableCandidateHash !== previousHash;
 	// before_agent_start precedes the context scheduler. Read the provider's
@@ -193,9 +194,10 @@ export function processSystemPromptForCache(args: {
 		}
 	}
 
-	const currentHash = createHash("md5")
-		.update(promptSurfaceHashMaterial(frozenPrompt, args.promptSurfacePreset))
-		.digest("hex");
+	const currentHash = systemPromptFingerprint(
+		frozenPrompt,
+		args.promptSurfacePreset,
+	);
 	const hashChanged = !isFirstHash && currentHash !== previousHash;
 
 	if (hashChanged) {
@@ -240,7 +242,7 @@ export function processSystemPromptForCache(args: {
  */
 export function clearPiSystemPromptSession(sessionId: string): void {
 	clearPiSystemPromptDelivery(sessionId);
-	stickyDateBySession.delete(sessionId);
+	stickyDateBySessionDefault.delete(sessionId);
 }
 
 /** Test-only markers for system-prompt parity assertions. */

@@ -4,6 +4,7 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 import * as sqlite from "@magic-context/core/shared/sqlite";
 import { Database } from "@magic-context/core/shared/sqlite";
+import { sessionMetaFixtureRow } from "../../plugin/src/features/magic-context/__tests__/session-meta-fixture";
 import { createTestTempDirFromPath } from "../../plugin/src/shared/test-temp-dir";
 import {
 	clearContextHandlerSession,
@@ -182,9 +183,7 @@ test("Pi writer wait honours a supplied host abort signal before writes", async 
 		} finally {
 			wait.mockRestore();
 		}
-		expect(
-			db.prepare("SELECT * FROM session_meta WHERE session_id='waiter'").get(),
-		).toBeNull();
+		expect(sessionMetaFixtureRow(db, "waiter")).toBeNull();
 	});
 });
 

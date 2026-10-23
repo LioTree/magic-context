@@ -13,6 +13,7 @@ import {
 } from "../../features/magic-context/compartment-storage";
 import {
     loadAgentFragmentsAfter,
+    loadDashboardFragmentsAfter,
     maxAgentFragmentId,
     renderStaleFragmentMarker,
 } from "../../features/magic-context/memory/agent-fragments";
@@ -62,6 +63,15 @@ import {
     readProjectDocsCanonical,
 } from "../../features/magic-context/storage";
 import {
+    sessionRenderCacheSelect,
+    sessionRenderCacheValueSql,
+    writeSessionRenderCache,
+} from "../../features/magic-context/storage-session-cache";
+import {
+    readSessionMetaCollection,
+    writeSessionMetaCollection,
+} from "../../features/magic-context/storage-session-collections";
+import {
     getActiveUserMemories,
     type UserMemory,
 } from "../../features/magic-context/user-memory/storage-user-memory";
@@ -104,6 +114,7 @@ import { compareRawSessionMessageOrder, resolveHostServedBoundaryId } from "./re
 import { getMessageTimesFromOpenCodeDb } from "./read-session-db";
 import { estimateTokens } from "./read-session-formatting";
 import { projectCompartmentScores, readAppliedScoreWatermark } from "./score-projection";
+import { refuseServedPrefix, replayServedPrefix, type ServedPrefix } from "./served-prefix";
 import type { MessageLike } from "./tag-messages";
 import { formatDate } from "./temporal-awareness";
 import { renderUserProfileContent } from "./user-profile-render";
@@ -260,14 +271,31 @@ export function getVisibleMemoryIds(db: Database, sessionId: string): Set<number
         const projected = readFullyVisibleMemoryIds(db, sessionId);
         if (projected !== undefined) return projected.size > 0 ? projected : null;
         const row = db
-            .prepare(
-                "SELECT memory_block_ids, cached_m0_bytes, cached_m1_bytes FROM session_meta WHERE session_id = ?",
-            )
-            .get(sessionId) as {
-            memory_block_ids: string | null;
-            cached_m0_bytes: Buffer | Uint8Array | null;
-            cached_m1_bytes: Buffer | Uint8Array | null;
-        } | null;
+            .transaction(() => {
+                const header = db
+                    .prepare(
+                        `SELECT ${sessionRenderCacheSelect("cached_m0_bytes")},
+                    ${sessionRenderCacheSelect("cached_m1_bytes")}
+                FROM session_meta WHERE session_id = ?`,
+                    )
+                    .get(sessionId) as
+                    | {
+                          cached_m0_bytes: Buffer | Uint8Array | null;
+                          cached_m1_bytes: Buffer | Uint8Array | null;
+                      }
+                    | undefined;
+                return header
+                    ? {
+                          ...header,
+                          memory_block_ids: readSessionMetaCollection(
+                              db,
+                              sessionId,
+                              "memory_block_ids",
+                          ) as string | null,
+                      }
+                    : null;
+            })
+            .deferred();
         if (!row?.memory_block_ids) return null;
         const parsed = JSON.parse(row.memory_block_ids) as unknown;
         if (!Array.isArray(parsed)) return null;
@@ -553,12 +581,10 @@ export function prepareCompartmentInjection(
     if (projectPath) {
         // Use cached memory block to avoid cache busting on background changes (ctx_memory write, promotion).
         // Cache is cleared by replaceSessionFacts/replaceAllCompartmentState after historian/compressor/recomp.
-        // Audit note: `as` cast is safe here — session_meta schema is owned by this plugin and the two
-        // columns are guaranteed present after initializeDatabase(). A type guard would add overhead on a
-        // hot path (every transform) for a table we fully control.
+        // Read the stable payload and its count in the same SQLite snapshot.
         const cachedMemory = db
             .prepare(
-                "SELECT memory_block_cache, memory_block_count FROM session_meta WHERE session_id = ?",
+                `SELECT ${sessionRenderCacheSelect("memory_block_cache")}, memory_block_count FROM session_meta WHERE session_id = ?`,
             )
             .get(sessionId) as { memory_block_cache: string; memory_block_count: number } | null;
 
@@ -585,9 +611,18 @@ export function prepareCompartmentInjection(
             // proceed with a one-turn cache miss than crash the user's prompt.
             // Issue: https://github.com/cortexkit/magic-context/issues/23
             try {
-                db.prepare(
-                    "UPDATE session_meta SET memory_block_cache = ?, memory_block_count = ?, memory_block_ids = ? WHERE session_id = ?",
-                ).run(memoryBlock ?? "", memoryCount, JSON.stringify(renderedIds), sessionId);
+                db.transaction(() => {
+                    writeSessionRenderCache(db, sessionId, "memory_block_cache", memoryBlock ?? "");
+                    writeSessionMetaCollection(
+                        db,
+                        sessionId,
+                        "memory_block_ids",
+                        JSON.stringify(renderedIds),
+                    );
+                    db.prepare(
+                        "UPDATE session_meta SET memory_block_count = ? WHERE session_id = ?",
+                    ).run(memoryCount, sessionId);
+                }).immediate();
             } catch (error) {
                 const code = (error as { code?: string } | null)?.code;
                 if (code === "SQLITE_BUSY") {
@@ -828,7 +863,7 @@ function readCachedBaselineState(
 ): { hasCachedM0: boolean; boundary: string | null } {
     const row = db
         .prepare(
-            "SELECT cached_m0_bytes AS m0, cached_m0_last_baseline_end_message_id AS boundary FROM session_meta WHERE session_id = ?",
+            `SELECT ${sessionRenderCacheSelect("cached_m0_bytes", "m0")}, cached_m0_last_baseline_end_message_id AS boundary FROM session_meta WHERE session_id = ?`,
         )
         .get(sessionId) as { m0: unknown; boundary: string | null } | undefined;
     const boundary = row?.boundary;
@@ -1008,6 +1043,8 @@ export interface M0M1State {
 }
 
 export interface M0M1RenderOptions {
+    /** Called inside the cache write transaction, only when the served M1 or cut changes. */
+    onM1Commit?: () => void;
     db: Database;
     sessionId: string;
     messages?: MessageLike[];
@@ -1134,6 +1171,7 @@ export interface PrefixTrimSourceOrder {
 }
 
 export interface InjectM0M1Result {
+    servedPrefixRecord?: ServedPrefix<MessageLike>;
     injected: boolean;
     prependedMessageCount: number;
     m0RematerializedThisPass: boolean;
@@ -1989,28 +2027,14 @@ export function mustMaterialize(args: {
         }
     }
 
-    // Compare the workspace fingerprint whenever EITHER the cached baseline or
-    // the current pass is workspaced — keying only on current `isWorkspaced`
-    // would miss the workspace→single transition: a cached union m[0] whose
-    // session just left its workspace would fall through to the integer-epoch
-    // compare and keep rendering the stale union if a membership bump were
-    // missed. Mirrors renderM1's soft-refresh gate and Pi's mustMaterializePi.
-    if (
-        current.workspaceFingerprint !== null ||
-        (args.state.cachedM0WorkspaceFingerprint ?? null) !== null
-    ) {
-        if ((args.state.cachedM0WorkspaceFingerprint ?? null) !== current.workspaceFingerprint) {
-            return withToolSetHashComparison({ value: true, reason: "project_memory_epoch" });
-        }
-    } else if (args.state.cachedM0ProjectMemoryEpoch !== current.projectMemoryEpoch) {
-        return { value: true, reason: "project_memory_epoch" };
-    }
+    // External memory and workspace changes never request a baseline rebuild
+    // (HARD). Dashboard log payloads join the delta only when a refresh (SOFT)
+    // is already authorized, then remain frozen until that baseline rebuild.
     // NOTE: project_user_profile_version is deliberately NOT a trigger. Additive
     // user-profile promotions surface in m[1] via renderM1's <new-user-profile>
     // delta (version-watermark), exactly like new compartments and memories. A
     // version change must not fold m[0]; the delta reconciles into m[0] on the
-    // next HARD fold. Destructive profile edits route through the same delta plus
-    // the project_memory_epoch path for external (dashboard) mutations.
+    // next HARD fold. Destructive profile edits use the same held delta.
     //
     // NOTE: max_compartment_seq is deliberately NOT a trigger. New compartments
     // are the canonical m[1] delta (renderM1 -> readNewCompartments WHERE
@@ -2923,13 +2947,18 @@ export function materializeM0(options: M0M1RenderOptions): MaterializeM0Result {
         // dogfood 2026-05-30: AFT showed "Injected 256" against 124 live memories,
         // all 256 ids deleted. Same transaction as the m[0] snapshot so the cached
         // bytes and their id manifest never diverge.
+        writeSessionMetaCollection(
+            options.db,
+            options.sessionId,
+            "memory_block_ids",
+            visibleIdsJson,
+        );
         options.db
             .prepare(
-                "UPDATE session_meta SET memory_block_count = ?, memory_block_ids = ?, cached_m0_last_baseline_end_message_id = ?, cached_m0_score_selection_watermark = ? WHERE session_id = ?",
+                "UPDATE session_meta SET memory_block_count = ?, cached_m0_last_baseline_end_message_id = ?, cached_m0_score_selection_watermark = ? WHERE session_id = ?",
             )
             .run(
                 visibleMemoryIds.length,
-                visibleIdsJson,
                 baselineEndMessageId,
                 snapshotMarkers.scoreSelectionWatermark ?? 0,
                 options.sessionId,
@@ -3128,17 +3157,17 @@ function renderNewUserProfileBlock(options: M0M1RenderOptions, markers: M0Snapsh
 }
 
 /**
- * The m[1] of a busting SOFT pass. It reads no memory rows and no mutation log:
- * new compartments and the user profile render as usual, the HARD fold's memory
- * blocks replay byte for byte, and this session's newer agent fragments are
- * appended (see composeSoftMemoryUpdates). Memory changes by anyone else, and
- * by automated writers, reach the prompt only at the next HARD fold.
+ * The m[1] of an authorized delta refresh (SOFT). Frozen memory blocks and
+ * admitted corrections replay byte for byte. New corrections come only from
+ * this session's agent fragments and dashboard-tagged mutation-log payloads;
+ * automated writers and other agents still wait for a baseline rebuild (HARD).
  */
 function renderSoftM1(
     options: M0M1RenderOptions,
     markers: M0SnapshotMarkers,
     projection: AppliedProjection,
     m0Text: string,
+    renderedMemoryIds: readonly number[],
 ): { result: RenderM1Result; projection: AppliedProjection } {
     if (!markers || markers.maxCompartmentSeq === undefined) {
         throw new RenderM1InvalidMarkersError(options.sessionId);
@@ -3169,6 +3198,10 @@ function renderSoftM1(
             : composeSoftMemoryUpdates({
                   db: options.db,
                   sessionId: options.sessionId,
+                  projectPath: options.projectPath,
+                  dashboardAfterId: markers.maxMemoryMutationId,
+                  baselineMemoryIds: renderedMemoryIds,
+                  maxMemoryId: markers.maxMemoryId,
                   projection,
                   memoryBudgetTokens:
                       options.memoryInjectionBudgetTokens ?? DEFAULT_MEMORY_BUDGET_TOKENS,
@@ -3436,6 +3469,10 @@ export function renderMemoryEditOverflowLine(memoryIds: readonly number[], count
 export function composeSoftMemoryUpdates(args: {
     db: Database;
     sessionId: string;
+    projectPath?: string;
+    dashboardAfterId?: number;
+    baselineMemoryIds?: readonly number[];
+    maxMemoryId?: number;
     projection: AppliedProjection;
     memoryBudgetTokens: number;
     historyBudgetTokens: number;
@@ -3452,6 +3489,7 @@ export function composeSoftMemoryUpdates(args: {
               id: overflowEntry.id,
               memoryIds: [...(overflowEntry.overflowIds ?? [])],
               count: overflowEntry.overflowCount ?? 0,
+              dashboardLogId: overflowEntry.dashboardLogId,
           }
         : null;
     const processedThrough = Math.max(
@@ -3459,6 +3497,20 @@ export function composeSoftMemoryUpdates(args: {
         ...args.projection.committed.map((fragment) => fragment.id),
     );
     const pending = loadAgentFragmentsAfter(args.db, args.sessionId, processedThrough);
+    if (args.projectPath) {
+        pending.push(
+            ...loadDashboardFragmentsAfter(
+                args.db,
+                args.projectPath,
+                Math.max(
+                    args.dashboardAfterId ?? 0,
+                    ...args.projection.committed.map((f) => f.dashboardLogId ?? 0),
+                ),
+                args.baselineMemoryIds ?? [],
+                args.maxMemoryId ?? 0,
+            ),
+        );
+    }
     if (pending.length > 0) {
         const headerTokens = estimateTokens(
             `<memory-updates>\n${MEMORY_UPDATES_HEADER}\n</memory-updates>\n`,
@@ -3498,6 +3550,9 @@ export function composeSoftMemoryUpdates(args: {
                 ) {
                     committed.push({
                         id: fragment.id,
+                        ...(fragment.dashboardLogId === undefined
+                            ? {}
+                            : { dashboardLogId: fragment.dashboardLogId }),
                         form: "full",
                         lines: fragment.lines,
                         visibleTexts: fragment.visibleTexts,
@@ -3511,6 +3566,9 @@ export function composeSoftMemoryUpdates(args: {
                 if (usedMarkers + markerCost <= markerReserve) {
                     committed.push({
                         id: fragment.id,
+                        ...(fragment.dashboardLogId === undefined
+                            ? {}
+                            : { dashboardLogId: fragment.dashboardLogId }),
                         form: "marker",
                         lines: [marker],
                         visibleTexts: [],
@@ -3518,9 +3576,16 @@ export function composeSoftMemoryUpdates(args: {
                     usedMarkers += markerCost;
                     continue;
                 }
-                overflow = { id: fragment.id, memoryIds: [], count: 0 };
+                overflow = {
+                    id: fragment.id,
+                    memoryIds: [],
+                    count: 0,
+                    dashboardLogId: undefined as number | undefined,
+                };
             }
-            overflow.id = fragment.id;
+            overflow.id = Math.max(overflow.id, fragment.id);
+            if (fragment.dashboardLogId !== undefined)
+                overflow.dashboardLogId = fragment.dashboardLogId;
             overflow.memoryIds.push(...fragment.memoryIds);
             overflow.count += 1;
         }
@@ -3529,6 +3594,9 @@ export function composeSoftMemoryUpdates(args: {
     if (overflow)
         nextCommitted.push({
             id: overflow.id,
+            ...(overflow.dashboardLogId === undefined
+                ? {}
+                : { dashboardLogId: overflow.dashboardLogId }),
             form: "overflow",
             lines: [renderMemoryEditOverflowLine(overflow.memoryIds, overflow.count)],
             visibleTexts: [],
@@ -3632,30 +3700,46 @@ export function hydrateCachedM0Mural(db: Database, sessionId: string, state: M0M
 
 function readCachedM0M1Row(db: Database, sessionId: string): CachedM0M1Row | null {
     return db
-        .prepare(
-            `SELECT cached_m0_bytes, cached_m0_score_selection_watermark, cached_m0_mural_data_url,
-                    cached_m0_mural_hash, cached_m1_bytes,
-                    cached_m0_project_memory_epoch,
-                    cached_m0_workspace_fingerprint,
-                    cached_m0_project_user_profile_version,
-                    cached_m0_max_compartment_seq,
-                    cached_m0_max_memory_id,
-                    cached_m0_max_mutation_id,
-                    cached_m0_max_memory_mutation_id,
-                    cached_m0_project_docs_hash,
-                    cached_m0_materialized_at,
-                    cached_m0_session_facts_version,
-                     cached_m0_upgrade_state,
-                     cached_m0_system_hash,
-                     cached_m0_tool_set_hash,
-                     cached_m0_model_key,
-                     cached_m0_project_identity,
-                     cached_m0_last_baseline_end_message_id,
-                     memory_block_ids
-               FROM session_meta
+        .transaction(() => {
+            const row = db
+                .prepare(
+                    `SELECT ${sessionRenderCacheSelect("cached_m0_bytes")},
+                cached_m0_score_selection_watermark,
+                ${sessionRenderCacheSelect("cached_m0_mural_data_url")},
+                cached_m0_mural_hash,
+                ${sessionRenderCacheSelect("cached_m1_bytes")},
+                cached_m0_project_memory_epoch,
+                cached_m0_workspace_fingerprint,
+                cached_m0_project_user_profile_version,
+                cached_m0_max_compartment_seq,
+                cached_m0_max_memory_id,
+                cached_m0_max_mutation_id,
+                cached_m0_max_memory_mutation_id,
+                cached_m0_project_docs_hash,
+                cached_m0_materialized_at,
+                cached_m0_session_facts_version,
+                ${sessionRenderCacheSelect("cached_m0_upgrade_state")},
+                cached_m0_system_hash,
+                cached_m0_tool_set_hash,
+                cached_m0_model_key,
+                cached_m0_project_identity,
+                cached_m0_last_baseline_end_message_id
+            FROM session_meta
               WHERE session_id = ?`,
-        )
-        .get(sessionId) as CachedM0M1Row | null;
+                )
+                .get(sessionId) as CachedM0M1Row | null;
+            return row
+                ? {
+                      ...row,
+                      memory_block_ids: readSessionMetaCollection(
+                          db,
+                          sessionId,
+                          "memory_block_ids",
+                      ) as string | null,
+                  }
+                : null;
+        })
+        .deferred();
 }
 
 function markersFromCachedRow(row: CachedM0M1Row): M0SnapshotMarkers | null {
@@ -3845,6 +3929,7 @@ function softRefreshCachedM1(options: M0M1RenderOptions): RenderM1Result {
             readAppliedProjection(options.db, options.sessionId, options.projectPath, m0Text) ??
                 legacyProjection(options.db, options.sessionId, options.projectPath, row),
             m0Text,
+            renderedM0Ids,
         );
         const rendered = soft.result;
         // Ids shown in full: the served manifest, plus agent fragments shown in full.
@@ -3863,23 +3948,30 @@ function softRefreshCachedM1(options: M0M1RenderOptions): RenderM1Result {
         steps.mark("m1Render");
 
         options.db
-            .prepare(
-                `UPDATE session_meta
-                    SET cached_m1_bytes = ?,
-                        cached_m0_last_baseline_end_message_id = ?,
-                        memory_block_count = ?,
-                        memory_block_ids = ?,
-                        cached_m0_upgrade_state = ?
+            .transaction(() => {
+                writeSessionRenderCache(options.db, options.sessionId, "cached_m1_bytes", m1Bytes);
+                writeSessionMetaCollection(
+                    options.db,
+                    options.sessionId,
+                    "memory_block_ids",
+                    visibleIdsJson,
+                );
+                writeSessionRenderCache(
+                    options.db,
+                    options.sessionId,
+                    "cached_m0_upgrade_state",
+                    withCachedM0MemoryIds(row.cached_m0_upgrade_state, renderedM0Ids),
+                );
+                options.db
+                    .prepare(
+                        `UPDATE session_meta
+                    SET cached_m0_last_baseline_end_message_id = ?,
+                        memory_block_count = ?
                   WHERE session_id = ?`,
-            )
-            .run(
-                m1Bytes,
-                baselineEndMessageId,
-                visibleMemoryIds.length,
-                visibleIdsJson,
-                withCachedM0MemoryIds(row.cached_m0_upgrade_state, renderedM0Ids),
-                options.sessionId,
-            );
+                    )
+                    .run(baselineEndMessageId, visibleMemoryIds.length, options.sessionId);
+            })
+            .immediate();
         writeSoftProjection(options.db, {
             sessionId: options.sessionId,
             projectPath: options.projectPath,
@@ -3887,6 +3979,11 @@ function softRefreshCachedM1(options: M0M1RenderOptions): RenderM1Result {
             projection: soft.projection,
         });
         steps.mark("sessionMeta");
+        if (
+            !bufferEqualsNullable(row.cached_m1_bytes, m1Bytes) ||
+            row.cached_m0_last_baseline_end_message_id !== baselineEndMessageId
+        )
+            options.onM1Commit?.();
         options.db.exec("COMMIT");
         steps.mark("commit");
         logSlowWriteTransaction(
@@ -4368,8 +4465,8 @@ export function capturePrefixTrimSourceOrder(
     for (const [index, message] of messages.entries()) {
         const id = message.info.id;
         // OpenCode 2 renders instruction-update rows as id-less system messages
-        // anywhere in history. They carry no row identity to order, and the trim
-        // places them by their persisted neighbours.
+        // anywhere in history. They carry no row identity to order, so both
+        // visible-boundary and persisted-order trimming preserve them.
         if (isHostRenderedSystemMessage(message)) continue;
         if (typeof id !== "string" || id.length === 0) {
             if (!sawPersistedRow && isSyntheticPrefixHead(message)) {
@@ -4393,6 +4490,46 @@ export function capturePrefixTrimSourceOrder(
         syntheticHeadCount,
         invalidReason,
     });
+}
+
+/**
+ * Use persisted order to place a missing boundary in the captured host ID list.
+ * This is evidence only: no missing message body is restored. A missing lookup,
+ * duplicate or reordered window cannot prove a cut and keeps the refusal path.
+ * On a cache-preserving pass, this removes the same identified covered rows as
+ * visible-boundary trimming and keeps every ID-less system row. Hiding only a
+ * fully covered boundary leaves request bytes unchanged, even on the first replay.
+ * No new cache-bust permission or change to the prepared prefix is needed.
+ */
+function reanchorStoredBoundary(
+    options: M0M1RenderOptions,
+    boundary: string,
+): PrefixTrimSourceOrder | undefined {
+    if (!options.messages) return undefined;
+    const source = options.prefixTrimSourceOrder ?? capturePrefixTrimSourceOrder(options.messages);
+    if (source.invalidReason) return undefined;
+    try {
+        if (compareRawSessionMessageOrder(options.sessionId, boundary, boundary) !== 0)
+            return undefined;
+        const messageIds = [...source.messageIds];
+        let previous: string | undefined;
+        let insertion = messageIds.length;
+        for (const [index, id] of messageIds.entries()) {
+            if (previous) {
+                const increasing = compareRawSessionMessageOrder(options.sessionId, previous, id);
+                if (increasing === null || !Number.isFinite(increasing) || increasing >= 0)
+                    return undefined;
+            }
+            const order = compareRawSessionMessageOrder(options.sessionId, boundary, id);
+            if (order === null || !Number.isFinite(order) || order === 0) return undefined;
+            if (order < 0 && insertion === messageIds.length) insertion = index;
+            previous = id;
+        }
+        messageIds.splice(insertion, 0, boundary);
+        return { ...source, messageIds };
+    } catch {
+        return undefined;
+    }
 }
 
 function trimToPreparedPrefix(
@@ -4444,7 +4581,13 @@ function trimToPreparedPrefix(
                     sourcePosition.get(boundary) ??
                     sourcePosition.get(resolveHostServedBoundaryId(options.sessionId, boundary));
                 if (boundaryPosition === undefined) {
-                    status = refuse("boundary absent from immutable source order");
+                    const reanchored = reanchorStoredBoundary(options, boundary);
+                    status = reanchored
+                        ? trimToPreparedPrefix(
+                              { ...options, prefixTrimSourceOrder: reanchored },
+                              prepared,
+                          )
+                        : refuse("boundary absent from immutable source order");
                 } else {
                     let lastSourcePosition = -1;
                     let sawPersistedRow = false;
@@ -4455,10 +4598,16 @@ function trimToPreparedPrefix(
                     for (const [index, message] of options.messages.entries()) {
                         const id = message.info.id;
                         if (isHostRenderedSystemMessage(message)) {
-                            // Belongs to the rows around its persisted neighbours:
-                            // kept exactly when the row before it is kept or is the
-                            // boundary, the same cut the id-lookup trim makes.
-                            if (lastSourcePosition >= boundaryPosition) retained.push(message);
+                            // Unplaced means a host system/instruction row without
+                            // its own stable ID, not the injected synthetic user head. A
+                            // neighbour cannot prove its coverage; even a covered
+                            // instruction need not survive in a compartment summary.
+                            // Retain it whether the boundary is visible or missing,
+                            // so hiding the boundary on a cache-preserving pass
+                            // cannot change the already-served request bytes.
+                            // An identified location notice uses its own persisted
+                            // order (OpenCode 2 seq), even with no raw-message ordinal.
+                            retained.push(message);
                             continue;
                         }
                         if (typeof id !== "string" || id.length === 0) {
@@ -4520,11 +4669,15 @@ function trimToPreparedPrefix(
         } else {
             const index = findBoundaryIndex(options.sessionId, options.messages, boundary);
             if (index >= 0) {
-                const removed = options.messages.splice(
-                    0,
+                const cut =
                     index +
-                        (isPartialCompartmentEnd(options.db, options.sessionId, boundary) ? 0 : 1),
-                );
+                    (isPartialCompartmentEnd(options.db, options.sessionId, boundary) ? 0 : 1);
+                // Match source-order trimming: a summary is not proof that an
+                // ID-less host instruction is dispensable. Retaining it here too
+                // keeps request bytes unchanged if the host later hides only the
+                // boundary on a cache-preserving pass.
+                const unplaced = options.messages.slice(0, cut).filter(isHostRenderedSystemMessage);
+                const removed = options.messages.splice(0, cut, ...unplaced);
                 retireDecisions(
                     removed
                         .map((message) => message.info.id)
@@ -4533,7 +4686,15 @@ function trimToPreparedPrefix(
                 resetPrefixTrimFallbackState(options.sessionId);
                 status = "applied";
             } else {
-                status = classifyAbsentBoundary(options, options.messages, boundary);
+                const reanchored = reanchorStoredBoundary(options, boundary);
+                if (reanchored && reanchored.messageIds[0] !== boundary) {
+                    status = trimToPreparedPrefix(
+                        { ...options, prefixTrimSourceOrder: reanchored },
+                        prepared,
+                    );
+                } else {
+                    status = classifyAbsentBoundary(options, options.messages, boundary);
+                }
             }
         }
     }
@@ -4578,7 +4739,7 @@ export function prepareCachedM0M1Replay(
 export function hasCompleteCachedM0M1(db: Database, sessionId: string): boolean {
     const row = db
         .prepare(
-            "SELECT length(cached_m0_bytes) > 0 AND length(cached_m1_bytes) > 0 AS complete FROM session_meta WHERE session_id = ?",
+            `SELECT length(${sessionRenderCacheValueSql("cached_m0_bytes")}) > 0 AND length(${sessionRenderCacheValueSql("cached_m1_bytes")}) > 0 AS complete FROM session_meta WHERE session_id = ?`,
         )
         .get(sessionId) as { complete: number | null } | null;
     return row?.complete === 1;
@@ -4586,6 +4747,23 @@ export function hasCompleteCachedM0M1(db: Database, sessionId: string): boolean 
 
 export function injectM0M1(options: M0M1RenderOptions): InjectM0M1Result {
     const prepared = options.preparedPrefix;
+    if (prepared?.servedPrefixRecord && options.messages) {
+        const record = prepared.servedPrefixRecord;
+        const problem = replayServedPrefix({
+            messages: options.messages,
+            record,
+            stableId: (message) => message.info.id,
+            isHead: isSyntheticPrefixHead,
+            isSummary: (message) => message.info.summary === true,
+            keepIdless: isHostRenderedSystemMessage,
+        });
+        if (problem) refuseServedPrefix(problem, options.sessionId);
+        return {
+            ...prepared,
+            prependedMessageCount: record.head.length,
+            prefixTrimStatus: "applied",
+        };
+    }
     if (prepared?.preparedMessages) {
         const head = prepared.preparedMessages;
         let prefixTrimStatus: PrefixTrimStatus = "not-attempted";

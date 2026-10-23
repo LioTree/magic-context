@@ -39,7 +39,7 @@
  * `run()` → {changes,lastInsertRowid}) is identical and was verified directly.
  */
 
-import { AsyncLocalStorage } from "node:async_hooks";
+import { AsyncLocalStorage, AsyncResource } from "node:async_hooks";
 import { statSync } from "node:fs";
 
 // Type import only — runtime is loaded dynamically below. @types/better-sqlite3
@@ -47,6 +47,16 @@ import { statSync } from "node:fs";
 // we use, so calls typed against BetterSqlite3 work under bun:sqlite and
 // node:sqlite at runtime (both expose prepare/run/get/all/exec/close).
 import type BetterSqlite3 from "better-sqlite3";
+
+// Capture the root before creating request-local AsyncLocalStorage scopes.
+// Shared workers and timers must not inherit callbacks that reject stale
+// database writes: those callbacks can retain an obsolete request's inputs.
+const resourceRoot = new AsyncResource("magic-context:root");
+
+/** Create host-owned resources without inheriting request-local state. */
+export function inRootAsyncContext<T>(operation: () => T): T {
+    return resourceRoot.runInAsyncScope(operation);
+}
 
 /**
  * Slow-write reporting is injected rather than imported: this module is also
@@ -299,6 +309,81 @@ const TAG_COLUMNS_OUTSIDE_IDENTITY = new Set([
 ]);
 
 let tagIdentityWriteGeneration = 0;
+const rollbackStateKey = Symbol.for("magic-context.sqlite.rollback-generation.v1");
+type RollbackState = { generation: number; transactionOpen: () => boolean };
+
+/** Invalidate observations of uncommitted values when a transaction or savepoint rolls back. */
+export function getSqliteRollbackGeneration(db: BetterSqlite3.Database): number | undefined {
+    return (db as unknown as Record<symbol, RollbackState>)[rollbackStateKey]?.generation;
+}
+
+export function isSqliteTransactionOpen(db: BetterSqlite3.Database): boolean {
+    const state = (db as unknown as Record<symbol, RollbackState>)[rollbackStateKey];
+    return state ? state.transactionOpen() : isInTransaction(db);
+}
+
+function noteSqliteRollback(db: BetterSqlite3.Database): void {
+    const state = (db as unknown as Record<symbol, RollbackState>)[rollbackStateKey];
+    if (state) state.generation++;
+}
+
+const observedRollbackForms = new WeakMap<object, Set<PropertyKey>>();
+// Raw prepared/query commands and lazy iterators can roll back without passing through db.exec.
+function observeRollbackForms(
+    db: BetterSqlite3.Database,
+    statement: any,
+    sql: string,
+    observeErrors = false,
+    remainingPreparedMethods = false,
+): void {
+    const mayRollback = /\bROLLBACK\b/i.test(sql);
+    if (!mayRollback && !observeErrors) return;
+    let observed = observedRollbackForms.get(statement);
+    if (!observed) {
+        observed = new Set();
+        observedRollbackForms.set(statement, observed);
+    }
+    const executeObserved = <T>(operation: () => T): T => {
+        const wasInTransaction = isInTransaction(db);
+        try {
+            return operation();
+        } catch (error) {
+            if (wasInTransaction && !isInTransaction(db)) noteSqliteRollback(db);
+            throw error;
+        } finally {
+            if (mayRollback) noteSqliteRollback(db);
+        }
+    };
+    for (const key of ["run", "get", "all", "values", "iterate", Symbol.iterator]) {
+        // The db.prepare wrapper below already checks run/get/all for automatic rollback.
+        if (remainingPreparedMethods && !mayRollback && ["run", "get", "all"].includes(String(key)))
+            continue;
+        if (observed.has(key) || typeof statement[key] !== "function") continue;
+        observed.add(key);
+        const execute = statement[key].bind(statement);
+        Object.defineProperty(statement, key, {
+            configurable: true,
+            value: (...args: unknown[]) => {
+                const result = executeObserved(() => execute(...args));
+                if (key !== "iterate" && key !== Symbol.iterator) return result;
+                if (result === null || (typeof result !== "object" && typeof result !== "function"))
+                    return result;
+                const proxy: object = new Proxy(result, {
+                    get(target, property) {
+                        if (property === Symbol.iterator) return () => proxy;
+                        const method = Reflect.get(target, property, target);
+                        if (typeof method !== "function") return method;
+                        if (["next", "return", "throw"].includes(String(property)))
+                            return (...values: unknown[]) =>
+                                executeObserved(() => method.apply(target, values));
+                        return method.bind(target);
+                    },
+                });
+                return proxy;
+            },
+        });
+    }
+}
 
 /**
  * Whether a write statement may change an existing `tags` row's identity
@@ -390,7 +475,22 @@ export function getTagIdentityWriteGeneration(): number {
  * default to IMMEDIATE; explicit deferred calls and readonly handles keep read
  * snapshots without acquiring the writer lock. */
 function installTransactionRouting(db: BetterSqlite3.Database, readonly: boolean): void {
-    const nativeExec = db.exec.bind(db);
+    // Transparent connection proxies must observe the same rollback lifetime as the underlying handle.
+    Object.defineProperty(db, rollbackStateKey, {
+        value: { generation: 0, transactionOpen: () => isInTransaction(db) },
+    });
+    const executeNative = db.exec.bind(db);
+    const nativeExec = (sql: string) => {
+        const wasInTransaction = isInTransaction(db);
+        try {
+            return executeNative(sql);
+        } catch (error) {
+            if (wasInTransaction && !isInTransaction(db)) noteSqliteRollback(db);
+            throw error;
+        } finally {
+            if (/\bROLLBACK\b/i.test(sql)) noteSqliteRollback(db);
+        }
+    };
     Object.defineProperty(db, "exec", {
         configurable: true,
         writable: true,
@@ -424,7 +524,9 @@ function installTransactionRouting(db: BetterSqlite3.Database, readonly: boolean
                 !/^\s*(?:SELECT|EXPLAIN|PRAGMA|COMMIT|END|ROLLBACK|SAVEPOINT|RELEASE)\b/i.test(sql)
             ) {
                 try {
-                    return withAutocommitTimeout(db, () => nativeExec(sql));
+                    // exec can commit a script prefix before BUSY. Run it once;
+                    // only prepared statements are safe to probe and retry.
+                    return withAutocommitTimeout(db, () => nativeExec(sql), false);
                 } finally {
                     if (mayChangeTagIdentity(sql)) tagIdentityWriteGeneration += 1;
                 }
@@ -438,18 +540,28 @@ function installTransactionRouting(db: BetterSqlite3.Database, readonly: boolean
         writable: true,
         value: (sql: string) => {
             const statement = nativePrepare(sql);
+            observeRollbackForms(db, statement, sql, true, true);
             // SELECT/EXPLAIN cannot acquire a writer. Treat CTEs conservatively:
             // WITH can introduce INSERT/UPDATE/DELETE as well as a read query.
-            if (!readonly && !/^\s*(?:SELECT|EXPLAIN|PRAGMA)\b/i.test(sql)) {
-                const changesTagIdentity = mayChangeTagIdentity(sql);
+            {
+                const writes = !readonly && !/^\s*(?:SELECT|EXPLAIN|PRAGMA)\b/i.test(sql);
+                const changesTagIdentity = writes && mayChangeTagIdentity(sql);
                 for (const method of ["run", "get", "all"] as const) {
                     const execute = statement[method].bind(statement);
                     Object.defineProperty(statement, method, {
                         configurable: true,
                         // biome-ignore lint/suspicious/noExplicitAny: retain SQLite's native binding overloads.
                         value: (...args: any[]) => {
+                            const wasInTransaction = isInTransaction(db);
                             try {
-                                return withAutocommitTimeout(db, () => execute(...args));
+                                return writes
+                                    ? withAutocommitTimeout(db, () => execute(...args))
+                                    : execute(...args);
+                            } catch (error) {
+                                // SQLite can roll back a transaction automatically, without an explicit ROLLBACK.
+                                if (wasInTransaction && !isInTransaction(db))
+                                    noteSqliteRollback(db);
+                                throw error;
                             } finally {
                                 if (changesTagIdentity) tagIdentityWriteGeneration += 1;
                             }
@@ -461,6 +573,19 @@ function installTransactionRouting(db: BetterSqlite3.Database, readonly: boolean
             return statement;
         },
     });
+    const nativeQuery = (
+        db as unknown as { query?: (sql: string, ...args: unknown[]) => any }
+    ).query?.bind(db);
+    if (nativeQuery)
+        Object.defineProperty(db, "query", {
+            configurable: true,
+            writable: true,
+            value: (sql: string, ...args: unknown[]) => {
+                const statement = nativeQuery(sql, ...args);
+                observeRollbackForms(db, statement, sql, true);
+                return statement;
+            },
+        });
     Object.defineProperty(db, "transaction", {
         configurable: true,
         writable: true,
@@ -591,7 +716,9 @@ function trackSqliteConnection(
 
 const TrackedDatabase = new Proxy(DatabaseImpl, {
     construct(target, args) {
-        const db = Reflect.construct(target, args, target) as BetterSqlite3.Database;
+        const db = inRootAsyncContext(
+            () => Reflect.construct(target, args, target) as BetterSqlite3.Database,
+        );
         return trackSqliteConnection(db, args[0], args[1]);
     },
 }) as typeof BetterSqlite3;
@@ -1004,33 +1131,60 @@ function foregroundWaitLease() {
         : undefined;
 }
 
-/** Bound implicit writer admission too, including prepared INSERT OR IGNORE and
- * writes with RETURNING. Charge successful execution time conservatively: the
- * native API cannot separate lock waiting from statement execution. Exhaustion
- * switches to zero-wait acquisition, not a refusal when the writer is free. */
-function withAutocommitTimeout<T>(db: Database, operation: () => T): T {
+/** Probe a prepared statement's writer lock without charging uncontended work
+ * against the foreground lock-wait budget. An exec script may commit some of
+ * its statements before failing, so it cannot be retried without duplicating
+ * writes; conservatively charge its single attempt's full execution time. */
+function withAutocommitTimeout<T>(db: Database, operation: () => T, singleStatement = true): T {
     assertTransformWrite();
     const lease = foregroundWaitLease();
     if (isInTransaction(db)) return operation();
     const scoped = lease || backgroundWriterScope.getStore();
     const previous = scoped ? pragmaNumber(db, "busy_timeout") : null;
-    if (scoped)
-        db.exec(
-            `PRAGMA busy_timeout=${lease ? Math.floor(Math.min(lease.remainingWaitMs, lease.guard?.remainingMs() ?? Infinity)) : SHORT_BUSY_TIMEOUT_MS}`,
-        );
     const started = performance.now();
     let completed = false;
-    try {
+    const execute = () => {
         const result = operation();
         completed = true;
         return result;
+    };
+    try {
+        if (!scoped) return execute();
+        if (singleStatement) {
+            db.exec("PRAGMA busy_timeout=0");
+            try {
+                return execute();
+            } catch (error) {
+                if (!isTransientSqliteError(error) || isInTransaction(db)) throw error;
+            }
+            assertTransformWrite();
+        }
+        const timeout = Math.floor(
+            Math.min(
+                lease?.remainingWaitMs ?? SHORT_BUSY_TIMEOUT_MS,
+                lease?.guard?.remainingMs() ?? Infinity,
+            ),
+        );
+        db.exec(`PRAGMA busy_timeout=${timeout}`);
+        const waitStarted = performance.now();
+        try {
+            return execute();
+        } finally {
+            // Deduct the prepared statement's contended retry or the exec
+            // script's execution from the remaining foreground wait budget;
+            // the native API cannot separate lock waiting from execution.
+            if (lease)
+                lease.remainingWaitMs = Math.max(
+                    0,
+                    lease.remainingWaitMs - (performance.now() - waitStarted),
+                );
+        }
     } catch (error) {
         if (lease && isTransientSqliteError(error))
             throw new SqliteAcquisitionBusyError(error, "autocommit");
         throw error;
     } finally {
         const elapsed = performance.now() - started;
-        if (lease) lease.remainingWaitMs = Math.max(0, lease.remainingWaitMs - elapsed);
         if (previous !== null) db.exec(`PRAGMA busy_timeout=${previous}`);
         // Native autocommit does not expose the instant its lock was acquired.
         // Label the upper bound so a waiting statement is not blamed as a holder.

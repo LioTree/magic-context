@@ -20,6 +20,7 @@ import {
 /** Hidden agents that run with elevated/autonomous capability. */
 const HIDDEN_AGENT_KEYS = ["historian", "dreamer"] as const;
 const HARNESS_KEYS = PER_HARNESS_MODEL_KEYS;
+const HISTORIAN_MODEL_HARNESS_KEYS = [...PER_HARNESS_MODEL_KEYS, "broca"] as const;
 /** Every historian model-resolution field, including per-harness qualifiers.
  *  Variant and thinking_level merge onto the user's historian model at resolve
  *  time, so leaving them would let a cloned repo force extra spend. */
@@ -343,12 +344,12 @@ function makeProjectThresholdWarning(field: string, reason: string): string {
  *    where private memory/search/commit text is embedded. Query/document prefix
  *    overrides also remain user-owned so a repository cannot alter the text sent
  *    to that destination or silently force a corpus re-embed.
- *  - `transform_mode` is intentionally allowed at project tier so a repository
- *    can opt its own runtime into the experimental Rust pipeline. The resolver
- *    requires trusted user-level `subc` configuration before Rust can activate.
- *  - historian model-resolution fields (model, fallback_models, variant,
- *    thinking_level) and `runner`, including both per-harness blocks — historian
- *    model spend is user-level only. Qualifiers merge onto the user's historian
+ *  - `transform_mode` is accepted at project tier but ignored, like every other
+ *    tier: every host runs the TypeScript transform. `rust_pipeline` is still
+ *    stripped from project config below, although it no longer selects anything.
+ *  - historian model-resolution fields (`model`, `fallback_models`, `variant`,
+ *    `thinking_level`) and `runner` are stripped from every per-harness block.
+ *    Historian model spend is user-level only. Qualifiers merge onto the user's historian
  *    model at resolve time, so a cloned repo cannot force extra thinking or
  *    variant cost, and cannot move the completion to a different process or
  *    provider account. `host_runner` is stripped for the same reason in the other
@@ -375,6 +376,12 @@ export function stripUnsafeProjectConfigFields(projectRaw: Record<string, unknow
         delete projectRaw.rust_pipeline;
         warnings.push(
             "Ignoring rust_pipeline from project config (security: only user-level config may select the Rust provider pipeline).",
+        );
+    }
+    if ("rust_background_enabled" in projectRaw) {
+        delete projectRaw.rust_background_enabled;
+        warnings.push(
+            "Ignoring rust_background_enabled from project config (security: only user-level config may hand dream tasks to the Rust module).",
         );
     }
     if ("rust_provider_preparation" in projectRaw) {
@@ -586,7 +593,7 @@ export function stripUnsafeProjectConfigFields(projectRaw: Record<string, unknow
                 removed.push(field);
             }
         }
-        for (const harness of HARNESS_KEYS) {
+        for (const harness of HISTORIAN_MODEL_HARNESS_KEYS) {
             const harnessBlock = historian[harness];
             if (!isPlainObject(harnessBlock)) continue;
             for (const field of HISTORIAN_USER_ONLY_FIELDS) {

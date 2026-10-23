@@ -26,7 +26,7 @@ function fixture(mode: "WAL" | "DELETE") {
     db.exec(`UPDATE memories SET importance=40,classified_at=7;
         UPDATE memories SET status='archived' WHERE id%7=0;
         ALTER TABLE memories DROP COLUMN safety_critical;
-        DELETE FROM schema_migrations WHERE version=102;`);
+        DELETE FROM schema_migrations WHERE version=104;`);
     db.exec(`PRAGMA journal_mode=${mode}`);
     const rows = db.prepare("SELECT * FROM memories ORDER BY id").all();
     db.close();
@@ -34,7 +34,7 @@ function fixture(mode: "WAL" | "DELETE") {
 }
 
 for (const mode of ["WAL", "DELETE"] as const) {
-    test(`s02 review: populated 101 survives SIGKILL after migration 102 DDL (${mode})`, async () => {
+    test(`s02 review: populated 103 survives SIGKILL after migration 104 DDL (${mode})`, async () => {
         const f = fixture(mode);
         try {
             const child = Bun.spawn(
@@ -45,13 +45,13 @@ for (const mode of ["WAL", "DELETE"] as const) {
                 import { MIGRATIONS, runMigrations } from ${JSON.stringify(new URL("./migrations.ts", import.meta.url).href)};
                 import { writeSync } from 'node:fs';
                 const db = new Database(${JSON.stringify(f.path)});
-                const step = MIGRATIONS.find(m => m.version === 102);
+                const step = MIGRATIONS.find(m => m.version === 104);
                 const original = step.up;
                 step.up = db => {
                     original(db);
                     const col = db.prepare('PRAGMA table_info(memories)').all().find(c => c.name === 'safety_critical');
                     if (!col) throw new Error('DDL was not reached');
-                    writeSync(1, 'migration 102 DDL reached before version insert/COMMIT\\n');
+                    writeSync(1, 'migration 104 DDL reached before version insert/COMMIT\\n');
                     process.kill(process.pid, 'SIGKILL');
                 };
                 runMigrations(db);`,
@@ -61,11 +61,11 @@ for (const mode of ["WAL", "DELETE"] as const) {
             const exit = await child.exited;
             const output = await new Response(child.stdout).text();
             expect(exit).not.toBe(0);
-            expect(output).toContain("migration 102 DDL reached before version insert/COMMIT");
+            expect(output).toContain("migration 104 DDL reached before version insert/COMMIT");
             const db = new Database(f.path);
             try {
                 expect(db.prepare("SELECT MAX(version) v FROM schema_migrations").get()).toEqual({
-                    v: 101,
+                    v: 103,
                 });
                 expect(
                     db
@@ -76,7 +76,7 @@ for (const mode of ["WAL", "DELETE"] as const) {
                 expect(db.prepare("SELECT * FROM memories ORDER BY id").all()).toEqual(f.rows);
                 runMigrations(db);
                 expect(db.prepare("SELECT MAX(version) v FROM schema_migrations").get()).toEqual({
-                    v: 102,
+                    v: 104,
                 });
                 expect(db.prepare("SELECT * FROM memories ORDER BY id").all()).toEqual(
                     f.rows.map((row) => ({ ...row, safety_critical: null })),
@@ -85,7 +85,7 @@ for (const mode of ["WAL", "DELETE"] as const) {
                     integrity_check: "ok",
                 });
                 console.log(
-                    `s02 migration ${mode}: 256 rows preserved, killed inside real migration transaction, replay committed v102`,
+                    `s02 migration ${mode}: 256 rows preserved, killed inside real migration transaction, replay committed v104`,
                 );
             } finally {
                 db.close();

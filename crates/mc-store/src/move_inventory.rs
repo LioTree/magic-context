@@ -7,9 +7,9 @@ use rusqlite::Connection;
 use serde::{Deserialize, Serialize};
 
 /// Section-inventory protocol version serialized in move manifests.
-pub const INVENTORY_VERSION: u32 = 7;
-pub const CONTEXT_SCHEMA_VERSION: u32 = 102;
-pub const STORE_SCHEMA_VERSION: u32 = 72;
+pub const INVENTORY_VERSION: u32 = 10;
+pub const CONTEXT_SCHEMA_VERSION: u32 = 104;
+pub const STORE_SCHEMA_VERSION: u32 = 74;
 pub const GLOBAL_USER_PROFILE_PROJECT_PATH: &str = "__global__";
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -118,6 +118,62 @@ macro_rules! table {
     };
 }
 
+// Lazy UI tables are not migration prerequisites or export sections. Validate
+// their exact schema when present without requiring them in a clean store.
+const LAZY_MODULE_TABLES: &[TableInventory] = &[
+    // Transferring a session to another process establishes a new UI connection;
+    // do not export command outcomes or event acknowledgements from the old
+    // project/session connection. mc_ops_retire deletes those records when its
+    // mc_cache_state session row is removed during discard. Keep the requested
+    // refresh flag in exported metadata so the next transform still refreshes.
+    table!(
+        Module,
+        "mc_ops_commands",
+        LocalReset,
+        RowSelector::None,
+        &["project_identity", "session_id", "command_id"],
+        &[
+            "session_id",
+            "command_id",
+            "job_id",
+            "parameters",
+            "job",
+            "project_identity"
+        ],
+        &[],
+        None,
+        None
+    ),
+    table!(
+        Module,
+        "mc_ops_stream",
+        LocalReset,
+        RowSelector::None,
+        &["project_identity", "session_id"],
+        &[
+            "session_id",
+            "sequence",
+            "acked",
+            "active_command",
+            "project_identity"
+        ],
+        &[],
+        None,
+        None
+    ),
+    table!(
+        Module,
+        "mc_ops_events",
+        LocalReset,
+        RowSelector::None,
+        &["project_identity", "session_id", "sequence"],
+        &["session_id", "sequence", "event", "project_identity"],
+        &[],
+        None,
+        None
+    ),
+];
+
 /// Stable table order for the v1 stream; each store half is filtered from this
 /// explicit list. Schema discovery is validation only and never grants shipping.
 pub const TABLES: &[TableInventory] = &[
@@ -224,7 +280,7 @@ pub const TABLES: &[TableInventory] = &[
         None
     ),
     // BEGIN FRESH-MIGRATION CENSUS
-    // context.db: 111 tables observed after fresh migration.
+    // context.db: 113 tables observed after fresh migration.
     table!(
         Context,
         "authority_capture_bounds",
@@ -842,7 +898,8 @@ pub const TABLES: &[TableInventory] = &[
             "session_id",
             "served_capture_id",
             "full_coverage",
-            "slot_state"
+            "slot_state",
+            "served_digest"
         ],
         &[],
         Some(KeyPolicy::Preserve),
@@ -932,7 +989,6 @@ pub const TABLES: &[TableInventory] = &[
             "verification_status",
             "verified_at",
             "classified_at",
-            "safety_critical",
             "superseded_by_memory_id",
             "merged_from",
             "metadata_json",
@@ -940,6 +996,7 @@ pub const TABLES: &[TableInventory] = &[
             "mural_cue_hash",
             "mural_cue_at",
             "mural_cue_rejection_count",
+            "safety_critical",
             "revision",
             "verify_result",
             "verify_files_json",
@@ -1763,8 +1820,6 @@ pub const TABLES: &[TableInventory] = &[
             "note_nudge_trigger_message_id",
             "note_nudge_sticky_text",
             "note_nudge_sticky_message_id",
-            "note_nudge_anchors",
-            "auto_search_hint_decisions",
             "last_todo_state",
             "todo_permission_denied",
             "todo_synthetic_call_id",
@@ -1782,16 +1837,13 @@ pub const TABLES: &[TableInventory] = &[
             "historian_last_error",
             "historian_last_failure_at",
             "system_prompt_hash",
-            "memory_block_cache",
             "memory_block_count",
-            "memory_block_ids",
             "pending_compaction_marker_state",
             "compaction_marker_target_end_message_id",
             "pending_pi_compaction_marker_state",
             "new_work_tokens",
             "total_input_tokens",
             "deferred_execute_state",
-            "cached_m0_bytes",
             "served_prefix",
             "held_release",
             "cached_m0_score_selection_watermark",
@@ -1803,7 +1855,6 @@ pub const TABLES: &[TableInventory] = &[
             "cached_m0_max_mutation_id",
             "cached_m0_max_memory_mutation_id",
             "cached_m0_project_docs_hash",
-            "cached_m1_bytes",
             "last_observed_model_key",
             "last_usage_context_limit",
             "prior_boundary_ordinal",
@@ -1821,7 +1872,6 @@ pub const TABLES: &[TableInventory] = &[
             "compaction_mode_record",
             "cached_m0_materialized_at",
             "cached_m0_session_facts_version",
-            "cached_m0_upgrade_state",
             "cached_m0_system_hash",
             "cached_m0_tool_set_hash",
             "cached_m0_model_key",
@@ -1833,11 +1883,6 @@ pub const TABLES: &[TableInventory] = &[
             "note_last_read_at",
             "cleared_reasoning_through_tag",
             "tool_reclaim_watermark",
-            "stripped_placeholder_ids",
-            "stale_reduce_stripped_ids",
-            "processed_image_stripped_ids",
-            "merged_reasoning_stripped_ids",
-            "trailing_blank_decisions",
             "system_prompt_tokens",
             "compaction_marker_state",
             "key_files",
@@ -1851,7 +1896,6 @@ pub const TABLES: &[TableInventory] = &[
             "emergency_recovery_origin",
             "upgrade_reminder_last_sent_at",
             "upgrade_reminder_count",
-            "cached_m0_mural_data_url",
             "cached_m0_mural_hash",
             "coordinate_generation",
             "coordinate_rebase_notice"
@@ -1862,11 +1906,45 @@ pub const TABLES: &[TableInventory] = &[
     ),
     table!(
         Context,
+        "session_meta_chunks",
+        Ship,
+        RowSelector::Predicate("session_id = ?1"),
+        &["session_id", "column_name", "chunk"],
+        &["session_id", "column_name", "chunk", "body"],
+        &[],
+        Some(KeyPolicy::Preserve),
+        None
+    ),
+    // Chunk imports rebuild local revision identities through SQLite triggers.
+    table!(
+        Context,
+        "session_meta_collection_revisions",
+        LocalReset,
+        RowSelector::Predicate("session_id = ?1"),
+        &["id"],
+        &["id", "session_id", "column_name", "revision"],
+        &[],
+        None,
+        None
+    ),
+    table!(
+        Context,
         "session_projects",
         Ship,
         RowSelector::Predicate("session_id = ?1"),
         &["session_id", "harness"],
         &["session_id", "harness", "project_path", "updated_at"],
+        &[],
+        Some(KeyPolicy::Preserve),
+        None
+    ),
+    table!(
+        Context,
+        "session_render_cache",
+        Ship,
+        RowSelector::Predicate("session_id = ?1"),
+        &["session_id", "cache_key"],
+        &["session_id", "cache_key", "value"],
         &[],
         Some(KeyPolicy::Preserve),
         None
@@ -2778,7 +2856,26 @@ pub const TABLES: &[TableInventory] = &[
         Some(KeyPolicy::Preserve),
         None
     ),
-    // store.db: 39 tables observed after fresh migration.
+// store.db: 43 tables observed after fresh migration.
+    table!(Module, "mc_async_compaction", Ship,
+        RowSelector::Predicate("session = ?1"), &["session_ref"],
+        &["session_ref", "conversation_key", "session", "state_json", "version_high_water"],
+        &[], Some(KeyPolicy::PreserveOrRefuseCollision), None),
+    // The held transcript and engine baselines are part of the same async
+    // conversation record: without them the small record names a cursor and
+    // baselines that no longer exist, so they ship with it.
+    table!(Module, "mc_async_compaction_entries", Ship,
+        RowSelector::Predicate("session = ?1"),
+        &["session_ref", "ordinal"], &["session_ref", "session", "ordinal", "entry_json", "index_json"],
+        &[], Some(KeyPolicy::PreserveOrRefuseCollision), None),
+    table!(Module, "mc_async_compaction_views", Ship,
+        RowSelector::Predicate("session = ?1"),
+        &["session_ref", "version"], &["session_ref", "session", "version", "view_json", "engine_json", "announced"],
+        &[], Some(KeyPolicy::PreserveOrRefuseCollision), None),
+    table!(Module, "mc_async_compaction_baselines", Ship,
+        RowSelector::Predicate("session = ?1"),
+        &["session_ref", "slot"], &["session_ref", "session", "slot", "view_json"],
+        &[], Some(KeyPolicy::PreserveOrRefuseCollision), None),
     // Provider state cannot be rebuilt: it includes allocated versions and tags,
     // frozen catalog admission, and answers that the runner may not have applied.
     // Select every project/harness coordinate of this opaque host session. Both
@@ -3017,29 +3114,6 @@ pub const TABLES: &[TableInventory] = &[
         RowSelector::Predicate("engine_namespace IN (SELECT engine_namespace FROM mc_provider_conversations_v2 WHERE session = ?1)"),
         &["engine_namespace", "tag_number"],
         &["engine_namespace", "tag_number", "session"],
-        &[],
-        Some(KeyPolicy::PreserveOrRefuseCollision),
-        None
-    ),
-    table!(
-        Module,
-        "mc_provider_views_v1",
-        Ship,
-        RowSelector::Predicate(
-            "conv_key IN (SELECT conv_key FROM mc_provider_conversations_v2 WHERE session = ?1)"
-        ),
-        &["conv_key", "version"],
-        &[
-            "conv_key",
-            "version",
-            "lineage_id",
-            "range_from",
-            "range_to",
-            "replacement_json",
-            "state",
-            "view_json",
-            "session"
-        ],
         &[],
         Some(KeyPolicy::PreserveOrRefuseCollision),
         None
@@ -3580,7 +3654,13 @@ pub fn tables(store: Store) -> impl Iterator<Item = &'static TableInventory> {
 }
 
 pub fn entry(store: Store, table: &str) -> Option<&'static TableInventory> {
-    tables(store).find(|entry| entry.table == table)
+    tables(store)
+        .chain(
+            LAZY_MODULE_TABLES
+                .iter()
+                .filter(move |entry| entry.store == store),
+        )
+        .find(|entry| entry.table == table)
 }
 
 /// SQLite owns this namespace, including optional ANALYZE outputs. These tables
@@ -3792,13 +3872,18 @@ mod tests {
             import { runMigrations } from './packages/plugin/src/features/magic-context/migrations';
             const db = new Database(process.env.MOVE_TEST_CONTEXT);
             initializeDatabase(db); runMigrations(db);
-            if (LATEST_SUPPORTED_VERSION !== 102 || db.prepare('SELECT MAX(version) AS v FROM schema_migrations WHERE version < 10000').get().v !== 102) throw new Error('update the schema-pinned inventory');
+            const pinned = Number(process.env.MOVE_TEST_CONTEXT_VERSION);
+            if (LATEST_SUPPORTED_VERSION !== pinned || db.prepare('SELECT MAX(version) AS v FROM schema_migrations WHERE version < 10000').get().v !== pinned) throw new Error('update the schema-pinned inventory');
             db.close();
         "#;
         let output = Command::new("bun")
             .current_dir(&root)
             .args(["-e", script])
             .env("MOVE_TEST_CONTEXT", dir.path().join("context.db"))
+            .env(
+                "MOVE_TEST_CONTEXT_VERSION",
+                CONTEXT_SCHEMA_VERSION.to_string(),
+            )
             .output()
             .unwrap();
         assert_bun_succeeded(&output);
@@ -4278,7 +4363,13 @@ mod tests {
             .unwrap();
         assert_bun_succeeded(&output);
         let session_tables: Vec<String> = serde_json::from_slice(&output.stdout).unwrap();
-        assert_eq!(session_tables.len(), 46);
+        assert_eq!(session_tables.len(), 49);
+        assert!(session_tables
+            .iter()
+            .any(|table| table == "session_render_cache"));
+        assert!(session_tables
+            .iter()
+            .any(|table| table == "session_meta_chunks"));
         for table in session_tables {
             assert!(matches!(
                 entry(Store::Context, &table).unwrap().class,

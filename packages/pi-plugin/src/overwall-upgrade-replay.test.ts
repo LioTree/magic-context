@@ -5,6 +5,14 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { copySessionStateForClone } from "@magic-context/core/features/magic-context/storage";
 import { getNativeToolInputs } from "@magic-context/core/features/magic-context/storage-native-replay";
+import {
+	clearSessionMetaFixtureFault,
+	rejectSessionMetaCollectionWrites,
+} from "../../plugin/src/features/magic-context/__tests__/session-meta-faults";
+import {
+	sessionMetaCollectionSelect,
+	updateSessionMetaCollection,
+} from "../../plugin/src/features/magic-context/storage-session-collections";
 import { createTestTempDirFromPath } from "../../plugin/src/shared/test-temp-dir";
 import { clearContextHandlerSession } from "./context-handler";
 import { calls, fixture } from "./overwall-upgrade-replay.fixture";
@@ -45,13 +53,21 @@ test("Q2 partial marker batch replays exactly after restart", async () => {
 	const f = fixture(true, 10);
 	try {
 		await f.seed();
-		f.db.exec(
-			`CREATE TRIGGER partial BEFORE UPDATE OF trailing_blank_decisions ON session_meta WHEN (SELECT count(*) FROM json_each(json_extract(NEW.trailing_blank_decisions, '$.piNative.toolInputs'))) > 5 BEGIN SELECT RAISE(FAIL,'partial failure'); END`,
+		rejectSessionMetaCollectionWrites(
+			f.db,
+			"trailing_blank_decisions",
+			"partial",
+			{
+				error: "partial failure",
+				when: (value) =>
+					typeof value === "string" &&
+					Object.keys(JSON.parse(value).piNative?.toolInputs ?? {}).length > 5,
+			},
 		);
 		const priced = await f.pass(90);
 		expect(getNativeToolInputs(f.db, f.session).size).toBe(5);
 		expect(calls(priced)).toBe(5);
-		f.db.exec("DROP TRIGGER partial");
+		clearSessionMetaFixtureFault(f.db, "partial");
 		f.restart();
 		expect(JSON.stringify(await f.pass(0))).toBe(JSON.stringify(priced));
 		expect(getNativeToolInputs(f.db, f.session).size).toBe(5);
@@ -92,11 +108,12 @@ test("Q2 malformed document after mint retains pairs on restart defer", async ()
 	try {
 		await f.seed();
 		expect(calls(await f.pass(90))).toBe(0);
-		f.db
-			.prepare(
-				"UPDATE session_meta SET trailing_blank_decisions = ? WHERE session_id = ?",
-			)
-			.run("{", f.session);
+		updateSessionMetaCollection(
+			f.db,
+			f.session,
+			"trailing_blank_decisions",
+			"{",
+		);
 		f.restart();
 		publication.reset();
 		const deferred = await f.pass(0);
@@ -106,7 +123,7 @@ test("Q2 malformed document after mint retains pairs on restart defer", async ()
 		expect(
 			f.db
 				.prepare(
-					"SELECT trailing_blank_decisions FROM session_meta WHERE session_id = ?",
+					`SELECT ${sessionMetaCollectionSelect("trailing_blank_decisions", "trailing_blank_decisions", f.db)} FROM session_meta WHERE session_id = ?`,
 				)
 				.get(f.session),
 		).toEqual({ trailing_blank_decisions: "{" });

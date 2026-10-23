@@ -1,6 +1,10 @@
 import type { ToolDefinition } from "@opencode-ai/plugin";
 import type { MagicContextPluginConfig } from "../config";
-import { isCompactionEnabled, isDreamerRunnable } from "../config/agent-disable";
+import {
+    isCompactionEnabled,
+    isDreamerRunnable,
+    isSmartNoteSurfaceAvailable,
+} from "../config/agent-disable";
 import { resolveProjectIdentityForSession } from "../features/magic-context/memory/project-identity";
 import { getProtectionWindowForSession } from "../features/magic-context/protection-window";
 import {
@@ -31,7 +35,6 @@ import { CTX_NOTE_LIGHT_DESCRIPTION } from "../tools/light-descriptions";
 import { parameterDescriptionsFor } from "../tools/parameter-descriptions";
 import { ensureProjectRegisteredFromOpenCodeDirectory } from "./embedding-bootstrap";
 import { normalizeToolArgSchemas } from "./normalize-tool-arg-schemas";
-import type { RustToolBackends } from "./rust-tool-backends";
 import { guardSubagentTools } from "./subagent-tool-policy";
 import type { PluginContext } from "./types";
 
@@ -64,13 +67,12 @@ export function getCompactionOffRemovedToolIds(): readonly string[] {
 export function createToolRegistry(args: {
     ctx: PluginContext;
     pluginConfig: MagicContextPluginConfig;
-    rustToolBackends?: RustToolBackends;
     promptSurfaceRuntime?: PromptSurfaceRuntime;
     registrationPromptSurface?: PromptSurfaceConfig;
     includeDreamerOnlyTools?: boolean;
     internalChildSessions?: ReadonlySet<string>;
 }): Record<string, ToolDefinition> {
-    const { ctx, pluginConfig, rustToolBackends } = args;
+    const { ctx, pluginConfig } = args;
 
     if (pluginConfig.enabled !== true) {
         return {};
@@ -154,7 +156,6 @@ export function createToolRegistry(args: {
                           sessionId,
                           getObservedEpochFloor(db, sessionId),
                       ),
-                  rustToolBackends,
               })),
         ...createCtxExpandTools({ db, expandTools: pluginConfig.historian?.expand_tools }),
         ...createCtxNoteTools({
@@ -162,7 +163,6 @@ export function createToolRegistry(args: {
             dreamerEnabled: isDreamerRunnable(pluginConfig),
             smartNotesEnabled: pluginConfig.smart_notes?.enabled,
             resolveProjectPath,
-            rustToolBackends,
         }),
         ...createCtxSearchTools({
             db,
@@ -181,8 +181,6 @@ export function createToolRegistry(args: {
                   // enumeration) stays dreamer-only (runtime-gated via
                   // toolContext.agent in tools.ts).
                   allowedActions: [...CTX_MEMORY_ACTIONS],
-                  memoryAuthority: pluginConfig.transform_mode === "rust" ? "module" : "ts",
-                  rustToolBackends,
                   agentSaveClassificationAnchor: (location) =>
                       agentSaveClassificationAnchor(location),
               })
@@ -192,7 +190,6 @@ export function createToolRegistry(args: {
                   db,
                   resolveProjectPath,
                   ensureProjectRegistered: ensureProjectRegisteredFromOpenCodeDirectory,
-                  rustToolBackends,
               })
             : {}),
     };
@@ -210,12 +207,16 @@ export function createToolRegistry(args: {
     const registration = promptSurfaceRuntime.resolveRegistration(
         args.registrationPromptSurface ?? pluginConfig.prompt_surface,
     );
+    // Smart notes need both smart_notes.enabled and a runnable dreamer, which
+    // evaluates their conditions; without either, ctx_note is surfaced without
+    // its surface_condition argument and smart-note text.
+    const smartNotesAvailable = isSmartNoteSurfaceAvailable(pluginConfig);
     const surfacedTools = Object.fromEntries(
         Object.entries(allTools).map(([toolId, definition]) => {
             const parameterDescriptions = parameterDescriptionsFor(
                 toolId,
                 registration.preset,
-                pluginConfig.smart_notes?.enabled,
+                smartNotesAvailable,
             );
             const argsWithPresetDescriptions = parameterDescriptions
                 ? Object.fromEntries(
@@ -237,7 +238,7 @@ export function createToolRegistry(args: {
                     ...definition,
                     args: argsWithPresetDescriptions,
                     description:
-                        toolId === "ctx_note" && pluginConfig.smart_notes?.enabled === false
+                        toolId === "ctx_note" && !smartNotesAvailable
                             ? withoutSmartNoteText(
                                   registration.preset === "light"
                                       ? CTX_NOTE_LIGHT_DESCRIPTION

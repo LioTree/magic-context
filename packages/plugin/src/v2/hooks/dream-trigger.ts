@@ -1,4 +1,6 @@
 import type { DreamerConfig } from "../../config/schema/magic-context";
+import type { DreamModuleClient } from "../../features/magic-context/dreamer/rust-ownership";
+import { readRustOwnedDreamTasks } from "../../features/magic-context/dreamer/rust-ownership";
 import { buildDreamTaskRuntimeConfigs } from "../../features/magic-context/dreamer/task-config";
 import { createDreamTaskExecutor } from "../../features/magic-context/dreamer/task-executor";
 import { runDueTasksForProject } from "../../features/magic-context/dreamer/task-scheduler";
@@ -54,14 +56,24 @@ export function startDreamTrigger(
     args: {
         config: DreamerConfig;
         smartNotesEnabled?: boolean;
-        sample?: () => { config: DreamerConfig; mural?: { enabled: boolean } };
+        sample?: () => {
+            config: DreamerConfig;
+            mural?: { enabled: boolean };
+            rustBackgroundEnabled?: boolean;
+        };
         executor: HiddenCompletionExecutor;
         projectIdentity: () => string;
-        /** The project's `memory.enabled`; `false` keeps the identity unscheduled. */
+        /** The project's `memory.enabled`; `false` leaves its project-memory tasks unscheduled. */
         projectMemoryEnabled?: boolean;
         memoryInjectionBudgetTokens?: number;
         language?: string;
         mural?: { enabled: boolean };
+        retinaHandoff?: boolean;
+        /**
+         * Present only when this host is attached to ck-mc. Then, with the live
+         * `rust_background_enabled` on, the tasks ck-mc publishes are skipped.
+         */
+        moduleClient?: DreamModuleClient;
         /** Native source boundary; injectable for scheduler-only tests. */
         openReader?: () => Pick<V2StoreReader, "rootSessionActivity" | "close">;
     },
@@ -111,10 +123,19 @@ export function startDreamTrigger(
                         ),
                         toolsSupported: args.executor.capabilities.tools === true,
                     });
+                    const projectIdentity = args.projectIdentity();
+                    const rustOwnedTasks = await readRustOwnedDreamTasks({
+                        rustBackgroundEnabled: sampled?.rustBackgroundEnabled,
+                        moduleClient: args.moduleClient,
+                        projectIdentity,
+                        projectRoot: context.location.directory,
+                    });
                     await runDueTasksForProject({
                         db,
-                        projectIdentity: args.projectIdentity(),
+                        projectIdentity,
                         projectMemoryEnabled: args.projectMemoryEnabled,
+                        rustOwnedTasks,
+                        smartNotesEnabled: args.smartNotesEnabled,
                         tasks: runnable,
                         executor: createDreamTaskExecutor({
                             hiddenCompletionExecutor: args.executor,
@@ -125,6 +146,7 @@ export function startDreamTrigger(
                             retrospectiveRawProvider: (db) => new V2RetrospectiveRawProvider(db),
                             language: args.language,
                             mural: sampled?.mural ?? args.mural,
+                            retinaHandoff: args.retinaHandoff,
                             smartNotesEnabled: args.smartNotesEnabled,
                         }),
                     });

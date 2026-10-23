@@ -264,6 +264,25 @@ impl HistorianDurableState {
 /// Distinguishes tokens minted in the same millisecond for the same run.
 static TOKEN_SEQUENCE: AtomicU64 = AtomicU64::new(0);
 
+#[cfg(feature = "test-support")]
+thread_local! {
+    static FIXTURE_ENTROPY: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+}
+
+/// Freeze only process entropy for byte-exact disposable-store conformance tests.
+/// Run, attempt, claimant and clock still participate in token minting.
+#[cfg(feature = "test-support")]
+pub fn with_historian_claim_fixture_entropy<T>(f: impl FnOnce() -> T) -> T {
+    struct Reset(bool);
+    impl Drop for Reset {
+        fn drop(&mut self) {
+            FIXTURE_ENTROPY.with(|slot| slot.set(self.0));
+        }
+    }
+    let _reset = Reset(FIXTURE_ENTROPY.with(|slot| slot.replace(true)));
+    f()
+}
+
 /// Mint the secret a claim is identified by.
 ///
 /// `(run_id, attempt)` is already unique, so uniqueness costs nothing here; the
@@ -278,8 +297,15 @@ fn mint_token(run_id: &str, attempt: u32, claimant_instance_id: &str, now_ms: i6
     hasher.update(claimant_instance_id.as_bytes());
     hasher.update([0u8]);
     hasher.update(now_ms.to_le_bytes());
+    let process_id = std::process::id();
+    #[cfg(feature = "test-support")]
+    let (sequence, process_id) = if FIXTURE_ENTROPY.with(|slot| slot.get()) {
+        (0, 0)
+    } else {
+        (sequence, process_id)
+    };
     hasher.update(sequence.to_le_bytes());
-    hasher.update(std::process::id().to_le_bytes());
+    hasher.update(process_id.to_le_bytes());
     let digest = hasher.finalize();
     digest.iter().take(16).map(|b| format!("{b:02x}")).collect()
 }

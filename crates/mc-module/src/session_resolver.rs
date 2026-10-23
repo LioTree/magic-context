@@ -18,14 +18,53 @@ use subc_protocol::{BindIdentity, RouteTarget};
 use crate::route_targets::{RegisteredRoute, RouteTargetConfig};
 const SESSION_RESOLVE_DEADLINE: Duration = Duration::from_secs(2);
 
-/// Broca binds provider and tool routes as a runner, not as the caller's harness.
-/// The caller's harness travels separately in compaction and hook request bodies.
+/// Tool-provider and process-configured runner routes use the fixed `runner` harness.
+/// Conversation routes for compaction use the route project root and the harness and
+/// session reported in Setup.
 pub const RUNNER_BIND_HARNESS: &str = "runner";
+
+/// The bind identity for a conversation consists of the canonical project root from
+/// the route that accepted Setup and the harness and session in Setup's body.
+#[derive(Clone, Debug, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+pub struct RunnerBindIdentity {
+    pub project_root: PathBuf,
+    pub harness: String,
+    pub session: String,
+}
+
+/// The role versions every route this module opens to a runner declares:
+/// it speaks `llm-runner/v1` there. The declaration is part of the route's
+/// identity, so the same map must be given when the route is closed.
+pub fn llm_runner_role_versions() -> std::collections::BTreeMap<String, String> {
+    std::collections::BTreeMap::from([(
+        cortexkit_role_llm_runner::ROLE.to_string(),
+        cortexkit_role_llm_runner::VERSION.to_string(),
+    )])
+}
 
 /// Provider callbacks use the configured runner route and the SDK's daemon-verified
 /// module launch identity. They must never use the gateway's session resolver.
 #[async_trait]
 pub trait ProviderRunner: Send + Sync {
+    async fn call_for(
+        &self,
+        route: &crate::route_targets::SessionRunnerRoute,
+        project_root: &Path,
+        method: &str,
+        params: Value,
+        budget: Duration,
+    ) -> Result<Value, SessionResolveError> {
+        self.call(project_root, route.parent_session(), method, params, budget)
+            .await
+    }
+    async fn call_for_identity(
+        &self,
+        route: &crate::route_targets::SessionRunnerRoute,
+        identity: &RunnerBindIdentity,
+        method: &str,
+        params: Value,
+        budget: Duration,
+    ) -> Result<Value, SessionResolveError>;
     async fn call(
         &self,
         project_root: &Path,
@@ -52,6 +91,44 @@ impl RealProviderRunner {
 
 #[async_trait]
 impl ProviderRunner for RealProviderRunner {
+    async fn call_for(
+        &self,
+        route: &crate::route_targets::SessionRunnerRoute,
+        project_root: &Path,
+        method: &str,
+        params: Value,
+        budget: Duration,
+    ) -> Result<Value, SessionResolveError> {
+        self.call_target(
+            route.target(),
+            &RunnerBindIdentity {
+                project_root: project_root.to_path_buf(),
+                harness: RUNNER_BIND_HARNESS.into(),
+                session: route.parent_session().into(),
+            },
+            method,
+            params,
+            budget,
+        )
+        .await
+    }
+
+    async fn call_for_identity(
+        &self,
+        route: &crate::route_targets::SessionRunnerRoute,
+        identity: &RunnerBindIdentity,
+        method: &str,
+        params: Value,
+        budget: Duration,
+    ) -> Result<Value, SessionResolveError> {
+        if identity.session != route.parent_session() {
+            return Err(SessionResolveError::InvalidResponse(
+                "session runner route identity mismatch".into(),
+            ));
+        }
+        self.call_target(route.target(), identity, method, params, budget)
+            .await
+    }
     async fn call(
         &self,
         project_root: &Path,
@@ -64,7 +141,35 @@ impl ProviderRunner for RealProviderRunner {
             .route_targets
             .target(RegisteredRoute::ProviderRunner)
             .expect("provider runner has a registered target");
-        let identity = BindIdentity::new(project_root.to_path_buf(), RUNNER_BIND_HARNESS, session);
+        self.call_target(
+            target,
+            &RunnerBindIdentity {
+                project_root: project_root.to_path_buf(),
+                harness: RUNNER_BIND_HARNESS.into(),
+                session: session.into(),
+            },
+            method,
+            params,
+            budget,
+        )
+        .await
+    }
+}
+
+impl RealProviderRunner {
+    async fn call_target(
+        &self,
+        target: RouteTarget,
+        identity: &RunnerBindIdentity,
+        method: &str,
+        params: Value,
+        budget: Duration,
+    ) -> Result<Value, SessionResolveError> {
+        let bind_identity = BindIdentity::new(
+            identity.project_root.clone(),
+            identity.harness.as_str(),
+            identity.session.as_str(),
+        );
         let work = async {
             let mut options = consumer_options();
             options.handshake_timeout = budget;
@@ -75,23 +180,32 @@ impl ProviderRunner for RealProviderRunner {
             let response = consumer
                 .call(
                     target.clone(),
-                    identity.clone(),
+                    bind_identity.clone(),
                     serde_json::to_vec(&json!({"method": method, "params": params}))
                         .map_err(|e| SessionResolveError::Transport(e.to_string()))?,
                     CallOptions {
                         timeout: budget,
                         route_retry_deadline: budget,
+                        role_versions: Some(llm_runner_role_versions()),
                         ..call_options()
                     },
                 )
                 .await;
             consumer
-                .close_route(target, identity, CloseRouteOptions::default())
+                .close_route(
+                    target,
+                    bind_identity,
+                    CloseRouteOptions {
+                        role_versions: Some(llm_runner_role_versions()),
+                        ..CloseRouteOptions::default()
+                    },
+                )
                 .await;
             consumer.close().await;
-            let bytes = response.map_err(call_error_to_resolve_error)?;
-            serde_json::from_slice(&bytes)
-                .map_err(|e| SessionResolveError::InvalidResponse(e.to_string()))
+            let bytes = response.map_err(runner_call_error)?;
+            let reply = serde_json::from_slice(&bytes)
+                .map_err(|e| SessionResolveError::InvalidResponse(e.to_string()))?;
+            read_runner_reply(reply)
         };
         tokio::time::timeout(budget, work)
             .await
@@ -103,6 +217,19 @@ pub struct MissingProviderRunner;
 
 #[async_trait]
 impl ProviderRunner for MissingProviderRunner {
+    async fn call_for_identity(
+        &self,
+        _: &crate::route_targets::SessionRunnerRoute,
+        _: &RunnerBindIdentity,
+        _: &str,
+        _: Value,
+        _: Duration,
+    ) -> Result<Value, SessionResolveError> {
+        Err(SessionResolveError::Transport(
+            "provider runner connection is unavailable".into(),
+        ))
+    }
+
     async fn call(
         &self,
         _: &Path,
@@ -130,6 +257,14 @@ pub enum SessionResolveError {
     Timeout,
     Transport(String),
     InvalidResponse(String),
+    /// An llm-runner reply that is not exactly `{"result": <answer>}`; the
+    /// detail names what arrived. See [`read_runner_reply`].
+    ReplyShape(String),
+    /// The runner refused the call with an ERROR frame: its role `code`.
+    Refused {
+        code: String,
+        message: String,
+    },
 }
 
 impl fmt::Display for SessionResolveError {
@@ -140,6 +275,11 @@ impl fmt::Display for SessionResolveError {
             Self::InvalidResponse(message) => {
                 write!(f, "session.resolve returned an invalid response: {message}")
             }
+            Self::ReplyShape(detail) => write!(
+                f,
+                "{RUNNER_REPLY_SHAPE}: llm-runner requires a reply of exactly {{\"result\": <answer>}}; {detail}"
+            ),
+            Self::Refused { code, message } => write!(f, "runner refused {code}: {message}"),
         }
     }
 }
@@ -290,6 +430,51 @@ fn call_options() -> CallOptions {
     }
 }
 
+/// The contract error for an llm-runner reply in any shape but
+/// `{"result": <answer>}`.
+pub const RUNNER_REPLY_SHAPE: &str = "runner_reply_shape";
+
+/// The answer inside an llm-runner reply. Every llm-runner op reply ck-mc
+/// reads is exactly `{"result": <answer>}`, an object with that one key
+/// (pinned for llm-runner 0.4.1). A bare answer, or a `result` beside other
+/// keys, is refused by name rather than read either way, so a runner that
+/// drifts from the pinned shape is seen at once instead of being misread.
+/// This is the one place ck-mc decodes the runner reply envelope.
+pub fn read_runner_reply(reply: Value) -> Result<Value, SessionResolveError> {
+    match reply {
+        Value::Object(mut map) if map.len() == 1 && map.contains_key("result") => {
+            Ok(map.remove("result").expect("checked result key"))
+        }
+        Value::Object(map) => Err(SessionResolveError::ReplyShape(format!(
+            "got an object with keys {:?}",
+            map.keys().collect::<Vec<_>>()
+        ))),
+        other => Err(SessionResolveError::ReplyShape(format!(
+            "got a JSON {}",
+            match other {
+                Value::Null => "null",
+                Value::Bool(_) => "boolean",
+                Value::Number(_) => "number",
+                Value::String(_) => "string",
+                Value::Array(_) => "array",
+                Value::Object(_) => unreachable!(),
+            }
+        ))),
+    }
+}
+
+/// A runner call's failure: an ERROR frame keeps the runner's own code, so
+/// a caller can act on a named refusal (`fork_unsupported`, say).
+fn runner_call_error(error: CallError) -> SessionResolveError {
+    match error {
+        CallError::Module(body) => SessionResolveError::Refused {
+            code: body.code,
+            message: body.message,
+        },
+        other => SessionResolveError::Transport(other.to_string()),
+    }
+}
+
 fn call_error_to_resolve_error(error: CallError) -> SessionResolveError {
     match error {
         CallError::Module(body) if body.code == "session_resolve_timeout" => {
@@ -362,5 +547,253 @@ mod tests {
             format!("{:?}", resolver.route_target()),
             "ManagementSurface { module_id: \"thalamus\" }"
         );
+    }
+
+    /// What a fake daemon saw of one runner route.open request.
+    #[derive(Debug, Default)]
+    struct SeenRoute {
+        target: Option<RouteTarget>,
+        project_root: String,
+        harness: String,
+        session: String,
+        role_versions: Option<std::collections::BTreeMap<String, String>>,
+    }
+
+    /// A one-connection fake daemon answering every routed request with `{}`.
+    async fn fake_daemon() -> (
+        tempfile::TempDir,
+        PathBuf,
+        std::sync::Arc<std::sync::Mutex<Vec<SeenRoute>>>,
+    ) {
+        fake_daemon_answering(br#"{"result":{}}"#.to_vec()).await
+    }
+
+    /// A daemon whose every routed request is answered with `reply`.
+    async fn fake_daemon_answering(
+        reply: Vec<u8>,
+    ) -> (
+        tempfile::TempDir,
+        PathBuf,
+        std::sync::Arc<std::sync::Mutex<Vec<SeenRoute>>>,
+    ) {
+        use subc_control::{ClientControlRequest, ClientControlResponse};
+        use subc_protocol::{Flags, Frame, FrameType, Priority};
+        use subc_transport::{
+            authenticate_server, generate_daemon_id, generate_key, read_frame, write_atomic,
+            write_frame, ConnectionInfo, Endpoint, SCHEMA_VERSION,
+        };
+        let temp = tempfile::tempdir().unwrap();
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        let key = generate_key().unwrap();
+        let daemon_id = generate_daemon_id().unwrap();
+        let connection_file = temp.path().join("connection.json");
+        write_atomic(
+            &connection_file,
+            &ConnectionInfo {
+                schema: SCHEMA_VERSION,
+                wire_version: Some(subc_protocol::PROTOCOL_VERSION),
+                endpoints: vec![Endpoint {
+                    host: address.ip().to_string(),
+                    port: address.port(),
+                }],
+                key: key.clone(),
+                daemon_id,
+                pid: std::process::id(),
+                daemon_ver: "fake".into(),
+            },
+        )
+        .unwrap();
+        let seen = std::sync::Arc::new(std::sync::Mutex::new(Vec::<SeenRoute>::new()));
+        let log = seen.clone();
+        tokio::spawn(async move {
+            while let Ok((mut stream, _)) = listener.accept().await {
+                authenticate_server(
+                    &mut stream,
+                    &key,
+                    &daemon_id,
+                    "fake",
+                    Duration::from_secs(2),
+                )
+                .await
+                .unwrap();
+                while let Ok(Some(frame)) = read_frame(&mut stream).await {
+                    let body = match frame.header.ty {
+                        FrameType::Request if frame.header.channel == 0 => {
+                            let Ok(ClientControlRequest::RouteOpen {
+                                target,
+                                identity,
+                                role_versions,
+                                ..
+                            }) = serde_json::from_slice(&frame.body)
+                            else {
+                                continue;
+                            };
+                            let mut log = log.lock().unwrap();
+                            log.push(SeenRoute {
+                                target: Some(target),
+                                project_root: identity.project_root.to_string_lossy().into(),
+                                harness: identity.harness,
+                                session: identity.session,
+                                role_versions,
+                            });
+                            serde_json::to_vec(&ClientControlResponse::RouteOpen {
+                                route_channel: 9 + log.len() as u16,
+                                route_epoch: 1,
+                            })
+                            .unwrap()
+                        }
+                        FrameType::Request => reply.clone(),
+                        _ => continue,
+                    };
+                    let response = Frame::build(
+                        FrameType::Response,
+                        Flags::new(false, Priority::Interactive, false),
+                        frame.header.channel,
+                        frame.header.epoch,
+                        frame.header.corr,
+                        body,
+                    )
+                    .unwrap();
+                    write_frame(&mut stream, &response).await.unwrap();
+                }
+            }
+        });
+        (temp, connection_file, seen)
+    }
+
+    /// The one place ck-mc decodes an llm-runner reply: exactly
+    /// `{"result": <answer>}`. A bare answer and a `result` beside other keys
+    /// are both refused by name, never read either way.
+    #[test]
+    fn runner_replies_are_read_only_in_the_pinned_wrapped_shape() {
+        let page = json!({"lineage_id":"L","messages":[]});
+        assert_eq!(
+            read_runner_reply(json!({"result": page.clone()})).unwrap(),
+            page
+        );
+        let refused = |reply: Value| match read_runner_reply(reply.clone()) {
+            Err(error @ SessionResolveError::ReplyShape(_)) => {
+                assert!(error.to_string().starts_with(RUNNER_REPLY_SHAPE), "{error}");
+            }
+            other => panic!("{reply} was not refused by shape: {other:?}"),
+        };
+        refused(page.clone());
+        refused(json!({"result": page.clone(), "lineage_id": "L"}));
+        refused(json!({"result": page, "error": null}));
+        refused(json!({}));
+        refused(json!(null));
+        refused(json!([{"result": {}}]));
+    }
+
+    /// Through the real runner client: a wrapped `session.read` page and a
+    /// wrapped `session.send` reply come back as their answers; a bare page
+    /// is refused by name.
+    #[tokio::test]
+    async fn the_runner_client_reads_wrapped_replies_and_refuses_bare_ones() {
+        let route = crate::route_targets::SessionRunnerRoute::for_principal(
+            Some(&subc_protocol::Principal::Reserved {
+                module_id: "broca".into(),
+            }),
+            "s",
+        )
+        .unwrap();
+        let identity = RunnerBindIdentity {
+            project_root: "/project".into(),
+            harness: "broca".into(),
+            session: "s".into(),
+        };
+        let page = json!({"lineage_id":"L","messages":[]});
+        let send = json!({"state":"pending","submission_id":"q"});
+        for (reply, method, expected) in [
+            (
+                json!({"result": page.clone()}),
+                "session.read",
+                Some(page.clone()),
+            ),
+            (
+                json!({"result": send.clone()}),
+                "session.send",
+                Some(send.clone()),
+            ),
+            (page.clone(), "session.read", None),
+        ] {
+            let (_temp, connection_file, _) =
+                fake_daemon_answering(serde_json::to_vec(&reply).unwrap()).await;
+            let runner =
+                RealProviderRunner::new(connection_file, RouteTargetConfig::runner_module("broca"));
+            let answer = runner
+                .call_for_identity(&route, &identity, method, json!({}), Duration::from_secs(5))
+                .await;
+            match (answer, expected) {
+                (Ok(answer), Some(expected)) => assert_eq!(answer, expected),
+                (Err(SessionResolveError::ReplyShape(_)), None) => {}
+                (other, expected) => panic!("{method} {reply}: {other:?}, expected {expected:?}"),
+            }
+        }
+    }
+
+    /// Both runner paths, the process-configured provider runner and a
+    /// conversation's own session runner, open their route declaring
+    /// `llm-runner/v1`.
+    #[tokio::test]
+    async fn every_provider_runner_route_declares_llm_runner_v1() {
+        let (_temp, connection_file, seen) = fake_daemon().await;
+        let runner =
+            RealProviderRunner::new(connection_file, RouteTargetConfig::runner_module("broca"));
+        let project = Path::new("/project");
+        runner
+            .call(
+                project,
+                "s",
+                "session.read",
+                json!({}),
+                Duration::from_secs(5),
+            )
+            .await
+            .unwrap();
+        let route = crate::route_targets::SessionRunnerRoute::for_principal(
+            Some(&subc_protocol::Principal::Reserved {
+                module_id: "thalamus-harness".into(),
+            }),
+            "parent",
+        )
+        .unwrap();
+        runner
+            .call_for_identity(
+                &route,
+                &RunnerBindIdentity {
+                    project_root: project.to_path_buf(),
+                    harness: "claude-code".into(),
+                    session: "parent".into(),
+                },
+                "session.read",
+                json!({}),
+                Duration::from_secs(5),
+            )
+            .await
+            .unwrap();
+        let seen = seen.lock().unwrap();
+        assert_eq!(seen.len(), 2, "{seen:?}");
+        assert_eq!(seen[0].project_root, project.to_string_lossy());
+        assert_eq!(seen[0].harness, RUNNER_BIND_HARNESS);
+        assert_eq!(seen[0].session, "s");
+        assert_eq!(seen[1].project_root, project.to_string_lossy());
+        assert_eq!(seen[1].harness, "claude-code");
+        assert_eq!(seen[1].session, "parent");
+        let expected = Some(std::collections::BTreeMap::from([(
+            "llm-runner".to_string(),
+            "v1".to_string(),
+        )]));
+        for (route, module) in seen.iter().zip(["broca", "thalamus-harness"]) {
+            assert_eq!(
+                route.target,
+                Some(RouteTarget::ManagementSurface {
+                    module_id: module.into()
+                })
+            );
+            assert_eq!(route.role_versions, expected, "{route:?}");
+        }
+        assert_eq!(seen[1].session, "parent");
     }
 }

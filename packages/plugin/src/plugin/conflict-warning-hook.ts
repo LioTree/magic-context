@@ -11,6 +11,7 @@ import { existsSync, readFileSync } from "node:fs";
 import { homedir, platform } from "node:os";
 import { join } from "node:path";
 import { sendStatusNotification } from "../hooks/magic-context/send-session-notification";
+import { isBridgedSession } from "../shared/bridged-sessions";
 import type { ConflictResult } from "../shared/conflict-detector";
 import { formatConflictShort } from "../shared/conflict-detector";
 import { log } from "../shared/logger";
@@ -120,6 +121,9 @@ function getDesktopState(directory: string): DesktopState {
         cached = readDesktopState(directory);
         cachedDesktopStateByDir.set(directory, cached);
     }
+    // A session another product's bridge serves gets no Magic Context warnings,
+    // announcements or cleanup deletions, so treat it as "no session known".
+    if (isBridgedSession(cached.sessionId)) return { ...cached, sessionId: null };
     return cached;
 }
 

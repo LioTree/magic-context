@@ -5,10 +5,16 @@ import { isRustMarkerAdmissionFenced } from "../../features/magic-context/storag
 import { drainBackgroundBatches } from "../../shared/background-batch-drain";
 import { getHarness } from "../../shared/harness";
 import { sessionLog } from "../../shared/logger";
-import type { Database } from "../../shared/sqlite";
+import { type Database, withoutSqliteTransformPass } from "../../shared/sqlite";
 import { logSlowWriteTransaction } from "../../shared/write-transaction-timing";
 import { clearLkgRecoveryFence, commitLkgWithRecoveryFence } from "./lkg-recovery-fence";
-import { readServedMarker, recordServedSlotState } from "./lkg-served-marker";
+import {
+    ownsServedMarkerAllocation,
+    pendingServedDigest,
+    readServedMarkerRow,
+    recordServedSlotState,
+    type ServedMarkerRow,
+} from "./lkg-served-marker";
 import type { LkgPersistenceBackend, LkgSlot } from "./lkg-slot";
 
 /**
@@ -200,6 +206,288 @@ function rememberFingerprint(db: Database, sessionId: string, fingerprint: strin
     saved.set(sessionId, fingerprint);
 }
 
+/**
+ * The identity a served-capture certificate binds, in exactly the text form the
+ * `lkg_slots` row stores, so a reader can recompute the digest from the row alone.
+ * `prefixHash` is the row's `json_prefix_hash`; loads verify it against every
+ * stored slice. Capture time and the process-local capture ordinal are excluded:
+ * a repeated serve of identical bytes keeps its certificate.
+ */
+export interface LkgCertifiedIdentity {
+    prefixHash: string;
+    inputIdSeq: string;
+    inputContentDigests: string;
+    inputContentSignatures: string | null;
+    inputMoveDigests: string | null;
+    lastInputMessageId: string;
+    modelKey: string | null;
+    providerKey: string | null;
+    rowVersion: number | null;
+}
+
+export function lkgCertificateDigest(identity: LkgCertifiedIdentity): string {
+    return createHash("sha256")
+        .update(
+            JSON.stringify([
+                "lkg-served-certificate-v1",
+                identity.prefixHash,
+                identity.inputIdSeq,
+                identity.inputContentDigests,
+                identity.inputContentSignatures,
+                identity.inputMoveDigests,
+                identity.lastInputMessageId,
+                identity.modelKey,
+                identity.providerKey,
+                identity.rowVersion,
+            ]),
+        )
+        .digest("hex");
+}
+
+/** Serialize a slot's certified identity the same way `persistLkgSlot` stores it. */
+function certifiedIdentity(slot: LkgSlot, prefixHash: string): LkgCertifiedIdentity {
+    return {
+        prefixHash,
+        inputIdSeq: JSON.stringify(
+            slot.piOutputEntryIds
+                ? { version: 1, inputIds: slot.inputIdSeq, piOutputEntryIds: slot.piOutputEntryIds }
+                : slot.inputIdSeq,
+        ),
+        inputContentDigests: JSON.stringify(slot.inputContentDigests),
+        inputContentSignatures: slot.inputContentSignatures
+            ? JSON.stringify(slot.inputContentSignatures)
+            : null,
+        inputMoveDigests: slot.inputMoveDigests ? JSON.stringify(slot.inputMoveDigests) : null,
+        lastInputMessageId: slot.lastInputMessageId,
+        modelKey: slot.modelKey,
+        providerKey: slot.providerKey,
+        rowVersion: slot.rowVersion ?? null,
+    };
+}
+
+/**
+ * The certificate digest of a slot's exact bytes. Hashes the whole prefix, so
+ * callers on the serve path use `boundLkgCertificate` instead.
+ */
+export function lkgSlotCertificateDigest(slot: LkgSlot): string {
+    return lkgCertificateDigest(certifiedIdentity(slot, layoutLkgPrefix(slot.jsonPrefix).hash));
+}
+
+/**
+ * The certificate this connection last bound for a session: its id, digest and
+ * prefix. A repeated serve compares its prefix with this record instead of
+ * hashing the request again.
+ */
+export interface BoundLkgCertificate {
+    servedCaptureId: number;
+    digest: string;
+    jsonPrefix: string;
+}
+const boundCertificates = new WeakMap<Database, Map<string, BoundLkgCertificate>>();
+
+export function boundLkgCertificate(
+    db: Database,
+    sessionId: string,
+): BoundLkgCertificate | undefined {
+    return boundCertificates.get(db)?.get(sessionId);
+}
+
+function rememberBoundCertificate(
+    db: Database,
+    sessionId: string,
+    certificate: BoundLkgCertificate,
+): void {
+    let bound = boundCertificates.get(db);
+    if (!bound) {
+        bound = new Map();
+        boundCertificates.set(db, bound);
+    }
+    bound.delete(sessionId);
+    if (bound.size >= PERSISTED_FINGERPRINT_MAX_SESSIONS) {
+        const oldest = bound.keys().next().value;
+        if (oldest !== undefined) bound.delete(oldest);
+    }
+    bound.set(sessionId, certificate);
+}
+
+/**
+ * A slot saved with its certificate deferred: the bytes are durable under the
+ * id, but the marker stays unbound until the request is dispatched. Kept per
+ * connection so only the writer that saved the bytes can bind them.
+ */
+interface PreparedLkgCertificate extends BoundLkgCertificate {
+    receipt: object;
+    prefixHash: string;
+    /** The marker's stored value while the id is unbound (its pending token, or legacy NULL). */
+    unboundValue: string | null;
+}
+// A session normally has one or two receipts outstanding between save and dispatch, so 16 bounds memory without evicting live ones.
+const PREPARED_CERTIFICATE_MAX_CAPTURES_PER_SESSION = 16;
+const preparedCertificates = new WeakMap<
+    Database,
+    Map<string, Map<number, PreparedLkgCertificate>>
+>();
+/** Opaque identity of this connection's deferred save, distinct even when an id is reused. */
+export function preparedLkgDispatchReceipt(
+    db: Database,
+    sessionId: string,
+    servedCaptureId: number | undefined,
+): object | undefined {
+    return servedCaptureId === undefined
+        ? undefined
+        : preparedCertificates.get(db)?.get(sessionId)?.get(servedCaptureId)?.receipt;
+}
+function clearPreparedCertificates(db: Database, sessionId: string): void {
+    preparedCertificates.get(db)?.delete(sessionId);
+}
+/** Marker slot state of a request saved before dispatch whose pass was then refused. */
+const UNDISPATCHED_SLOT_STATE = "undispatched";
+
+function prepareCertificateSession(
+    db: Database,
+    sessionId: string,
+): Map<number, PreparedLkgCertificate> {
+    let sessions = preparedCertificates.get(db);
+    if (!sessions) {
+        sessions = new Map();
+        preparedCertificates.set(db, sessions);
+    }
+    let prepared = sessions.get(sessionId);
+    if (!prepared) {
+        if (sessions.size >= PERSISTED_FINGERPRINT_MAX_SESSIONS) {
+            for (const [id, captures] of sessions) {
+                if (captures.size === 0) sessions.delete(id);
+            }
+            // Refuse a new deferred save before writing its bytes rather than discard
+            // another session's receipt for a request that has not been dispatched.
+            if (sessions.size >= PERSISTED_FINGERPRINT_MAX_SESSIONS)
+                throw new Error("LKG prepared certificate session capacity reached");
+        }
+        prepared = new Map();
+        sessions.set(sessionId, prepared);
+    }
+    return prepared;
+}
+
+function rememberPreparedCertificate(
+    prepared: Map<number, PreparedLkgCertificate>,
+    certificate: Omit<PreparedLkgCertificate, "receipt">,
+): void {
+    // Only this session's receipts share a capture limit. The current marker
+    // already names the newest capture, so repair cannot bind an older id.
+    prepared.delete(certificate.servedCaptureId);
+    if (prepared.size >= PREPARED_CERTIFICATE_MAX_CAPTURES_PER_SESSION) {
+        const oldest = prepared.keys().next().value;
+        if (oldest !== undefined) prepared.delete(oldest);
+    }
+    prepared.set(certificate.servedCaptureId, { ...certificate, receipt: {} });
+}
+
+/**
+ * Record that a request saved with `deferCertificate` will never be dispatched:
+ * its pass was refused after the save committed. The bytes stay durable, but the
+ * marker's slot state becomes `undispatched`. A restarted process does not hydrate
+ * these bytes while the marker still identifies this capture as undispatched.
+ * If another writer replaces the marker,
+ * replay these bytes only when the current input exactly matches the input they
+ * were saved from. Only the database handle
+ * that saved the deferred certificate can mark this capture as undispatched.
+ * Never throws.
+ */
+export function refuseUndispatchedLkgSlot(
+    db: Database,
+    sessionId: string,
+    servedCaptureId: number,
+    receipt?: object,
+): boolean {
+    const captures = preparedCertificates.get(db)?.get(sessionId);
+    const prepared = captures?.get(servedCaptureId);
+    if (!prepared || (receipt !== undefined && prepared.receipt !== receipt)) return false;
+    captures?.delete(servedCaptureId);
+    try {
+        // A refused pass is often refused because it ran past its deadline, and a
+        // pass's write guard then blocks its writes. Recording that its request was
+        // never sent publishes nothing for it, so it runs outside that guard.
+        return withoutSqliteTransformPass(
+            () =>
+                db
+                    .prepare(
+                        `UPDATE lkg_served_markers SET slot_state = '${UNDISPATCHED_SLOT_STATE}'
+                    WHERE session_id = ? AND served_capture_id = ? AND slot_state = 'captured'
+                    AND served_digest IS ?`,
+                    )
+                    .run(sessionId, servedCaptureId, prepared.unboundValue).changes > 0,
+        );
+    } catch (error) {
+        sessionLog(sessionId, "LKG refused request could not be marked undispatched:", error);
+        return false;
+    }
+}
+
+/** Whether this connection saved the slot's bytes with their certificate deferred, not yet dispatched. */
+export function isPreparedUndispatchedLkgSlot(
+    db: Database,
+    sessionId: string,
+    servedCaptureId: number | undefined,
+): boolean {
+    return (
+        servedCaptureId !== undefined &&
+        preparedCertificates.get(db)?.get(sessionId)?.has(servedCaptureId) === true
+    );
+}
+
+/**
+ * Bind the certificate of a slot saved with `deferCertificate`, once its request
+ * was actually dispatched. Binds only while the marker still names that id
+ * unbound and storage still holds those bytes under it. Returns whether the id
+ * now certifies those bytes. Never throws: a missed bind leaves the slot durable
+ * but uncertified. A restarted process with no record that this request was sent
+ * may replay these bytes only for the exact input they were saved with.
+ */
+export function certifyDispatchedLkgSlot(
+    db: Database,
+    sessionId: string,
+    servedCaptureId: number,
+    receipt?: object,
+): boolean {
+    const captures = preparedCertificates.get(db)?.get(sessionId);
+    const prepared = captures?.get(servedCaptureId);
+    if (!prepared || (receipt !== undefined && prepared.receipt !== receipt)) return false;
+    captures?.delete(servedCaptureId);
+    // The dispatch ticket proves this request was sent even if a newer allocation
+    // prevents binding the session's current marker. It does not certify that marker.
+    rememberBoundCertificate(db, sessionId, prepared);
+    try {
+        const { changes } = db
+            .prepare(
+                `UPDATE lkg_served_markers SET served_digest = ?
+                WHERE session_id = ? AND served_capture_id = ? AND slot_state = 'captured'
+                AND served_digest IS ?
+                AND EXISTS (SELECT 1 FROM lkg_slots WHERE session_id = ?
+                    AND served_capture_id = ? AND json_prefix_hash = ?)`,
+            )
+            .run(
+                prepared.digest,
+                sessionId,
+                servedCaptureId,
+                prepared.unboundValue,
+                sessionId,
+                servedCaptureId,
+                prepared.prefixHash,
+            );
+        if (changes === 0) return false;
+        rememberBoundCertificate(db, sessionId, {
+            servedCaptureId,
+            digest: prepared.digest,
+            jsonPrefix: prepared.jsonPrefix,
+        });
+        return true;
+    } catch (error) {
+        sessionLog(sessionId, "LKG dispatched request left uncertified:", error);
+        return false;
+    }
+}
+
 function slotFingerprint(slot: LkgSlot): string {
     // capturedAt is the time of this capture, not part of the served request.
     // Keep all replay fences and metadata in the fingerprint so a changed slot
@@ -240,14 +528,41 @@ function persistLkgSlot(
     db: Database,
     sessionId: string,
     slot: LkgSlot,
-    options: { force?: boolean; publishMetadata?: () => void } | (() => void) = {},
+    options: LkgSaveOptions | (() => void) = {},
 ): boolean {
-    const { force, publishMetadata } =
-        typeof options === "function" ? { publishMetadata: options, force: false } : options;
-    const fingerprint = slotFingerprint(slot);
+    const { force, publishMetadata, prepareMetadata, deferCertificate } =
+        typeof options === "function"
+            ? {
+                  publishMetadata: options,
+                  prepareMetadata: undefined,
+                  force: false,
+                  deferCertificate: false,
+              }
+            : options;
+    // Pi saves served tag numbers and the request in one transaction. Even when
+    // the request is unchanged, those numbers must commit, so the fingerprint
+    // used to skip repeated request-only saves cannot skip this transaction.
+    // Avoid computing that unused hash for host-built arrays. Custom serializers
+    // can reject preparation before publication; preserve their existing preflight.
+    const plainPublication =
+        (publishMetadata || prepareMetadata) &&
+        [
+            slot.inputIdSeq,
+            slot.inputContentDigests,
+            slot.inputContentSignatures,
+            slot.piOutputEntryIds,
+            slot.inputMoveDigests,
+        ].every(
+            (values) =>
+                values === undefined ||
+                (Object.getPrototypeOf(values) === Array.prototype && !("toJSON" in values)),
+        );
+    const fingerprint = plainPublication ? undefined : slotFingerprint(slot);
     if (
         !force &&
         !publishMetadata &&
+        !prepareMetadata &&
+        fingerprint !== undefined &&
         persistedFingerprints.get(db)?.get(sessionId) === fingerprint
     ) {
         const durable = loadPersistedLkgSlot(db, sessionId);
@@ -257,51 +572,80 @@ function persistLkgSlot(
     try {
         // Ownership arrays grow with the session. Serialize them before BEGIN so
         // preparing a large saved request does not exclude another host's writer.
-        const inputIdSeq = JSON.stringify(
-            slot.piOutputEntryIds
-                ? { version: 1, inputIds: slot.inputIdSeq, piOutputEntryIds: slot.piOutputEntryIds }
-                : slot.inputIdSeq,
-        );
-        const inputContentDigests = JSON.stringify(slot.inputContentDigests);
-        const inputContentSignatures = slot.inputContentSignatures
-            ? JSON.stringify(slot.inputContentSignatures)
-            : null;
-        db.transaction(() => {
-            // Historical migration fixtures also save pre-marker slots. When the
-            // columns exist, an uncertified overwrite must clear their old ids.
-            const withServedMetadata =
-                slot.servedCaptureId !== undefined ||
-                (db.prepare("PRAGMA table_info(lkg_slots)").all() as Array<{ name: string }>).some(
-                    (column) => column.name === "served_capture_id",
-                );
-            if (slot.servedCaptureId !== undefined) {
-                const marker = readServedMarker(db, sessionId);
-                if (
-                    marker?.servedCaptureId !== slot.servedCaptureId ||
-                    marker.slotState !== "captured"
-                )
-                    throw new Error("LKG capture was superseded or invalidated");
-            }
-            const storedHashes = new Map<unknown, unknown>();
-            for (const row of db
-                .prepare("SELECT chunk, hash FROM lkg_slot_chunks WHERE session_id = ?")
-                .all(sessionId) as Array<{ chunk: unknown; hash: unknown }>) {
-                storedHashes.set(row.chunk, row.hash);
-            }
-            const upsertChunk = db.prepare(
-                `INSERT INTO lkg_slot_chunks (session_id, chunk, hash, body) VALUES (?, ?, ?, ?)
+        const identity = certifiedIdentity(slot, layout.hash);
+        const { inputIdSeq, inputContentDigests, inputContentSignatures } = identity;
+        const certificateDigest =
+            slot.servedCaptureId !== undefined ? lkgCertificateDigest(identity) : undefined;
+        // Set when the marker still names this id unbound after a deferred-certificate
+        // save; the later dispatch binds it from this value.
+        let unboundValue: string | null | undefined;
+        let prepared: Map<number, PreparedLkgCertificate> | undefined;
+        const metadataConflict = Symbol("metadata revision conflict");
+        for (let attempt = 0; ; attempt++) {
+            const preparedMetadata = prepareMetadata?.();
+            unboundValue = undefined;
+            prepared = undefined;
+            try {
+                db.transaction(() => {
+                    // Some migration fixtures save slots created before the served-marker columns
+                    // existed. When those columns are present, an uncertified overwrite must clear
+                    // any prior served-capture metadata.
+                    const withServedMetadata =
+                        slot.servedCaptureId !== undefined ||
+                        (
+                            db.prepare("PRAGMA table_info(lkg_slots)").all() as Array<{
+                                name: string;
+                            }>
+                        ).some((column) => column.name === "served_capture_id");
+                    if (slot.servedCaptureId !== undefined) {
+                        const marker = readServedMarkerRow(db, sessionId);
+                        if (
+                            marker?.servedCaptureId !== slot.servedCaptureId ||
+                            marker.slotState !== "captured"
+                        )
+                            throw new Error("LKG capture was superseded or invalidated");
+                        // After session cleanup deletes the marker row the counter restarts,
+                        // so another writer can allocate an id equal to this slot's. Only the
+                        // connection that made the pending allocation may bind it; a stale
+                        // save from the older serve must not displace the newer one.
+                        if (!ownsServedMarkerAllocation(db, sessionId, marker))
+                            throw new Error("LKG capture id was allocated by another writer");
+                        // Once a save has bound an id to bytes, no other bytes may claim that
+                        // id.
+                        if (
+                            marker.servedDigest !== null &&
+                            marker.servedDigest !== certificateDigest
+                        )
+                            throw new Error("LKG capture id is bound to different bytes");
+                        if (deferCertificate && marker.servedDigest === null) {
+                            prepared = prepareCertificateSession(db, sessionId);
+                            unboundValue = pendingServedDigest(marker);
+                        }
+                    }
+                    const storedHashes = new Map<unknown, unknown>();
+                    for (const row of db
+                        .prepare("SELECT chunk, hash FROM lkg_slot_chunks WHERE session_id = ?")
+                        .all(sessionId) as Array<{ chunk: unknown; hash: unknown }>) {
+                        storedHashes.set(row.chunk, row.hash);
+                    }
+                    const upsertChunk = db.prepare(
+                        `INSERT INTO lkg_slot_chunks (session_id, chunk, hash, body) VALUES (?, ?, ?, ?)
                 ON CONFLICT(session_id, chunk) DO UPDATE SET hash = excluded.hash, body = excluded.body`,
-            );
-            for (let index = 0; index < layout.chunks.length; index += 1) {
-                if (storedHashes.get(index) === layout.chunkHashes[index]) continue;
-                upsertChunk.run(sessionId, index, layout.chunkHashes[index], layout.chunks[index]);
-            }
-            db.prepare("DELETE FROM lkg_slot_chunks WHERE session_id = ? AND chunk >= ?").run(
-                sessionId,
-                layout.chunks.length,
-            );
-            db.prepare(
-                `INSERT INTO lkg_slots (
+                    );
+                    for (let index = 0; index < layout.chunks.length; index += 1) {
+                        if (storedHashes.get(index) === layout.chunkHashes[index]) continue;
+                        upsertChunk.run(
+                            sessionId,
+                            index,
+                            layout.chunkHashes[index],
+                            layout.chunks[index],
+                        );
+                    }
+                    db.prepare(
+                        "DELETE FROM lkg_slot_chunks WHERE session_id = ? AND chunk >= ?",
+                    ).run(sessionId, layout.chunks.length);
+                    db.prepare(
+                        `INSERT INTO lkg_slots (
                     session_id, json_prefix_chars, json_prefix_chunks, json_prefix_hash,
                     input_id_seq, input_content_digests, input_content_signatures,
                     last_input_message_id, model_key, provider_key,
@@ -320,35 +664,63 @@ function persistLkgSlot(
                     captured_at = excluded.captured_at,
                     row_version = excluded.row_version,
                     capture_sequence = excluded.capture_sequence${withServedMetadata ? ", served_capture_id = excluded.served_capture_id, input_move_digests = excluded.input_move_digests" : ""}`,
-            ).run(
-                sessionId,
-                layout.chars,
-                layout.chunks.length,
-                layout.hash,
-                inputIdSeq,
-                inputContentDigests,
-                inputContentSignatures,
-                slot.lastInputMessageId,
-                slot.modelKey,
-                slot.providerKey,
-                slot.capturedAt,
-                slot.rowVersion ?? null,
-                slot.captureSequence ?? null,
-                ...(withServedMetadata
-                    ? [
-                          slot.servedCaptureId ?? null,
-                          slot.inputMoveDigests ? JSON.stringify(slot.inputMoveDigests) : null,
-                      ]
-                    : []),
-            );
-            // Safety metadata must share the request's commit, not a later callback.
-            publishMetadata?.();
-        }).immediate();
-        rememberFingerprint(db, sessionId, fingerprint);
+                    ).run(
+                        sessionId,
+                        layout.chars,
+                        layout.chunks.length,
+                        layout.hash,
+                        inputIdSeq,
+                        inputContentDigests,
+                        inputContentSignatures,
+                        slot.lastInputMessageId,
+                        slot.modelKey,
+                        slot.providerKey,
+                        slot.capturedAt,
+                        slot.rowVersion ?? null,
+                        slot.captureSequence ?? null,
+                        ...(withServedMetadata
+                            ? [slot.servedCaptureId ?? null, identity.inputMoveDigests]
+                            : []),
+                    );
+                    // Bind the marker to these exact bytes in the same transaction that
+                    // writes them, so no reader ever sees the id without its bytes. A
+                    // deferred-certificate save leaves the id unbound until dispatch.
+                    if (slot.servedCaptureId !== undefined && !deferCertificate)
+                        db.prepare(
+                            "UPDATE lkg_served_markers SET served_digest = ? WHERE session_id = ? AND served_capture_id = ?",
+                        ).run(certificateDigest ?? null, sessionId, slot.servedCaptureId);
+                    // Commit the metadata with the LKG slot and chunks, never in a later callback.
+                    if (preparedMetadata) {
+                        if (!preparedMetadata()) throw metadataConflict;
+                    } else publishMetadata?.();
+                }).immediate();
+                break;
+            } catch (error) {
+                if (error !== metadataConflict || attempt >= 4) throw error;
+                // Retry the rolled-back LKG-slot-and-metadata transaction with the same allocated served ID and slot bytes.
+            }
+        }
+        if (fingerprint !== undefined) rememberFingerprint(db, sessionId, fingerprint);
+        if (slot.servedCaptureId !== undefined && certificateDigest !== undefined) {
+            const certificate = {
+                servedCaptureId: slot.servedCaptureId,
+                digest: certificateDigest,
+                jsonPrefix: slot.jsonPrefix,
+            };
+            if (unboundValue !== undefined && prepared)
+                rememberPreparedCertificate(prepared, {
+                    ...certificate,
+                    prefixHash: layout.hash,
+                    unboundValue,
+                });
+            // A deferred save onto an id already bound to these same bytes needs no
+            // later bind: the certificate already names them.
+            else rememberBoundCertificate(db, sessionId, certificate);
+        }
         return true;
     } catch (error) {
         // Paired Pi publication reports its optional failure once per session/reason.
-        if (!publishMetadata)
+        if (!publishMetadata && !prepareMetadata)
             sessionLog(
                 sessionId,
                 "LKG snapshot persistence failed (in-memory slot retained):",
@@ -358,11 +730,25 @@ function persistLkgSlot(
     }
 }
 
+export interface LkgSaveOptions {
+    force?: boolean;
+    publishMetadata?: () => void;
+    /** Prepare before BEGIN; a false publish result rolls back the LKG-slot save and prepares the metadata again. */
+    prepareMetadata?: () => () => boolean;
+    /**
+     * Save the bytes durably under their id but leave the marker unbound. The
+     * caller binds them with `certifyDispatchedLkgSlot` only after the request
+     * was dispatched; until then the slot certifies nothing and a restarted
+     * process does not hydrate it as the last request sent.
+     */
+    deferCertificate?: boolean;
+}
+
 export function saveLkgSlotToDb(
     db: Database,
     sessionId: string,
     slot: LkgSlot,
-    options: { force?: boolean; publishMetadata?: () => void } | (() => void) = {},
+    options: LkgSaveOptions | (() => void) = {},
     fence: {
         rebuild?: boolean;
         retainDirtyRevision?: string;
@@ -404,12 +790,15 @@ export function clearPersistedLkgSlotStrict(
             .immediate(),
     );
     persistedFingerprints.get(db)?.delete(sessionId);
+    boundCertificates.get(db)?.delete(sessionId);
+    clearPreparedCertificates(db, sessionId);
 }
 
 export function loadPersistedLkgSlot(
     db: Database,
     sessionId: string,
     forPublication = false,
+    confirmDispatch = false,
 ): LkgSlot | undefined {
     // Publication verifies the row just committed, even while a history cut is
     // fenced. Ordinary readers still cannot hydrate that row for replay.
@@ -418,6 +807,8 @@ export function loadPersistedLkgSlot(
     type ChunkRow = { chunk?: unknown; hash?: unknown; body?: unknown };
     let row: Record<string, unknown> | undefined;
     let chunkRows: ChunkRow[];
+    let marker: ServedMarkerRow | undefined;
+    let markerReadFailed = false;
     try {
         // One read transaction, so the row and its slices come from the same
         // snapshot even while another connection is saving this slot.
@@ -432,6 +823,14 @@ export function loadPersistedLkgSlot(
                         "SELECT chunk, hash, body FROM lkg_slot_chunks WHERE session_id = ? ORDER BY chunk",
                     )
                     .all(sessionId) as ChunkRow[];
+                if (confirmDispatch) {
+                    try {
+                        marker = readServedMarkerRow(db, sessionId);
+                    } catch (error) {
+                        markerReadFailed = true;
+                        sessionLog(sessionId, "LKG durable dispatch check failed:", error);
+                    }
+                }
                 return { row: slotRow, chunkRows: slices };
             })
             .deferred());
@@ -461,6 +860,14 @@ export function loadPersistedLkgSlot(
     }
     // Size admission is enforced by the slot store's own bound when the loaded
     // slot is installed; an oversized row simply declines to hydrate.
+    if (confirmDispatch) {
+        const state = markerReadFailed ? "unconfirmed" : dispatchState(db, sessionId, slot, marker);
+        if (state === "refused") {
+            sessionLog(sessionId, "LKG durable slot was refused before dispatch; not hydrated");
+            return undefined;
+        }
+        if (state === "unconfirmed") return { ...slot, dispatchUnconfirmed: true };
+    }
     return slot;
 }
 
@@ -512,6 +919,8 @@ function pruneStaleLkgSlotsBatch(db: Database, now: number): { slots: number; ch
         logSlowWriteTransaction("lkg_stale_gc", transactionStartedAt);
         if (changes.slots && slot) {
             persistedFingerprints.get(db)?.delete(slot.session_id);
+            boundCertificates.get(db)?.delete(slot.session_id);
+            clearPreparedCertificates(db, slot.session_id);
         }
         return changes;
     } finally {
@@ -540,10 +949,33 @@ export async function drainStaleLkgSlots(
     return removed;
 }
 
+/**
+ * Only positive evidence bound to this capture proves dispatch. A newer marker
+ * says nothing about older bytes, and legacy NULL digests are not certificates.
+ */
+function dispatchState(
+    db: Database,
+    sessionId: string,
+    slot: LkgSlot,
+    marker: ServedMarkerRow | undefined,
+): "refused" | "unconfirmed" | "settled" {
+    if (slot.servedCaptureId === undefined) return "unconfirmed";
+    const digest = lkgSlotCertificateDigest(slot);
+    const bound = boundLkgCertificate(db, sessionId);
+    if (bound?.servedCaptureId === slot.servedCaptureId && bound.digest === digest)
+        return "settled";
+    if (marker?.servedCaptureId !== slot.servedCaptureId) return "unconfirmed";
+    if (marker.slotState === UNDISPATCHED_SLOT_STATE) return "refused";
+    if (marker.servedDigest === null) return "unconfirmed";
+    return marker.slotState === "captured" && marker.servedDigest === digest
+        ? "settled"
+        : "unconfirmed";
+}
+
 /** Backend bound to one database handle, for registration with the slot store. */
 export function createDbLkgPersistence(db: Database): LkgPersistenceBackend {
     return {
-        load: (sessionId) => loadPersistedLkgSlot(db, sessionId),
+        load: (sessionId) => loadPersistedLkgSlot(db, sessionId, false, true),
         clear: (sessionId, reason) => clearPersistedLkgSlot(db, sessionId, reason),
     };
 }

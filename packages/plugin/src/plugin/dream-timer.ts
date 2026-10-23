@@ -1,7 +1,6 @@
 import { statSync } from "node:fs";
 
 import type { DreamerConfig } from "../config/schema/magic-context";
-import type { ClassifyModuleClient } from "../features/magic-context/dreamer/classify";
 import { acquireLease, releaseLease } from "../features/magic-context/dreamer/lease";
 import { logDreamerNotOwnerOnce } from "../features/magic-context/dreamer/module-apply";
 import { openOpenCodeDb } from "../features/magic-context/dreamer/open-opencode-db";
@@ -15,6 +14,10 @@ import {
     OpenCodeRetrospectiveRawProvider,
     type RetrospectiveRawProvider,
 } from "../features/magic-context/dreamer/retrospective-raw-provider";
+import {
+    type DreamModuleClient,
+    readRustOwnedDreamTasks,
+} from "../features/magic-context/dreamer/rust-ownership";
 import { deleteTaskScheduleRowsForProject } from "../features/magic-context/dreamer/storage-task-schedule";
 import {
     buildDreamTaskRuntimeConfigs,
@@ -120,7 +123,11 @@ interface ProjectRegistration {
     sampleDreamRun?: () => Partial<
         Pick<
             ProjectRegistration,
-            "dreamerConfig" | "mural" | "historianChildSweep" | "gitCommitIndexing"
+            | "dreamerConfig"
+            | "mural"
+            | "historianChildSweep"
+            | "gitCommitIndexing"
+            | "rustBackgroundEnabled"
         >
     >;
     language?: string;
@@ -160,16 +167,15 @@ interface ProjectRegistration {
     primerRawProviderFactory?: (
         sessionId: string,
     ) => Promise<RawMessageProvider | null> | RawMessageProvider | null;
-    transformMode?: "ts" | "rust";
+    /**
+     * The live `rust_background_enabled`. With it on and `moduleClient` present
+     * (this host is attached to ck-mc), the tasks ck-mc publishes as its own are
+     * skipped here; without ck-mc nothing is skipped.
+     */
+    rustBackgroundEnabled?: boolean;
+    /** Optional transport for dream routes only; standalone registrations omit it. */
+    moduleClient?: DreamModuleClient;
     onDreamerProgress?: (progress: DreamTaskProgress | null, completedTask?: DreamTaskName) => void;
-    moduleClient?: ClassifyModuleClient & {
-        authorityStatus?: (args: {
-            context_store_uuid: string;
-            project: string;
-            projectRoot?: string;
-            domain: "memories" | "notes";
-        }) => Promise<{ authority: { state?: string; generation?: number } | null }>;
-    };
     sessionCleanupModuleClient?: {
         deleteSession(sessionId: string, projectRoot: string): Promise<void>;
         closeSession?(sessionId: string): void;
@@ -318,7 +324,9 @@ export async function startDreamScheduleTimer(
             runTick("startup");
         });
 
-        const timer = setInterval(() => runTick("interval"), DREAM_TIMER_INTERVAL_MS);
+        const timer = inRootAsyncContext(() =>
+            setInterval(() => runTick("interval"), DREAM_TIMER_INTERVAL_MS),
+        );
         if (typeof timer === "object" && "unref" in timer) {
             timer.unref();
         }
@@ -536,7 +544,7 @@ async function runProjectMaintenance(
     const projectMaintenanceEnabled =
         Boolean(current.dreamerConfig && current.dreamerConfig.disable !== true) ||
         reg.memoryEnabled === true ||
-        reg.gitCommitIndexing?.enabled === true ||
+        current.gitCommitIndexing?.enabled === true ||
         reg.historianChildSweep !== undefined;
     if (!projectMaintenanceEnabled) return;
 
@@ -552,7 +560,9 @@ async function runProjectMaintenance(
         // Compartment-chunk backfill remains demand-driven to avoid bursty
         // requests to local embedding endpoints.
     }
-    await sweepProject(current, origin, db);
+    // Indexing commit text does not require an embedding provider. Only the
+    // optional vector backfill depends on the embedding snapshot.
+    await sweepProject(current, origin, db, current.gitCommitIndexing?.enabled === true);
 }
 
 /**
@@ -685,10 +695,14 @@ async function sweepProject(
             memoryInjectionBudgetTokens: reg.memoryInjectionBudgetTokens,
             retinaHandoff: reg.retinaHandoff,
             smartNotesEnabled: reg.smartNotesEnabled,
-            transformMode: reg.transformMode,
-            moduleClient: reg.moduleClient,
             onProgress: (progress, completedTask) =>
                 reg.onDreamerProgress?.(progress, completedTask),
+        });
+        const rustOwnedTasks = await readRustOwnedDreamTasks({
+            rustBackgroundEnabled: reg.rustBackgroundEnabled,
+            moduleClient: reg.moduleClient,
+            projectIdentity: reg.projectIdentity,
+            projectRoot: reg.directory,
         });
         const ran = await runDueTasksForProject({
             db,
@@ -696,6 +710,8 @@ async function sweepProject(
             tasks: runtimeConfigs,
             executor,
             projectMemoryEnabled: reg.memoryEnabled !== false,
+            rustOwnedTasks,
+            smartNotesEnabled: reg.smartNotesEnabled,
         });
         if (ran > 0) {
             log(`[dreamer] timer tick (${origin}) ${reg.projectIdentity} — ran ${ran} task(s)`);
@@ -800,17 +816,19 @@ function startGitSweepLeaseRenewal(
     projectIdentity: string,
     holderId: string,
 ): () => void {
-    const timer = setInterval(() => {
-        try {
-            if (!renewGitSweepLease(db, projectIdentity, holderId)) {
-                log(`[git-commits] sweep lease renewal failed for ${projectIdentity}`);
+    const timer = inRootAsyncContext(() =>
+        setInterval(() => {
+            try {
+                if (!renewGitSweepLease(db, projectIdentity, holderId)) {
+                    log(`[git-commits] sweep lease renewal failed for ${projectIdentity}`);
+                }
+            } catch (error) {
+                log(
+                    `[git-commits] sweep lease renewal errored for ${projectIdentity}: ${error instanceof Error ? error.message : String(error)}`,
+                );
             }
-        } catch (error) {
-            log(
-                `[git-commits] sweep lease renewal errored for ${projectIdentity}: ${error instanceof Error ? error.message : String(error)}`,
-            );
-        }
-    }, GIT_SWEEP_LEASE_RENEWAL_MS);
+        }, GIT_SWEEP_LEASE_RENEWAL_MS),
+    );
     (timer as { unref?: () => void }).unref?.();
     return () => clearInterval(timer);
 }
@@ -894,3 +912,5 @@ async function sweepGitCommits(args: {
         stopRenewal();
     }
 }
+
+import { inRootAsyncContext } from "../shared/sqlite";

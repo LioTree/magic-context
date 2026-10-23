@@ -6,6 +6,8 @@ import { closeQuietly } from "../../shared/sqlite-helpers";
 import { runMigrations } from "./migrations";
 import { initializeDatabase } from "./storage-db";
 import { healAllNullColumns } from "./storage-schema-helpers";
+import { sessionRenderCacheSelect } from "./storage-session-cache";
+import { sessionMetaCollectionSelect } from "./storage-session-collections";
 
 function tableExists(db: DatabaseType, table: string): boolean {
     return Boolean(
@@ -105,7 +107,12 @@ describe("migration v51 — durable backfill state and strict healing", () => {
             expect(
                 db
                     .prepare(
-                        "SELECT cache_ttl, prior_boundary_ordinal, memory_block_cache, memory_block_ids, memory_block_count FROM session_meta WHERE session_id = 'nulls'",
+                        `SELECT cache_ttl,
+                            prior_boundary_ordinal,
+                            ${sessionRenderCacheSelect("memory_block_cache", "memory_block_cache", db)},
+                            ${sessionMetaCollectionSelect("memory_block_ids", "memory_block_ids", db)},
+                            memory_block_count
+                        FROM session_meta WHERE session_id = 'nulls'`,
                     )
                     .get(),
             ).toEqual({
@@ -118,7 +125,7 @@ describe("migration v51 — durable backfill state and strict healing", () => {
             expect(
                 db
                     .prepare(
-                        "SELECT memory_block_cache FROM session_meta WHERE session_id = 'repair'",
+                        `SELECT ${sessionRenderCacheSelect("memory_block_cache", "memory_block_cache", db)} FROM session_meta WHERE session_id = 'repair'`,
                     )
                     .get(),
             ).toEqual({ memory_block_cache: "" });

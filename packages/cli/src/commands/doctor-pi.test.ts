@@ -281,6 +281,9 @@ describe("Pi doctor", () => {
         expect(output).toContain("PASS Pi 0.74.0 detected");
         expect(output).toContain("PASS npm:@cortexkit/pi-magic-context is registered");
         expect(output).toContain("PASS SQLite integrity_check: ok");
+        expect(output).toContain(
+            `WARN Magic Context storage is at ${join(root, ".local", "share", "cortexkit", "magic-context")}, outside the folder Engram backs up (~/.local/share/cortexkit/magic-context). It is not included in CortexKit backups.`,
+        );
         expect(output).toContain("Summary: PASS");
         expect(output).toContain("FAIL 0");
     });
@@ -445,7 +448,7 @@ describe("Pi doctor", () => {
         );
         expect(output).toContain("postinstall likely failed");
         expect(output).toContain("Stale Pi extension cache found");
-        expect(output).toContain("WARN 2");
+        expect(output).toContain("WARN 3");
     });
 
     it("skips unrelated local dev-path packages and broken trees when probing the embedding runtime", async () => {
@@ -926,12 +929,13 @@ describe("Pi doctor", () => {
         }
 
         expect(ghCreateCalled).toBe(false);
-        expect(logged.join("\n")).toContain("[pi] Bug title");
+        expect(logged.join("\n")).toContain("[pi] <text omitted>");
         const reportPath = join(cwd, "magic-context-pi-issue-20260428-123456.md");
         expect(existsSync(reportPath)).toBe(true);
         const report = readFileSync(reportPath, "utf-8");
-        expect(report).toContain("[pi] Bug title");
-        expect(report).toContain("<HOME>");
+        expect(report).toContain("[pi] <text omitted>");
+        expect(report).toContain("~/path-");
+        expect(report).not.toContain("Bug title");
         expect(report).not.toContain(root);
         expect(report).not.toContain("abc123");
         expect(report).not.toContain("sk-12345678901234567890");

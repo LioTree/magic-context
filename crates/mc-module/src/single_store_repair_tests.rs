@@ -178,12 +178,21 @@ impl Fixture {
         embedding(&live, 20);
         candidate(&live, 202, 3, 4);
         live.execute(
-            "INSERT INTO session_meta(session_id, cached_m0_bytes, cached_m1_bytes, cached_m0_max_compartment_seq,
-                 cached_m0_last_baseline_end_message_id, pending_compaction_marker_state, memory_block_cache, compaction_marker_state)
-             VALUES (?1, x'01', x'02', 4, 'm45', '{\"ordinal\":48}', 'memories', '{\"boundaryOrdinal\":50}')",
+            "INSERT INTO session_meta(session_id, cached_m0_max_compartment_seq,
+                 cached_m0_last_baseline_end_message_id, pending_compaction_marker_state, compaction_marker_state)
+             VALUES (?1, 4, 'm45', '{\"ordinal\":48}', '{\"boundaryOrdinal\":50}')",
             params![SESSION],
         )
         .unwrap();
+        live.execute("INSERT INTO session_render_cache(session_id,cache_key,value) VALUES (?1,'cached_m0_bytes',x'01'),(?1,'cached_m1_bytes',x'02'),(?1,'memory_block_cache','memories')", params![SESSION]).unwrap();
+        live.execute(
+            "UPDATE session_meta SET served_prefix = ?1, held_release = ?2 WHERE session_id = ?3",
+            params![
+                r#"{"version":1,"head":[{"info":{"role":"user"},"parts":[{"type":"text","text":"frozen head"}]}],"summary":null,"first_kept":{"id":"m26","digest":"frozen-digest"},"cut_mode":{"mode":"inclusive","id":"m25"},"turn":"m1","provenance":{"host":"opencode-v1","id_space":"opencode-v1-message","generation":"v1","projection":"messages","pass":1}}"#,
+                r#"{"version":1,"materialization":"user_flush"}"#,
+                SESSION
+            ],
+        ).unwrap();
         drop(live);
         let store = open_rw(&live_store);
         store
@@ -200,7 +209,7 @@ impl Fixture {
         store
             .execute(
                 "INSERT INTO mc_cache_state(session_id, row_version, core_state, meta, last_activity_at)
-                 VALUES (?1, 1, '{}', '{\"initialized\":true}', 1)",
+                 VALUES (?1, 1, '{}', '{\"initialized\":true,\"held_release\":{\"reason\":\"flush\",\"obligations\":[{\"lane\":\"flush\",\"pending\":true}]}}', 1)",
                 params![SESSION],
             )
             .unwrap();
@@ -376,6 +385,14 @@ fn the_preview_names_the_truncated_session_and_writes_nothing() {
 #[test]
 fn apply_restores_the_backup_history_with_its_ids_and_dependents() {
     let fixture = Fixture::new();
+    let held_before: (String, String) = fixture
+        .live()
+        .query_row(
+            "SELECT served_prefix, held_release FROM session_meta WHERE session_id = ?1",
+            params![SESSION],
+            |row| Ok((row.get(0)?, row.get(1)?)),
+        )
+        .unwrap();
     let report = fixture.apply();
     assert_eq!(report.status, "repaired");
     let live = fixture.live();
@@ -412,8 +429,8 @@ fn apply_restores_the_backup_history_with_its_ids_and_dependents() {
     );
     let meta: SessionMetaAfter = live
         .query_row(
-            "SELECT cached_m0_bytes, cached_m1_bytes, cached_m0_max_compartment_seq, cached_m0_last_baseline_end_message_id,
-                    pending_compaction_marker_state, memory_block_cache, compaction_marker_state
+            "SELECT (SELECT value FROM session_render_cache WHERE session_id=session_meta.session_id AND cache_key='cached_m0_bytes'), (SELECT value FROM session_render_cache WHERE session_id=session_meta.session_id AND cache_key='cached_m1_bytes'), cached_m0_max_compartment_seq, cached_m0_last_baseline_end_message_id,
+                    pending_compaction_marker_state, COALESCE((SELECT value FROM session_render_cache WHERE session_id=session_meta.session_id AND cache_key='memory_block_cache'), ''), compaction_marker_state
                FROM session_meta WHERE session_id = ?1",
             params![SESSION],
             |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?, row.get(4)?, row.get(5)?, row.get(6)?)),
@@ -432,6 +449,21 @@ fn apply_restores_the_backup_history_with_its_ids_and_dependents() {
         ),
         "cached m[0] and the pending marker move are cleared; the host's marker state is kept"
     );
+    let held: (String, String) = open_rw(&fixture.live_context)
+        .query_row(
+            "SELECT served_prefix, held_release FROM session_meta WHERE session_id = ?1",
+            params![SESSION],
+            |row| Ok((row.get(0)?, row.get(1)?)),
+        )
+        .unwrap();
+    assert_eq!(
+        held, held_before,
+        "repair must not replace the served unit or a parked release"
+    );
+    let prefix: serde_json::Value = serde_json::from_str(&held.0).unwrap();
+    assert_eq!(prefix["head"][0]["parts"][0]["text"], "frozen head");
+    assert_eq!(prefix["first_kept"]["id"], "m26");
+    assert_eq!(held.1, r#"{"version":1,"materialization":"user_flush"}"#);
     assert_eq!(
         fixture
             .ids("SELECT COUNT(*) FROM m0_mutation_log WHERE mutation_type = 'compartment_delete'"),
@@ -456,8 +488,12 @@ fn apply_restores_the_backup_history_with_its_ids_and_dependents() {
         )
         .unwrap();
     assert!(
-        meta.contains("\"project_memory_epoch_pending\":true"),
+        meta.contains("\"bootstrap_seed_fold_pending\":true"),
         "{meta}"
+    );
+    assert_eq!(
+        serde_json::from_str::<serde_json::Value>(&meta).unwrap()["held_release"],
+        serde_json::json!({"reason":"flush","obligations":[{"lane":"flush","pending":true}]})
     );
     assert!(fixture.root.join("repair-backup/MANIFEST.tsv").exists());
     // A second preview has nothing left to do.
@@ -578,7 +614,13 @@ fn repair_discards_typescript_memory_ids_with_the_cached_pair() {
     let fixture = Fixture::new();
     let live = fixture.live();
     live.execute(
-        "UPDATE session_meta SET cached_m0_upgrade_state = ?2, memory_block_ids = '[1,2]', memory_block_count = 2 WHERE session_id = ?1",
+        "UPDATE session_meta SET memory_block_count=2 WHERE session_id=?1",
+        [SESSION],
+    )
+    .unwrap();
+    live.execute("INSERT INTO session_meta_chunks(session_id,column_name,chunk,body) VALUES (?1,'memory_block_ids',-1,x''),(?1,'memory_block_ids',0,CAST('[1,2]' AS BLOB))", [SESSION]).unwrap();
+    live.execute(
+        "INSERT INTO session_render_cache(session_id,cache_key,value) VALUES (?1,'cached_m0_upgrade_state',?2)",
         params![SESSION, "ready|compartment-render:cre2|memory-render:mre3|m0-memory-ids:[1]"],
     ).unwrap();
     drop(live);
@@ -586,7 +628,7 @@ fn repair_discards_typescript_memory_ids_with_the_cached_pair() {
     fixture.apply();
     let live = fixture.live();
     let cleared: ClearedCachedPair = live.query_row(
-        "SELECT cached_m0_upgrade_state, cached_m0_bytes, cached_m1_bytes, memory_block_ids, memory_block_count FROM session_meta WHERE session_id = ?1",
+        "SELECT (SELECT value FROM session_render_cache WHERE session_id=session_meta.session_id AND cache_key='cached_m0_upgrade_state'), (SELECT value FROM session_render_cache WHERE session_id=session_meta.session_id AND cache_key='cached_m0_bytes'), (SELECT value FROM session_render_cache WHERE session_id=session_meta.session_id AND cache_key='cached_m1_bytes'), COALESCE((SELECT CAST(group_concat(body, '') AS TEXT) FROM (SELECT body FROM session_meta_chunks WHERE session_id=session_meta.session_id AND column_name='memory_block_ids' AND chunk>=0 ORDER BY chunk)), ''), memory_block_count FROM session_meta WHERE session_id = ?1",
         params![SESSION],
         |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?, row.get(4)?)),
     ).unwrap();
@@ -600,7 +642,7 @@ fn repair_discards_typescript_memory_ids_with_the_cached_pair() {
         )
         .unwrap();
     assert_eq!(
-        serde_json::from_str::<Value>(&meta).unwrap()["project_memory_epoch_pending"],
+        serde_json::from_str::<Value>(&meta).unwrap()["bootstrap_seed_fold_pending"],
         true
     );
 }
@@ -692,4 +734,63 @@ fn rust_module_keeps_typescript_upgrade_metadata_out_of_render_identity() {
             "SESSION_META_RESETS".to_string()
         )]
     );
+}
+
+#[test]
+fn independent_first_transform_after_real_repair_rebuilds_complete_old_pair() {
+    use crate::transform::{
+        tests::{item, memory_input, pctx, req, store},
+        transform,
+    };
+    let fixture = Fixture::new();
+    // Reuse real frozen bytes rather than the fixture's empty core, which would
+    // request a first render even if repair failed to mark the cache stale.
+    let source_dir = tempfile::tempdir().unwrap();
+    let source = store(source_dir.path());
+    source
+        .insert_memory(memory_input(
+            PROJECT,
+            "CONSTRAINTS",
+            "OLD_REPAIR_SENTINEL",
+            0,
+        ))
+        .unwrap();
+    let request = req(SESSION, "unchanged", vec![item("tail", 100, "tail")]);
+    let mut ctx = pctx(PROJECT, "/nonexistent-docs", NOW);
+    ctx.compaction_enabled = false;
+    transform(&source, &request, &ctx).unwrap();
+    let before = source.load(SESSION).unwrap();
+    open_rw(&fixture.live_store)
+        .execute(
+            "UPDATE mc_cache_state SET core_state=?1,meta=?2 WHERE session_id=?3",
+            params![
+                serde_json::to_string(&before.core).unwrap(),
+                serde_json::to_string(&before.meta).unwrap(),
+                SESSION
+            ],
+        )
+        .unwrap();
+    // The repair fixture retains old mirror tables for its SQL assertions. A
+    // runnable migrated store has already dropped those populated tables.
+    open_rw(&fixture.live_store)
+        .execute_batch(mc_store::single_store_schema::MIGRATION_61_DROP_SQL)
+        .unwrap();
+    fixture.apply();
+    let repaired = store(&fixture.root);
+    let reset = repaired.load(SESSION).unwrap();
+    assert_eq!(reset.meta.max_memory_id, before.meta.max_memory_id);
+    assert!(reset.meta.bootstrap_seed_fold_pending);
+    let first = transform(&repaired, &request, &ctx).unwrap();
+    assert_eq!(first.action, "HARD", "{:?}", first.materialize_reason);
+    assert!(!serde_json::to_string(first.messages())
+        .unwrap()
+        .contains("OLD_REPAIR_SENTINEL"));
+    assert!(
+        !repaired
+            .load(SESSION)
+            .unwrap()
+            .meta
+            .bootstrap_seed_fold_pending
+    );
+    assert_ne!(transform(&repaired, &request, &ctx).unwrap().action, "HARD");
 }

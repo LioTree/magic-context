@@ -1,5 +1,5 @@
+import type { ModuleSessionClient } from "./module-session-kernel";
 import { getDefaultSubcConnectionFile, SubcModuleTransport } from "./module-transport";
-import type { RustModeModuleClient } from "./rust-mode-transform";
 
 /**
  * Build the subc-backed module client every host lane uses to reach `ck-mc`.
@@ -19,7 +19,7 @@ export function createSubcModuleClient(options: {
     connectionFile?: string;
     /** Route root recorded on calls that need a bound project. */
     projectRoot: string;
-}): RustModeModuleClient {
+}): ModuleSessionClient {
     const transport = new SubcModuleTransport(
         options.connectionFile ?? getDefaultSubcConnectionFile(),
     );

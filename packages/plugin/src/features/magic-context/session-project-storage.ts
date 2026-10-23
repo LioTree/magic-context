@@ -103,6 +103,7 @@ export function recordSessionProjectIdentity(
     if (
         !projectPath.startsWith("git:") &&
         !projectPath.startsWith("dir:") &&
+        !projectPath.startsWith("pj-") &&
         isUserHomeDirectory(projectPath)
     )
         return;

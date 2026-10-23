@@ -1590,6 +1590,33 @@ export class PiSubagentRunner implements PiRpcHistorianRunner {
 					};
 				}
 				settled = true;
+				if (zenChild) {
+					const classified = classifyZenFreeTierFailure(
+						result,
+						options.model,
+						options.agent,
+						this.invocation.targetHarness,
+					);
+					if (classified !== result && !classified.ok) {
+						sessionLog(
+							options.accountingSessionId ?? "subagent",
+							classified.error,
+						);
+					}
+					result = classified;
+					if (deferredZenStderr && !reportedZenStderr) {
+						emitProgress({
+							type: "stderr",
+							chunk:
+								result.meta?.failureClass === ZEN_FREE_TIER_FAILURE
+									? zenFreeTierMessage(
+											options.agent,
+											this.invocation.targetHarness,
+										)
+									: deferredZenStderr,
+						});
+					}
+				}
 				rpcAlive = false;
 				pendingTurn?.(
 					result.ok
@@ -1700,53 +1727,55 @@ export class PiSubagentRunner implements PiRpcHistorianRunner {
 			// Calibration belongs to this invocation, not to a spawning historian child.
 			delete parentEnv.MAGIC_CONTEXT_HISTORIAN_TEMPERATURE;
 			try {
-				child = this.spawnImpl(
-					this.invocation.command,
-					[...this.invocation.prefixArgs, ...this.extraArgs, ...args],
-					{
-						windowsHide: true,
-						cwd: options.cwd,
-						// Merge over the parent env so PATH/HOME/auth variables flow
-						// through for provider extensions. The guard only disables Magic
-						// Context's full entry; it must not replace the process env.
-						env: {
-							...parentEnv,
-							[MAGIC_CONTEXT_PI_SUBAGENT_ENV]: "1",
-							MAGIC_CONTEXT_SUBAGENT_PROMPT_FILE: systemPromptPath,
-							MAGIC_CONTEXT_SUBAGENT_BUDGET_GUARD_FILE: budgetGuardFile,
-							MAGIC_CONTEXT_SUBAGENT_PROVENANCE_ONLY:
-								options.agent === "rescore" ||
-								/^(magic-context-)?historian(?:-recomp|-editor)?$/.test(
-									options.agent,
-								)
-									? undefined
-									: "1",
-							...(options.temperature !== undefined
-								? {
-										MAGIC_CONTEXT_HISTORIAN_TEMPERATURE: String(
-											options.temperature,
-										),
-									}
-								: {}),
-							...(options.maxOutputTokens !== undefined
-								? {
-										MAGIC_CONTEXT_HISTORIAN_MAX_OUTPUT_TOKENS: String(
-											options.maxOutputTokens,
-										),
-									}
-								: {}),
+				child = inRootAsyncContext(() =>
+					this.spawnImpl(
+						this.invocation.command,
+						[...this.invocation.prefixArgs, ...this.extraArgs, ...args],
+						{
+							windowsHide: true,
+							cwd: options.cwd,
+							// Merge over the parent env so PATH/HOME/auth variables flow
+							// through for provider extensions. The guard only disables Magic
+							// Context's full entry; it must not replace the process env.
+							env: {
+								...parentEnv,
+								[MAGIC_CONTEXT_PI_SUBAGENT_ENV]: "1",
+								MAGIC_CONTEXT_SUBAGENT_PROMPT_FILE: systemPromptPath,
+								MAGIC_CONTEXT_SUBAGENT_BUDGET_GUARD_FILE: budgetGuardFile,
+								MAGIC_CONTEXT_SUBAGENT_PROVENANCE_ONLY:
+									options.agent === "rescore" ||
+									/^(magic-context-)?historian(?:-recomp|-editor)?$/.test(
+										options.agent,
+									)
+										? undefined
+										: "1",
+								...(options.temperature !== undefined
+									? {
+											MAGIC_CONTEXT_HISTORIAN_TEMPERATURE: String(
+												options.temperature,
+											),
+										}
+									: {}),
+								...(options.maxOutputTokens !== undefined
+									? {
+											MAGIC_CONTEXT_HISTORIAN_MAX_OUTPUT_TOKENS: String(
+												options.maxOutputTokens,
+											),
+										}
+									: {}),
+							},
+							// stdout = JSON events; stderr = diagnostics. stdin is a pipe
+							// when we deliver the user message there (always on Windows, or
+							// for oversized prompts elsewhere). Otherwise it stays closed
+							// because the message rides in argv and print-mode would block
+							// reading an open, idle stdin.
+							stdio: [
+								deliverViaStdin || rpcBudget ? "pipe" : "ignore",
+								"pipe",
+								"pipe",
+							],
 						},
-						// stdout = JSON events; stderr = diagnostics. stdin is a pipe
-						// when we deliver the user message there (always on Windows, or
-						// for oversized prompts elsewhere). Otherwise it stays closed
-						// because the message rides in argv and print-mode would block
-						// reading an open, idle stdin.
-						stdio: [
-							deliverViaStdin || rpcBudget ? "pipe" : "ignore",
-							"pipe",
-							"pipe",
-						],
-					},
+					),
 				);
 				childCreated = true;
 			} catch (error) {
@@ -3367,3 +3396,5 @@ export const __test = {
 		loggedUnavailableBuiltinTools.clear();
 	},
 };
+
+import { inRootAsyncContext } from "@magic-context/core/shared/sqlite";

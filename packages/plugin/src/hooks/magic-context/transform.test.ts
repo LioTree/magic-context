@@ -1,5 +1,3 @@
-import { drainNotifications, registerNotificationSink } from "../../shared/rpc-notifications";
-import { createTestTempDirFromPath } from "../../shared/test-temp-dir";
 /// <reference types="bun-types" />
 
 import { afterEach, beforeEach, describe, expect, it, mock, spyOn } from "bun:test";
@@ -7,7 +5,6 @@ import { createHash } from "node:crypto";
 import { mkdirSync, rmSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { dirname, join } from "node:path";
-
 import {
     replaceAllCompartmentState,
     replaceAllCompartments,
@@ -57,6 +54,7 @@ import {
     setPersistedCompactionMarkerState,
 } from "../../features/magic-context/storage-meta-persisted";
 import { addNote } from "../../features/magic-context/storage-notes";
+import { sessionMetaCollectionSelect } from "../../features/magic-context/storage-session-collections";
 import { createTagger } from "../../features/magic-context/tagger";
 import { recordToolDefinition } from "../../features/magic-context/tool-definition-tokens";
 import {
@@ -68,14 +66,17 @@ import { buildSidebarSnapshot } from "../../plugin/rpc-handlers";
 import type { PluginContext } from "../../plugin/types";
 import * as loggerModule from "../../shared/logger";
 import { clearModelsDevCache, refreshModelLimitsFromApi } from "../../shared/models-dev-cache";
+import { drainNotifications, registerNotificationSink } from "../../shared/rpc-notifications";
 import { Database } from "../../shared/sqlite";
 import { closeQuietly } from "../../shared/sqlite-helpers";
+import { createTestTempDirFromPath } from "../../shared/test-temp-dir";
 import type { MarkerUpdateOutcome } from "./compaction-marker-manager";
 import { getActiveCompartmentRun, registerActiveCompartmentRun } from "./compartment-runner";
 import { createToolExecuteAfterHook } from "./hook-handlers";
 import { injectM0M1 } from "./inject-compartments";
 import { captureSlot, getSlot, resetLkgSlotsForTest } from "./lkg-slot";
 import { onNoteTrigger } from "./note-nudger";
+import { requestPendingMaterialization } from "./pending-materialization";
 import { __ignoredNotificationTest } from "./send-session-notification";
 import { clearMessageTokensCache, createTransform } from "./transform";
 
@@ -113,6 +114,12 @@ type TestMessage = {
     };
     parts: TestPart[];
 };
+
+function userFlushSessions(sessionId: string): Set<string> {
+    const sessions = new Set<string>();
+    requestPendingMaterialization(sessions, sessionId, "user_flush");
+    return sessions;
+}
 
 const tempDirs: string[] = [];
 
@@ -356,7 +363,7 @@ describe("createTransform", () => {
                 (
                     db
                         .prepare(
-                            "SELECT merged_reasoning_stripped_ids AS ids FROM session_meta WHERE session_id = ?",
+                            `SELECT ${sessionMetaCollectionSelect("merged_reasoning_stripped_ids", "ids", db)} FROM session_meta WHERE session_id = ?`,
                         )
                         .get(sessionId) as { ids: string }
                 ).ids,
@@ -507,7 +514,7 @@ describe("createTransform", () => {
                 (
                     db
                         .prepare(
-                            "SELECT merged_reasoning_stripped_ids AS ids FROM session_meta WHERE session_id = ?",
+                            `SELECT ${sessionMetaCollectionSelect("merged_reasoning_stripped_ids", "ids", db)} FROM session_meta WHERE session_id = ?`,
                         )
                         .get(sessionId) as { ids: string }
                 ).ids,
@@ -1160,12 +1167,25 @@ describe("createTransform", () => {
         const realDb = openDatabase();
         const preparedSql: string[] = [];
         const tokenQueryIds: string[][] = [];
+        const revisionReads: string[] = [];
         const db = new Proxy(realDb, {
             get(target, prop, receiver) {
                 if (prop === "prepare") {
                     return (sql: string) => {
                         preparedSql.push(sql);
                         const statement = target.prepare.call(target, sql);
+                        if (sql.includes("session_meta_collection_revisions AS revisions"))
+                            return new Proxy(statement, {
+                                get(stmt, key) {
+                                    if (key === "get")
+                                        return (...params: Parameters<typeof stmt.get>) => {
+                                            revisionReads.push(String(params[0]));
+                                            return stmt.get(...params);
+                                        };
+                                    const value = Reflect.get(stmt, key);
+                                    return typeof value === "function" ? value.bind(stmt) : value;
+                                },
+                            });
                         if (
                             !sql.includes("tags.reasoning_token_count") ||
                             !sql.includes("status = 'active'")
@@ -1240,6 +1260,7 @@ describe("createTransform", () => {
         expect(tokenQueryIds).toHaveLength(1);
         tokenQueryIds.length = 0;
         preparedSql.length = 0;
+        revisionReads.length = 0;
         const second = structuredClone(input);
         await transform({}, { messages: second });
 
@@ -1248,8 +1269,8 @@ describe("createTransform", () => {
             preparedSql.filter((sql) => sql.includes("SELECT historian_failure_count")).length,
         ).toBe(1);
         expect(
-            preparedSql.filter((sql) => sql.includes("SELECT stale_reduce_stripped_ids")).length,
-        ).toBe(1);
+            revisionReads.filter((column) => column === "stale_reduce_stripped_ids"),
+        ).toHaveLength(1);
         expect(preparedSql.some((sql) => sql.includes("SELECT last_response_time FROM"))).toBe(
             false,
         );
@@ -1460,36 +1481,14 @@ describe("createTransform", () => {
         expect(bySession.get(shortSession)?.tool_call_tokens).toBe(0);
         expect(bySession.get(toolSession)?.tool_call_tokens).toBeGreaterThan(0);
 
-        const moduleStatus = {
-            usage: { current_total_input_tokens: 10_000, context_limit_tokens: 100_000 },
-        };
-        const shortSnapshot = buildSidebarSnapshot(
-            db,
-            shortSession,
-            process.cwd(),
-            undefined,
-            undefined,
-            undefined,
-            moduleStatus,
-        );
-        const longSnapshot = buildSidebarSnapshot(
-            db,
-            longSession,
-            process.cwd(),
-            undefined,
-            undefined,
-            undefined,
-            moduleStatus,
-        );
-        const toolSnapshot = buildSidebarSnapshot(
-            db,
-            toolSession,
-            process.cwd(),
-            undefined,
-            undefined,
-            undefined,
-            moduleStatus,
-        );
+        // The sidebar spreads the last measured input over its buckets, so give
+        // each session a reading to spread.
+        db.prepare(
+            "UPDATE session_meta SET last_input_tokens = 10000, last_context_percentage = 10 WHERE session_id IN (?, ?, ?)",
+        ).run(shortSession, longSession, toolSession);
+        const shortSnapshot = buildSidebarSnapshot(db, shortSession, process.cwd());
+        const longSnapshot = buildSidebarSnapshot(db, longSession, process.cwd());
+        const toolSnapshot = buildSidebarSnapshot(db, toolSession, process.cwd());
         expect(shortSnapshot.toolCallTokens).toBe(0);
         expect(toolSnapshot.toolCallTokens).toBeGreaterThan(0);
         expect(shortSnapshot.conversationTokens).not.toBe(toolSnapshot.conversationTokens);
@@ -1758,7 +1757,7 @@ describe("createTransform", () => {
         // postprocess `isExplicitFlush`) — that's what gates heuristic
         // execution and `isCacheBustingPass`.
         const flushedHistory = new Set<string>(["ses-compartment-dropped-carrier"]);
-        const flushedMaterialization = new Set<string>(["ses-compartment-dropped-carrier"]);
+        const flushedMaterialization = userFlushSessions("ses-compartment-dropped-carrier");
         replaceAllCompartments(db, "ses-compartment-dropped-carrier", [
             {
                 sequence: 0,
@@ -2224,7 +2223,7 @@ describe("createTransform", () => {
             ]),
             db: openDatabase(),
             historyRefreshSessions: new Set<string>(),
-            pendingMaterializationSessions: new Set<string>([sessionId]),
+            pendingMaterializationSessions: userFlushSessions(sessionId),
             lastHeuristicsTurnId: new Map<string, string>(),
             clearReasoningAge: 50,
             protectedTokens: 0,
@@ -2321,9 +2320,9 @@ describe("createTransform", () => {
             });
         }
         queuePendingOp(db, "ses-1", 1, "drop");
-        pendingMaterializationSessions.add("ses-1");
+        requestPendingMaterialization(pendingMaterializationSessions, "ses-1", "user_flush");
         queuePendingOp(db, "ses-1", 2, "drop");
-        pendingMaterializationSessions.add("ses-1");
+        requestPendingMaterialization(pendingMaterializationSessions, "ses-1", "user_flush");
         shouldExecute.mockImplementation(() => "execute");
 
         const secondPass: TestMessage[] = [
@@ -2407,7 +2406,7 @@ describe("createTransform", () => {
         // Three-set refactor: flush simulation now seeds the persistent
         // pending-materialization signal (read by postprocess as
         // isExplicitFlush) plus history-refresh (consumed by transform).
-        pendingMaterializationSessions.add("ses-1");
+        requestPendingMaterialization(pendingMaterializationSessions, "ses-1", "user_flush");
         historyRefreshSessions.add("ses-1");
 
         const secondPass: TestMessage[] = [
@@ -2705,7 +2704,7 @@ describe("createTransform", () => {
 
         await transform({}, { messages: firstPass });
         queuePendingOp(db, "ses-sub-drop", 2, "drop", Date.now());
-        pendingMaterializationSessions.add("ses-sub-drop");
+        requestPendingMaterialization(pendingMaterializationSessions, "ses-sub-drop", "user_flush");
 
         const secondPass: TestMessage[] = [
             {
@@ -2994,7 +2993,7 @@ describe("createTransform", () => {
         );
         expect(firstTag?.tagNumber).toBe(1);
         queuePendingOp(db, sessionId, 1, "drop");
-        pendingMaterializationSessions.add(sessionId);
+        requestPendingMaterialization(pendingMaterializationSessions, sessionId, "user_flush");
 
         decision = "execute";
         await transform({}, { messages });
@@ -3027,7 +3026,7 @@ describe("createTransform", () => {
             ]),
             db,
             historyRefreshSessions: new Set<string>(),
-            pendingMaterializationSessions: new Set<string>(["ses-primary-once"]),
+            pendingMaterializationSessions: userFlushSessions("ses-primary-once"),
             lastHeuristicsTurnId,
             clearReasoningAge: 50,
             protectedTokens: 0,
@@ -3180,7 +3179,7 @@ describe("createTransform", () => {
 
         const db = openDatabase();
         queuePendingOp(db, "ses-multi", 1, "drop");
-        pendingMaterializationSessions.add("ses-multi");
+        requestPendingMaterialization(pendingMaterializationSessions, "ses-multi", "user_flush");
 
         const secondPass: TestMessage[] = [
             {
@@ -3246,7 +3245,7 @@ describe("createTransform", () => {
         const db = openDatabase();
         const assistantTextTag = 2;
         queuePendingOp(db, "ses-think", assistantTextTag, "drop");
-        pendingMaterializationSessions.add("ses-think");
+        requestPendingMaterialization(pendingMaterializationSessions, "ses-think", "user_flush");
         shouldExecute.mockImplementation(() => "execute");
 
         const secondPass: TestMessage[] = [
@@ -4798,7 +4797,7 @@ describe("live transform protected-token window", () => {
             ]),
             db,
             historyRefreshSessions: new Set<string>(),
-            pendingMaterializationSessions: new Set([options.sessionId]),
+            pendingMaterializationSessions: userFlushSessions(options.sessionId),
             lastHeuristicsTurnId: new Map<string, string>(),
             clearReasoningAge: 50,
             protectedTokens: options.protectedTokens,
@@ -5141,8 +5140,8 @@ for (const { modelID, prefixBound } of [
             getTagsBySession(db, sessionId).find((t) => t.tagNumber === tag)?.status;
         const logs = spyOn(loggerModule, "sessionLog").mockImplementation(() => {});
         try {
-            // Cache m[0]/m[1] before signed thinking enters the tool loop.
-            await transform({}, { messages: structuredClone(raw.slice(0, 1)) });
+            // Publish the current user request before simulating its signed tool reply.
+            await transform({}, { messages: structuredClone(raw.slice(0, 4)) });
             const baseline = await pass();
             expect(getOrCreateSessionMeta(db, sessionId).cachedM0Bytes).not.toBeNull();
             const tools = getTagsBySession(db, sessionId)
@@ -5159,7 +5158,7 @@ for (const { modelID, prefixBound } of [
                 hasUsageTokens: true,
             });
             // A primary applies queued drops on a cache-busting pass; request one.
-            pendingMaterializationSessions.add(sessionId);
+            requestPendingMaterialization(pendingMaterializationSessions, sessionId, "user_flush");
             const executed = await pass();
             // Either way, the active turn's thinking reaches the provider unchanged.
             expect(activeThinking(executed)).toBe(activeThinking(baseline));
@@ -5194,7 +5193,7 @@ for (const { modelID, prefixBound } of [
                 info: { id: "prompt-3", role: "user", sessionID: sessionId },
                 parts: [{ type: "text", text: "third task" }],
             });
-            pendingMaterializationSessions.add(sessionId);
+            requestPendingMaterialization(pendingMaterializationSessions, sessionId, "user_flush");
             const released = await pass();
             expect(JSON.stringify(released)).not.toContain("OLD-SPENT");
             expect(JSON.stringify(released)).not.toContain("ACTIVE-SPENT");
@@ -5209,7 +5208,7 @@ for (const { modelID, prefixBound } of [
                 expect(
                     logs.mock.calls.filter((call) => String(call[1]).includes("m[0]/m[1] frozen:")),
                 ).toHaveLength(2);
-                await transform.clearRustSession(sessionId);
+                transform.clearSessionLogState(sessionId);
                 await pass();
                 expect(
                     logs.mock.calls.filter((call) => String(call[1]).includes("m[0]/m[1] frozen:")),
@@ -5379,6 +5378,7 @@ it("a flush in a held signed turn is parked through execute and defer passes and
                 ],
             },
         );
+        await transform({}, { messages: structuredClone(source.slice(0, -1)) });
         const baseline = JSON.stringify(await serve());
         const old = getTagsBySession(db, sessionId).filter(
             (tag) =>
@@ -5407,7 +5407,7 @@ it("a flush in a held signed turn is parked through execute and defer passes and
                 .filter((tag) => tag.status === "active"),
         ).toHaveLength(33);
         expect(getStrippedPlaceholderIds(db, sessionId).has("held-placeholder")).toBe(false);
-        flush.add(sessionId);
+        requestPendingMaterialization(flush, sessionId, "user_flush");
         updateSessionMeta(db, sessionId, { systemPromptHash: "after" });
         expect(JSON.stringify(await serve())).toBe(baseline);
         expect(getPendingOps(db, sessionId)).toHaveLength(33);
@@ -5529,6 +5529,30 @@ for (const trigger of ["wall", "final fit"] as const)
                 });
                 await serve();
                 const tag = getTagsBySession(db, sessionId).find((tag) => tag.type === "tool")!;
+                // Establish the active turn while its mandatory user text fits
+                // a larger advertised window, then shrink the window before
+                // testing emergency reclaim. The signed request bytes stay fixed.
+                source.push({
+                    info: { id: "active-user", role: "user", sessionID: sessionId },
+                    parts: [
+                        {
+                            type: "text",
+                            text: outcome === "fits" ? "continue" : "MANDATORY_USER ".repeat(90000),
+                        },
+                    ],
+                });
+                usage.set(sessionId, {
+                    usage: { percentage: 20, inputTokens: 2_000_000 },
+                    updatedAt: Date.now(),
+                    hasUsageTokens: true,
+                });
+                await serve();
+                source.pop();
+                usage.set(sessionId, {
+                    usage: { percentage: 20, inputTokens: 20_000 },
+                    updatedAt: Date.now(),
+                    hasUsageTokens: true,
+                });
                 (source[1].parts[0] as ToolPart).state.output = "RECLAIMABLE ".repeat(60000);
                 source.push(
                     {
@@ -5780,7 +5804,11 @@ describe("sticky nudge request-byte stability", () => {
                 lastResponseTime: Date.now() - 2 * 60 * 60 * 1000,
                 cacheTtl: "5m",
             });
-            f.pendingMaterializationSessions.add("rewritten-head-note");
+            requestPendingMaterialization(
+                f.pendingMaterializationSessions,
+                "rewritten-head-note",
+                "user_flush",
+            );
             f.force();
             const rewritten = await f.serve();
             expect(JSON.stringify(rewritten[0])).toContain(

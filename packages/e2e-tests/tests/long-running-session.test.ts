@@ -18,6 +18,7 @@ import {
 import { buildMockHistorianPayload, findHistorianOrdinalRange } from "../src/mock-historian";
 import type { MockUsage } from "../src/mock-provider/server";
 import { openTestDb } from "../src/test-db";
+import { sessionMetaFieldSelect } from "../src/session-meta-fields";
 
 const HISTORIAN_SYSTEM_MARKER = "the hippocampus of a long-running coding agent";
 const RUST_MODE = process.env.MC_E2E_MODE === "rust";
@@ -558,7 +559,7 @@ forEachHost(import.meta.url, "long-running OpenCode Magic Context session", (hos
         replayNudgeMarker = await send(sessionId, "turn 15: note nudge sticky replay should be byte-identical", "phase 3 nudge replay");
         const replayNudgeBody = (await mainRequestForMarker(replayNudgeMarker)).body;
         expect(JSON.stringify(replayNudgeBody)).toContain("notes ready");
-        expect(readMeta<{ note_nudge_anchors: string }>(sessionId, "note_nudge_anchors")?.note_nudge_anchors ?? "").toContain("notes ready");
+        expect(readMeta<{ note_nudge_anchors: string }>(sessionId, sessionMetaFieldSelect("note_nudge_anchors"))?.note_nudge_anchors ?? "").toContain("notes ready");
         }
         // The 15-minute cooldown uses process-local wall-clock time; this long test cannot advance it without sleeping.
 
@@ -736,7 +737,7 @@ forEachHost(import.meta.url, "long-running OpenCode Magic Context session", (hos
         const autoRequests = requestsSince(beforeAutoSearch);
         expect(autoRequests.length).toBeGreaterThanOrEqual(1);
         const hinted = autoRequests.map((request) => latestUserText(request.body)).filter((text) => text.includes("<ctx-search-hint>"));
-        const autoSearchDecisions = readMeta<{ auto_search_hint_decisions: string }>(sessionId, "auto_search_hint_decisions")?.auto_search_hint_decisions ?? "";
+        const autoSearchDecisions = readMeta<{ auto_search_hint_decisions: string }>(sessionId, sessionMetaFieldSelect("auto_search_hint_decisions"))?.auto_search_hint_decisions ?? "";
         if (hinted.length > 0) {
             expect(hinted[0]).toContain("zebra cache ritual");
             if (hinted.length > 1) expect(hinted[hinted.length - 1]).toBe(hinted[0]);

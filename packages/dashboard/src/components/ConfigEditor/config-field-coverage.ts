@@ -114,6 +114,8 @@ export const OMITTED_BY_DESIGN: Readonly<Record<string, string>> = {
   "historian.disable": "advanced agent registration control; raw JSONC",
   "historian.expand_tools": "custom tool expansion templates; raw JSONC",
   "historian.host_runner": "advanced host runner ownership; raw JSONC",
+  "historian.broca":
+    "ck-mc's Broca-specific model chain; raw JSONC because the dashboard's model catalogs cover OpenCode, Pi, and OMP",
   "historian.two_pass": "advanced historian editor pass; raw JSONC",
   "historian.disallowed_tools": "legacy compatibility option; raw JSONC",
   ...Object.fromEntries(
@@ -141,11 +143,13 @@ export const OMITTED_BY_DESIGN: Readonly<Record<string, string>> = {
   subc: "user-only subc daemon routing; raw JSONC because project configs cannot provide this connection",
   shadow_embedding: "developer-only shadow embedding lane; raw JSONC and never a dashboard knob",
   transform_mode:
-    "experimental project-wide Rust runtime cutover; requires user-level subc configuration and is not exposed in the dashboard yet",
+    "deprecated and ignored; every host runs the TypeScript transform and old configs remain loadable",
   rust_pipeline:
-    "experimental user-only Rust provider pipeline; applies only to OpenCode with Rust transform mode and remains editable in Raw JSONC",
+    "deprecated and ignored; the in-tree Rust provider pipeline is no longer selectable and old configs remain loadable",
   rust_provider_preparation:
     "experimental user-only switch for prepared provider policy in the Rust provider pipeline; off by default and editable in Raw JSONC",
+  rust_background_enabled:
+    "experimental user-only switch letting ck-mc run the dream tasks it publishes; off by default and editable in Raw JSONC",
   signed_thinking_hold:
     "experimental user-only signed-thinking trigger parking; off by default and editable in Raw JSONC",
   fail_closed_blocking:

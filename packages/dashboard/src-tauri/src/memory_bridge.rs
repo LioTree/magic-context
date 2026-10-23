@@ -13,7 +13,7 @@ pub async fn request(path: &Path, method: &str, params: Value) -> Result<Value, 
         if method == "memory.restore" {
             value["decisionKey"] = params["decisionKey"].clone();
             value["restoredDecisionKey"] = Value::Null;
-            value["adoption"] = json!("dashboard_epoch_hard");
+            value["adoption"] = json!("next_allowed_bust");
         }
         value
     }

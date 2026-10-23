@@ -114,14 +114,15 @@ import {
     producerWindowFailureReason,
 } from "./producer-window-guard";
 import {
+    type BoundarySnapshotValidationResult,
     createDefaultBoundarySnapshotForTests,
     describeBoundaryDiagnostics,
     hasRunnableCompartmentWindow,
     recordHighPressureNoEligibleHead,
     resolveOpenCodeProtectedTailBoundary,
     selectPerRunCap,
-    validateBoundarySnapshot,
 } from "./protected-tail-boundary";
+import { validateBoundarySnapshotOffThread } from "./raw-exact-ordinal-read";
 import {
     getRawSessionTagKeysThrough,
     hasRawMessageProvider,
@@ -133,7 +134,7 @@ import {
 } from "./read-session-chunk";
 import { getMessageTimesFromOpenCodeDb } from "./read-session-db";
 import { estimateTokens } from "./read-session-formatting";
-import { isStrictGapHealingMessage } from "./read-session-raw";
+import { isStrictGapHealingMessage, RawOrdinalsNotReady } from "./read-session-raw";
 import { readEffectiveReferenceCompartments } from "./score-projection";
 import { sendStatusNotification } from "./send-session-notification";
 
@@ -365,11 +366,27 @@ export async function runCompartmentAgent(deps: HiddenCompartmentRunnerDeps): Pr
         }
     };
 
+    // Exact ordinals that are not ready yet are a normal answer, not a historian
+    // failure: this start is skipped without a failure count, notice or backoff,
+    // and the next transform pass that fires the trigger starts it again.
+    let historianRunStarted = false;
+    const deferUntilOrdinalsReady = (reason: string): void => {
+        sessionLog(
+            sessionId,
+            `historian deferred: exact ordinals not ready (${reason}); a later pass starts it again`,
+        );
+        telemetry.status = "noop";
+        telemetry.failureReason = `ordinals_not_ready: ${reason}`;
+        rollbackDrainReservation();
+    };
+
     updateSessionMeta(db, sessionId, { compartmentInProgress: true });
 
     try {
-        if (!ordinalsReady)
-            throw new Error("Session ordinals are warming; retry the historian shortly.");
+        if (!ordinalsReady) {
+            deferUntilOrdinalsReady("ordinal warm-up still running");
+            return;
+        }
         const openCodeDbResolution = resolveOpenCodeDbPath();
         if (!openCodeDbPathExists(openCodeDbResolution) && !hasRawMessageProvider(sessionId)) {
             telemetry.status = "noop";
@@ -472,15 +489,22 @@ export async function runCompartmentAgent(deps: HiddenCompartmentRunnerDeps): Pr
             rollbackDrainReservation();
             return;
         }
-        let validation =
-            boundarySnapshot.rawRangeFingerprint.length > 0
-                ? validateBoundarySnapshot({
-                      db,
-                      snapshot: boundarySnapshot,
-                      currentContextLimit:
-                          deps.currentContextLimit ?? boundarySnapshot.contextLimit,
-                  })
-                : { ok: true };
+        let validation: BoundarySnapshotValidationResult = { ok: true };
+        if (boundarySnapshot.rawRangeFingerprint.length > 0) {
+            // The exact id reads scan the session up to each checked ordinal, so
+            // they run on a worker; this run waits for them without blocking the
+            // thread that serves every session.
+            const checked = await validateBoundarySnapshotOffThread({
+                db,
+                snapshot: boundarySnapshot,
+                currentContextLimit: deps.currentContextLimit ?? boundarySnapshot.contextLimit,
+            });
+            if (checked.kind === "not-ready") {
+                deferUntilOrdinalsReady(`boundary validation ${checked.reason}`);
+                return;
+            }
+            validation = checked.result;
+        }
         // In an active session the protected tail's newest message changes every
         // turn (a fresh user/assistant message lands), so a snapshot captured at
         // trigger time goes stale on the "last ordinal id" check by the time the
@@ -581,11 +605,18 @@ export async function runCompartmentAgent(deps: HiddenCompartmentRunnerDeps): Pr
         // reconcile step compares the fact with existing memory instead.
         const turnOneLane = resolveTurnOneLane(deps.memoryLifecycleLane);
         const anchoredFacts = turnOneLane === "enabled" && deps.memoryEnabled !== false;
-        const memories = anchoredFacts
-            ? []
-            : getMemoriesByProject(db, projectPath, ["active", "permanent"]);
+        // Every attempt in the chain (configured fallbacks, then the session
+        // model as the last resort) sends this same prompt, so size it for each
+        // of their windows too, resolved as their pre-send check resolves them.
+        const fallbackWindows = [
+            ...(deps.fallbackModels ?? []).map((entry) => toModelEntry(entry)?.model),
+            deps.fallbackModelId,
+        ]
+            .filter((key): key is string => typeof key === "string" && key !== producerModel)
+            .map((key) => resolveHistorianProducerWindow(key, deps.historianMaxOutputTokens));
         const promptFit = fitHistorianPrompt({
             window: producerWindow,
+            fallbackWindows,
             systemPrompt: withContentLanguageDirective(
                 historianSystemPrompt(turnOneLane === "enabled"),
                 deps.language,
@@ -599,9 +630,11 @@ export async function runCompartmentAgent(deps: HiddenCompartmentRunnerDeps): Pr
                 sessionId,
                 priorCompartments,
             ),
-            memories,
+            memories: () =>
+                anchoredFacts ? [] : getMemoriesByProject(db, projectPath, ["active", "permanent"]),
             memoryEnabled: deps.memoryEnabled !== false,
             anchoredFacts,
+            userObservationsRequested: deps.userObservationsRequested,
         });
         if (!promptFit.ok) {
             telemetry.failureReason = promptFit.reason;
@@ -775,6 +808,7 @@ export async function runCompartmentAgent(deps: HiddenCompartmentRunnerDeps): Pr
         // the active-run registration; a synchronous no-op above never reaches
         // here, so its lingering registration is cleared instead of blocking the
         // same transform pass's pending-op drain.
+        historianRunStarted = true;
         deps.onHistorianRunStarted?.();
 
         // v2 bounded reference model (replaces the unbounded existing_state dump):
@@ -794,6 +828,7 @@ export async function runCompartmentAgent(deps: HiddenCompartmentRunnerDeps): Pr
             inputSource: `Messages ${chunk.startIndex}-${chunk.endIndex}:\n\n${chunkText}`,
             memoryEnabled: deps.memoryEnabled !== false,
             anchoredFacts,
+            userObservationsRequested: deps.userObservationsRequested,
         });
 
         // Intentional: session.get failure is non-fatal — we fall back to deps.directory
@@ -878,8 +913,9 @@ export async function runCompartmentAgent(deps: HiddenCompartmentRunnerDeps): Pr
             turnTwoEnabled: turnOneLane === "enabled",
         });
         retainedChild = validatedPass.ok ? validatedPass.retainedChild : undefined;
-        // A window refusal here comes from a fallback model (the primary was fitted
-        // above). Treat it like any other failed pass: count it, notify, and keep
+        // A window refusal here comes from a fallback too small to hold even a
+        // minimal prompt (every other chain model was fitted above). Treat it like
+        // any other failed pass: count it, notify, and keep
         // the reserved drain budget spent so the next trigger does not retry at once.
         if (!validatedPass.ok) {
             // Always track historian failures regardless of usage percentage.
@@ -1560,6 +1596,12 @@ export async function runCompartmentAgent(deps: HiddenCompartmentRunnerDeps): Pr
             });
         }
     } catch (error: unknown) {
+        if (error instanceof RawOrdinalsNotReady && !historianRunStarted) {
+            // A bounded read (count, fingerprint or chunk) found its ordinal
+            // ranks still warming. Nothing was sent to the historian yet.
+            deferUntilOrdinalsReady("bounded read refused");
+            return;
+        }
         const desc = describeError(error);
         if (publishCommitted) {
             // The publication is durable and was signaled right after COMMIT. Counting this

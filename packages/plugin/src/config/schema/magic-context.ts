@@ -257,6 +257,37 @@ export const OmpHarnessBlockSchema = z
     .describe("Strict OMP model-resolution block. It accepts no OpenCode vocabulary.");
 export type OmpHarnessBlock = z.infer<typeof OmpHarnessBlockSchema>;
 
+/** Strict model-resolution block used by historian.broca. */
+const BrocaEntryObjectSchema = z
+    .object({
+        model: z.string().describe("Broca model ID (for example, provider/model)."),
+        variant: z.string().optional().describe("Broca reasoning variant for this entry."),
+    })
+    .strict();
+const BrocaEntrySchema = z.union([
+    z.string().describe("Broca model ID (for example, provider/model)."),
+    BrocaEntryObjectSchema,
+]);
+export const BrocaHarnessBlockSchema = z
+    .object({
+        model: BrocaEntrySchema.optional().describe("Primary Broca model entry."),
+        fallback_models: z
+            .array(BrocaEntrySchema)
+            .optional()
+            .describe("Ordered fallback Broca entries."),
+        variant: z
+            .string()
+            .optional()
+            .describe(
+                "Broca reasoning variant for the primary entry when it declares none. Fallback entries declare variants per-entry.",
+            ),
+    })
+    .strict()
+    .describe(
+        "Strict user-level Broca model-resolution block for ck-mc sessions. Its free-form variant string is forwarded as model.variant in the Broca llm-runner session.send request. When no primary is configured, ck-mc tries the session model after configured fallbacks. TypeScript hosts validate this block but do not resolve models from it.",
+    );
+export type BrocaHarnessBlock = z.infer<typeof BrocaHarnessBlockSchema>;
+
 /** Strict OpenCode-only execution override for one dreamer task. */
 export const OpenCodeTaskExecutionSchema = z
     .object({
@@ -443,6 +474,7 @@ const ProfileHistorianSchema = z
         opencode: ProfileOpenCodeModelBlockSchema.optional(),
         pi: ProfilePiModelBlockSchema.optional(),
         omp: ProfileOmpModelBlockSchema.optional(),
+        broca: BrocaHarnessBlockSchema.optional(),
     })
     .strict();
 const ProfileDreamerSchema = z
@@ -613,6 +645,8 @@ export const DreamTasksSchema = z
         ),
         "review-user-memories": ReviewUserMemoriesTaskConfigSchema.default(() =>
             ReviewUserMemoriesTaskConfigSchema.parse(defaultTaskConfig("review-user-memories")),
+        ).describe(
+            "Promote recurring user observations into the <user-profile> block. A non-empty schedule also makes the historian collect user observations, but only while the dreamer is runnable (dreamer.disable not true); collection and review follow that one gate and do not depend on memory.enabled.",
         ),
         "promote-primers": PromotePrimersTaskConfigSchema.default(() =>
             PromotePrimersTaskConfigSchema.parse(defaultTaskConfig("promote-primers")),
@@ -644,12 +678,17 @@ export const DreamerConfigSchema = AgentMetadataSchema.extend({
     // Its own node rather than the one shared with the historian through
     // AgentMetadataSchema: `dreamer.disable` is a live-reload key and the
     // historian's is not, and the live marker is set on the schema node.
-    disable: z.boolean().optional().describe("Disable this agent"),
+    disable: z
+        .boolean()
+        .optional()
+        .describe(
+            "Disable the dreamer: no scheduled or manual dream task runs. Also turns off smart notes (ctx_note drops surface_condition even with smart_notes.enabled true) and the historian's collection of user observations for review-user-memories. dreamer.inject_docs still applies.",
+        ),
     runner: z
         .enum(["broca", "host"])
         .optional()
         .describe(
-            'Which side runs the dreamer completions the Rust module routes (classify-memories) in Rust transform mode: "host" runs them on this process\'s carrier, "broca" routes them to the Broca module. When unset, historian.runner applies, and when that is unset too the harness decides the same way it does for the historian. User-level config only.',
+            'Only for sessions the ck-mc module serves (through the CortexKit bridge, Broca or the Claude Code gateway): which side runs the dreamer completions the module routes (classify-memories). "host" runs them on the host\'s own carrier, "broca" routes them to the Broca module. When unset, historian.runner applies, and when that is unset too the harness decides the same way it does for the historian. The TypeScript dreamer runs its tasks in this process and does not read this setting. User-level config only.',
         ),
     opencode: DreamerOpenCodeHarnessBlockSchema.optional(),
     pi: DreamerPiHarnessBlockSchema.optional(),
@@ -659,14 +698,15 @@ export const DreamerConfigSchema = AgentMetadataSchema.extend({
         .boolean()
         .default(true)
         .describe(
-            "Inject ARCHITECTURE.md and STRUCTURE.md into the m[0] `<project-docs>` block (default true)",
+            "Inject ARCHITECTURE.md and STRUCTURE.md into the m[0] `<project-docs>` block (default true). Not a dreamer setting despite its place under dreamer: it applies on every host, also with dreamer.disable true.",
         ),
 });
 export type DreamerConfig = z.infer<typeof DreamerConfigSchema>;
 
 /**
- * Historian metadata remains harness-independent. Only model resolution moves to
- * the strict opencode, pi, and omp blocks; two_pass and disallowed_tools stay here.
+ * Historian metadata remains harness-independent. Model resolution moves to strict
+ * per-harness blocks; two_pass and disallowed_tools stay here. TypeScript hosts do
+ * not resolve models from historian.broca, but validate the block for ck-mc sessions.
  */
 export const HistorianConfigSchema = AgentMetadataSchema.extend({
     expand_tools: z
@@ -687,11 +727,12 @@ export const HistorianConfigSchema = AgentMetadataSchema.extend({
     opencode: OpenCodeHarnessBlockSchema.optional(),
     pi: PiHarnessBlockSchema.optional(),
     omp: OmpHarnessBlockSchema.optional(),
+    broca: BrocaHarnessBlockSchema.optional(),
     runner: z
         .enum(["broca", "host"])
         .optional()
         .describe(
-            'Which side runs the historian completion in Rust transform mode: "host" queues it for this process to run on the configured historian model, "broca" routes it to the Broca module. When unset the harness decides: OpenCode 1 and OpenCode 2 use "host", Claude Code (through the Thalamus gateway, which has no host to run a completion) uses "broca". User-level config only — it decides whose provider account pays for the call.',
+            'Only for sessions the ck-mc module serves (through the CortexKit bridge, Broca or the Claude Code gateway): which side runs the historian completion. "host" queues it for a host process to run on the configured historian model, "broca" routes it to the Broca module. When unset the harness decides: OpenCode 1 and OpenCode 2 use "host", Claude Code (through the Thalamus gateway, which has no host to run a completion) uses "broca". The TypeScript historian runs in this process and does not read this setting. User-level config only — it decides whose provider account pays for the call.',
         ),
     host_runner: z
         .object({
@@ -929,13 +970,15 @@ export interface MagicContextConfig {
     /** User-level setting that lets a session in the canonical home directory use project memory. */
     allow_home_project: boolean;
     mural: MuralConfig;
-    /** Selects the runtime implementation for this project. Rust mode is experimental and requires user-level subc configuration. */
+    /** Deprecated and ignored. The loader always resolves this to "ts": every host runs the TypeScript transform. */
     transform_mode: "ts" | "rust";
-    /** Opt-in host provider pipeline; full_request preserves the existing Rust adapter. */
+    /** Deprecated and ignored. The loader always resolves this to "full_request". */
     rust_pipeline?: "full_request" | "provider";
     /** User-only opt-in for unfinished signed-thinking trigger parking and release obligations. */
     signed_thinking_hold?: "off" | "on";
     rust_provider_preparation?: boolean;
+    /** User-only opt-in that lets ck-mc run the dream tasks it publishes as its own. */
+    rust_background_enabled?: boolean;
     /** Auto-update the cached OpenCode plugin wrapper when a newer npm version is available.
      *  USER config only; project configs cannot disable it. Default: true. */
     auto_update?: boolean;
@@ -1143,14 +1186,16 @@ export const MagicContextConfigSchema = z
             .enum(["ts", "rust"])
             .default("ts")
             .describe(
-                'Experimental: routes the entire Magic Context runtime for the project through the ck-mc Rust module over subc (requires user-level `subc` config); "ts" is the current TypeScript pipeline.',
-            ),
+                "Deprecated: ignored. Magic Context always runs its TypeScript transform; sessions on the Rust step contract are served by the CortexKit bridge. Remove this key; it no longer does anything.",
+            )
+            .meta({ deprecated: true }),
         rust_pipeline: z
             .enum(["full_request", "provider"])
             .default("full_request")
             .describe(
-                'Experimental, user-level only, not for production use: off by default (full_request). The provider pipeline applies only with transform_mode: "rust" on OpenCode; full_request keeps the legacy request adapter.',
-            ),
+                "Deprecated: ignored. The in-tree Rust provider pipeline is no longer selectable; sessions on the Rust step contract are served by the CortexKit bridge. Remove this key; it no longer does anything.",
+            )
+            .meta({ deprecated: true }),
         signed_thinking_hold: z
             .enum(["off", "on"])
             .default("off")
@@ -1162,6 +1207,12 @@ export const MagicContextConfigSchema = z
             .default(false)
             .describe(
                 "Experimental, user-level only: consume revision-matched provider hook preparation; disabled by default pending byte/state and timing review.",
+            ),
+        rust_background_enabled: z
+            .boolean()
+            .default(false)
+            .describe(
+                "Experimental, user-level only: let the ck-mc module run the dream tasks it publishes as its own. A host attached to ck-mc then skips exactly those tasks; every other task, and every task on a host without ck-mc, keeps running here. Off by default.",
             ),
         auto_update: z
             .boolean()
@@ -1198,13 +1249,13 @@ export const MagicContextConfigSchema = z
                 "Select a named user-owned model profile. A valid project name overrides this user default; an empty string, null, or other non-string project value is ignored with a warning so the user selection still applies. Unknown names warn and use the base configuration.",
             ),
         profiles: ConfigProfilesSchema.optional().describe(
-            "User-level named model profiles. A profile may contain only historian/dreamer model, fallback_models, OpenCode variant, and Pi/OMP thinking_level fields; task execution policy (including timeout_minutes) is excluded. Project configs may select a name but cannot define profiles.",
+            "User-level named model profiles. Profiles may set model and fallback_models in historian and dreamer blocks, plus variant for OpenCode and Broca or thinking_level for Pi and OMP. They cannot set task execution policy, including timeout_minutes. Project configs may select a name but cannot define profiles.",
         ),
         historian: HistorianConfigSchema.describe(
-            "Historian metadata plus independent strict OpenCode, Pi, and OMP execution blocks. Retained metadata stays at historian; model, fallback_models, variant, and thinking_level belong only in historian.opencode, historian.pi, or historian.omp.",
+            "Historian metadata plus independent strict OpenCode, Pi, OMP, and Broca execution blocks. Other historian metadata remains at historian. TypeScript hosts do not resolve models from historian.broca, which configures ck-mc's Broca session runner. Model, fallback_models, variant, and thinking_level belong in the matching harness block.",
         ),
         dreamer: DreamerConfigSchema.optional().describe(
-            "Dreamer metadata and scheduling plus independent strict OpenCode, Pi, and OMP execution blocks. schedule and promotion_threshold stay at dreamer.tasks; model, fallback_models, variant, thinking_level, and timeout_minutes belong only in the matching harness block.",
+            "Dreamer metadata and scheduling plus independent strict OpenCode, Pi, and OMP execution blocks. schedule and promotion_threshold stay at dreamer.tasks; model, fallback_models, variant, thinking_level, and timeout_minutes belong only in the matching harness block. Each task follows the setting it serves: memory tasks need memory.enabled, evaluate-smart-notes needs smart_notes.enabled, review-user-memories needs its schedule, maintain-docs only a runnable dreamer.",
         ),
         smart_notes: z
             .object({
@@ -1212,7 +1263,7 @@ export const MagicContextConfigSchema = z
                     .boolean()
                     .default(true)
                     .describe(
-                        "Enable smart-note authoring and condition evaluation. User-level only: tool definitions are process-wide. Changes require a host restart and rebuild each session's cached prompt once. Pending notes remain stored and unchecked; already-ready notes still surface.",
+                        "Enable smart-note authoring and condition evaluation. Needs a runnable dreamer, which evaluates the conditions: with dreamer.disable true (or no dreamer block) ctx_note offers no surface_condition whatever this says. User-level only: tool definitions are process-wide. Changes require a host restart and rebuild each session's cached prompt once. Pending notes remain stored and unchecked; already-ready notes still surface.",
                     ),
                 retina_handoff: z
                     .boolean()
@@ -1326,7 +1377,7 @@ export const MagicContextConfigSchema = z
             .min(60_000)
             .default(DEFAULT_HISTORIAN_TIMEOUT_MS)
             .describe(
-                "Timeout for each historian prompt call in both TypeScript and Rust transform modes, in milliseconds (default: 600000)",
+                "Timeout for each historian prompt call, in milliseconds (default: 600000). It applies to the TypeScript historian, and to historian runs the ck-mc module queues for this host to answer. No effect while historian.disable is true or compaction.enabled is false.",
             ),
         commit_cluster_trigger: z
             .object({
@@ -1344,7 +1395,7 @@ export const MagicContextConfigSchema = z
             })
             .default({ enabled: true, min_clusters: 3 })
             .describe(
-                "Commit-cluster trigger: fire historian when enough commit clusters accumulate in the unsummarized tail",
+                "Commit-cluster trigger: fire historian when enough commit clusters accumulate in the unsummarized tail. A historian setting kept at the top level for compatibility; no effect while historian.disable is true or compaction.enabled is false.",
             ),
         system_prompt_injection: z
             .object({
@@ -1533,7 +1584,7 @@ export const MagicContextConfigSchema = z
                     .boolean()
                     .default(true)
                     .describe(
-                        "Enable cross-session memory (default: true). Does not affect history embedding or semantic ctx_search over session history; set embedding.provider to 'off' to stop all embedding.",
+                        "Enable cross-session project memory (default: true). Also gates the dreamer's project-memory tasks: while false, map-memories, verify, verify-broad, curate, compress-cues, classify-memories, retrospective, promote-primers and refresh-primers neither run on schedule nor through /ctx-dream; maintain-docs, evaluate-smart-notes and review-user-memories still run. memory.auto_search and memory.git_commit_indexing do not depend on it. Does not affect history embedding or semantic ctx_search over session history; set embedding.provider to 'off' to stop all embedding.",
                     ),
                 injection_budget_tokens: z
                     .number()
@@ -1547,14 +1598,14 @@ export const MagicContextConfigSchema = z
                     .boolean()
                     .default(true)
                     .describe(
-                        "Automatically promote eligible session facts into memory (default: true)",
+                        "Automatically promote eligible session facts into memory (default: true). No effect while memory.enabled is false.",
                     ),
                 retrieval_count_promotion_threshold: z
                     .number()
                     .min(1)
                     .default(3)
                     .describe(
-                        "retrieval_count threshold for promoting memory to permanent status (min: 1, default: 3)",
+                        "Currently has no effect: no code reads this value, and memories are not promoted to permanent by retrieval count. Kept so existing configs stay valid (min: 1, default: 3).",
                     ),
                 auto_search: z
                     .object({
@@ -1562,7 +1613,7 @@ export const MagicContextConfigSchema = z
                             .boolean()
                             .default(true)
                             .describe(
-                                "Automatically append a compact <ctx-search-hint> to eligible user messages when relevant memories, conversation, or commits are found. Graduated from experimental.auto_search; on by default (set false to opt out). Independent of memory.enabled.",
+                                "Automatically append a compact <ctx-search-hint> to eligible user messages when relevant memories, conversation, or commits are found. Graduated from experimental.auto_search; on by default (set false to opt out). Independent of memory.enabled despite its place under memory: with memory off it still searches past conversation and commits, only the memory source is skipped.",
                             ),
                         score_threshold: z
                             .number()
@@ -1583,7 +1634,7 @@ export const MagicContextConfigSchema = z
                     })
                     .default({ enabled: true, score_threshold: 0.6, min_prompt_chars: 20 })
                     .describe(
-                        "Auto-search hint: transform-time ctx_search on each new user message; when the top hit clears the threshold, append a compact <ctx-search-hint> block of vague fragments to that user message. Does NOT inject full content. Graduated from experimental.auto_search; enabled by default (set enabled: false to opt out). Independent of memory.enabled.",
+                        "Auto-search hint: transform-time ctx_search on each new user message; when the top hit clears the threshold, append a compact <ctx-search-hint> block of vague fragments to that user message. Does NOT inject full content. Graduated from experimental.auto_search; enabled by default (set enabled: false to opt out). Independent of memory.enabled despite its place under memory: with memory off it still searches past conversation and commits.",
                     ),
                 git_commit_indexing: z
                     .object({
@@ -1591,7 +1642,7 @@ export const MagicContextConfigSchema = z
                             .boolean()
                             .default(false)
                             .describe(
-                                "Index HEAD git commits for ctx_search (git_commit source). Graduated from experimental.git_commit_indexing; opt-in, default off. Independent of memory.enabled.",
+                                "Index HEAD git commits for ctx_search (git_commit source). Graduated from experimental.git_commit_indexing; opt-in, default off. Independent of memory.enabled despite its place under memory.",
                             ),
                         since_days: z
                             .number()
@@ -1612,7 +1663,7 @@ export const MagicContextConfigSchema = z
                     })
                     .default({ enabled: false, since_days: 365, max_commits: 2000 })
                     .describe(
-                        "Index git commit messages from HEAD into ctx_search. Commits become a 4th searchable source alongside memories and session history. Graduated from experimental.git_commit_indexing; opt-in, default off (per-project embedding cost). Independent of memory.enabled.",
+                        "Index git commit messages from HEAD into ctx_search. Commits become a 4th searchable source alongside memories and session history. Graduated from experimental.git_commit_indexing; opt-in, default off (per-project embedding cost). Independent of memory.enabled despite its place under memory.",
                     ),
             })
             .default({
@@ -1623,7 +1674,9 @@ export const MagicContextConfigSchema = z
                 auto_search: { enabled: true, score_threshold: 0.6, min_prompt_chars: 20 },
                 git_commit_indexing: { enabled: false, since_days: 365, max_commits: 2000 },
             })
-            .describe("Cross-session memory configuration"),
+            .describe(
+                "Cross-session memory configuration. auto_search and git_commit_indexing sit here for history but work with memory.enabled false.",
+            ),
     })
     .transform((data): MagicContextConfig => {
         return {
@@ -1645,6 +1698,9 @@ export const LIVE_RELOAD_CONFIG_PATHS = [
     "historian.omp.model",
     "historian.omp.fallback_models",
     "historian.omp.thinking_level",
+    "historian.broca.model",
+    "historian.broca.fallback_models",
+    "historian.broca.variant",
     "historian.two_pass",
     "historian.expand_tools",
     "historian.maxTokens",
@@ -1652,6 +1708,7 @@ export const LIVE_RELOAD_CONFIG_PATHS = [
     "commit_cluster_trigger.enabled",
     "commit_cluster_trigger.min_clusters",
     "memory.auto_promote",
+    "rust_background_enabled",
     "dreamer.disable",
     "dreamer.maxTokens",
     "dreamer.opencode.model",

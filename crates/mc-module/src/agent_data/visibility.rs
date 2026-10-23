@@ -169,7 +169,7 @@ impl MoveVisibility {
             return Ok(None);
         }
         let reason = match method {
-            Some("transform" | "compaction.step" | "transform.hook") => "turn_in_flight",
+            Some("transform") => "turn_in_flight",
             Some("dreamer.run_task") => "dreamer_running",
             Some(method) if method.starts_with("historian.") => "historian_running",
             _ => "run_active",

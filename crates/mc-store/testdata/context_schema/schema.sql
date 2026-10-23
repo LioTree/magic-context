@@ -253,14 +253,14 @@ CREATE TABLE memories (
       verification_status TEXT DEFAULT 'unverified',
       verified_at INTEGER,
       classified_at INTEGER,
-      safety_critical INTEGER CHECK (safety_critical IN (0, 1)),
       superseded_by_memory_id INTEGER,
       merged_from TEXT,
       metadata_json TEXT,
       mural_cue TEXT,
       mural_cue_hash TEXT,
       mural_cue_at INTEGER,
-      mural_cue_rejection_count INTEGER NOT NULL DEFAULT 0, revision INTEGER NOT NULL DEFAULT 1, verify_result TEXT, verify_files_json TEXT, verify_commit TEXT,
+      mural_cue_rejection_count INTEGER NOT NULL DEFAULT 0,
+      safety_critical INTEGER CHECK (safety_critical IN (0, 1)), revision INTEGER NOT NULL DEFAULT 1, verify_result TEXT, verify_files_json TEXT, verify_commit TEXT,
       UNIQUE(project_path, category, normalized_hash)
     );
 
@@ -609,7 +609,7 @@ CREATE TABLE lkg_served_markers (
         served_capture_id INTEGER NOT NULL CHECK (served_capture_id > 0),
         full_coverage INTEGER NOT NULL CHECK (full_coverage IN (0, 1)),
         slot_state TEXT NOT NULL
-    );
+    , served_digest TEXT);
 
 CREATE TABLE lkg_slot_chunks (
         session_id TEXT NOT NULL,
@@ -699,8 +699,6 @@ CREATE TABLE session_meta (
       note_nudge_trigger_message_id TEXT DEFAULT '',
       note_nudge_sticky_text TEXT DEFAULT '',
       note_nudge_sticky_message_id TEXT DEFAULT '',
-      note_nudge_anchors TEXT NOT NULL DEFAULT '[]',
-      auto_search_hint_decisions TEXT NOT NULL DEFAULT '[]',
       last_todo_state TEXT DEFAULT '',
       todo_permission_denied INTEGER NOT NULL DEFAULT 2,
       todo_synthetic_call_id TEXT DEFAULT '',
@@ -718,9 +716,7 @@ CREATE TABLE session_meta (
       historian_last_error TEXT DEFAULT NULL,
       historian_last_failure_at INTEGER DEFAULT NULL,
       system_prompt_hash TEXT DEFAULT '',
-      memory_block_cache TEXT DEFAULT '',
       memory_block_count INTEGER DEFAULT 0,
-      memory_block_ids TEXT DEFAULT '',
       -- pending_compaction_marker_state: intentionally NULLABLE without a
       -- default. Absence of a deferred marker is SQL NULL; presence is a
       -- valid JSON blob written via setPendingCompactionMarkerState.
@@ -740,7 +736,6 @@ CREATE TABLE session_meta (
       -- Retired columns remain in place so existing databases keep the same schema:
       -- deferred_execute_state was used by the removed turn-boundary execute hold.
       deferred_execute_state TEXT,
-      cached_m0_bytes BLOB,
       served_prefix TEXT,
       held_release TEXT,
       cached_m0_score_selection_watermark INTEGER NOT NULL DEFAULT 0
@@ -753,7 +748,6 @@ CREATE TABLE session_meta (
       cached_m0_max_mutation_id INTEGER,
       cached_m0_max_memory_mutation_id INTEGER,
       cached_m0_project_docs_hash TEXT,
-      cached_m1_bytes BLOB,
       last_observed_model_key TEXT,
       last_usage_context_limit INTEGER NOT NULL DEFAULT 0,
       prior_boundary_ordinal INTEGER NOT NULL DEFAULT 1,
@@ -771,7 +765,6 @@ CREATE TABLE session_meta (
       compaction_mode_record TEXT,
       cached_m0_materialized_at INTEGER,
       cached_m0_session_facts_version INTEGER,
-      cached_m0_upgrade_state TEXT,
       cached_m0_system_hash TEXT,
       cached_m0_tool_set_hash TEXT,
       cached_m0_model_key TEXT,
@@ -780,7 +773,7 @@ CREATE TABLE session_meta (
        thinking_binding_recovery_target TEXT NOT NULL DEFAULT '',
        upgrade_reminded_at INTEGER,
        pi_stable_id_scheme INTEGER
-    , note_last_read_at INTEGER DEFAULT 0, cleared_reasoning_through_tag INTEGER DEFAULT 0, tool_reclaim_watermark INTEGER DEFAULT 0, stripped_placeholder_ids TEXT DEFAULT '', stale_reduce_stripped_ids TEXT DEFAULT '', processed_image_stripped_ids TEXT DEFAULT '', merged_reasoning_stripped_ids TEXT DEFAULT '', trailing_blank_decisions TEXT DEFAULT '', system_prompt_tokens INTEGER DEFAULT 0, compaction_marker_state TEXT DEFAULT '', key_files TEXT DEFAULT '', conversation_tokens INTEGER DEFAULT 0, tool_call_tokens INTEGER DEFAULT 0, recomp_partial_range_start INTEGER DEFAULT 0, recomp_partial_range_end INTEGER DEFAULT 0, detected_context_limit INTEGER DEFAULT 0, detected_context_limit_model_key TEXT, needs_emergency_recovery INTEGER DEFAULT 0, emergency_recovery_origin TEXT DEFAULT '', upgrade_reminder_last_sent_at INTEGER, upgrade_reminder_count INTEGER NOT NULL DEFAULT 0, cached_m0_mural_data_url TEXT, cached_m0_mural_hash TEXT, coordinate_generation TEXT, coordinate_rebase_notice TEXT);
+    , note_last_read_at INTEGER DEFAULT 0, cleared_reasoning_through_tag INTEGER DEFAULT 0, tool_reclaim_watermark INTEGER DEFAULT 0, system_prompt_tokens INTEGER DEFAULT 0, compaction_marker_state TEXT DEFAULT '', key_files TEXT DEFAULT '', conversation_tokens INTEGER DEFAULT 0, tool_call_tokens INTEGER DEFAULT 0, recomp_partial_range_start INTEGER DEFAULT 0, recomp_partial_range_end INTEGER DEFAULT 0, detected_context_limit INTEGER DEFAULT 0, detected_context_limit_model_key TEXT, needs_emergency_recovery INTEGER DEFAULT 0, emergency_recovery_origin TEXT DEFAULT '', upgrade_reminder_last_sent_at INTEGER, upgrade_reminder_count INTEGER NOT NULL DEFAULT 0, cached_m0_mural_hash TEXT, coordinate_generation TEXT, coordinate_rebase_notice TEXT);
 
 CREATE TABLE tool_owner_backfill_state (
       session_id TEXT PRIMARY KEY,
@@ -966,6 +959,50 @@ CREATE INDEX idx_memories_project_status_expires ON memories(project_path, statu
 CREATE INDEX idx_memories_project_category_hash ON memories(project_path, category, normalized_hash);
 
 CREATE INDEX idx_message_history_index_updated_at ON message_history_index(updated_at);
+
+CREATE TABLE session_render_cache (
+    session_id TEXT NOT NULL,
+    cache_key TEXT NOT NULL,
+    value BLOB,
+    PRIMARY KEY (session_id, cache_key)
+) WITHOUT ROWID;
+
+CREATE TABLE session_meta_chunks (
+    session_id TEXT NOT NULL,
+    column_name TEXT NOT NULL,
+    chunk TEXT NOT NULL,
+    body BLOB,
+    PRIMARY KEY (session_id, column_name, chunk)
+) WITHOUT ROWID;
+
+CREATE TABLE session_meta_collection_revisions (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    session_id TEXT NOT NULL,
+    column_name TEXT NOT NULL,
+    revision INTEGER NOT NULL CHECK(typeof(revision)='integer' AND revision > 0),
+    UNIQUE(session_id,column_name)
+);
+
+CREATE TRIGGER session_meta_chunks_revision_ai AFTER INSERT ON session_meta_chunks BEGIN
+    INSERT INTO session_meta_collection_revisions(session_id,column_name,revision)
+    SELECT NEW.session_id,NEW.column_name,1 WHERE 1
+    ON CONFLICT(session_id,column_name) DO UPDATE SET revision=revision+1;
+END;
+
+CREATE TRIGGER session_meta_chunks_revision_au AFTER UPDATE ON session_meta_chunks BEGIN
+    INSERT INTO session_meta_collection_revisions(session_id,column_name,revision)
+    SELECT OLD.session_id,OLD.column_name,1 WHERE OLD.session_id IS NOT NEW.session_id OR OLD.column_name IS NOT NEW.column_name
+    ON CONFLICT(session_id,column_name) DO UPDATE SET revision=revision+1;
+    INSERT INTO session_meta_collection_revisions(session_id,column_name,revision)
+    SELECT NEW.session_id,NEW.column_name,1 WHERE 1
+    ON CONFLICT(session_id,column_name) DO UPDATE SET revision=revision+1;
+END;
+
+CREATE TRIGGER session_meta_chunks_revision_ad AFTER DELETE ON session_meta_chunks BEGIN
+    INSERT INTO session_meta_collection_revisions(session_id,column_name,revision)
+    SELECT OLD.session_id,OLD.column_name,1 WHERE 1
+    ON CONFLICT(session_id,column_name) DO UPDATE SET revision=revision+1;
+END;
 
 CREATE TABLE compartment_history_versions (
             session_id TEXT PRIMARY KEY NOT NULL,
@@ -1941,7 +1978,9 @@ INSERT INTO schema_migrations (version, description, applied_at) VALUES
 (99, 'memory lifecycle evidence, attempts, receipts and applied snapshots', :applied_at),
 (100, 'durable served thinking prefix and held release request', :applied_at),
 (101, 'indexed trimmed-source tag retirement', :applied_at),
-(102, 'nullable safety-critical memory assessment', :applied_at);
+(102, 'bind served capture markers to the digest of their certified bytes', :applied_at),
+(103, 'isolate session render payloads and chunk growing replay metadata', :applied_at),
+(104, 'nullable safety-critical memory assessment', :applied_at);
 
 INSERT INTO "message_fts_rowid_map_backfill_state" ("completed", "id", "updated_at", "watermark_rowid") VALUES
 (0, 1, 0, 0);

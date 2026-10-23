@@ -119,6 +119,67 @@ describe("task-scheduler — manual lease wait", () => {
     });
 });
 
+describe("task-scheduler — a slot another dreamer already ran", () => {
+    it("a scheduled pass skips a planned slot that was run before it took the lease", async () => {
+        db = freshDb();
+        seedActiveMemory(db);
+        const now = Date.now();
+        const slot = now - 1000;
+        const row = {
+            projectPath: PROJECT,
+            task: "curate" as const,
+            lastRunAt: null,
+            nextDueAt: slot,
+            schedule: "0 4 * * 0",
+            lastStatus: null,
+            lastError: null,
+            retryCount: 0,
+        };
+        writeTaskScheduleState(db, row);
+        // Between planning and this pass's lease acquisition, another dreamer
+        // sharing the store (ck-mc's Rust dreamer, which this host does not ask)
+        // runs the slot and moves next_due_at on. The first BEGIN IMMEDIATE the
+        // domain-group runner issues opens its lease acquisition.
+        const shared = db;
+        const exec = shared.exec.bind(shared);
+        let ranElsewhere = false;
+        shared.exec = ((sql: string) => {
+            if (
+                !ranElsewhere &&
+                sql === "BEGIN IMMEDIATE" &&
+                new Error().stack?.includes("runDomainGroupWithCooldown")
+            ) {
+                ranElsewhere = true;
+                writeTaskScheduleState(shared, {
+                    ...row,
+                    lastRunAt: now,
+                    nextDueAt: now + 3_600_000,
+                    lastStatus: "completed",
+                });
+            }
+            return exec(sql);
+        }) as typeof shared.exec;
+        let executed = 0;
+        await runDueTasksForProject({
+            db,
+            projectIdentity: PROJECT,
+            tasks: [cfg("curate", "0 4 * * 0")],
+            executor: async () => {
+                executed += 1;
+                return { status: "completed" };
+            },
+            now,
+        });
+        expect(ranElsewhere).toBe(true);
+        expect(executed).toBe(0);
+        // The row is left exactly as the other dreamer wrote it.
+        const state = getTaskScheduleState(db, PROJECT, "curate");
+        expect(state?.nextDueAt).toBe(now + 3_600_000);
+        expect(state?.lastRunAt).toBe(now);
+        expect(state?.lastStatus).toBe("completed");
+    });
+});
+
 describe("task-scheduler — planDueTasks", () => {
     it("first-seed does NOT fire immediately (next_due in the future)", () => {
         db = freshDb();
@@ -698,6 +759,42 @@ describe("task-scheduler — runDueTasksForProject", () => {
 });
 
 describe("task-scheduler — runManualDream", () => {
+    // Only project-memory tasks are refused with memory off; maintain-docs and the
+    // other tasks that serve different settings stay runnable (task-settings-gate.test.ts).
+    it("memory-off refuses even forced memory and classifier tasks before any store read", async () => {
+        const unreadable = {
+            prepare() {
+                throw new Error("memory-off store read");
+            },
+        } as unknown as Database;
+        let executed = 0;
+        const executor = async (): Promise<TaskExecOutcome> => {
+            executed += 1;
+            return { status: "completed" };
+        };
+        for (const task of [
+            "curate",
+            "classify-memories",
+            "map-memories",
+            "refresh-primers",
+        ] as const) {
+            const tasks = [cfg(task, "0 3 * * *")];
+            const deps = {
+                db: unreadable,
+                projectIdentity: PROJECT,
+                tasks,
+                executor,
+                projectMemoryEnabled: false,
+            };
+            const result = await runManualDream({ ...deps, task });
+            expect(result.ran).toEqual([]);
+            expect(result.backlogBefore).toEqual({});
+            expect((await runManualDream(deps)).ran).toEqual([]);
+            expect(await runDueTasksForProject(deps)).toBe(0);
+        }
+        expect(executed).toBe(0);
+    });
+
     it("no task arg runs ALL enabled tasks regardless of schedule (not due)", async () => {
         db = freshDb();
         seedActiveMemory(db);

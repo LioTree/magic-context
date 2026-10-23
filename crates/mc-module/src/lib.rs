@@ -44,16 +44,286 @@ pub mod classify;
 pub mod codec;
 pub mod compartment_coverage;
 pub mod config;
+mod dream_claim;
+pub mod dream_dispatch;
+pub mod dream_tasks;
+mod memory_actions;
+
+/// Names reserved for scoped, non-tool management requests. These are not facade
+/// tools: adding them to the model-visible catalog would invalidate cached prefixes.
+pub mod non_served_contract {
+    pub const UI_METHODS: &[&str] = &[
+        "mc.ui_capabilities",
+        "mc.read_sidebar",
+        "mc.read_status",
+        "mc.read_embed",
+        "mc.read_compartment_count",
+        "mc.read_todos",
+        "mc.recomp_preview",
+        "mc.recomp_start",
+        "mc.rescore",
+        "mc.wrapup",
+        "mc.flush",
+        "mc.dream",
+        "mc.embed",
+        "mc.job_read",
+        "mc.job_cancel",
+        "mc.ui_events",
+        "mc.notice_currentness",
+    ];
+    pub const RETRIEVAL_METHOD: &str = "mc.retrieval";
+    pub const MEMORY_METHOD: &str = "mc.memory";
+
+    /// Resolve the project from the session attached to the admitted channel,
+    /// using `route_project_identity`, never from request project/directory fields.
+    /// All other reserved methods are restricted to that channel's session.
+    pub const PROJECT_METHODS: &[&str] = &[
+        "mc.ui_capabilities",
+        "mc.read_sidebar",
+        "mc.read_status",
+        "mc.read_embed",
+        "mc.rescore",
+        "mc.dream",
+        "mc.embed",
+        RETRIEVAL_METHOD,
+        MEMORY_METHOD,
+    ];
+    pub const UI_READ_METHODS: &[&str] = &[
+        "mc.ui_capabilities",
+        "mc.read_sidebar",
+        "mc.read_status",
+        "mc.read_embed",
+        "mc.read_compartment_count",
+        "mc.read_todos",
+    ];
+
+    /// `HandlerOutcome::Error` has two wire fields. Its `message` is the exact
+    /// refused method name, not prose, so clients can identify the unsupported route.
+    pub const ROUTE_REFUSAL_CODE: &str = "route_not_ported";
+    pub const ROUTE_NAME_FIELD: &str = "message";
+    /// Keys are Rust `RetrievalSource` ids. In particular `raw_message` and
+    /// `compartment` are separate keys, unlike the TS request source `message`.
+    pub const RETRIEVAL_AVAILABILITY_FIELD: &str = "source_availability";
+
+    /// Selectors for comparing the existing transform paths: the legacy Rust
+    /// adapter, a complete message-array request, and the fast provider protocol.
+    /// `full_request` selects the adapter but may still send only changed messages
+    /// via `tail_delta`. For a complete array, omit that field and supply `messages`.
+    /// The provider protocol also needs compaction enabled and an available module
+    /// client, just like today's Rust adapter.
+    /// See the plugin's config/schema/magic-context.ts and rust-mode-transform.ts.
+    pub const SERVED_LANE_SELECTORS: &[(&str, &str)] = &[
+        (
+            "current_rust",
+            "transform_mode=rust; rust_pipeline=full_request",
+        ),
+        (
+            "full_array",
+            "transform_mode=rust; rust_pipeline=full_request; request.messages; tail_delta absent",
+        ),
+        (
+            "fast_rust_provider",
+            "transform_mode=rust; rust_pipeline=provider; compaction.enabled=true",
+        ),
+    ];
+
+    /// Missing handles and busy/locked reads share this unknown-state envelope.
+    /// Unknown values must never be displayed as successful, authoritative zeros.
+    pub fn partial_state_body() -> serde_json::Value {
+        serde_json::json!({
+            "v": 1, "ok": false, "state": "partial", "reason": "store_unavailable",
+            "authority": "unknown", "data": null,
+        })
+    }
+}
 pub mod config_parity;
 mod content_language;
 pub mod decay_render;
 pub mod decision_calibration;
 mod digest;
 pub mod divergence;
+mod dream_runner;
+pub mod entorhinal_resolve;
+/// Explicit background entries. None is called by a served transform or tool.
+/// Config resolution and all adapter work happen on the worker, not its caller.
+pub mod background {
+    use crate::config_parity::{ConfigResolveRequest, CoreConfig, CoreConfigResolver};
+    pub use crate::dream_runner::{
+        CarrierError, ChildRequest, Completion, DreamCarrier, DreamRequest, DreamRole, RunResult,
+    };
+    pub use crate::historian_numerical_drain::{
+        DrainMeta, DrainReservation, DrainReserveResult, DrainStore, ReserveRequest,
+    };
+    use mc_store::parity_schema_manifest::CapabilityResult;
+    use std::sync::Arc;
+    use std::thread::JoinHandle;
+
+    pub struct ConfigInput {
+        pub resolver: Arc<dyn CoreConfigResolver>,
+        pub request: ConfigResolveRequest,
+    }
+
+    /// Only an off-thread entry can construct a unit containing resolved config
+    /// and activation. Nested operations keep that activation value across toggles.
+    pub struct Unit {
+        config: CoreConfig,
+        activated: bool,
+    }
+
+    fn spawn<T: Send + 'static>(
+        name: &str,
+        input: ConfigInput,
+        work: impl FnOnce(Unit) -> T + Send + 'static,
+    ) -> std::io::Result<JoinHandle<Result<Option<T>, String>>> {
+        std::thread::Builder::new()
+            .name(name.into())
+            .spawn(move || {
+                let config = match input.resolver.resolve(&input.request) {
+                    CapabilityResult::Available { value } => value,
+                    CapabilityResult::Degraded { reason, .. }
+                    | CapabilityResult::Unavailable { reason } => return Err(reason.code),
+                };
+                let activated = config.effective.rust_background_enabled();
+                if !activated {
+                    return Ok(None);
+                }
+                Ok(Some(work(Unit { config, activated })))
+            })
+    }
+
+    // The orchestration callback is trusted engine code or a hermetic fixture,
+    // never an RPC payload. Each tick and manual run captures config independently;
+    // no serving path calls these entries.
+    pub fn dreamer_tick<T: Send + 'static>(
+        input: ConfigInput,
+        dispatch: impl FnOnce(Unit) -> T + Send + 'static,
+    ) -> std::io::Result<JoinHandle<Result<Option<T>, String>>> {
+        spawn("mc-dreamer-tick", input, dispatch)
+    }
+
+    pub fn manual_dream<T: Send + 'static>(
+        input: ConfigInput,
+        dispatch: impl FnOnce(Unit) -> T + Send + 'static,
+    ) -> std::io::Result<JoinHandle<Result<Option<T>, String>>> {
+        spawn("mc-manual-dream", input, dispatch)
+    }
+
+    pub fn historian_drain<T: Send + 'static>(
+        input: ConfigInput,
+        drain: impl FnOnce(Unit) -> T + Send + 'static,
+    ) -> std::io::Result<JoinHandle<Result<Option<T>, String>>> {
+        spawn("mc-historian-drain", input, drain)
+    }
+
+    pub fn embedding_drain<T: Send + 'static>(
+        input: ConfigInput,
+        drain: impl FnOnce(Unit) -> T + Send + 'static,
+    ) -> std::io::Result<JoinHandle<Result<Option<T>, String>>> {
+        spawn("mc-embedding-drain", input, drain)
+    }
+
+    impl Unit {
+        pub fn captured_dream_config(
+            &self,
+            harness: String,
+            directory: std::path::PathBuf,
+        ) -> Arc<crate::dream_dispatch::context::CapturedConfig> {
+            Arc::new(crate::dream_dispatch::context::CapturedConfig {
+                activated: self.activated,
+                route: self.config.effective.clone(),
+                effective: self.config.settings.clone(),
+                harness,
+                directory,
+            })
+        }
+
+        pub fn run_dream_task<T>(
+            &self,
+            request: &DreamRequest<'_>,
+            carrier: &mut impl DreamCarrier,
+            validate: impl FnMut(&Completion) -> Result<T, String>,
+        ) -> RunResult<T> {
+            // Each worker owns its runtime; no model future blocks the serving runtime.
+            tokio::runtime::Builder::new_current_thread()
+                .enable_all()
+                .build()
+                .expect("background runtime")
+                .block_on(crate::dream_runner::run_dream_task(
+                    self.activated,
+                    &self.config.effective,
+                    &self.config.settings,
+                    request,
+                    carrier,
+                    validate,
+                ))
+        }
+
+        pub fn reserve_historian<S: DrainStore>(
+            &self,
+            store: &S,
+            request: ReserveRequest<'_>,
+        ) -> Result<Option<DrainReserveResult>, S::Error> {
+            crate::historian_numerical_drain::reserve_protected_tail_drain_tokens(
+                store,
+                self.activated,
+                request,
+            )
+        }
+
+        pub fn refund_historian<S: DrainStore>(
+            &self,
+            store: &S,
+            reservation: &DrainReservation,
+        ) -> Result<(), S::Error> {
+            crate::historian_numerical_drain::rollback_protected_tail_drain_reservation(
+                store,
+                self.activated,
+                Some(reservation),
+            )
+        }
+
+        pub fn publish_historian(
+            &self,
+            store: &mc_store::McStore,
+            mut request: mc_store::HistorianPublishRequest<'_>,
+        ) -> Result<mc_store::HistorianPublishResult, mc_store::HistorianPublishError> {
+            request.rust_background_enabled = self.activated;
+            store.publish_historian_chunk(request)
+        }
+
+        #[allow(clippy::too_many_arguments)]
+        pub fn drain_embeddings(
+            &self,
+            db: &mut rusqlite::Connection,
+            chunks: &dyn mc_store::retrieval_vectors::store::ChunkCatalog,
+            provider: &mut dyn mc_store::retrieval_vectors::drain::EmbeddingProvider,
+            registration: &mc_store::retrieval_vectors::drain::Registration,
+            limit: usize,
+            now: i64,
+            completed_at: impl FnOnce() -> i64,
+        ) -> Result<
+            Option<mc_store::retrieval_vectors::drain::FinishOutcome>,
+            mc_store::retrieval_vectors::drain::DrainError,
+        > {
+            mc_store::retrieval_vectors::queue::drain_once(
+                self.activated,
+                db,
+                chunks,
+                provider,
+                registration,
+                limit,
+                now,
+                completed_at,
+            )
+        }
+    }
+}
+mod descriptors;
 pub mod healing;
 pub mod historian;
 pub mod historian_chunk;
 pub mod historian_host;
+mod historian_numerical_drain;
 pub mod historian_producer;
 pub mod historian_prompt;
 pub mod historian_recovery;
@@ -70,23 +340,30 @@ pub mod m1_compose;
 pub mod memory_render;
 pub mod memory_tool;
 mod memory_verification;
+pub mod offline_first_pass;
+pub mod offline_move;
+mod ops_facade;
 pub mod parity_contract;
 pub mod project_docs;
 pub mod project_identity;
 pub mod prompt_surface;
 pub mod protection_window;
-#[cfg(test)]
-pub(crate) mod provider_transport_tests;
-mod providers;
+pub mod providers;
+mod recomp_staging;
 mod reply_pages;
 mod retained_size;
 pub mod retrieval;
-mod transport_admission;
+mod retrieval_store;
+mod runner_follow;
+pub mod runner_limits;
 mod transport_handler;
 pub use transport_handler::McTransportHandler;
 pub mod edit_admission;
+pub mod engram_catalog;
+mod reclaim_distance;
 pub mod route_targets;
 pub mod runner_choices;
+pub mod runner_reminders;
 pub mod scheduler;
 pub mod selection;
 pub mod session_resolver;
@@ -95,6 +372,7 @@ pub mod single_store_reads;
 pub mod single_store_repair;
 mod stable_hash;
 mod state_sync_timing;
+mod subagent_invocations_read;
 mod tail_hygiene;
 mod tool_catalog;
 pub mod transform;
@@ -163,7 +441,7 @@ use historian_host::{HostReportDeliveryError, HostRunLedger, HostRunReport};
 use historian_producer::{HistorianProducer, HistorianProducerConfig, HistorianProducerError};
 use historian_runner::HistorianRunnerKind;
 use prompt_surface::{PromptSurfacePreset, PromptSurfaceSelection};
-use route_targets::{route_targets, RouteTargetConfig};
+use route_targets::{route_targets, RouteTargetConfig, SessionRunnerRoute};
 use scheduler::MIN_PLAUSIBLE_CONTEXT_LIMIT;
 use selection::SelKind;
 #[cfg(test)]
@@ -185,6 +463,8 @@ pub mod test_support;
 
 #[cfg(test)]
 mod differential_goldens;
+#[cfg(test)]
+mod historian_claim_conformance;
 use transform::{
     transform_with_projection_cached, HistorianDiagnostics, ProjectionCacheInput,
     SerializedOutputCache, TransformRequest,
@@ -199,10 +479,6 @@ use transform::{
 /// the daemon controls.
 #[derive(Debug, Clone, PartialEq)]
 pub struct SessionBinding {
-    pub connection_incarnation: u64,
-    /// Native provider generation resolved from the admitted route plan, never
-    /// from a message body or the user's durable session identifier.
-    pub native_generation: Option<mc_store::provider_records::ProviderGeneration>,
     /// Identity stamped by the daemon at bind, never supplied by an RPC body.
     pub principal: Option<subc_protocol::Principal>,
     /// Daemon-stamped scope owner and authorization, copied from the owner's scope.sync record at bind.
@@ -215,6 +491,14 @@ pub struct SessionBinding {
     /// The fallback history budget (tokens) frozen at bind. A transform request may carry
     /// a newer harness-resolved value because config can change while the route remains open.
     pub history_budget_tokens: f64,
+}
+
+fn runner_bind_identity(binding: &SessionBinding) -> session_resolver::RunnerBindIdentity {
+    session_resolver::RunnerBindIdentity {
+        project_root: binding.project_root.clone(),
+        harness: binding.harness.clone(),
+        session: binding.session.clone(),
+    }
 }
 
 fn apply_claude_code_config_controls(
@@ -1604,8 +1888,6 @@ struct ModuleStateSyncWire {
     historian_model_chain: Option<Vec<String>>,
     #[serde(default)]
     pass_complete: Option<bool>,
-    #[serde(default)]
-    provider_pass: Option<Value>,
 }
 
 #[derive(Debug, Clone, Deserialize)]
@@ -2551,16 +2833,29 @@ struct FacadeScope {
     /// Daemon-bound filesystem path retained only for route-vocabulary enforcement.
     route_project_root: String,
     conversation_key: String,
+    /// The conversation is an asynchronous compaction conversation, so its
+    /// history tools take the async lane.
+    async_conversation: bool,
     memory_enabled: bool,
     /// Why memory is paused for this route, when its project identity is unavailable.
     memory_paused: Option<String>,
 }
 
 /// The project a route's history is keyed by. See [`McHandler::route_project`].
+#[derive(Clone)]
 struct RouteProject {
     key: String,
     /// The reason memory features are paused, when the route has no project identity.
     memory_paused: Option<String>,
+}
+
+/// Identity state belongs to a channel, not a session or directory: a fresh binding
+/// may adopt a newer host decision without changing an already-served prefix.
+#[derive(Default)]
+struct BindingProject {
+    initial: Option<Result<String, project_identity::ProjectIdentityError>>,
+    served: Option<RouteProject>,
+    mismatch_logged: bool,
 }
 
 impl RouteProject {
@@ -3863,16 +4158,30 @@ pub struct McHandler {
     store_open: Arc<StoreOpenCoordinator>,
     producer_factory: Arc<dyn HistorianProducerFactory>,
     session_resolver: Arc<dyn SessionResolver>,
+    retrieval_reranker: Option<Arc<dyn retrieval::hybrid::RerankClient>>,
     config: Arc<Mutex<ConfigCache>>,
     historian_runner_refusals: Arc<HistorianRunnerRefusalCache>,
     /// Runs queued for a claimant that a firing task in this process is still
     /// waiting on. Empty under the in-module runner.
     host_runs: Arc<HostRunLedger>,
+    dream_children: Arc<dream_dispatch::host_carrier::DreamQueue>,
+    /// Live Broca dream children, keyed by the Broca session each one runs in.
+    /// A memory tool the runner dispatches on such a session reaches the task's
+    /// router only through this record, never the foreground facade.
+    broca_dream_tools: Arc<dream_dispatch::broca_carrier::BrocaToolRoute>,
+    /// What each plugin claimant last declared it can carry. Dream ownership is
+    /// published from these declarations; see `dream_dispatch::ownership`.
+    dream_claimants: Arc<dream_dispatch::ownership::ClaimantRegistry>,
+    /// The Rust dreamer's projects, timer and transports; see `dream_dispatch::tick`.
+    dream_runs: Arc<dream_dispatch::tick::DreamRuns>,
     /// Which runner each session's most recent historian and dreamer completion
     /// used in this process, and why. Read by the status and health surfaces.
     runner_choices: Arc<Mutex<runner_choices::RunnerChoiceLog>>,
     /// Project identities of route roots whose session the host has not recorded.
     project_identities: Arc<project_identity::ProjectIdentityResolver>,
+    entorhinal: entorhinal_resolve::EntorhinalResolver,
+    binding_projects: Mutex<HashMap<u16, BindingProject>>,
+    active_project_roots: Mutex<HashMap<String, PathBuf>>,
     /// Route roots inside a git checkout whose identity git could not give, with the
     /// reason. Their history keeps being served, but every memory feature is paused until
     /// a later request resolves the identity (see [`McHandler::route_project`]).
@@ -3883,6 +4192,16 @@ pub struct McHandler {
     resolve_project_identity_for_test: AtomicBool,
     #[cfg(test)]
     fixed_config: Option<McModuleConfig>,
+    #[cfg(test)]
+    fixed_dream_settings: Option<Value>,
+    /// Trusted settings the provider historian resolves its models from when no host
+    /// sent a chain. Tests never read the environment's config; unset means `{}`.
+    #[cfg(test)]
+    fixed_historian_settings: Option<Value>,
+    /// Replaces the production executor wiring in fixtures, so publication can be
+    /// exercised for tasks this build does not yet run.
+    #[cfg(test)]
+    dream_wiring: Option<dream_dispatch::ownership::Wiring>,
     reattaching_sessions: Arc<Mutex<HashSet<String>>>,
     live_historian_sessions: Arc<Mutex<HashMap<String, LiveHistorianSession>>>,
     wrapup_sessions: Arc<Mutex<HashMap<String, LiveWrapupSession>>>,
@@ -3903,8 +4222,8 @@ pub struct McHandler {
     frozen_tool_catalogs: Mutex<HashMap<(PathBuf, String), tool_catalog::FrozenCatalog>>,
     provider_store: Arc<providers::Storage>,
     provider_serial: Arc<providers::ProviderSerial>,
-    provider_resident: Arc<providers::resident_hooks::ResidentHooks>,
     provider_runner: Arc<dyn session_resolver::ProviderRunner>,
+    historian_model_catalog: Arc<providers::HistorianModelCatalog>,
     provider_historian_worker: OnceLock<Arc<McHandler>>,
     provider_historian_budget: Arc<providers::historian_budget::Budget>,
     provider_historian_evaluations: Arc<Mutex<HashSet<String>>>,
@@ -3955,11 +4274,6 @@ pub struct McHandler {
     /// lock-free map) is appropriate because writes are rare (once per route open/close)
     /// and reads are one cheap lookup per transform.
     bindings: Mutex<HashMap<u16, SessionBinding>>,
-    native_route_plans: Mutex<HashMap<u16, providers::NativeConnectionPlan>>,
-    native_connection_sequence: std::sync::atomic::AtomicU64,
-    #[cfg(test)]
-    native_bundle_override:
-        Mutex<Option<cortexkit_role_step_transform_provider::claude_code::ClaudeCodeCapabilities>>,
     threshold_logged_routes: Mutex<HashSet<u16>>,
     /// Per-project evaluator capability asserted by the host's state-sync payload. Absence is
     /// fail-closed so a Rust-authority smart note cannot become permanently pending.
@@ -3992,11 +4306,58 @@ pub trait HistorianProducerFactory: Send + Sync {
         &self,
         project_root: &Path,
     ) -> Result<Box<dyn HistorianProducerDriver + Send>, HistorianProducerError>;
+
+    /// Connect a producer to the runner route selected for this conversation. Each run
+    /// uses a child session; `identity` supplies the conversation's project root and
+    /// Setup harness for binding that child. A factory that cannot reach the runner
+    /// must refuse rather than use the configured runner.
+    async fn connect_session_runner(
+        &self,
+        _identity: &session_resolver::RunnerBindIdentity,
+        route: &SessionRunnerRoute,
+    ) -> Result<Box<dyn HistorianProducerDriver + Send>, HistorianProducerError> {
+        Err(HistorianProducerError::Subc(
+            historian_producer::ProducerErrorBody::untagged(
+                "session_runner_unavailable",
+                format!(
+                    "no session runner transport for module {}",
+                    route.module_id()
+                ),
+            ),
+        ))
+    }
+}
+
+/// The route a runner-lane conversation's background model calls take, or `None`
+/// for a conversation that keeps the configured runner (it is not on a runner lane,
+/// or the user explicitly configured `broca`). See
+/// [`SessionRunnerRoute::for_background_call`].
+pub(crate) fn session_runner_route(
+    binding: &SessionBinding,
+    resolved: historian_runner::ResolvedRunner,
+) -> Option<SessionRunnerRoute> {
+    SessionRunnerRoute::for_background_call(binding.principal.as_ref(), &binding.session, resolved)
 }
 
 struct RealHistorianProducerFactory {
     connection_file: PathBuf,
     route_targets: RouteTargetConfig,
+}
+
+fn session_runner_historian_config(
+    connection_file: PathBuf,
+    route_targets: RouteTargetConfig,
+    identity: &session_resolver::RunnerBindIdentity,
+) -> HistorianProducerConfig {
+    HistorianProducerConfig {
+        handshake_timeout: Duration::from_secs(2),
+        route_targets,
+        ..HistorianProducerConfig::new(
+            connection_file,
+            identity.project_root.clone(),
+            identity.harness.clone(),
+        )
+    }
 }
 
 #[async_trait]
@@ -4015,6 +4376,24 @@ impl HistorianProducerFactory for RealHistorianProducerFactory {
                     "opencode",
                 )
             })
+            .await?,
+        ))
+    }
+
+    async fn connect_session_runner(
+        &self,
+        identity: &session_resolver::RunnerBindIdentity,
+        route: &SessionRunnerRoute,
+    ) -> Result<Box<dyn HistorianProducerDriver + Send>, HistorianProducerError> {
+        Ok(Box::new(
+            HistorianProducer::connect_to_session_runner(
+                session_runner_historian_config(
+                    self.connection_file.clone(),
+                    self.route_targets.clone(),
+                    identity,
+                ),
+                route.clone(),
+            )
             .await?,
         ))
     }
@@ -4234,6 +4613,8 @@ fn historian_trigger_rule(reason: boundary::TriggerReason) -> &'static str {
 }
 
 struct HistorianPrepareContext<'a> {
+    /// A drain/provider supplies its start-time value; ordinary callers capture here.
+    rust_background_enabled: Option<bool>,
     now: i64,
     // Provider runs compare selected message fingerprints and lineage cuts
     // against the database. They have no full-request cache generation to check,
@@ -4243,13 +4624,21 @@ struct HistorianPrepareContext<'a> {
     /// Final immutable tag rows validated by the transform's generation/count/max identity.
     /// Early pass-through paths leave this absent and retain the legacy store fallback.
     tag_snapshot: Option<Arc<Vec<McTagRow>>>,
+    /// An async evaluation's captured applied coverage, including an empty prefix.
+    /// Other lanes continue resolving their coverage from the stored compartments.
+    async_coverage: Option<Option<u64>>,
     reclaim_ride_available: bool,
+    /// Whether the conversation is on a runner lane: its firings and restart
+    /// reattach run on its own runner. Only the provider (runner-lane) path sets it.
+    runner_lane: bool,
     timings: &'a mut HistorianTriggerTimings,
 }
 
 struct ReattachPublicationGuards {
+    rust_background_enabled: bool,
     snapshot_generation: Option<u64>,
     log_fence: Option<Arc<dyn historian::HistorianPublicationFence>>,
+    session_runner: Option<SessionRunnerRoute>,
 }
 
 #[derive(Default)]
@@ -4277,6 +4666,7 @@ struct WrapupPrepareContext {
     now: i64,
     project_path: String,
     allow_unknown_module_retry: bool,
+    publication_fence: Option<Arc<dyn historian::HistorianPublicationFence>>,
 }
 
 #[derive(Clone)]
@@ -4540,7 +4930,62 @@ impl historian::HistorianPublicationFence for ReattachSnapshotPublicationFence {
     }
 }
 
+type HistorianRunnerRefit = Box<
+    dyn FnOnce(
+            &McStore,
+            runner_limits::RunnerLimits,
+        ) -> Result<AssembledHistorianFiring, HistorianProducerError>
+        + Send,
+>;
+
+fn historian_runner_refit(
+    mut config: HistorianAssemblerConfig,
+    messages: &[ck_wire::CkIngressMessage],
+    projection: &ck_wire::FlatProjection,
+    now: i64,
+    provider: bool,
+    wrapup: bool,
+) -> HistorianRunnerRefit {
+    let messages = messages.to_vec();
+    let identities = projection.identity_by_mid.clone();
+    let live: Vec<_> = projection
+        .blocks
+        .iter()
+        .filter(|block| !block.synthetic)
+        .cloned()
+        .collect();
+    Box::new(move |store, limits| {
+        limits.historian_chain(&config.session_id, &mut config.model_chain)?;
+        limits.fit_limits(
+            &config.model_chain,
+            &mut config.model_limits,
+            config.historian_context_limit_tokens,
+            config.max_output_tokens,
+        )?;
+        let assembler = if provider {
+            historian_chunk::assemble_provider_historian_firing
+        } else {
+            assemble_historian_firing
+        };
+        match assembler(store, &messages, &live, &identities, config, now) {
+            Ok(AssembleHistorianFiringOutcome::Fire(mut firing)) => {
+                if wrapup {
+                    firing.validate_options.force_keep_last_compartment = !firing.chunk.has_more;
+                }
+                Ok(*firing)
+            }
+            Ok(AssembleHistorianFiringOutcome::NoFire(reason)) => Err(runner_limits::refusal(
+                format!("historian_runner_fit_refused: {reason:?}"),
+            )),
+            Err(error) => Err(runner_limits::refusal(format!(
+                "historian_runner_fit_failed: {error}"
+            ))),
+        }
+    })
+}
+
 struct HistorianFiringTask {
+    rust_background_enabled: bool,
     store: Arc<McStore>,
     session_id: String,
     /// The route's harness label, stamped on rows the single-store writers produce.
@@ -4552,12 +4997,20 @@ struct HistorianFiringTask {
     project_root: PathBuf,
     project_slug: String,
     firing: AssembledHistorianFiring,
+    /// Rebuild from the same source snapshot only if runner discovery changes
+    /// model eligibility or the output reserve. Discovery stays off the transform path.
+    runner_refit: Option<HistorianRunnerRefit>,
     /// Which side runs the completion for this firing, resolved from config at
     /// the moment the firing was prepared so a config edit mid-run cannot move a
     /// firing already in flight to a different lane.
     runner: HistorianRunnerKind,
     /// Waiters for runs queued for a claimant. Unused by the in-module runner.
     host_runs: Arc<HostRunLedger>,
+    /// Set for a runner-lane conversation: the completion runs on the
+    /// conversation's own runner over llm-runner, never on the claim queue and
+    /// never on the configured runner, whatever `runner` says.
+    session_runner: Option<SessionRunnerRoute>,
+    runner_identity: session_resolver::RunnerBindIdentity,
     model_chain_generation: u64,
     runner_refusal_cache: Arc<HistorianRunnerRefusalCache>,
     live_guard: SessionSetGuard,
@@ -4578,9 +5031,128 @@ impl HistorianProducerFactory for MissingProducerFactory {
     }
 }
 
+fn retrieval_values<T: Default>(
+    result: parity_contract::CapabilityResult<T>,
+    source: &str,
+    availability: &mut std::collections::BTreeMap<String, parity_contract::Availability>,
+) -> T {
+    use parity_contract::{Availability, CapabilityResult};
+    let status = result.availability();
+    if !availability
+        .get(source)
+        .is_some_and(|s| matches!(s, Availability::Unavailable { .. }))
+    {
+        availability.insert(source.into(), status);
+    }
+    match result {
+        CapabilityResult::Available { value } | CapabilityResult::Degraded { value, .. } => value,
+        CapabilityResult::Unavailable { .. } => T::default(),
+    }
+}
+
+fn retrieval_key(candidate: &retrieval::hybrid::SearchCandidate) -> String {
+    format!("{:?}:{}", candidate.hit.source, candidate.hit.source_id)
+}
+
+fn retrieval_candidate(
+    source: parity_contract::RetrievalSource,
+    source_id: String,
+    ordinal: Option<u64>,
+    text: String,
+    score: f64,
+    scope: &parity_contract::StoreScope,
+) -> retrieval::hybrid::SearchCandidate {
+    use parity_contract::*;
+    retrieval::hybrid::SearchCandidate {
+        hit: RetrievalHit {
+            source,
+            source_id: source_id.clone(),
+            provenance: Provenance {
+                origin: InputOrigin::Core,
+                source_id,
+                source_revision: "snapshot".into(),
+                content_hash: ContentHash(format!(
+                    "{:x}",
+                    <sha2::Sha256 as sha2::Digest>::digest(text.as_bytes())
+                )),
+                generation: scope.generation,
+                observed_at_ms: 0,
+            },
+            ordinal: ordinal.map(|value| MessageOrdinal {
+                value,
+                base: OrdinalBase::One,
+            }),
+            score,
+            text,
+        },
+        compartment_range: None,
+    }
+}
+
+/// Combine message and compartment ranks using reciprocal-rank fusion.
+/// Covered messages add evidence to their compartment instead of appearing twice.
+/// This produces fallback search results, not the larger pool sent to the reranker.
+fn retrieval_merge_messages(
+    messages: Vec<retrieval::hybrid::SearchCandidate>,
+    compartments: Vec<retrieval::hybrid::SearchCandidate>,
+    limit: usize,
+) -> Vec<retrieval::hybrid::SearchCandidate> {
+    if compartments.is_empty() {
+        return messages;
+    }
+    if messages.is_empty() {
+        return compartments;
+    }
+    let mut fused = compartments
+        .iter()
+        .enumerate()
+        .map(|(rank, c)| (c.clone(), 1.0 / (60 + rank) as f64))
+        .collect::<Vec<_>>();
+    for (rank, message) in messages.into_iter().enumerate() {
+        let containing = message.hit.ordinal.and_then(|o| {
+            compartments.iter().find(|c| {
+                c.compartment_range
+                    .is_some_and(|(start, end)| o.value >= start && o.value <= end)
+            })
+        });
+        let candidate = containing.unwrap_or(&message);
+        if let Some(row) = fused
+            .iter_mut()
+            .find(|(c, _)| retrieval_key(c) == retrieval_key(candidate))
+        {
+            row.1 += 1.0 / (60 + rank) as f64;
+        } else {
+            fused.push((candidate.clone(), 1.0 / (60 + rank) as f64));
+        }
+    }
+    fused.sort_by(|(a, sa), (b, sb)| {
+        sb.total_cmp(sa).then(
+            a.hit
+                .ordinal
+                .map(|o| o.value)
+                .cmp(&b.hit.ordinal.map(|o| o.value)),
+        )
+    });
+    fused.truncate(limit);
+    let count = fused.len();
+    fused
+        .into_iter()
+        .enumerate()
+        .map(|(rank, (mut c, _))| {
+            c.hit.score = 1.0 - rank as f64 / count as f64;
+            c
+        })
+        .collect()
+}
+
 impl McHandler {
     pub fn new() -> Self {
         Self::new_with_connection_file(None)
+    }
+
+    /// Transcript access shared by compaction engines using the runner route.
+    pub fn provider_runner(&self) -> &dyn session_resolver::ProviderRunner {
+        self.provider_runner.as_ref()
     }
 
     pub fn new_with_connection_file(connection_file: Option<PathBuf>) -> Self {
@@ -4606,6 +5178,18 @@ impl McHandler {
         route_targets: RouteTargetConfig,
         module_id: String,
     ) -> Self {
+        let dream_runs = Arc::new(dream_dispatch::tick::DreamRuns::new(
+            connection_file.clone(),
+            &route_targets,
+        ));
+        let retrieval_reranker = connection_file.as_ref().map(|path| {
+            Arc::new(retrieval_store::RerankTransport {
+                connection_file: path.clone(),
+                target: route_targets
+                    .target(route_targets::RegisteredRoute::SynapseRerank)
+                    .expect("rerank route is registered"),
+            }) as Arc<dyn retrieval::hybrid::RerankClient>
+        });
         let producer_factory: Arc<dyn HistorianProducerFactory> = match connection_file.clone() {
             Some(path) => Arc::new(RealHistorianProducerFactory {
                 connection_file: path,
@@ -4613,6 +5197,7 @@ impl McHandler {
             }),
             None => Arc::new(MissingProducerFactory),
         };
+        let entorhinal = entorhinal_resolve::EntorhinalResolver::new(connection_file.clone());
         let session_resolver: Arc<dyn SessionResolver> = match connection_file {
             Some(ref path) => Arc::new(RealSessionResolver::new_with_route_targets(
                 path.clone(),
@@ -4628,15 +5213,24 @@ impl McHandler {
                 Arc::clone(&move_visibility),
             )
         });
-        let provider_runner: Arc<dyn session_resolver::ProviderRunner> = match connection_file {
-            Some(path) => Arc::new(session_resolver::RealProviderRunner::new(
-                path,
-                route_targets,
-            )),
-            None => Arc::new(session_resolver::MissingProviderRunner),
-        };
+        let bus_connection_file = connection_file.clone();
+        let provider_runner: Arc<dyn session_resolver::ProviderRunner> =
+            match connection_file.as_ref() {
+                Some(path) => Arc::new(session_resolver::RealProviderRunner::new(
+                    path.clone(),
+                    route_targets.clone(),
+                )),
+                None => Arc::new(session_resolver::MissingProviderRunner),
+            };
+        let historian_model_catalog =
+            providers::HistorianModelCatalog::new(connection_file.clone(), route_targets);
         let store = Arc::new(OnceLock::new());
         let provider_store = Arc::new(providers::Storage::new(Arc::clone(&store)));
+        *provider_store
+            .async_runtime
+            .connection_file
+            .lock()
+            .expect("bus connection file") = bus_connection_file;
         McHandler {
             agent_data,
             move_visibility,
@@ -4646,16 +5240,30 @@ impl McHandler {
             store_open: Arc::new(StoreOpenCoordinator::new()),
             producer_factory,
             session_resolver,
+            retrieval_reranker,
             config: Arc::new(Mutex::new(ConfigCache::default())),
             historian_runner_refusals: Arc::new(HistorianRunnerRefusalCache::default()),
             host_runs: Arc::new(HostRunLedger::new()),
+            dream_children: Arc::new(dream_dispatch::host_carrier::DreamQueue::default()),
+            broca_dream_tools: Arc::new(dream_dispatch::broca_carrier::BrocaToolRoute::default()),
+            dream_claimants: Arc::new(dream_dispatch::ownership::ClaimantRegistry::default()),
+            dream_runs,
             runner_choices: Arc::new(Mutex::new(runner_choices::RunnerChoiceLog::default())),
             project_identities: Arc::new(project_identity::ProjectIdentityResolver::new()),
+            entorhinal,
+            binding_projects: Mutex::default(),
+            active_project_roots: Mutex::default(),
             memory_paused_routes: Arc::default(),
             #[cfg(test)]
             resolve_project_identity_for_test: AtomicBool::new(false),
             #[cfg(test)]
             fixed_config: None,
+            #[cfg(test)]
+            fixed_dream_settings: None,
+            #[cfg(test)]
+            fixed_historian_settings: None,
+            #[cfg(test)]
+            dream_wiring: None,
             reattaching_sessions: Arc::new(Mutex::new(HashSet::new())),
             live_historian_sessions: Arc::new(Mutex::new(HashMap::new())),
             wrapup_sessions: Arc::new(Mutex::new(HashMap::new())),
@@ -4675,8 +5283,8 @@ impl McHandler {
             frozen_tool_catalogs: Mutex::new(HashMap::new()),
             provider_store,
             provider_serial: Arc::new(providers::ProviderSerial::default()),
-            provider_resident: Arc::new(providers::resident_hooks::ResidentHooks::default()),
             provider_runner,
+            historian_model_catalog,
             provider_historian_worker: OnceLock::new(),
             provider_historian_budget: providers::historian_budget::Budget::process(),
             provider_historian_evaluations: Arc::new(Mutex::new(HashSet::new())),
@@ -4712,10 +5320,6 @@ impl McHandler {
             #[cfg(test)]
             publication_fence_write_hook: Arc::new(Mutex::new(None)),
             bindings: Mutex::new(HashMap::new()),
-            native_route_plans: Mutex::new(HashMap::new()),
-            native_connection_sequence: std::sync::atomic::AtomicU64::new(0),
-            #[cfg(test)]
-            native_bundle_override: Mutex::new(None),
             threshold_logged_routes: Mutex::new(HashSet::new()),
             note_evaluation_capabilities: Mutex::new(HashMap::new()),
             transform_route_channels: Mutex::new(HashMap::new()),
@@ -4767,7 +5371,7 @@ impl McHandler {
             .fetch_add(1, Ordering::Relaxed);
         let store = Arc::clone(&self.store);
         let coordinator = Arc::clone(&self.store_open);
-        let prime_serving_wal = self.provider_resident.is_enabled();
+        let prime_serving_wal = true;
         tokio::spawn(async move {
             let _guard = StoreOpenWaiterGuard {
                 coordinator: Arc::clone(&coordinator),
@@ -5018,6 +5622,7 @@ impl McHandler {
         Self::with_producer_factory_and_config(
             factory,
             McModuleConfig {
+                rust_background_enabled: false,
                 cache_ttl_by_model: std::collections::BTreeMap::new(),
                 catalog: crate::config::CatalogConfigInputs::default(),
                 historian_temperature: None,
@@ -5040,6 +5645,7 @@ impl McHandler {
                 caveman: crate::config::CavemanConfig::default(),
                 auto_promote: true,
                 user_memory_collection_enabled: false,
+                user_observations_requested: true,
                 historian_context_limit_tokens: 128_000,
                 historian_context_limit_known: false,
                 memory_budget_tokens: 4_000.0,
@@ -5091,15 +5697,29 @@ impl McHandler {
             store_open: Arc::new(StoreOpenCoordinator::new()),
             producer_factory: factory,
             session_resolver,
+            retrieval_reranker: None,
             config: Arc::new(Mutex::new(ConfigCache::default())),
             historian_runner_refusals: Arc::new(HistorianRunnerRefusalCache::default()),
             host_runs: Arc::new(HostRunLedger::new()),
+            dream_children: Arc::new(dream_dispatch::host_carrier::DreamQueue::default()),
+            broca_dream_tools: Arc::new(dream_dispatch::broca_carrier::BrocaToolRoute::default()),
+            dream_claimants: Arc::new(dream_dispatch::ownership::ClaimantRegistry::default()),
+            dream_runs: Arc::new(dream_dispatch::tick::DreamRuns::new(
+                None,
+                &RouteTargetConfig::default(),
+            )),
             runner_choices: Arc::new(Mutex::new(runner_choices::RunnerChoiceLog::default())),
             project_identities: Arc::new(project_identity::ProjectIdentityResolver::new()),
+            entorhinal: entorhinal_resolve::EntorhinalResolver::new(None),
+            binding_projects: Mutex::default(),
+            active_project_roots: Mutex::default(),
             memory_paused_routes: Arc::default(),
             #[cfg(test)]
             resolve_project_identity_for_test: AtomicBool::new(false),
             fixed_config: Some(config),
+            fixed_dream_settings: None,
+            fixed_historian_settings: None,
+            dream_wiring: None,
             reattaching_sessions: Arc::new(Mutex::new(HashSet::new())),
             live_historian_sessions: Arc::new(Mutex::new(HashMap::new())),
             wrapup_sessions: Arc::new(Mutex::new(HashMap::new())),
@@ -5119,8 +5739,11 @@ impl McHandler {
             frozen_tool_catalogs: Mutex::new(HashMap::new()),
             provider_store,
             provider_serial: Arc::new(providers::ProviderSerial::default()),
-            provider_resident: Arc::new(providers::resident_hooks::ResidentHooks::default()),
             provider_runner: Arc::new(session_resolver::MissingProviderRunner),
+            historian_model_catalog: providers::HistorianModelCatalog::new(
+                None,
+                RouteTargetConfig::default(),
+            ),
             provider_historian_worker: OnceLock::new(),
             provider_historian_budget: providers::historian_budget::Budget::process(),
             provider_historian_evaluations: Arc::new(Mutex::new(HashSet::new())),
@@ -5144,10 +5767,6 @@ impl McHandler {
             #[cfg(test)]
             publication_fence_write_hook: Arc::new(Mutex::new(None)),
             bindings: Mutex::new(HashMap::new()),
-            native_route_plans: Mutex::new(HashMap::new()),
-            native_connection_sequence: std::sync::atomic::AtomicU64::new(0),
-            #[cfg(test)]
-            native_bundle_override: Mutex::new(None),
             threshold_logged_routes: Mutex::new(HashSet::new()),
             note_evaluation_capabilities: Mutex::new(HashMap::new()),
             transform_route_channels: Mutex::new(HashMap::new()),
@@ -5168,12 +5787,12 @@ impl McHandler {
     /// Record the route's session binding (called from `on_bind`). Last write wins for a
     /// reused channel — the daemon won't reuse a channel without a `route.gone` first, so
     /// this only overwrites a stale entry that somehow survived (defensive).
-    fn bind_route(&self, channel: u16, mut binding: SessionBinding) {
-        binding.connection_incarnation = self
-            .native_connection_sequence
-            .fetch_add(1, std::sync::atomic::Ordering::Relaxed)
-            + 1;
+    fn bind_route(&self, channel: u16, binding: SessionBinding) {
         DISPATCH_HEALTH.route_open(channel);
+        self.binding_projects
+            .lock()
+            .expect("binding project mutex")
+            .insert(channel, BindingProject::default());
         self.threshold_logged_routes
             .lock()
             .expect("threshold log mutex")
@@ -5184,10 +5803,6 @@ impl McHandler {
             .remove(&channel);
         let replacement = {
             let mut bindings = self.bindings.lock().expect("bindings mutex");
-            self.native_route_plans
-                .lock()
-                .expect("native route plans mutex")
-                .remove(&channel);
             let previous = bindings.insert(channel, binding);
             previous.and_then(|previous| {
                 let still_bound = bindings
@@ -5201,6 +5816,10 @@ impl McHandler {
         }
         let replacement_session = replacement.map(|previous| previous.session);
         if let Some(session_id) = replacement_session {
+            self.active_project_roots
+                .lock()
+                .expect("active project roots mutex")
+                .remove(&session_id);
             self.frozen_tool_catalogs
                 .lock()
                 .expect("frozen catalog mutex")
@@ -5606,6 +6225,10 @@ impl McHandler {
 
     /// Remove a route and evict process-local session state after its final binding closes.
     fn unbind_route(&self, channel: u16) {
+        self.binding_projects
+            .lock()
+            .expect("binding project mutex")
+            .remove(&channel);
         self.threshold_logged_routes
             .lock()
             .expect("threshold log mutex")
@@ -5621,10 +6244,6 @@ impl McHandler {
             .remove(&channel);
         let (removed_root, last_session_route) = {
             let mut bindings = self.bindings.lock().expect("bindings mutex");
-            self.native_route_plans
-                .lock()
-                .expect("native route plans mutex")
-                .remove(&channel);
             let removed = bindings.remove(&channel);
             let last_session_route = removed.as_ref().and_then(|binding| {
                 let still_bound = bindings
@@ -5641,6 +6260,10 @@ impl McHandler {
             self.clear_note_evaluation_capability_if_unbound(&root);
         }
         if let Some(session) = last_session_route {
+            self.active_project_roots
+                .lock()
+                .expect("active project roots mutex")
+                .remove(&session);
             self.frozen_tool_catalogs
                 .lock()
                 .expect("frozen catalog mutex")
@@ -5834,10 +6457,11 @@ impl McHandler {
     /// `git_identity_unavailable`. Paths that serve history use [`Self::route_project`].
     fn route_project_identity(
         &self,
+        channel: u16,
         store: &McStore,
         binding: &SessionBinding,
     ) -> Result<String, HandlerOutcome> {
-        let route = self.route_project(store, binding)?;
+        let route = self.route_project(channel, store, binding)?;
         match route.memory_paused {
             None => Ok(route.key),
             Some(reason) => Err(HandlerOutcome::Error {
@@ -5856,23 +6480,79 @@ impl McHandler {
     /// its transform (compaction, m0/m1 history) under a key that names no project, with
     /// every memory feature paused: no memory block, no memory search, no fact promotion,
     /// no memory writes and no dreamer runs. The reason is logged once per route root, and
-    /// each request resolves again, so the route recovers as soon as git does. A home or
-    /// unreadable directory still refuses outright.
+    /// each fallback request retries git, so the route recovers as soon as git does. Home,
+    /// missing and non-directory paths still refuse outright, as do failed metadata reads.
     fn route_project(
         &self,
+        channel: u16,
         store: &McStore,
         binding: &SessionBinding,
     ) -> Result<RouteProject, HandlerOutcome> {
-        match store.session_project_identity(&binding.session) {
-            Ok(Some(identity)) => return Ok(RouteProject::resolved(identity)),
-            Ok(None) => {}
-            Err(error) => {
-                return Err(HandlerOutcome::Error {
-                    code: "store_load_failed".to_string(),
-                    message: error.to_string(),
-                })
+        let mut projects = self.binding_projects.lock().expect("binding project mutex");
+        let project = projects.entry(channel).or_default();
+        let moved = self
+            .active_project_roots
+            .lock()
+            .expect("active project roots mutex")
+            .insert(binding.session.clone(), binding.project_root.clone())
+            .is_some_and(|previous| previous != binding.project_root);
+        if moved {
+            // Hosts reuse an open channel when returning to a directory. A move
+            // starts a new prefix decision even though that channel stayed open.
+            project.served = None;
+            project.mismatch_logged = false;
+            if let Ok(directory) = self
+                .project_identities
+                .eligible_directory(&binding.project_root)
+            {
+                if let Some(pin) = self
+                    .project_identities
+                    .pinned_identity(&directory)
+                    .or_else(|| self.project_identities.common_dir_pin(&directory))
+                {
+                    project.initial = Some(Ok(pin));
+                }
+            }
+            tracing::info!(session = %binding.session, root = %binding.project_root.display(), "mc-module: project directory moved; refreshing route identity without resolve");
+        }
+        let row = store
+            .session_project_identity(&binding.session)
+            .map_err(|error| HandlerOutcome::Error {
+                code: "store_load_failed".to_string(),
+                message: error.to_string(),
+            })?;
+        let candidate = match row {
+            Some(identity) => RouteProject::resolved(identity),
+            None => self.binding_fallback_project(store, binding, project)?,
+        };
+        if let Some(served) = &project.served {
+            if served.key != candidate.key
+                && (project_identity::is_project_pin(&served.key)
+                    || project_identity::is_project_pin(&candidate.key))
+            {
+                if !project.mismatch_logged {
+                    tracing::warn!(
+                        session = %binding.session,
+                        channel,
+                        served = %served.key,
+                        observed = %candidate.key,
+                        "mc-module: ignoring changed project identity until a new route binding"
+                    );
+                    project.mismatch_logged = true;
+                }
+                return Ok(served.clone());
             }
         }
+        project.served = Some(candidate.clone());
+        Ok(candidate)
+    }
+
+    fn binding_fallback_project(
+        &self,
+        _store: &McStore,
+        binding: &SessionBinding,
+        project: &BindingProject,
+    ) -> Result<RouteProject, HandlerOutcome> {
         #[cfg(test)]
         if !self
             .resolve_project_identity_for_test
@@ -5880,10 +6560,36 @@ impl McHandler {
         {
             let root = binding.project_root.to_string_lossy().to_string();
             return Ok(RouteProject::resolved(
-                store.route_identity_for_test(&root).unwrap_or(root),
+                _store.route_identity_for_test(&root).unwrap_or(root),
             ));
         }
-        let outcome = self.project_identities.resolve(&binding.project_root);
+        let outcome = match &project.initial {
+            Some(Ok(identity)) if !identity.starts_with("dir:") => Ok(identity.clone()),
+            Some(Err(error))
+                if !matches!(
+                    error,
+                    project_identity::ProjectIdentityError::GitUnavailable { .. }
+                ) =>
+            {
+                Err(error.clone())
+            }
+            initial => {
+                let outcome = self.project_identities.resolve(&binding.project_root);
+                // Revalidation may discover git, but a pin gained after bind belongs to
+                // the next binding, never to this binding's fallback decision.
+                if outcome
+                    .as_ref()
+                    .is_ok_and(|id| project_identity::is_project_pin(id))
+                {
+                    if let Some(served) = &project.served {
+                        return Ok(served.clone());
+                    }
+                    initial.clone().unwrap_or(outcome)
+                } else {
+                    outcome
+                }
+            }
+        };
         let mut paused = self
             .memory_paused_routes
             .lock()
@@ -5939,22 +6645,6 @@ impl McHandler {
             .lock()
             .expect("config mutex")
             .freeze_smart_notes_enabled(enabled);
-        self
-    }
-
-    /// Cache native-host hook policy totals and protection indexes in this process.
-    /// Generic runner callbacks still fetch transcripts at reminder cadence.
-    pub fn with_startup_provider_resident_enabled(mut self, enabled: bool) -> Self {
-        self.provider_resident =
-            Arc::new(providers::resident_hooks::ResidentHooks::enabled(enabled));
-        self
-    }
-
-    pub fn with_startup_provider_resident_process_cap(mut self, bytes: usize) -> Self {
-        let enabled = self.provider_resident.is_enabled();
-        self.provider_resident = Arc::new(
-            providers::resident_hooks::ResidentHooks::enabled(enabled).with_process_cap(bytes),
-        );
         self
     }
 
@@ -6176,11 +6866,14 @@ impl McHandler {
         now: i64,
     ) -> Option<&'static str> {
         let ReattachPublicationGuards {
+            rust_background_enabled,
             snapshot_generation,
             log_fence: log_publication_fence,
+            session_runner,
         } = guards;
         let project_path = binding.project_root.to_string_lossy().to_string();
         let harness = binding.harness.clone();
+        let runner_identity = runner_bind_identity(binding);
         let config = self.effective_config(&binding.project_root);
         let Ok(loaded) = store.load_meta(&parsed.session_id) else {
             return Some("recovery_load_failed");
@@ -6336,6 +7029,7 @@ impl McHandler {
                 let _guard = guard;
                 let outcome =
                     historian::adopt_historian_run_on_host(historian::HistorianReattachRequest {
+                        rust_background_enabled,
                         store: &store,
                         session_id: &session_id,
                         project_path: &project_path,
@@ -6472,10 +7166,20 @@ impl McHandler {
                             }
                             historian::RestartAction::ReattachProducer { .. } => {}
                         }
-                        let mut producer = factory.connect(&project_root).await?;
+                        // A run started on the conversation's own runner is
+                        // followed there; its run id means nothing to any other.
+                        let mut producer = match &session_runner {
+                            Some(route) => {
+                                factory
+                                    .connect_session_runner(&runner_identity, route)
+                                    .await?
+                            }
+                            None => factory.connect(&project_root).await?,
+                        };
                         reattach_historian_producer(
                             &mut *producer,
                             historian::HistorianReattachRequest {
+                                rust_background_enabled,
                                 store: &store,
                                 session_id: &session_id,
                                 project_path: &project_path,
@@ -6556,11 +7260,14 @@ impl McHandler {
     ) -> PreparedHistorianAction {
         profile_start!(_perf_trigger, "trigger_ms");
         let HistorianPrepareContext {
+            rust_background_enabled,
             now,
             snapshot_generation,
             publication_fence,
             tag_snapshot,
+            async_coverage,
             reclaim_ride_available,
+            runner_lane,
             timings,
         } = prepare;
         let trigger_timer = HistorianTriggerTimer {
@@ -6636,14 +7343,21 @@ impl McHandler {
             };
         }
         let cfg = self.effective_config(&binding.project_root);
+        let rust_background_enabled =
+            rust_background_enabled.unwrap_or_else(|| cfg.rust_background_enabled());
+        let session_runner = runner_lane
+            .then(|| session_runner_route(binding, cfg.historian_runner_for(&binding.harness)))
+            .flatten();
         if loaded.meta.historian.state != HistorianPhase::Idle {
             let no_fire = self
                 .maybe_spawn_reattach(
                     Arc::clone(&store),
                     parsed,
                     ReattachPublicationGuards {
+                        rust_background_enabled,
                         snapshot_generation,
                         log_fence: publication_fence.clone(),
+                        session_runner: session_runner.clone(),
                     },
                     binding,
                     projection,
@@ -6678,7 +7392,17 @@ impl McHandler {
                 .prime_from_persisted_tags(&parsed.session_id, tags.as_slice());
         } else {
             profile_start!(_perf_fallback, "rt19_fallback_tag_load");
-            if let Ok(tags) = store.load_tags_for_session(&parsed.session_id) {
+            let tags = if async_coverage.is_some() {
+                let blocks = projection
+                    .blocks
+                    .iter()
+                    .map(|block| block.id.as_str())
+                    .collect::<Vec<_>>();
+                store.load_tags_for_blocks(&parsed.session_id, &blocks)
+            } else {
+                store.load_tags_for_session(&parsed.session_id)
+            };
+            if let Ok(tags) = tags {
                 // Malformed-lineage and compaction-off paths return before normal tag hydration.
                 // Preserve their fail-open tokenization behavior rather than treating absence as empty.
                 self.boundary_tokens
@@ -6704,42 +7428,54 @@ impl McHandler {
             .timings
             .tokenized_blocks
             .saturating_add(tokenized_blocks);
-        let compartment_end_result = store.max_compartment_end_ordinal(&parsed.session_id);
-        let last_compartment_end_ordinal = match compartment_end_result {
-            Ok(ordinal) if ordinal > 0 => Some(ordinal as u64),
-            Ok(_) | Err(_) if loaded.meta.ordinal_continuation_base.is_some() => {
-                let detail = "continued_ordinal_offset_missing";
-                tracing::info!(
-                    "mc-module: aborting historian trigger for {}: {detail}",
-                    parsed.session_id
-                );
-                let diagnostics = historian_no_fire_diagnostics(NoFireDiagnosticsInput {
-                    no_fire: detail.into(),
-                    detail_kind: detail,
-                    cause: HistorianNoFireCause::ContinuedOrdinalOffsetMissing,
-                    extra: None,
-                    reason: None,
-                    state,
-                    progress: None,
-                    last_failure,
-                });
-                self.record_no_fire(
-                    &store,
-                    &parsed.session_id,
-                    &loaded,
-                    &diagnostics,
-                    &decision_context,
-                );
-                return PreparedHistorianAction::Complete(diagnostics);
+        let compartment_end_result = if async_coverage.is_none() {
+            store.max_compartment_end_ordinal(&parsed.session_id)
+        } else {
+            Ok(0)
+        };
+        let last_compartment_end_ordinal = if let Some(coverage) = async_coverage {
+            coverage
+        } else {
+            match compartment_end_result {
+                Ok(ordinal) if ordinal > 0 => Some(ordinal as u64),
+                Ok(_) | Err(_) if loaded.meta.ordinal_continuation_base.is_some() => {
+                    let detail = "continued_ordinal_offset_missing";
+                    tracing::info!(
+                        "mc-module: aborting historian trigger for {}: {detail}",
+                        parsed.session_id
+                    );
+                    let diagnostics = historian_no_fire_diagnostics(NoFireDiagnosticsInput {
+                        no_fire: detail.into(),
+                        detail_kind: detail,
+                        cause: HistorianNoFireCause::ContinuedOrdinalOffsetMissing,
+                        extra: None,
+                        reason: None,
+                        state,
+                        progress: None,
+                        last_failure,
+                    });
+                    self.record_no_fire(
+                        &store,
+                        &parsed.session_id,
+                        &loaded,
+                        &diagnostics,
+                        &decision_context,
+                    );
+                    return PreparedHistorianAction::Complete(diagnostics);
+                }
+                Ok(_) | Err(_) => None,
             }
-            Ok(_) | Err(_) => None,
         };
         let serializer_profile = SerializerProfile::parse(&parsed.serializer_profile)
             .expect("serializer_profile validated upstream");
         let fold_is_only_reclaim = !tail_reclaim(serializer_profile);
-        let pending_drops = store
-            .load_pending_agent_drops(&parsed.session_id)
-            .unwrap_or_default();
+        let pending_drops = if async_coverage.is_some() && !reclaim_ride_available {
+            Vec::new()
+        } else {
+            store
+                .load_pending_agent_drops(&parsed.session_id)
+                .unwrap_or_default()
+        };
         // The projection reads frozen `red:` units only when agent drops are pending, which is
         // rare; only then is the frozen list loaded.
         let pending_frozen_units = if pending_drops.is_empty() {
@@ -6762,7 +7498,12 @@ impl McHandler {
         let trigger = {
             let mut formatted_token_estimator =
                 |bytes: &str| token_cache_snapshot.formatted_token_count(bytes);
-            boundary::check_compartment_trigger_with_token_estimator(
+            let check = if async_coverage.is_some() {
+                boundary::check_compartment_trigger_tail_with_token_estimator
+            } else {
+                boundary::check_compartment_trigger_with_token_estimator
+            };
+            check(
                 &boundary_messages,
                 &TriggerContext {
                     boundary: BoundaryContext {
@@ -7028,37 +7769,51 @@ impl McHandler {
         } else {
             assemble_historian_firing
         };
+        let assembler_config = HistorianAssemblerConfig {
+            expand_tools: cfg.historian_expand_tools.clone(),
+            session_id: parsed.session_id.clone(),
+            project_path: project_path.to_string(),
+            project_slug: project_slug.clone(),
+            model_chain: model_chain.to_vec(),
+            model_limits: parsed.historian_model_limits.clone(),
+            model_variants: parsed.historian_model_variants.clone(),
+            token_budget: derive_historian_chunk_tokens(cfg.historian_context_limit_tokens),
+            historian_context_limit_tokens: cfg
+                .historian_context_limit_known
+                .then_some(cfg.historian_context_limit_tokens),
+            max_output_tokens: parsed
+                .historian_max_output_tokens
+                .unwrap_or(historian_producer::HISTORIAN_MAX_OUTPUT_TOKENS),
+            boundary,
+            memory_enabled: cfg.memory_enabled,
+            auto_promote: cfg.auto_promote,
+            user_memory_collection_enabled: cfg.user_memory_collection_enabled,
+            user_observations_requested: cfg.user_observations_requested,
+            extraction_free: false,
+            in_emergency: parsed.emergency_recovery_armed,
+            force_keep_last_compartment: false,
+            fold_is_only_reclaim,
+            failure_backoff_at_ms: now + HISTORIAN_FAILURE_BACKOFF_MS,
+            min_chunk_tokens: DEFAULT_HISTORIAN_MIN_CHUNK_TOKENS,
+        };
+        let runner_refit = (session_runner.is_some()
+            || cfg.historian_runner_for(&binding.harness).kind == HistorianRunnerKind::Broca)
+            .then(|| {
+                historian_runner_refit(
+                    assembler_config.clone(),
+                    &parsed.messages,
+                    projection,
+                    now,
+                    publication_fence.is_some(),
+                    false,
+                )
+            });
         let assemble = assembler(
             &store,
             &parsed.messages,
             &live,
             &projection.identity_by_mid,
-            HistorianAssemblerConfig {
-                expand_tools: cfg.historian_expand_tools.clone(),
-                session_id: parsed.session_id.clone(),
-                project_path: project_path.to_string(),
-                project_slug: project_slug.clone(),
-                model_chain: model_chain.to_vec(),
-                model_limits: parsed.historian_model_limits.clone(),
-                model_variants: parsed.historian_model_variants.clone(),
-                token_budget: derive_historian_chunk_tokens(cfg.historian_context_limit_tokens),
-                historian_context_limit_tokens: cfg
-                    .historian_context_limit_known
-                    .then_some(cfg.historian_context_limit_tokens),
-                max_output_tokens: parsed
-                    .historian_max_output_tokens
-                    .unwrap_or(historian_producer::HISTORIAN_MAX_OUTPUT_TOKENS),
-                boundary,
-                memory_enabled: cfg.memory_enabled,
-                auto_promote: cfg.auto_promote,
-                user_memory_collection_enabled: cfg.user_memory_collection_enabled,
-                extraction_free: false,
-                in_emergency: parsed.emergency_recovery_armed,
-                force_keep_last_compartment: false,
-                fold_is_only_reclaim,
-                failure_backoff_at_ms: now + HISTORIAN_FAILURE_BACKOFF_MS,
-                min_chunk_tokens: DEFAULT_HISTORIAN_MIN_CHUNK_TOKENS,
-            },
+            assembler_config,
             now,
         );
         let mut firing = match assemble {
@@ -7168,6 +7923,7 @@ impl McHandler {
         PreparedHistorianAction::FireReady(Box::new(PreparedHistorianFiring {
             diagnostics,
             task: HistorianFiringTask {
+                rust_background_enabled,
                 store,
                 session_id: parsed.session_id.clone(),
                 harness: binding.harness.clone(),
@@ -7180,8 +7936,11 @@ impl McHandler {
                 project_root: binding.project_root.clone(),
                 project_slug,
                 firing,
+                runner_refit,
                 runner: self.record_historian_runner(&parsed.session_id, &cfg, &binding.harness),
                 host_runs: Arc::clone(&self.host_runs),
+                session_runner,
+                runner_identity: runner_bind_identity(binding),
                 model_chain_generation,
                 runner_refusal_cache: Arc::clone(&self.historian_runner_refusals),
                 live_guard,
@@ -7208,6 +7967,7 @@ impl McHandler {
             now,
             project_path,
             allow_unknown_module_retry,
+            publication_fence,
         } = context;
         let loaded = match store.load(&parsed.session_id) {
             Ok(loaded) => loaded,
@@ -7269,39 +8029,62 @@ impl McHandler {
             .collect::<Vec<_>>();
         let project_slug = project_slug(&binding.project_root);
         let language = cfg.language.clone();
-        let assemble = assemble_historian_firing(
+        let assembler_config = HistorianAssemblerConfig {
+            expand_tools: cfg.historian_expand_tools.clone(),
+            session_id: parsed.session_id.clone(),
+            project_path: project_path.clone(),
+            project_slug: project_slug.clone(),
+            model_chain,
+            model_limits: parsed.historian_model_limits.clone(),
+            model_variants: parsed.historian_model_variants.clone(),
+            token_budget: derive_historian_chunk_tokens(cfg.historian_context_limit_tokens),
+            historian_context_limit_tokens: cfg
+                .historian_context_limit_known
+                .then_some(cfg.historian_context_limit_tokens),
+            max_output_tokens: parsed
+                .historian_max_output_tokens
+                .unwrap_or(historian_producer::HISTORIAN_MAX_OUTPUT_TOKENS),
+            boundary: boundary.clone(),
+            memory_enabled: cfg.memory_enabled,
+            auto_promote: cfg.auto_promote,
+            user_memory_collection_enabled: cfg.user_memory_collection_enabled,
+            user_observations_requested: cfg.user_observations_requested,
+            extraction_free: false,
+            in_emergency: false,
+            force_keep_last_compartment: false,
+            // Explicit wrapup is the only reclaim mechanism on this surface, so a
+            // small final chunk must not be rejected by the substance floor.
+            fold_is_only_reclaim: true,
+            failure_backoff_at_ms: now + HISTORIAN_FAILURE_BACKOFF_MS,
+            min_chunk_tokens: DEFAULT_HISTORIAN_MIN_CHUNK_TOKENS,
+        };
+        let session_runner = publication_fence
+            .is_some()
+            .then(|| session_runner_route(binding, cfg.historian_runner_for(&binding.harness)))
+            .flatten();
+        let runner_refit = (session_runner.is_some()
+            || cfg.historian_runner_for(&binding.harness).kind == HistorianRunnerKind::Broca)
+            .then(|| {
+                historian_runner_refit(
+                    assembler_config.clone(),
+                    &parsed.messages,
+                    projection,
+                    now,
+                    publication_fence.is_some(),
+                    true,
+                )
+            });
+        let assembler = if publication_fence.is_some() {
+            historian_chunk::assemble_provider_historian_firing
+        } else {
+            assemble_historian_firing
+        };
+        let assemble = assembler(
             &store,
             &parsed.messages,
             &live,
             &projection.identity_by_mid,
-            HistorianAssemblerConfig {
-                expand_tools: cfg.historian_expand_tools.clone(),
-                session_id: parsed.session_id.clone(),
-                project_path: project_path.clone(),
-                project_slug: project_slug.clone(),
-                model_chain,
-                model_limits: parsed.historian_model_limits.clone(),
-                model_variants: parsed.historian_model_variants.clone(),
-                token_budget: derive_historian_chunk_tokens(cfg.historian_context_limit_tokens),
-                historian_context_limit_tokens: cfg
-                    .historian_context_limit_known
-                    .then_some(cfg.historian_context_limit_tokens),
-                max_output_tokens: parsed
-                    .historian_max_output_tokens
-                    .unwrap_or(historian_producer::HISTORIAN_MAX_OUTPUT_TOKENS),
-                boundary: boundary.clone(),
-                memory_enabled: cfg.memory_enabled,
-                auto_promote: cfg.auto_promote,
-                user_memory_collection_enabled: cfg.user_memory_collection_enabled,
-                extraction_free: false,
-                in_emergency: false,
-                force_keep_last_compartment: false,
-                // Explicit wrapup is the only reclaim mechanism on this surface, so a
-                // small final chunk must not be rejected by the substance floor.
-                fold_is_only_reclaim: true,
-                failure_backoff_at_ms: now + HISTORIAN_FAILURE_BACKOFF_MS,
-                min_chunk_tokens: DEFAULT_HISTORIAN_MIN_CHUNK_TOKENS,
-            },
+            assembler_config,
             now,
         );
         let firing = match assemble {
@@ -7329,6 +8112,7 @@ impl McHandler {
             }
         };
         PreparedWrapupAction::FireReady(Box::new(HistorianFiringTask {
+            rust_background_enabled: binding.config.rust_background_enabled(),
             store,
             session_id: parsed.session_id.clone(),
             harness: binding.harness.clone(),
@@ -7343,17 +8127,22 @@ impl McHandler {
             project_root: binding.project_root.clone(),
             project_slug,
             firing,
+            runner_refit,
             runner: self.record_historian_runner(
                 &parsed.session_id,
                 &binding.config,
                 &binding.harness,
             ),
             host_runs: Arc::clone(&self.host_runs),
+            // Keep the conversation's runner route; use its Setup-derived project root,
+            // harness, and session when binding child routes.
+            session_runner,
+            runner_identity: runner_bind_identity(binding),
             model_chain_generation,
             runner_refusal_cache: Arc::clone(&self.historian_runner_refusals),
             live_guard,
             connect_failure_commit_hook: Arc::clone(&self.connect_failure_commit_hook),
-            publication_fence: None,
+            publication_fence,
             provider_completion: None,
         }))
     }
@@ -7439,6 +8228,7 @@ impl McHandler {
         task: HistorianFiringTask,
     ) -> Result<historian::HistorianDriveOutcome, historian::HistorianDriveError> {
         let HistorianFiringTask {
+            rust_background_enabled,
             store,
             session_id,
             harness,
@@ -7448,9 +8238,12 @@ impl McHandler {
             project_path,
             project_slug,
             project_root,
-            firing,
+            mut firing,
+            runner_refit,
             runner,
             host_runs,
+            session_runner,
+            runner_identity,
             model_chain_generation,
             runner_refusal_cache,
             live_guard,
@@ -7475,7 +8268,7 @@ impl McHandler {
         // whether turn two is enabled. Both runners must use that session decision;
         // the Host/Broca runner kind must not choose the output contract.
         let turn_two_enabled = false;
-        if runner == HistorianRunnerKind::Host {
+        if runner == HistorianRunnerKind::Host && session_runner.is_none() {
             // The host lane never opens a Broca route, so there is no connect step
             // to fail: the run is queued and this task waits for a claimant.
             let mut request = firing.as_fire_request(
@@ -7488,6 +8281,7 @@ impl McHandler {
                 turn_two_enabled,
             );
             request.temperature = historian_temperature;
+            request.rust_background_enabled = rust_background_enabled;
             request.publication_fence = publication_fence.as_deref();
             // The claimant walks the same model chain a Broca firing would, each
             // attempt under the host's own per-attempt timeout, so this waits for the
@@ -7509,7 +8303,53 @@ impl McHandler {
             }
             return result;
         }
-        let result = match factory.connect(&project_root).await {
+        let connected = match &session_runner {
+            Some(route) => {
+                factory
+                    .connect_session_runner(&runner_identity, route)
+                    .await
+            }
+            None => factory.connect(&project_root).await,
+        };
+        let connected = match connected {
+            Ok(mut producer) => {
+                let prepared = async {
+                    let state = store.load_meta(&session_id).map_err(|error| {
+                        runner_limits::refusal(format!("historian_runner_discovery: {error}"))
+                    })?;
+                    let child = historian::historian_producer_session_id(
+                        &project_slug,
+                        &session_id,
+                        state.meta.historian.firing_seq.saturating_add(1),
+                    );
+                    if let Some(limits) = producer.session_runner_limits(&child).await? {
+                        limits.require_historian()?;
+                        let skips_zen = firing.model_chain.iter().any(|model| runner_limits::is_zen_model(model));
+                        if !limits.max_output_tokens || skips_zen {
+                            let refit = runner_refit.ok_or_else(|| {
+                                runner_limits::refusal("historian_runner_fit_unavailable".into())
+                            })?;
+                            let recent_decision = firing.recent_decision.clone();
+                            firing = refit(&store, limits)?;
+                            firing.recent_decision = recent_decision;
+                        }
+                    } else if session_runner.is_some() {
+                        return Err(runner_limits::refusal("historian_runner_missing_groups: no_tools,max_steps (describe unavailable)".into()));
+                    }
+                    Ok::<(), HistorianProducerError>(())
+                }
+                .await;
+                match prepared {
+                    Ok(()) => Ok(producer),
+                    Err(error) => {
+                        producer.close().await;
+                        Err(error)
+                    }
+                }
+            }
+            other => other,
+        };
+        let result = match connected {
             Ok(mut producer) => {
                 let mut request = firing.as_fire_request(
                     &store,
@@ -7521,6 +8361,7 @@ impl McHandler {
                     turn_two_enabled,
                 );
                 request.temperature = historian_temperature;
+                request.rust_background_enabled = rust_background_enabled;
                 request.await_timeout = historian_await_timeout;
                 request.publication_fence = publication_fence.as_deref();
                 run_historian_firing_with_model_cache(
@@ -8240,6 +9081,634 @@ impl McHandler {
         Ok((session_id.to_string(), binding))
     }
 
+    async fn handle_retrieval(&self, channel: u16, envelope: &Value) -> HandlerOutcome {
+        use parity_contract::*;
+        use retrieval::hybrid::*;
+        let (_, binding) =
+            match self.management_binding(channel, envelope, non_served_contract::RETRIEVAL_METHOD)
+            {
+                Ok(value) => value,
+                Err(outcome) => return outcome,
+            };
+        let Some(store) = self.store.get() else {
+            return HandlerOutcome::Error {
+                code: "store_refusal".into(),
+                message: "mc.retrieval requires a store".into(),
+            };
+        };
+        let project = match self.route_project_identity(channel, store, &binding) {
+            Ok(project) => project,
+            Err(outcome) => return outcome,
+        };
+        let scope = StoreScope {
+            project: ProjectId(project),
+            session: SessionId(binding.session.clone()),
+            generation: Generation(0),
+        };
+        let bad_request = |message: &str| HandlerOutcome::Error {
+            code: "bad_request".into(),
+            message: message.into(),
+        };
+        let op = envelope
+            .get("op")
+            .and_then(Value::as_str)
+            .unwrap_or("search");
+        if op == "expand" {
+            use retrieval::hybrid::expand;
+            let Ok(source) = serde_json::from_value::<RetrievalSource>(envelope["source"].clone())
+            else {
+                return bad_request("mc.retrieval expand requires a Rust source id");
+            };
+            if !matches!(
+                source,
+                RetrievalSource::RawMessage | RetrievalSource::Compartment
+            ) {
+                return HandlerOutcome::Error {
+                    code: "expand_unsupported_source".into(),
+                    message: envelope["source"].as_str().unwrap_or_default().into(),
+                };
+            }
+            // Keep recorded object-key order: parsing tool inputs through Value would
+            // sort their keys and change the TypeScript recovery text.
+            let Some(pages_json) = envelope["pages_json"].as_str() else {
+                return bad_request("mc.retrieval expand requires pages_json");
+            };
+            let Ok(pages) = serde_json::from_str::<Vec<Vec<expand::RawMessage>>>(pages_json) else {
+                return bad_request("mc.retrieval expand requires recorded raw-message pages");
+            };
+            if source == RetrievalSource::RawMessage {
+                let Some(ordinal) = envelope["ordinal"].as_i64() else {
+                    return bad_request("expand requires ordinal");
+                };
+                return respond(
+                    json!({"v":1,"text":expand::render_message_by_ordinal(&pages, ordinal)}),
+                );
+            }
+            let (Some(start), Some(end), Some(budget)) = (
+                envelope["start"].as_i64(),
+                envelope["end"].as_i64(),
+                envelope["token_budget"].as_u64(),
+            ) else {
+                return bad_request("compartment expand requires start, end and token_budget");
+            };
+            let overrides = match envelope.get("overrides") {
+                Some(value) => {
+                    match serde_json::from_value::<expand::ToolExpansionMap>(value.clone()) {
+                        Ok(value) => value,
+                        Err(_) => return bad_request("invalid expand preview overrides"),
+                    }
+                }
+                None => Default::default(),
+            };
+            let rendered = expand::render_verbose_range(
+                &pages,
+                start,
+                end,
+                budget.min(usize::MAX as u64) as usize,
+                &overrides,
+            );
+            return respond(
+                json!({"v":1,"text":rendered.text,"lastOrdinal":rendered.last_ordinal,"truncated":rendered.truncated}),
+            );
+        }
+        if !matches!(op, "search" | "auto_hint") {
+            return bad_request("unknown mc.retrieval operation");
+        }
+        let Ok(mut request) =
+            serde_json::from_value::<RetrievalRequest>(envelope["request"].clone())
+        else {
+            return bad_request("mc.retrieval requires a RetrievalRequest");
+        };
+        let Ok(sources) =
+            serde_json::from_value::<Vec<RetrievalSource>>(envelope["sources"].clone())
+        else {
+            return bad_request("mc.retrieval requires Rust source ids");
+        };
+        if request
+            .ordinal_cutoff
+            .is_some_and(|o| o.base != OrdinalBase::One || o.value > i64::MAX as u64)
+            || matches!((request.start_at_ms, request.end_at_ms_inclusive), (Some(a), Some(b)) if a > b)
+        {
+            return bad_request("invalid retrieval bounds");
+        }
+        if op == "auto_hint" {
+            request.intent = RetrievalIntent::Auto;
+        }
+        request.query = trim_query(&request.query).to_owned();
+        let limit = request.limit.clamp(1, 25) as usize;
+        let tier_limit = (limit * 3).max(10);
+        let dates = DateBounds {
+            from_ms: request.start_at_ms,
+            to_ms: request.end_at_ms_inclusive,
+        };
+        let cutoff = request
+            .ordinal_cutoff
+            .map(|o| o.value as i64)
+            .unwrap_or(i64::MAX);
+        let adapter = retrieval_store::RetrievalStore {
+            store,
+            now_ms: chrono::Utc::now().timestamp_millis(),
+        };
+        let mut availability = std::collections::BTreeMap::new();
+        let mut lanes = SearchLanes::default();
+        let mut bodies = HashMap::<String, String>::new();
+        let mut memory_hits = Vec::new();
+        let mut raw_hits = Vec::new();
+        let mut compartment_hits = Vec::new();
+        let mut other_hits = Vec::new();
+        let vector = serde_json::from_value::<Vec<f32>>(envelope["query_vector"].clone()).ok();
+        let query_vector = request
+            .embedding
+            .as_ref()
+            .zip(vector.as_deref())
+            .filter(|(id, v)| {
+                !matches!(id.provider.as_str(), "local" | "transformers")
+                    && id.model != "off"
+                    && id.dimensions > 0
+                    && v.len() == id.dimensions as usize
+                    && v.iter().all(|v| v.is_finite())
+            });
+        let probes = literal_probes(request.intent, &request.query);
+        let has = |source| sources.contains(&source);
+        if has(RetrievalSource::Memory) {
+            let memories = retrieval_values(
+                adapter.read_search_memories(&scope, dates),
+                "memory",
+                &mut availability,
+            );
+            let fts = retrieval_values(
+                adapter.search_memory_fts(&scope, &request.query, dates, FTS_CANDIDATE_LIMIT),
+                "memory",
+                &mut availability,
+            );
+            let visible = retrieval_values(
+                adapter.read_visible_memory_ids(&scope),
+                "memory",
+                &mut availability,
+            )
+            .into_iter()
+            .chain(request.visible_memory_ids.iter().map(|v| *v as i64))
+            .collect();
+            let vectors = query_vector
+                .map(|(id, _)| {
+                    retrieval_values(
+                        adapter.read_memory_vectors(
+                            &scope,
+                            &memories.iter().map(|m| m.id).collect::<Vec<_>>(),
+                            id,
+                        ),
+                        "memory",
+                        &mut availability,
+                    )
+                })
+                .unwrap_or_default();
+            let (ranked, _) = rank_memories(
+                &memories,
+                &fts,
+                &vectors,
+                query_vector,
+                &visible,
+                dates,
+                tier_limit.max(25),
+            );
+            for hit in ranked {
+                let memory = memories
+                    .iter()
+                    .find(|m| m.id == hit.memory_id)
+                    .expect("ranked memory belongs to snapshot");
+                let candidate = retrieval_candidate(
+                    RetrievalSource::Memory,
+                    hit.memory_id.to_string(),
+                    None,
+                    hit.content,
+                    hit.score,
+                    &scope,
+                );
+                bodies.insert(
+                    retrieval_key(&candidate),
+                    candidate_text(
+                        &format!("memory {} {}", hit.memory_id, scope.project.0),
+                        memory.content.lines().next().unwrap_or_default(),
+                        &memory.content,
+                    ),
+                );
+                memory_hits.push(candidate);
+            }
+            let convert = |hit: MemoryHit| {
+                retrieval_candidate(
+                    RetrievalSource::Memory,
+                    hit.memory_id.to_string(),
+                    None,
+                    hit.content,
+                    hit.score,
+                    &scope,
+                )
+            };
+            lanes.memory_fts = rank_memories(&memories, &fts, &[], None, &visible, dates, 25)
+                .0
+                .into_iter()
+                .map(convert)
+                .collect();
+            lanes.memory_vector =
+                rank_memories(&memories, &[], &vectors, query_vector, &visible, dates, 25)
+                    .0
+                    .into_iter()
+                    .map(convert)
+                    .collect();
+            for candidate in lanes.memory_fts.iter().chain(&lanes.memory_vector) {
+                if let Some(memory) = memories
+                    .iter()
+                    .find(|m| m.id.to_string() == candidate.hit.source_id)
+                {
+                    bodies.insert(
+                        retrieval_key(candidate),
+                        candidate_text(
+                            &format!("memory {} {}", memory.id, scope.project.0),
+                            memory.content.lines().next().unwrap_or_default(),
+                            &memory.content,
+                        ),
+                    );
+                }
+            }
+            memory_hits.truncate(tier_limit);
+        }
+        if has(RetrievalSource::RawMessage) {
+            let rows = retrieval_values(
+                adapter.raw_messages(
+                    &scope,
+                    &request.query,
+                    dates,
+                    cutoff,
+                    75,
+                    request.intent == RetrievalIntent::Explicit,
+                ),
+                "raw_message",
+                &mut availability,
+            );
+            for (rank, row) in rows.iter().enumerate() {
+                let candidate = retrieval_candidate(
+                    RetrievalSource::RawMessage,
+                    row.id.clone(),
+                    Some(row.ordinal as u64),
+                    row.content.clone(),
+                    1.0 - rank as f64 / rows.len() as f64,
+                    &scope,
+                );
+                bodies.insert(
+                    retrieval_key(&candidate),
+                    candidate_text(
+                        &format!("message {} {} @{}", row.id, scope.session.0, row.ordinal),
+                        &format!(
+                            "{}: {}",
+                            row.role,
+                            row.content.lines().next().unwrap_or_default()
+                        ),
+                        &row.content,
+                    ),
+                );
+                raw_hits.push(candidate);
+            }
+            if !probes.is_empty() {
+                let corpus = retrieval_values(
+                    adapter.corpus_size(&scope, cutoff),
+                    "raw_message",
+                    &mut availability,
+                );
+                let matches = probes
+                    .iter()
+                    .map(|probe| {
+                        let rows = retrieval_values(
+                            adapter.raw_messages(&scope, probe, dates, cutoff, 75, true),
+                            "raw_message",
+                            &mut availability,
+                        );
+                        let hits = rows
+                            .iter()
+                            .map(|row| {
+                                let c = retrieval_candidate(
+                                    RetrievalSource::RawMessage,
+                                    row.id.clone(),
+                                    Some(row.ordinal as u64),
+                                    row.content.clone(),
+                                    0.0,
+                                    &scope,
+                                );
+                                bodies.insert(
+                                    retrieval_key(&c),
+                                    candidate_text(
+                                        &format!(
+                                            "message {} {} @{}",
+                                            row.id, scope.session.0, row.ordinal
+                                        ),
+                                        &format!(
+                                            "{}: {}",
+                                            row.role,
+                                            row.content.lines().next().unwrap_or_default()
+                                        ),
+                                        &row.content,
+                                    ),
+                                );
+                                c.hit
+                            })
+                            .collect();
+                        ProbeMatches {
+                            probe: probe.clone(),
+                            document_frequency: retrieval_values(
+                                adapter.probe_frequency(&scope, probe, dates, cutoff),
+                                "raw_message",
+                                &mut availability,
+                            ),
+                            hits,
+                        }
+                    })
+                    .collect::<Vec<_>>();
+                raw_hits = rank_message_probes(
+                    &raw_hits.iter().map(|c| c.hit.clone()).collect::<Vec<_>>(),
+                    &matches,
+                    corpus,
+                    75,
+                    tier_limit.max(25),
+                )
+                .into_iter()
+                .map(|hit| SearchCandidate {
+                    hit,
+                    compartment_range: None,
+                })
+                .collect();
+            }
+            lanes.message_fts = raw_hits
+                .iter()
+                .take(25)
+                .cloned()
+                .map(|mut c| {
+                    c.hit.text = preview(&c.hit.text);
+                    c
+                })
+                .collect();
+            raw_hits.truncate(tier_limit);
+            let count = raw_hits.len();
+            for (rank, candidate) in raw_hits.iter_mut().enumerate() {
+                candidate.hit.text = preview(&candidate.hit.text);
+                candidate.hit.score = 1.0 - rank as f64 / count as f64;
+            }
+        }
+        if has(RetrievalSource::Compartment) {
+            if let Some((identity, vector)) = query_vector {
+                let chunks = retrieval_values(
+                    adapter.read_compartment_chunks(&scope, dates, identity),
+                    "compartment",
+                    &mut availability,
+                );
+                for hit in retrieval::compartments::rank_compartments(
+                    &chunks,
+                    &scope,
+                    identity,
+                    vector,
+                    dates,
+                    Some(cutoff),
+                    tier_limit.max(25),
+                ) {
+                    let mut candidate = retrieval_candidate(
+                        RetrievalSource::Compartment,
+                        hit.compartment_id.to_string(),
+                        Some(hit.start_ordinal as u64),
+                        hit.content,
+                        hit.score,
+                        &scope,
+                    );
+                    candidate.compartment_range =
+                        Some((hit.start_ordinal as u64, hit.end_ordinal as u64));
+                    let body = adapter.compartment_text(&scope, hit.start_ordinal, hit.end_ordinal);
+                    if let CapabilityResult::Available { value: body }
+                    | CapabilityResult::Degraded { value: body, .. } = body
+                    {
+                        bodies.insert(
+                            retrieval_key(&candidate),
+                            candidate_text(
+                                &format!(
+                                    "compartment {} {} @{}-{}",
+                                    hit.compartment_id,
+                                    scope.session.0,
+                                    hit.start_ordinal,
+                                    hit.end_ordinal
+                                ),
+                                &hit.title,
+                                &body,
+                            ),
+                        );
+                    }
+                    compartment_hits.push(candidate);
+                }
+                lanes.chunk_vector = compartment_hits.iter().take(25).cloned().collect();
+                compartment_hits.truncate(tier_limit);
+            } else {
+                availability.insert(
+                    "compartment".into(),
+                    mc_store::parity_schema_manifest::unavailable("retrieval_lane"),
+                );
+            }
+        }
+        if has(RetrievalSource::GitCommit) {
+            let result = retrieval_values(
+                adapter.git_commits(&scope, &request, query_vector, tier_limit),
+                "git_commit",
+                &mut availability,
+            );
+            let convert = |hit: &mc_store::git_archive::GitCommitSearchHit| {
+                retrieval_candidate(
+                    RetrievalSource::GitCommit,
+                    hit.commit.sha.clone(),
+                    None,
+                    preview(&hit.commit.message),
+                    hit.score,
+                    &scope,
+                )
+            };
+            for hit in result.hits.iter().chain(&result.fts).chain(&result.vector) {
+                let candidate = convert(hit);
+                bodies.insert(
+                    retrieval_key(&candidate),
+                    candidate_text(
+                        &format!("git_commit {} {}", hit.commit.sha, scope.project.0),
+                        &format!(
+                            "{} {}",
+                            hit.commit.short_sha,
+                            hit.commit.message.lines().next().unwrap_or_default()
+                        ),
+                        &hit.commit.message,
+                    ),
+                );
+            }
+            lanes.git_fts = result.fts.iter().map(convert).collect();
+            lanes.git_vector = result.vector.iter().map(convert).collect();
+            other_hits.extend(result.hits.iter().map(convert));
+        }
+        if has(RetrievalSource::Note) {
+            let (hits, rows) = retrieval_values(
+                adapter.notes(&scope, &request, &probes, tier_limit.max(25)),
+                "note",
+                &mut availability,
+            );
+            for hit in hits {
+                let candidate = retrieval_candidate(
+                    RetrievalSource::Note,
+                    hit.note_id.to_string(),
+                    hit.anchor_ordinal.and_then(|o| u64::try_from(o).ok()),
+                    hit.content,
+                    hit.score,
+                    &scope,
+                );
+                if let Some(row) = rows.iter().find(|r| r.id == hit.note_id) {
+                    let body = format!(
+                        "{}{}",
+                        row.content,
+                        row.ready_reason
+                            .as_deref()
+                            .filter(|s| !s.is_empty())
+                            .map(|s| format!("\nReason: {s}"))
+                            .unwrap_or_default()
+                    );
+                    bodies.insert(
+                        retrieval_key(&candidate),
+                        candidate_text(
+                            &format!("note {} {}", hit.note_id, scope.project.0),
+                            body.lines().next().unwrap_or_default(),
+                            &body,
+                        ),
+                    );
+                }
+                lanes.notes.push(candidate.clone());
+                other_hits.push(candidate);
+            }
+            lanes.notes.truncate(25);
+        }
+        if has(RetrievalSource::Primer) {
+            availability.insert(
+                "primer".into(),
+                mc_store::parity_schema_manifest::unavailable("retrieval_lane"),
+            );
+        }
+        let mut baseline = memory_hits;
+        baseline.extend(retrieval_merge_messages(
+            raw_hits,
+            compartment_hits,
+            tier_limit,
+        ));
+        baseline.extend(other_hits);
+        baseline.sort_by(|a, b| {
+            let boost = |c: &SearchCandidate| match c.hit.source {
+                RetrievalSource::Memory => 1.3,
+                RetrievalSource::RawMessage | RetrievalSource::Compartment => 1.275,
+                RetrievalSource::GitCommit => 1.2,
+                RetrievalSource::Primer => 1.25,
+                RetrievalSource::Note => 1.0,
+            };
+            (b.hit.score * boost(b))
+                .total_cmp(&(a.hit.score * boost(a)))
+                .then_with(|| {
+                    if a.hit.source != b.hit.source {
+                        return std::cmp::Ordering::Equal;
+                    }
+                    match a.hit.source {
+                        RetrievalSource::Memory => a
+                            .hit
+                            .source_id
+                            .parse::<i64>()
+                            .unwrap_or_default()
+                            .cmp(&b.hit.source_id.parse::<i64>().unwrap_or_default()),
+                        RetrievalSource::RawMessage | RetrievalSource::Compartment => a
+                            .hit
+                            .ordinal
+                            .map(|o| o.value)
+                            .cmp(&b.hit.ordinal.map(|o| o.value)),
+                        _ => std::cmp::Ordering::Equal,
+                    }
+                })
+        });
+        baseline.truncate(limit);
+        if request.query.is_empty() {
+            baseline.clear();
+        }
+        let identity = RerankIdentity::new(
+            binding.project_root.to_string_lossy().into_owned(),
+            binding.session.clone(),
+        );
+        let pinned = prepare_reranker(
+            request.intent,
+            &request.query,
+            self.retrieval_reranker.as_deref(),
+            &identity,
+        )
+        .await;
+        let session = pinned
+            .zip(self.retrieval_reranker.as_deref())
+            .map(|(lane, client)| RerankSession {
+                client,
+                lane,
+                identity,
+            });
+        let pool = fuse_search_lanes(&lanes);
+        let texts = pool
+            .iter()
+            .map(|c| bodies.get(&retrieval_key(c)).cloned())
+            .collect::<Option<Vec<_>>>();
+        let hits = if let Some(texts) = texts {
+            rerank_search_results(
+                request.intent,
+                session.as_ref(),
+                &request.query,
+                &baseline,
+                &pool,
+                &texts,
+                limit,
+            )
+            .await
+        } else {
+            baseline
+        };
+        let mut body = json!({"v":1,"hits":hits.into_iter().map(|c| c.hit).collect::<Vec<_>>(),"source_availability":availability,"literal_probes":probes});
+        if envelope["capture_lanes"] == true {
+            body["lanes"] = json!({"git_fts":lanes.git_fts.iter().map(|c|&c.hit).collect::<Vec<_>>(),"git_vector":lanes.git_vector.iter().map(|c|&c.hit).collect::<Vec<_>>()});
+        }
+        respond(body)
+    }
+
+    fn handle_non_served_method(
+        &self,
+        channel: u16,
+        request: &Value,
+        method: &str,
+    ) -> HandlerOutcome {
+        if non_served_contract::UI_METHODS.contains(&method) {
+            return self.handle_ops_facade(channel, request, method);
+        }
+        let (_, binding) = match self.management_binding(channel, request, method) {
+            Ok(value) => value,
+            Err(outcome) => return outcome,
+        };
+        let store = self.store.get();
+        if non_served_contract::UI_READ_METHODS.contains(&method) && store.is_none() {
+            return respond(non_served_contract::partial_state_body());
+        }
+        if non_served_contract::PROJECT_METHODS.contains(&method) {
+            if let Some(store) = store {
+                if let Err(outcome) = self.route_project_identity(channel, store, &binding) {
+                    return outcome;
+                }
+            }
+        }
+        if method == "mc.dream" {
+            return self.dream_control_entry(&binding, request);
+        }
+        non_served_route_refusal(method)
+    }
+
+    // The manual dream controller is deliberately separate from dreamer.run_task.
+    // Until a scheduler owns this entry, it starts no host or Rust work.
+    fn dream_control_entry(&self, _binding: &SessionBinding, _request: &Value) -> HandlerOutcome {
+        non_served_route_refusal("mc.dream")
+    }
+
     fn handle_todo_state_set_value(&self, channel: u16, request: &Value) -> HandlerOutcome {
         let (session_id, _binding) =
             match self.management_binding(channel, request, "todo_state.set") {
@@ -8278,11 +9747,14 @@ impl McHandler {
     }
 
     fn handle_session_flush_value(&self, channel: u16, request: &Value) -> HandlerOutcome {
-        let (session_id, _binding) =
-            match self.management_binding(channel, request, "session.flush") {
-                Ok(scope) => scope,
-                Err(outcome) => return outcome,
-            };
+        let (session_id, binding) = match self.management_binding(channel, request, "session.flush")
+        {
+            Ok(scope) => scope,
+            Err(outcome) => return outcome,
+        };
+        if let Some(outcome) = self.flush_async_compaction(&binding) {
+            return outcome;
+        }
         let store = match self.store.get() {
             Some(store) => store,
             None => return self.store_refusal(),
@@ -8495,16 +9967,11 @@ impl McHandler {
     /// The project a claim-lane request may act on, and the version check the rest
     /// of the management surface applies.
     ///
-    /// The four claim ops cannot take a `session_id` the way the neighbouring
-    /// management ops do: a claimant polls precisely because it does not know which
-    /// session produced a run. What it can be held to is the channel's own binding.
-    /// One module store serves every project on the machine, the queue row records
-    /// which project queued the run, and `historian.claim` hands back the folded
-    /// conversation transcript — so without this scope a second project's host
-    /// process can list and claim the first project's runs and read its transcripts.
-    ///
-    /// The project is resolved exactly as the transform that queued the run resolved it,
-    /// so both agree on one key.
+    /// Both lanes derive their project from the channel, never the request body.
+    /// The legacy in-process plugin discovers runs project-wide; an attested
+    /// harness route is additionally confined to its bound session. Claims expose
+    /// transcript bytes, so module callers must pass the bridge's host attestation
+    /// check before looking up any run.
     fn historian_lane_binding(
         &self,
         channel: u16,
@@ -8517,29 +9984,108 @@ impl McHandler {
                 message: format!("{operation} requires v=1"),
             });
         }
-        self.facade_binding(channel)
+        let binding = self
+            .facade_binding(channel)
             .map_err(|_| HandlerOutcome::Error {
                 code: "route_unbound".to_string(),
                 message: format!("{operation} on a channel with no session binding"),
-            })
+            })?;
+        // The in-process plugin's route keeps its project-wide access (see
+        // historian_plugin_lane). Every other route must carry the same daemon
+        // attestations (reserved:thalamus-harness plus an authorized
+        // prefrontal-core scope) as the bridge host lane.
+        if !historian_plugin_lane(&binding) {
+            if !matches!(binding.harness.as_str(), "opencode" | "opencode2" | "pi") {
+                return Err(HandlerOutcome::Error {
+                    code: "host_lane_requires_harness_module".into(),
+                    message: "Historian host lane requires an OpenCode or Pi harness".into(),
+                });
+            }
+            ops_facade::authorize_harness_scope(&binding)?;
+        }
+        Ok(binding)
+    }
+
+    fn historian_lane_run(
+        &self,
+        binding: &SessionBinding,
+        store: &McStore,
+        run_id: &str,
+    ) -> Result<(), HandlerOutcome> {
+        if historian_plugin_lane(binding) {
+            return Ok(());
+        }
+        // A harness route owns one session. A run id or session id in the body
+        // cannot grant access to a sibling session, even within the same project.
+        match store.load_parked_historian_run(&binding.session) {
+            Ok(Some(run)) if run.run_id == run_id => Ok(()),
+            Ok(_) => Err(respond(json!({"ok": false, "refusal": "unknown_run"}))),
+            Err(error) => Err(HandlerOutcome::Error {
+                code: "store_load_failed".into(),
+                message: error.to_string(),
+            }),
+        }
     }
 
     /// The project key a bound channel's runs are queued under: the same project identity
     /// the transform resolved when it queued them.
     fn historian_lane_project(
         &self,
+        channel: u16,
         binding: &SessionBinding,
         store: &McStore,
     ) -> Result<String, HandlerOutcome> {
         // The same key the transform queued the run under, also while memory is paused.
-        self.route_project(store, binding).map(|route| route.key)
+        self.route_project(channel, store, binding)
+            .map(|route| route.key)
+    }
+
+    /// `subagent_invocations.read {query, ...}`: the subagent failure sentinel
+    /// flow's read of `subagent_invocations`, served on the management surface.
+    /// The reply is the management envelope `{result: {rows, more}}`. See
+    /// [`subagent_invocations_read`] for the queries and their bounds.
+    fn handle_subagent_invocations_read(&self, channel: u16, request: &Value) -> HandlerOutcome {
+        // The caller is judged from the daemon's bind stamp, before any argument is read.
+        let admitted = match self.bindings.lock().expect("route bindings").get(&channel) {
+            Some(binding) => subagent_invocations_read::authorize_caller(
+                binding.principal.as_ref(),
+                binding.scope.as_ref(),
+            ),
+            None => Err(format!(
+                "{} on a channel with no binding",
+                subagent_invocations_read::METHOD
+            )),
+        };
+        if let Err(message) = admitted {
+            return HandlerOutcome::Error {
+                code: "caller_forbidden".to_string(),
+                message,
+            };
+        }
+        let query =
+            match subagent_invocations_read::parse(request.get("params").unwrap_or(&Value::Null)) {
+                Ok(query) => query,
+                Err(message) => return invalid_params_error(message),
+            };
+        let store = match self.store.get() {
+            Some(store) => store,
+            None => return self.store_refusal(),
+        };
+        // The query-only context reader: the op never writes.
+        match store.with_context_read(|conn| subagent_invocations_read::run(conn, &query)) {
+            Ok(result) => respond(json!({ "result": result })),
+            Err(error) => HandlerOutcome::Error {
+                code: "store_load_failed".to_string(),
+                message: error.to_string(),
+            },
+        }
     }
 
     /// `historian.pending {session_id?}` — runs waiting for a claimant.
     ///
-    /// Omitting `session_id` lists every run of the caller's own project, because a
-    /// claimant discovers runs by polling, not by already knowing which session
-    /// produced them. Runs queued by any other project are not the caller's to see.
+    /// The plugin may omit `session_id` to discover every run in its own project.
+    /// The harness lane always uses the route's session, ignoring a body filter.
+    /// Runs queued by another project are never the caller's to see.
     fn handle_historian_pending_value(&self, channel: u16, request: &Value) -> HandlerOutcome {
         let binding = match self.historian_lane_binding(channel, request, "historian.pending") {
             Ok(binding) => binding,
@@ -8553,11 +10099,17 @@ impl McHandler {
             Some(store) => store,
             None => return self.store_refusal(),
         };
-        let project_path = match self.historian_lane_project(&binding, store) {
+        let project_path = match self.historian_lane_project(channel, &binding, store) {
             Ok(project) => project,
             Err(outcome) => return outcome,
         };
-        match store.list_pending_historian_runs(&project_path, session_id.as_deref(), now_ms()) {
+        let session_id = if historian_plugin_lane(&binding) {
+            session_id.as_deref()
+        } else {
+            Some(binding.session.as_str())
+        };
+        match store.list_pending_historian_runs(&project_path, session_id, historian_claim_now_ms())
+        {
             Ok(runs) => respond(json!({
                 "ok": true,
                 "runs": runs
@@ -8602,11 +10154,15 @@ impl McHandler {
             Some(store) => store,
             None => return self.store_refusal(),
         };
-        let project_path = match self.historian_lane_project(&binding, store) {
+        let project_path = match self.historian_lane_project(channel, &binding, store) {
             Ok(project) => project,
             Err(outcome) => return outcome,
         };
-        match store.claim_historian_run(&project_path, &run_id, &claimant, now_ms()) {
+        if let Err(outcome) = self.historian_lane_run(&binding, store, &run_id) {
+            return outcome;
+        }
+        match store.claim_historian_run(&project_path, &run_id, &claimant, historian_claim_now_ms())
+        {
             Ok(mc_store::HistorianClaimOutcome::Claimed(claim)) => {
                 let lifecycle = if historian_stage::lifecycle_enabled() {
                     let state = match store.load_meta(&claim.session_id) {
@@ -8694,11 +10250,19 @@ impl McHandler {
             Some(store) => store,
             None => return self.store_refusal(),
         };
-        let project_path = match self.historian_lane_project(&binding, store) {
+        let project_path = match self.historian_lane_project(channel, &binding, store) {
             Ok(project) => project,
             Err(outcome) => return outcome,
         };
-        match store.heartbeat_historian_run(&project_path, &run_id, &token, now_ms()) {
+        if let Err(outcome) = self.historian_lane_run(&binding, store, &run_id) {
+            return outcome;
+        }
+        match store.heartbeat_historian_run(
+            &project_path,
+            &run_id,
+            &token,
+            historian_claim_now_ms(),
+        ) {
             Ok(mc_store::HistorianHeartbeatOutcome::Extended { claim_deadline_ms }) => {
                 respond(json!({
                     "ok": true,
@@ -8754,10 +10318,13 @@ impl McHandler {
             Some(store) => store,
             None => return self.store_refusal(),
         };
-        let project_path = match self.historian_lane_project(&binding, store) {
+        let project_path = match self.historian_lane_project(channel, &binding, store) {
             Ok(project) => project,
             Err(outcome) => return outcome,
         };
+        if let Err(outcome) = self.historian_lane_run(&binding, store, &run_id) {
+            return outcome;
+        }
         let authorization = match store.authorize_historian_report(&project_path, &run_id, &token) {
             Ok(mc_store::HistorianReportOutcome::Authorized(authorization)) => authorization,
             Ok(mc_store::HistorianReportOutcome::Refused(refusal)) => {
@@ -8833,7 +10400,7 @@ impl McHandler {
                     &run_id,
                     &token,
                     &durable,
-                    now_ms(),
+                    historian_claim_now_ms(),
                 ) {
                     Ok(mc_store::HistorianRecordOutcome::Recorded) => {
                         deferred_telemetry.record_invocations(
@@ -9403,7 +10970,7 @@ impl McHandler {
             None => return self.store_refusal(),
         };
         // A wrapup compacts history, so it runs with memory paused rather than refusing.
-        let project_path = match self.route_project(&store, &binding) {
+        let project_path = match self.route_project(channel, &store, &binding) {
             Ok(route) => route.key,
             Err(outcome) => return outcome,
         };
@@ -9713,6 +11280,7 @@ impl McHandler {
                     now: round_now,
                     project_path: project_path.clone(),
                     allow_unknown_module_retry: unknown_module_observed_at.is_some(),
+                    publication_fence: None,
                 },
             );
             // Assembly performs store reads, so verify the raw-history generation again
@@ -10708,7 +12276,7 @@ impl McHandler {
         // Resolve the route root to the identity memories and notes are keyed by before any
         // store read. Keep the filesystem directory only for project documents and
         // configuration below.
-        let route = match self.route_project(&store, &binding) {
+        let route = match self.route_project(channel, &store, &binding) {
             Ok(route) => route,
             Err(outcome) => return outcome,
         };
@@ -11060,11 +12628,14 @@ impl McHandler {
                 &project_path,
                 &result.projection,
                 HistorianPrepareContext {
+                    rust_background_enabled: None,
                     now: pass_now,
                     snapshot_generation: Some(snapshot_generation),
                     publication_fence: None,
                     tag_snapshot: result.historian_tags.clone(),
+                    async_coverage: None,
                     reclaim_ride_available: result.reclaim_ride_available,
+                    runner_lane: false,
                     timings: &mut trigger_timings,
                 },
             ) {
@@ -11093,11 +12664,14 @@ impl McHandler {
                             &project_path,
                             &result.projection,
                             HistorianPrepareContext {
+                                rust_background_enabled: None,
                                 now: pass_now,
                                 snapshot_generation: Some(snapshot_generation),
                                 publication_fence: None,
                                 tag_snapshot: result.historian_tags.clone(),
+                                async_coverage: None,
                                 reclaim_ride_available: result.reclaim_ride_available,
+                                runner_lane: false,
                                 timings: &mut trigger_timings,
                             },
                         ) {
@@ -11167,11 +12741,14 @@ impl McHandler {
                 &project_path,
                 &result.projection,
                 HistorianPrepareContext {
+                    rust_background_enabled: None,
                     now: pass_now,
                     snapshot_generation: Some(snapshot_generation),
                     publication_fence: None,
                     tag_snapshot: result.historian_tags.clone(),
+                    async_coverage: None,
                     reclaim_ride_available: result.reclaim_ride_available,
+                    runner_lane: false,
                     timings: &mut trigger_timings,
                 },
             ) {
@@ -11385,47 +12962,6 @@ impl McHandler {
     }
 
     fn handle_state_sync_value(&self, channel: u16, request: Value) -> HandlerOutcome {
-        if request.get("provider_pass").is_some()
-            && serde_json::to_vec(&request).map_or(true, |bytes| bytes.len() > 3 * 1024 * 1024)
-        {
-            return HandlerOutcome::Error {
-                code: "provider_message_too_large".into(),
-                message: "provider state-sync page exceeds 3 MiB encoded cap".into(),
-            };
-        }
-        // A provider pass without appends still has a barrier, even when all
-        // synchronized watermarks are unchanged. This carries no message data.
-        if (request.get("pass_complete") == Some(&Value::Bool(true))
-            || request.get("provider_pass").is_some())
-            && request.get("shadow_generation").is_none()
-        {
-            let binding = match self
-                .state_sync_binding(channel, request.get("session_id").and_then(Value::as_str))
-            {
-                Ok(binding) => binding,
-                Err(error) => return error,
-            };
-            let Some(store) = self.store.get() else {
-                return self.store_refusal();
-            };
-            let chain: Option<Vec<String>> = match request.get("historian_model_chain") {
-                Some(value) => match serde_json::from_value(value.clone()) {
-                    Ok(chain) => Some(chain),
-                    Err(error) => return providers::invalid(error),
-                },
-                None => None,
-            };
-            return match self.sync_provider_pass_inputs(
-                &binding,
-                store,
-                chain.as_deref(),
-                request.get("pass_complete") == Some(&Value::Bool(true)),
-                request.get("provider_pass"),
-            ) {
-                Ok(()) => respond(json!({"ok":true})),
-                Err(error) => error,
-            };
-        }
         let started = Instant::now();
         let mut timing = state_sync_timing::StateSyncTiming {
             session: request
@@ -11970,21 +13506,6 @@ impl McHandler {
         store: &McStore,
         parsed: ModuleStateSyncWire,
     ) -> HandlerOutcome {
-        // Refuse contention before any authority or provider input is committed.
-        // Keep the same lock until both synchronized stores have been updated.
-        let _provider_serial = match self.host_provider_conversation(binding) {
-            Some((key, _)) => match self.provider_serial.try_lock_for(&key) {
-                Ok(guard) => Some(guard),
-                Err(_) => return providers::transient("provider conversation is busy"),
-            },
-            None => None,
-        };
-        if parsed.provider_pass.is_some() && _provider_serial.is_none() {
-            return providers::invalid("provider_pass requires an admitted host conversation");
-        }
-        let chain = parsed.historian_model_chain.clone();
-        let pass_complete = parsed.pass_complete == Some(true);
-        let provider_pass = parsed.provider_pass.as_ref();
         let note_evaluation_available = parsed.note_evaluation_available.unwrap_or(false);
         #[cfg(test)]
         if !parsed.compartments.is_empty() {
@@ -12096,20 +13617,6 @@ impl McHandler {
             acked_watermarks,
         }) {
             Ok(result) => {
-                if let Err(error) = self.sync_provider_pass_inputs_locked(
-                    binding,
-                    store,
-                    chain.as_deref(),
-                    pass_complete,
-                    provider_pass,
-                ) {
-                    return error;
-                }
-                if pass_complete {
-                    if let Some((key, _)) = self.host_provider_conversation(binding) {
-                        self.schedule_provider_historian(binding.clone(), key);
-                    }
-                }
                 self.set_note_evaluation_capability(
                     &binding.project_root,
                     note_evaluation_available,
@@ -12498,18 +14005,90 @@ impl McHandler {
             .contains(session_id)
     }
 
+    fn dream_task_settings(&self, project_root: &Path) -> Result<Value, HandlerOutcome> {
+        #[cfg(test)]
+        if let Some(settings) = &self.fixed_dream_settings {
+            return Ok(settings.clone());
+        }
+        use config_parity::CoreConfigResolver;
+        use mc_store::parity_schema_manifest::CapabilityResult;
+        match config_parity::TrustedConfigResolver::from_environment().resolve(
+            &config_parity::ConfigResolveRequest {
+                user_config_path: String::new(),
+                project_root: project_root.to_string_lossy().into_owned(),
+                generation: mc_store::parity_schema_manifest::Generation(0),
+            },
+        ) {
+            CapabilityResult::Available { value } => Ok(value.settings),
+            CapabilityResult::Degraded { reason, .. }
+            | CapabilityResult::Unavailable { reason } => Err(HandlerOutcome::Error {
+                code: "unavailable_capability".into(),
+                message: format!("dreamer config unavailable: {}", reason.code),
+            }),
+        }
+    }
+
     async fn handle_dreamer_run_task(&self, channel: u16, request: &Value) -> HandlerOutcome {
         let (ledger_session, binding) =
             match self.management_binding(channel, request, "dreamer.run_task") {
                 Ok(value) => value,
                 Err(outcome) => return outcome,
             };
+        if !binding.config.memory_enabled {
+            return HandlerOutcome::Error {
+                code: "memory_disabled".to_string(),
+                message: "project memory is disabled; dreamer tasks cannot run".to_string(),
+            };
+        }
         let Some(store) = self.store.get().cloned() else {
             return self.store_refusal();
         };
         let Some(task) = request.get("task").and_then(Value::as_str) else {
             return invalid_params_error("dreamer.run_task requires task");
         };
+        let config = self.effective_config(&binding.project_root);
+        let activated = config.rust_background_enabled();
+        let canonical = mc_store::dream_scheduler::schedules::CANONICAL_TASKS
+            .into_iter()
+            .find(|name| name.as_str() == task);
+        // A plugin route still runs every task Rust has not published, exactly as
+        // with the switch off; only a published task belongs to the Rust scheduler.
+        if activated && dream_claim::plugin_lane(&binding) {
+            if canonical.is_some_and(|name| self.dream_task_published(channel, &binding, name)) {
+                return HandlerOutcome::Error {
+                    code: "rust_scheduler_owns_task".into(),
+                    message: format!("Rust scheduler owns dreamer task {task:?}"),
+                };
+            }
+        } else if activated {
+            let available = canonical.is_some()
+                && (config.smart_notes_enabled || task != "evaluate-smart-notes");
+            if !available {
+                return invalid_params_error(format!("unknown dreamer task {task:?}"));
+            }
+            let settings = match self.dream_task_settings(&binding.project_root) {
+                Ok(settings) => settings,
+                Err(outcome) => return outcome,
+            };
+            let enabled = settings["dreamer"]["tasks"][task]["schedule"]
+                .as_str()
+                .is_some_and(|schedule| !schedule.trim().is_empty());
+            if !enabled {
+                return invalid_params_error(format!("unknown dreamer task {task:?}"));
+            }
+            // Ownership comes only from the published list; request fields and
+            // config alone cannot claim a task for Rust.
+            if canonical.is_some_and(|name| self.dream_task_published(channel, &binding, name)) {
+                return HandlerOutcome::Error {
+                    code: "rust_scheduler_owns_task".into(),
+                    message: format!("Rust scheduler owns dreamer task {task:?}"),
+                };
+            }
+            return HandlerOutcome::Error {
+                code: "unavailable_capability".into(),
+                message: format!("Rust implementation unavailable for dreamer task {task:?}"),
+            };
+        }
         if task != CLASSIFY_TASK {
             // Enumerating the task here is a capability boundary: callers cannot use this
             // route to select an arbitrary system prompt, model, or tool-enabled run.
@@ -12523,7 +14102,7 @@ impl McHandler {
         }
         // Classification writes land in context.db under the route's project identity.
         // An `authority_generation` sent by an older host is accepted and ignored.
-        let authority_project = match self.route_project_identity(&store, &binding) {
+        let authority_project = match self.route_project_identity(channel, &store, &binding) {
             Ok(project) => project,
             Err(outcome) => return outcome,
         };
@@ -12642,7 +14221,14 @@ impl McHandler {
                 &ledger_session,
                 runner_choices::RunnerChoice::new(dreamer_runner, &binding.harness),
             );
-        if host_completion.is_none() && dreamer_runner.kind == HistorianRunnerKind::Host {
+        // A runner-lane route runs the completion on its own runner, so it is never
+        // asked to run and resend it as a host completion.
+        let session_runner = session_runner_route(&binding, dreamer_runner);
+        let runner_identity = runner_bind_identity(&binding);
+        if host_completion.is_none()
+            && dreamer_runner.kind == HistorianRunnerKind::Host
+            && session_runner.is_none()
+        {
             tracing::info!(
                 "mc-module: classify runner=host ({}): the host runs the completion for command {command_id}",
                 dreamer_runner.source.describe()
@@ -12718,7 +14304,15 @@ impl McHandler {
                     attempt_errors.push(format!("{model}: {detail}"));
                 }
             };
-            let mut producer = match self.producer_factory.connect(&binding.project_root).await {
+            let connected = match &session_runner {
+                Some(route) => {
+                    self.producer_factory
+                        .connect_session_runner(&runner_identity, route)
+                        .await
+                }
+                None => self.producer_factory.connect(&binding.project_root).await,
+            };
+            let mut producer = match connected {
                 Ok(producer) => producer,
                 Err(error) => {
                     record_attempt("connect_failed", error.to_string());
@@ -12872,7 +14466,7 @@ impl McHandler {
         let Some(store) = self.store.get() else {
             return self.store_refusal();
         };
-        let route_project = match self.route_project_identity(store, &binding) {
+        let route_project = match self.route_project_identity(channel, store, &binding) {
             Ok(project) => project,
             Err(outcome) => return outcome,
         };
@@ -13249,6 +14843,12 @@ impl McHandler {
         let Some(name) = request.get("name").and_then(Value::as_str) else {
             return unrecognized_request_error(&request);
         };
+        if matches!(
+            name,
+            "user_command.invoke" | "late_results" | "late_results.ack"
+        ) {
+            return self.handle_user_command_op(channel, name, &request).await;
+        }
         if let Err(outcome) = self.check_catalog_call(channel, name, &request) {
             return outcome;
         }
@@ -13399,17 +14999,14 @@ impl McHandler {
                 .cloned()
         });
         let frozen = match self.facade_binding(channel) {
-            Ok(binding) if binding.harness == session_resolver::RUNNER_BIND_HARNESS => {
-                let key = self.provider_store.tool_key(&binding)?;
-                self.provider_store
-                    .load(&key)?
-                    .catalog
-                    .map(|catalog| tool_catalog::FrozenCatalog {
-                        compacting: catalog.compacting,
-                        tools: catalog.tools,
-                    })
-                    .or(frozen)
-            }
+            Ok(binding) if binding.harness == session_resolver::RUNNER_BIND_HARNESS => self
+                .provider_store
+                .catalog(&binding)?
+                .map(|catalog| tool_catalog::FrozenCatalog {
+                    compacting: catalog.compacting,
+                    tools: catalog.tools,
+                })
+                .or(frozen),
             _ => frozen,
         };
         if preset.is_none() && frozen.is_none() {
@@ -13489,7 +15086,7 @@ impl McHandler {
         let Some(store) = self.store.get() else {
             return Err(self.facade_store_refusal());
         };
-        let identity = self.route_project_identity(store, &binding)?;
+        let identity = self.route_project_identity(channel, store, &binding)?;
         if identity != requested_project {
             tracing::warn!(
                 "mc-module: {domain} write for {requested_project} on a route whose project is {identity}"
@@ -13508,6 +15105,7 @@ impl McHandler {
         arguments: Option<&Map<String, Value>>,
         authority_domain: &str,
         _bind_for_write: bool,
+        allow_async_resync: bool,
     ) -> Result<FacadeScope, HandlerOutcome> {
         let binding = self
             .facade_binding(channel)
@@ -13527,11 +15125,23 @@ impl McHandler {
             binding.harness == OPENCODE_HARNESS || binding.harness == "opencode2";
         let transform_session_known =
             self.module_knows_transform_session(bound_session, &binding.project_root);
-        let conversation_key = if binding.harness == session_resolver::RUNNER_BIND_HARNESS {
-            self.provider_store.tool_key(&binding)?.engine_key()
-        } else if opencode_harness
-            && (transform_session_known || self.host_provider_conversation(&binding).is_some())
+        // The bind's (project_root, session) names an asynchronous compaction
+        // conversation whatever harness the bind declares: an MCP facade binds
+        // a runner's conversation by its session alone. More than one match
+        // refuses rather than guessing; none keeps the harness's own path.
+        let async_key = if binding.harness == session_resolver::RUNNER_BIND_HARNESS
+            || self.store.get().is_some()
         {
+            self.async_compaction_namespace(&binding, allow_async_resync)?
+        } else {
+            None
+        };
+        let async_conversation = async_key.is_some();
+        let conversation_key = if let Some(key) = async_key {
+            key
+        } else if binding.harness == session_resolver::RUNNER_BIND_HARNESS {
+            return Err(session_unresolved_error());
+        } else if opencode_harness && transform_session_known {
             bound_session.to_string()
         } else {
             match self
@@ -13561,7 +15171,7 @@ impl McHandler {
         // History tools (ctx_reduce, ctx_expand) keep working while the route's identity is
         // unavailable; memory tools read `memory_paused` and refuse by name.
         let route = match self.store.get() {
-            Some(store) => self.route_project(store, &binding)?,
+            Some(store) => self.route_project(channel, store, &binding)?,
             None => return Err(self.facade_store_refusal()),
         };
         let memory_paused = route.memory_paused;
@@ -13581,6 +15191,7 @@ impl McHandler {
             memory_project_path,
             route_project_root,
             conversation_key,
+            async_conversation,
             memory_enabled: binding.config.memory_enabled && memory_paused.is_none(),
             memory_paused,
         })
@@ -13602,16 +15213,15 @@ impl McHandler {
             }
         };
         let facade_scope = match self
-            .resolve_facade_scope(channel, Some(&args), "memories", false)
+            // Reduction reports unchecked tags as retryable during resync;
+            // other facade tools still refuse until the transcript is ready.
+            .resolve_facade_scope(channel, Some(&args), "memories", false, true)
             .await
         {
             Ok(scope) => scope,
             Err(outcome) => return outcome,
         };
-        if self.facade_binding(channel).is_ok_and(|binding| {
-            binding.harness == session_resolver::RUNNER_BIND_HARNESS
-                || self.host_provider_conversation(&binding).is_some()
-        }) {
+        if facade_scope.async_conversation {
             return self.handle_provider_reduce(channel, &requested).await;
         }
         let store = match self.store_for_request().await {
@@ -13730,7 +15340,7 @@ impl McHandler {
         // External editors have no served session. The authenticated connection fixes
         // their project directory and identity; the write transaction checks again
         // whether this process may still change that project's memories.
-        let route = match self.route_project(&store, &binding) {
+        let route = match self.route_project(channel, &store, &binding) {
             Ok(route) => route,
             Err(outcome) => return outcome,
         };
@@ -13831,7 +15441,7 @@ impl McHandler {
             Vec::new()
         };
         let facade_scope = match self
-            .resolve_facade_scope(channel, Some(args), "memories", is_mutation)
+            .resolve_facade_scope(channel, Some(args), "memories", is_mutation, false)
             .await
         {
             Ok(scope) => scope,
@@ -14337,7 +15947,7 @@ impl McHandler {
         }
         let sources = facade_search_sources(args);
         let facade_scope = match self
-            .resolve_facade_scope(channel, Some(args), "memories", false)
+            .resolve_facade_scope(channel, Some(args), "memories", false, false)
             .await
         {
             Ok(scope) => scope,
@@ -14427,7 +16037,7 @@ impl McHandler {
         };
         let args = &args;
         let facade_scope = match self
-            .resolve_facade_scope(channel, Some(args), "memories", false)
+            .resolve_facade_scope(channel, Some(args), "memories", false, false)
             .await
         {
             Ok(scope) => scope,
@@ -14570,7 +16180,7 @@ impl McHandler {
             };
         };
         let scope = match self
-            .resolve_facade_scope(channel, None, "notes", false)
+            .resolve_facade_scope(channel, None, "notes", false, false)
             .await
         {
             Ok(scope) => scope,
@@ -14690,7 +16300,7 @@ impl McHandler {
         }
         let is_mutation = matches!(action, "write" | "update" | "dismiss");
         let facade_scope = match self
-            .resolve_facade_scope(channel, Some(args), "notes", is_mutation)
+            .resolve_facade_scope(channel, Some(args), "notes", is_mutation, false)
             .await
         {
             Ok(scope) => scope,
@@ -15060,6 +16670,7 @@ impl ModuleHandler for McHandler {
             warn_if_log_directory_differs(&descriptor, log_directory);
         }
         self.begin_store_open(descriptor, origin);
+        self.start_async_compaction_background();
     }
 
     /// Return an atomics-only liveness snapshot. The SDK invokes this on its separate
@@ -15121,11 +16732,42 @@ impl ModuleHandler for McHandler {
             }
         }
         let config = self.effective_config(&req.identity.project_root);
+        // Hosts record their project identity before opening the route. Without
+        // that row, resolve through Entorhinal once the store can check managed projects.
+        let host_identity = self.store.get().and_then(|store| {
+            store
+                .session_project_identity(&req.identity.session)
+                .ok()
+                .flatten()
+        });
+        let initial = match host_identity {
+            Some(identity) => Ok(identity),
+            None => {
+                if let Some(store) = self.store.get() {
+                    self.entorhinal
+                        .resolve_for_session(
+                            &self.project_identities,
+                            &req.identity.project_root,
+                            &req.identity.harness,
+                            &req.identity.session,
+                            Some(store.as_ref()),
+                        )
+                        .await
+                } else {
+                    // Without an open store we cannot read context.db's authority_managed
+                    // marker, which prevents identity merges until the single-store migration.
+                    // Keep the existing identity rather than authorizing a new pin.
+                    project_identity::log_once(
+                        format!("entorhinal-authority-unavailable:{}", req.identity.project_root.display()),
+                        "Keeping project identity; authority check unavailable until the store opens",
+                    );
+                    self.project_identities.resolve(&req.identity.project_root)
+                }
+            }
+        };
         self.bind_route(
             req.handle.channel,
             SessionBinding {
-                connection_incarnation: 0,
-                native_generation: None,
                 principal: req.principal.clone(),
                 scope: req.scope.clone(),
                 project_root: req.identity.project_root.clone(),
@@ -15138,6 +16780,12 @@ impl ModuleHandler for McHandler {
                 history_budget_tokens: memory_render::DEFAULT_HISTORY_BUDGET_TOKENS,
             },
         );
+        self.binding_projects
+            .lock()
+            .expect("binding project mutex")
+            .get_mut(&req.handle.channel)
+            .expect("newly bound route")
+            .initial = Some(initial);
         self.record_route_role_versions(req.handle.channel, req.role_versions.as_ref());
         if let Ok(binding) = self.facade_binding(req.handle.channel) {
             if let Some(service) = &self.agent_data {
@@ -15165,13 +16813,17 @@ impl ModuleHandler for McHandler {
 
     async fn handle(&self, ctx: RequestCtx, body: Vec<u8>) -> HandlerOutcome {
         let channel = ctx.route_handle().channel;
-        if self.agent_data.as_ref().is_some_and(|service| {
-            service
-                .channels
-                .lock()
-                .expect("agent data channels")
-                .contains(&channel)
-        }) {
+        // A flow-scoped route never takes the agent-data lane: it falls through to
+        // the dispatcher, whose flow fence admits only the flow ops.
+        if !self.flow_scoped(channel)
+            && self.agent_data.as_ref().is_some_and(|service| {
+                service
+                    .channels
+                    .lock()
+                    .expect("agent data channels")
+                    .contains(&channel)
+            })
+        {
             let admitted = self.bindings.lock().expect("route bindings").get(&channel).is_some_and(|binding|
                 matches!(&binding.principal, Some(subc_protocol::Principal::Reserved { module_id }) if module_id == "entorhinal"));
             if !admitted {
@@ -15220,7 +16872,47 @@ impl ModuleHandler for McHandler {
     }
 }
 
+/// The only methods a flow-scoped route may call. Declaring `flow-scopes/v1`
+/// promises the daemon that ck-mc never treats a flow as its owner agent for
+/// approvals, writes or grants; admitting a flow route to a fixed list of
+/// read-only ops keeps that true whatever the other lanes' own checks do. A new
+/// flow op joins this list deliberately.
+const FLOW_ROUTE_METHODS: &[&str] = &[subagent_invocations_read::METHOD];
+
 impl McHandler {
+    /// Whether the daemon bound `channel` under a flow's scope (`flow_id` in the stamp).
+    fn flow_scoped(&self, channel: u16) -> bool {
+        self.bindings
+            .lock()
+            .expect("route bindings")
+            .get(&channel)
+            .and_then(|binding| binding.scope.as_ref())
+            .is_some_and(|scope| scope.attributes.flow_id.is_some())
+    }
+
+    /// Refuses, before any dispatch, every request on a flow-scoped route except
+    /// a [`FLOW_ROUTE_METHODS`] call in the `{"method": ...}` shape. Tool-call
+    /// shapes (`{"name", "arguments"}`) carry no method and are refused too.
+    fn flow_route_refusal(&self, channel: u16, request: &Value) -> Option<HandlerOutcome> {
+        if !self.flow_scoped(channel) {
+            return None;
+        }
+        let method = request.get("method").and_then(Value::as_str);
+        if method.is_some_and(|method| FLOW_ROUTE_METHODS.contains(&method)) {
+            return None;
+        }
+        let named = method
+            .or_else(|| request.get("name").and_then(Value::as_str))
+            .or_else(|| request.get("kind").and_then(Value::as_str))
+            .unwrap_or("(no method)");
+        Some(HandlerOutcome::Error {
+            code: "flow_route_not_admitted".to_string(),
+            message: format!(
+                "a flow-scoped route may call only {FLOW_ROUTE_METHODS:?}, not `{named}`"
+            ),
+        })
+    }
+
     /// Route a parsed request body to its handler. Split from `handle()` so the
     /// routing arms are unit-testable (`RequestCtx` cannot be constructed
     /// outside the transport).
@@ -15228,48 +16920,6 @@ impl McHandler {
     async fn dispatch_value(&self, channel: u16, request: Value) -> HandlerOutcome {
         self.dispatch_value_with_inbound_bytes(channel, request, None)
             .await
-    }
-
-    fn redact_unserved_tool_tags(&self, channel: u16, outcome: HandlerOutcome) -> HandlerOutcome {
-        let Ok(binding) = self.facade_binding(channel) else {
-            return outcome;
-        };
-        let Some((key, _)) = self.host_provider_conversation(&binding) else {
-            return outcome;
-        };
-        let Some(store) = self.store.get() else {
-            return self.store_refusal();
-        };
-        let numbers = match store.unserved_provider_tag_numbers(&key.store_key()) {
-            Ok(numbers) => numbers,
-            Err(error) => return tool_error_result(format!("Error reading served tags: {error}")),
-        };
-        if numbers.is_empty() {
-            return outcome;
-        }
-        let HandlerOutcome::Response(bytes) = outcome else {
-            return outcome;
-        };
-        let mut value: Value = match serde_json::from_slice(&bytes) {
-            Ok(value) => value,
-            Err(_) => return tool_error_result("Error reading tool response"),
-        };
-        // Filter every result string, including raw recovered text, snippets,
-        // error echoes and status details. Transform/hook answers deliberately
-        // bypass this boundary: they introduce the message's own tag, and retries
-        // must replay that exact tagged payload rather than a redacted variant.
-        fn redact(value: &mut Value, numbers: &BTreeSet<i64>) {
-            match value {
-                Value::String(text) => {
-                    *text = redact_unserved_tag_text(text, numbers);
-                }
-                Value::Array(values) => values.iter_mut().for_each(|v| redact(v, numbers)),
-                Value::Object(values) => values.values_mut().for_each(|v| redact(v, numbers)),
-                _ => {}
-            }
-        }
-        redact(&mut value, &numbers);
-        respond(value)
     }
 
     async fn dispatch_value_with_inbound_bytes(
@@ -15282,6 +16932,9 @@ impl McHandler {
             .get("method")
             .and_then(Value::as_str)
             .or_else(|| request.get("kind").and_then(Value::as_str));
+        if let Some(refusal) = self.flow_route_refusal(channel, &request) {
+            return refusal;
+        }
         if let Some(method) = method.filter(|method| method.starts_with("agent_data.")) {
             let Some(service) = &self.agent_data else {
                 return HandlerOutcome::Error {
@@ -15305,34 +16958,78 @@ impl McHandler {
             Ok(pass) => pass,
             Err(refusal) => return refusal,
         };
-        let provider_operation = if method == Some("tools/call") {
-            request.pointer("/params/name").and_then(Value::as_str)
-        } else {
-            method.or_else(|| request.get("name").and_then(Value::as_str))
-        };
-        if let Ok(binding) = self.facade_binding(channel) {
-            if let Some(refusal) =
-                providers::inbound_ceiling(&binding, provider_operation, inbound_bytes)
-            {
-                return refusal;
+        // Authenticate these non-tool routes before store-open or provider checks.
+        // Their executors will replace the named refusals without retargeting served paths.
+        match method {
+            Some("mc.ui_capabilities") => {
+                return self.handle_non_served_method(channel, &request, "mc.ui_capabilities")
             }
+            Some("mc.read_sidebar") => {
+                return self.handle_non_served_method(channel, &request, "mc.read_sidebar")
+            }
+            Some("mc.read_status") => {
+                return self.handle_non_served_method(channel, &request, "mc.read_status")
+            }
+            Some("mc.read_embed") => {
+                return self.handle_non_served_method(channel, &request, "mc.read_embed")
+            }
+            Some("mc.read_compartment_count") => {
+                return self.handle_non_served_method(
+                    channel,
+                    &request,
+                    "mc.read_compartment_count",
+                )
+            }
+            Some("mc.read_todos") => {
+                return self.handle_non_served_method(channel, &request, "mc.read_todos")
+            }
+            Some("mc.recomp_preview") => {
+                return self.handle_non_served_method(channel, &request, "mc.recomp_preview")
+            }
+            Some("mc.recomp_start") => {
+                return self.handle_non_served_method(channel, &request, "mc.recomp_start")
+            }
+            Some("mc.rescore") => {
+                return self.handle_non_served_method(channel, &request, "mc.rescore")
+            }
+            Some("mc.wrapup") => {
+                return self.handle_non_served_method(channel, &request, "mc.wrapup")
+            }
+            Some("mc.flush") => {
+                return self.handle_non_served_method(channel, &request, "mc.flush")
+            }
+            Some("mc.dream") => {
+                return self.handle_non_served_method(channel, &request, "mc.dream")
+            }
+            Some("mc.embed") => {
+                return self.handle_non_served_method(channel, &request, "mc.embed")
+            }
+            Some("mc.job_read") => {
+                return self.handle_non_served_method(channel, &request, "mc.job_read")
+            }
+            Some("mc.job_cancel") => {
+                return self.handle_non_served_method(channel, &request, "mc.job_cancel")
+            }
+            Some("mc.ui_events") => {
+                return self.handle_non_served_method(channel, &request, "mc.ui_events")
+            }
+            Some("mc.notice_currentness") => {
+                return self.handle_non_served_method(channel, &request, "mc.notice_currentness")
+            }
+            Some("mc.retrieval") => return self.handle_retrieval(channel, &request).await,
+            Some("mc.memory") => {
+                return self.handle_non_served_method(channel, &request, "mc.memory")
+            }
+            _ => {}
+        }
+        // A route bound to a Broca dream child's session serves only that child's
+        // admitted task tools (plus read-only discovery), whatever the request says.
+        if let Some(outcome) = self.broca_dream_route(channel, method, &request) {
+            return outcome;
         }
         let catalog_request = method.is_none()
             && request.get("name").and_then(Value::as_str) == Some("tool.catalog")
             && request.get("arguments").is_some();
-        if matches!(
-            method,
-            Some("compaction.setup" | "compaction.step" | "transform.hook")
-        ) {
-            if let (Ok(binding), Some(session)) = (
-                self.facade_binding(channel),
-                request.pointer("/params/session").and_then(Value::as_str),
-            ) {
-                if let Some(refusal) = self.provider_store.catalog_refusal(&binding, session) {
-                    return refusal;
-                }
-            }
-        }
         // A store that a newer ck-mc migrated past this binary refuses every request by name,
         // whatever its lane. Most lanes would refuse anyway because no store handle exists, but
         // Catalog discovery is the exception: its bytes derive from config, not
@@ -15353,11 +17050,7 @@ impl McHandler {
         if let Some(method) = method {
             return match method {
                 "role.describe" => providers::describe(),
-                "compaction.setup"
-                | "compaction.step"
-                | "compaction.view.read"
-                | "transform.declare"
-                | "transform.hook" => {
+                "compaction.setup" | "view.get" | "compaction.ride" => {
                     self.handle_provider_value(
                         channel,
                         method,
@@ -15381,17 +17074,27 @@ impl McHandler {
                 "state_import" => self.handle_state_import_value(channel, request),
                 "agent_drops.append" => self.handle_agent_drops_value(channel, request),
                 "note.evaluate" => self.handle_note_evaluation_value(channel, &request).await,
+                "dream.child.pending"
+                | "dream.child.claim"
+                | "dream.child.heartbeat"
+                | "dream.child.opened"
+                | "dream.child.event"
+                | "dream.child.tool"
+                | "dream.child.cleanup"
+                | "dream.child.unavailable" => self.handle_dream_child(channel, method, &request),
+                "dream.ownership" => self.handle_dream_ownership(channel, &request),
+                "dream.run" => self.handle_dream_run(channel, &request),
                 "historian.pending" => self.handle_historian_pending_value(channel, &request),
+                subagent_invocations_read::METHOD => {
+                    self.handle_subagent_invocations_read(channel, &request)
+                }
                 "historian.claim" => self.handle_historian_claim_value(channel, &request),
                 "historian.heartbeat" => self.handle_historian_heartbeat_value(channel, &request),
                 "historian.complete" => self.handle_historian_complete_value(channel, &request),
                 "todo_state.set" => self.handle_todo_state_set_value(channel, &request),
                 "session.flush" => self.handle_session_flush_value(channel, &request),
                 "session.recomp" => self.handle_session_recomp_value(channel, &request),
-                "session.status" => self.redact_unserved_tool_tags(
-                    channel,
-                    self.handle_session_status_value(channel, &request),
-                ),
+                "session.status" => self.handle_session_status_value(channel, &request),
                 "session.delete" => self.handle_session_delete_value(channel, &request),
                 "session.wrapup" => self.handle_session_wrapup_value(channel, &request).await,
                 // Explicit wire-debugging echo. Opt-in only: echoing every
@@ -15404,27 +17107,17 @@ impl McHandler {
         }
         if request.get("name").is_some() && request.get("arguments").is_some() {
             let outcome = self.handle_facade_value(channel, request).await;
-            return self.redact_unserved_tool_tags(channel, outcome);
+            return outcome;
         }
         unrecognized_request_error(&request)
     }
 }
 
-fn redact_unserved_tag_text(text: &str, numbers: &BTreeSet<i64>) -> String {
-    static TAG: OnceLock<regex::Regex> = OnceLock::new();
-    let tag = TAG.get_or_init(|| regex::Regex::new(r"§([0-9]+)§").expect("tag regex"));
-    tag.replace_all(text, |captures: &regex::Captures<'_>| {
-        if captures[1]
-            .parse()
-            .ok()
-            .is_some_and(|n| numbers.contains(&n))
-        {
-            "[unserved tag]".to_string()
-        } else {
-            captures[0].to_string()
-        }
-    })
-    .into_owned()
+fn non_served_route_refusal(method: &str) -> HandlerOutcome {
+    HandlerOutcome::Error {
+        code: non_served_contract::ROUTE_REFUSAL_CODE.to_string(),
+        message: method.to_string(),
+    }
 }
 
 fn has_transform_page_fields(request: &Value) -> bool {
@@ -15485,6 +17178,33 @@ fn unrecognized_request_error(request: &Value) -> HandlerOutcome {
 /// be a historian document the validator would accept anyway, and refusing at
 /// the wire keeps an oversized body from reaching the parser at all.
 const MAX_HISTORIAN_REPORT_BYTES: usize = MAX_FACADE_FRAME_BYTES;
+
+/// Whether a historian claim-op route belongs to the in-process Magic Context
+/// plugin, which may list and claim queued historian runs for any session of its
+/// bound project, as it could before harness routes were admitted.
+///
+/// The plugin opens its route without a consumer identity, so the daemon stamps
+/// `Principal::Direct` on the bind and no scope (the plugin never asks for one).
+/// A daemon that predates principal stamping sends no principal at all. Both
+/// shapes are the plugin. Any other binding is treated as a harness module: a
+/// Direct route that asked the daemon for a scope, or a reserved or unverified
+/// principal. Those must pass historian claim authorization and may only touch
+/// the run of their own bound session.
+fn historian_plugin_lane(binding: &SessionBinding) -> bool {
+    match &binding.principal {
+        None => true,
+        Some(subc_protocol::Principal::Direct) => binding.scope.is_none(),
+        Some(_) => false,
+    }
+}
+
+fn historian_claim_now_ms() -> i64 {
+    #[cfg(test)]
+    if let Some(now) = historian_claim_conformance::fixture_now_ms() {
+        return now;
+    }
+    now_ms()
+}
 
 /// Read a required non-empty string field from a historian claim-lane request.
 fn required_run_string(
@@ -17429,7 +19149,6 @@ fn assemble_state_sync_seed(
             .or(batched_note_evaluation_available),
         historian_model_chain: final_batch.historian_model_chain,
         pass_complete: final_batch.pass_complete,
-        provider_pass: final_batch.provider_pass,
     }
 }
 
@@ -19957,6 +21676,11 @@ pub fn manifest_with_route_targets(
     manifest_with_route_targets_and_smart_notes(module_id, resolved_routes, true)
 }
 
+/// The ctx tool facades resolve a bind's `(project_root, session)` to an
+/// asynchronous compaction conversation whatever harness the bind names, so
+/// an MCP facade may bind a runner's conversation by its session alone.
+pub const MCP_CONVERSATION_BINDING_V1: &str = "mcp-conversation-binding/v1";
+
 pub fn manifest_with_route_targets_and_smart_notes(
     module_id: &str,
     resolved_routes: &RouteTargetConfig,
@@ -19972,15 +21696,23 @@ pub fn manifest_with_route_targets_and_smart_notes(
     // project, whereas MC uses one machine-wide store with project-keyed rows.
     let mut capabilities = vec![
         cortexkit_role_compaction_provider::PROVIDES.to_string(),
-        cortexkit_role_step_transform_provider::PROVIDES.to_string(),
+        MCP_CONVERSATION_BINDING_V1.to_string(),
+        // basal reaches `subagent_invocations.read` over the calling flow's own
+        // scoped route, which the daemon opens only to a module declaring this.
+        // The promise it makes (a flow is never treated as its owner agent) is
+        // kept by the dispatcher's flow fence and the op's caller check.
+        subc_protocol::scope::FLOW_SCOPES_CAPABILITY.to_string(),
     ];
-    let mut provides = vec![ProviderRole::ToolProvider {
-        tools,
-        identity_scope: vec![IdentityScope::Project, IdentityScope::Session],
-        concurrency: Concurrency::ModuleManaged,
-        emits_push: false,
-        sub_supervises: false,
-    }];
+    let mut provides = vec![
+        ProviderRole::ToolProvider {
+            tools,
+            identity_scope: vec![IdentityScope::Project, IdentityScope::Session],
+            concurrency: Concurrency::ModuleManaged,
+            emits_push: false,
+            sub_supervises: false,
+        },
+        subagent_invocations_read::management_role(),
+    ];
     if agent_data::ENABLED {
         capabilities.push(cortexkit_role_agent_data::PROVIDES.to_string());
         provides.push(ProviderRole::InternalService {
@@ -20043,6 +21775,7 @@ pub fn manifest_with_route_targets_and_smart_notes(
 #[cfg(test)]
 mod tests {
     include!("tests/tool_attachment_memory_review.rs");
+    include!("tests/subagent_invocations_read.rs");
     use super::*;
     use std::collections::{HashMap, VecDeque};
     use std::sync::{
@@ -20062,6 +21795,24 @@ mod tests {
         StoredCompartment, TagMintInput,
     };
     use tokio::sync::Notify;
+
+    #[test]
+    fn session_runner_historian_child_config_uses_setup_root_and_harness() {
+        let identity = session_resolver::RunnerBindIdentity {
+            project_root: PathBuf::from("/canonical/project"),
+            harness: "broca".into(),
+            session: "conversation".into(),
+        };
+
+        let config = session_runner_historian_config(
+            PathBuf::from("/connection.json"),
+            RouteTargetConfig::default(),
+            &identity,
+        );
+
+        assert_eq!(config.project_root, identity.project_root);
+        assert_eq!(config.harness, identity.harness);
+    }
 
     // Adversarial gate over the host-runner slice and the single-store marker
     // slice merged together. Kept in its own files so the sequences it executes
@@ -20083,12 +21834,1009 @@ mod tests {
     pub(crate) fn per_pass_fixed_now_ms() -> Option<i64> {
         per_pass_cost::fixed_now_ms()
     }
+    /// Fix `now_ms()` on this thread until the guard drops, for tests that
+    /// compare committed state from two runs.
+    pub(crate) fn fixed_clock() -> impl Drop {
+        per_pass_cost::fixed_clock()
+    }
     mod catalog_startup;
     mod single_store_drill;
     mod tool_catalog;
     mod tool_catalog_conformance;
     // The per-harness default runner, driven through real passes.
     mod default_runner;
+    mod retrieval_parity;
+    // Prompt and response pairs for a scripted historian in model-less rigs.
+    mod scripted_historian_pairs;
+
+    mod i4_roots {
+        use super::*;
+        use crate::background::{self, ConfigInput, DreamCarrier, DreamRequest, DreamRole};
+        use crate::config_parity::{
+            ConfigResolveRequest, CoreConfig, CoreConfigResolver, ProtectedTokenTiers, TrustFlags,
+        };
+        use mc_store::dream_scheduler::schedules::CANONICAL_TASKS;
+        use mc_store::parity_schema_manifest::{Availability, CapabilityResult, Generation};
+
+        struct ConfigFixture {
+            on: AtomicBool,
+            reads: AtomicUsize,
+        }
+
+        impl CoreConfigResolver for ConfigFixture {
+            fn availability(&self) -> Availability {
+                Availability::Available
+            }
+
+            fn resolve(&self, _: &ConfigResolveRequest) -> CapabilityResult<CoreConfig> {
+                self.reads.fetch_add(1, Ordering::SeqCst);
+                let mut effective = default_test_config();
+                effective.rust_background_enabled = self.on.load(Ordering::SeqCst);
+                effective.historian_runner = Some(HistorianRunnerKind::Host);
+                effective.dreamer_runner = Some(HistorianRunnerKind::Broca);
+                CapabilityResult::Available {
+                    value: CoreConfig {
+                        effective,
+                        generation: Generation(1),
+                        settings: json!({"dreamer":{"opencode":{"model":"fixture/primary",
+                            "fallback_models":["fixture/fallback"]}}}),
+                        warnings: Vec::new(),
+                        trust: TrustFlags::default(),
+                        protected_token_tiers: ProtectedTokenTiers::default(),
+                    },
+                }
+            }
+        }
+
+        fn input(on: bool) -> (Arc<ConfigFixture>, ConfigInput) {
+            let resolver = Arc::new(ConfigFixture {
+                on: AtomicBool::new(on),
+                reads: AtomicUsize::new(0),
+            });
+            let input = ConfigInput {
+                resolver: resolver.clone(),
+                request: ConfigResolveRequest {
+                    user_config_path: String::new(),
+                    project_root: "/recorded/project".into(),
+                    generation: Generation(1),
+                },
+            };
+            (resolver, input)
+        }
+
+        #[test]
+        fn off_roots_do_not_start_any_work() {
+            for root in [
+                background::dreamer_tick,
+                background::manual_dream,
+                background::historian_drain,
+                background::embedding_drain,
+            ] {
+                let (config, input) = input(false);
+                let result = root(input, |_: background::Unit| -> () {
+                    panic!("disabled background root started work")
+                })
+                .unwrap()
+                .join()
+                .unwrap()
+                .unwrap();
+                assert_eq!(result, None);
+                assert_eq!(config.reads.load(Ordering::SeqCst), 1);
+            }
+        }
+
+        #[derive(Default)]
+        struct Carrier {
+            calls: Vec<&'static str>,
+            models: Vec<String>,
+        }
+
+        impl DreamCarrier for Carrier {
+            async fn open(
+                &mut self,
+                request: &background::ChildRequest,
+            ) -> Result<String, background::CarrierError> {
+                self.calls.push("open");
+                assert_eq!(request.runner.kind, HistorianRunnerKind::Broca);
+                assert_eq!(request.temperature, None);
+                assert_eq!(request.directory, Path::new("/recorded/project"));
+                self.models
+                    .push(request.model.as_ref().unwrap().model.clone());
+                Ok(format!("child-{}", self.models.len()))
+            }
+
+            async fn complete(
+                &mut self,
+                _: &str,
+                _: &background::ChildRequest,
+            ) -> Result<background::Completion, background::CarrierError> {
+                self.calls.push("complete");
+                Ok(background::Completion {
+                    text: if self.models.len() == 1 {
+                        "bad"
+                    } else {
+                        "accepted"
+                    }
+                    .into(),
+                    ..Default::default()
+                })
+            }
+
+            async fn close(
+                &mut self,
+                _: &str,
+                settled: bool,
+            ) -> Result<(), background::CarrierError> {
+                self.calls.push(if settled { "settled" } else { "aborted" });
+                Ok(())
+            }
+        }
+
+        #[test]
+        fn dream_roots_capture_once_and_resolve_every_role_off_thread() {
+            let caller = std::thread::current().id();
+            for manual in [false, true] {
+                let (config, input) = input(true);
+                let toggle = config.clone();
+                let run = move |unit: background::Unit| {
+                    assert_ne!(std::thread::current().id(), caller);
+                    toggle.on.store(false, Ordering::SeqCst);
+                    for role in [
+                        DreamRole::Classifier,
+                        DreamRole::MemoryMapper,
+                        DreamRole::Curate,
+                        DreamRole::Docs,
+                        DreamRole::Reviewer,
+                        DreamRole::PrimerInvestigator,
+                        DreamRole::Retrospective,
+                    ] {
+                        let mut carrier = Carrier::default();
+                        let result = unit.run_dream_task(
+                            &DreamRequest {
+                                task: "classify-memories",
+                                role,
+                                harness: "opencode",
+                                parent_session_id: "ses",
+                                directory: Path::new("/recorded/project"),
+                                system: "recorded system",
+                                prompt: "recorded input",
+                                timeout: Duration::from_secs(1),
+                                token_budget: Some(100),
+                                allow_empty: false,
+                            },
+                            &mut carrier,
+                            |output| {
+                                (output.text == "accepted")
+                                    .then_some(output.text.clone())
+                                    .ok_or_else(|| "invalid draft".into())
+                            },
+                        );
+                        assert_eq!(result.result.unwrap(), "accepted");
+                        assert_eq!(carrier.models, ["fixture/primary", "fixture/fallback"]);
+                        assert_eq!(
+                            carrier.calls,
+                            ["open", "complete", "aborted", "open", "complete", "settled"]
+                        );
+                    }
+                };
+                let job = if manual {
+                    background::manual_dream(input, run)
+                } else {
+                    background::dreamer_tick(input, run)
+                };
+                assert_eq!(job.unwrap().join().unwrap().unwrap(), Some(()));
+                assert_eq!(config.reads.load(Ordering::SeqCst), 1);
+            }
+        }
+
+        #[test]
+        fn runner_routes_use_the_canonical_host_set_and_dreamer_precedence() {
+            let mut config = default_test_config();
+            config.historian_runner = None;
+            config.dreamer_runner = None;
+            for harness in crate::historian_runner::HOST_RUNNER_HARNESSES {
+                assert_eq!(
+                    config.dreamer_runner_for(harness).kind,
+                    HistorianRunnerKind::Host
+                );
+            }
+            for harness in ["", "unknown", "broca"] {
+                assert_eq!(
+                    config.dreamer_runner_for(harness).kind,
+                    HistorianRunnerKind::Broca
+                );
+            }
+            config.historian_runner = Some(HistorianRunnerKind::Host);
+            assert_eq!(
+                config.dreamer_runner_for("").kind,
+                HistorianRunnerKind::Host
+            );
+            config.dreamer_runner = Some(HistorianRunnerKind::Broca);
+            assert_eq!(
+                config.dreamer_runner_for("pi").kind,
+                HistorianRunnerKind::Broca
+            );
+            config.historian_runner = None;
+            assert_eq!(
+                config.dreamer_runner_for("pi").kind,
+                HistorianRunnerKind::Broca
+            );
+        }
+
+        fn code(outcome: HandlerOutcome) -> String {
+            match outcome {
+                HandlerOutcome::Error { code, .. } => code,
+                other => panic!("expected refusal, got {other:?}"),
+            }
+        }
+
+        struct VectorQueue;
+        impl crate::memory_actions::MemoryEmbeddingQueue for VectorQueue {
+            fn enqueue_tx(
+                &self,
+                tx: &rusqlite::Transaction<'_>,
+                effect: &crate::memory_actions::EmbeddingEffect,
+            ) -> rusqlite::Result<()> {
+                let record = serde_json::from_value(serde_json::to_value(effect).unwrap()).unwrap();
+                mc_store::retrieval_vectors::queue::enqueue_tx(tx, &record)
+            }
+        }
+
+        fn memory_write(tx: &rusqlite::Transaction<'_>, project: &str) -> rusqlite::Result<String> {
+            use crate::memory_actions::*;
+            MemoryActions::default().execute_tx(
+                tx,
+                &VectorQueue,
+                &MemoryActionContext {
+                    project_path: project,
+                    session_id: "ses",
+                    harness: "opencode",
+                    role: MemoryRole::Dreamer,
+                    workspace_members: &[],
+                    shared_categories: &[],
+                    curate_category: Some("CONSTRAINTS"),
+                    memory_enabled: true,
+                    now_ms: 100,
+                    decision_key: "recorded-memory-task",
+                },
+                &serde_json::from_value(json!({"action":"write", "content":"Background memory fact", "category":"CONSTRAINTS"})).unwrap(),
+            )
+        }
+
+        fn scalar(db: &rusqlite::Connection, sql: &str) -> i64 {
+            db.query_row(sql, [], |row| row.get(0)).unwrap()
+        }
+
+        struct NoChunks;
+        impl mc_store::retrieval_vectors::store::ChunkCatalog for NoChunks {
+            fn pending(
+                &self,
+                _: &rusqlite::Connection,
+                _: &str,
+                _: &str,
+                _: usize,
+            ) -> rusqlite::Result<Vec<mc_store::retrieval_vectors::store::Passage>> {
+                Ok(Vec::new())
+            }
+            fn current(
+                &self,
+                _: &rusqlite::Connection,
+                _: &mc_store::retrieval_vectors::store::Passage,
+            ) -> rusqlite::Result<bool> {
+                panic!("memory-only drain requested chunks")
+            }
+        }
+
+        struct Embedder(Arc<AtomicUsize>);
+        impl mc_store::retrieval_vectors::drain::EmbeddingProvider for Embedder {
+            fn embed(
+                &mut self,
+                _: &mc_store::retrieval_vectors::drain::Registration,
+                passages: &[mc_store::retrieval_vectors::store::Passage],
+            ) -> Result<Vec<Vec<f32>>, String> {
+                self.0.fetch_add(passages.len(), Ordering::SeqCst);
+                Ok(vec![vec![0.25, 0.75]; passages.len()])
+            }
+        }
+
+        #[test]
+        fn embedding_root_drains_a_real_memory_action_only_when_on() {
+            use mc_store::retrieval_vectors::drain::{FinishOutcome, Registration};
+            let dir = tempfile::tempdir().unwrap();
+            let path = dir.path().join("fixture.db");
+            let db = rusqlite::Connection::open(&path).unwrap();
+            db.execute_batch(
+                &include_str!("../../mc-store/testdata/context_schema/schema.sql")
+                    .replace(":applied_at", "1"),
+            )
+            .unwrap();
+            let (_, task_input) = input(true);
+            let task_path = path.clone();
+            background::manual_dream(task_input, move |unit| {
+                let mut carrier = Carrier::default();
+                unit.run_dream_task(
+                    &DreamRequest {
+                        task: "curate",
+                        role: DreamRole::Curate,
+                        harness: "opencode",
+                        parent_session_id: "ses",
+                        directory: Path::new("/recorded/project"),
+                        system: "recorded memory-task system",
+                        prompt: "recorded memory-task input",
+                        timeout: Duration::from_secs(1),
+                        token_budget: Some(100),
+                        allow_empty: false,
+                    },
+                    &mut carrier,
+                    |output| {
+                        (output.text == "accepted")
+                            .then_some(())
+                            .ok_or_else(|| "invalid result".into())
+                    },
+                )
+                .result
+                .unwrap();
+                let mut db = rusqlite::Connection::open(task_path).unwrap();
+                let tx = db.transaction().unwrap();
+                assert_eq!(
+                    memory_write(&tx, "git:identity").unwrap(),
+                    "Saved memory [ID: 1] in CONSTRAINTS."
+                );
+                tx.commit().unwrap();
+            })
+            .unwrap()
+            .join()
+            .unwrap()
+            .unwrap()
+            .unwrap();
+            // Exercise the TS entry points against the same memory-task database.
+            // Any executor entry would be a second writer, including turn two.
+            let ts_reference_path = Path::new(env!("CARGO_MANIFEST_DIR"))
+                .join("testdata/i4-roots-ts-executor-exclusion.json");
+            let ts_reference = std::fs::read(&ts_reference_path).unwrap_or_else(|error| {
+                panic!(
+                    "unable to read TS executor exclusion reference {}: {error}",
+                    ts_reference_path.display()
+                )
+            });
+            let ts: serde_json::Value =
+                serde_json::from_slice(&ts_reference).unwrap_or_else(|error| {
+                    panic!(
+                        "invalid TS executor exclusion reference {}: {error}",
+                        ts_reference_path.display()
+                    )
+                });
+            assert!(
+                ts["success"]
+                    .as_bool()
+                    .expect("reference success field must be boolean"),
+                "{}",
+                ts["stderr"]
+                    .as_str()
+                    .expect("reference stderr field must be text")
+            );
+            assert!(ts["stdout"]
+                .as_str()
+                .expect("reference stdout field must be text")
+                .contains("TS_EXECUTORS tasks=0 memory_rows=1"));
+            let registration = Registration {
+                project: "git:identity".into(),
+                model_id: "fixture".into(),
+                chunk_model_id: "fixture:raw".into(),
+                fingerprint: "fixture-fingerprint".into(),
+                table_epoch: 1,
+                dimensions: 2,
+                generation: 1,
+            };
+            db.execute("INSERT INTO embedding_registrations(project_path,model_id,chunk_model_id,fingerprint,table_epoch,dims,generation) VALUES(?1,?2,?3,?4,1,2,1)", rusqlite::params![registration.project,registration.model_id,registration.chunk_model_id,registration.fingerprint]).unwrap();
+            let calls = Arc::new(AtomicUsize::new(0));
+            for on in [false, true] {
+                let (config, input) = input(on);
+                let toggle = config.clone();
+                let path = path.clone();
+                let registration = registration.clone();
+                let mut provider = Embedder(calls.clone());
+                let result = background::embedding_drain(input, move |unit| {
+                    toggle.on.store(false, Ordering::SeqCst);
+                    let mut db = rusqlite::Connection::open(path).unwrap();
+                    unit.drain_embeddings(
+                        &mut db,
+                        &NoChunks,
+                        &mut provider,
+                        &registration,
+                        1,
+                        100,
+                        || 101,
+                    )
+                    .unwrap()
+                })
+                .unwrap()
+                .join()
+                .unwrap()
+                .unwrap();
+                if on {
+                    assert!(matches!(
+                        result,
+                        Some(Some(FinishOutcome::Published { accepted: 1, .. }))
+                    ));
+                    assert_eq!(calls.load(Ordering::SeqCst), 1);
+                    assert_eq!(scalar(&db, "SELECT COUNT(*) FROM memory_embeddings"), 1);
+                } else {
+                    assert_eq!(result, None);
+                    assert_eq!(calls.load(Ordering::SeqCst), 0);
+                    assert_eq!(scalar(&db, "SELECT COUNT(*) FROM memory_embeddings"), 0);
+                }
+                assert_eq!(config.reads.load(Ordering::SeqCst), 1);
+                assert_eq!(scalar(&db, "SELECT COUNT(*) FROM memories"), 1);
+                assert_eq!(scalar(&db, "SELECT COUNT(*) FROM memory_journal"), 1);
+                assert_eq!(scalar(&db, "SELECT COUNT(*) FROM memory_history"), 0);
+                assert_eq!(scalar(&db, "SELECT COUNT(*) FROM authority_managed"), 0);
+                assert_eq!(
+                    scalar(&db, "SELECT COUNT(*) FROM authority_repair_pending"),
+                    0
+                );
+                assert_eq!(scalar(&db, "SELECT COUNT(*) FROM memory_pending_facts WHERE reason='authority_elsewhere'"), 0);
+            }
+        }
+
+        #[derive(Default)]
+        struct DrainAccounting(Mutex<background::DrainMeta>);
+        impl background::DrainStore for DrainAccounting {
+            type Error = ();
+            fn with_immediate_transaction<T>(
+                &self,
+                _: &str,
+                apply: impl FnOnce(&mut background::DrainMeta) -> T,
+            ) -> Result<T, ()> {
+                Ok(apply(&mut self.0.lock().unwrap()))
+            }
+        }
+
+        #[test]
+        fn historian_root_keeps_reservation_and_refund_under_its_capture() {
+            let (config, input) = input(true);
+            let toggle = config.clone();
+            let result = background::historian_drain(input, move |unit| {
+                toggle.on.store(false, Ordering::SeqCst);
+                let accounting = DrainAccounting::default();
+                let reserved = unit
+                    .reserve_historian(
+                        &accounting,
+                        background::ReserveRequest {
+                            session_id: "ses",
+                            run_id: "run",
+                            true_raw_tokens: 30.0,
+                            usage_percentage: 70.0,
+                            usable: 100_000.0,
+                            per_run_cap: 50_000.0,
+                            execute_threshold_percentage: 65.0,
+                            now: 100,
+                        },
+                    )
+                    .unwrap()
+                    .unwrap();
+                assert_eq!(reserved.reserved_tokens, 30.0);
+                assert_eq!(
+                    accounting.0.lock().unwrap().protected_tail_drain_tokens,
+                    30.0
+                );
+                unit.refund_historian(&accounting, reserved.reservation.as_ref().unwrap())
+                    .unwrap();
+                assert_eq!(
+                    accounting.0.lock().unwrap().protected_tail_drain_tokens,
+                    0.0
+                );
+            })
+            .unwrap()
+            .join()
+            .unwrap()
+            .unwrap();
+            assert_eq!(result, Some(()));
+            assert_eq!(config.reads.load(Ordering::SeqCst), 1);
+        }
+
+        #[tokio::test]
+        async fn enabled_background_results_wait_for_natural_rebuild_even_after_restart() {
+            let producer = Arc::new(ProducerState::default());
+            let mut config = default_test_config();
+            config.rust_background_enabled = true;
+            config.inject_docs = false;
+            config.temporal_awareness = false;
+            config.cache_ttl = "never".into();
+            let (handler, store, _dir, project) =
+                handler_with_store(producer.clone(), config.clone());
+            store.set_route_identity_for_test(project.to_str().unwrap(), "git:identity");
+            // Start with an already folded prefix. Legacy whole-array transforms
+            // deliberately materialize the first-ever compartment immediately.
+            store.with_context_conn_for_test(|tx| tx.execute_batch("INSERT INTO compartments(session_id,sequence,start_message,end_message,end_message_id,title,content,p1,created_at) VALUES('ses',1,1,1,'m1#0','Initial','Initial history','Initial history',1)")).unwrap();
+            let mut body = request_with_usage(
+                vec![
+                    ck("m1", 1, "hello"),
+                    ck("m2", 2, "new history"),
+                    ck("m3", 3, "keep raw tail"),
+                ],
+                1_000,
+                50_000,
+            );
+            body["memory_enabled"] = json!(true);
+            body["cache_ttl"] = json!("5m");
+            body["prev_response_completed_at_ms"] = json!(now_ms());
+            let first = call_transform_request(&handler, body.clone()).await;
+            assert_eq!(first["status"], "ok");
+            let stable = call_transform_request(&handler, body.clone()).await;
+            let before = store.load("ses").unwrap();
+            let (resolver, input) = input(true);
+            let toggle = resolver.clone();
+            let work_store = store.clone();
+            background::historian_drain(input, move |unit| {
+                let mut loaded = work_store.load("ses").unwrap();
+                let selected = vec![mc_store::HistorianSelectedMessageIdentity {
+                    mid: "m2".into(),
+                    block_identities: loaded.meta.block_identity_by_mid["m2"].clone(),
+                }];
+                let predicate = mc_store::HistorianPublishPredicate {
+                    firing_seq: 7,
+                    producer_run_id: "recorded-run".into(),
+                    producer_attempt: 0,
+                    chunk_fingerprint: "recorded-chunk".into(),
+                    selected_range_identities: selected.clone(),
+                    compartment_set_generation: mc_store::CompartmentSetGeneration {
+                        max_sequence: 1,
+                        count: 1,
+                    },
+                };
+                loaded.meta.historian = HistorianDurableState {
+                    state: HistorianPhase::Publishing,
+                    firing_seq: 7,
+                    producer_run_id: Some("recorded-run".into()),
+                    chunk_fingerprint: "recorded-chunk".into(),
+                    selected_range_identities: selected,
+                    compartment_set_generation: predicate.compartment_set_generation,
+                    ..Default::default()
+                };
+                let version = work_store
+                    .commit("ses", loaded.row_version, &loaded.core, &loaded.meta)
+                    .unwrap();
+                toggle.on.store(false, Ordering::SeqCst);
+                let publish = || unit.publish_historian(
+                    &work_store,
+                    mc_store::HistorianPublishRequest {
+                        rust_background_enabled: false,
+                        lifecycle_publication_id: None,
+                        harness: Some("opencode"),
+                        session_id: "ses",
+                        expected_row_version: Some(version),
+                        expected_revert_epoch: 0,
+                        predicate: &predicate,
+                        project_path: "git:identity",
+                        compartments: &[stored_comp(2, 2, 2, "m2", "Background historian summary")],
+                        facts: &[],
+                        promote_facts: false,
+                        events: &[],
+                        primer_candidates: &[],
+                        user_memory_candidates: &[],
+                        publication_floor_ordinal: 2,
+                        chunk_transcript: None,
+                        raw_chunk_messages: None,
+                    },
+                );
+                work_store.with_context_conn_for_test(|tx| {
+                    tx.execute("INSERT INTO compartment_state_lease(session_id,holder_id,acquired_at,expires_at) VALUES('ses','ts-wrapup',?1,?2)", rusqlite::params![now_ms(), now_ms()+60_000])?;
+                    Ok(())
+                }).unwrap();
+                assert!(matches!(publish(), Err(mc_store::HistorianPublishError::Deferred { reason }) if reason == "compartment lease busy"));
+                assert_eq!(work_store.load_compartments("ses").unwrap().len(), 1);
+                work_store.with_context_conn_for_test(|tx| tx.execute_batch("DELETE FROM compartment_state_lease WHERE session_id='ses'")).unwrap();
+                publish().unwrap();
+                work_store
+                    .with_context_conn_for_test(|tx| memory_write(tx, "git:identity"))
+                    .unwrap();
+            })
+            .unwrap()
+            .join()
+            .unwrap()
+            .unwrap()
+            .unwrap();
+            assert_eq!(resolver.reads.load(Ordering::SeqCst), 1);
+            let after = store.load("ses").unwrap();
+            assert_eq!(after.core, before.core);
+            assert_eq!(
+                after.meta.project_memory_epoch,
+                before.meta.project_memory_epoch
+            );
+            assert_eq!(
+                after.meta.project_memory_epoch_pending,
+                before.meta.project_memory_epoch_pending
+            );
+            assert_eq!(store.load_compartments("ses").unwrap().len(), 2);
+            let deferred = call_transform_request(&handler, body.clone()).await;
+            let restarted = McHandler::with_producer_factory_config_resolver(
+                Arc::new(TestProducerFactory {
+                    state: producer.clone(),
+                }),
+                config,
+                Arc::new(MissingSessionResolver),
+            );
+            restarted.store.set(store.clone()).ok().unwrap();
+            restarted.bind_route(7, binding(project.to_str().unwrap(), "ses"));
+            let replay = call_transform_request(&restarted, body.clone()).await;
+            for response in [deferred, replay] {
+                assert_eq!(response["decision"], stable["decision"], "{response}");
+                assert_eq!(response["ck_messages"], stable["ck_messages"], "{response}");
+            }
+            body["model_key"] = json!("natural-model-change");
+            let rebuilt = call_transform_request(&restarted, body).await;
+            let text = serde_json::to_string(&rebuilt["ck_messages"]).unwrap();
+            assert!(text.contains("Background historian summary"), "{rebuilt}");
+            assert!(text.contains("Background memory fact"), "{rebuilt}");
+            assert_eq!(producer.starts.load(Ordering::SeqCst), 0);
+        }
+
+        #[tokio::test]
+        async fn canonical_dream_task_matrix_preserves_off_and_refuses_enabled_tasks() {
+            let ts = include_str!(
+                "../../../packages/plugin/src/features/magic-context/dreamer/task-registry.ts"
+            );
+            let registry = ts
+                .split("export const CANONICAL_DREAM_TASKS = [")
+                .nth(1)
+                .unwrap()
+                .split("] as const")
+                .next()
+                .unwrap();
+            let ts_names: Vec<_> = registry
+                .lines()
+                .filter_map(|line| line.trim().strip_prefix('"')?.split('"').next())
+                .collect();
+            assert_eq!(
+                CANONICAL_TASKS.map(|task| task.as_str()).as_slice(),
+                ts_names
+            );
+            let mut config = default_test_config();
+            config.rust_background_enabled = true;
+            config.smart_notes_enabled = true;
+            let producer = Arc::new(ProducerState::default());
+            // A Host-runner project with a declared harness claimant that can carry
+            // every role: publication then depends only on which tasks are wired.
+            config.dreamer_runner = Some(HistorianRunnerKind::Host);
+            let (mut handler, store, _dir, project) =
+                handler_with_store(producer.clone(), config.clone());
+            handler.fixed_config = Some(config.clone());
+            handler.dream_claimants.declare(
+                &lane_project_key(&store, &project),
+                "ses",
+                dream_dispatch::ownership::tests::claimant_carrying_every_role(now_ms())
+                    .on_route("ses", "mc-module-test"),
+            );
+            let mut settings = json!({"dreamer":{"tasks":{}}});
+            for task in CANONICAL_TASKS {
+                settings["dreamer"]["tasks"][task.as_str()] = json!({"schedule":"0 3 * * *"});
+            }
+            handler.fixed_dream_settings = Some(settings.clone());
+            for (channel, request, expected) in [
+                (
+                    7,
+                    json!({"session_id":"ses","task":"curate"}),
+                    "bad_request",
+                ),
+                (7, json!({"v":1,"task":"curate"}), "bad_request"),
+                (
+                    8,
+                    json!({"v":1,"session_id":"ses","task":"curate"}),
+                    "route_unbound",
+                ),
+                (
+                    7,
+                    json!({"v":1,"session_id":"foreign","task":"curate"}),
+                    "session_mismatch",
+                ),
+                (7, json!({"v":1,"session_id":"ses"}), "invalid_params"),
+                (
+                    7,
+                    json!({"v":1,"session_id":"ses","task":"unknown"}),
+                    "invalid_params",
+                ),
+            ] {
+                assert_eq!(
+                    code(handler.handle_dreamer_run_task(channel, &request).await),
+                    expected
+                );
+            }
+            // Ownership is the published list: a wired task with a Rust host and a
+            // capable claimant is owned; a task with no Rust host (compress-cues,
+            // maintain-docs, evaluate-smart-notes) never is, even when wired.
+            for implemented in [false, true] {
+                for task in CANONICAL_TASKS {
+                    handler.dream_wiring = Some(dream_dispatch::ownership::Wiring {
+                        tasks: if implemented { vec![task] } else { Vec::new() },
+                        broca: false,
+                        broca_file_read: false,
+                    });
+                    let request = json!({"v":1,"session_id":"ses","task":task.as_str(),
+                        "implemented":true,"model_chain":false,"payload":false,"command_id":false});
+                    assert_eq!(
+                        code(handler.handle_dreamer_run_task(7, &request).await),
+                        if implemented && dream_dispatch::ownership::task_roles(task).is_some() {
+                            "rust_scheduler_owns_task"
+                        } else {
+                            "unavailable_capability"
+                        },
+                        "{}",
+                        task.as_str()
+                    );
+                }
+            }
+            config.smart_notes_enabled = false;
+            handler.fixed_config = Some(config.clone());
+            handler.dream_wiring = Some(dream_dispatch::ownership::Wiring {
+                tasks: vec![mc_store::dream_scheduler::schedules::TaskName::EvaluateSmartNotes],
+                broca: false,
+                broca_file_read: false,
+            });
+            assert_eq!(
+                code(
+                    handler
+                        .handle_dreamer_run_task(
+                            7,
+                            &json!({"v":1,"session_id":"ses","task":"evaluate-smart-notes"})
+                        )
+                        .await
+                ),
+                "invalid_params"
+            );
+            handler.dream_wiring = None;
+            config.smart_notes_enabled = true;
+            handler.fixed_config = Some(config.clone());
+            for task in CANONICAL_TASKS {
+                let mut disabled = settings.clone();
+                disabled["dreamer"]["tasks"][task.as_str()]["schedule"] = json!("  ");
+                handler.fixed_dream_settings = Some(disabled);
+                assert_eq!(
+                    code(
+                        handler
+                            .handle_dreamer_run_task(
+                                7,
+                                &json!({"v":1,"session_id":"ses","task":task.as_str()})
+                            )
+                            .await
+                    ),
+                    "invalid_params"
+                );
+            }
+            handler.fixed_dream_settings = Some(settings);
+            config.rust_background_enabled = false;
+            handler.fixed_config = Some(config);
+            for task in CANONICAL_TASKS {
+                assert_eq!(
+                    code(
+                        handler
+                            .handle_dreamer_run_task(
+                                7,
+                                &json!({"v":1,"session_id":"ses","task":task.as_str(),
+                    "command_id":"matrix","payload":{"prompt_body":"recorded","items":[]}})
+                            )
+                            .await
+                    ),
+                    if task.as_str() == CLASSIFY_TASK {
+                        "model_chain_missing"
+                    } else {
+                        "invalid_params"
+                    }
+                );
+            }
+            assert!(store
+                .load_dream_task_command("ses", "matrix")
+                .unwrap()
+                .is_none());
+            assert_eq!(producer.starts.load(Ordering::SeqCst), 0);
+        }
+    }
+
+    fn owner_prep_methods() -> impl Iterator<Item = &'static str> {
+        non_served_contract::UI_METHODS.iter().copied().chain([
+            non_served_contract::RETRIEVAL_METHOD,
+            non_served_contract::MEMORY_METHOD,
+        ])
+    }
+
+    #[tokio::test]
+    async fn owner_prep_each_arm_authorizes_before_read_write_replay_or_job_lookup() {
+        assert_eq!(owner_prep_methods().count(), 19);
+        assert_eq!(
+            owner_prep_methods()
+                .collect::<std::collections::BTreeSet<_>>()
+                .len(),
+            19
+        );
+        let (handler, store, _dir, project) =
+            handler_with_store(Arc::new(ProducerState::default()), default_test_config());
+        store.set_route_identity_for_test(project.to_str().unwrap(), "git:bound-project");
+        ops_facade::attest_ui_fixture(&handler, Some(&store), "git:bound-project");
+        store
+            .replace_compartments("ses", &[stored_comp(1, 1, 1, "m1", "owned")])
+            .unwrap();
+        store
+            .replace_compartments("foreign", &[stored_comp(2, 1, 1, "m2", "private")])
+            .unwrap();
+        let changes = || {
+            store
+                .with_context_conn_for_test(|tx| {
+                    tx.query_row("SELECT total_changes()", [], |row| row.get::<_, i64>(0))
+                })
+                .unwrap()
+        };
+        let before = changes();
+        for method in owner_prep_methods() {
+            for (channel, request, expected) in [
+                (
+                    7,
+                    json!({"method":method,"session_id":"ses"}),
+                    "bad_request",
+                ),
+                (
+                    7,
+                    json!({"method":method,"v":2,"session_id":"ses"}),
+                    "bad_request",
+                ),
+                (7, json!({"method":method,"v":1}), "bad_request"),
+                (
+                    7,
+                    json!({"method":method,"v":1,"session_id":""}),
+                    "bad_request",
+                ),
+                (
+                    7,
+                    json!({"method":method,"v":1,"session_id":"  "}),
+                    "bad_request",
+                ),
+                (
+                    8,
+                    json!({"method":method,"v":1,"session_id":"ses"}),
+                    "route_unbound",
+                ),
+                (
+                    7,
+                    json!({"method":method,"v":1,"session_id":"foreign"}),
+                    "session_mismatch",
+                ),
+            ] {
+                match handler.dispatch_value(channel, request).await {
+                    HandlerOutcome::Error { code, .. } => assert_eq!(code, expected, "{method}"),
+                    _ => panic!("{method} must refuse {expected} without returning data"),
+                }
+            }
+        }
+        assert_eq!(
+            changes(),
+            before,
+            "refused arms must write nothing in any table"
+        );
+    }
+
+    #[tokio::test]
+    async fn owner_prep_authorized_arms_refuse_by_exact_route_without_effects() {
+        let recorded = [
+            "mc.ui_capabilities",
+            "mc.read_sidebar",
+            "mc.read_status",
+            "mc.read_embed",
+            "mc.read_compartment_count",
+            "mc.read_todos",
+            "mc.recomp_preview",
+            "mc.recomp_start",
+            "mc.rescore",
+            "mc.wrapup",
+            "mc.flush",
+            "mc.dream",
+            "mc.embed",
+            "mc.job_read",
+            "mc.job_cancel",
+            "mc.ui_events",
+            "mc.notice_currentness",
+            "mc.retrieval",
+            "mc.memory",
+        ];
+        assert_eq!(owner_prep_methods().collect::<Vec<_>>(), recorded);
+        let partition = ops_facade::IMPLEMENTED
+            .iter()
+            .chain(ops_facade::UNPORTED)
+            .copied()
+            .chain([
+                non_served_contract::RETRIEVAL_METHOD,
+                non_served_contract::MEMORY_METHOD,
+            ])
+            .collect::<Vec<_>>();
+        assert_eq!(partition.len(), recorded.len());
+        assert_eq!(
+            partition
+                .into_iter()
+                .collect::<std::collections::BTreeSet<_>>(),
+            recorded.into_iter().collect()
+        );
+        let (handler, store, _dir, project) =
+            handler_with_store(Arc::new(ProducerState::default()), default_test_config());
+        store.set_route_identity_for_test(project.to_str().unwrap(), "git:bound-project");
+        ops_facade::attest_ui_fixture(&handler, Some(&store), "git:bound-project");
+        let before = store.load("ses").unwrap().row_version;
+        for method in ops_facade::UNPORTED
+            .iter()
+            .copied()
+            .chain([non_served_contract::MEMORY_METHOD])
+        {
+            match handler
+                .dispatch_value(
+                    7,
+                    json!({
+                        "method":method,"v":1,"session_id":"ses", "project":"git:foreign-project",
+                        "directory":"/foreign", "command_id":"same-command", "job_id":"foreign-job",
+                        "acked_position":0,
+                    }),
+                )
+                .await
+            {
+                HandlerOutcome::Error { code, message } => {
+                    assert_eq!(code, "route_not_ported", "{method}");
+                    assert_eq!(message, method);
+                }
+                _ => panic!("{method} must not claim an executor is implemented"),
+            }
+        }
+        assert_eq!(store.load("ses").unwrap().row_version, before);
+        assert_eq!(non_served_contract::ROUTE_NAME_FIELD, "message");
+        assert_eq!(
+            non_served_contract::RETRIEVAL_AVAILABILITY_FIELD,
+            "source_availability"
+        );
+    }
+
+    #[tokio::test]
+    async fn owner_prep_store_absence_is_partial_only_after_authorization() {
+        let handler = McHandler::new();
+        let dir = tempfile::tempdir().unwrap();
+        handler.bind_route(7, binding(dir.path().to_str().unwrap(), "ses"));
+        ops_facade::attest_ui_fixture(&handler, None, "git:bound-project");
+        for method in non_served_contract::UI_READ_METHODS {
+            let request = json!({"method":method,"v":1,"session_id":"ses"});
+            assert_eq!(
+                error_code(handler.dispatch_value(8, request.clone()).await),
+                "route_unbound"
+            );
+            let body = call_dispatch_request(&handler, request).await;
+            assert_eq!(
+                body,
+                json!({
+                    "v":1,"ok":false,"state":"partial","reason":"store_unavailable",
+                    "authority":"unknown","data":null,
+                }),
+                "{method}"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn owner_prep_project_scope_uses_bound_identity_not_request_fields() {
+        let (handler, _store, _dir, project) =
+            handler_with_store(Arc::new(ProducerState::default()), default_test_config());
+        ops_facade::attest_ui_fixture(&handler, None, "git:bound-project");
+        std::fs::write(project.join(".git"), "gitdir: /nonexistent/for/this/test\n").unwrap();
+        handler
+            .resolve_project_identity_for_test
+            .store(true, Ordering::Relaxed);
+        // The throwaway checkout has a broken Git identity. A caller-supplied
+        // project must not rescue it or authorize another project's rows.
+        for method in non_served_contract::PROJECT_METHODS {
+            let outcome = handler
+                .dispatch_value(
+                    7,
+                    json!({
+                        "method":method,"v":1,"session_id":"ses",
+                        "project":"git:forged", "project_path":"git:forged", "directory":"/forged",
+                    }),
+                )
+                .await;
+            assert_eq!(error_code(outcome), "git_identity_unavailable", "{method}");
+        }
+    }
 
     #[test]
     fn search_date_bounds_are_utc_inclusive_and_reject_invalid_values() {
@@ -21443,38 +24191,6 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn resident_startup_primes_wal_before_publishing_the_store() {
-        for enabled in [false, true] {
-            let dir = tempfile::tempdir().unwrap();
-            let descriptor = dev_descriptor_at(dir.path().to_str().unwrap());
-            drop(McStore::open_for_test(&descriptor).unwrap());
-            // Match the migration timestamps in store.db and context.db, then
-            // remove the fresh-install marker so attachment performs no repair
-            // writes that could hide a missing startup prime.
-            let seeded = McHandler::open_store_once(&descriptor, false)
-                .await
-                .unwrap();
-            seeded
-                .set_single_store_marker_build_for_test("restart-fixture")
-                .unwrap();
-            drop(seeded);
-            let StorageBackend::Sqlite { path } = &descriptor.backend else {
-                unreachable!()
-            };
-            let handler = McHandler::new().with_startup_provider_resident_enabled(enabled);
-            handler.begin_store_open(descriptor.clone(), DescriptorOrigin::DevFallback);
-            wait_for_store_open_phase(&handler, STORE_OPENED).await;
-            assert!(handler.store.get().is_some());
-            let bytes = std::fs::metadata(format!("{path}-wal")).map_or(0, |meta| meta.len());
-            assert_eq!(
-                bytes > 32,
-                enabled,
-                "only resident startup must prime WAL before publication"
-            );
-        }
-    }
-
-    #[tokio::test]
     async fn double_store_open_during_lease_wait_has_one_waiter() {
         let dir = tempfile::tempdir().unwrap();
         let data_home = dir.path().join("data");
@@ -21650,7 +24366,10 @@ mod tests {
         let line = supported_fences_line();
         assert_eq!(
             line,
-            format!("context.db=102 store.db={LATEST_MIGRATION_VERSION}")
+            format!(
+                "context.db={} store.db={LATEST_MIGRATION_VERSION}",
+                mc_store::move_inventory::CONTEXT_SCHEMA_VERSION
+            )
         );
     }
 
@@ -21729,6 +24448,19 @@ mod tests {
                 of: route_targets::expected_routes_for_tests("broca")
             }]
         );
+        let mut expected_capabilities = vec![
+            "compaction-provider/v1".to_string(),
+            "mcp-conversation-binding/v1".to_string(),
+            "flow-scopes/v1".to_string(),
+        ];
+        if agent_data::ENABLED {
+            expected_capabilities.push(cortexkit_role_agent_data::PROVIDES.to_string());
+        }
+        assert_eq!(
+            m.capabilities.as_ref().map(|c| &c.provides),
+            Some(&expected_capabilities),
+            "capability list is pinned"
+        );
         let ProviderRole::ToolProvider { tools, .. } = &m.provides[0] else {
             panic!("magic-context must expose a tool provider role");
         };
@@ -21776,10 +24508,860 @@ mod tests {
         binding_with_harness(root, "mc-module-test", session)
     }
 
+    mod binding_projects {
+        use super::*;
+        use subc_control::{ClientControlRequest, ClientControlResponse};
+        use subc_protocol::{Flags, Frame, FrameType, Priority};
+        use subc_transport::{
+            authenticate_server, generate_daemon_id, generate_key, read_frame, write_atomic,
+            write_frame, ConnectionInfo, Endpoint, SCHEMA_VERSION,
+        };
+
+        struct FakeEntorhinal {
+            connection_file: PathBuf,
+            calls: Arc<AtomicUsize>,
+            reply_at: Arc<Mutex<Option<tokio::time::Instant>>>,
+            task: tokio::task::JoinHandle<()>,
+            _temp: tempfile::TempDir,
+        }
+
+        impl Drop for FakeEntorhinal {
+            fn drop(&mut self) {
+                self.task.abort();
+            }
+        }
+
+        impl FakeEntorhinal {
+            async fn start(reply: Option<Value>, reply_at: Option<tokio::time::Instant>) -> Self {
+                Self::start_mode(reply, reply_at, false, false).await
+            }
+
+            async fn start_mode(
+                reply: Option<Value>,
+                reply_at: Option<tokio::time::Instant>,
+                never_reply: bool,
+                sleep_for_reply: bool,
+            ) -> Self {
+                let base = std::env::temp_dir().join("magic-context/pj-pin-async");
+                std::fs::create_dir_all(&base).unwrap();
+                let temp = tempfile::tempdir_in(base).unwrap();
+                let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+                let address = listener.local_addr().unwrap();
+                let key = generate_key().unwrap();
+                let daemon_id = generate_daemon_id().unwrap();
+                let connection_file = temp.path().join("connection.json");
+                write_atomic(
+                    &connection_file,
+                    &ConnectionInfo {
+                        schema: SCHEMA_VERSION,
+                        wire_version: Some(subc_protocol::PROTOCOL_VERSION),
+                        endpoints: vec![Endpoint {
+                            host: address.ip().to_string(),
+                            port: address.port(),
+                        }],
+                        key: key.clone(),
+                        daemon_id,
+                        pid: std::process::id(),
+                        daemon_ver: "fake".into(),
+                    },
+                )
+                .unwrap();
+                let calls = Arc::new(AtomicUsize::new(0));
+                let observed = calls.clone();
+                let reply_at = Arc::new(Mutex::new(reply_at));
+                let pending_reply_at = reply_at.clone();
+                let task = tokio::spawn(async move {
+                    while let Ok((mut stream, _)) = listener.accept().await {
+                        authenticate_server(
+                            &mut stream,
+                            &key,
+                            &daemon_id,
+                            "fake",
+                            Duration::from_secs(2),
+                        )
+                        .await
+                        .unwrap();
+                        while let Ok(Some(frame)) = read_frame(&mut stream).await {
+                            if frame.header.ty != FrameType::Request {
+                                continue;
+                            }
+                            let (ty, body) = if frame.header.channel == 0 {
+                                let control: ClientControlRequest =
+                                    serde_json::from_slice(&frame.body).unwrap();
+                                let ClientControlRequest::RouteOpen { target, .. } = control else {
+                                    continue;
+                                };
+                                assert_eq!(target, entorhinal_resolve::route_target());
+                                (
+                                    FrameType::Response,
+                                    serde_json::to_vec(&ClientControlResponse::RouteOpen {
+                                        route_channel: 10,
+                                        route_epoch: 1,
+                                    })
+                                    .unwrap(),
+                                )
+                            } else {
+                                let request: Value = serde_json::from_slice(&frame.body).unwrap();
+                                assert_eq!(request["method"], "resolve");
+                                observed.fetch_add(1, Ordering::SeqCst);
+                                if never_reply {
+                                    std::future::pending::<()>().await;
+                                }
+                                let at = *pending_reply_at.lock().unwrap();
+                                if let Some(at) = at {
+                                    // Use an absolute instant so connect and route-open
+                                    // consume the same budget as the reply wait.
+                                    if sleep_for_reply {
+                                        tokio::time::sleep_until(at).await;
+                                    } else {
+                                        while tokio::time::Instant::now() < at {
+                                            tokio::task::yield_now().await;
+                                        }
+                                    }
+                                }
+                                match &reply {
+                                    Some(reply) => (FrameType::Response, serde_json::to_vec(reply).unwrap()),
+                                    None => (FrameType::Error, serde_json::to_vec(&json!({"code":"unknown_module", "message":"absent", "detail":null})).unwrap()),
+                                }
+                            };
+                            let response = Frame::build(
+                                ty,
+                                Flags::new(false, Priority::Interactive, false),
+                                frame.header.channel,
+                                frame.header.epoch,
+                                frame.header.corr,
+                                body,
+                            )
+                            .unwrap();
+                            if write_frame(&mut stream, &response).await.is_err() {
+                                break;
+                            }
+                        }
+                    }
+                });
+                Self {
+                    connection_file,
+                    calls,
+                    reply_at,
+                    task,
+                    _temp: temp,
+                }
+            }
+        }
+
+        fn fixture() -> (McHandler, Arc<McStore>, tempfile::TempDir, PathBuf) {
+            let (mut handler, store, temp, project) = handler_with_store_and_resolver(
+                Arc::new(ProducerState::default()),
+                default_test_config(),
+                Arc::new(MissingSessionResolver),
+            );
+            handler.project_identities =
+                Arc::new(project_identity::ProjectIdentityResolver::with_sidecar_dir(
+                    temp.path().join("sidecars"),
+                ));
+            handler
+                .resolve_project_identity_for_test
+                .store(true, Ordering::Relaxed);
+            (
+                handler,
+                store,
+                temp,
+                std::fs::canonicalize(project).unwrap(),
+            )
+        }
+
+        fn root_reply(project: &Path) -> Value {
+            let vectors: Value = serde_json::from_str(include_str!(
+                "../../../test-vectors/project-resolve-v1/resolve.json"
+            ))
+            .unwrap();
+            let mut reply = vectors[0]["reply"].clone();
+            reply["result"]["canonicalRoot"] = json!(project);
+            reply
+        }
+
+        async fn bind(handler: &McHandler, project: &Path, channel: u16) {
+            let identity = serde_json::from_value(json!({
+                "project_root": project, "harness": "opencode", "session": "ses"
+            }))
+            .unwrap();
+            let request = RouteBindRequest::new(
+                RouteHandle::detached(channel, 1),
+                RouteTargetConfig::runner_module("magic-context")
+                    .target(route_targets::RegisteredRoute::HistorianRunner)
+                    .unwrap(),
+                identity,
+            );
+            let _decision = handler.on_bind(&request).await;
+            assert!(handler.bindings.lock().unwrap().contains_key(&channel));
+        }
+
+        fn row(store: &McStore, identity: &str) {
+            store.with_context_conn_for_test(|db| {
+                db.execute("INSERT INTO session_projects (session_id, harness, project_path, updated_at) VALUES ('ses', 'opencode', ?1, 1) ON CONFLICT(session_id, harness) DO UPDATE SET project_path = excluded.project_path, updated_at = updated_at + 1", [identity])
+            }).unwrap();
+        }
+
+        fn served(handler: &McHandler, store: &McStore, channel: u16) -> String {
+            let binding = handler.facade_binding(channel).unwrap();
+            handler
+                .route_project(channel, store, &binding)
+                .unwrap_or_else(|_| panic!("project resolution failed"))
+                .key
+        }
+
+        #[tokio::test]
+        async fn host_row_at_bind_skips_resolve_and_first_request_reads_latest_row() {
+            let (mut handler, store, _temp, project) = fixture();
+            let fake = FakeEntorhinal::start(Some(root_reply(&project)), None).await;
+            handler.entorhinal =
+                entorhinal_resolve::EntorhinalResolver::new(Some(fake.connection_file.clone()));
+            row(&store, "pj-A");
+            bind(&handler, &project, 7).await;
+            row(&store, "pj-B");
+            assert_eq!(served(&handler, &store, 7), "pj-B");
+            assert_eq!(fake.calls.load(Ordering::SeqCst), 0);
+        }
+
+        #[tokio::test]
+        async fn no_host_row_resolves_at_bind_and_requests_keep_the_decision() {
+            let (mut handler, store, temp, project) = fixture();
+            let reply = root_reply(&project);
+            let expected = reply["result"]["projectId"].as_str().unwrap().to_string();
+            let fake = FakeEntorhinal::start(Some(reply), None).await;
+            handler.entorhinal =
+                entorhinal_resolve::EntorhinalResolver::new(Some(fake.connection_file.clone()));
+            bind(&handler, &project, 7).await;
+            assert_eq!(fake.calls.load(Ordering::SeqCst), 1);
+            // Removing the pin distinguishes the stored decision from a fresh
+            // directory lookup that would otherwise return the same identity.
+            handler.project_identities.flush_pins();
+            std::fs::remove_dir_all(temp.path().join("sidecars")).unwrap();
+            for _ in 0..3 {
+                assert_eq!(served(&handler, &store, 7), expected);
+            }
+            assert_eq!(fake.calls.load(Ordering::SeqCst), 1);
+            for changed in ["git:changed", "pj-changed"] {
+                row(&store, changed);
+                assert_eq!(served(&handler, &store, 7), expected);
+            }
+        }
+
+        #[cfg(unix)]
+        #[test]
+        fn on_bind_latency_distribution_isolated() {
+            let base = std::env::temp_dir().join("magic-context/pj-pin-async");
+            std::fs::create_dir_all(&base).unwrap();
+            let root = tempfile::tempdir_in(base).unwrap();
+            let output = std::process::Command::new(std::env::current_exe().unwrap())
+                .args([
+                    "--exact",
+                    "tests::binding_projects::on_bind_latency_host",
+                    "--ignored",
+                    "--nocapture",
+                ])
+                .env("MC_BIND_LATENCY_ROOT", root.path())
+                .env("HOME", root.path().join("home"))
+                .env("XDG_DATA_HOME", root.path())
+                .env("XDG_CONFIG_HOME", root.path().join("config"))
+                .env("XDG_STATE_HOME", root.path().join("state"))
+                .env("XDG_RUNTIME_DIR", root.path().join("run"))
+                .env("MAGIC_CONTEXT_STORAGE_DIR", root.path().join("storage"))
+                .env("MAGIC_CONTEXT_TEST_DATA_DIR", root.path())
+                .env("OPENCODE_DB", root.path().join("opencode.db"))
+                .output()
+                .unwrap();
+            println!("{}", String::from_utf8_lossy(&output.stdout));
+            assert!(
+                output.status.success(),
+                "{}",
+                String::from_utf8_lossy(&output.stderr)
+            );
+            assert!(String::from_utf8_lossy(&output.stdout).contains("BIND_LATENCY never n=50"));
+        }
+
+        #[tokio::test]
+        async fn on_bind_slow_pin_writer_latency_distribution() {
+            use mc_store::private_permissions::write_file_atomic;
+            use project_identity::pin_writer::PinWriter;
+
+            for delay_ms in [0, 1_000] {
+                let base = std::env::temp_dir().join("magic-context/pj-pin-async");
+                std::fs::create_dir_all(&base).unwrap();
+                let temp = tempfile::tempdir_in(base).unwrap();
+                let store = Arc::new(
+                    McStore::open_for_test(&dev_descriptor_at(temp.path().to_str().unwrap()))
+                        .unwrap(),
+                );
+                let mut handler = McHandler::with_producer_factory_config_resolver(
+                    Arc::new(TestProducerFactory {
+                        state: Arc::new(ProducerState::default()),
+                    }),
+                    default_test_config(),
+                    Arc::new(MissingSessionResolver),
+                );
+                handler.store.set(store.clone()).ok().unwrap();
+                handler
+                    .resolve_project_identity_for_test
+                    .store(true, Ordering::Relaxed);
+                let (started_send, started_recv) = std::sync::mpsc::channel();
+                let writes = Arc::new(AtomicUsize::new(0));
+                let observed = writes.clone();
+                let writer = PinWriter::new(Arc::new(move |path, bytes, private| {
+                    let _ = started_send.send(());
+                    std::thread::sleep(Duration::from_millis(delay_ms));
+                    observed.fetch_add(1, Ordering::SeqCst);
+                    write_file_atomic(path, bytes, private)
+                }));
+                handler.project_identities =
+                    Arc::new(project_identity::ProjectIdentityResolver::with_pin_writer(
+                        temp.path().join("sidecars"),
+                        writer.clone(),
+                    ));
+                let mut samples = Vec::new();
+                for iteration in 0..50 {
+                    let project = temp.path().join(format!("pin-{delay_ms}-{iteration}"));
+                    std::fs::create_dir(&project).unwrap();
+                    let fake = FakeEntorhinal::start(Some(root_reply(&project)), None).await;
+                    handler.entorhinal = entorhinal_resolve::EntorhinalResolver::new(Some(
+                        fake.connection_file.clone(),
+                    ));
+                    assert!(store.session_project_identity("ses").unwrap().is_none());
+                    let started = std::time::Instant::now();
+                    bind(&handler, &project, 7).await;
+                    let elapsed = started.elapsed().as_secs_f64() * 1_000.0;
+                    samples.push(elapsed);
+                    assert!(
+                        elapsed < 500.0,
+                        "bind waited for pin writer ({delay_ms} ms): {elapsed:.3} ms"
+                    );
+                    assert_eq!(served(&handler, &store, 7), "pj-resolve-root");
+                    assert_eq!(fake.calls.load(Ordering::SeqCst), 1);
+                }
+                samples.sort_by(f64::total_cmp);
+                println!(
+                    "PIN_BIND_LATENCY writer_delay_ms={delay_ms} n=50 p50_ms={:.3} p99_ms={:.3}",
+                    samples[24], samples[49]
+                );
+                started_recv.recv_timeout(Duration::from_secs(2)).unwrap();
+                // A bounded shutdown may abandon queued work, but cannot cancel
+                // the atomic write already running. Keep its temporary root alive.
+                writer.shutdown(Duration::from_millis(250));
+                assert!(writer.flush(Duration::from_secs(2)));
+                assert!(
+                    writes.load(Ordering::SeqCst) > 0,
+                    "injected writer never ran"
+                );
+            }
+        }
+
+        #[cfg(unix)]
+        #[tokio::test]
+        #[ignore = "spawned by on_bind_latency_distribution_isolated with a throwaway root"]
+        async fn on_bind_latency_host() {
+            let root = PathBuf::from(
+                std::env::var_os("MC_BIND_LATENCY_ROOT").expect("isolated host only"),
+            );
+            let store = Arc::new(
+                McStore::open_for_test(&dev_descriptor_at(root.to_str().unwrap())).unwrap(),
+            );
+            let descriptors = std::process::Command::new("lsof")
+                .args(["-p", &std::process::id().to_string(), "-Fn"])
+                .output()
+                .unwrap();
+            assert!(descriptors.status.success());
+            let descriptors = String::from_utf8(descriptors.stdout).unwrap();
+            let databases: Vec<_> = descriptors
+                .lines()
+                .filter(|line| line.starts_with('n') && line.contains(".db"))
+                .collect();
+            assert!(!databases.is_empty());
+            for database in &databases {
+                assert!(Path::new(&database[1..]).starts_with(&root), "{database}");
+            }
+            println!("lsof -p {}: {databases:?}", std::process::id());
+            for mode in ["immediate", "near-deadline", "never"] {
+                let mut samples = Vec::new();
+                for iteration in 0..50 {
+                    let project = root.join(format!("{mode}-{iteration}"));
+                    std::fs::create_dir(&project).unwrap();
+                    let project = std::fs::canonicalize(project).unwrap();
+                    let mut handler = McHandler::with_producer_factory_config_resolver(
+                        Arc::new(TestProducerFactory {
+                            state: Arc::new(ProducerState::default()),
+                        }),
+                        default_test_config(),
+                        Arc::new(MissingSessionResolver),
+                    );
+                    handler.store.set(store.clone()).ok().unwrap();
+                    handler.project_identities =
+                        Arc::new(project_identity::ProjectIdentityResolver::with_sidecar_dir(
+                            root.join(format!("sidecars-{mode}-{iteration}")),
+                        ));
+                    handler
+                        .resolve_project_identity_for_test
+                        .store(true, Ordering::Relaxed);
+                    let reply = root_reply(&project);
+                    let expected = reply["result"]["projectId"].as_str().unwrap().to_string();
+                    let fake =
+                        FakeEntorhinal::start_mode(Some(reply), None, mode == "never", true).await;
+                    handler.entorhinal = entorhinal_resolve::EntorhinalResolver::new(Some(
+                        fake.connection_file.clone(),
+                    ));
+                    assert!(store.session_project_identity("ses").unwrap().is_none());
+                    let started = tokio::time::Instant::now();
+                    let started_unix_us = std::time::SystemTime::now()
+                        .duration_since(std::time::UNIX_EPOCH)
+                        .unwrap()
+                        .as_micros();
+                    // A near-deadline peer answers 50 ms inside the resolve deadline. A
+                    // 5 ms margin let a loaded runner deliver the answer after the deadline,
+                    // where the bind correctly falls back to the directory identity.
+                    let near_deadline_ms = entorhinal_resolve::ENTORHINAL_RESOLVE_DEADLINE_MS - 50;
+                    if mode == "near-deadline" {
+                        *fake.reply_at.lock().unwrap() =
+                            Some(started + Duration::from_millis(near_deadline_ms));
+                    }
+                    let bind_future = bind(&handler, &project, 7);
+                    if mode == "never" {
+                        tokio::time::timeout(Duration::from_secs(1), bind_future)
+                            .await
+                            .expect("bind failed to return after resolve timeout");
+                    } else {
+                        bind_future.await;
+                    }
+                    let elapsed = started.elapsed().as_secs_f64() * 1000.0;
+                    if elapsed > 600.0 {
+                        println!("BIND_LATENCY_SLOW {mode} iteration={iteration} started_unix_us={started_unix_us} elapsed_ms={elapsed:.3}");
+                    }
+                    if mode == "near-deadline" {
+                        assert!(
+                            elapsed >= near_deadline_ms as f64,
+                            "near-deadline peer answered early: {elapsed}"
+                        );
+                    }
+                    samples.push(elapsed);
+                    assert_eq!(fake.calls.load(Ordering::SeqCst), 1);
+                    // The network deadline does not include background persistence.
+                    if mode == "never" {
+                        assert!(
+                            elapsed < 1_000.0,
+                            "bind failed to return after resolve timeout: {elapsed}"
+                        );
+                        assert!(handler
+                            .project_identities
+                            .pinned_identity(&project)
+                            .is_none());
+                        assert!(served(&handler, &store, 7).starts_with("dir:"));
+                    } else {
+                        assert_eq!(
+                            handler
+                                .project_identities
+                                .pinned_identity(&project)
+                                .as_deref(),
+                            Some(expected.as_str()),
+                            "{mode} iteration {iteration}: answered bind did not pin after {elapsed:.3} ms"
+                        );
+                        assert_eq!(served(&handler, &store, 7), expected);
+                        assert!(elapsed < 10_000.0, "bind failed to return: {elapsed}");
+                    }
+                    handler.project_identities.flush_pins();
+                }
+                samples.sort_by(f64::total_cmp);
+                println!(
+                    "BIND_LATENCY {mode} n=50 p50_ms={:.3} p99_ms={:.3} over_500ms={}",
+                    samples[24],
+                    samples[49],
+                    samples.iter().filter(|ms| **ms > 500.0).count()
+                );
+            }
+        }
+
+        #[tokio::test]
+        async fn authority_managed_defers_populated_projects_until_row_removal() {
+            use tracing::instrument::WithSubscriber;
+            use tracing_subscriber::prelude::*;
+
+            for git in [false, true] {
+                let (mut handler, store, temp, project) = fixture();
+                if git {
+                    for args in [
+                        vec!["init", "--quiet"],
+                        vec![
+                            "-c",
+                            "user.name=Fixture",
+                            "-c",
+                            "user.email=fixture@example.test",
+                            "commit",
+                            "--quiet",
+                            "--allow-empty",
+                            "-m",
+                            "fixture",
+                        ],
+                    ] {
+                        let output = std::process::Command::new("git")
+                            .current_dir(&project)
+                            .args(args)
+                            .output()
+                            .unwrap();
+                        assert!(output.status.success(), "{output:?}");
+                    }
+                }
+                let fallback = handler.project_identities.resolve(&project).unwrap();
+                assert!(fallback.starts_with(if git { "git:" } else { "dir:" }));
+                store
+                    .seed_memory(1, &fallback, "CONSTRAINTS", "managed project fact", 50)
+                    .unwrap();
+                store.with_context_conn_for_test(|db| {
+                    db.execute_batch("CREATE TABLE IF NOT EXISTS authority_managed (project_path TEXT PRIMARY KEY, context_store_uuid TEXT NOT NULL, marked_at INTEGER NOT NULL)")?;
+                    db.execute("INSERT INTO authority_managed VALUES (?1, 'fixture', 1)", [&fallback])
+                }).unwrap();
+                let reply = root_reply(&project);
+                let expected = reply["result"]["projectId"].as_str().unwrap().to_string();
+                let fake = FakeEntorhinal::start(Some(reply), None).await;
+                handler.entorhinal =
+                    entorhinal_resolve::EntorhinalResolver::new(Some(fake.connection_file.clone()));
+                let logs = tempfile::tempdir().unwrap();
+                let mut config = cortexkit_log::Config::in_dir("magic-context", logs.path());
+                config.spec = Some("warn".into());
+                let (layer, log) = cortexkit_log::layer(config).unwrap();
+                bind(&handler, &project, 7)
+                    .with_subscriber(tracing_subscriber::registry().with(layer))
+                    .await;
+                for _ in 0..3 {
+                    assert_eq!(served(&handler, &store, 7), fallback);
+                }
+                assert!(handler
+                    .project_identities
+                    .pinned_identity(&project)
+                    .is_none());
+                let lines = std::fs::read_to_string(log.path()).unwrap();
+                assert_eq!(
+                    lines
+                        .matches("Keeping Rust-managed project identity")
+                        .count(),
+                    1
+                );
+                assert_eq!(fake.calls.load(Ordering::SeqCst), 1);
+                store
+                    .with_context_conn_for_test(|db| {
+                        let rows: i64 = db.query_row(
+                            "SELECT COUNT(*) FROM memories WHERE project_path = ?1",
+                            [&fallback],
+                            |row| row.get(0),
+                        )?;
+                        assert_eq!(rows, 1);
+                        // The offline single-store migration clears this marker, not session start.
+                        db.execute_batch("DELETE FROM authority_managed")
+                    })
+                    .unwrap();
+                bind(&handler, &project, 8).await;
+                assert_eq!(served(&handler, &store, 8), expected);
+                assert_eq!(served(&handler, &store, 7), fallback);
+                assert_eq!(
+                    handler.project_identities.pinned_identity(&project),
+                    Some(expected)
+                );
+                assert_eq!(fake.calls.load(Ordering::SeqCst), 2);
+                handler.project_identities.flush_pins();
+                assert!(temp.path().join("sidecars").exists());
+            }
+        }
+
+        #[tokio::test]
+        async fn authority_missing_table_or_row_allows_registered_pins() {
+            for has_table in [false, true] {
+                let (mut handler, store, _temp, project) = fixture();
+                store.with_context_conn_for_test(|db| {
+                    db.execute_batch("DROP TABLE IF EXISTS authority_managed")?;
+                    if has_table {
+                        db.execute_batch("CREATE TABLE authority_managed (project_path TEXT PRIMARY KEY, context_store_uuid TEXT NOT NULL, marked_at INTEGER NOT NULL);
+                            INSERT INTO authority_managed VALUES ('git:other', 'fixture', 1)")?;
+                    }
+                    Ok(())
+                }).unwrap();
+                let reply = root_reply(&project);
+                let expected = reply["result"]["projectId"].as_str().unwrap().to_string();
+                let fake = FakeEntorhinal::start(Some(reply), None).await;
+                handler.entorhinal =
+                    entorhinal_resolve::EntorhinalResolver::new(Some(fake.connection_file.clone()));
+                bind(&handler, &project, 7).await;
+                assert_eq!(served(&handler, &store, 7), expected);
+                assert_eq!(
+                    handler.project_identities.pinned_identity(&project),
+                    Some(expected)
+                );
+                assert_eq!(fake.calls.load(Ordering::SeqCst), 1);
+            }
+        }
+
+        #[tokio::test]
+        async fn authority_query_failure_keeps_fallback_without_pinning() {
+            let (mut handler, store, _temp, project) = fixture();
+            let fallback = handler.project_identities.resolve(&project).unwrap();
+            store
+                .with_context_conn_for_test(|db| {
+                    db.execute_batch(
+                        "DROP TABLE IF EXISTS authority_managed;
+                    CREATE TABLE authority_managed (wrong_column TEXT)",
+                    )
+                })
+                .unwrap();
+            let fake = FakeEntorhinal::start(Some(root_reply(&project)), None).await;
+            handler.entorhinal =
+                entorhinal_resolve::EntorhinalResolver::new(Some(fake.connection_file.clone()));
+            bind(&handler, &project, 7).await;
+            assert_eq!(served(&handler, &store, 7), fallback);
+            assert!(handler
+                .project_identities
+                .pinned_identity(&project)
+                .is_none());
+            assert_eq!(fake.calls.load(Ordering::SeqCst), 1);
+        }
+
+        #[tokio::test]
+        async fn authority_unavailable_store_keeps_fallback_without_pinning() {
+            let (mut handler, store, _temp, project) = fixture();
+            let fallback = handler.project_identities.resolve(&project).unwrap();
+            handler.store = Arc::new(OnceLock::new());
+            let fake = FakeEntorhinal::start(Some(root_reply(&project)), None).await;
+            handler.entorhinal =
+                entorhinal_resolve::EntorhinalResolver::new(Some(fake.connection_file.clone()));
+            bind(&handler, &project, 7).await;
+            assert_eq!(served(&handler, &store, 7), fallback);
+            assert!(handler
+                .project_identities
+                .pinned_identity(&project)
+                .is_none());
+            assert_eq!(fake.calls.load(Ordering::SeqCst), 0);
+        }
+
+        #[tokio::test]
+        async fn reply_one_millisecond_before_bind_deadline_serves_pj() {
+            let (mut handler, store, _temp, project) = fixture();
+            let reply = root_reply(&project);
+            let expected = reply["result"]["projectId"].as_str().unwrap();
+            store
+                .seed_memory(1, expected, "CONSTRAINTS", "near-deadline project fact", 50)
+                .unwrap();
+            let fake = FakeEntorhinal::start(Some(reply), None).await;
+            handler.entorhinal =
+                entorhinal_resolve::EntorhinalResolver::new(Some(fake.connection_file.clone()));
+            let started = tokio::time::Instant::now();
+            *fake.reply_at.lock().unwrap() = Some(
+                started
+                    + Duration::from_millis(entorhinal_resolve::ENTORHINAL_RESOLVE_DEADLINE_MS - 1),
+            );
+            bind(&handler, &project, 7).await;
+            assert!(
+                started.elapsed()
+                    >= Duration::from_millis(
+                        entorhinal_resolve::ENTORHINAL_RESOLVE_DEADLINE_MS - 1
+                    )
+            );
+            let response =
+                call_transform_request(&handler, request(vec![ck("m1", 1, "hello")])).await;
+            assert_eq!(response["status"], "ok");
+            assert!(
+                response.to_string().contains("near-deadline project fact"),
+                "{response}"
+            );
+            assert_eq!(fake.calls.load(Ordering::SeqCst), 1);
+        }
+
+        #[tokio::test]
+        async fn served_pj_and_fallback_bindings_reject_pj_transitions_until_rebind() {
+            use tracing_subscriber::prelude::*;
+            for own_decision in [false, true] {
+                for (before, after) in [("pj-A", "git:B"), ("pj-A", "pj-B"), ("git:A", "pj-B")] {
+                    let (handler, store, _temp, project) = fixture();
+                    if !own_decision {
+                        row(&store, before);
+                    }
+                    bind(&handler, &project, 7).await;
+                    if own_decision {
+                        handler
+                            .binding_projects
+                            .lock()
+                            .unwrap()
+                            .get_mut(&7)
+                            .unwrap()
+                            .initial = Some(Ok(before.into()));
+                    }
+                    assert_eq!(served(&handler, &store, 7), before);
+                    row(&store, after);
+                    let logs = tempfile::tempdir().unwrap();
+                    let mut config = cortexkit_log::Config::in_dir("magic-context", logs.path());
+                    config.spec = Some("warn".into());
+                    let (layer, log) = cortexkit_log::layer(config).unwrap();
+                    tracing::subscriber::with_default(
+                        tracing_subscriber::registry().with(layer),
+                        || {
+                            for _ in 0..3 {
+                                assert_eq!(served(&handler, &store, 7), before);
+                            }
+                        },
+                    );
+                    let lines = std::fs::read_to_string(log.path()).unwrap();
+                    assert_eq!(
+                        lines.matches("ignoring changed project identity").count(),
+                        1
+                    );
+                    assert!(handler.binding_projects.lock().unwrap()[&7].mismatch_logged);
+                    bind(&handler, &project, 8).await;
+                    assert_eq!(served(&handler, &store, 8), after);
+                }
+            }
+        }
+
+        #[tokio::test]
+        async fn absent_entorhinal_keeps_per_request_standalone_rows() {
+            let (mut handler, store, _temp, project) = fixture();
+            let fake = FakeEntorhinal::start(None, None).await;
+            handler.entorhinal =
+                entorhinal_resolve::EntorhinalResolver::new(Some(fake.connection_file.clone()));
+            bind(&handler, &project, 7).await;
+            assert!(served(&handler, &store, 7).starts_with("dir:"));
+            row(&store, "dir:A");
+            assert_eq!(served(&handler, &store, 7), "dir:A");
+            row(&store, "git:A");
+            assert_eq!(served(&handler, &store, 7), "git:A");
+            row(&store, "git:B");
+            assert_eq!(served(&handler, &store, 7), "git:B");
+            assert_eq!(fake.calls.load(Ordering::SeqCst), 1);
+            assert!(!handler.binding_projects.lock().unwrap()[&7].mismatch_logged);
+        }
+
+        fn git_commit(project: &Path) -> String {
+            for args in [
+                vec!["init", "-q"],
+                vec![
+                    "-c",
+                    "user.name=Test",
+                    "-c",
+                    "user.email=test@example.invalid",
+                    "commit",
+                    "--allow-empty",
+                    "-qm",
+                    "initial",
+                ],
+            ] {
+                assert!(std::process::Command::new("git")
+                    .args(args)
+                    .current_dir(project)
+                    .status()
+                    .unwrap()
+                    .success());
+            }
+            let output = std::process::Command::new("git")
+                .args(["rev-parse", "HEAD"])
+                .current_dir(project)
+                .output()
+                .unwrap();
+            assert!(output.status.success());
+            format!("git:{}", String::from_utf8(output.stdout).unwrap().trim())
+        }
+
+        #[tokio::test]
+        async fn own_fallback_does_not_adopt_a_later_pj_row() {
+            for git in [false, true] {
+                let (handler, store, _temp, project) = fixture();
+                let expected = if git {
+                    git_commit(&project)
+                } else {
+                    project_identity::directory_fallback(&project)
+                };
+                bind(&handler, &project, 7).await;
+                assert_eq!(served(&handler, &store, 7), expected);
+                row(&store, "pj-new");
+                assert_eq!(served(&handler, &store, 7), expected);
+                bind(&handler, &project, 8).await;
+                assert_eq!(served(&handler, &store, 8), "pj-new");
+            }
+        }
+
+        #[tokio::test]
+        async fn fallback_dir_revalidates_and_paused_git_retries_without_entorhinal() {
+            for broken_git in [false, true] {
+                let (mut handler, store, temp, project) = fixture();
+                if broken_git {
+                    std::fs::write(project.join(".git"), "gitdir: /nonexistent/bind-test\n")
+                        .unwrap();
+                }
+                bind(&handler, &project, 7).await;
+                let binding = handler.facade_binding(7).unwrap();
+                let before = handler
+                    .route_project(7, &store, &binding)
+                    .unwrap_or_else(|_| panic!("fallback failed"));
+                assert_eq!(before.memory_paused.is_some(), broken_git);
+                if broken_git {
+                    std::fs::remove_file(project.join(".git")).unwrap();
+                    // Replacing the resolver drops its cached git failure, simulating
+                    // expiry of the five-minute git retry window without a long wait.
+                    handler.project_identities =
+                        Arc::new(project_identity::ProjectIdentityResolver::with_sidecar_dir(
+                            temp.path().join("sidecars"),
+                        ));
+                } else {
+                    assert!(before.key.starts_with("dir:"));
+                }
+                let expected = git_commit(&project);
+                assert_eq!(served(&handler, &store, 7), expected);
+                assert!(!handler
+                    .memory_paused_routes
+                    .lock()
+                    .unwrap()
+                    .contains_key(&project));
+                handler
+                    .project_identities
+                    .pin_live_answer(&project, "pj-later", Some(&project));
+                assert_eq!(served(&handler, &store, 7), expected);
+            }
+        }
+
+        #[tokio::test]
+        async fn move_between_pins_uses_new_binding_and_return_refreshes_row() {
+            let (handler, store, temp, project) = fixture();
+            let other = temp.path().join("other");
+            std::fs::create_dir(&other).unwrap();
+            handler
+                .project_identities
+                .pin_live_answer(&project, "pj-A", Some(&project));
+            handler
+                .project_identities
+                .pin_live_answer(&other, "pj-B", Some(&other));
+            row(&store, "pj-A");
+            bind(&handler, &project, 7).await;
+            assert_eq!(served(&handler, &store, 7), "pj-A");
+            row(&store, "pj-B");
+            bind(&handler, &other, 8).await;
+            assert_eq!(served(&handler, &store, 8), "pj-B");
+            row(&store, "pj-A");
+            assert_eq!(served(&handler, &store, 7), "pj-A");
+            handler.unbind_route(7);
+            assert!(!handler.binding_projects.lock().unwrap().contains_key(&7));
+        }
+
+        #[tokio::test]
+        async fn returning_to_open_binding_adopts_a_pin_gained_while_away() {
+            let (handler, store, temp, project) = fixture();
+            bind(&handler, &project, 7).await;
+            assert!(served(&handler, &store, 7).starts_with("dir:"));
+            let other = temp.path().join("other");
+            std::fs::create_dir(&other).unwrap();
+            row(&store, "pj-B");
+            bind(&handler, &other, 8).await;
+            assert_eq!(served(&handler, &store, 8), "pj-B");
+            handler
+                .project_identities
+                .pin_live_answer(&project, "pj-A", Some(&project));
+            row(&store, "pj-A");
+            assert_eq!(served(&handler, &store, 7), "pj-A");
+        }
+    }
+
     fn binding_with_harness(root: &str, harness: &str, session: &str) -> SessionBinding {
         SessionBinding {
-            connection_incarnation: 0,
-            native_generation: None,
             principal: None,
             scope: None,
             project_root: PathBuf::from(root),
@@ -22354,9 +25936,14 @@ mod tests {
         ));
     }
 
+    #[path = "background_run_limits.rs"]
+    mod background_run_limits;
+
     #[derive(Default)]
     struct ProducerState {
+        runner_limits: Mutex<Option<runner_limits::RunnerLimits>>,
         connects: AtomicUsize,
+        session_runner_connects: AtomicUsize,
         starts: AtomicUsize,
         start_errors: Mutex<VecDeque<Result<RunHandle, HistorianProducerError>>>,
         binds: AtomicUsize,
@@ -22404,6 +25991,17 @@ mod tests {
                 state: Arc::clone(&self.state),
             }))
         }
+
+        async fn connect_session_runner(
+            &self,
+            identity: &session_resolver::RunnerBindIdentity,
+            _route: &SessionRunnerRoute,
+        ) -> Result<Box<dyn HistorianProducerDriver + Send>, HistorianProducerError> {
+            self.state
+                .session_runner_connects
+                .fetch_add(1, Ordering::SeqCst);
+            self.connect(&identity.project_root).await
+        }
     }
 
     struct TestProducer {
@@ -22412,6 +26010,12 @@ mod tests {
 
     #[async_trait]
     impl HistorianProducerDriver for TestProducer {
+        async fn session_runner_limits(
+            &mut self,
+            _child: &str,
+        ) -> Result<Option<runner_limits::RunnerLimits>, HistorianProducerError> {
+            Ok(*self.state.runner_limits.lock().unwrap())
+        }
         async fn bind_session(&mut self, _session_id: &str) -> Result<(), HistorianProducerError> {
             self.state.binds.fetch_add(1, Ordering::SeqCst);
             Ok(())
@@ -23100,6 +26704,7 @@ mod tests {
 
     fn default_test_config() -> McModuleConfig {
         McModuleConfig {
+            rust_background_enabled: false,
             cache_ttl_by_model: std::collections::BTreeMap::new(),
             catalog: crate::config::CatalogConfigInputs::default(),
             historian_temperature: None,
@@ -23122,6 +26727,7 @@ mod tests {
             caveman: crate::config::CavemanConfig::default(),
             auto_promote: true,
             user_memory_collection_enabled: false,
+            user_observations_requested: true,
             historian_context_limit_tokens: 200_000,
             historian_context_limit_known: true,
             memory_budget_tokens: 4_000.0,
@@ -28271,6 +31877,7 @@ mod tests {
                     let loaded = store.load("ses").unwrap();
                     store
                         .publish_historian_chunk(mc_store::HistorianPublishRequest {
+                            rust_background_enabled: false,
                             lifecycle_publication_id: None,
                             harness: None,
                             session_id: "ses",
@@ -30460,6 +34067,7 @@ mod tests {
             .unwrap();
         store
             .publish_historian_chunk(mc_store::HistorianPublishRequest {
+                rust_background_enabled: false,
                 lifecycle_publication_id: None,
                 harness: None,
                 session_id: "ses",
@@ -36881,6 +40489,74 @@ mod tests {
     }
 
     #[tokio::test(flavor = "current_thread")]
+    async fn runner_transcript_todo_matches_the_todo_state_set_anchor() {
+        // A runner sends no todo_state.set; ck-mc reads the todowrite call and
+        // its result from the transcript. The stored state, and the synthetic
+        // todo pair built from it, must equal what todo_state.set produces.
+        let fixture: Value =
+            serde_json::from_str(include_str!("../testdata/runner-todo-transcript.json")).unwrap();
+        let producer = Arc::new(ProducerState::default());
+        let (handler, store, _dir, _project) = handler_with_store(producer, default_test_config());
+        let set = &fixture["todo_state_set"];
+        let request = json!({
+            "method": "todo_state.set",
+            "v": 1,
+            "session_id": "ses",
+            "state_json": serde_json::to_string(&set["todos"]).unwrap(),
+            "owner_message_id": set["owner_message_id"],
+        });
+        assert_eq!(
+            call_dispatch_request(&handler, request).await,
+            json!({ "ok": true })
+        );
+
+        let transcript: Vec<crate::providers::codec::InboundMessage> =
+            serde_json::from_value(fixture["transcript"].clone()).unwrap();
+        let mut scan = crate::providers::runner_todo::TodoScan::default();
+        let derived = crate::providers::runner_todo::scan_status_messages(
+            &mut scan,
+            fixture["lineage_id"].as_str().unwrap(),
+            &transcript,
+        )
+        .unwrap()
+        .expect("the transcript holds a successful todowrite");
+        store
+            .set_todo_state(
+                "ses-derived",
+                &derived.state_json,
+                &derived.owner_message_id,
+                &derived.state_hash,
+            )
+            .unwrap();
+
+        let reported = store.load("ses").unwrap().meta;
+        let derived_meta = store.load("ses-derived").unwrap().meta;
+        assert_eq!(
+            reported.last_todo_state.as_deref(),
+            fixture["expected_state_json"].as_str()
+        );
+        assert_eq!(derived_meta.last_todo_state, reported.last_todo_state);
+        assert_eq!(
+            derived_meta.last_todo_state_hash,
+            reported.last_todo_state_hash
+        );
+        assert_eq!(
+            derived_meta.last_todo_state_owner_message_id,
+            reported.last_todo_state_owner_message_id
+        );
+        let anchor =
+            |meta: &mc_store::ModuleMeta| match crate::injection::advance_injection_from_meta(
+                meta, None, true, None,
+            ) {
+                crate::injection::InjectionOutcome::Replace(pair) => {
+                    pair.freeze_at(meta.last_todo_state_owner_message_id.clone())
+                }
+                other => panic!("expected a synthetic todo pair, got {other:?}"),
+            };
+        assert_eq!(anchor(&derived_meta), anchor(&reported));
+    }
+
+    #[tokio::test(flavor = "current_thread")]
     async fn management_todo_flush_and_recomp_contracts_are_replay_safe() {
         let producer = Arc::new(ProducerState::default());
         let (handler, store, _dir, _project) = handler_with_store(producer, default_test_config());
@@ -40400,6 +44076,7 @@ mod tests {
         };
         store
             .publish_historian_chunk(mc_store::HistorianPublishRequest {
+                rust_background_enabled: false,
                 lifecycle_publication_id: None,
                 harness: None,
                 session_id: "ses",
@@ -42652,6 +46329,7 @@ mod tests {
         };
         store
             .publish_historian_chunk(mc_store::HistorianPublishRequest {
+                rust_background_enabled: false,
                 lifecycle_publication_id: None,
                 harness: None,
                 session_id,

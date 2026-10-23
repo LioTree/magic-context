@@ -6,11 +6,18 @@ import {
 	updateReplayDocument,
 } from "@magic-context/core/features/magic-context/storage-replay-document";
 import * as persistence from "@magic-context/core/hooks/magic-context/lkg-persist";
+import { checkLkgDurability } from "@magic-context/core/hooks/magic-context/lkg-served-marker";
 import {
 	dropSlot,
 	getInMemorySlot,
 	resetLkgSlotsForTest,
 } from "@magic-context/core/hooks/magic-context/lkg-slot";
+import { rejectSessionMetaCollectionWrites } from "../../plugin/src/features/magic-context/__tests__/session-meta-faults";
+import { patchSessionMeta } from "../../plugin/src/features/magic-context/__tests__/session-meta-fixture";
+import {
+	sessionMetaCollectionSelect,
+	updateSessionMetaCollection,
+} from "../../plugin/src/features/magic-context/storage-session-collections";
 import { createTestTempDir } from "../../plugin/src/shared/test-temp-dir";
 import {
 	clearContextHandlerSession,
@@ -238,6 +245,91 @@ for (const failure of ["db-save", "late-commit"] as const) {
 	);
 }
 
+test("real managed handler certifies the request it returns, and a late commit stays uncertified", async () => {
+	for (const late of [false, true]) {
+		await fixture(async (db, sessionId, root) => {
+			const fake = createFakePi();
+			registerPiContextHandler(fake.pi as never, { db });
+			const handler = fake.handlers.get("context");
+			if (!handler) throw new Error("context handler missing");
+			const raw = [userMessage("certified at dispatch", 1)];
+			const ctx = fakeContext(sessionId, root, ["entry-1"], raw);
+			let now = 0;
+			const clock = spyOn(performance, "now").mockImplementation(() => now);
+			const save = persistence.saveLkgSlotToDb;
+			const saver = spyOn(persistence, "saveLkgSlotToDb").mockImplementation(
+				(...args) => {
+					const committed = save(...args);
+					if (late) now = 26_000;
+					return committed;
+				},
+			);
+			try {
+				const pending = handler({ messages: raw } as never, ctx as never);
+				if (late) await expect(pending).rejects.toThrow("elapsed=26000ms");
+				else await pending;
+				expect(
+					persistence.loadPersistedLkgSlot(db, sessionId)?.jsonPrefix,
+				).toContain("certified at dispatch");
+				const status = checkLkgDurability(db, sessionId);
+				if (late) {
+					expect(status).toEqual({
+						durable: true,
+						servedCaptureId: null,
+						certified: false,
+					});
+					expect(
+						persistence.createDbLkgPersistence(db).load(sessionId),
+					).toBeUndefined();
+				} else {
+					expect(status.durable && status.servedCaptureId).toBe(1);
+				}
+			} finally {
+				saver.mockRestore();
+				clock.mockRestore();
+			}
+		});
+	}
+});
+
+test("a request the dispatch wrapper refuses after the handler returns stays uncertified and unhydrated", async () => {
+	await fixture(async (db, sessionId, root) => {
+		const fake = createFakePi();
+		let now = 0;
+		const clock = spyOn(performance, "now").mockImplementation(() => now);
+		// The handler's last hook runs after its own deadline checks: crossing the
+		// deadline here lets the handler return, and the wrapper then refuses.
+		registerPiContextHandler(fake.pi as never, {
+			db,
+			onPostprocess: () => {
+				now = 26_000;
+			},
+		});
+		const handler = fake.handlers.get("context");
+		if (!handler) throw new Error("context handler missing");
+		const raw = [userMessage("refused after return", 1)];
+		const ctx = fakeContext(sessionId, root, ["entry-1"], raw);
+		try {
+			await expect(
+				handler({ messages: raw } as never, ctx as never),
+			).rejects.toThrow("elapsed=26000ms");
+			expect(
+				persistence.loadPersistedLkgSlot(db, sessionId)?.jsonPrefix,
+			).toContain("refused after return");
+			expect(checkLkgDurability(db, sessionId)).toEqual({
+				durable: true,
+				servedCaptureId: null,
+				certified: false,
+			});
+			expect(
+				persistence.createDbLkgPersistence(db).load(sessionId),
+			).toBeUndefined();
+		} finally {
+			clock.mockRestore();
+		}
+	});
+});
+
 for (const limitation of [
 	"branch-unavailable",
 	"identical-unsaved-twins",
@@ -307,8 +399,15 @@ test("number-only write failure serves without publishing and counts every faile
 		ctx.sessionManager.getBranch = () => {
 			throw new Error("branch unavailable");
 		};
-		db.exec(
-			`CREATE TRIGGER reject_number_evidence BEFORE UPDATE OF trailing_blank_decisions ON session_meta WHEN instr(NEW.trailing_blank_decisions, '"piServedTagNumbers"') > 0 BEGIN SELECT RAISE(ABORT, 'fixture evidence IO failure'); END`,
+		rejectSessionMetaCollectionWrites(
+			db,
+			"trailing_blank_decisions",
+			"reject_number_evidence",
+			{
+				error: "fixture evidence IO failure",
+				when: (value) =>
+					typeof value === "string" && value.includes('"piServedTagNumbers"'),
+			},
 		);
 		const publication = observePiPublicationForTest(sessionId);
 		try {
@@ -344,9 +443,12 @@ for (const envelope of [
 	test(`unreadable publication envelope serves without writing: ${envelope}`, async () => {
 		await fixture(async (db, sessionId, root) => {
 			expect(updateReplayDocument(db, sessionId, () => false)).toBe(true);
-			db.prepare(
-				"UPDATE session_meta SET trailing_blank_decisions = ? WHERE session_id = ?",
-			).run(envelope, sessionId);
+			updateSessionMetaCollection(
+				db,
+				sessionId,
+				"trailing_blank_decisions",
+				envelope,
+			);
 			const fake = createFakePi();
 			registerPiContextHandler(fake.pi as never, { db });
 			const handler = fake.handlers.get("context");
@@ -367,7 +469,7 @@ for (const envelope of [
 				expect(
 					db
 						.prepare(
-							"SELECT trailing_blank_decisions FROM session_meta WHERE session_id = ?",
+							`SELECT ${sessionMetaCollectionSelect("trailing_blank_decisions", "trailing_blank_decisions", db)} FROM session_meta WHERE session_id = ?`,
 						)
 						.get(sessionId),
 				).toEqual({ trailing_blank_decisions: envelope });
@@ -392,9 +494,7 @@ for (const envelope of [
 test("unpaired envelope-conflict repairs once and keeps serving", async () => {
 	await fixture(async (db, sessionId, root) => {
 		expect(updateReplayDocument(db, sessionId, () => false)).toBe(true);
-		db.prepare(
-			"UPDATE session_meta SET trailing_blank_decisions = '{' WHERE session_id = ?",
-		).run(sessionId);
+		patchSessionMeta(db, sessionId, { trailing_blank_decisions: "{" });
 		const fake = createFakePi();
 		registerPiContextHandler(fake.pi as never, { db });
 		const handler = fake.handlers.get("context");

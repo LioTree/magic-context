@@ -43,10 +43,44 @@ export function pendingMaterializationOrigin(sessions: Set<string>, sessionId: s
         : "pending_materialization";
 }
 
+/** Admission uses every recorded cause, not just the first diagnostic label. */
+export function hasPendingMaterializationOrigin(
+    sessions: Set<string>,
+    sessionId: string,
+    origin: PendingMaterializationOrigin,
+): boolean {
+    return sessions.has(sessionId) && causes.get(sessions)?.get(sessionId)?.has(origin) === true;
+}
+
 export function clearPendingMaterialization(sessions: Set<string>, sessionId: string): void {
     sessions.delete(sessionId);
     origins.get(sessions)?.delete(sessionId);
     causes.get(sessions)?.delete(sessionId);
+}
+
+/** Save a pending rebuild and every reason for it; a failed edit/removal transaction restores this session only. */
+export function snapshotPendingMaterialization(
+    sessions: Set<string>,
+    sessionId: string,
+): () => void {
+    const pending = sessions.has(sessionId);
+    const origin = origins.get(sessions)?.get(sessionId);
+    const previous = causes.get(sessions)?.get(sessionId);
+    const savedCauses = previous ? new Set(previous) : undefined;
+    return () => {
+        if (pending) sessions.add(sessionId);
+        else sessions.delete(sessionId);
+        let originMap = origins.get(sessions);
+        if (origin !== undefined) {
+            if (!originMap) origins.set(sessions, (originMap = new Map()));
+            originMap.set(sessionId, origin);
+        } else originMap?.delete(sessionId);
+        let causeMap = causes.get(sessions);
+        if (savedCauses) {
+            if (!causeMap) causes.set(sessions, (causeMap = new Map()));
+            causeMap.set(sessionId, new Set(savedCauses));
+        } else causeMap?.delete(sessionId);
+    };
 }
 
 /** The first origin remains the log label, but subsequent requests still matter:
@@ -57,4 +91,26 @@ export function hasOnlySystemHashMaterialization(
 ): boolean {
     const pendingCauses = causes.get(sessions)?.get(sessionId);
     return sessions.has(sessionId) && pendingCauses?.size === 1 && pendingCauses.has("system_hash");
+}
+
+// A real host system-prompt change edits bytes before every kept signed
+// thinking block, so on a prefix-bound model the older thinking must be stripped
+// together with it. The system hook records the change here; the first transform
+// pass with no current-turn thinking boundary consumes it with that strip. The
+// record is separate from the materialization request because that request can
+// be drained or deferred independently of the pass that pays for the strip.
+const systemPromptEdits = new WeakMap<Set<string>, Set<string>>();
+
+export function recordSystemPromptEdit(sessions: Set<string>, sessionId: string): void {
+    let edited = systemPromptEdits.get(sessions);
+    if (!edited) systemPromptEdits.set(sessions, (edited = new Set()));
+    edited.add(sessionId);
+}
+
+export function hasSystemPromptEdit(sessions: Set<string>, sessionId: string): boolean {
+    return systemPromptEdits.get(sessions)?.has(sessionId) === true;
+}
+
+export function clearSystemPromptEdit(sessions: Set<string>, sessionId: string): void {
+    systemPromptEdits.get(sessions)?.delete(sessionId);
 }

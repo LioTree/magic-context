@@ -27,6 +27,7 @@ import { buildMockHistorianPayload, findHistorianOrdinalRange } from "../src/moc
 import type { MockUsage } from "../src/mock-provider/server";
 import { PiTestHarness } from "../src/pi-harness";
 import { PI_PACKAGE_JSON } from "../src/pi-runner/spawn";
+import { sessionMetaFieldSelect } from "../src/session-meta-fields";
 
 const HISTORIAN_SYSTEM_MARKER = "the hippocampus of a long-running coding agent";
 const COMPARTMENT_TITLE = "Inspected runtime sources before implementing the plan";
@@ -130,7 +131,9 @@ it("counts compartments served in m[1] in the Compartments bucket", async () => 
 
     const meta = h
         .contextDb()
-        .prepare("SELECT cached_m0_bytes, cached_m1_bytes FROM session_meta WHERE session_id = ?")
+        .prepare(
+            `SELECT ${sessionMetaFieldSelect("cached_m0_bytes")}, ${sessionMetaFieldSelect("cached_m1_bytes")} FROM session_meta WHERE session_id = ?`,
+        )
         .get(sessionId) as { cached_m0_bytes: Uint8Array | null; cached_m1_bytes: Uint8Array | null } | null;
     const m0Text = meta?.cached_m0_bytes ? Buffer.from(meta.cached_m0_bytes).toString("utf8") : "";
     const m1Text = meta?.cached_m1_bytes ? Buffer.from(meta.cached_m1_bytes).toString("utf8") : "";

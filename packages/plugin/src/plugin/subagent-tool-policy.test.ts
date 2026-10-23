@@ -123,7 +123,7 @@ test("OC2 hides only memory and note on a child request without mutating primary
     expect(JSON.stringify(tools)).toBe(bytes);
 });
 
-test("OC2 execution refuses forged child calls before entering a module backend", async () => {
+test("OC2 execution refuses forged child calls before any write", async () => {
     const registered: Array<{
         name: string;
         execute: (args: unknown, call: unknown) => Promise<{ content: string }>;
@@ -139,18 +139,7 @@ test("OC2 execution refuses forged child calls before entering a module backend"
         },
     } as unknown as V2Context;
     const { parsePluginConfig } = await import("../config");
-    let backendCalls = 0;
-    await registerTools(context, db, parsePluginConfig({ memory: { enabled: true } }), {
-        authorityState: async () => "MODULE",
-        note: async () => {
-            backendCalls++;
-            return "written";
-        },
-        memory: async () => {
-            backendCalls++;
-            return "written";
-        },
-    } as unknown as Parameters<typeof registerTools>[3]);
+    await registerTools(context, db, parsePluginConfig({ memory: { enabled: true } }));
     for (const id of ["ctx_memory", "ctx_note"]) {
         const result = await registered
             .find((t) => t.name === id)!
@@ -160,5 +149,6 @@ test("OC2 execution refuses forged child calls before entering a module backend"
             );
         expect(result.content).toContain(`${id} is unavailable`);
     }
-    expect(backendCalls).toBe(0);
+    expect(db.prepare("SELECT COUNT(*) AS n FROM memories").get()).toEqual({ n: 0 });
+    expect(db.prepare("SELECT COUNT(*) AS n FROM notes").get()).toEqual({ n: 0 });
 });

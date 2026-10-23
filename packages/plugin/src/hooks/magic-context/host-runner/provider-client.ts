@@ -1,7 +1,7 @@
 import { randomUUID } from "node:crypto";
 import { z } from "zod";
 import { sessionLog } from "../../../shared/logger";
-import type { RustModeModuleClient } from "../rust-mode-transform";
+import type { ModuleSessionClient } from "../module-session-kernel";
 import {
     checkAnswerFence,
     encodedBytes,
@@ -389,10 +389,15 @@ export type ProviderResult<A> =
           exit_reason?: "provider_message_too_large";
       };
 export interface ProviderClientOptions {
-    moduleClient: Pick<RustModeModuleClient, "call">;
+    moduleClient: Pick<ModuleSessionClient, "call">;
     sessionId: string;
     projectRoot: string;
-    harness: "opencode" | "opencode2";
+    harness: "opencode" | "opencode2" | "pi";
+    /** Encode saved message objects as native host JSON before RPC, and decode native reply messages. */
+    wire?: {
+        request(method: ProviderMethod, encoded: string): string;
+        answer(method: ProviderMethod, answer: unknown): unknown;
+    };
     /** Must durably write the fence; a failure refuses the turn, never raw passthrough. */
     persistFence: (fence: ProviderFence) => Promise<void>;
     /** Globally fresh, including after restart; each encoded id must fit requestIdBytes. */
@@ -528,6 +533,7 @@ export class ProviderClient {
         record?: RunnerRecord<M>,
         signal?: AbortSignal,
     ): Promise<ProviderResult<ProviderAnswers[K]>> {
+        encoded = this.options.wire?.request(method, encoded) ?? encoded;
         if (encodedBytes(encoded) > MAX_REQUEST_BYTES)
             return { status: "unavailable", request_id: id, reason: "oversize" };
         const remaining = deadline - this.now();
@@ -555,7 +561,7 @@ export class ProviderClient {
                 this.options.moduleClient.call({
                     sessionId: this.options.sessionId,
                     projectRoot: this.options.projectRoot,
-                    method: method as Parameters<RustModeModuleClient["call"]>[0]["method"],
+                    method: method as Parameters<ModuleSessionClient["call"]>[0]["method"],
                     body: new TextEncoder().encode(encoded),
                     signal: abort.signal,
                     timeoutMs: remaining,
@@ -571,7 +577,10 @@ export class ProviderClient {
             if (rejection) return { status: "unavailable", request_id: id, reason: rejection };
             let answer: ProviderAnswers[K];
             try {
-                answer = decodeProviderAnswer(method, response);
+                answer = decodeProviderAnswer(
+                    method,
+                    this.options.wire?.answer(method, response) ?? response,
+                );
             } catch (error) {
                 return { status: "unavailable", request_id: id, reason: "invalid_answer", error };
             }

@@ -1,5 +1,8 @@
 import type { createCompactionHandler } from "../../features/magic-context/compaction";
-import { resolveProjectIdentityForSession } from "../../features/magic-context/memory/project-identity";
+import {
+    awaitSessionIdentityDecision,
+    forgetSessionIdentityDecision,
+} from "../../features/magic-context/memory/session-identity-decision";
 import { scheduleClearAndReindex } from "../../features/magic-context/message-index-async";
 import {
     detectLatestTurnThinkingMismatch,
@@ -136,6 +139,7 @@ export interface EventHandlerDeps {
     onSessionDeleted?: (sessionId: string) => Promise<void> | void;
     rustSessionCleanup?: boolean;
     allowHomeProject?: boolean;
+    subcConnectionFile?: string;
     config: {
         clear_reasoning_age?: unknown;
         execute_threshold_percentage?: number | { default: number; [modelKey: string]: number };
@@ -197,9 +201,9 @@ async function deliverChannel2IfPending(deps: EventHandlerDeps, sessionId: strin
         // `pending` intent exists, a client is wired, and a subagent run is still
         // active.
         const baseline = deps.channel1StateBySession?.get(sessionId);
-        // A reduce after the persisted generation invalidates its U/T values.
-        // Hold the pending intent until a cache-busting pass rewalks the final
-        // rendered tail; delivery must never burn the cap from stale mass.
+        // Context reduction makes the last measured token counts stale. Wait for
+        // a successful refresh rather than using the pre-reduction estimate to
+        // consume a reminder delivery opportunity.
         if (baseline?.reducedSinceRefresh) return;
         const delivered = await maybeDeliverChannel2(sessionId, {
             db: deps.db,
@@ -344,7 +348,13 @@ export function createEventHandler(deps: EventHandlerDeps) {
                     recordSessionProjectIdentity(
                         deps.db,
                         info.id,
-                        resolveProjectIdentityForSession(info.directory, deps.allowHomeProject),
+                        (
+                            await awaitSessionIdentityDecision(info.id, info.directory, {
+                                db: deps.db,
+                                allowHomeProject: deps.allowHomeProject,
+                                connectionFile: deps.subcConnectionFile,
+                            })
+                        ).identity,
                     );
                 }
                 const modelKey = resolveModelKey(info.providerID, info.modelID);
@@ -1295,6 +1305,7 @@ export function createEventHandler(deps: EventHandlerDeps) {
                 return;
             }
 
+            forgetSessionIdentityDecision(sessionId);
             dropSlot(sessionId, "session.deleted");
             clearLkgMeasuredRequest(sessionId);
             clearTrackedOpenCodeSession(sessionId);

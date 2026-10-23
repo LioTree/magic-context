@@ -14,6 +14,10 @@ import {
 import * as logger from "@magic-context/core/shared/logger";
 import { closeQuietly } from "@magic-context/core/shared/sqlite-helpers";
 import {
+	clearSessionMetaFixtureFault,
+	rejectSessionRenderCacheWrites,
+} from "../../plugin/src/features/magic-context/__tests__/session-meta-faults";
+import {
 	applyDeferredPiCompactionMarker,
 	clearPiCompactionMarkerDrainLogState,
 } from "./compaction-marker-manager-pi";
@@ -419,8 +423,11 @@ for (const harness of ["pi", "omp"] as const) {
 						getLeafId: () => "u1",
 					},
 				};
-				db.exec(
-					"CREATE TRIGGER refuse_prefix_clear BEFORE UPDATE OF cached_m0_bytes ON session_meta BEGIN SELECT RAISE(ABORT, 'mock rollback'); END",
+				rejectSessionRenderCacheWrites(
+					db,
+					"cached_m0_bytes",
+					"refuse_prefix_clear",
+					{ error: "mock rollback" },
 				);
 				expect(() => repairPiHistoryBoundary(db, sessionId, ctx)).toThrow();
 				expect(getPendingPiCompactionMarkerState(db, sessionId)).toEqual(
@@ -431,7 +438,7 @@ for (const harness of ["pi", "omp"] as const) {
 						text.startsWith("Pi compaction-marker clear:"),
 					),
 				).toHaveLength(0);
-				db.exec("DROP TRIGGER refuse_prefix_clear");
+				clearSessionMetaFixtureFault(db, "refuse_prefix_clear");
 				repairPiHistoryBoundary(db, sessionId, ctx);
 				repairPiHistoryBoundary(db, sessionId, ctx);
 				expect(getPendingPiCompactionMarkerState(db, sessionId)).toBeNull();

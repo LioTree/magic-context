@@ -1,15 +1,11 @@
 /// <reference types="bun-types" />
 
 import { afterEach, describe, expect, mock, spyOn, test } from "bun:test";
-import { createDreamTimerModuleClient } from "../../../plugin/dream-timer-module-client";
 import * as logger from "../../../shared/logger";
 import { Database } from "../../../shared/sqlite";
 import { closeQuietly } from "../../../shared/sqlite-helpers";
 import { userFacingFailureCode } from "../../../shared/user-facing-codes";
-import {
-    ensureContextStoreUuid,
-    installAuthorityManagedMarker,
-} from "../legacy-authority-fixture.test-support";
+import { installAuthorityManagedMarker } from "../legacy-authority-fixture.test-support";
 import {
     getMemoriesByProject,
     getUnclassifiedMemoryIds,
@@ -17,11 +13,15 @@ import {
     recordMemoryVerifications,
 } from "../memory";
 import { runMigrations } from "../migrations";
+import * as cues from "../mural/compress-cues";
 import { initializeDatabase } from "../storage-db";
 import { ensureProjectState, getProjectState } from "../storage-project-state";
 import { getUserMemoryCandidates } from "../user-memory/storage-user-memory";
 import { recordCurateSafetyRefusal } from "./curate-memory-safety";
+import * as expiry from "./expire-memories";
 import { acquireLease, acquireLeaseWithAcquisition, releaseLease } from "./lease";
+import * as mapping from "./map-memories";
+import { DreamerModuleFailureError } from "./module-apply";
 import { recordedGeminiQuotaMessages } from "./provider-output-failure.test-support";
 import { applyRetrospectiveLearnings } from "./retrospective-learnings";
 import {
@@ -41,6 +41,7 @@ import {
     runDueTasksForProject,
     runManualDream,
 } from "./task-scheduler";
+import * as verification from "./verify";
 
 let db: Database | null = null;
 
@@ -1309,7 +1310,7 @@ describe("createDreamTaskExecutor — verify-broad disposition", () => {
         expect(task.error).toBeUndefined();
         expect(task.progress).toContain("verify-broad cycle");
         expect(task.progress).toContain("remain");
-        expect(task.backlog).toMatchObject({ pendingAtStart: 21, pendingAtEnd: 1, processed: 20 });
+        expect(task.backlog).toMatchObject({ pendingAtStart: 21, pendingAtEnd: 16, processed: 5 });
     });
 
     test("surfaces provider-outage completions as transient task failures", async () => {
@@ -1961,7 +1962,6 @@ describe("createDreamTaskExecutor — classify-memories", () => {
             client: client as never,
             sessionDirectory: process.cwd(),
             openOpenCodeDb: () => null,
-            transformMode: "ts",
         });
         const leaseKey = leaseKeyFor("classify-memories", project);
         expect(acquireLease(db, "ts-holder", leaseKey)).toBe(true);
@@ -1971,7 +1971,7 @@ describe("createDreamTaskExecutor — classify-memories", () => {
         );
         expect(outcome.status).toBe("skipped");
         expect(outcome.detail).toBe(
-            "Magic Context's Rust mode needs a one-time migration of its store. Quit OpenCode and every ck-mc process, then run `magic-context doctor single-store migrate`. (MC-C14)",
+            "Magic Context needs a one-time migration of its store. Quit OpenCode and every ck-mc process, then run `magic-context doctor single-store migrate`. (MC-C14)",
         );
         expect(client.session.create).not.toHaveBeenCalled();
         expect(client.session.list).not.toHaveBeenCalled();
@@ -2125,76 +2125,6 @@ describe("createDreamTaskExecutor — classify-memories", () => {
             retryCount: 1,
         });
     });
-    test("module failures are transient and never fall back to a TypeScript child", async () => {
-        db = freshDb();
-        const project = "/repo/rust-classify-failure";
-        ensureContextStoreUuid(db);
-        for (let i = 0; i < 12; i += 1) {
-            const memory = insertMemory(db, {
-                projectPath: project,
-                category: "ARCHITECTURE",
-                content: `Module classification failure fixture ${i}.`,
-            });
-            db.prepare(
-                "INSERT INTO mirror_identity(domain, module_project, module_row_id, context_row_id) VALUES ('memories', ?, ?, ?)",
-            ).run(project, 11000 + i, memory.id);
-            db.prepare(
-                "INSERT INTO mirror_live_memory_rows(module_project, module_row_id, category, normalized_hash) VALUES (?, ?, ?, ?)",
-            ).run(project, 11000 + i, memory.category, memory.normalizedHash);
-        }
-
-        const client = {
-            session: {
-                list: mock(async () => ({
-                    data: [{ id: "ses-parent", title: "ordinary session" }],
-                })),
-                create: mock(async () => ({ data: { id: "must-not-create" } })),
-                delete: mock(async () => ({})),
-            },
-        };
-        const moduleCalls: string[] = [];
-        class FailingTimerModuleClient {
-            private readonly instanceState = "timer-transport";
-
-            async authorityStatus() {
-                if (this.instanceState !== "timer-transport")
-                    throw new Error("lost transport this");
-                return { authority: { state: "MODULE", generation: 9 } };
-            }
-
-            async call(args: { method: string }) {
-                if (this.instanceState !== "timer-transport")
-                    throw new Error("lost transport this");
-                moduleCalls.push(args.method);
-                throw new Error("module transport unavailable");
-            }
-        }
-        const moduleClient = createDreamTimerModuleClient(new FailingTimerModuleClient() as never);
-        const executor = createDreamTaskExecutor({
-            client: client as never,
-            sessionDirectory: project,
-            openOpenCodeDb: () => null,
-            moduleClient: moduleClient as never,
-        });
-        const leaseKey = leaseKeyFor("classify-memories", project);
-        expect(acquireLease(db, "holder-rust-classify-failure", leaseKey)).toBe(true);
-
-        const result = await executor(
-            { task: "classify-memories", schedule: "0 6 * * *", timeoutMinutes: 20 },
-            {
-                db,
-                projectIdentity: project,
-                holderId: "holder-rust-classify-failure",
-                leaseKey,
-            },
-        );
-
-        expect(result.status).toBe("failed");
-        expect(result.transient).toBe(true);
-        expect(result.error).toContain("Rust classify module failed");
-        expect(client.session.create).not.toHaveBeenCalled();
-        expect(moduleCalls).toEqual(["dreamer.run_task"]);
-    });
 });
 
 describe("createDreamTaskExecutor — compress-cues", () => {
@@ -2279,6 +2209,148 @@ describe("createDreamTaskExecutor — compress-cues", () => {
 });
 
 describe("createDreamTaskExecutor — retrospective", () => {
+    test("probe-only opening user line skips the gate and completes with an explicit no-op", async () => {
+        db = freshDb();
+        const project = "/repo/retrospective-probe-only";
+        const provider = {
+            listProjectSessions: mock(() => [{ sessionId: "probe" }]),
+            readUserMessagesSince: mock(() => ({
+                messages: [
+                    {
+                        sessionId: "probe",
+                        ordinal: 1,
+                        role: "user" as const,
+                        text: "Reply with the single word: ok",
+                        ts: 200,
+                    },
+                ],
+                truncated: false,
+            })),
+            readUserMessagesBefore: mock(() => []),
+        };
+        const client = {
+            session: {
+                list: mock(async () => ({
+                    data: [{ id: "ses-parent", title: "ordinary session" }],
+                })),
+                create: mock(async () => ({ data: { id: "retro-child" } })),
+                prompt: mock(async () => ({})),
+            },
+        };
+        const executor = createDreamTaskExecutor({
+            client: client as never,
+            sessionDirectory: project,
+            openOpenCodeDb: () => null,
+            retrospectiveRawProvider: provider,
+        });
+
+        const result = await executor(
+            {
+                task: "retrospective",
+                schedule: "0 5 * * *",
+                timeoutMinutes: 20,
+                retrospectiveRecencyDays: 100_000,
+            },
+            {
+                db,
+                projectIdentity: project,
+                holderId: "holder-retro-probe-only",
+                leaseKey: leaseKeyFor("retrospective", project),
+            },
+        );
+
+        expect(result).toEqual({
+            status: "completed",
+            detail: "no reply-following user lines",
+            schedulePatch: { retrospectiveWatermarkMs: 200 },
+        });
+        expect(client.session.create).not.toHaveBeenCalled();
+        expect(client.session.prompt).not.toHaveBeenCalled();
+        const recordedTask = JSON.parse(getDreamRuns(db, project)[0]?.tasks_json ?? "[]")[0] as {
+            status?: string;
+            progress?: string;
+        };
+        expect(recordedTask.status).toBe("completed");
+        expect(recordedTask.progress).toBe("no reply-following user lines");
+    });
+
+    test("a new first message remains context when another session has a reply-following line", async () => {
+        db = freshDb();
+        const project = "/repo/retrospective-cross-session";
+        const rows = [
+            {
+                sessionId: "probe",
+                ordinal: 1,
+                role: "user" as const,
+                text: "Reply with the single word: ok",
+                ts: 200,
+            },
+            {
+                sessionId: "conversation",
+                ordinal: 3,
+                role: "user" as const,
+                text: "Please correct the earlier response.",
+                followsAssistantReply: true,
+                ts: 210,
+            },
+        ];
+        const provider = {
+            listProjectSessions: mock(() => [
+                { sessionId: "probe" },
+                { sessionId: "conversation" },
+            ]),
+            readUserMessagesSince: mock((sessionId: string) => ({
+                messages: rows.filter((row) => row.sessionId === sessionId),
+                truncated: false,
+            })),
+            readUserMessagesBefore: mock(() => []),
+        };
+        let gatePrompt = "";
+        const client = {
+            session: {
+                list: mock(async () => ({
+                    data: [{ id: "ses-parent", title: "ordinary session" }],
+                })),
+                create: mock(async () => ({ data: { id: "retro-child" } })),
+                prompt: mock(async (args: { body?: { parts?: Array<{ text?: string }> } }) => {
+                    gatePrompt = args.body?.parts?.[0]?.text ?? "";
+                    return {};
+                }),
+                messages: mock(async () => ({ data: assistantMessages("n") })),
+                delete: mock(async () => ({})),
+            },
+        };
+        const executor = createDreamTaskExecutor({
+            client: client as never,
+            sessionDirectory: project,
+            openOpenCodeDb: () => null,
+            retrospectiveRawProvider: provider,
+        });
+
+        const result = await executor(
+            {
+                task: "retrospective",
+                schedule: "0 5 * * *",
+                timeoutMinutes: 20,
+                retrospectiveRecencyDays: 100_000,
+            },
+            {
+                db,
+                projectIdentity: project,
+                holderId: "holder-retro-cross-session",
+                leaseKey: leaseKeyFor("retrospective", project),
+            },
+        );
+
+        expect(result).toEqual({
+            status: "completed",
+            schedulePatch: { retrospectiveWatermarkMs: 210 },
+        });
+        expect(client.session.prompt).toHaveBeenCalledTimes(1);
+        expect(gatePrompt).toContain("Reply with the single word: ok");
+        expect(gatePrompt).toContain("Please correct the earlier response.");
+    });
+
     test("two size rejections persist recovery and make the third source window disjoint", async () => {
         db = freshDb();
         const project = "/repo/retrospective-overflow";
@@ -2288,6 +2360,7 @@ describe("createDreamTaskExecutor — retrospective", () => {
             ordinal: index + 1,
             role: "user" as const,
             text: `line-${index + 1} ${"diagnostic payload ".repeat(80)}`,
+            followsAssistantReply: true,
             ts: start + index * 10,
         }));
         db.prepare(
@@ -2425,6 +2498,14 @@ describe("createDreamTaskExecutor — retrospective", () => {
                         ordinal: 1,
                         role: "user" as const,
                         text: "Please add a focused migration test for the new config key.",
+                        ts: 190,
+                    },
+                    {
+                        sessionId: "s1",
+                        ordinal: 3,
+                        role: "user" as const,
+                        text: "Please correct the migration test to cover the new config key.",
+                        followsAssistantReply: true,
                         ts: 200,
                     },
                 ],
@@ -2433,14 +2514,16 @@ describe("createDreamTaskExecutor — retrospective", () => {
             readUserMessagesBefore: mock(() => []),
         };
         let prompts = 0;
+        let gatePrompt = "";
         const client = {
             session: {
                 list: mock(async () => ({
                     data: [{ id: "ses-parent", title: "ordinary session" }],
                 })),
                 create: mock(async () => ({ data: { id: "retro-child" } })),
-                prompt: mock(async () => {
+                prompt: mock(async (args: { body?: { parts?: Array<{ text?: string }> } }) => {
                     prompts += 1;
+                    gatePrompt = args.body?.parts?.[0]?.text ?? "";
                     return {};
                 }),
                 // Gate turn → verdict "n" (no friction). The deepen turn never runs.
@@ -2478,6 +2561,8 @@ describe("createDreamTaskExecutor — retrospective", () => {
         });
         expect(client.session.create).toHaveBeenCalled();
         expect(prompts).toBe(1); // gate only — no deepen turn
+        expect(gatePrompt).toContain("Please add a focused migration test");
+        expect(gatePrompt).toContain("Please correct the migration test");
         const { delete: deleteSession } = client.session;
         expect(deleteSession).toHaveBeenCalledWith({
             path: { id: "retro-child" },
@@ -2512,6 +2597,7 @@ describe("createDreamTaskExecutor — retrospective", () => {
                         ordinal: 3,
                         role: "user" as const,
                         text: "Please verify provider executed tools on wire before saying they work.",
+                        followsAssistantReply: true,
                         ts: 220,
                     },
                 ],
@@ -2620,6 +2706,7 @@ describe("createDreamTaskExecutor — retrospective", () => {
                         ordinal: 1,
                         role: "user" as const,
                         text: "Please stop assuming CLI commands work without checking the actual output.",
+                        followsAssistantReply: true,
                         ts: 200,
                     },
                     {
@@ -2627,6 +2714,7 @@ describe("createDreamTaskExecutor — retrospective", () => {
                         ordinal: 2,
                         role: "user" as const,
                         text: "Please stop assuming CLI commands work without checking actual output.",
+                        followsAssistantReply: true,
                         ts: 220,
                     },
                 ],
@@ -2913,5 +3001,230 @@ describe("carrier host with a parent lookup (OpenCode 2 schedule timer)", () => 
             skipReason?: string;
         };
         expect(task.skipReason ?? "").not.toContain("no session in this directory");
+    });
+});
+
+describe("zero-progress causes survive task telemetry", () => {
+    function driver(task: "map-memories" | "compress-cues" | "curate" | "verify") {
+        db = freshDb();
+        const project = `/repo/zero-progress-${task}`;
+        insertMemory(db, {
+            projectPath: project,
+            category: "ARCHITECTURE",
+            content: "Pending code fact.",
+        });
+        const create = mock(async () => ({ data: { id: "must-not-start" } }));
+        const executor = createDreamTaskExecutor({
+            client: {
+                session: {
+                    list: async () => ({ data: [{ id: "parent", title: "ordinary" }] }),
+                    create,
+                },
+            } as never,
+            sessionDirectory: project,
+            mural: { enabled: true } as never,
+            openOpenCodeDb: () => null,
+        });
+        const leaseKey = leaseKeyFor(task, project);
+        expect(acquireLease(db, "zero-holder", leaseKey)).toBe(true);
+        return {
+            create,
+            project,
+            run: () =>
+                executor(
+                    { task, schedule: "0 3 * * *", timeoutMinutes: 20 },
+                    { db: db!, projectIdentity: project, holderId: "zero-holder", leaseKey },
+                ),
+            summary: () => JSON.parse(getDreamRuns(db!, project)[0].tasks_json)[0],
+        };
+    }
+
+    test("incremental verify banks slice progress and monotonic per-child telemetry", async () => {
+        const f = driver("verify");
+        const spy = spyOn(verification, "runVerify").mockImplementation(async (args) => {
+            args.onBudgetUpdate?.({
+                sessionId: "verify-fixture-child",
+                spent: 500,
+                finalizeFired: false,
+            });
+            args.onBudgetUpdate?.({
+                sessionId: "verify-fixture-child",
+                spent: 300,
+                finalizeFired: false,
+            });
+            return {
+                verified: 5,
+                updated: 0,
+                archived: 0,
+                skipped: 0,
+                refused: 0,
+                batches: 1,
+                inScope: 6,
+                remaining: 1,
+                complete: false,
+                mode: "incremental",
+                stopReason: "deadline",
+            };
+        });
+        try {
+            expect((await f.run()).status).toBe("completed");
+            expect(f.summary().failure).toBeUndefined();
+            expect(f.summary().children).toEqual([
+                { sessionId: "verify-fixture-child", promptTokens: 500 },
+            ]);
+            expect(f.summary().progress).toContain("processed 5");
+            expect(f.summary().tokenBudget.budget).toBe(2_500_000);
+        } finally {
+            spy.mockRestore();
+        }
+    });
+
+    for (const task of ["map-memories", "compress-cues"] as const) {
+        test(`${task} child-start failure is a local refusal, not a model parse failure`, async () => {
+            const f = driver(task);
+            const failure = {
+                failure: new Error("host refused session.create"),
+                failureStage: "child-start" as const,
+                remaining: 1,
+                complete: false,
+            };
+            const spy =
+                task === "map-memories"
+                    ? spyOn(mapping, "mapMemories").mockResolvedValue({
+                          ...failure,
+                          mapped: 0,
+                          independent: 0,
+                          batches: 0,
+                      })
+                    : spyOn(cues, "runCompressCues").mockResolvedValue({
+                          ...failure,
+                          compressed: 0,
+                          skipped: 0,
+                          chunks: 0,
+                      });
+            try {
+                expect((await f.run()).status).toBe("failed");
+                expect(f.summary().failure.failure_class).toBe("local_refusal");
+                expect(f.summary().error).toContain("child-start");
+                expect(f.summary().error).toContain("host refused session.create");
+            } finally {
+                spy.mockRestore();
+            }
+        });
+    }
+
+    test("map retry backoff is a deliberate skip with no child and no failure", async () => {
+        const f = driver("map-memories");
+        const spy = spyOn(mapping, "mapMemories").mockResolvedValue({
+            mapped: 0,
+            independent: 0,
+            batches: 0,
+            remaining: 1,
+            complete: false,
+            deferred: true,
+        });
+        try {
+            expect((await f.run()).status).toBe("skipped");
+            expect(f.create).not.toHaveBeenCalled();
+            expect(f.summary().skipReason).toContain("retry backoff");
+            expect(f.summary().failure).toBeUndefined();
+        } finally {
+            spy.mockRestore();
+        }
+    });
+
+    test("map zero-progress module rejection keeps its admission cause", async () => {
+        const f = driver("map-memories");
+        const spy = spyOn(mapping, "mapMemories").mockResolvedValue({
+            mapped: 0,
+            independent: 0,
+            batches: 0,
+            remaining: 1,
+            complete: false,
+            failure: new DreamerModuleFailureError("mapping", new Error("session unresolved")),
+        });
+        try {
+            expect((await f.run()).status).toBe("failed");
+            expect(f.summary().failure.failure_class).toBe("local_refusal");
+            expect(f.summary().error).toContain("session unresolved");
+        } finally {
+            spy.mockRestore();
+        }
+    });
+
+    test("compress structural failure names validation instead of unknown", async () => {
+        const f = driver("compress-cues");
+        const spy = spyOn(cues, "runCompressCues").mockResolvedValue({
+            compressed: 0,
+            skipped: 0,
+            chunks: 1,
+            remaining: 1,
+            complete: false,
+            failure: new Error("cues manifest missing expected memory ids"),
+        });
+        try {
+            expect((await f.run()).status).toBe("failed");
+            expect(f.summary().failure.failure_class).toBe("parse_failed");
+            expect(f.summary().error).toContain("missing expected memory ids");
+            expect(f.summary().tokenBudget?.spent ?? 0).toBe(0);
+        } finally {
+            spy.mockRestore();
+        }
+    });
+
+    test("compress per-cue rejection names the rejected count", async () => {
+        const f = driver("compress-cues");
+        const spy = spyOn(cues, "runCompressCues").mockResolvedValue({
+            compressed: 0,
+            skipped: 1,
+            chunks: 1,
+            remaining: 1,
+            complete: false,
+        });
+        try {
+            expect((await f.run()).status).toBe("failed");
+            expect(f.summary().failure.failure_class).toBe("parse_failed");
+            expect(f.summary().error).toContain("1 cues rejected by validation");
+        } finally {
+            spy.mockRestore();
+        }
+    });
+
+    test("compress deadline before dispatch is a skip, not a failed model call", async () => {
+        const f = driver("compress-cues");
+        const spy = spyOn(cues, "runCompressCues").mockResolvedValue({
+            compressed: 0,
+            skipped: 0,
+            chunks: 0,
+            remaining: 1,
+            complete: false,
+            stopReason: "deadline",
+        });
+        try {
+            expect((await f.run()).status).toBe("skipped");
+            expect(f.create).not.toHaveBeenCalled();
+            expect(f.summary().failure).toBeUndefined();
+        } finally {
+            spy.mockRestore();
+        }
+    });
+
+    test("curate pre-child expiry rejection is local_refusal and retains session unresolved", async () => {
+        const f = driver("curate");
+        const spy = spyOn(expiry, "archiveExpiredMemories").mockRejectedValue(
+            new DreamerModuleFailureError(
+                "ctx_memory expired archive",
+                new Error("session unresolved"),
+            ),
+        );
+        try {
+            expect((await f.run()).status).toBe("failed");
+            expect(f.create).not.toHaveBeenCalled();
+            expect(f.summary().failure.failure_class).toBe("local_refusal");
+            expect(f.summary().error).toContain("ctx_memory expired archive");
+            expect(f.summary().failure.refusal_reason).toContain("session unresolved");
+        } finally {
+            spy.mockRestore();
+        }
     });
 });

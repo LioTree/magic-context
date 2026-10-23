@@ -61,11 +61,7 @@ for (const change of ["history", "tools"] as const) {
                     providerKey: "openai",
                 });
             },
-            {
-                isProviderSession: () => false,
-                getRustReplayParticipant: () => null,
-                disposeRust: () => {},
-            },
+            { clearSessionLogState: () => {} },
         );
         const transform = spyOn(transformModule, "createTransform").mockReturnValue(
             fakeTransform as ReturnType<typeof transformModule.createTransform>,

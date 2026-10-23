@@ -399,8 +399,8 @@ pub fn compose_soft_m1(
     )
 }
 
-/// Extend an authorized SOFT with only this session's immutable fragments. Measure
-/// the other delta content first: memory fragments must not authorize a HARD rebuild.
+/// Extend an authorized SOFT with this session's immutable fragments and held
+/// dashboard log payloads. Neither source may authorize a baseline rebuild.
 #[allow(clippy::too_many_arguments)]
 pub fn compose_projected_soft_m1(
     store: &McStore,
@@ -447,11 +447,24 @@ pub fn compose_projected_soft_m1(
         .iter()
         .map(|entry| entry.id)
         .fold(projection.fragment_watermark, i64::max);
-    let pending = if memory_enabled {
+    let mut pending = if memory_enabled {
         store.load_agent_fragments(session_id, after)?
     } else {
         Vec::new()
     };
+    if memory_enabled {
+        let cursor = projection
+            .committed
+            .iter()
+            .filter_map(|entry| entry.dashboard_log_id)
+            .fold(meta.memory_mutation_cursor, i64::max);
+        pending.extend(store.load_dashboard_fragments(
+            project_path,
+            cursor,
+            &meta.rendered_memory_ids,
+            meta.max_memory_id,
+        )?);
+    }
     let old_updates = crate::agent_fragments::block(&composition.body, "memory-updates");
     let independent = composition.body.replace(&old_updates, "");
     let independent_tokens = if composition.body == M1_PLACEHOLDER {

@@ -6,7 +6,7 @@ It runs in several hosts and shares one implementation of the core behaviour:
 
 - **OpenCode 1.x and 2.x**, as the npm plugin `@cortexkit/opencode-magic-context` (`packages/plugin`). The 1.x and 2.x hosts have different plugin APIs; each has a thin adapter over the same core.
 - **Pi and OMP**, as `@cortexkit/pi-magic-context` (`packages/pi-plugin`), which imports the core from the OpenCode package.
-- **The Rust module `ck-mc`** (`crates/`), a module of the subconscious daemon (subc). It runs the transform and historian when a project opts into Rust transform mode, and it serves Claude Code through the Thalamus proxy.
+- **The Rust module `ck-mc`** (`crates/`), a module of the subconscious daemon (subc). It serves the provider lanes for hosts that run without an in-process plugin: Broca workers, Claude Code through the Thalamus gateway, and bridged OpenCode and Pi sessions. It runs their transform steps, compaction and historian.
 
 All hosts and all projects on a machine share one SQLite database, `~/.local/share/cortexkit/magic-context/context.db`. Session-scoped tables carry a `harness` column; project-scoped tables (memories, git commits) are shared across hosts. The Rust module keeps its own store, `store.db`, which moves in step with `context.db` (see Storage).
 
@@ -28,9 +28,9 @@ Magic Context rewrites the message array and system prompt the host is about to 
 | Layer | Where | Role |
 |---|---|---|
 | Entry | `src/index.ts` | Load config, register hooks, tools, hidden agents, RPC server and dream timer. Default-exports both host shapes (`{ id, server }` for 1.x, `setup` for 2.x). |
-| OpenCode 1 adapter | `src/plugin/` | Hook wrappers, tool registry, RPC handlers, dream-timer lifecycle, Rust-mode tool routing. |
+| OpenCode 1 adapter | `src/plugin/` | Hook wrappers, tool registry, RPC handlers, dream-timer lifecycle. |
 | OpenCode 2 adapter | `src/v2/` | Context and compaction hooks, store reader, hidden-completion executor, fold ownership, TUI seam. |
-| Runtime | `src/hooks/magic-context/` | The transform, its postprocess phase, history rendering, nudges, strip-and-replay, the Rust-mode adapter. |
+| Runtime | `src/hooks/magic-context/` | The transform, its postprocess phase, history rendering, nudges, strip-and-replay. |
 | Services | `src/features/magic-context/` | Storage and migrations, tagger, scheduler, memory, dreamer, search and indexes, overflow detection. |
 | Tools | `src/tools/` | `ctx_reduce`, `ctx_expand`, `ctx_note`, `ctx_memory`, `ctx_search`. |
 | Shared | `src/shared/`, `src/config/` | Logger, SQLite backend, RPC, config schema and loader, prompt surfaces, window geometry. |
@@ -41,9 +41,9 @@ Magic Context rewrites the message array and system prompt the host is about to 
 
 `STRUCTURE.md` has the directory map and where to add new code.
 
-## Transform modes
+## Where the transform runs
 
-The transform runs in TypeScript by default. With `transform_mode: "rust"` (experimental; OpenCode 1 only, and only when subc is configured at user level; otherwise it falls back to TypeScript), the TypeScript layer becomes a coordinator: it syncs state to the module, sends each pass over subc, and serves the module's output. If the module fails, it replays the last known good output for the session (`lkg-slot.ts`, `lkg-replay.ts`) so the cached prefix survives the fault, and refuses the turn rather than send an unmanaged prompt when it cannot.
+Inside OpenCode 1 and 2, Pi and OMP, the TypeScript transform is the only in-host transform; the old `transform_mode` setting is accepted and ignored with one warning. Hosts without an in-process plugin use ck-mc's provider lanes: Broca workers and Claude Code call its step-transform and compaction hooks directly, and the OpenCode and Pi bridges relay a session through the Thalamus harness module to the same lanes. Each session runs on exactly one path, the in-host TypeScript transform or a provider lane; when a session is bridged, the in-host plugin stands down for it.
 
 <!-- mc:protected START — hand-authored cache-stability core. The dreamer's maintain-docs task MUST NOT edit, reword, reorder, trim, or drop anything between mc:protected START and mc:protected END; carry it forward byte-for-byte on any rewrite. Only a human edits this region, deliberately. -->
 
@@ -99,12 +99,12 @@ The compacted history renders into TWO synthetic `user`-role message slots at th
 
 **`mustMaterialize` (HARD fold) triggers — organized around the bust taxonomy** so the trigger list and the m[0]/m[1] contract can never silently disagree:
 - *Provider-side cache eviction* (the cache is already dead, so folding is free): model/provider change (`cachedM0ModelKey`), system-prompt-hash change (`cachedM0SystemHash`), idle > TTL (`cacheExpired`, self-consuming via `lastResponseTime > cachedM0MaterializedAt`).
-- *Genuine m[0] content change* (baseline bytes differ): first render, `cached_m1_missing`, `project_memory_epoch` change (dashboard / external mutation), pending m[0] mutations (`max_mutation_id` — structural compartment delete/merge/recomp), upgrade-state change.
+- *Genuine m[0] content change* (baseline bytes differ): first render, `cached_m1_missing`, pending m[0] mutations (`max_mutation_id` — structural compartment delete/merge/recomp), upgrade-state change. `project_memory_epoch` and workspace membership/fingerprint changes are deliberately NOT HARD triggers: external changes are held until an independently authorized refresh or natural rebuild.
 - **Deliberately NOT triggers** (these are m[1] deltas — triggering would bust m[0] on routine background work and defeat the design): **new compartment sequence**, `project_user_profile_version`, `maxMemoryId`, **project-docs-hash change** (docs edits fold in on the next natural hard bust, never on their own), and **tool-set-hash change** (process-global, false positives).
 - **Pressure backstop refold:** on a cache-busting pass, if no natural HARD bust has arrived but m[1] has grown large — gated by the m[1]/m[0] size ratio (with a small-m[0] floor) OR an absolute m[1] token cap (~20% of history budget) OR a large memory-mutation count.
 - `applyMarkersToState` updates ALL `state.cachedM0*` fields post-materialize (guards against an infinite re-materialize loop). `/ctx-flush` is SOFT (drives m[1] refresh + heuristics, not an m[0] fold).
 
-**Memory mutations route through m[1], not the epoch.** In-session `ctx_memory` mutations do NOT bump `project_memory_epoch`: additive writes surface via the `maxMemoryId` watermark; non-additive (`update`/`archive`/`merge`) record a `memory_mutation_log` row rendered as a `<memory-updates>` delta. Both reconcile into m[0] on the next natural hard bust. The epoch is bumped only by **dashboard** mutations (an external editor can't otherwise signal a running session).
+**Memory mutations route through held deltas, not the epoch.** In-session `ctx_memory` operations append immutable, session-scoped correction fragments; dashboard edits and audited restores atomically record dashboard-tagged `memory_mutation_log` payloads. An already-authorized m[1] refresh may admit these corrections (and own-project additions/restores); once admitted, their bytes and ordering remain frozen until the next natural HARD folds canonical rows into m[0]. Automated mutations and other agents' inserts continue to wait for HARD. Neither a memory epoch change nor a workspace membership change forces HARD or an m[1] refresh. `project_memory_epoch` remains a cross-process embedding-cache and storage-coherence signal and is bumped by dashboard, identity/workspace and maintenance writers; it is not a prompt-cache invalidation signal. An explicit immediate flush is future work.
 
 <!-- mc:protected END -->
 

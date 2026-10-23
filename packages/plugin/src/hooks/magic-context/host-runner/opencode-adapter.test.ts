@@ -1,6 +1,4 @@
 import { afterEach, describe, expect, spyOn, test } from "bun:test";
-import { MagicContextConfigSchema } from "../../../config/schema/magic-context";
-import { resolveTransformMode } from "../../../config/transform-mode";
 import { runMigrations } from "../../../features/magic-context/migrations";
 import type { ProviderPassMeters } from "../../../features/magic-context/provider-meters";
 import {
@@ -22,10 +20,9 @@ import { adaptPayload, HEAD_IDS } from "../../../v2/hooks/payload";
 import type { SessionContext, V2Context } from "../../../v2/hooks/types";
 import { deliverSyntheticUserMessage } from "../channel2-delivery";
 import { EmergencyFailClosedError } from "../emergency-fail-closed";
-import { clearLkgRecoveryFence } from "../lkg-recovery-fence";
-import { createRustModeTransform } from "../rust-mode-transform";
+import type { createModuleSessionKernel } from "../module-session-kernel";
 import { StoreAheadOfBinaryError } from "../store-ahead-refusal";
-import { createTransform, type TransformDeps } from "../transform";
+import type { TransformDeps } from "../transform";
 import type { MessageLike } from "../transform-operations";
 import {
     applyProviderOps,
@@ -163,7 +160,7 @@ function fixture(host: "v1" | "v2", options: OpenCodeProviderOptions = {}) {
             fallbacks.push({ input: JSON.stringify(input) });
             out.messages = input;
         },
-    } as unknown as ReturnType<typeof createRustModeTransform>;
+    } as unknown as ReturnType<typeof createModuleSessionKernel>;
     const seams: OpenCodeProviderOptions = {
         resolveOrdinals: async (args) => {
             resolveCalls++;
@@ -940,28 +937,6 @@ test("cold decisions equal full-request TTL corpus with frozen model default and
     expect(decisions).toEqual([false, true, false, true, false, true]);
 });
 
-test("rust provider plus compaction off routes to TS and never calls Setup", async () => {
-    const config = MagicContextConfigSchema.parse({
-        transform_mode: "rust",
-        rust_pipeline: "provider",
-        compaction: { enabled: false },
-    });
-    expect(config.rust_pipeline).toBe("provider");
-    expect(MagicContextConfigSchema.parse({}).rust_pipeline).toBe("full_request");
-    expect(
-        resolveTransformMode({
-            configured: config.transform_mode,
-            userTierHasSubc: true,
-            compactionEnabled: false,
-        }).mode,
-    ).toBe("ts");
-    const f = fixture("v1");
-    const transform = createTransform({ ...f.deps, compactionOff: true, historianRunnable: false });
-    await transform({}, { messages: [message("A")] });
-    expect(f.wires.some((w) => w.method === "compaction.setup")).toBe(false);
-    transform.disposeRust();
-});
-
 test("wrapper error uses only durable provider assembly and explicit refusal never replays", async () => {
     const f = fixture("v1");
     await f.pass([message("A")]);
@@ -1137,114 +1112,6 @@ for (const host of ["v1", "v2"] as const) {
         await loop.stop();
     });
 }
-
-for (const host of ["v1", "v2"] as const)
-    test(`OpenCode ${host} setting-off outgoing requests match legacy full-request adapter through wrapper`, async () => {
-        const { setRawMessageProvider } = await import("../read-session-chunk");
-        const { getSlot, resetLkgSlotsForTest } = await import("../lkg-slot");
-        const native = [message("A")];
-        const row = { id: "A", timeCreated: 1, contributesOrdinal: true, hasValidInfo: true };
-        const unregister = setRawMessageProvider("session", {
-            readMessages: () => native as any,
-            readMessageOrdinalPage: (anchor) => (anchor ? [] : [row]),
-            getStoredMessageCount: () => 1,
-            readMessagePartsById: () => ({
-                id: "A",
-                role: "user",
-                parts: native[0]!.parts,
-                createdAt: 1,
-            }),
-        });
-        const outputs: string[] = [];
-        const calls: string[][] = [];
-        try {
-            for (const lane of ["legacy", "absent", "full_request"] as const) {
-                resetLkgSlotsForTest();
-                // Each comparison starts from a new in-memory database. Its
-                // recovery fence must not come from another arm's same-named session.
-                clearLkgRecoveryFence("session", () => undefined);
-                const f = fixture(host);
-                const methods: string[] = [];
-                const deps: TransformDeps = {
-                    ...f.deps,
-                    rustPipeline: lane === "full_request" ? "full_request" : undefined,
-                    storeGeneration: undefined,
-                    historianRunner: "broca",
-                    injectDocs: false,
-                    memoryConfig: {
-                        enabled: false,
-                        injectionBudgetTokens: 1000,
-                        autoPromote: false,
-                    },
-                    rustModeModuleClient: {
-                        call: async ({ method }) => {
-                            methods.push(method);
-                            return method === "transform"
-                                ? {
-                                      decision: "SOFT+",
-                                      prefix_bust_permitted: false,
-                                      row_version: 1,
-                                      native_messages: structuredClone(native),
-                                  }
-                                : { ok: true };
-                        },
-                    },
-                };
-                let capture = 0;
-                const old =
-                    lane === "legacy"
-                        ? createRustModeTransform(deps, {
-                              moduleClient: deps.rustModeModuleClient!,
-                              scheduleLkgCapture: (fn) => {
-                                  capture++;
-                                  fn();
-                              },
-                          })
-                        : undefined;
-                const current = old
-                    ? Object.assign(
-                          async (
-                              _input: Record<string, never>,
-                              output: { messages: unknown[] },
-                          ) => {
-                              await old.run(
-                                  "session",
-                                  output.messages as MessageLike[],
-                                  output,
-                                  getOrCreateSessionMeta(f.db, "session"),
-                              );
-                          },
-                          {},
-                      )
-                    : createTransform(deps);
-                const out = { messages: structuredClone(native) } as any;
-                await createMessagesTransformHandler({
-                    magicContext: { "experimental.chat.messages.transform": current },
-                })({}, out);
-                await new Promise<void>((resolve) => setImmediate(resolve));
-                outputs.push(JSON.stringify(out.messages));
-                calls.push(
-                    methods.filter(
-                        (m) =>
-                            m === "transform" ||
-                            m.startsWith("compaction.") ||
-                            m.startsWith("transform."),
-                    ),
-                );
-                expect(methods).toContain("transform");
-                expect(getSlot("session")).toBeDefined();
-                if (old) {
-                    expect(capture).toBeGreaterThan(0);
-                    old.dispose();
-                } else (current as ReturnType<typeof createTransform>).disposeRust();
-            }
-            expect(outputs).toEqual(Array(3).fill(JSON.stringify(native)));
-            expect(calls).toEqual([["transform"], ["transform"], ["transform"]]);
-        } finally {
-            unregister();
-            resetLkgSlotsForTest();
-        }
-    });
 
 for (const host of ["v1", "v2"] as const)
     describe(`OpenCode ${host} cold-path safety`, () => {

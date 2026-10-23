@@ -24,6 +24,8 @@ import { MockProvider, type MockResponse } from "./mock-provider/server";
 import { spawnOpencode, type SpawnedOpencode, type SpawnOptions } from "./opencode-runner/spawn";
 
 export interface TestHarnessOptions {
+    /** Preallocated private paths for fixture setup before the host starts; caller owns cleanup. */
+    existingEnv?: SpawnOptions["existingEnv"];
     mockModelID?: string;
     thinkingScope?: (body: Record<string, unknown>) => string | undefined;
     prefixBinding?: boolean;
@@ -154,6 +156,7 @@ export class TestHarness implements HostHarness {
             (options.expectMagicContext === false ? "conflict-disabled" : "enabled");
         const expectMagicContext = expectedMagicContextState === "enabled";
         const spawnOpts: SpawnOptions = {
+            existingEnv: options.existingEnv,
             mockProviderURL: baseURL,
             mockProviderID: options.mockProviderID,
             mockModelID: options.mockModelID,

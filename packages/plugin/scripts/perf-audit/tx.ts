@@ -6,6 +6,8 @@ import { join } from "node:path";
 import { readFrozenMergedReasoningParts } from "../../src/features/magic-context/merged-reasoning-decisions";
 import { initializeDatabase } from "../../src/features/magic-context/storage-db";
 import { getOrCreateSessionMeta, updateSessionMeta } from "../../src/features/magic-context/storage-meta-session";
+import { sessionRenderCacheSelect } from "../../src/features/magic-context/storage-session-cache";
+import { writeSessionMetaCollection } from "../../src/features/magic-context/storage-session-collections";
 import { getSourceContents } from "../../src/features/magic-context/storage-source";
 import { getActiveTagTokenTotalsByMessage, getAllStatusTagTokenTotalsFlat, getDroppedTagsByNumbers, getInertWhitespaceAssistantTags, getTagById, getTagNumberByMessageId, getTailHygieneTags } from "../../src/features/magic-context/storage-tags";
 import { createTagger } from "../../src/features/magic-context/tagger";
@@ -93,7 +95,7 @@ try {
         time("TX-7 decision x3", size, () => { for (let i = 0; i < 3; i++) mustMaterialize(renderOptions); });
         time("TX-8 active tag reads x3", size, () => { for (let i = 0; i < 3; i++) getTailHygieneTags(db, sessionId); });
         time("TX-8 token totals (one new id)", size, () => getActiveTagTokenTotalsByMessage(db, sessionId, Bun.argv.includes("--after") ? [`msg-${size - 1}`] : undefined));
-        db.prepare("UPDATE session_meta SET stripped_placeholder_ids = ? WHERE session_id = ?").run(JSON.stringify(messages.map(m => m.info.id)), sessionId);
+        writeSessionMetaCollection(db, sessionId, "stripped_placeholder_ids", JSON.stringify(messages.map(m => m.info.id)));
         time("TX-9 warm replay copy", size, () => postprocessReplaySnapshot(db, sessionId));
         time("TX-9 invalidated replay", size, () => { updateSessionMeta(db, sessionId, { conversationTokens: size }); postprocessReplaySnapshot(db, sessionId); postprocessTailTags(db, sessionId); });
         const numbers = Array.from({ length: size }, (_, i) => i + 1);
@@ -107,7 +109,7 @@ try {
         const muralHead = structuredClone(head ?? []);
         muralHead[0]?.parts.push({ type: "file", mime: "image/png", url: `data:image/png;base64,${"A".repeat(2 * 1024 * 1024)}`, synthetic: true });
         time("TX-12 2-MiB mural head clone", size, () => structuredClone(muralHead));
-        time("TX-12 head presence read", size, () => db.prepare("SELECT cached_m0_bytes AS m0, cached_m0_last_baseline_end_message_id AS boundary FROM session_meta WHERE session_id = ?").get(sessionId));
+        time("TX-12 head presence read", size, () => db.prepare(`SELECT ${sessionRenderCacheSelect("cached_m0_bytes", "m0")}, cached_m0_last_baseline_end_message_id AS boundary FROM session_meta WHERE session_id = ?`).get(sessionId));
         time("TX-13 whitespace probes", size, () => {
             for (let i = 0; i < size; i++) {
                 getTagNumberByMessageId(db, sessionId, `msg-${i}:p0`);

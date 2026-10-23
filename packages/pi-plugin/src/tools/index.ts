@@ -14,6 +14,7 @@
 
 import type {
 	ExtensionAPI,
+	ExtensionContext,
 	ToolDefinition,
 } from "@earendil-works/pi-coding-agent";
 import type { ContextDatabase } from "@magic-context/core/features/magic-context/storage";
@@ -66,7 +67,9 @@ export interface RegisterToolsOptions {
 	gitCommitsEnabled?: boolean;
 	rerankConnectionFile?: string;
 	/** Resolve the current directory's project identity using the user-level home-project setting. */
-	resolveProjectIdentity?: (ctx: { cwd: string }) => string | undefined;
+	resolveProjectIdentity?: (
+		ctx: Pick<ExtensionContext, "cwd" | "sessionManager">,
+	) => string | undefined;
 	/** When true, register the separate ctx_memory_list tool and enable Curate-only
 	 *  execution fields. Set only by the lean dreamer subagent extension. */
 	allowDreamerActions?: boolean;
@@ -110,7 +113,8 @@ export function registerMagicContextTools(
 	opts: RegisterToolsOptions,
 ): void {
 	const resolveProjectIdentity = opts.resolveProjectIdentity
-		? (directory: string) => opts.resolveProjectIdentity?.({ cwd: directory })
+		? (_directory: string, ctx: ExtensionContext) =>
+				opts.resolveProjectIdentity?.(ctx)
 		: undefined;
 	const promptSurfaceRuntime =
 		opts.promptSurfaceRuntime ??
@@ -124,19 +128,24 @@ export function registerMagicContextTools(
 	const registration = promptSurfaceRuntime.resolveRegistration(
 		opts.promptSurface,
 	);
+	// Smart notes need smart_notes.enabled and a runnable dreamer, which evaluates
+	// their conditions. Either one off drops ctx_note's smart-note text; an
+	// omitted flag (as in subagent entries) counts as on.
+	const smartNotesAvailable =
+		opts.smartNotesEnabled !== false && opts.dreamerEnabled !== false;
 	const surfaceTool = <T extends ToolDefinition>(definition: T): T => {
 		const parameters = structuredClone(definition.parameters);
 		applyJsonSchemaParameterDescriptions(
 			definition.name,
 			parameters,
 			registration.preset,
-			opts.smartNotesEnabled,
+			smartNotesAvailable ? opts.smartNotesEnabled : false,
 		);
 		return throwReturnedToolErrors({
 			...definition,
 			parameters,
 			description:
-				definition.name === "ctx_note" && opts.smartNotesEnabled === false
+				definition.name === "ctx_note" && !smartNotesAvailable
 					? withoutSmartNoteText(
 							registration.preset === "light"
 								? CTX_NOTE_LIGHT_DESCRIPTION
@@ -190,7 +199,7 @@ export function registerMagicContextTools(
 			surfaceTool(
 				createCtxNoteTool({
 					db: opts.db,
-					dreamerEnabled: opts.dreamerEnabled ?? false,
+					dreamerEnabled: opts.dreamerEnabled,
 					smartNotesEnabled: opts.smartNotesEnabled,
 					resolveDreamerEnabled: opts.resolveDreamerEnabled,
 					resolveProjectIdentity,

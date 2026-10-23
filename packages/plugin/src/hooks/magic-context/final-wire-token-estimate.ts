@@ -23,7 +23,11 @@ import {
     wireContentBytes,
 } from "./wire-content";
 
-export { type MessageTokenEstimate, wireContentBytes } from "./wire-content";
+export {
+    estimatePartImageTokens,
+    type MessageTokenEstimate,
+    wireContentBytes,
+} from "./wire-content";
 
 function compactWireLabel(value: unknown, fallback: string): string {
     if (typeof value !== "string" || value.length === 0) return fallback;

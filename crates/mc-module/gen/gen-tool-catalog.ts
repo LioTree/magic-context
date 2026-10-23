@@ -819,6 +819,14 @@ export function answer(request: CatalogRequest, config: ResolvedConfig): JsonObj
     const compositionDigest = request.composition ? sha256Hex(jcs(request.composition)) : undefined;
     if (compositionDigest) content.composition_digest = compositionDigest;
     content.tools = catalogTools(request, config);
+    if (compactsSession(request.composition) && requestPreset(request) === "head") {
+        content.user_commands = [
+            { name: "ctx-status", description: "Show magic context status, pending queue, cache TTL, and debug info" },
+            { name: "ctx-flush", description: "Force-process all pending magic context operations immediately" },
+            { name: "ctx-wrapup", description: "Summarize older history while keeping the newest N messages with optional keep-N" },
+        ];
+        content.capabilities = { late_results: true };
+    }
     if (request.system_text) {
         const text = guidanceText(request, config);
         const toolNames = [...ownToolNames(request, servedToolIds(request, config))].sort();

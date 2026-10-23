@@ -8,6 +8,7 @@ import {
 } from "./merged-reasoning-decisions";
 import { decodePiContentDecision, encodePiContentDecision } from "./pi-content-decisions";
 import {
+    decodeThinkingBindingEntryOrder,
     getPendingPiCompactionMarkerState,
     logPiCompactionMarkerClear,
     type PendingPiCompactionMarker,
@@ -16,6 +17,7 @@ import {
     serializeProcessedImageMarkers,
     serializeStrippedPlaceholderState,
     THINKING_BINDING_RECOVERY_FROZEN_PREFIX,
+    thinkingBindingEntryOrderId,
 } from "./storage-meta-persisted";
 import { getNativeReplayState } from "./storage-native-replay";
 import {
@@ -23,6 +25,11 @@ import {
     readReplayDocument,
     writeReplayDocument,
 } from "./storage-replay-document";
+import { writeSessionRenderCache } from "./storage-session-cache";
+import {
+    sessionMetaCollectionSelect,
+    writeSessionMetaCollection,
+} from "./storage-session-collections";
 
 export interface CloneCompartmentRow {
     sequence: number;
@@ -161,6 +168,17 @@ function clonePiContentDecisions(
         if (typeof entry !== "string") continue;
         if (isReservedLedgerControlEntry(entry)) {
             copied.push(entry);
+            continue;
+        }
+        const order = decodeThinkingBindingEntryOrder(entry);
+        if (order) {
+            if (filter.includeMessageId(order.id))
+                copied.push(
+                    thinkingBindingEntryOrderId(
+                        mapMessageId(filter, order.id) ?? order.id,
+                        order.order,
+                    ),
+                );
             continue;
         }
         const decision = decodePiContentDecision(entry);
@@ -711,13 +729,19 @@ export function copySessionStateForClone(
 
         const meta = db
             .prepare(
-                `SELECT cleared_reasoning_through_tag, tool_reclaim_watermark,
-                        pi_stable_id_scheme, stripped_placeholder_ids,
-                        stale_reduce_stripped_ids, processed_image_stripped_ids, merged_reasoning_stripped_ids,
-                        pending_pi_compaction_marker_state, last_todo_state,
-                        todo_synthetic_call_id, todo_synthetic_anchor_message_id,
-                        todo_synthetic_state_json
-                   FROM session_meta WHERE session_id = ?`,
+                `SELECT cleared_reasoning_through_tag,
+                    tool_reclaim_watermark,
+                    pi_stable_id_scheme,
+                    ${sessionMetaCollectionSelect("stripped_placeholder_ids", "stripped_placeholder_ids", db)},
+                    ${sessionMetaCollectionSelect("stale_reduce_stripped_ids", "stale_reduce_stripped_ids", db)},
+                    ${sessionMetaCollectionSelect("processed_image_stripped_ids", "processed_image_stripped_ids", db)},
+                    ${sessionMetaCollectionSelect("merged_reasoning_stripped_ids", "merged_reasoning_stripped_ids", db)},
+                    pending_pi_compaction_marker_state,
+                    last_todo_state,
+                    todo_synthetic_call_id,
+                    todo_synthetic_anchor_message_id,
+                    todo_synthetic_state_json
+                FROM session_meta WHERE session_id = ?`,
             )
             .get(sourceSessionId) as RawSessionMetaRow | undefined;
         const maxCopiedTag = copiedTagNumbers.reduce((max, value) => Math.max(max, value), 0);
@@ -729,35 +753,34 @@ export function copySessionStateForClone(
             clearedMarker = getPendingPiCompactionMarkerState(db, destinationSessionId);
         const todoAnchor = meta?.todo_synthetic_anchor_message_id ?? "";
         const migrateTodo = todoAnchor.length > 0 && filter.includeMessageId(todoAnchor);
+        const separated = tableExists(db, "session_render_cache");
+        if (separated) {
+            writeSessionRenderCache(db, destinationSessionId, "cached_m0_bytes", null);
+            writeSessionRenderCache(db, destinationSessionId, "cached_m1_bytes", null);
+        }
 
         db.prepare(
             `INSERT INTO session_meta
                 (session_id, harness, counter, cleared_reasoning_through_tag,
-                 tool_reclaim_watermark, pi_stable_id_scheme, stripped_placeholder_ids,
-                 stale_reduce_stripped_ids, processed_image_stripped_ids, merged_reasoning_stripped_ids,
+                 tool_reclaim_watermark, pi_stable_id_scheme,
                  pending_pi_compaction_marker_state, last_todo_state,
                  todo_synthetic_call_id, todo_synthetic_anchor_message_id,
                  todo_synthetic_state_json, served_prefix, held_release)
-             VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, NULL, NULL)
+             VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, NULL, NULL)
              ON CONFLICT(session_id) DO UPDATE SET
                 harness = excluded.harness,
                 counter = excluded.counter,
                 cleared_reasoning_through_tag = excluded.cleared_reasoning_through_tag,
                 tool_reclaim_watermark = excluded.tool_reclaim_watermark,
                 pi_stable_id_scheme = excluded.pi_stable_id_scheme,
-                stripped_placeholder_ids = excluded.stripped_placeholder_ids,
-                stale_reduce_stripped_ids = excluded.stale_reduce_stripped_ids,
-                 processed_image_stripped_ids = excluded.processed_image_stripped_ids,
-                 merged_reasoning_stripped_ids = excluded.merged_reasoning_stripped_ids,
                 pending_pi_compaction_marker_state = excluded.pending_pi_compaction_marker_state,
                 last_todo_state = excluded.last_todo_state,
                 todo_synthetic_call_id = excluded.todo_synthetic_call_id,
                 todo_synthetic_anchor_message_id = excluded.todo_synthetic_anchor_message_id,
                 todo_synthetic_state_json = excluded.todo_synthetic_state_json,
-                cached_m0_bytes = NULL,
-                cached_m1_bytes = NULL,
-                served_prefix = NULL,
-                held_release = NULL`,
+                 ${separated ? "" : "cached_m0_bytes = NULL, cached_m1_bytes = NULL,"}
+                 served_prefix = NULL,
+                 held_release = NULL`,
         ).run(
             destinationSessionId,
             getHarness(),
@@ -768,15 +791,35 @@ export function copySessionStateForClone(
                 Number.isFinite(meta.pi_stable_id_scheme)
                 ? meta.pi_stable_id_scheme
                 : null,
-            filterStrippedPlaceholderBlob(meta?.stripped_placeholder_ids ?? null, filter),
-            filterIdBlob(meta?.stale_reduce_stripped_ids ?? null, filter),
-            filterProcessedImageBlob(meta?.processed_image_stripped_ids ?? null, filter),
-            clonePiContentDecisions(meta?.merged_reasoning_stripped_ids ?? null, filter),
             pendingMarker,
             migrateTodo ? (meta?.last_todo_state ?? "") : "",
             migrateTodo ? (meta?.todo_synthetic_call_id ?? "") : "",
             migrateTodo ? (mapMessageId(filter, todoAnchor) ?? "") : "",
             migrateTodo ? (meta?.todo_synthetic_state_json ?? "") : "",
+        );
+        writeSessionMetaCollection(
+            db,
+            destinationSessionId,
+            "stripped_placeholder_ids",
+            filterStrippedPlaceholderBlob(meta?.stripped_placeholder_ids ?? null, filter),
+        );
+        writeSessionMetaCollection(
+            db,
+            destinationSessionId,
+            "stale_reduce_stripped_ids",
+            filterIdBlob(meta?.stale_reduce_stripped_ids ?? null, filter),
+        );
+        writeSessionMetaCollection(
+            db,
+            destinationSessionId,
+            "processed_image_stripped_ids",
+            filterProcessedImageBlob(meta?.processed_image_stripped_ids ?? null, filter),
+        );
+        writeSessionMetaCollection(
+            db,
+            destinationSessionId,
+            "merged_reasoning_stripped_ids",
+            clonePiContentDecisions(meta?.merged_reasoning_stripped_ids ?? null, filter),
         );
         // Clone owns the whole replay document so its filtered native state
         // cannot be overwritten by the CLI's later generic metadata copy.
@@ -784,7 +827,7 @@ export function copySessionStateForClone(
             name: string;
         }>;
         const metaColumns = new Set(metaColumnRows.map((column) => column.name));
-        if (metaColumns.has("trailing_blank_decisions")) {
+        if (metaColumns.has("trailing_blank_decisions") || tableExists(db, "session_meta_chunks")) {
             const replayDocument = cloneReplayDocument(
                 db,
                 sourceSessionId,

@@ -26,8 +26,8 @@ import type { SessionContext } from "../../../v2/hooks/types";
 import { EmergencyFailClosedError } from "../emergency-fail-closed";
 import { clearLkgRecoveryFence } from "../lkg-recovery-fence";
 import { captureSlot, lkgContentDigest, resetLkgSlotsForTest } from "../lkg-slot";
+import { createModuleSessionKernel } from "../module-session-kernel";
 import { setRawMessageProvider } from "../read-session-chunk";
-import type { createRustModeTransform } from "../rust-mode-transform";
 import { StorageBusyRefusalError } from "../storage-busy-refusal";
 import type { TransformDeps } from "../transform";
 import type { MessageLike } from "../transform-operations";
@@ -39,6 +39,26 @@ import type { HookAnswer } from "./record";
 const disposals: (() => void)[] = [];
 afterEach(() => {
     for (const dispose of disposals.splice(0).reverse()) dispose();
+});
+
+test("a provider exit refuses the retired transform route without changing served bytes", async () => {
+    const f = fixture("v1");
+    f.deps.rustPipeline = "full_request";
+    const kernel = createModuleSessionKernel({ moduleClient: f.deps.rustModeModuleClient! });
+    const adapter = createOpenCodeProviderTransform(f.deps, kernel);
+    const messages = [message("unchanged")];
+    const output = { messages: structuredClone(messages) as unknown[] };
+    const bytes = JSON.stringify(output);
+    try {
+        await expect(
+            adapter.run("session", messages, output, getOrCreateSessionMeta(f.db, "session")),
+        ).rejects.toMatchObject({ code: "transform_route_retired" });
+        expect(JSON.stringify(output)).toBe(bytes);
+        expect(f.wires).toEqual([]);
+    } finally {
+        await adapter.dispose();
+        kernel.dispose();
+    }
 });
 
 type Host = "v1" | "v2";
@@ -198,7 +218,7 @@ function fixture(host: Host, covered = false) {
         ordinalMemoCheckpoints: [],
     };
     const legacy = { getState: () => legacyState } as unknown as ReturnType<
-        typeof createRustModeTransform
+        typeof createModuleSessionKernel
     >;
     const seams = {
         now: () => clock,

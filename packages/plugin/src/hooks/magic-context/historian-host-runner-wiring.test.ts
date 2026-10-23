@@ -5,15 +5,16 @@ import type { ContextDatabase } from "../../features/magic-context/storage";
 import { initializeDatabase } from "../../features/magic-context/storage-db";
 import { getOrCreateSessionMeta } from "../../features/magic-context/storage-meta";
 import { Database } from "../../shared/sqlite";
+import { createOpenCodeProviderTransform } from "./host-runner/opencode-adapter";
 import { resetLkgSlotsForTest } from "./lkg-slot";
+import { createModuleSessionKernel } from "./module-session-kernel";
 import { setRawMessageProvider } from "./read-session-chunk";
 import { closeReadOnlySessionDb } from "./read-session-db";
-import { createRustModeTransform, type RustModeModuleClient } from "./rust-mode-transform";
 import type { TransformDeps } from "./transform";
 import type { MessageLike } from "./transform-operations";
 
 /**
- * Where the pull loop meets a transform pass.
+ * Where the pull loop meets a provider pass.
  *
  * This transform serves only OpenCode 1 and OpenCode 2, whose runner is the host
  * when the user names none, so an unset runner polls. An explicit "broca" is the
@@ -36,6 +37,7 @@ function createFixture(
     runMigrations(db);
     const row = { id: "m1", timeCreated: 1, contributesOrdinal: true, hasValidInfo: true };
     const unregister = setRawMessageProvider(sessionId, {
+        hasMessageById: (id) => id === "m1",
         readMessages: () => [row],
         readMessageOrdinalPage: (after, limit) => (after ? [] : [row].slice(0, limit)),
         getStoredMessageCount: () => 1,
@@ -54,19 +56,34 @@ function createFixture(
     ];
     const methods: string[] = [];
     const bodies: Array<{ method: string; body: unknown }> = [];
-    let rowVersion = 0;
-    const moduleClient: RustModeModuleClient = {
+    const moduleClient: NonNullable<TransformDeps["rustModeModuleClient"]> = {
         call: async ({ method, body }) => {
             methods.push(method);
             bodies.push({ method, body });
             if (method === "historian.pending") return { ok: true, runs: [] };
-            if (method !== "transform") return { ok: true };
-            return {
-                decision: "HARD",
-                row_version: ++rowVersion,
-                rendered_memory_ids: [],
-                native_messages: structuredClone(messages),
+            const params = (
+                body instanceof Uint8Array ? JSON.parse(new TextDecoder().decode(body)) : body
+            ).params;
+            if (method === "transform.declare") return { subscriptions: [] };
+            const view = {
+                compaction_id: "wiring",
+                version: 1,
+                range: { from: 0, to: 0 },
+                replacement: [],
             };
+            if (method === "compaction.setup")
+                return {
+                    answer: "ready",
+                    request_id: params.request_id,
+                    initial: { ...view, version: 0 },
+                };
+            if (method === "compaction.step")
+                return {
+                    answer: "compaction_message",
+                    request_id: params.request_id,
+                    compaction: view,
+                };
+            throw new Error(`Unexpected module method: ${method}`);
         },
     };
     const deps: TransformDeps = {
@@ -84,6 +101,7 @@ function createFixture(
         memoryConfig: { enabled: false, injectionBudgetTokens: 1, autoPromote: false },
         liveModelBySession: new Map([[sessionId, { providerID, modelID }]]),
         sessionDirectoryBySession: new Map([[sessionId, project]]),
+        rustPipeline: "provider",
         transformMode: "rust",
         rustModeModuleClient: moduleClient,
         ...(runner ? { historianRunner: runner } : {}),
@@ -91,9 +109,20 @@ function createFixture(
             ? { historianHostRunnerEnabled: hostRunnerEnabled }
             : {}),
     };
-    const transform = createRustModeTransform(deps, {
-        moduleClient,
-        scheduleLkgCapture: (capture) => capture(),
+    const kernel = createModuleSessionKernel({ moduleClient, projectRoot: project });
+    const transform = createOpenCodeProviderTransform(deps, kernel, {
+        sync: async () => {},
+        persisted: () => true,
+        resolveOrdinals: async ({ messages }) => ({
+            ok: true,
+            annotatedInput: messages.map((m, i) => ({ ...m, absolute_ordinal: i + 1 })),
+            memoGeneration: 0,
+            memoAnchor: null,
+            memoStoredCount: messages.length,
+            memoCanonicalCount: messages.length,
+            normalizations: [],
+            stats: { mode: "memo", rowsRead: 0, pages: 0, rewinds: 0 },
+        }),
     });
     return {
         methods,
@@ -110,7 +139,8 @@ function createFixture(
             await new Promise((resolve) => setTimeout(resolve, 0));
         },
         async dispose() {
-            await transform.stopHostRunner();
+            await transform.dispose();
+            kernel.dispose();
             unregister();
             closeReadOnlySessionDb();
             resetLkgSlotsForTest();

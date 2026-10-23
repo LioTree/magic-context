@@ -1,6 +1,7 @@
 {
     "schema": 1,
-    "header": "CI push workflows run the manifest-derived TypeScript suites and Rust hermetic suite through scripts/run-rust-hermetic-e2e.sh; tag releases run the same Rust invocation. Cargo.lock pins the Rust dependency versions and git revisions. CI mc-module daemon tests and push/release builders use the locked subconscious source to build ck-subc; the scheduled CI builder intentionally probes default-branch HEAD as drift, while test shards consume its prebuilt artifact.",
+    "rust_lane": "retired",
+    "header": "CI push workflows run the manifest-derived TypeScript suites. The Rust hermetic lane is retired (rust_lane: \"retired\"): transform_mode no longer selects the full-array Rust transform, so no entry has a rust invocation and scripts/run-rust-hermetic-e2e.sh exits 0 with no files selected. Cargo.lock pins the Rust dependency versions and git revisions. CI mc-module daemon tests and push/release builders use the locked subconscious source to build ck-subc; the scheduled CI builder intentionally probes default-branch HEAD as drift, while test shards consume its prebuilt artifact.",
     "entries": [
         {
             "path": "tests/prefix-binding-validator.test.ts",
@@ -46,9 +47,17 @@
             "path": "tests/latest-turn-thinking.test.ts",
             "tier": "ts-only",
             "invocation": { "ts": true, "rust": false },
-            "rationale": "Real OpenCode 1.18.x task child and primary long tool loop at execute and force against a provider-side thinking oracle; negative controls reject edited, removed and reordered latest-turn blocks, queued drops release only after a real user turn, accepted legacy strips replay unchanged, a provider rejection restores the original thinking once, and host PID lsof proves throwaway containment. OpenCode 2, Pi and Rust have caller and module unit gates.",
+            "rationale": "Real OpenCode 1 task child and primary long tool loop at execute and force against a provider-side thinking oracle; negative controls reject edited, removed and reordered latest-turn blocks, a plain real user turn preserves the primary signed prefix and queued drop until explicit flush, accepted legacy strips replay unchanged, a provider rejection restores the original thinking once, and host PID lsof proves throwaway containment.",
             "contract_refs": ["FOLD-UNDER-PRESSURE"],
             "hosts": ["opencode"]
+        },
+        {
+            "path": "tests/opencode2/signed-drop-rebuild.test.ts",
+            "tier": "ts-only",
+            "invocation": { "ts": true, "rust": false },
+            "rationale": "Real pinned OpenCode 2 signed-thinking tool loop at 76 percent queues a drop, preserves every historical request byte and signed block on the next plain real user turn with a named hold reason, then drains only on explicit ctx-flush. Host PID lsof proves throwaway-store containment.",
+            "contract_refs": ["FOLD-UNDER-PRESSURE", "OC2-S1"],
+            "hosts": ["opencode2"]
         },
         {
             "path": "tests/pi-historian-runtime.test.ts",
@@ -68,17 +77,17 @@
         },
         {
             "path": "tests/rust-tool-attachments.test.ts",
-            "tier": "rust-only",
-            "invocation": { "ts": false, "rust": true },
-            "rationale": "Real OpenCode 1 Rust-mode native attach: mock screenshot plus read image/PDF reach the Anthropic wire with tagged text on first sight and replay byte-identically on later defers; host PID lsof proves throwaway-store containment",
+            "tier": "excluded",
+            "invocation": { "ts": false, "rust": false },
+            "rationale": "Retired with transform_mode: no host runs the full-array Rust transform any more, so this rust-only file no longer runs; it stays until it is deleted or ported to the bridge lanes. Before: Real OpenCode 1 Rust-mode native attach: mock screenshot plus read image/PDF reach the Anthropic wire with tagged text on first sight and replay byte-identically on later defers; host PID lsof proves throwaway-store containment",
             "contract_refs": ["S2-MIGRATION"],
             "hosts": ["opencode"]
         },
         {
             "path": "tests/rust-tool-attachment-upgrade.test.ts",
-            "tier": "rust-only",
-            "invocation": { "ts": false, "rust": true },
-            "rationale": "Real OpenCode 1 old-adapter upgrade preserves previously served attachment-free bytes on three defers across restart, restores once on acknowledged independent module flush permission, then replays media byte-identically on three tail deltas; host PID lsof proves throwaway-store containment",
+            "tier": "excluded",
+            "invocation": { "ts": false, "rust": false },
+            "rationale": "Retired with transform_mode: no host runs the full-array Rust transform any more, so this rust-only file no longer runs; it stays until it is deleted or ported to the bridge lanes. Before: Real OpenCode 1 old-adapter upgrade preserves previously served attachment-free bytes on three defers across restart, restores once on acknowledged independent module flush permission, then replays media byte-identically on three tail deltas; host PID lsof proves throwaway-store containment",
             "contract_refs": ["S2-MIGRATION"],
             "hosts": ["opencode"]
         },
@@ -148,20 +157,12 @@
         },
         {
             "path": "tests/idle-ttl-restart.test.ts",
-            "tier": "both-modes",
-            "invocation": { "ts": true, "rust": true },
-            "rationale": "Shared served-completion idle clock and OpenCode 1 late-system abort/resend byte replay, including Rust module frozen identity, consumed-fold watermark and idle attribution; Pi/OMP and native OpenCode 2 cover the TS portable idle behavior (v2 lacks the v1 decision-row binding)",
+            "tier": "ts-only",
+            "invocation": { "ts": true, "rust": false },
+            "rationale": "The Rust invocation is retired with transform_mode, so this file now runs only in the TypeScript lanes. Before: Shared served-completion idle clock and OpenCode 1 late-system abort/resend byte replay, including Rust module frozen identity, consumed-fold watermark and idle attribution; Pi/OMP and native OpenCode 2 cover the TS portable idle behavior (v2 lacks the v1 decision-row binding)",
             "contract_refs": ["S2-MIGRATION"],
             "hosts": ["opencode", "pi", "omp", "opencode2"],
             "behavior": true
-        },
-        {
-            "path": "tests/rust-plugin-stage-cache.test.ts",
-            "tier": "excluded",
-            "invocation": { "ts": false, "rust": false },
-            "rationale": "opt-in measurement (MC_RUST_STAGE_BASELINE): compares the pre-change Rust adapter bundle with the current one for byte-identical output and todo/mural stage cost through a hermetic module and isolated OpenCode 1.18; needs a preserved baseline bundle, so it runs by hand, outside the mode lanes",
-            "contract_refs": ["S2-MIGRATION"],
-            "hosts": ["opencode"]
         },
         {
             "path": "tests/system-prompt-change-order.test.ts",
@@ -193,6 +194,14 @@
             "invocation": { "ts": true, "rust": false },
             "rationale": "native OpenCode 2 manual and scheduled retrospective read five real user sessions and advance the shared content watermark; throwaway roots with host PID lsof containment",
             "contract_refs": ["S2-MIGRATION"],
+            "hosts": ["opencode2"]
+        },
+        {
+            "path": "tests/opencode2/out-of-order-history-boundary.test.ts",
+            "tier": "ts-only",
+            "invocation": { "ts": true, "rust": false },
+            "rationale": "Issue 702: a real OpenCode 2 host serves a session whose stored summary boundary is missing from the context-hook window (moved session, deleted rows) by placing it from stored order instead of refusing; throwaway roots with host PID lsof containment",
+            "contract_refs": ["OC2-S1"],
             "hosts": ["opencode2"]
         },
         {
@@ -267,12 +276,12 @@
         },
         {
             "path": "tests/cache-invariants.test.ts",
-            "tier": "both-modes",
+            "tier": "ts-only",
             "invocation": {
                 "ts": true,
-                "rust": true
+                "rust": false
             },
-            "rationale": "one manifest-driven host behavior scenario runs from the shared HostHarness contract",
+            "rationale": "The Rust invocation is retired with transform_mode, so this file now runs only in the TypeScript lanes. Before: one manifest-driven host behavior scenario runs from the shared HostHarness contract",
             "contract_refs": [
                 "S2-MIGRATION"
             ],
@@ -286,12 +295,12 @@
         },
         {
             "path": "tests/cache-stability.test.ts",
-            "tier": "both-modes",
+            "tier": "ts-only",
             "invocation": {
                 "ts": true,
-                "rust": true
+                "rust": false
             },
-            "rationale": "one manifest-driven host behavior scenario runs from the shared HostHarness contract",
+            "rationale": "The Rust invocation is retired with transform_mode, so this file now runs only in the TypeScript lanes. Before: one manifest-driven host behavior scenario runs from the shared HostHarness contract",
             "contract_refs": [
                 "S2-MIGRATION"
             ],
@@ -424,12 +433,12 @@
         },
         {
             "path": "tests/context-limits.test.ts",
-            "tier": "both-modes",
+            "tier": "ts-only",
             "invocation": {
                 "ts": true,
-                "rust": true
+                "rust": false
             },
-            "rationale": "one manifest-driven host behavior scenario runs from the shared HostHarness contract",
+            "rationale": "The Rust invocation is retired with transform_mode, so this file now runs only in the TypeScript lanes. Before: one manifest-driven host behavior scenario runs from the shared HostHarness contract",
             "contract_refs": [
                 "S2-MIGRATION"
             ],
@@ -555,12 +564,12 @@
         },
         {
             "path": "tests/dropped-input-guard.test.ts",
-            "tier": "both-modes",
+            "tier": "ts-only",
             "invocation": {
                 "ts": true,
-                "rust": true
+                "rust": false
             },
-            "rationale": "one manifest-driven host behavior scenario runs from the shared HostHarness contract",
+            "rationale": "The Rust invocation is retired with transform_mode, so this file now runs only in the TypeScript lanes. Before: one manifest-driven host behavior scenario runs from the shared HostHarness contract",
             "contract_refs": [
                 "S2-MIGRATION"
             ],
@@ -667,12 +676,12 @@
         },
         {
             "path": "tests/emergency-blocking.test.ts",
-            "tier": "both-modes",
+            "tier": "ts-only",
             "invocation": {
                 "ts": true,
-                "rust": true
+                "rust": false
             },
-            "rationale": "one manifest-driven host behavior scenario runs from the shared HostHarness contract",
+            "rationale": "The Rust invocation is retired with transform_mode, so this file now runs only in the TypeScript lanes. Before: one manifest-driven host behavior scenario runs from the shared HostHarness contract",
             "contract_refs": [
                 "S2-MIGRATION"
             ],
@@ -686,12 +695,12 @@
         },
         {
             "path": "tests/historian-success.test.ts",
-            "tier": "both-modes",
+            "tier": "ts-only",
             "invocation": {
                 "ts": true,
-                "rust": true
+                "rust": false
             },
-            "rationale": "one manifest-driven host behavior scenario runs from the shared HostHarness contract",
+            "rationale": "The Rust invocation is retired with transform_mode, so this file now runs only in the TypeScript lanes. Before: one manifest-driven host behavior scenario runs from the shared HostHarness contract",
             "contract_refs": [
                 "S2-MIGRATION"
             ],
@@ -730,12 +739,12 @@
         },
         {
             "path": "tests/long-running-session.test.ts",
-            "tier": "both-modes",
+            "tier": "ts-only",
             "invocation": {
                 "ts": true,
-                "rust": true
+                "rust": false
             },
-            "rationale": "one manifest-driven host behavior scenario runs from the shared HostHarness contract",
+            "rationale": "The Rust invocation is retired with transform_mode, so this file now runs only in the TypeScript lanes. Before: one manifest-driven host behavior scenario runs from the shared HostHarness contract",
             "contract_refs": [
                 "S2-MIGRATION"
             ],
@@ -760,12 +769,12 @@
         },
         {
             "path": "tests/memory-injection.test.ts",
-            "tier": "both-modes",
+            "tier": "ts-only",
             "invocation": {
                 "ts": true,
-                "rust": true
+                "rust": false
             },
-            "rationale": "one manifest-driven host behavior scenario runs from the shared HostHarness contract",
+            "rationale": "The Rust invocation is retired with transform_mode, so this file now runs only in the TypeScript lanes. Before: one manifest-driven host behavior scenario runs from the shared HostHarness contract",
             "contract_refs": [
                 "S2-MIGRATION"
             ],
@@ -1516,12 +1525,12 @@
         },
         {
             "path": "tests/opencode2/rust-mode-fold-cadence.test.ts",
-            "tier": "rust-only",
+            "tier": "excluded",
             "invocation": {
                 "ts": false,
-                "rust": true
+                "rust": false
             },
-            "rationale": "Boots the hermetic ck-subc daemon and ck-mc module behind the GA 2.0.5 host, so it only has meaning in the Rust invocation: it pins who decides when a Rust-mode session folds, by holding the usage the host measures fixed while the content the module measures changes",
+            "rationale": "Retired with transform_mode: no host runs the full-array Rust transform any more, so this rust-only file no longer runs; it stays until it is deleted or ported to the bridge lanes. Before: Boots the hermetic ck-subc daemon and ck-mc module behind the GA 2.0.5 host, so it only has meaning in the Rust invocation: it pins who decides when a Rust-mode session folds, by holding the usage the host measures fixed while the content the module measures changes",
             "contract_refs": [
                 "OC2-S1"
             ],
@@ -1531,12 +1540,12 @@
         },
         {
             "path": "tests/opencode2/rust-mode-host-runner-default.test.ts",
-            "tier": "rust-only",
+            "tier": "excluded",
             "invocation": {
                 "ts": false,
-                "rust": true
+                "rust": false
             },
-            "rationale": "the OpenCode 2 twin: with no historian.runner configured, a Rust-mode session folds through the host runner (the v2 hidden-completion carrier) with no Broca module present",
+            "rationale": "Retired with transform_mode: no host runs the full-array Rust transform any more, so this rust-only file no longer runs; it stays until it is deleted or ported to the bridge lanes. Before: the OpenCode 2 twin: with no historian.runner configured, a Rust-mode session folds through the host runner (the v2 hidden-completion carrier) with no Broca module present",
             "contract_refs": [
                 "OC2-S1",
                 "HISTORIAN-PRODUCER"
@@ -1562,12 +1571,12 @@
         },
         {
             "path": "tests/opencode2/rust-mode-module-served.test.ts",
-            "tier": "rust-only",
+            "tier": "excluded",
             "invocation": {
                 "ts": false,
-                "rust": true
+                "rust": false
             },
-            "rationale": "Boots the hermetic ck-subc daemon and ck-mc module behind the GA 2.0.5 host, so it only has meaning in the Rust invocation: it pins that the OpenCode 2 lane's transforms are module-served, byte-identical across defers, and that the status surfaces read module state",
+            "rationale": "Retired with transform_mode: no host runs the full-array Rust transform any more, so this rust-only file no longer runs; it stays until it is deleted or ported to the bridge lanes. Before: Boots the hermetic ck-subc daemon and ck-mc module behind the GA 2.0.5 host, so it only has meaning in the Rust invocation: it pins that the OpenCode 2 lane's transforms are module-served, byte-identical across defers, and that the status surfaces read module state",
             "contract_refs": [
                 "OC2-S1"
             ],
@@ -1741,12 +1750,12 @@
         },
         {
             "path": "tests/overflow-recovery.test.ts",
-            "tier": "both-modes",
+            "tier": "ts-only",
             "invocation": {
                 "ts": true,
-                "rust": true
+                "rust": false
             },
-            "rationale": "one manifest-driven host behavior scenario runs from the shared HostHarness contract",
+            "rationale": "The Rust invocation is retired with transform_mode, so this file now runs only in the TypeScript lanes. Before: one manifest-driven host behavior scenario runs from the shared HostHarness contract",
             "contract_refs": [
                 "S2-MIGRATION"
             ],
@@ -1867,12 +1876,12 @@
         },
         {
             "path": "tests/pi-rust-degradation-arc-1.test.ts",
-            "tier": "rust-only",
+            "tier": "excluded",
             "invocation": {
                 "ts": false,
-                "rust": true
+                "rust": false
             },
-            "rationale": "FM-PI-1 covers Pi-owned JSONL/branch-entry continuation and explicit refusal seams after a mid-session external-module fault",
+            "rationale": "Retired with transform_mode: no host runs the full-array Rust transform any more, so this rust-only file no longer runs; it stays until it is deleted or ported to the bridge lanes. Before: FM-PI-1 covers Pi-owned JSONL/branch-entry continuation and explicit refusal seams after a mid-session external-module fault",
             "contract_refs": [
                 "FM-PI-1",
                 "pi-rust-degradation-trace.json"
@@ -1901,12 +1910,12 @@
         },
         {
             "path": "tests/pi-rust-degradation-arc-4.test.ts",
-            "tier": "rust-only",
+            "tier": "excluded",
             "invocation": {
                 "ts": false,
-                "rust": true
+                "rust": false
             },
-            "rationale": "FM-PI-4 covers Pi-owned provider-proof emergency continuation and fail-closed refusal at the 95 percent boundary",
+            "rationale": "Retired with transform_mode: no host runs the full-array Rust transform any more, so this rust-only file no longer runs; it stays until it is deleted or ported to the bridge lanes. Before: FM-PI-4 covers Pi-owned provider-proof emergency continuation and fail-closed refusal at the 95 percent boundary",
             "contract_refs": [
                 "FM-PI-4",
                 "pi-rust-degradation-trace.json"
@@ -1934,585 +1943,15 @@
             ]
         },
         {
-            "path": "tests/rust-adapter-perf.test.ts",
-            "tier": "rust-only",
-            "invocation": {
-                "ts": false,
-                "rust": true
-            },
-            "rationale": "rust adapter overhead profile (elapsed minus module handler_total) on a seeded 1,500-message session with an optional copied-state snapshot; wall-clock, so it asserts only under MC_PERF_GATE=1 and records timings otherwise",
-            "contract_refs": [
-                "RUST-E2E"
-            ],
-            "hosts": [
-                "opencode"
-            ]
-        },
-        {
-            "path": "tests/rust-classify-producer.test.ts",
-            "tier": "rust-only",
-            "invocation": {
-                "ts": false,
-                "rust": true
-            },
-            "rationale": "the classify dreamer task gives every fallback attempt its own provider session so a parked run cannot queue the next model's send, names a queued send as a transient cause, and returns a manifest covering the whole pool on the ordinary path",
-            "contract_refs": [
-                "RUST-E2E",
-                "CLASSIFY-PRODUCER"
-            ],
-            "hosts": [
-                "opencode"
-            ]
-        },
-        {
-            "path": "tests/rust-cold-seed-perf.test.ts",
-            "tier": "rust-only",
-            "invocation": {
-                "ts": false,
-                "rust": true
-            },
-            "rationale": "cold-seed handler budget on an ASTRO-shaped 10k-message seed; wall-clock, so it asserts only under MC_PERF_GATE=1 and records timings otherwise",
-            "contract_refs": [
-                "RUST-E2E"
-            ],
-            "hosts": [
-                "opencode"
-            ]
-        },
-        {
-            "path": "tests/rust-cold-seed-tag-surface.test.ts",
-            "tier": "rust-only",
-            "invocation": {
-                "ts": false,
-                "rust": true
-            },
-            "rationale": "a cold state-sync seed renders every tag on its first coordinating HARD, replays byte-identically, and appends without rewriting the stable prefix",
-            "contract_refs": [
-                "RUST-E2E",
-                "COLD-SEED-TAG-SURFACE"
-            ],
-            "hosts": [
-                "opencode"
-            ]
-        },
-        {
-            "path": "tests/rust-cold-start-drop-seed.test.ts",
-            "tier": "rust-only",
-            "invocation": {
-                "ts": false,
-                "rust": true
-            },
-            "rationale": "cold TS-to-Rust restart reproduces a frozen dropped-tag seed before historian publication can supersede the sentinel",
-            "contract_refs": [
-                "RUST-E2E",
-                "COLD-START-DROP-SEED"
-            ],
-            "hosts": [
-                "opencode"
-            ]
-        },
-        {
-            "path": "tests/rust-real-or-absent-drops.test.ts",
-            "tier": "rust-only",
-            "invocation": {
-                "ts": false,
-                "rust": true
-            },
-            "rationale": "TS-to-Rust restart serves seeded real-or-absent drops and converts a legacy marker skeleton on the first HARD fold, under an Anthropic pairing and prefill validator",
-            "contract_refs": [
-                "RUST-E2E",
-                "COLD-START-DROP-SEED"
-            ],
-            "hosts": [
-                "opencode"
-            ]
-        },
-        {
-            "path": "tests/rust-compaction-marker-byte-identity.test.ts",
-            "tier": "rust-only",
-            "invocation": {
-                "ts": false,
-                "rust": true
-            },
-            "rationale": "rust-mode compaction marker advance leaves the served wire bytes identical with and without the marker; the marker only shrinks the input array",
-            "contract_refs": [
-                "RUST-E2E"
-            ],
-            "hosts": [
-                "opencode"
-            ]
-        },
-        {
-            "path": "tests/rust-ctx-reduce-roundtrip.test.ts",
-            "tier": "rust-only",
-            "invocation": {
-                "ts": false,
-                "rust": true
-            },
-            "rationale": "agent drop queues in the module ledger, drains on the producer-backed bust, and remains proven after m0 supersedes the transient sentinel",
-            "contract_refs": [
-                "RUST-E2E",
-                "CTX-REDUCE-ROUNDTRIP",
-                "HISTORIAN-PRODUCER"
-            ],
-            "hosts": [
-                "opencode"
-            ]
-        },
-        {
-            "path": "tests/rust-dangling-boundary-seed.test.ts",
-            "tier": "rust-only",
-            "invocation": {
-                "ts": false,
-                "rust": true
-            },
-            "rationale": "a compartment whose boundary message id is absent from the raw store must not park the rust cold seed; the boundary resolves from its neighbours and a clean session's served bytes stay byte-identical",
-            "contract_refs": [
-                "RUST-E2E"
-            ],
-            "hosts": [
-                "opencode"
-            ]
-        },
-        {
-            "path": "tests/rust-duplicate-tool-use-id.test.ts",
-            "tier": "rust-only",
-            "invocation": {
-                "ts": false,
-                "rust": true
-            },
-            "rationale": "existing rust-* file; hermetic Rust harness leg",
-            "contract_refs": [
-                "RUST-E2E"
-            ],
-            "hosts": [
-                "opencode"
-            ]
-        },
-        {
-            "path": "tests/rust-fm-oc-1.test.ts",
-            "tier": "rust-only",
-            "invocation": {
-                "ts": false,
-                "rust": true
-            },
-            "rationale": "FM-OC-1 confirms the external module exited after SIGKILL before exercising byte-identical LKG continuation and loud failure reporting",
-            "contract_refs": [
-                "FM-OC-1",
-                "RUST-E2E"
-            ],
-            "hosts": [
-                "opencode"
-            ]
-        },
-        {
-            "path": "tests/rust-fm-oc-2.test.ts",
-            "tier": "rust-only",
-            "invocation": {
-                "ts": false,
-                "rust": true
-            },
-            "rationale": "FM-OC-2 confirms the external module exited after SIGKILL, then pins the shipped failure threshold and park-transition token",
-            "contract_refs": [
-                "FM-OC-2",
-                "RUST-E2E",
-                "RUST-SYNTHETIC-TODO-INDEPENDENT-BUST"
-            ],
-            "hosts": [
-                "opencode"
-            ]
-        },
-        {
-            "path": "tests/rust-fm-oc-3.test.ts",
-            "tier": "rust-only",
-            "invocation": {
-                "ts": false,
-                "rust": true
-            },
-            "rationale": "FM-OC-3 confirms the killed module exited before replacement, then pins bounded probe recovery and monotonic row versions",
-            "contract_refs": [
-                "FM-OC-3",
-                "RUST-E2E",
-                "RUST-SYNTHETIC-TODO-INDEPENDENT-BUST"
-            ],
-            "hosts": [
-                "opencode"
-            ]
-        },
-        {
-            "path": "tests/rust-fm-oc-4.test.ts",
-            "tier": "rust-only",
-            "invocation": {
-                "ts": false,
-                "rust": true
-            },
-            "rationale": "FM-OC-4 confirms external-module exit before asserting typed fail-closed refusal at the provider-proven emergency limit",
-            "contract_refs": [
-                "FM-OC-4",
-                "RUST-E2E",
-                "RUST-SYNTHETIC-TODO-INDEPENDENT-BUST"
-            ],
-            "hosts": [
-                "opencode"
-            ]
-        },
-        {
-            "path": "tests/rust-fm-oc-5.test.ts",
-            "tier": "rust-only",
-            "invocation": {
-                "ts": false,
-                "rust": true
-            },
-            "rationale": "FM-OC-5 SIGSTOP/SIGCONT only exercises transport timeout classification and recovery",
-            "contract_refs": [
-                "FM-OC-5",
-                "RUST-E2E"
-            ],
-            "hosts": [
-                "opencode"
-            ]
-        },
-        {
-            "path": "tests/rust-fm-oc-6.test.ts",
-            "tier": "rust-only",
-            "invocation": {
-                "ts": false,
-                "rust": true
-            },
-            "rationale": "FM-OC-6 confirms external-module exit, then asserts emergency refusal before LKG admission",
-            "contract_refs": [
-                "FM-OC-6",
-                "RUST-E2E",
-                "RUST-SYNTHETIC-TODO-INDEPENDENT-BUST"
-            ],
-            "hosts": [
-                "opencode"
-            ]
-        },
-        {
-            "path": "tests/rust-fold-under-pressure.test.ts",
-            "tier": "rust-only",
-            "invocation": {
-                "ts": false,
-                "rust": true
-            },
-            "rationale": "real content pressure lands a deterministic producer-backed fold whose materialized m0 shrinks the provider wire",
-            "contract_refs": [
-                "RUST-E2E",
-                "FOLD-UNDER-PRESSURE",
-                "HISTORIAN-PRODUCER"
-            ],
-            "hosts": [
-                "opencode"
-            ]
-        },
-        {
-            "path": "tests/rust-historian-producer.test.ts",
-            "tier": "rust-only",
-            "invocation": {
-                "ts": false,
-                "rust": true
-            },
-            "rationale": "hermetic Broca producer publishes deterministic v2 compartments and proves outage/strict-validation failures",
-            "contract_refs": [
-                "RUST-E2E",
-                "HISTORIAN-PRODUCER"
-            ],
-            "hosts": [
-                "opencode"
-            ]
-        },
-        {
-            "path": "tests/rust-host-runner-default.test.ts",
-            "tier": "rust-only",
-            "invocation": {
-                "ts": false,
-                "rust": true
-            },
-            "rationale": "with no historian.runner configured, a Rust-mode OpenCode 1 session folds through the host runner (an OpenCode child session) with no Broca module present, and an explicit historian.runner still wins",
-            "contract_refs": [
-                "RUST-E2E",
-                "HISTORIAN-PRODUCER"
-            ],
-            "hosts": [
-                "opencode"
-            ]
-        },
-        {
-            "path": "tests/rust-maintenance-contract.test.ts",
-            "tier": "rust-only",
-            "invocation": {
-                "ts": false,
-                "rust": true
-            },
-            "rationale": "hermetic wrapup/recomp command drill pins durable coverage, row-version, and disposition contracts",
-            "contract_refs": [
-                "RUST-E2E",
-                "MAINTENANCE-COMMANDS"
-            ],
-            "hosts": [
-                "opencode"
-            ]
-        },
-        {
-            "path": "tests/rust-memory-off-parity.test.ts",
-            "tier": "rust-only",
-            "invocation": {
-                "ts": false,
-                "rust": true
-            },
-            "rationale": "one hermetic persistent-data fixture runs memory-on/off transitions through both TS and Rust served-wire lanes",
-            "contract_refs": [
-                "RUST-E2E",
-                "MEMORY-OFF-TRANSFORM-PARITY"
-            ],
-            "hosts": [
-                "opencode"
-            ]
-        },
-        {
-            "path": "tests/rust-memory-update-reembed.test.ts",
-            "tier": "rust-only",
-            "invocation": {
-                "ts": false,
-                "rust": true
-            },
-            "rationale": "a memory updated through the module facade while the module holds authority is re-embedded from its new content; the host vector is not dropped and left absent (issue 479)",
-            "contract_refs": [
-                "RUST-E2E",
-                "MEMORY-AUTHORITY-EMBED"
-            ],
-            "hosts": [
-                "opencode"
-            ]
-        },
-        {
-            "path": "tests/rust-multi-frame-delta-perf.test.ts",
-            "tier": "rust-only",
-            "invocation": {
-                "ts": false,
-                "rust": true
-            },
-            "rationale": "large provider-visible tail remains intact across recut-era one-page reuse and bounded multi-page retransmission",
-            "contract_refs": [
-                "RUST-E2E",
-                "BOUNDARY-DIVERGENCE-RECUT",
-                "RUST-SYNTHETIC-TODO-ANCHOR-MIRROR-BACK"
-            ],
-            "hosts": [
-                "opencode"
-            ]
-        },
-        {
-            "path": "tests/rust-oversize-reply.test.ts",
-            "tier": "rust-only",
-            "invocation": {
-                "ts": false,
-                "rust": true
-            },
-            "rationale": "hermetic daemon verifies opt-in bounded screenshot replies, byte-identical replay, legacy unary compatibility and responsive health during slow transforms",
-            "contract_refs": [
-                "RUST-E2E"
-            ],
-            "hosts": [
-                "opencode"
-            ]
-        },
-        {
-            "path": "tests/rust-paired-session-replay.test.ts",
-            "tier": "rust-only",
-            "invocation": {
-                "ts": false,
-                "rust": true
-            },
-            "rationale": "same sanitized session shape is replayed through TS and Rust provider-wire lanes and diffed pass by pass",
-            "contract_refs": [
-                "RUST-E2E",
-                "PARITY-REPLAY"
-            ],
-            "hosts": [
-                "opencode"
-            ]
-        },
-        {
-            "path": "tests/rust-park-self-heal.test.ts",
-            "tier": "rust-only",
-            "invocation": {
-                "ts": false,
-                "rust": true
-            },
-            "rationale": "park self-heal confirms external-module exit before driving the prolonged outage, then proves the recovered process resumes real transforms",
-            "contract_refs": [
-                "RUST-E2E"
-            ],
-            "hosts": [
-                "opencode"
-            ]
-        },
-        {
-            "path": "tests/rust-persisted-synthetic-prompt.test.ts",
-            "tier": "rust-only",
-            "invocation": {
-                "ts": false,
-                "rust": true
-            },
-            "rationale": "hermetic Rust harness leg; a plugin-injected synthetic user prompt must stay on the served wire after it stops being newest",
-            "contract_refs": [
-                "RUST-E2E"
-            ],
-            "hosts": [
-                "opencode"
-            ]
-        },
-        {
-            "path": "tests/rust-removal-self-heal.test.ts",
-            "tier": "rust-only",
-            "invocation": {
-                "ts": false,
-                "rust": true
-            },
-            "rationale": "existing rust-* file; hermetic Rust harness leg",
-            "contract_refs": [
-                "RUST-E2E"
-            ],
-            "hosts": [
-                "opencode"
-            ]
-        },
-        {
-            "path": "tests/rust-shared-memory-addressing.test.ts",
-            "tier": "rust-only",
-            "invocation": {
-                "ts": false,
-                "rust": true
-            },
-            "rationale": "a workspace-shared memory id from another project resolves for reads, refuses permanent mutation, and a mixed batch is reported per id rather than as one unmapped refusal (issue 478)",
-            "contract_refs": [
-                "RUST-E2E",
-                "SHARED-MEMORY-ADDRESSING"
-            ],
-            "hosts": [
-                "opencode"
-            ]
-        },
-        {
             "path": "tests/rust-smoke.test.ts",
-            "tier": "rust-only",
+            "tier": "excluded",
             "invocation": {
                 "ts": false,
-                "rust": true
+                "rust": false
             },
-            "rationale": "existing rust-* file; hermetic Rust harness leg",
+            "rationale": "Retired with transform_mode: no host runs the full-array Rust transform any more, so this rust-only file no longer runs; it stays until it is deleted or ported to the bridge lanes. Before: existing rust-* file; hermetic Rust harness leg",
             "contract_refs": [
                 "RUST-E2E"
-            ],
-            "hosts": [
-                "opencode"
-            ]
-        },
-        {
-            "path": "tests/rust-frozen-restart-review-drill.test.ts",
-            "tier": "rust-only",
-            "invocation": {
-                "ts": false,
-                "rust": true
-            },
-            "rationale": "Rust-mode frozen replay across a host restart (slice A review drills): a restart during a freeze keeps serving frozen bytes, an emergency-band refusal sends no provider request, and a restart right after an uncaptured outage replay strips the thinking produced against the raw tail instead of sending it behind retagged bytes",
-            "contract_refs": [
-                "RUST-E2E"
-            ],
-            "hosts": [
-                "opencode"
-            ]
-        },
-        {
-            "path": "tests/rust-steady-state-byte-identity.test.ts",
-            "tier": "rust-only",
-            "invocation": {
-                "ts": false,
-                "rust": true
-            },
-            "rationale": "existing rust-* file; hermetic Rust harness leg",
-            "contract_refs": [
-                "RUST-E2E"
-            ],
-            "hosts": [
-                "opencode"
-            ]
-        },
-        {
-            "path": "tests/rust-subagent-lkg-cycle.test.ts",
-            "tier": "rust-only",
-            "invocation": {
-                "ts": false,
-                "rust": true
-            },
-            "rationale": "existing rust-* file; hermetic Rust harness leg",
-            "contract_refs": [
-                "RUST-E2E"
-            ],
-            "hosts": [
-                "opencode"
-            ]
-        },
-        {
-            "path": "tests/rust-tail-mutation-readopt.test.ts",
-            "tier": "rust-only",
-            "invocation": {
-                "ts": false,
-                "rust": true
-            },
-            "rationale": "existing rust-* file; hermetic Rust harness leg",
-            "contract_refs": [
-                "RUST-E2E"
-            ],
-            "hosts": [
-                "opencode"
-            ]
-        },
-        {
-            "path": "tests/rust-timeout-epoch-recovery.test.ts",
-            "tier": "rust-only",
-            "invocation": {
-                "ts": false,
-                "rust": true
-            },
-            "rationale": "a timed-out transform is not silently duplicated; after raw fallback the stale tag-feature epoch is folded once and the following pass is soft",
-            "contract_refs": [
-                "RUST-E2E",
-                "TIMEOUT-EPOCH-RECOVERY"
-            ],
-            "hosts": [
-                "opencode"
-            ]
-        },
-        {
-            "path": "tests/rust-timeout-double-hard.test.ts",
-            "tier": "rust-only",
-            "invocation": {
-                "ts": false,
-                "rust": true
-            },
-            "rationale": "a timed-out pass followed by twenty steady passes renders at most one HARD, and need_full_sync recovers without rebuilding the ordinal map from the whole session",
-            "contract_refs": [
-                "RUST-E2E",
-                "TIMEOUT-EPOCH-RECOVERY"
-            ],
-            "hosts": [
-                "opencode"
-            ]
-        },
-        {
-            "path": "tests/rust-restart-variant-double-hard.test.ts",
-            "tier": "rust-only",
-            "invocation": {
-                "ts": false,
-                "rust": true
-            },
-            "rationale": "a session whose render identity keeps the variant pays no extra HARD after a module restart: the need_full_sync retry sends the same identity fields as the ordinary request",
-            "contract_refs": [
-                "RUST-E2E",
-                "TIMEOUT-EPOCH-RECOVERY"
             ],
             "hosts": [
                 "opencode"
@@ -2570,12 +2009,12 @@
         },
         {
             "path": "tests/slow-historian.test.ts",
-            "tier": "both-modes",
+            "tier": "ts-only",
             "invocation": {
                 "ts": true,
-                "rust": true
+                "rust": false
             },
-            "rationale": "one manifest-driven host behavior scenario runs from the shared HostHarness contract",
+            "rationale": "The Rust invocation is retired with transform_mode, so this file now runs only in the TypeScript lanes. Before: one manifest-driven host behavior scenario runs from the shared HostHarness contract",
             "contract_refs": [
                 "S2-MIGRATION"
             ],
@@ -2608,12 +2047,12 @@
         },
         {
             "path": "tests/subagent-behavior.test.ts",
-            "tier": "both-modes",
+            "tier": "ts-only",
             "invocation": {
                 "ts": true,
-                "rust": true
+                "rust": false
             },
-            "rationale": "subagent tag delivery and provider bytes run through both the TS and Rust OpenCode harnesses",
+            "rationale": "The Rust invocation is retired with transform_mode, so this file now runs only in the TypeScript lanes. Before: subagent tag delivery and provider bytes run through both the TS and Rust OpenCode harnesses",
             "contract_refs": [
                 "S2-MIGRATION"
             ],
@@ -2641,12 +2080,12 @@
         },
         {
             "path": "tests/tag-owner-collision.test.ts",
-            "tier": "both-modes",
+            "tier": "ts-only",
             "invocation": {
                 "ts": true,
-                "rust": true
+                "rust": false
             },
-            "rationale": "one manifest-driven host behavior scenario runs from the shared HostHarness contract",
+            "rationale": "The Rust invocation is retired with transform_mode, so this file now runs only in the TypeScript lanes. Before: one manifest-driven host behavior scenario runs from the shared HostHarness contract",
             "contract_refs": [
                 "S2-MIGRATION"
             ],
@@ -2679,12 +2118,12 @@
         },
         {
             "path": "tests/thinking-block-safety.test.ts",
-            "tier": "both-modes",
+            "tier": "ts-only",
             "invocation": {
                 "ts": true,
-                "rust": true
+                "rust": false
             },
-            "rationale": "one manifest-driven host behavior scenario runs from the shared HostHarness contract",
+            "rationale": "The Rust invocation is retired with transform_mode, so this file now runs only in the TypeScript lanes. Before: one manifest-driven host behavior scenario runs from the shared HostHarness contract",
             "contract_refs": [
                 "S2-MIGRATION"
             ],
@@ -2712,12 +2151,12 @@
         },
         {
             "path": "tests/todo-synthesis.test.ts",
-            "tier": "both-modes",
+            "tier": "ts-only",
             "invocation": {
                 "ts": true,
-                "rust": true
+                "rust": false
             },
-            "rationale": "one manifest-driven host behavior scenario runs from the shared HostHarness contract",
+            "rationale": "The Rust invocation is retired with transform_mode, so this file now runs only in the TypeScript lanes. Before: one manifest-driven host behavior scenario runs from the shared HostHarness contract",
             "contract_refs": [
                 "S2-MIGRATION",
                 "ARCHITECTURE.md#synthetic-todowrite"
@@ -2766,21 +2205,6 @@
             ],
             "hosts": [
                 "opencode2"
-            ]
-        },
-        {
-            "path": "tests/rust-classify-host-runner.test.ts",
-            "tier": "excluded",
-            "invocation": {
-                "ts": false,
-                "rust": false
-            },
-            "rationale": "Adversarial gate reproduction, run on demand: the classify dreamer task after the module restarts with historian.runner = host",
-            "contract_refs": [
-                "RUST-E2E"
-            ],
-            "hosts": [
-                "opencode"
             ]
         },
         {
@@ -2977,14 +2401,6 @@
             "hosts": [
                 "opencode2"
             ]
-        },
-        {
-            "path": "tests/rust-full-sync-frame-cap.test.ts",
-            "tier": "excluded",
-            "invocation": { "ts": false, "rust": false },
-            "rationale": "manual real-module probe with prebuilt ck-mc and ck-subc (MC_E2E_CK_MC_PREBUILT_BIN, MC_E2E_CK_SUBC_BIN): a 9,268-message paged full-sync retry above 48 MiB in total is admitted frame by frame, while an oversized single tool frame stays refused",
-            "contract_refs": ["FOLD-UNDER-PRESSURE"],
-            "hosts": ["opencode"]
         },
         {
             "path": "tests/dreamer-mapper-step-cap-pi.test.ts",

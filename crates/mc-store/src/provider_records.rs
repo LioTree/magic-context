@@ -1,5 +1,6 @@
 //! Provider records on the store's fenced connection. The older observation lane
 //! uses a normalized compatibility codec; host hooks use the incremental API.
+#[cfg(test)]
 use crate::provider_legacy;
 pub use crate::provider_log::*;
 use rusqlite::functions::FunctionFlags;
@@ -30,10 +31,14 @@ pub(crate) fn register_migration_functions(conn: &rusqlite::Connection) -> rusql
     )
 }
 
-use crate::{McStore, McStoreError, McTagRow};
+#[cfg(test)]
+use crate::McTagRow;
+use crate::{McStore, McStoreError};
 use rusqlite::{params, OptionalExtension};
 
-/// The route-bound project and the runner's session/caller-harness coordinates.
+// The connection-local revision catches our own writes; data_version catches
+// other connections. Triggers cover every metadata writer without copying the
+// compatibility JSON (which contains the last, potentially large, served view).
 #[derive(Clone, Debug)]
 pub struct ProviderSessionKey {
     pub project_root: String,
@@ -50,6 +55,102 @@ pub struct ProviderGeneration {
 }
 
 impl McStore {
+    /// Resolve tools to one stored conversation without hydrating legacy hook records.
+    pub fn provider_session_keys(
+        &self,
+        project_root: &str,
+        session: &str,
+    ) -> Result<Vec<ProviderSessionKey>, McStoreError> {
+        self.inner.with_conn(|conn| {
+            let mut statement = conn.prepare(
+                "SELECT harness FROM mc_provider_conversations_v2
+                 WHERE project_root = ?1 AND session = ?2 AND profile_generation = '' AND provider_generation = ''",
+            )?;
+            let rows = statement.query_map(params![project_root, session], |row| {
+                Ok(ProviderSessionKey {
+                    project_root: project_root.into(),
+                    session: session.into(),
+                    harness: row.get(0)?,
+                    generation: None,
+                })
+            })?.collect();
+            rows
+        }).map_err(McStoreError::from)
+    }
+
+    /// Remove one provider conversation atomically. The caller holds its provider
+    /// serial lock; project memories and the normal session/engine data are not owned here.
+    pub fn delete_provider_conversation(
+        &self,
+        key: &ProviderSessionKey,
+    ) -> Result<(), McStoreError> {
+        self.inner.with_conn_fenced(|tx| {
+            let conv = key.conversation_key();
+            let namespace: Option<String> = tx.query_row(
+                "SELECT engine_namespace FROM mc_provider_conversations_v2 WHERE conv_key=?1",
+                [&conv], |row| row.get(0),
+            ).optional()?;
+            let revision: Option<i64> = match &namespace {
+                Some(namespace) => tx.query_row("SELECT revision FROM mc_provider_policy_revisions_v1 WHERE engine_namespace=?1", [namespace], |row| row.get(0)).optional()?,
+                None => None,
+            };
+            // Remove the head first: child-delete triggers must not invalidate a
+            // different conversation's policy cache in a shared engine namespace.
+            tx.execute("DELETE FROM mc_provider_conversations_v2 WHERE conv_key=?1", [&conv])?;
+            for table in [
+                "mc_provider_view_overrides_v1",
+                "mc_provider_views_v2",
+                "mc_provider_policy_overrides_v1",
+                "mc_provider_policy_cuts_v1",
+                "mc_provider_policy_preparations_v1",
+                "mc_provider_policy_summaries_v1",
+                "mc_provider_policy_changes_v1",
+                "mc_provider_policy_parts_v1",
+                "mc_provider_hook_answers_v1",
+                "mc_provider_legacy_tags_v1",
+                "mc_provider_pending_drops_v1",
+                "mc_provider_messages_v1",
+                "mc_provider_lineages_v1",
+            ] {
+                tx.execute(&format!("DELETE FROM {table} WHERE conv_key=?1"), [&conv])?;
+            }
+            tx.execute(
+                "DELETE FROM mc_provider_sessions_v1 WHERE project_root=?1 AND session=?2 AND harness=?3",
+                params![key.project_root, key.session, key.harness],
+            )?;
+            // Catalogs predate harness selection. Keep one while any sibling
+            // conversation in that project/session can still depend on it.
+            tx.execute(
+                "DELETE FROM mc_provider_catalogs_v1 WHERE project_root=?1 AND session=?2
+                 AND NOT EXISTS (SELECT 1 FROM mc_provider_conversations_v2 WHERE project_root=?1 AND session=?2)",
+                params![key.project_root, key.session],
+            )?;
+            if let Some(namespace) = namespace {
+                // The head's BEFORE DELETE trigger bumps the namespace revision.
+                // Surviving conversations lost no policy inputs: preserve their
+                // cache token within this transaction, before any reader can see it.
+                if tx.query_row("SELECT EXISTS(SELECT 1 FROM mc_provider_conversations_v2 WHERE engine_namespace=?1)", [&namespace], |row| row.get::<_, bool>(0))? {
+                    if let Some(revision) = revision {
+                        tx.execute("UPDATE mc_provider_policy_revisions_v1 SET revision=?2 WHERE engine_namespace=?1", params![namespace, revision])?;
+                    } else {
+                        tx.execute("DELETE FROM mc_provider_policy_revisions_v1 WHERE engine_namespace=?1", [&namespace])?;
+                    }
+                }
+                for table in ["mc_provider_consumed_tags_v1", "mc_provider_policy_revisions_v1"] {
+                    tx.execute(
+                        &format!("DELETE FROM {table} WHERE engine_namespace=?1 AND NOT EXISTS
+                            (SELECT 1 FROM mc_provider_conversations_v2 WHERE engine_namespace=?1)"),
+                        [&namespace],
+                    )?;
+                }
+            }
+            Ok(())
+        })?;
+        Ok(())
+    }
+
+    /// Read historical runner fixtures while verifying schema upgrades.
+    #[cfg(test)]
     pub fn load_provider_record(
         &self,
         key: &ProviderSessionKey,
@@ -61,32 +162,21 @@ impl McStore {
 
     /// Commit the answer/high-water record and newly live tags as one fenced write.
     /// Allocated but unobserved tags belong only in the opaque record, not mc_tags.
+    /// The record names its views by version; `views` holds recipes for
+    /// referenced versions not yet stored, committed in the same transaction.
+    #[cfg(test)]
     pub fn save_provider_record(
         &self,
         key: &ProviderSessionKey,
         record_json: &str,
         engine_session: &str,
         tags: &[McTagRow],
+        views: &[crate::ProviderViewRecipe],
     ) -> Result<(), McStoreError> {
         self.inner.with_conn_fenced(|tx| {
-            provider_legacy::save_tx(tx, key, record_json, engine_session, tags)
+            provider_legacy::save_tx(tx, key, record_json, engine_session, tags, views)
         })?;
         Ok(())
-    }
-
-    pub fn provider_records_for_session(
-        &self,
-        project_root: &str,
-        session: &str,
-    ) -> Result<Vec<(String, String)>, McStoreError> {
-        Ok(self.inner.with_conn(|conn| {
-            let mut query = conn.prepare("SELECT harness FROM mc_provider_conversations_v2 WHERE project_root=?1 AND session=?2 AND profile_generation='' AND provider_generation=''")?;
-            let harnesses = query.query_map(params![project_root,session], |r|r.get::<_,String>(0))?.collect::<rusqlite::Result<Vec<_>>>()?;
-            harnesses.into_iter().map(|harness| {
-                let key=ProviderSessionKey {project_root:project_root.into(),session:session.into(),harness:harness.clone(),generation:None};
-                Ok((harness,provider_legacy::load_tx(conn,&key)?.unwrap()))
-            }).collect()
-        })?)
     }
 
     pub fn load_provider_catalog(
@@ -233,7 +323,7 @@ mod tests {
         let record = r#"{"setup":{"compaction_id":"comp","allocated_version":17},"hook":{"high_water":23},"pending_drops":[23],"last_answer":{"request_id":"r"}}"#;
         let catalog = r#"{"compacting":true,"tools":["ctx_reduce"]}"#;
         store
-            .save_provider_record(&key, record, "engine", &[tag(23, "m2#0")])
+            .save_provider_record(&key, record, "engine", &[tag(23, "m2#0")], &[])
             .unwrap();
         store
             .save_provider_catalog(&key.project_root, &key.session, catalog)
@@ -309,64 +399,6 @@ mod tests {
             })
             .unwrap();
     }
-
-    #[test]
-    fn provider_answer_and_observed_tags_roll_back_together() {
-        let dir = tempfile::tempdir().unwrap();
-        let store = McStore::open_for_test(&descriptor(dir.path())).unwrap();
-        let key = key("/project", "session", "broca");
-        store.inner.with_conn(|conn|conn.execute_batch("CREATE TEMP TRIGGER abort_provider_tag BEFORE INSERT ON mc_tags
-            WHEN NEW.session_id='engine' BEGIN SELECT RAISE(ABORT,'provider tag write failed'); END;")).unwrap();
-        assert!(store
-            .save_provider_record(
-                &key,
-                r#"{"allocated_version":17,"tag_high_water":23}"#,
-                "engine",
-                &[tag(23, "m2#0")]
-            )
-            .is_err());
-        assert!(store.load_provider_record(&key).unwrap().is_none());
-        assert!(store.load_tags_for_session("engine").unwrap().is_empty());
-        store
-            .inner
-            .with_conn(|conn| conn.execute_batch("DROP TRIGGER abort_provider_tag;"))
-            .unwrap();
-        store
-            .save_provider_record(
-                &key,
-                r#"{"allocated_version":17,"tag_high_water":23}"#,
-                "engine",
-                &[tag(23, "m2#0")],
-            )
-            .unwrap();
-        assert!(store.load_provider_record(&key).unwrap().is_some());
-        assert_eq!(store.load_tags_for_session("engine").unwrap().len(), 1);
-    }
-
-    #[test]
-    fn catalog_admission_and_its_session_copy_roll_back_together() {
-        let dir = tempfile::tempdir().unwrap();
-        let store = McStore::open_for_test(&descriptor(dir.path())).unwrap();
-        let key = key("/project", "session", "broca");
-        let before = r#"{"catalog":null,"allocated_version":17}"#;
-        store
-            .save_provider_record(&key, before, "engine", &[])
-            .unwrap();
-        assert!(store
-            .save_provider_catalog("/project", "session", "not JSON")
-            .is_err());
-        assert!(store
-            .load_provider_catalog("/project", "session")
-            .unwrap()
-            .is_none());
-        assert_eq!(
-            serde_json::from_str::<serde_json::Value>(
-                &store.load_provider_record(&key).unwrap().unwrap()
-            )
-            .unwrap(),
-            serde_json::from_str::<serde_json::Value>(before).unwrap()
-        );
-    }
 }
 
 #[cfg(test)]
@@ -417,7 +449,14 @@ mod generation_migration_tests {
             Ok(())
         }).unwrap();
         drop(inner);
-        let store = McStore::open_for_test(&descriptor).unwrap();
+        // Stop at 72: migration 73 resets development conversations that own a
+        // retired mc_provider_views_v1 row, which this fixture deliberately has.
+        let through_72 = MIGRATIONS
+            .iter()
+            .filter(|m| m.version <= 72)
+            .cloned()
+            .collect::<Vec<_>>();
+        let store = McStore::open_with_migrations(&descriptor, false, &through_72).unwrap();
         assert_eq!(store.module_store_schema_version().unwrap(), 72);
         let conversation = store.load_provider_conversation(&legacy).unwrap().unwrap();
         assert_eq!(conversation.engine_namespace, "legacy-engine");
@@ -426,22 +465,29 @@ mod generation_migration_tests {
             store.load_provider_messages(&legacy, "L").unwrap()[0].message_bytes,
             raw
         );
-        assert_eq!(
-            store
-                .load_provider_view(&legacy, 1)
-                .unwrap()
-                .unwrap()
-                .replacement_json,
-            " [ ] "
-        );
+        store
+            .inner
+            .with_conn(|conn| {
+                assert_eq!(
+                    conn.query_row(
+                        "SELECT replacement_json FROM mc_provider_views_v1 WHERE conv_key=?1 AND version=1",
+                        [&key],
+                        |r| r.get::<_, String>(0)
+                    )?,
+                    " [ ] "
+                );
+                Ok(())
+            })
+            .unwrap();
         store.inner.with_conn(|conn| {
+            // Schema-inventory validation runs at the current head in the
+            // migration train; this database deliberately stays at 72.
             assert_eq!(conn.query_row("SELECT summary_json FROM mc_provider_policy_summaries_v1 WHERE conv_key=?1",[&key],|r|r.get::<_,String>(0))?,"{\"kept\":true}");
-            crate::move_inventory::validate_schema(conn,crate::move_inventory::Store::Module).unwrap();
             assert_eq!(conn.query_row("SELECT count(*) FROM sqlite_master WHERE type='trigger' AND name IN ('mc_provider_native_contract_immutable','mc_provider_consumed_tags_change','mc_provider_conversations_policy_namespace_change')",[],|r|r.get::<_,u64>(0))?,3);
             Ok(())
         }).unwrap();
         drop(store);
-        let reopened = McStore::open_for_test(&descriptor).unwrap();
+        let reopened = McStore::open_with_migrations(&descriptor, false, &through_72).unwrap();
         assert_eq!(
             reopened.load_provider_messages(&legacy, "L").unwrap()[0].message_bytes,
             raw

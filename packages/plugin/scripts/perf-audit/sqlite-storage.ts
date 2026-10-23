@@ -25,6 +25,8 @@ import {
     setLastNudgeUndropped,
 } from "../../src/features/magic-context/storage-meta-persisted";
 import { getOrCreateSessionMeta } from "../../src/features/magic-context/storage-meta-session";
+import { writeSessionRenderCache } from "../../src/features/magic-context/storage-session-cache";
+import { writeSessionMetaCollection } from "../../src/features/magic-context/storage-session-collections";
 import { ensureColumn } from "../../src/features/magic-context/storage-schema-helpers";
 import { getSourceContents } from "../../src/features/magic-context/storage-source";
 import {
@@ -190,8 +192,9 @@ function seed(db: Database, n: number) {
         for (let i = 0; i < n; i++) pluginMessage.run(`other-${i % Math.ceil(n / 100)}`);
         const candidate = db.prepare("INSERT INTO user_memory_candidates(session_id, content, created_at) VALUES (?, 'fixture memory', 0)");
         for (let i = 0; i < n / 10; i++) candidate.run(`other-${i % Math.ceil(n / 100)}`);
-        db.prepare(`UPDATE session_meta SET cached_m0_bytes = ?, cached_m1_bytes = ?, stripped_placeholder_ids = ? WHERE session_id = ?`)
-            .run(Buffer.alloc(262144, "m"), Buffer.alloc(65536, "d"), JSON.stringify(Array.from({ length: 4096 }, (_, i) => `placeholder-${i}`)), session);
+        writeSessionRenderCache(db, session, "cached_m0_bytes", Buffer.alloc(262144, "m"));
+        writeSessionRenderCache(db, session, "cached_m1_bytes", Buffer.alloc(65536, "d"));
+        writeSessionMetaCollection(db, session, "stripped_placeholder_ids", JSON.stringify(Array.from({ length: 4096 }, (_, i) => `placeholder-${i}`)));
     });
 }
 

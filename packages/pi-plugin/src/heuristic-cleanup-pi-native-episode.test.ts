@@ -10,6 +10,10 @@ import {
 	addNativeReasoningIds,
 	getNativeReasoningIds,
 } from "@magic-context/core/features/magic-context/storage-native-replay";
+import {
+	clearSessionMetaFixtureFault,
+	rejectSessionMetaCollectionWrites,
+} from "../../plugin/src/features/magic-context/__tests__/session-meta-faults";
 import { createTestTempDirFromPath } from "../../plugin/src/shared/test-temp-dir";
 import {
 	clearContextHandlerSession,
@@ -229,10 +233,23 @@ for (const mode of ["replay-only", "failed-persistence", "defer"] as const) {
 			if (mode === "replay-only")
 				addNativeReasoningIds(f.db, sessionId, ["entry-old"]);
 			if (mode === "failed-persistence") {
-				f.db.exec(`CREATE TRIGGER refuse_native_reasoning BEFORE UPDATE OF trailing_blank_decisions ON session_meta
-     WHEN COALESCE(json_extract(NEW.trailing_blank_decisions, '$.piNative.reasoningIds'), '[]')
-       != COALESCE(json_extract(NULLIF(OLD.trailing_blank_decisions, ''), '$.piNative.reasoningIds'), '[]')
-     BEGIN SELECT RAISE(FAIL, 'native reasoning persistence refused'); END`);
+				rejectSessionMetaCollectionWrites(
+					f.db,
+					"trailing_blank_decisions",
+					"refuse_native_reasoning",
+					{
+						error: "native reasoning persistence refused",
+						when: (value, previous) => {
+							const ids = (raw: unknown) =>
+								typeof raw === "string" && raw
+									? (JSON.parse(raw).piNative?.reasoningIds ?? [])
+									: [];
+							return (
+								JSON.stringify(ids(value)) !== JSON.stringify(ids(previous))
+							);
+						},
+					},
+				);
 			}
 			const messages = await f.pass(mode === "defer" ? 0 : 90);
 			expect(f.sample()).toBe(0);
@@ -242,7 +259,7 @@ for (const mode of ["replay-only", "failed-persistence", "defer"] as const) {
 				expect(JSON.stringify(messages)).toContain("old cipher");
 				expect(getNativeReasoningIds(f.db, sessionId).size).toBe(0);
 				if (mode === "failed-persistence")
-					f.db.exec("DROP TRIGGER refuse_native_reasoning");
+					clearSessionMetaFixtureFault(f.db, "refuse_native_reasoning");
 				expect(JSON.stringify(await f.pass(90))).not.toContain("old cipher");
 				expect(f.sample()).toBe(90000);
 			}

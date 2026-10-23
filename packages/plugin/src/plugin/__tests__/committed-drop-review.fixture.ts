@@ -11,6 +11,7 @@ import { createTagger } from "../../features/magic-context/tagger";
 import { saveLkgSlotToDb } from "../../hooks/magic-context/lkg-persist";
 import { captureLkgSlot } from "../../hooks/magic-context/lkg-replay";
 import { getSlot } from "../../hooks/magic-context/lkg-slot";
+import { requestPendingMaterialization } from "../../hooks/magic-context/pending-materialization";
 import { createTransform } from "../../hooks/magic-context/transform";
 import { adaptPayload } from "../../v2/hooks/payload";
 import { createMessagesTransformHandler } from "../messages-transform";
@@ -64,7 +65,6 @@ if (lane === "pi") {
                 injectDocs: false,
             }),
         },
-        rustReplayParticipant: () => null,
         onLkgReplay: () => {
             recoveryCount = (recoveryCount ?? 0) + 1;
         },
@@ -86,6 +86,13 @@ function rawPi(count = 8): any[] {
                 toolName: mode === "healthy" ? "read" : "ctx_reduce",
             },
         ]).flat(),
+        // Age this probe's outputs past the three-turn threshold before injecting a write failure.
+        ...(signed
+            ? Array.from({ length: 3 }, (_, i) => [
+                  u.userMessage(`follow-up ${i + 1}`, 30 + i * 2),
+                  u.assistantMessage(`response ${i + 1}`, 31 + i * 2),
+              ]).flat()
+            : []),
         u.assistantMessage("answered", 100),
         u.userMessage(`continue ${tick}`, signed ? 103 : 101),
     ];
@@ -274,7 +281,7 @@ try {
                         "drop",
                     );
                 if (lane === "pi") piHandler!.signalPiPendingMaterialization(sessionId);
-                else pending.add(sessionId);
+                else requestPendingMaterialization(pending, sessionId, "user_flush");
             }
             warm();
             records.push({ wire: await pass(), state: state() });
@@ -305,7 +312,7 @@ try {
         );
         decision = "execute";
         if (lane === "pi") piHandler!.signalPiPendingMaterialization(sessionId);
-        else pending.add(sessionId);
+        else requestPendingMaterialization(pending, sessionId, "user_flush");
         let wire: string | undefined, error: string | undefined;
         try {
             wire = await pass();

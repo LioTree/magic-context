@@ -20,6 +20,46 @@ use mc_store::{McStore, StoredCompartment};
 use serde_json::{json, Value};
 use std::collections::BTreeSet;
 
+// The native module returns its own frozen head; no host inserts a summary
+// afterward. Compare those committed payloads with the actual served slots.
+fn native_head_is_recorded(units: &[mc_core::FrozenUnit], response: &TransformResponse) -> bool {
+    let messages = serde_json::to_value(response.messages()).unwrap();
+    ["m0", "m1"].iter().enumerate().all(|(index, key)| {
+        units
+            .iter()
+            .find(|unit| unit.key == *key)
+            .is_some_and(|unit| {
+                messages[index]["content"][0]["kind"]["text"].as_str()
+                    == Some(unit.frozen_payload.as_str())
+            })
+    })
+}
+
+#[test]
+fn golden_eligibility_checks_the_committed_native_head() {
+    let mut fixture = Fixture::new(
+        "opencode-aisdk",
+        false,
+        Lane::Recomp,
+        "native-head-validation",
+    );
+    let response = fixture.pass();
+    let mut units = fixture
+        .store
+        .load(&fixture.req.session_id)
+        .unwrap()
+        .core
+        .frozen_units;
+    assert!(native_head_is_recorded(&units, &response));
+    units
+        .iter_mut()
+        .find(|unit| unit.key == "m0")
+        .unwrap()
+        .frozen_payload
+        .push('X');
+    assert!(!native_head_is_recorded(&units, &response));
+}
+
 fn golden() -> bool {
     std::env::var_os("MC_AUDIT_GOLDEN").is_some()
 }
@@ -525,21 +565,12 @@ impl Fixture {
         let has_boundary = self.mock.receipts.iter().any(|r| {
             r.2 == self.mock.turn && wire.iter().any(|b| b[1]["signature"] == r.0["signature"])
         });
-        let no_parked_trigger = self
-            .store
-            .load_meta(&self.req.session_id)
-            .unwrap()
-            .meta
-            .held_release
-            .is_none();
+        let loaded = self.store.load(&self.req.session_id).unwrap();
+        let no_parked_trigger = loaded.meta.held_release.is_none();
+        let validating_record = native_head_is_recorded(&loaded.core.frozen_units, response);
         let eligibility = json!({
             "defer": !response.prefix_bust_permitted, "noBoundary": !has_boundary,
-            // validatingRecord is an eligibility flag for comparing captured request bytes,
-            // not a validation result here. A saved request-prefix record would cover the
-            // messages at the start, compaction summary and history-removal boundary.
-            // This fixture never validates that record, so the flag is always true;
-            // noParkedTrigger separately checks held_release for delayed triggers.
-            "noParkedTrigger": no_parked_trigger, "validatingRecord": true,
+            "noParkedTrigger": no_parked_trigger, "validatingRecord": validating_record,
         });
         let mode = if std::env::var("MC_AUDIT_STRICT").as_deref() == Ok("1") {
             "strict"
@@ -564,7 +595,7 @@ impl Fixture {
             .unwrap();
         use std::io::Write;
         writeln!(file, "{}", json!({"wire": wire, "wireBytes": serde_json::to_string(&wire).unwrap(), "bustedThisPass": response.prefix_bust_permitted,
-            "identityEligible": !response.prefix_bust_permitted && !has_boundary && no_parked_trigger,
+            "identityEligible": !response.prefix_bust_permitted && !has_boundary && no_parked_trigger && validating_record,
             "eligibility": eligibility})).unwrap();
     }
 
@@ -966,6 +997,17 @@ fn mid_loop(profile: &str, subagent: bool, lane: Lane) {
     audit_assert!(
         !non_thinking_edit,
         "{profile} subagent={subagent} {lane:?}: held lane changed bytes"
+    );
+    audit_assert_eq!(
+        before
+            .iter()
+            .filter(|b| b[1]["type"] == "reasoning")
+            .collect::<Vec<_>>(),
+        after
+            .iter()
+            .filter(|b| b[1]["type"] == "reasoning")
+            .collect::<Vec<_>>(),
+        "{profile} subagent={subagent} {lane:?}: held lane changed thinking"
     );
     audit_assert!(
         !landed,

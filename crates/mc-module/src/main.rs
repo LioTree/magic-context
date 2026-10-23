@@ -48,6 +48,12 @@ async fn main() -> Result<(), Box<dyn Error + Send + Sync>> {
         let args: Vec<String> = std::env::args().skip(2).collect();
         std::process::exit(mc_module::single_store_repair::cli_main(&args));
     }
+    // The offline move of a standalone OpenCode 1 session to mode 3 runs in a
+    // restart window with every host and ck-mc stopped.
+    if std::env::args().nth(1).as_deref() == Some("offline") {
+        let args: Vec<String> = std::env::args().skip(2).collect();
+        std::process::exit(mc_module::offline_move::cli_main(&args));
+    }
     let module_id = effective_module_id();
 
     let logger = match cortexkit_log::init_from_env() {
@@ -68,19 +74,24 @@ async fn main() -> Result<(), Box<dyn Error + Send + Sync>> {
         "mc-module: log permission tightening"
     );
     let connection_file = parse_subc_arg(std::env::args_os().skip(1))?;
+    // Engram backs up this data folder only from the catalog file in it, so the
+    // catalog is published before serving. A failure is logged inside and never
+    // stops startup.
+    if let Some(data_dir) = mc_module::host_store::resolve_context_db_path().parent() {
+        let _ = mc_module::engram_catalog::write_catalog_at_startup(data_dir);
+    }
     // The runner settings are user-tier only, so one resolution covers every project
     // this process serves. The manifest's background-completion routes and
     // self-signals follow it: when every role is configured to the host runner, no
     // background-completion route to Broca is opened. An unconfigured role is decided
     // per request by the harness, and a Claude Code request then still goes to Broca,
     // so that route stays declared. The provider runner route (Broca serving as the
-    // runner of compaction and step-transform providers) is declared separately and
+    // transcript source for compaction providers) is declared separately and
     // is optional: ck-mc starts and serves without it.
     let route_targets =
         RouteTargetConfig::for_configured_runners(mc_module::config::user_configured_runners());
     let smart_notes_enabled = mc_module::config::user_smart_notes_enabled();
-    let resident_enabled = mc_module::config::user_provider_resident_enabled();
-    subc_client_rs::serve_with(
+    let result = subc_client_rs::serve_with(
         &connection_file,
         manifest_with_route_targets_and_smart_notes(
             &module_id,
@@ -94,15 +105,12 @@ async fn main() -> Result<(), Box<dyn Error + Send + Sync>> {
                 module_id,
             )
             .with_startup_smart_notes_enabled(smart_notes_enabled)
-            .with_startup_provider_resident_enabled(resident_enabled)
-            .with_startup_provider_resident_process_cap(
-                mc_module::config::user_provider_resident_process_cap(),
-            )
             .with_log_directory(logger.logs_dir().to_path_buf()),
-        )
-        .with_resident_admission(resident_enabled),
+        ),
     )
-    .await?;
+    .await;
+    mc_module::project_identity::shutdown_pin_writes();
+    result?;
     Ok(())
 }
 

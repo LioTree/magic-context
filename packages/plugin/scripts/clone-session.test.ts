@@ -10,6 +10,16 @@ import {
     parseReplayDocument,
     serializeReplayDocument,
 } from "../src/features/magic-context/storage-replay-document";
+import { splitSessionMetaPayloads } from "../src/features/magic-context/migration-v103-session-payloads";
+import {
+    SESSION_RENDER_CACHE_COLUMNS,
+    sessionRenderCacheSelect,
+} from "../src/features/magic-context/storage-session-cache";
+import {
+    SESSION_META_COLLECTION_DEFAULTS,
+    type SessionMetaCollection,
+    sessionMetaCollectionSelect,
+} from "../src/features/magic-context/storage-session-collections";
 import { cloneSession, deleteClonedSession } from "./clone-session";
 
 const temporaryDirectories: string[] = [];
@@ -691,6 +701,107 @@ describe("clone-session", () => {
         expect((context.prepare("SELECT COUNT(*) AS count FROM compartments WHERE session_id = ?").get(clone.plan.destinationSessionId) as { count: number }).count).toBe(0);
         opencode.close();
         context.close();
+    });
+
+    it("copies the values context migration 103 moved out of session_meta the same way on both layouts", () => {
+        const moved = (split: boolean): Record<string, string | null> => {
+            const fixture = makeFixture();
+            const seed = new Database(fixture.contextPath);
+            try {
+                seed.exec(`
+                    ALTER TABLE session_meta ADD COLUMN note_nudge_anchors TEXT DEFAULT '[]';
+                    ALTER TABLE session_meta ADD COLUMN auto_search_hint_decisions TEXT DEFAULT '[]';
+                    ALTER TABLE session_meta ADD COLUMN memory_block_ids TEXT DEFAULT '';
+                    ALTER TABLE session_meta ADD COLUMN memory_block_cache TEXT DEFAULT '';
+                    ALTER TABLE session_meta ADD COLUMN cached_m0_mural_data_url TEXT;
+                    ALTER TABLE session_meta ADD COLUMN cached_m0_upgrade_state TEXT;
+                `);
+                const assign = seed.prepare(
+                    `UPDATE session_meta SET
+                        stripped_placeholder_ids = ?, stale_reduce_stripped_ids = ?,
+                        processed_image_stripped_ids = ?, merged_reasoning_stripped_ids = ?,
+                        note_nudge_anchors = ?, auto_search_hint_decisions = ?, memory_block_ids = ?,
+                        memory_block_cache = ?, cached_m0_mural_data_url = ?, cached_m0_upgrade_state = ?
+                     WHERE session_id = ?`,
+                );
+                assign.run(
+                    JSON.stringify(["msg_source_1"]),
+                    JSON.stringify(["msg_source_2"]),
+                    JSON.stringify({ ids: ["msg_source_1"], textMarkerIds: ["msg_source_1"] }),
+                    JSON.stringify(["msg_source_2"]),
+                    JSON.stringify([{ messageId: "msg_source_1", text: "notes ready" }]),
+                    JSON.stringify([{ messageId: "msg_source_2", decision: "hint" }]),
+                    JSON.stringify([1, 2]),
+                    "<project-memory>remember</project-memory>",
+                    "data:image/png;base64,AAAA",
+                    "upgrade|render-budgets:m1",
+                    fixture.sourceSessionId,
+                );
+                if (split) splitSessionMetaPayloads(seed);
+            } finally {
+                seed.close();
+            }
+            const result = cloneSession({
+                sessionId: fixture.sourceSessionId,
+                opencodeDbPath: fixture.opencodePath,
+                contextDbPath: fixture.contextPath,
+            });
+            const opencode = new Database(fixture.opencodePath, { readonly: true });
+            const clonedIds = (
+                opencode
+                    .prepare("SELECT id FROM message WHERE session_id = ? ORDER BY time_created")
+                    .all(result.plan.destinationSessionId) as Array<{ id: string }>
+            ).map((row) => row.id);
+            opencode.close();
+            const context = new Database(fixture.contextPath, { readonly: true });
+            try {
+                const hasColumn = (context.prepare("PRAGMA table_info(session_meta)").all() as Array<{ name: string }>).some(
+                    (column) => column.name === "note_nudge_anchors",
+                );
+                expect(hasColumn).toBe(!split);
+                const fields = [
+                    ...SESSION_RENDER_CACHE_COLUMNS.map((column) => sessionRenderCacheSelect(column, column, context)),
+                    ...(Object.keys(SESSION_META_COLLECTION_DEFAULTS) as SessionMetaCollection[])
+                        .filter((column) => column !== "trailing_blank_decisions")
+                        .map((column) => sessionMetaCollectionSelect(column, column, context)),
+                ];
+                const row = context
+                    .prepare(`SELECT ${fields.join(", ")} FROM session_meta WHERE session_id = ?`)
+                    .get(result.plan.destinationSessionId) as Record<string, string | Uint8Array | null>;
+                // Clone ids are random; name them by position so both layouts compare equal.
+                return Object.fromEntries(
+                    Object.entries(row).map(([column, value]) => {
+                        if (value === null) return [column, null];
+                        let text = typeof value === "string" ? value : Buffer.from(value).toString("utf8");
+                        clonedIds.forEach((id, index) => {
+                            text = text.split(id).join(`<clone-message-${index}>`);
+                        });
+                        return [column, text];
+                    }),
+                );
+            } finally {
+                context.close();
+            }
+        };
+        const legacy = moved(false);
+        expect(legacy).toEqual({
+            cached_m0_bytes: null,
+            cached_m1_bytes: null,
+            cached_m0_mural_data_url: null,
+            memory_block_cache: "<project-memory>remember</project-memory>",
+            cached_m0_upgrade_state: null,
+            merged_reasoning_stripped_ids: JSON.stringify(["<clone-message-1>"]),
+            note_nudge_anchors: JSON.stringify([{ messageId: "<clone-message-0>", text: "notes ready" }]),
+            auto_search_hint_decisions: JSON.stringify([{ messageId: "<clone-message-1>", decision: "hint" }]),
+            stale_reduce_stripped_ids: JSON.stringify(["<clone-message-1>"]),
+            stripped_placeholder_ids: JSON.stringify(["<clone-message-0>"]),
+            processed_image_stripped_ids: JSON.stringify({
+                ids: ["<clone-message-0>"],
+                textMarkerIds: ["<clone-message-0>"],
+            }),
+            memory_block_ids: JSON.stringify([1, 2]),
+        });
+        expect(moved(true)).toEqual(legacy);
     });
 
     it("plans without writing either database", () => {

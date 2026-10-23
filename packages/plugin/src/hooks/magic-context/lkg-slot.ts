@@ -29,6 +29,18 @@ export interface LkgSlot {
     servedCaptureId?: number;
     /** Coverage of this process's capture, retained for drained marker repair. */
     fullCoverage?: boolean;
+    /**
+     * Set while the pass that captured this slot has not yet returned it to the
+     * host. Such a capture was never served, so the drained marker repair must not
+     * certify it. The pass clears it when it returns these bytes.
+     */
+    servedCaptureWithheld?: boolean;
+    /**
+     * Set on a slot loaded from storage without positive evidence that its request
+     * was dispatched. It certifies nothing and may replay only for exactly the
+     * input it was built from, subject to the host's live dispatch checks.
+     */
+    dispatchUnconfirmed?: boolean;
     /** RFC 8785 message digests for the portable hostCut frontier. */
     inputMoveDigests?: string[];
 }
@@ -58,10 +70,11 @@ const LKG_TOTAL_BYTES = 160 * 1024 * 1024;
 const LKG_METADATA_BYTES = 256;
 
 class MagicContextLkgHeapHolder {
-    readonly entries = new Map<string, { slot: LkgSlot; bytes: number }>();
+    readonly entries = new Map<string, { slot: LkgSlot; bytes: number; hydrated: boolean }>();
 }
 
 const lkgHeapHolder = new MagicContextLkgHeapHolder();
+const hydratedReads = new WeakSet<LkgSlot>();
 let totalBytes = 0;
 const hydrationPassBySession = new BoundedSessionMap<number>(1_000);
 const hydrationAttemptBySession = new BoundedSessionMap<number>(1_000);
@@ -589,7 +602,10 @@ export function lkgContentDigest(message: MessageLike): string | null {
     return fields ? lkgContentDigestFromFields(fields) : null;
 }
 
-function touch(sessionId: string, entry: { slot: LkgSlot; bytes: number }): void {
+function touch(
+    sessionId: string,
+    entry: { slot: LkgSlot; bytes: number; hydrated: boolean },
+): void {
     lkgHeapHolder.entries.delete(sessionId);
     lkgHeapHolder.entries.set(sessionId, entry);
 }
@@ -648,6 +664,9 @@ export function captureSlot(sessionId: string, slot: LkgSlot): boolean {
         return false;
     }
     const entry = {
+        hydrated:
+            hydratedReads.has(slot) ||
+            (prior?.hydrated === true && prior.slot.jsonPrefix === slot.jsonPrefix),
         slot: {
             ...slot,
             ...(slot.piOutputEntryIds ? { piOutputEntryIds: [...slot.piOutputEntryIds] } : {}),
@@ -689,6 +708,7 @@ function installHydratedSlot(sessionId: string, slot: LkgSlot): boolean {
         return false;
     }
     const entry = {
+        hydrated: true,
         slot: {
             ...slot,
             ...(slot.piOutputEntryIds ? { piOutputEntryIds: [...slot.piOutputEntryIds] } : {}),
@@ -723,11 +743,11 @@ function hydrateSlotFromPersistence(sessionId: string): LkgSlot | undefined {
     if (!installHydratedSlot(sessionId, loaded)) return undefined;
     sessionLog(sessionId, "lkg_hydrated_from_disk");
     const entry = lkgHeapHolder.entries.get(sessionId);
-    return entry ? copySlotForRead(entry.slot) : undefined;
+    return entry ? copySlotForRead(entry.slot, entry.hydrated) : undefined;
 }
 
-function copySlotForRead(slot: LkgSlot): LkgSlot {
-    return {
+function copySlotForRead(slot: LkgSlot, hydrated: boolean): LkgSlot {
+    const copy = {
         ...slot,
         ...(slot.piOutputEntryIds ? { piOutputEntryIds: [...slot.piOutputEntryIds] } : {}),
         inputIdSeq: [...slot.inputIdSeq],
@@ -737,11 +757,18 @@ function copySlotForRead(slot: LkgSlot): LkgSlot {
             ? [...slot.inputContentSignatures]
             : undefined,
     };
+    if (hydrated) hydratedReads.add(copy);
+    return copy;
 }
 
 export function getInMemorySlot(sessionId: string): LkgSlot | undefined {
     const entry = lkgHeapHolder.entries.get(sessionId);
-    return entry ? copySlotForRead(entry.slot) : undefined;
+    return entry ? copySlotForRead(entry.slot, entry.hydrated) : undefined;
+}
+
+/** Hydration is storage evidence, not evidence that this process handed bytes to its host. */
+export function isHydratedLkgSlot(sessionId: string): boolean {
+    return lkgHeapHolder.entries.get(sessionId)?.hydrated === true;
 }
 
 export function getSlot(sessionId: string): LkgSlot | undefined {
@@ -756,7 +783,70 @@ export function getSlot(sessionId: string): LkgSlot | undefined {
         return hydrateSlotFromPersistence(sessionId);
     }
     touch(sessionId, entry);
-    return copySlotForRead(entry.slot);
+    return copySlotForRead(entry.slot, entry.hydrated);
+}
+
+/**
+ * Mark the in-memory capture as served once its pass returns it: clear the
+ * withheld flag and attach the certificate id allocated at return. Only the same
+ * capture (same time and bytes) is changed; a newer capture is left alone.
+ */
+export function releaseWithheldServedCapture(
+    sessionId: string,
+    capture: Pick<LkgSlot, "capturedAt" | "jsonPrefix">,
+    servedCaptureId: number | undefined,
+): boolean {
+    const entry = lkgHeapHolder.entries.get(sessionId);
+    if (
+        !entry ||
+        entry.slot.capturedAt !== capture.capturedAt ||
+        entry.slot.jsonPrefix !== capture.jsonPrefix
+    )
+        return false;
+    entry.slot = { ...entry.slot, servedCaptureId, servedCaptureWithheld: undefined };
+    return true;
+}
+
+/**
+ * Remove the in-memory capture if its pass never returned it (still withheld),
+ * so the next read loads the last saved request instead. A withheld capture was
+ * never sent, so a replay must never serve it. Only the process copy is removed:
+ * a withheld capture is never saved, so the durable row still holds the last
+ * request sent. Returns whether a capture was removed.
+ */
+export function discardWithheldServedCapture(sessionId: string): boolean {
+    const entry = lkgHeapHolder.entries.get(sessionId);
+    if (!entry?.slot.servedCaptureWithheld) return false;
+    lkgHeapHolder.entries.delete(sessionId);
+    totalBytes -= entry.bytes;
+    // The durable row was never consulted for this miss; allow it to load now.
+    hydrationAttemptBySession.delete(sessionId);
+    return true;
+}
+
+/**
+ * Undo the in-memory install of a capture whose pass was refused instead of
+ * dispatched: put back `prior`, the capture served before it, or leave no slot
+ * when there is none. A refused capture was never sent, so neither a replay nor
+ * the next pass's entry note may use it. Acts only while `refused` is still the
+ * in-memory slot; a newer capture is left alone.
+ */
+export function restoreRefusedCapture(
+    sessionId: string,
+    refused: Pick<LkgSlot, "capturedAt" | "jsonPrefix">,
+    prior: LkgSlot | undefined,
+): boolean {
+    const entry = lkgHeapHolder.entries.get(sessionId);
+    if (
+        !entry ||
+        entry.slot.capturedAt !== refused.capturedAt ||
+        entry.slot.jsonPrefix !== refused.jsonPrefix
+    )
+        return false;
+    lkgHeapHolder.entries.delete(sessionId);
+    totalBytes -= entry.bytes;
+    if (prior) installHydratedSlot(sessionId, prior);
+    return true;
 }
 
 /** Evict only the process copy; durable replay authority is unchanged. */

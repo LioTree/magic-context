@@ -1,0 +1,447 @@
+{
+  "version": 1,
+  "format": {
+    "paths": "Replace <fixture> with the canonical absolute temporary fixture directory, including in sidecars and expected writes. Each case starts with a fresh fixture and only its listed sidecars.",
+    "git": "Initialize each repository with the empty tree and gitCommit below (hash-object -w -t commit, then update-ref HEAD). Linked worktrees share their main repository's objects. Repository kind determines the .git directory/file layout; gitDir and commonDir spell its canonical targets. Create directories after initializing repositories.",
+    "answer": "absent and not_answering describe the fake endpoint. Otherwise load file at zero-based caseIndex from project-resolve-v1/, clone the entire record, and recursively replace exact string values using replaceStrings. Then apply mutations in order: each path is an array of object keys in that cloned record, and value replaces or adds its final field. Keep the vector's implicit id when relocating its path: it must remain an implicit answer. Serve the mutated reply unchanged; never construct a replacement reply object. registrations describes the fake registry for nested-registration cases.",
+    "tolerantReader": "The unknown-via row also adds an extra field, covering the combined malformed-value example in constraints. Unknown via and numeric projectId count as not answering: use the fallback and log once. An unknown extra field alone is ignored: use the registered pj- answer, pin it, and do not log a resolve error. resolveLogs counts diagnostic lines from the Entorhinal decision, not unrelated logs.",
+    "rootPin": "Intent section 2's pin-writing bullet pins the resolved folder, and pins its checkout root only when the answer's canonicalRoot and that checkout root have equal canonical spellings. The two walk-subfolder rows vary only the returned canonicalRoot; via: walk alone never authorizes a parent pin. expected.canonicalRoot, when present, records the returned spelling independently of the queried directory.",
+    "eligibility": "A fixture's optional home field supplies the test user's home directory instead of the real home. Home access is disabled. A refused row has null identity and gitCommonDir, errorClass home_project_disabled, zero resolveCalls and gitProbeCalls, and no writes; eligibility runs before any identity resolution.",
+    "writes": "sidecarWrites is the complete set of writes, including legacy git records, not the resulting sidecar inventory. An empty list means existing sidecar bytes must remain unchanged. sidecarBytesUnchanged makes that byte comparison an explicit assertion for the no-overwrite row, independently of the returned identity. gitCommonDir is omitted on legacy git records."
+  },
+  "gitCommit": "tree 4b825dc642cb6eb9a060e54bf8d69288fbee4904\nauthor Fixture <fixture@example.invalid> 0 +0000\ncommitter Fixture <fixture@example.invalid> 0 +0000\n\nProject identity parity fixture\n",
+  "gitRootCommit": "73a7d66b6d566a1519aa44f6a275ca35ae2817cc",
+  "fixtures": {
+    "main": {
+      "repositories": [
+        { "kind": "main", "root": "<fixture>/repo", "gitDir": "<fixture>/repo/.git", "commonDir": "<fixture>/repo/.git" }
+      ],
+      "directories": ["<fixture>/repo/sub", "<fixture>/repo/pin-a", "<fixture>/repo/pin-b"]
+    },
+    "linked": {
+      "repositories": [
+        { "kind": "main", "root": "<fixture>/repo", "gitDir": "<fixture>/repo/.git", "commonDir": "<fixture>/repo/.git" },
+        { "kind": "worktree", "root": "<fixture>/worktree", "mainRoot": "<fixture>/repo", "gitDir": "<fixture>/repo/.git/worktrees/worktree", "commonDir": "<fixture>/repo/.git" }
+      ],
+      "directories": []
+    },
+    "separate": {
+      "repositories": [
+        { "kind": "separate", "root": "<fixture>/repo", "gitDir": "<fixture>/metadata/repo.git", "commonDir": "<fixture>/metadata/repo.git" }
+      ],
+      "directories": []
+    },
+    "linked-separate": {
+      "repositories": [
+        { "kind": "separate", "root": "<fixture>/repo", "gitDir": "<fixture>/metadata/repo.git", "commonDir": "<fixture>/metadata/repo.git" },
+        { "kind": "worktree", "root": "<fixture>/worktree", "mainRoot": "<fixture>/repo", "gitDir": "<fixture>/metadata/repo.git/worktrees/worktree", "commonDir": "<fixture>/metadata/repo.git" }
+      ],
+      "directories": []
+    },
+    "submodule": {
+      "repositories": [
+        { "kind": "main", "root": "<fixture>/repo", "gitDir": "<fixture>/repo/.git", "commonDir": "<fixture>/repo/.git" },
+        { "kind": "submodule", "root": "<fixture>/repo/sub", "mainRoot": "<fixture>/repo", "gitDir": "<fixture>/repo/.git/modules/sub", "commonDir": "<fixture>/repo/.git/modules/sub" }
+      ],
+      "directories": []
+    },
+    "home-directory": {
+      "home": "<fixture>/repo",
+      "repositories": [
+        { "kind": "main", "root": "<fixture>/repo", "gitDir": "<fixture>/repo/.git", "commonDir": "<fixture>/repo/.git" }
+      ],
+      "directories": []
+    }
+  },
+  "cases": [
+    {
+      "name": "registered-root",
+      "fixture": "main",
+      "directory": "<fixture>/repo",
+      "answer": { "file": "resolve.json", "caseIndex": 0, "replaceStrings": { "/fixture/root-checkout": "<fixture>/repo" } },
+      "sidecars": [],
+      "expected": {
+        "identity": "pj-resolve-root",
+        "gitCommonDir": "<fixture>/repo/.git",
+        "sidecarWrites": [{ "directory": "<fixture>/repo", "identity": "pj-resolve-root", "gitCommonDir": "<fixture>/repo/.git" }]
+      }
+    },
+    {
+      "name": "registered-subfolder",
+      "fixture": "main",
+      "directory": "<fixture>/repo/sub",
+      "answer": { "file": "resolve.json", "caseIndex": 1, "replaceStrings": { "/fixture/root-checkout": "<fixture>/repo", "/fixture/root-checkout/subfolder": "<fixture>/repo/sub" } },
+      "sidecars": [],
+      "expected": {
+        "identity": "pj-resolve-root",
+        "gitCommonDir": "<fixture>/repo/.git",
+        "sidecarWrites": [{ "directory": "<fixture>/repo/sub", "identity": "pj-resolve-root", "gitCommonDir": "<fixture>/repo/.git" }]
+      }
+    },
+    {
+      "name": "registered-linked-worktree",
+      "fixture": "linked",
+      "directory": "<fixture>/worktree",
+      "answer": { "file": "resolve.json", "caseIndex": 2, "replaceStrings": { "/fixture/root-checkout": "<fixture>/repo", "/fixture/external-worktree": "<fixture>/worktree" } },
+      "sidecars": [],
+      "expected": { "identity": "pj-resolve-root", "gitCommonDir": "<fixture>/repo/.git", "sidecarWrites": [] }
+    },
+    {
+      "name": "unregistered-checkout",
+      "fixture": "main",
+      "directory": "<fixture>/repo",
+      "answer": { "file": "resolve.json", "caseIndex": 3, "replaceStrings": { "/fixture/implicit-folder": "<fixture>/repo" } },
+      "sidecars": [],
+      "expected": {
+        "identity": "git:73a7d66b6d566a1519aa44f6a275ca35ae2817cc",
+        "gitCommonDir": "<fixture>/repo/.git",
+        "sidecarWrites": [{ "directory": "<fixture>/repo", "identity": "git:73a7d66b6d566a1519aa44f6a275ca35ae2817cc" }]
+      }
+    },
+    {
+      "name": "implicit-sidecar-is-ignored",
+      "fixture": "main",
+      "directory": "<fixture>/repo",
+      "answer": "absent",
+      "sidecars": [{ "directory": "<fixture>/repo", "identity": "pj-implicit1-30f9d5fcd6aa4ef2", "gitCommonDir": "<fixture>/repo/.git" }],
+      "expected": {
+        "identity": "git:73a7d66b6d566a1519aa44f6a275ca35ae2817cc",
+        "gitCommonDir": "<fixture>/repo/.git",
+        "ignoredImplicitSidecarLogs": 1,
+        "sidecarWrites": [{ "directory": "<fixture>/repo", "identity": "git:73a7d66b6d566a1519aa44f6a275ca35ae2817cc" }]
+      }
+    },
+    {
+      "name": "nested-registration-without-parent-pin",
+      "fixture": "main",
+      "directory": "<fixture>/repo/sub",
+      "registrations": [{ "directory": "<fixture>/repo", "identity": "pj-A" }, { "directory": "<fixture>/repo/sub", "identity": "pj-B" }],
+      "answer": { "file": "resolve.json", "caseIndex": 0, "replaceStrings": { "/fixture/root-checkout": "<fixture>/repo/sub", "pj-resolve-root": "pj-B" } },
+      "sidecars": [],
+      "expected": {
+        "identity": "pj-B",
+        "gitCommonDir": "<fixture>/repo/.git",
+        "sidecarWrites": [{ "directory": "<fixture>/repo/sub", "identity": "pj-B", "gitCommonDir": "<fixture>/repo/.git" }]
+      }
+    },
+    {
+      "name": "nested-registration-with-parent-pin",
+      "fixture": "main",
+      "directory": "<fixture>/repo/sub",
+      "registrations": [{ "directory": "<fixture>/repo", "identity": "pj-A" }, { "directory": "<fixture>/repo/sub", "identity": "pj-B" }],
+      "answer": { "file": "resolve.json", "caseIndex": 0, "replaceStrings": { "/fixture/root-checkout": "<fixture>/repo/sub", "pj-resolve-root": "pj-B" } },
+      "sidecars": [{ "directory": "<fixture>/repo", "identity": "pj-A", "gitCommonDir": "<fixture>/repo/.git" }],
+      "expected": {
+        "identity": "pj-B",
+        "gitCommonDir": "<fixture>/repo/.git",
+        "sidecarWrites": [{ "directory": "<fixture>/repo/sub", "identity": "pj-B", "gitCommonDir": "<fixture>/repo/.git" }]
+      }
+    },
+    {
+      "name": "common-dir-main",
+      "fixture": "main",
+      "directory": "<fixture>/repo",
+      "answer": "absent",
+      "sidecars": [],
+      "expected": {
+        "identity": "git:73a7d66b6d566a1519aa44f6a275ca35ae2817cc",
+        "gitCommonDir": "<fixture>/repo/.git",
+        "sidecarWrites": [{ "directory": "<fixture>/repo", "identity": "git:73a7d66b6d566a1519aa44f6a275ca35ae2817cc" }]
+      }
+    },
+    {
+      "name": "common-dir-separate-main",
+      "fixture": "separate",
+      "directory": "<fixture>/repo",
+      "answer": "absent",
+      "sidecars": [],
+      "expected": {
+        "identity": "git:73a7d66b6d566a1519aa44f6a275ca35ae2817cc",
+        "gitCommonDir": "<fixture>/metadata/repo.git",
+        "sidecarWrites": [{ "directory": "<fixture>/repo", "identity": "git:73a7d66b6d566a1519aa44f6a275ca35ae2817cc" }]
+      }
+    },
+    {
+      "name": "common-dir-separate-linked-worktree",
+      "fixture": "linked-separate",
+      "directory": "<fixture>/worktree",
+      "answer": "absent",
+      "sidecars": [],
+      "expected": {
+        "identity": "git:73a7d66b6d566a1519aa44f6a275ca35ae2817cc",
+        "gitCommonDir": "<fixture>/metadata/repo.git",
+        "sidecarWrites": [{ "directory": "<fixture>/worktree", "identity": "git:73a7d66b6d566a1519aa44f6a275ca35ae2817cc" }]
+      }
+    },
+    {
+      "name": "common-dir-submodule",
+      "fixture": "submodule",
+      "directory": "<fixture>/repo/sub",
+      "answer": "absent",
+      "sidecars": [],
+      "expected": {
+        "identity": "git:73a7d66b6d566a1519aa44f6a275ca35ae2817cc",
+        "gitCommonDir": "<fixture>/repo/.git/modules/sub",
+        "sidecarWrites": [{ "directory": "<fixture>/repo/sub", "identity": "git:73a7d66b6d566a1519aa44f6a275ca35ae2817cc" }]
+      }
+    },
+    {
+      "name": "single-common-dir-pin-not-answering",
+      "fixture": "linked-separate",
+      "directory": "<fixture>/worktree",
+      "answer": "not_answering",
+      "sidecars": [{ "directory": "<fixture>/repo", "identity": "pj-A", "gitCommonDir": "<fixture>/metadata/repo.git" }],
+      "expected": { "identity": "pj-A", "gitCommonDir": "<fixture>/metadata/repo.git", "sidecarWrites": [] }
+    },
+    {
+      "name": "single-common-dir-pin-implicit-worktree",
+      "fixture": "linked-separate",
+      "directory": "<fixture>/worktree",
+      "answer": { "file": "resolve.json", "caseIndex": 3, "replaceStrings": { "/fixture/implicit-folder": "<fixture>/worktree" } },
+      "sidecars": [{ "directory": "<fixture>/repo", "identity": "pj-A", "gitCommonDir": "<fixture>/metadata/repo.git" }],
+      "expected": { "identity": "pj-A", "gitCommonDir": "<fixture>/metadata/repo.git", "sidecarWrites": [] }
+    },
+    {
+      "name": "single-common-dir-pin-implicit-subfolder",
+      "fixture": "main",
+      "directory": "<fixture>/repo/sub",
+      "answer": { "file": "resolve.json", "caseIndex": 3, "replaceStrings": { "/fixture/implicit-folder": "<fixture>/repo/sub" } },
+      "sidecars": [{ "directory": "<fixture>/repo", "identity": "pj-A", "gitCommonDir": "<fixture>/repo/.git" }],
+      "expected": { "identity": "pj-A", "gitCommonDir": "<fixture>/repo/.git", "sidecarWrites": [] }
+    },
+    {
+      "name": "single-common-dir-pin-not-answering-subfolder",
+      "fixture": "main",
+      "directory": "<fixture>/repo/sub",
+      "answer": "not_answering",
+      "sidecars": [{ "directory": "<fixture>/repo", "identity": "pj-A", "gitCommonDir": "<fixture>/repo/.git" }],
+      "expected": { "identity": "pj-A", "gitCommonDir": "<fixture>/repo/.git", "sidecarWrites": [] }
+    },
+    {
+      "name": "conflicting-common-dir-pins",
+      "fixture": "main",
+      "directory": "<fixture>/repo",
+      "answer": "not_answering",
+      "sidecars": [
+        { "directory": "<fixture>/repo/pin-a", "identity": "pj-A", "gitCommonDir": "<fixture>/repo/.git" },
+        { "directory": "<fixture>/repo/pin-b", "identity": "pj-B", "gitCommonDir": "<fixture>/repo/.git" }
+      ],
+      "expected": {
+        "identity": "git:73a7d66b6d566a1519aa44f6a275ca35ae2817cc",
+        "gitCommonDir": "<fixture>/repo/.git",
+        "commonDirConflictLogs": 1,
+        "sidecarWrites": [{ "directory": "<fixture>/repo", "identity": "git:73a7d66b6d566a1519aa44f6a275ca35ae2817cc" }]
+      }
+    },
+    {
+      "name": "duplicate-common-dir-pins-same-identity",
+      "fixture": "main",
+      "directory": "<fixture>/repo",
+      "answer": "not_answering",
+      "sidecars": [
+        { "directory": "<fixture>/repo/pin-a", "identity": "pj-A", "gitCommonDir": "<fixture>/repo/.git" },
+        { "directory": "<fixture>/repo/pin-b", "identity": "pj-A", "gitCommonDir": "<fixture>/repo/.git" }
+      ],
+      "expected": { "identity": "pj-A", "gitCommonDir": "<fixture>/repo/.git", "sidecarWrites": [] }
+    },
+    {
+      "name": "pin-is-total-over-registered-answer",
+      "fixture": "main",
+      "directory": "<fixture>/repo",
+      "answer": { "file": "resolve.json", "caseIndex": 0, "replaceStrings": { "/fixture/root-checkout": "<fixture>/repo", "pj-resolve-root": "pj-OTHER" } },
+      "sidecars": [{ "directory": "<fixture>/repo", "identity": "pj-A", "gitCommonDir": "<fixture>/repo/.git" }],
+      "expected": { "identity": "pj-A", "gitCommonDir": "<fixture>/repo/.git", "resolveCalls": 0, "sidecarWrites": [] }
+    },
+    {
+      "name": "pin-is-total-over-implicit-answer",
+      "fixture": "main",
+      "directory": "<fixture>/repo",
+      "answer": { "file": "resolve.json", "caseIndex": 3, "replaceStrings": { "/fixture/implicit-folder": "<fixture>/repo" } },
+      "sidecars": [{ "directory": "<fixture>/repo", "identity": "pj-A", "gitCommonDir": "<fixture>/repo/.git" }],
+      "expected": { "identity": "pj-A", "gitCommonDir": "<fixture>/repo/.git", "resolveCalls": 0, "sidecarWrites": [] }
+    },
+    {
+      "name": "gone-registered-root-is-accepted",
+      "fixture": "main",
+      "directory": "<fixture>/repo",
+      "answer": { "file": "resolve.json", "caseIndex": 4, "replaceStrings": { "/fixture/gone-checkout": "<fixture>/repo" } },
+      "sidecars": [],
+      "expected": {
+        "identity": "pj-gone-root",
+        "gitCommonDir": "<fixture>/repo/.git",
+        "sidecarWrites": [{ "directory": "<fixture>/repo", "identity": "pj-gone-root", "gitCommonDir": "<fixture>/repo/.git" }]
+      }
+    },
+    {
+      "name": "tolerant-reader-unknown-via",
+      "fixture": "main",
+      "directory": "<fixture>/repo",
+      "answer": {
+        "file": "resolve.json",
+        "caseIndex": 0,
+        "replaceStrings": { "/fixture/root-checkout": "<fixture>/repo" },
+        "mutations": [
+          { "path": ["reply", "result", "via"], "value": "orbit" },
+          { "path": ["reply", "result", "futureField"], "value": true }
+        ]
+      },
+      "sidecars": [],
+      "expected": {
+        "identity": "git:73a7d66b6d566a1519aa44f6a275ca35ae2817cc",
+        "gitCommonDir": "<fixture>/repo/.git",
+        "resolveCalls": 1,
+        "resolveLogs": 1,
+        "sidecarWrites": [{ "directory": "<fixture>/repo", "identity": "git:73a7d66b6d566a1519aa44f6a275ca35ae2817cc" }]
+      }
+    },
+    {
+      "name": "tolerant-reader-extra-field",
+      "fixture": "main",
+      "directory": "<fixture>/repo",
+      "answer": {
+        "file": "resolve.json",
+        "caseIndex": 0,
+        "replaceStrings": { "/fixture/root-checkout": "<fixture>/repo" },
+        "mutations": [{ "path": ["reply", "result", "futureField"], "value": true }]
+      },
+      "sidecars": [],
+      "expected": {
+        "identity": "pj-resolve-root",
+        "gitCommonDir": "<fixture>/repo/.git",
+        "resolveCalls": 1,
+        "resolveLogs": 0,
+        "sidecarWrites": [{ "directory": "<fixture>/repo", "identity": "pj-resolve-root", "gitCommonDir": "<fixture>/repo/.git" }]
+      }
+    },
+    {
+      "name": "tolerant-reader-decode-failure",
+      "fixture": "main",
+      "directory": "<fixture>/repo",
+      "answer": {
+        "file": "resolve.json",
+        "caseIndex": 0,
+        "replaceStrings": { "/fixture/root-checkout": "<fixture>/repo" },
+        "mutations": [{ "path": ["reply", "result", "projectId"], "value": 42 }]
+      },
+      "sidecars": [],
+      "expected": {
+        "identity": "git:73a7d66b6d566a1519aa44f6a275ca35ae2817cc",
+        "gitCommonDir": "<fixture>/repo/.git",
+        "resolveCalls": 1,
+        "resolveLogs": 1,
+        "sidecarWrites": [{ "directory": "<fixture>/repo", "identity": "git:73a7d66b6d566a1519aa44f6a275ca35ae2817cc" }]
+      }
+    },
+    {
+      "name": "error-invalid-params",
+      "fixture": "main",
+      "directory": "<fixture>/repo",
+      "answer": { "file": "resolve.json", "caseIndex": 5, "replaceStrings": {} },
+      "sidecars": [],
+      "expected": {
+        "identity": "git:73a7d66b6d566a1519aa44f6a275ca35ae2817cc",
+        "gitCommonDir": "<fixture>/repo/.git",
+        "resolveCalls": 1,
+        "resolveLogs": 1,
+        "sidecarWrites": [{ "directory": "<fixture>/repo", "identity": "git:73a7d66b6d566a1519aa44f6a275ca35ae2817cc" }]
+      }
+    },
+    {
+      "name": "error-storage-unavailable",
+      "fixture": "main",
+      "directory": "<fixture>/repo",
+      "answer": {
+        "file": "resolve.json",
+        "caseIndex": 5,
+        "replaceStrings": {},
+        "mutations": [{ "path": ["reply", "code"], "value": "storage_unavailable" }]
+      },
+      "sidecars": [],
+      "expected": {
+        "identity": "git:73a7d66b6d566a1519aa44f6a275ca35ae2817cc",
+        "gitCommonDir": "<fixture>/repo/.git",
+        "resolveCalls": 1,
+        "sidecarWrites": [{ "directory": "<fixture>/repo", "identity": "git:73a7d66b6d566a1519aa44f6a275ca35ae2817cc" }]
+      }
+    },
+    {
+      "name": "legacy-git-record-replaced-by-live-project-pin",
+      "fixture": "main",
+      "directory": "<fixture>/repo",
+      "answer": { "file": "resolve.json", "caseIndex": 0, "replaceStrings": { "/fixture/root-checkout": "<fixture>/repo" } },
+      "sidecars": [{ "directory": "<fixture>/repo", "identity": "git:73a7d66b6d566a1519aa44f6a275ca35ae2817cc" }],
+      "expected": {
+        "identity": "pj-resolve-root",
+        "gitCommonDir": "<fixture>/repo/.git",
+        "resolveCalls": 1,
+        "sidecarWrites": [{ "directory": "<fixture>/repo", "identity": "pj-resolve-root", "gitCommonDir": "<fixture>/repo/.git" }]
+      }
+    },
+    {
+      "name": "pj-pin-preserves-sidecar-bytes",
+      "fixture": "main",
+      "directory": "<fixture>/repo",
+      "answer": { "file": "resolve.json", "caseIndex": 0, "replaceStrings": { "/fixture/root-checkout": "<fixture>/repo", "pj-resolve-root": "pj-OTHER" } },
+      "sidecars": [{ "directory": "<fixture>/repo", "identity": "pj-A", "gitCommonDir": "<fixture>/repo/.git" }],
+      "expected": {
+        "identity": "pj-A",
+        "gitCommonDir": "<fixture>/repo/.git",
+        "resolveCalls": 0,
+        "gitProbeCalls": 0,
+        "sidecarBytesUnchanged": true,
+        "sidecarWrites": []
+      }
+    },
+    {
+      "name": "walk-subfolder-canonical-root-equals-checkout",
+      "fixture": "main",
+      "directory": "<fixture>/repo/sub",
+      "answer": {
+        "file": "resolve.json",
+        "caseIndex": 1,
+        "replaceStrings": { "/fixture/root-checkout": "<fixture>/repo", "/fixture/root-checkout/subfolder": "<fixture>/repo/sub" },
+        "mutations": [{ "path": ["reply", "result", "canonicalRoot"], "value": "<fixture>/repo" }]
+      },
+      "sidecars": [],
+      "expected": {
+        "identity": "pj-resolve-root",
+        "canonicalRoot": "<fixture>/repo",
+        "gitCommonDir": "<fixture>/repo/.git",
+        "resolveCalls": 1,
+        "sidecarWrites": [
+          { "directory": "<fixture>/repo/sub", "identity": "pj-resolve-root", "gitCommonDir": "<fixture>/repo/.git" },
+          { "directory": "<fixture>/repo", "identity": "pj-resolve-root", "gitCommonDir": "<fixture>/repo/.git" }
+        ]
+      }
+    },
+    {
+      "name": "walk-subfolder-canonical-root-differs-from-checkout",
+      "fixture": "main",
+      "directory": "<fixture>/repo/sub",
+      "answer": { "file": "resolve.json", "caseIndex": 1, "replaceStrings": { "/fixture/root-checkout": "<fixture>/repo", "/fixture/root-checkout/subfolder": "<fixture>/repo/sub" } },
+      "sidecars": [],
+      "expected": {
+        "identity": "pj-resolve-root",
+        "canonicalRoot": "<fixture>/repo/sub",
+        "gitCommonDir": "<fixture>/repo/.git",
+        "resolveCalls": 1,
+        "sidecarWrites": [{ "directory": "<fixture>/repo/sub", "identity": "pj-resolve-root", "gitCommonDir": "<fixture>/repo/.git" }]
+      }
+    },
+    {
+      "name": "home-directory-refused-before-resolve",
+      "fixture": "home-directory",
+      "directory": "<fixture>/repo",
+      "answer": { "file": "resolve.json", "caseIndex": 0, "replaceStrings": { "/fixture/root-checkout": "<fixture>/repo" } },
+      "sidecars": [],
+      "expected": {
+        "identity": null,
+        "gitCommonDir": null,
+        "errorClass": "home_project_disabled",
+        "resolveCalls": 0,
+        "gitProbeCalls": 0,
+        "sidecarWrites": []
+      }
+    }
+  ]
+}

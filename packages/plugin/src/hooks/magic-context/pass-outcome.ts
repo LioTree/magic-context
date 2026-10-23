@@ -25,7 +25,6 @@ export const PASS_DEGRADATION_EFFECTS = {
     "store-generation-rebase-failure": "changes-request",
     "session-meta-early-return": "changes-request",
     "compaction-mode-transition-failure": "changes-request",
-    "rust-transform-unavailable": "changes-request",
     "overflow-state-read-failure": "changes-request",
     "tagging-persistence-failure": "changes-request",
     "flushed-status-failure": "changes-request",

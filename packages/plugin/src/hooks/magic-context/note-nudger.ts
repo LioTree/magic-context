@@ -27,6 +27,7 @@ import {
     getSessionNotes,
     type Note,
 } from "../../features/magic-context/storage-notes";
+import { updateSessionMetaCollection } from "../../features/magic-context/storage-session-collections";
 import { sessionLog } from "../../shared/logger";
 import type { Database } from "../../shared/sqlite";
 import { logSlowWriteTransaction } from "../../shared/write-transaction-timing";
@@ -431,10 +432,10 @@ export function clearNoteNudgeState(
 
 export function clearAllNoteNudgeState(db: Database, sessionId: string): void {
     db.transaction(() => {
+        updateSessionMetaCollection(db, sessionId, "note_nudge_anchors", "[]");
         db.prepare(
             `UPDATE session_meta
-             SET note_nudge_anchors = '[]',
-                 note_nudge_trigger_pending = 0,
+             SET note_nudge_trigger_pending = 0,
                  note_nudge_trigger_message_id = '',
                  note_nudge_sticky_text = '',
                  note_nudge_sticky_message_id = ''

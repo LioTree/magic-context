@@ -710,6 +710,9 @@ pub struct HistorianAssemblerConfig {
     pub memory_enabled: bool,
     pub auto_promote: bool,
     pub user_memory_collection_enabled: bool,
+    /// False when the dreamer is not runnable; the historian prompt then asks it
+    /// to skip user observations (see `build_compartment_agent_prompt`).
+    pub user_observations_requested: bool,
     pub extraction_free: bool,
     pub in_emergency: bool,
     pub force_keep_last_compartment: bool,
@@ -796,6 +799,7 @@ impl AssembledHistorianFiring {
         turn_two_enabled: bool,
     ) -> HistorianFireRequest<'a> {
         HistorianFireRequest {
+            rust_background_enabled: false,
             store,
             session_id,
             project_path,
@@ -867,6 +871,9 @@ struct HistorianPromptFit {
     /// What was kept, for the log: (session references, memories, seeds).
     kept: (usize, usize, usize),
     trimmed: bool,
+    /// The calibration and input limit of each model the chunk was sized to
+    /// fit; empty when no model in the chain has a known window.
+    sized_for: Vec<(crate::decision_calibration::DecisionCalibration, usize)>,
 }
 
 struct HistorianPromptFitInput<'a> {
@@ -876,18 +883,28 @@ struct HistorianPromptFitInput<'a> {
     compartments: &'a [ReferenceCompartment],
     memories: &'a [mc_store::StoredMemory],
     memory_enabled: bool,
+    user_observations_requested: bool,
     extraction_free: bool,
     /// Producer input limit after the output reserve and estimator margin.
     limit: Option<usize>,
     seed: &'a crate::decision_calibration::DecisionCalibration,
+    /// The other models in the attempt chain that this same prompt may be sent
+    /// to, each with its own calibration and input limit (models with an
+    /// unknown window are left out). The chunk is sized to fit every one of
+    /// them that can hold a minimal prompt on its own, so a fallback with a
+    /// smaller window than the primary is not handed a prompt it must refuse.
+    fallback_limits: &'a [(crate::decision_calibration::DecisionCalibration, usize)],
     system_tokens: f64,
     /// Chunk budget the caller would use without a window, in local tokens.
     requested: usize,
 }
 
-/// Size the historian prompt to the producer window: reserve the system prompt,
-/// the fixed user-prompt blocks and the output first, and give the chunk what
-/// remains. When the full requested chunk does not fit, trim diverse older
+/// Size the historian prompt to the attempt chain's windows: reserve the system
+/// prompt, the fixed user-prompt blocks and the output first, and give the chunk
+/// what remains in the smallest window among the primary and the fallbacks that
+/// can hold a minimal prompt. One prompt is built per firing and every attempt
+/// sends those same bytes, so it has to fit each model it may reach. When the
+/// full requested chunk does not fit, trim diverse older
 /// compartments before recent compartments (oldest first), then project-memory
 /// lines (lowest priority first), then seed
 /// examples, and only then shrink the chunk. When not even a minimal chunk fits,
@@ -914,7 +931,11 @@ fn fit_historian_prompt_selected(
                 input.chunk_start as i64,
             )
         });
-    let memories = order_historian_memories(input.memories);
+    let memories = order_historian_memories(if input.memory_enabled {
+        input.memories
+    } else {
+        &[]
+    });
     let render = |refs: usize, memory_count: usize, seed_count: usize| {
         (
             render_seed_examples_block(&seeds[..seed_count]),
@@ -934,6 +955,7 @@ fn fit_historian_prompt_selected(
             trimmed: refs < references.len()
                 || memory_count < memories.len()
                 || seed_count < seeds.len(),
+            sized_for: Vec::new(),
         }
     };
     let untrimmed = || {
@@ -944,27 +966,11 @@ fn fit_historian_prompt_selected(
             input.requested,
         )
     };
-    let Some(limit) = input.limit else {
+    if input.limit.is_none() && input.fallback_limits.is_empty() {
         return untrimmed();
-    };
-    let mass = |prose: usize| {
-        input.seed.provider_mass(
-            crate::decision_calibration::LocalMass {
-                system: input.system_tokens,
-                prose: prose as f64,
-                tools: 0.0,
-            },
-            true,
-        )
-    };
-    let fits = |prose: usize| {
-        let tokens = mass(prose);
-        tokens.is_finite() && tokens > 0.0 && tokens <= limit as f64
-    };
+    }
     let header = format!("Messages {}-{}:\n\n", input.chunk_start, input.last_ordinal);
-    // Largest chunk (local tokens) that keeps the calibrated prompt within the
-    // limit, or None when the fixed parts alone do not fit.
-    let room = |refs: usize, memory_count: usize, seed_count: usize| -> Option<usize> {
+    let fixed_tokens = |refs: usize, memory_count: usize, seed_count: usize| -> usize {
         let (seed_examples, session_references, memory_block) =
             render(refs, memory_count, seed_count);
         let prompt = build_compartment_agent_prompt(&CompartmentPromptInputs {
@@ -973,9 +979,29 @@ fn fit_historian_prompt_selected(
             project_memory: &memory_block,
             input_source: &header,
             memory_enabled: input.memory_enabled,
+            user_observations_requested: input.user_observations_requested,
             extraction_free: input.extraction_free,
         });
-        let fixed = estimate_tokens(&prompt);
+        estimate_tokens(&prompt)
+    };
+    // Largest chunk (local tokens) that keeps the prompt within one model's
+    // calibrated limit, before the slack, or None when the fixed parts alone do
+    // not fit that model.
+    let room_one = |fixed: usize,
+                    seed: &crate::decision_calibration::DecisionCalibration,
+                    limit: usize|
+     -> Option<usize> {
+        let fits = |prose: usize| {
+            let tokens = seed.provider_mass(
+                crate::decision_calibration::LocalMass {
+                    system: input.system_tokens,
+                    prose: prose as f64,
+                    tools: 0.0,
+                },
+                true,
+            );
+            tokens.is_finite() && tokens > 0.0 && tokens <= limit as f64
+        };
         if !fits(fixed) {
             return None;
         }
@@ -992,44 +1018,88 @@ fn fit_historian_prompt_selected(
                 hi = mid;
             }
         }
-        Some(lo.saturating_sub(PROMPT_FIT_SLACK_TOKENS))
+        Some(lo)
+    };
+    // Largest chunk (local tokens) that keeps the calibrated prompt within the
+    // limit of every model in `models`, or None when the fixed parts alone do
+    // not fit one of them.
+    let room_under = |models: &[(&crate::decision_calibration::DecisionCalibration, usize)],
+                      refs: usize,
+                      memory_count: usize,
+                      seed_count: usize|
+     -> Option<usize> {
+        let fixed = fixed_tokens(refs, memory_count, seed_count);
+        let mut room = usize::MAX;
+        for (seed, limit) in models {
+            room = room.min(room_one(fixed, seed, *limit)?);
+        }
+        Some(room.saturating_sub(PROMPT_FIT_SLACK_TOKENS))
+    };
+    let floor = input.requested.min(MIN_FIT_CHUNK_TOKENS);
+    // The primary always takes part, so a primary that cannot hold the prompt is
+    // still refused at admission exactly as before. A fallback that cannot hold
+    // even a minimal prompt on its own is left out: shrinking the chunk for it
+    // would not make it fit, and the per-attempt check refuses it anyway.
+    let mut models: Vec<(&crate::decision_calibration::DecisionCalibration, usize)> = input
+        .limit
+        .map(|limit| (input.seed, limit))
+        .into_iter()
+        .collect();
+    for (seed, limit) in input.fallback_limits {
+        let alone = [(seed, *limit)];
+        if room_under(&alone, 0, 0, 0).is_some_and(|room| room >= floor && room > 0) {
+            models.push((seed, *limit));
+        }
+    }
+    if models.is_empty() {
+        return untrimmed();
+    }
+    let room = |refs: usize, memory_count: usize, seed_count: usize| {
+        room_under(&models, refs, memory_count, seed_count)
     };
     let has_room = |refs: usize, memory_count: usize, seed_count: usize| {
         room(refs, memory_count, seed_count).is_some_and(|room| room >= input.requested)
     };
-
-    // 1. Diverse compartments first, then recent compartments oldest first.
-    for refs in (0..=references.len()).rev() {
-        if has_room(refs, memories.len(), seeds.len()) {
-            return accept(refs, memories.len(), seeds.len(), input.requested);
-        }
-    }
-    // 2. Project-memory lines, lowest priority dropped first. Fewer lines never
-    //    need more room, so binary-search the longest prefix that fits.
-    if !memories.is_empty() && has_room(0, 0, seeds.len()) {
-        let (mut lo, mut hi) = (0usize, memories.len());
-        while hi - lo > 1 {
-            let mid = lo + (hi - lo) / 2;
-            if has_room(0, mid, seeds.len()) {
-                lo = mid;
-            } else {
-                hi = mid;
+    let sized_for = models
+        .iter()
+        .map(|(seed, limit)| (**seed, *limit))
+        .collect();
+    let pick = || -> HistorianPromptFit {
+        // 1. Diverse compartments first, then recent compartments oldest first.
+        for refs in (0..=references.len()).rev() {
+            if has_room(refs, memories.len(), seeds.len()) {
+                return accept(refs, memories.len(), seeds.len(), input.requested);
             }
         }
-        return accept(0, lo, seeds.len(), input.requested);
-    }
-    // 3. Seed examples.
-    for seed_count in (0..=seeds.len()).rev() {
-        if has_room(0, 0, seed_count) {
-            return accept(0, 0, seed_count, input.requested);
+        // 2. Project-memory lines, lowest priority dropped first. Fewer lines never
+        //    need more room, so binary-search the longest prefix that fits.
+        if !memories.is_empty() && has_room(0, 0, seeds.len()) {
+            let (mut lo, mut hi) = (0usize, memories.len());
+            while hi - lo > 1 {
+                let mid = lo + (hi - lo) / 2;
+                if has_room(0, mid, seeds.len()) {
+                    lo = mid;
+                } else {
+                    hi = mid;
+                }
+            }
+            return accept(0, lo, seeds.len(), input.requested);
         }
-    }
-    // 4. Everything trimmed: the chunk takes whatever room is left.
-    let floor = input.requested.min(MIN_FIT_CHUNK_TOKENS);
-    match room(0, 0, 0) {
-        Some(room) if room >= floor && room > 0 => accept(0, 0, 0, input.requested.min(room)),
-        _ => untrimmed(),
-    }
+        // 3. Seed examples.
+        for seed_count in (0..=seeds.len()).rev() {
+            if has_room(0, 0, seed_count) {
+                return accept(0, 0, seed_count, input.requested);
+            }
+        }
+        // 4. Everything trimmed: the chunk takes whatever room is left.
+        match room(0, 0, 0) {
+            Some(room) if room >= floor && room > 0 => accept(0, 0, 0, input.requested.min(room)),
+            _ => untrimmed(),
+        }
+    };
+    let mut fit = pick();
+    fit.sized_for = sized_for;
+    fit
 }
 
 /// Convert a producer allowance before formatted-source splitting; tool summaries use the larger class seed.
@@ -1147,10 +1217,17 @@ fn assemble_historian_firing_inner(
             },
         ));
     }
-    // Size the prompt to the producer window before selecting the chunk: the
+    // Size the prompt to the attempt chain before selecting the chunk: the
     // system prompt, the fixed user-prompt blocks and the output reserve come off
-    // the window first, and the chunk gets what is left.
-    let memories = store.load_active_memories(&config.project_path, now_ms)?;
+    // the window first, and the chunk gets what is left. Each model's limit is
+    // resolved exactly as the per-attempt admission check resolves it, so a
+    // prompt built here is not refused by that check for any model it was sized
+    // for.
+    let memories = if config.memory_enabled {
+        store.load_active_memories(&config.project_path, now_ms)?
+    } else {
+        Vec::new()
+    };
     let system_tokens = estimate_tokens(crate::historian_prompt::HISTORIAN_SYSTEM_PROMPT) as f64;
     let primary_limits = config
         .model_chain
@@ -1162,11 +1239,6 @@ fn assemble_historian_firing_inner(
     } else {
         config.historian_context_limit_tokens
     };
-    let producer_input_limit = crate::historian::producer_input_token_limit_with_input(
-        primary_context,
-        primary_input,
-        config.max_output_tokens,
-    );
     let selected_compartments;
     let references = if bounded_context {
         let seeds = select_seeds(&config.session_id, chunk_start as i64, SEED_FLOOR);
@@ -1199,6 +1271,33 @@ fn assemble_historian_firing_inner(
     } else {
         &compartments
     };
+    let attempt_limit = |model: &str, legacy_window: Option<usize>| {
+        crate::historian::attempt_producer_input_limit(
+            model,
+            &config.model_limits,
+            legacy_window,
+            config.historian_context_limit_tokens,
+            config.max_output_tokens,
+        )
+    };
+    let producer_input_limit =
+        producer_key.and_then(|model| attempt_limit(model, config.historian_context_limit_tokens));
+    // The firing carries no per-fallback legacy windows, so a fallback's limit
+    // comes from its resolved model limits alone, as it does at attempt time.
+    let fallback_limits: Vec<_> = config
+        .model_chain
+        .iter()
+        .skip(1)
+        .filter(|model| Some(model.as_str()) != producer_key)
+        .filter_map(|model| {
+            attempt_limit(model, None).map(|limit| {
+                (
+                    crate::decision_calibration::DecisionCalibration::for_model(Some(model)),
+                    limit,
+                )
+            })
+        })
+        .collect();
     let reference_compartments: Vec<ReferenceCompartment> = references
         .iter()
         .map(|compartment| {
@@ -1220,14 +1319,17 @@ fn assemble_historian_firing_inner(
             compartments: &reference_compartments,
             memories: &memories,
             memory_enabled: config.memory_enabled,
+            user_observations_requested: config.user_observations_requested,
             extraction_free: config.extraction_free,
             limit: producer_input_limit,
             seed: &seed,
+            fallback_limits: &fallback_limits,
             system_tokens,
             requested: source_budget,
         },
         bounded_context.then_some(reference_compartments.as_slice()),
     );
+
     if prompt_fit.trimmed || prompt_fit.chunk_tokens < source_budget {
         tracing::info!(
             "[mc-module][{}] historian prompt fit: chunkTokens={} requestedChunkTokens={} sessionReferences={} memories={}/{} seeds={}",
@@ -1360,17 +1462,19 @@ fn assemble_historian_firing_inner(
         session_references: prompt_fit.session_references,
     };
     let memory_block = prompt_fit.memory_block;
+    let sized_for = prompt_fit.sized_for;
     let oversize_atomic_unit =
         estimate_tokens(&chunk.text) > source_budget
             && chunk.chunk.completed_tool_arcs.iter().any(|arc| {
                 arc.start <= chunk.chunk.end_index && arc.end >= chunk.chunk.start_index
             });
     // A source-only allowance can consume the entire producer window before the
-    // historian's system instructions, references, and wrapper are counted.
+    // historian's system instructions, references, and wrapper are counted. The
+    // whole prompt has to fit every model the chunk was sized for.
     let fits_producer_prompt = |source: &str| {
-        let Some(limit) = producer_input_limit else {
+        if sized_for.is_empty() {
             return false;
-        };
+        }
         let input_source =
             historian_input_source(chunk.chunk.start_index, chunk.chunk.end_index, source);
         let prompt = build_compartment_agent_prompt(&CompartmentPromptInputs {
@@ -1379,25 +1483,27 @@ fn assemble_historian_firing_inner(
             project_memory: &memory_block,
             input_source: &input_source,
             memory_enabled: config.memory_enabled,
+            user_observations_requested: config.user_observations_requested,
             extraction_free: config.extraction_free,
         });
-        let full_tokens = seed.provider_mass(
-            crate::decision_calibration::LocalMass {
-                system: system_tokens,
-                prose: estimate_tokens(&prompt) as f64,
-                tools: 0.0,
-            },
-            true,
-        );
-        full_tokens.is_finite() && full_tokens > 0.0 && full_tokens <= limit as f64
+        let prose = estimate_tokens(&prompt) as f64;
+        sized_for.iter().all(|(seed, limit)| {
+            let full_tokens = seed.provider_mass(
+                crate::decision_calibration::LocalMass {
+                    system: system_tokens,
+                    prose,
+                    tools: 0.0,
+                },
+                true,
+            );
+            full_tokens.is_finite() && full_tokens > 0.0 && full_tokens <= *limit as f64
+        })
     };
     let fitted_atomic_source = oversize_atomic_unit.then(|| {
         fit_atomic_historian_source_to_producer_window(
             &chunk.text,
             &chunk.tool_result_boundaries,
-            primary_context,
-            primary_input,
-            config.max_output_tokens,
+            sized_for.iter().map(|(_, limit)| *limit).min(),
             &fits_producer_prompt,
         )
     });
@@ -1460,6 +1566,7 @@ fn assemble_historian_firing_inner(
         project_memory: &memory_block,
         input_source: &input_source,
         memory_enabled: config.memory_enabled,
+        user_observations_requested: config.user_observations_requested,
         extraction_free: config.extraction_free,
     });
     let fingerprint_items: Vec<_> = chunk
@@ -1541,16 +1648,9 @@ fn ceil_char_boundary(input: &str, requested: usize) -> usize {
 fn fit_atomic_historian_source_to_producer_window(
     input: &str,
     result_boundaries: &[HistorianResultBoundary],
-    context_limit_tokens: Option<usize>,
-    input_limit_tokens: Option<usize>,
-    max_output_tokens: u32,
+    producer_input_limit_tokens: Option<usize>,
     fits_producer_prompt: &impl Fn(&str) -> bool,
 ) -> FittedHistorianSource {
-    let producer_input_limit_tokens = crate::historian::producer_input_token_limit_with_input(
-        context_limit_tokens,
-        input_limit_tokens,
-        max_output_tokens,
-    );
     let original_tokens = estimate_tokens(input);
     let Some(limit) = producer_input_limit_tokens else {
         return FittedHistorianSource {
@@ -1710,7 +1810,7 @@ fn text_parts(message: &FlatMessage<'_>) -> Vec<String> {
         .filter_map(|block| match &block.wire_shape().kind {
             CkKind::Text { .. } => {
                 let text = block.scalar_text().expect("text payload");
-                let cleaned = if message.role == "user" {
+                let cleaned = if message.role == "user" && !block.runner_lane {
                     clean_user_text(&text)
                 } else {
                     text.trim().to_string()
@@ -2585,6 +2685,7 @@ mod tests {
                 memory_enabled: false,
                 auto_promote: true,
                 user_memory_collection_enabled: false,
+                user_observations_requested: true,
                 extraction_free: false,
                 in_emergency: false,
                 force_keep_last_compartment: true,
@@ -2620,6 +2721,443 @@ mod tests {
         )
         .expect("whole component validates");
         assert_eq!(validated.compartments[0].end_message, 3);
+    }
+
+    /// Small primary: a 200,000-token window with a 32,000-token output reserve
+    /// and the 3% estimator margin leaves an input limit of 162,960 tokens.
+    const SMALL_PRIMARY: &str = "opencode/small-free-historian";
+    /// Large fallback with a one-million-token window.
+    const LARGE_FALLBACK: &str = "google/large-flash-historian";
+
+    fn chain_limits(
+        entries: &[(&str, usize)],
+    ) -> BTreeMap<String, crate::historian::HistorianModelLimits> {
+        entries
+            .iter()
+            .map(|(model, context)| {
+                (
+                    model.to_string(),
+                    crate::historian::HistorianModelLimits {
+                        context: Some(*context),
+                        input: None,
+                        output: Some(32_000),
+                    },
+                )
+            })
+            .collect()
+    }
+
+    /// `count` narrative turns of about 1,000 local tokens each, then one
+    /// protected-tail message.
+    fn long_narrative_session(count: u64) -> Vec<CkIngressMessage> {
+        let mut messages: Vec<_> = (1..=count)
+            .map(|ordinal| {
+                let role = if ordinal % 2 == 1 {
+                    "user"
+                } else {
+                    "assistant"
+                };
+                msg(
+                    &format!("m{ordinal}"),
+                    ordinal,
+                    role,
+                    vec![text(&format!(
+                        "turn {ordinal}: {}",
+                        "the migration plan keeps every ledger entry ".repeat(110)
+                    ))],
+                )
+            })
+            .collect();
+        messages.push(msg("tail", count + 1, "user", vec![text("protected tail")]));
+        messages
+    }
+
+    fn assemble_for_chain(
+        messages: &[CkIngressMessage],
+        chain: &[&str],
+        model_limits: BTreeMap<String, crate::historian::HistorianModelLimits>,
+        token_budget: usize,
+    ) -> AssembledHistorianFiring {
+        let projection = project_messages(messages).unwrap();
+        let protected = messages.last().unwrap().ordinal;
+        let (_dir, store) = store_for_tests();
+        let outcome = assemble_historian_firing(
+            &store,
+            messages,
+            &projection.blocks,
+            &projection.identity_by_mid,
+            HistorianAssemblerConfig {
+                expand_tools: BTreeMap::new(),
+                model_limits,
+                model_variants: Default::default(),
+                session_id: "chain-window".to_string(),
+                project_path: "/proj".to_string(),
+                project_slug: "proj".to_string(),
+                model_chain: chain.iter().map(|model| model.to_string()).collect(),
+                token_budget,
+                historian_context_limit_tokens: None,
+                max_output_tokens: 32_000,
+                boundary: crate::boundary::BoundaryResolution {
+                    protected_start_ordinal: protected,
+                    eligible_head: 1..protected,
+                    n_tokens: 9910.0,
+                    floored_by_live_prompt: false,
+                    fenced_by_open_arc: false,
+                    true_raw_eligible_tokens: 1.0,
+                    oversize_atomic_unit: false,
+                    raw_message_count: protected,
+                    boundary_reason: "test".to_string(),
+                },
+                memory_enabled: false,
+                auto_promote: true,
+                user_memory_collection_enabled: false,
+                user_observations_requested: true,
+                extraction_free: false,
+                in_emergency: false,
+                force_keep_last_compartment: true,
+                fold_is_only_reclaim: true,
+                failure_backoff_at_ms: 0,
+                min_chunk_tokens: 0,
+            },
+            1,
+        )
+        .unwrap();
+        let AssembleHistorianFiringOutcome::Fire(firing) = outcome else {
+            panic!("expected firing: {outcome:?}");
+        };
+        *firing
+    }
+
+    /// The calibrated prompt size and limit the per-attempt admission check
+    /// compares when it sends `firing`'s prompt to chain entry `index`.
+    fn attempt_admission(firing: &AssembledHistorianFiring, index: usize) -> (f64, usize) {
+        let model = &firing.model_chain[index];
+        let calibrated = crate::decision_calibration::DecisionCalibration::for_model(Some(model))
+            .provider_mass(
+                crate::decision_calibration::LocalMass {
+                    system: estimate_tokens(crate::historian_prompt::HISTORIAN_SYSTEM_PROMPT)
+                        as f64,
+                    prose: estimate_tokens(&firing.prompt) as f64,
+                    tools: 0.0,
+                },
+                true,
+            );
+        let limit = crate::historian::attempt_producer_input_limit(
+            model,
+            &firing.model_limits,
+            if index == 0 {
+                firing.historian_context_limit_tokens
+            } else {
+                None
+            },
+            firing.historian_context_limit_tokens,
+            firing.max_output_tokens,
+        )
+        .expect("chain model window is known");
+        (calibrated, limit)
+    }
+
+    pub(crate) fn assert_fetched_200k_window_sizes_chunk(
+        model: &str,
+        model_limits: BTreeMap<String, crate::historian::HistorianModelLimits>,
+    ) {
+        let messages = long_narrative_session(400);
+        let firing = assemble_for_chain(&messages, &[model, LARGE_FALLBACK], model_limits, 400_000);
+        let (calibrated, limit) = attempt_admission(&firing, 0);
+        assert!(
+            calibrated <= limit as f64,
+            "the fetched primary window must fit the historian prompt: calibrated_tokens={calibrated} limit={limit}"
+        );
+        assert!(
+            firing.to_ordinal < 400,
+            "chunk was not sized for the 200k window"
+        );
+        assert_eq!(firing.chunk.chunk.end_index, firing.to_ordinal);
+    }
+
+    #[test]
+    fn small_primary_gets_a_chunk_that_fits_its_window_before_a_large_fallback() {
+        let messages = long_narrative_session(400);
+        // A chunk request far above what the primary holds stands in for any
+        // run whose chunk would exceed the smallest window in the chain.
+        let firing = assemble_for_chain(
+            &messages,
+            &[SMALL_PRIMARY, LARGE_FALLBACK],
+            chain_limits(&[(SMALL_PRIMARY, 200_000), (LARGE_FALLBACK, 1_000_000)]),
+            400_000,
+        );
+        let (calibrated, limit) = attempt_admission(&firing, 0);
+        assert_eq!(limit, 162_960);
+        assert!(
+            calibrated <= limit as f64,
+            "primary would refuse: calibrated_tokens={calibrated} limit={limit}"
+        );
+        // The chunk shrank, and it still records exactly the range it covers so
+        // the next run continues right after it.
+        assert_eq!(firing.from_ordinal, 1);
+        assert!(firing.to_ordinal < 400, "to_ordinal={}", firing.to_ordinal);
+        assert_eq!(firing.chunk.chunk.end_index, firing.to_ordinal);
+        assert_eq!(
+            firing.chunk.chunk.lines.last().map(|line| line.ordinal),
+            Some(firing.to_ordinal)
+        );
+        assert!(firing
+            .prompt
+            .contains(&format!("Messages 1-{}:\n\n", firing.to_ordinal)));
+        assert!(!firing.prompt.contains("tokens truncated by Magic Context"));
+        let validated = crate::historian_validate::validate_historian_output(
+            &historian_output(1, firing.to_ordinal, firing.to_ordinal + 1),
+            &firing.chunk.chunk,
+            &firing.prior_compartments,
+            firing.validate_options,
+        )
+        .expect("the shrunk chunk validates over its recorded range");
+        assert_eq!(validated.compartments[0].end_message, firing.to_ordinal);
+    }
+
+    #[test]
+    fn undeclared_output_cap_reserves_the_full_model_maximum_and_declared_cap_keeps_chunk_bytes() {
+        let model = "provider/historian";
+        let messages = long_narrative_session(240);
+        let mut catalog = chain_limits(&[(model, 200_000)]);
+        catalog.get_mut(model).unwrap().output = Some(128_000);
+        let baseline = assemble_for_chain(&messages, &[model], catalog.clone(), 400_000);
+        let all = crate::runner_limits::RunnerLimits {
+            max_steps: true,
+            max_output_tokens: true,
+            no_tools: true,
+        };
+        let mut declared = catalog.clone();
+        all.fit_limits(&[model.into()], &mut declared, None, 32_000)
+            .unwrap();
+        let same = assemble_for_chain(&messages, &[model], declared, 400_000);
+        assert_eq!(same.prompt.as_bytes(), baseline.prompt.as_bytes());
+        assert_eq!(same.chunk.text.as_bytes(), baseline.chunk.text.as_bytes());
+        assert_eq!(
+            same.raw_chunk_messages.as_bytes(),
+            baseline.raw_chunk_messages.as_bytes()
+        );
+        assert_eq!(same.chunk_fingerprint, baseline.chunk_fingerprint);
+        let mut uncapped = catalog;
+        crate::runner_limits::RunnerLimits {
+            max_output_tokens: false,
+            ..all
+        }
+        .fit_limits(&[model.into()], &mut uncapped, None, 32_000)
+        .unwrap();
+        let smaller = assemble_for_chain(&messages, &[model], uncapped, 400_000);
+        assert!(smaller.to_ordinal < baseline.to_ordinal);
+        assert_ne!(smaller.prompt.as_bytes(), baseline.prompt.as_bytes());
+        let (tokens, limit) = attempt_admission(&smaller, 0);
+        assert_eq!(
+            limit, 69_840,
+            "(200000 - 128000) * 0.97, not the quarter-window reserve"
+        );
+        assert!(tokens <= limit as f64);
+        assert!(tokens + 128_000.0 <= 200_000.0);
+    }
+
+    #[test]
+    fn installation_catalog_limits_compare_old_and_uncapped_chunk_sizes() {
+        // Installation-provided models.dev facts. Runtime-only Antigravity
+        // aliases stay unknown; borrowing the canonical model's limits would
+        // hide the fallback policy this fixture needs to exercise.
+        let models = [
+            ("google/antigravity-gemini-3.8-flash", None, None),
+            ("google/antigravity-claude-opus-4-6-thinking", None, None),
+            ("google/gemini-3.8-flash", Some(1_048_576), Some(65_536)),
+            (
+                "anthropic/claude-sonnet-5-5",
+                Some(1_000_000),
+                Some(128_000),
+            ),
+            (
+                "openrouter/meta/muse-spark-1.3-contributor",
+                Some(1_048_576),
+                Some(943_718),
+            ),
+            (
+                "openrouter/google/gemini-3.8-flash",
+                Some(1_048_576),
+                Some(65_536),
+            ),
+        ];
+        let messages = long_narrative_session(400);
+        let broca = crate::runner_limits::RunnerLimits {
+            max_steps: true,
+            no_tools: true,
+            max_output_tokens: false,
+        };
+        assert!(crate::runner_limits::is_zen_model(
+            "opencode/muse-spark-1.3-contributor-free"
+        ));
+        for budget in [
+            crate::config::derive_historian_chunk_tokens(128_000),
+            50_000,
+        ] {
+            for (model, context, output) in models {
+                let old_limits = BTreeMap::from([(
+                    model.into(),
+                    crate::historian::HistorianModelLimits {
+                        context,
+                        output,
+                        input: None,
+                    },
+                )]);
+                let old = assemble_for_chain(&messages, &[model], old_limits.clone(), budget);
+                let mut new_limits = old_limits;
+                broca
+                    .fit_limits(&[model.into()], &mut new_limits, None, 32_000)
+                    .unwrap();
+                let new = assemble_for_chain(&messages, &[model], new_limits, budget);
+                println!("model_fit model={model} requested={budget} old_chunk_bytes={} new_chunk_bytes={} old_end={} new_end={} input_limit={:?}", old.chunk.text.len(), new.chunk.text.len(), old.to_ordinal, new.to_ordinal, crate::historian::attempt_producer_input_limit(model, &new.model_limits, None, None, 32_000));
+                assert!(
+                    new.chunk.text.len() <= old.chunk.text.len(),
+                    "{model}, budget={budget}"
+                );
+                let (calibrated, limit) = attempt_admission(&new, 0);
+                assert!(
+                    calibrated <= limit as f64,
+                    "{model}: {calibrated} > {limit}"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn large_primary_chunk_is_also_sized_for_a_smaller_fallback() {
+        let messages = long_narrative_session(400);
+        let firing = assemble_for_chain(
+            &messages,
+            &[LARGE_FALLBACK, SMALL_PRIMARY],
+            chain_limits(&[(LARGE_FALLBACK, 1_000_000), (SMALL_PRIMARY, 200_000)]),
+            400_000,
+        );
+        for index in 0..2 {
+            let (calibrated, limit) = attempt_admission(&firing, index);
+            assert!(
+                calibrated <= limit as f64,
+                "attempt {index} would refuse: calibrated_tokens={calibrated} limit={limit}"
+            );
+        }
+        assert!(firing.to_ordinal < 400);
+        assert_eq!(firing.chunk.chunk.end_index, firing.to_ordinal);
+    }
+
+    #[test]
+    fn fallback_too_small_for_any_prompt_does_not_shrink_the_chunk() {
+        let messages = long_narrative_session(60);
+        let alone = assemble_for_chain(
+            &messages,
+            &[LARGE_FALLBACK],
+            chain_limits(&[(LARGE_FALLBACK, 1_000_000)]),
+            32_000,
+        );
+        let with_tiny = assemble_for_chain(
+            &messages,
+            &[LARGE_FALLBACK, "tiny/model"],
+            chain_limits(&[(LARGE_FALLBACK, 1_000_000), ("tiny/model", 4_000)]),
+            32_000,
+        );
+        assert_eq!(with_tiny.prompt, alone.prompt);
+        assert_eq!(with_tiny.to_ordinal, alone.to_ordinal);
+    }
+
+    #[test]
+    fn chain_with_room_for_todays_chunk_keeps_prompt_bytes() {
+        // Every window in the chain holds the derived chunk, so the prompt is the
+        // same bytes it is with no window information at all.
+        let messages = long_narrative_session(120);
+        let budget = crate::config::derive_historian_chunk_tokens(128_000);
+        let unguarded = assemble_for_chain(
+            &messages,
+            &[SMALL_PRIMARY, LARGE_FALLBACK],
+            BTreeMap::new(),
+            budget,
+        );
+        let sized = assemble_for_chain(
+            &messages,
+            &[SMALL_PRIMARY, LARGE_FALLBACK],
+            chain_limits(&[(SMALL_PRIMARY, 200_000), (LARGE_FALLBACK, 1_000_000)]),
+            budget,
+        );
+        assert!(unguarded.to_ordinal < 120, "the budget must bind");
+        assert_eq!(sized.prompt, unguarded.prompt);
+        assert_eq!(
+            (sized.from_ordinal, sized.to_ordinal),
+            (unguarded.from_ordinal, unguarded.to_ordinal)
+        );
+    }
+
+    #[test]
+    fn oversize_component_is_split_to_fit_a_small_primary() {
+        // One completed tool arc far larger than the primary's window: the
+        // chunk reader keeps it whole, so only the atomic split can make it fit.
+        let steering = format!("{}CAPACITY_STEERING_END", "result value\n".repeat(80_000));
+        let messages = vec![
+            msg(
+                "a1",
+                1,
+                "assistant",
+                vec![CkKind::ToolCall {
+                    id: "call1".to_string(),
+                    name: "read".to_string(),
+                    input: json!({}),
+                    provider_executed: false,
+                }],
+            ),
+            msg(
+                "u2",
+                2,
+                "user",
+                vec![
+                    text(&steering),
+                    CkKind::ToolResult {
+                        id: "call1".to_string(),
+                        tool_name: "read".to_string(),
+                        output: mc_store::CkToolOutput::bare(mc_store::CkOutputKind::Text {
+                            text: "done".to_string(),
+                        }),
+                        provider_executed: false,
+                    },
+                ],
+            ),
+            msg("u3", 3, "user", vec![text("protected tail")]),
+        ];
+        let unguarded = assemble_for_chain(
+            &messages,
+            &[SMALL_PRIMARY, LARGE_FALLBACK],
+            BTreeMap::new(),
+            32_000,
+        );
+        let sized = assemble_for_chain(
+            &messages,
+            &[SMALL_PRIMARY, LARGE_FALLBACK],
+            chain_limits(&[(SMALL_PRIMARY, 200_000), (LARGE_FALLBACK, 1_000_000)]),
+            32_000,
+        );
+        // Control: the whole component overflows the primary.
+        let primary_limit = attempt_admission(&sized, 0).1 as f64;
+        let whole =
+            crate::decision_calibration::DecisionCalibration::for_model(Some(SMALL_PRIMARY))
+                .provider_mass(
+                    crate::decision_calibration::LocalMass {
+                        system: estimate_tokens(crate::historian_prompt::HISTORIAN_SYSTEM_PROMPT)
+                            as f64,
+                        prose: estimate_tokens(&unguarded.prompt) as f64,
+                        tools: 0.0,
+                    },
+                    true,
+                );
+        assert!(whole > primary_limit);
+        let (calibrated, limit) = attempt_admission(&sized, 0);
+        assert!(
+            calibrated <= limit as f64,
+            "primary would refuse: calibrated_tokens={calibrated} limit={limit}"
+        );
+        assert!(sized.prompt.contains("tokens truncated by Magic Context"));
+        // Coverage of the component stays whole.
+        assert_eq!((sized.from_ordinal, sized.to_ordinal), (1, 2));
     }
 
     #[test]
@@ -2693,6 +3231,7 @@ mod tests {
                 project_memory: "",
                 input_source: source,
                 memory_enabled: false,
+                user_observations_requested: true,
                 extraction_free: false,
             });
             let calibration = crate::decision_calibration::DecisionCalibration::for_model(Some(
@@ -2722,9 +3261,11 @@ mod tests {
                 source_offset: input.rfind("[4]").unwrap(),
                 body_tokens: 10_000,
             }],
-            Some(context_limit_tokens),
-            None,
-            max_output_tokens,
+            crate::historian::producer_input_token_limit_with_input(
+                Some(context_limit_tokens),
+                None,
+                max_output_tokens,
+            ),
             &fits_prompt,
         );
         let limit = crate::historian::producer_input_token_limit_with_input(
@@ -2741,6 +3282,7 @@ mod tests {
             project_memory: "",
             input_source: &fitted.text,
             memory_enabled: false,
+            user_observations_requested: true,
             extraction_free: false,
         });
         let calibration = crate::decision_calibration::DecisionCalibration::for_model(Some(
@@ -3025,6 +3567,7 @@ mod tests {
             memory_enabled: false,
             auto_promote: false,
             user_memory_collection_enabled: false,
+            user_observations_requested: true,
             extraction_free: false,
             in_emergency: true,
             force_keep_last_compartment: false,
@@ -3167,6 +3710,7 @@ mod tests {
                 memory_enabled: false,
                 auto_promote: true,
                 user_memory_collection_enabled: false,
+                user_observations_requested: true,
                 extraction_free: false,
                 in_emergency,
                 force_keep_last_compartment: false,
@@ -3227,6 +3771,7 @@ mod tests {
                 memory_enabled: false,
                 auto_promote: true,
                 user_memory_collection_enabled: false,
+                user_observations_requested: true,
                 extraction_free: false,
                 in_emergency,
                 force_keep_last_compartment: false,
@@ -3312,6 +3857,7 @@ mod tests {
                 memory_enabled: false,
                 auto_promote: true,
                 user_memory_collection_enabled: false,
+                user_observations_requested: true,
                 extraction_free: false,
                 in_emergency: false,
                 force_keep_last_compartment: false,
@@ -3773,6 +4319,9 @@ mod tests {
 }
 
 #[cfg(test)]
+pub(crate) use tests::assert_fetched_200k_window_sizes_chunk;
+
+#[cfg(test)]
 mod calibration_budget_tests {
     #[test]
     fn producer_source_budget_uses_producer_static_seed() {
@@ -3846,9 +4395,11 @@ mod prompt_fit_tests {
             compartments,
             memories,
             memory_enabled: true,
+            user_observations_requested: true,
             extraction_free: false,
             limit: Some(limit),
             seed: &seed,
+            fallback_limits: &[],
             system_tokens,
             requested: 10_000,
         });
@@ -3858,6 +4409,7 @@ mod prompt_fit_tests {
             project_memory: &fit.memory_block,
             input_source: "Messages 61-400:\n\n",
             memory_enabled: true,
+            user_observations_requested: true,
             extraction_free: false,
         });
         let sent = seed.provider_mass(
@@ -3908,6 +4460,7 @@ mod prompt_fit_tests {
                 project_memory: "",
                 input_source: "Messages 61-400:\n\n",
                 memory_enabled: true,
+                user_observations_requested: true,
                 extraction_free: false,
             });
             let limit = seed
@@ -3927,9 +4480,11 @@ mod prompt_fit_tests {
                 compartments: &compartments,
                 memories: &[],
                 memory_enabled: true,
+                user_observations_requested: true,
                 extraction_free: false,
                 limit: Some(limit),
                 seed: &seed,
+                fallback_limits: &[],
                 system_tokens,
                 requested: 10_000,
             });
@@ -3967,6 +4522,7 @@ mod prompt_fit_tests {
             project_memory: &render_historian_memory_block(&memories),
             input_source: "Messages 61-400:\n\n",
             memory_enabled: true,
+            user_observations_requested: true,
             extraction_free: false,
         });
         let full_mass = seed.provider_mass(
@@ -3986,6 +4542,43 @@ mod prompt_fit_tests {
         assert!(fit.kept.1 > 0 && fit.kept.1 < 300);
         assert_eq!(fit.kept.2, SEED_FLOOR);
         assert!(sent <= limit as f64);
+    }
+
+    #[test]
+    fn memory_off_fit_and_prompt_omit_project_memories() {
+        let memories = memories(3);
+        let seed = DecisionCalibration::for_model(Some(MODEL));
+        for limit in [None, Some(1_000_000)] {
+            let fit = fit_historian_prompt(&HistorianPromptFitInput {
+                session_id: "ses-memory-off",
+                chunk_start: 1,
+                last_ordinal: 5,
+                compartments: &[],
+                memories: &memories,
+                memory_enabled: false,
+                user_observations_requested: true,
+                extraction_free: false,
+                limit,
+                seed: &seed,
+                fallback_limits: &[],
+                system_tokens: 1000.0,
+                requested: 1000,
+            });
+            assert!(fit.memory_block.is_empty());
+            assert_eq!(fit.kept.1, 0);
+        }
+        let prompt = build_compartment_agent_prompt(&CompartmentPromptInputs {
+            seed_examples: "",
+            session_references: "",
+            project_memory: "<project-memory>private project memory</project-memory>",
+            input_source: "Messages 1-5: transcript",
+            memory_enabled: false,
+            user_observations_requested: true,
+            extraction_free: false,
+        });
+        assert!(!prompt.contains("private project memory"));
+        assert!(!prompt.contains("<project-memory>"));
+        assert!(prompt.contains("Messages 1-5: transcript"));
     }
 
     #[test]

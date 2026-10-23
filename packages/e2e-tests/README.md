@@ -39,9 +39,10 @@ bun run replay:transform-wire-parity -- --fixture ./fixtures/my-replay.json --pr
 
 The command prints sanitized JSON and exits nonzero when any value-space difference
 is not covered by an exact adjudication. It needs the same Rust prerequisites as
-`test:rust-e2e`. The CI-sized guards are `tests/paired-session-replay.test.ts`
-(differ classification) and `tests/rust-paired-session-replay.test.ts` (real paired
-stack).
+`test:rust-e2e`. The CI-sized guard is `tests/paired-session-replay.test.ts`
+(differ classification). The real paired-stack test, which compared the TypeScript
+wire with the plugin's former full-array Rust transform, was removed when that
+transform was deleted.
 
 ### Fixture contract
 

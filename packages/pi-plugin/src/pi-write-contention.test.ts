@@ -17,6 +17,10 @@ import { createTagger } from "@magic-context/core/features/magic-context/tagger"
 import { applyPendingOperations } from "@magic-context/core/hooks/magic-context/apply-operations";
 import { Database } from "@magic-context/core/shared/sqlite";
 import { tagTranscript } from "@magic-context/core/shared/tag-transcript";
+import {
+	clearSessionMetaFixtureFault,
+	rejectSessionMetaCollectionWrites,
+} from "../../plugin/src/features/magic-context/__tests__/session-meta-faults";
 import { createTestTempDirFromPath } from "../../plugin/src/shared/test-temp-dir";
 import { authorizePiToolRemoval } from "./native-replay-state-pi";
 import {
@@ -78,8 +82,11 @@ it("Pi write admission preserves the last served array under contention and retr
 		const tag = [...targets.keys()][0];
 		if (tag === undefined) throw new Error("Expected a reclaim target");
 		queuePendingOp(db, sessionId, tag, "drop");
-		db.exec(
-			"CREATE TRIGGER fail_marker BEFORE UPDATE OF trailing_blank_decisions ON session_meta BEGIN SELECT RAISE(ABORT, 'database is locked'); END",
+		rejectSessionMetaCollectionWrites(
+			db,
+			"trailing_blank_decisions",
+			"fail_marker",
+			{ error: "database is locked" },
 		);
 		const vetoed = prepare();
 		expect(
@@ -88,7 +95,7 @@ it("Pi write admission preserves the last served array under contention and retr
 		vetoed.transcript.commit();
 		expect(hash(vetoed.transcript)).toBe(lastGoodHash);
 		expect(getPendingOps(db, sessionId)).toHaveLength(1);
-		db.exec("DROP TRIGGER fail_marker");
+		clearSessionMetaFixtureFault(db, "fail_marker");
 		removalAttempts = 0;
 		db.exec("PRAGMA busy_timeout=1");
 		blocker.exec("BEGIN IMMEDIATE");

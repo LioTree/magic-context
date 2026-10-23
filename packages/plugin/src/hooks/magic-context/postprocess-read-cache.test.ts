@@ -4,6 +4,7 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { initializeDatabase } from "../../features/magic-context/storage-db";
 import { getOrCreateSessionMeta } from "../../features/magic-context/storage-meta-session";
+import { updateSessionMetaCollection } from "../../features/magic-context/storage-session-collections";
 import { insertTag, updateTagStatus } from "../../features/magic-context/storage-tags";
 import { Database } from "../../shared/sqlite";
 import { createTestTempDirFromPath } from "../../shared/test-temp-dir";
@@ -69,9 +70,11 @@ it("isolates pass-local frozen decisions and reloads changed replay rows", () =>
     const replay = postprocessReplaySnapshot(db, "replay-cache");
     expect(replay.strippedPlaceholderIds.has("not-committed")).toBe(false);
     expect(replay.trailingBlankDecisions.has("not-committed")).toBe(false);
-    db.prepare("UPDATE session_meta SET trailing_blank_decisions = ? WHERE session_id = ?").run(
-        JSON.stringify({ committed: "strip" }),
+    updateSessionMetaCollection(
+        db,
         "replay-cache",
+        "trailing_blank_decisions",
+        JSON.stringify({ committed: "strip" }),
     );
     expect(
         postprocessReplaySnapshot(db, "replay-cache").trailingBlankDecisions.get("committed"),

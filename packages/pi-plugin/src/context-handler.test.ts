@@ -79,6 +79,7 @@ import { resolvePromptSurface } from "@magic-context/core/shared/prompt-surface"
 import { closeQuietly } from "@magic-context/core/shared/sqlite-helpers";
 import type { SubagentRunner } from "@magic-context/core/shared/subagent-runner";
 import { tagTranscript } from "@magic-context/core/shared/tag-transcript";
+import { patchSessionMeta } from "../../plugin/src/features/magic-context/__tests__/session-meta-fixture";
 import { isPrefixBoundThinkingModel } from "../../plugin/src/features/magic-context/overflow-detection";
 import * as decisionLogs from "../../plugin/src/features/magic-context/transform-decision-log";
 import { createTestTempDirFromPath } from "../../plugin/src/shared/test-temp-dir";
@@ -784,7 +785,7 @@ describe("Pi pressure guards", () => {
 			expect(src).toContain("let pendingOpsDidMutate = false");
 			expect(src).toContain("let heuristicOrReasoningDidMutate = false");
 			expect(src).toContain(
-				"let isCacheBustingPass = prefixMutationAllowed && hasReclaimRide(rideSignals)",
+				"isCacheBustingPass = prefixMutationAllowed && hasReclaimRide(rideSignals)",
 			);
 			expect(src).toContain("if (identityRebuild) {");
 			expect(src).toMatch(
@@ -956,7 +957,7 @@ describe("Pi scheduler decision observability", () => {
 			// The fall-through label names the reclaim ride that granted the pass.
 			// It used to read "scheduler_execute", which is not the permission.
 			expect(lines).toContain(
-				"heuristics WILL RUN — reason=ride=explicitFlush+publishedHistory (pendingOps=1, scheduler=execute), context=75.0%, turn=n/a",
+				"heuristics WILL RUN — reason=ride=publishedHistory (pendingOps=1, scheduler=execute), context=75.0%, turn=n/a",
 			);
 			expect(getPendingOps(db, sessionId)).toHaveLength(0);
 			expect(
@@ -5872,19 +5873,13 @@ describe("registerPiContextHandler", () => {
 						if (args[2].length > 0) return injectM0M1Pi(...args);
 						if (competingWrites === 0) {
 							competingWrites += 1;
-							db.prepare(
-								`UPDATE session_meta
-								    SET cached_m0_bytes = ?,
-								        cached_m0_last_baseline_end_message_id = ?
-								  WHERE session_id = ?`,
-							).run(
-								Buffer.from(
+							patchSessionMeta(db, sessionId, {
+								cached_m0_bytes: Buffer.from(
 									"<session-history>PAIR_B</session-history>",
 									"utf8",
 								),
-								"entry-user",
-								sessionId,
-							);
+								cached_m0_last_baseline_end_message_id: "entry-user",
+							});
 						}
 						const exec = db.exec.bind(db);
 						const blocker = spyOn(db, "exec").mockImplementation((sql) => {
@@ -6055,7 +6050,7 @@ describe("registerPiContextHandler", () => {
 					).run(sessionId);
 				if (mode === "first")
 					db.prepare(
-						"UPDATE session_meta SET cached_m0_bytes = NULL, cached_m1_bytes = NULL WHERE session_id = ?",
+						"DELETE FROM session_render_cache WHERE cache_key IN ('cached_m0_bytes', 'cached_m1_bytes') AND session_id = ?",
 					).run(sessionId);
 				let sawFallback = false;
 				restoreInjection = contextHandlerInternals.setInjectM0M1PiForTests(
@@ -6775,7 +6770,51 @@ describe("registerPiContextHandler", () => {
 			}
 		});
 
-		it("preserves blob_Y and deferred signal when CAS clear loses to a newer blob", async () => {
+		it("retries the durable marker after serving and consuming publication flags", async () => {
+			const db = createTestDb();
+			const sessionId = "ses-pi-marker-independent-retry";
+			let unavailable = true;
+			const appendCompaction = mock(() =>
+				unavailable ? undefined : "compact-retry",
+			);
+			try {
+				seedCompartment(db, sessionId);
+				setPendingPiCompactionMarkerState(db, sessionId, {
+					firstKeptEntryId: "entry-3",
+					endMessageId: "entry-2",
+					ordinal: 2,
+					tokensBefore: 10,
+					summary: "summary",
+					publishedAt: 1,
+				});
+				signalPiDeferredHistoryRefresh(sessionId);
+				signalPiDeferredMaterialization(sessionId);
+				await runDrainPass({
+					db,
+					sessionId,
+					appendCompaction,
+					contextPercent: 70,
+				});
+				expect(appendCompaction).toHaveBeenCalledTimes(1);
+				expect(getPendingPiCompactionMarkerState(db, sessionId)).not.toBeNull();
+				expect(consumeDeferredHistoryRefresh(sessionId)).toBe(false);
+				expect(consumeDeferredMaterialization(sessionId)).toBe(false);
+				unavailable = false;
+				await runDrainPass({
+					db,
+					sessionId,
+					appendCompaction,
+					contextPercent: 70,
+				});
+				expect(appendCompaction).toHaveBeenCalledTimes(2);
+				expect(getPendingPiCompactionMarkerState(db, sessionId)).toBeNull();
+			} finally {
+				clearContextHandlerSession(sessionId);
+				closeQuietly(db);
+			}
+		});
+
+		it("preserves blob_Y independently of served publication bookkeeping when CAS clear loses", async () => {
 			const db = createTestDb();
 			const sessionId = "ses-pi-marker-cas-loss";
 			const blobY = {
@@ -6806,7 +6845,7 @@ describe("registerPiContextHandler", () => {
 				await runDrainPass({ db, sessionId, appendCompaction });
 
 				expect(getPendingPiCompactionMarkerState(db, sessionId)).toEqual(blobY);
-				expect(consumeDeferredHistoryRefresh(sessionId)).toBe(true);
+				expect(consumeDeferredHistoryRefresh(sessionId)).toBe(false);
 			} finally {
 				clearContextHandlerSession(sessionId);
 				closeQuietly(db);
@@ -8548,23 +8587,25 @@ it("019de471 decision rows hold execute batches until the publication opportunit
 			event: { messages: never[] },
 			ctx: never,
 		) => Promise<{ messages: never[] }>;
-		const pass = (percent: number) =>
-			handler(
-				{
-					messages: [
-						userMessage("keep", 1),
-						assistantMessage("queued evidence", 2),
-					] as never[],
-				},
-				{
-					...fakeContext(sessionId),
-					getContextUsage: () => ({
-						tokens: percent * 1000,
-						percent,
-						contextWindow: 100000,
-					}),
-				} as never,
-			);
+		const pass = (percent: number) => {
+			const messages = [
+				userMessage("keep", 1),
+				assistantMessage("queued evidence", 2),
+			];
+			return handler({ messages: messages as never[] }, {
+				...fakeContext(
+					sessionId,
+					process.cwd(),
+					["entry-1", "entry-2"],
+					messages,
+				),
+				getContextUsage: () => ({
+					tokens: percent * 1000,
+					percent,
+					contextWindow: 100000,
+				}),
+			} as never);
+		};
 		await pass(20);
 		const baseline = await pass(20);
 		queuePendingOp(db, sessionId, 2, "drop");
@@ -8588,6 +8629,8 @@ it("019de471 decision rows hold execute batches until the publication opportunit
 				endMessage: 1,
 				title: "Published history",
 				content: "U: keep",
+				startMessageId: "entry-1",
+				endMessageId: "entry-1",
 			},
 		]);
 		signalPiDeferredHistoryRefresh(sessionId);
@@ -9145,7 +9188,8 @@ describe("Pi proactive strip of invalidated thinking", () => {
 				return (result?.messages ?? messages) as unknown[];
 			};
 
-			// The first render busts the cache, so it already strips all thinking.
+			// Initial tag allocation adds handles before the older thinking blocks.
+			// That actual edit, not first-render permission alone, requires the strip.
 			const first = await pass(false);
 			expect(first.map(thinkingIn)).toEqual([0, 0, 0, 0, 0]);
 
@@ -9164,7 +9208,8 @@ describe("Pi proactive strip of invalidated thinking", () => {
 				new Set([
 					"binding_mismatch:entry-a1",
 					"binding_mismatch:entry-a2",
-					"binding_mismatch_order:end",
+					"binding_mismatch_entry_order:end:entry-a1",
+					"binding_mismatch_entry_order:end:entry-a2",
 				]),
 			);
 
@@ -9284,7 +9329,7 @@ describe("Pi proactive strip of invalidated thinking", () => {
 				(tag) => tag.messageId === "entry-u3:p0",
 			);
 			if (!dropped) throw new Error("missing tag for an older user message");
-			updateTagStatus(db, sessionId, dropped.tagNumber, "dropped");
+			queuePendingOp(db, sessionId, dropped.tagNumber, "drop");
 			signalPiPendingMaterialization(sessionId);
 			const dropPass = await pass(10, 96, true);
 			// Complete the active turn before introducing the external old-user

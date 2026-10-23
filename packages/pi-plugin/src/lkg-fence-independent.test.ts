@@ -293,7 +293,6 @@ test.skipIf(!root || !host)(
 					]),
 				});
 				dispose = async () => {
-					transform.disposeRust();
 					storage.closeDatabase();
 					availability.resetCtxReduceRegisteredGloballyForTest();
 				};

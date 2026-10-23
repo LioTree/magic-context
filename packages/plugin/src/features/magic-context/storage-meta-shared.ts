@@ -2,6 +2,8 @@ import { Buffer } from "node:buffer";
 import { getHarness, type HarnessId } from "../../shared/harness";
 import { piModelRefToCanonical } from "../../shared/harness-provider-map";
 import { type Database, prepareCachedStatement, type Statement } from "../../shared/sqlite";
+import { clearSessionRenderCache, writeSessionRenderCache } from "./storage-session-cache";
+import { writeSessionMetaCollection } from "./storage-session-collections";
 import type { SessionMeta } from "./types";
 
 export interface SessionMetaRow {
@@ -526,11 +528,24 @@ export function persistCachedM0(
     sessionId: string,
     payload: PersistCachedM0Payload,
 ): void {
-    ensureSessionMetaRow(db, sessionId);
-    db.prepare(
-        `UPDATE session_meta SET
-            cached_m0_bytes = ?,
-            cached_m0_mural_data_url = ?,
+    db.transaction(() => {
+        ensureSessionMetaRow(db, sessionId);
+        writeSessionRenderCache(db, sessionId, "cached_m0_bytes", Buffer.from(payload.m0Bytes));
+        writeSessionRenderCache(
+            db,
+            sessionId,
+            "cached_m1_bytes",
+            payload.m1Bytes ? Buffer.from(payload.m1Bytes) : null,
+        );
+        writeSessionRenderCache(
+            db,
+            sessionId,
+            "cached_m0_mural_data_url",
+            payload.muralDataUrl ?? null,
+        );
+        writeSessionRenderCache(db, sessionId, "cached_m0_upgrade_state", payload.upgradeState);
+        db.prepare(
+            `UPDATE session_meta SET
             cached_m0_mural_hash = ?,
             cached_m0_project_memory_epoch = ?,
             cached_m0_workspace_fingerprint = ?,
@@ -539,84 +554,89 @@ export function persistCachedM0(
             cached_m0_max_memory_id = ?,
             cached_m0_max_mutation_id = ?,
             cached_m0_max_memory_mutation_id = ?,
-            cached_m1_bytes = ?,
             cached_m0_project_docs_hash = ?,
             cached_m0_materialized_at = ?,
             cached_m0_session_facts_version = ?,
-            cached_m0_upgrade_state = ?,
             cached_m0_system_hash = ?,
             cached_m0_tool_set_hash = ?,
             cached_m0_model_key = ?,
             cached_m0_project_identity = ?
          WHERE session_id = ?`,
-    ).run(
-        Buffer.from(payload.m0Bytes),
-        payload.muralDataUrl ?? null,
-        payload.muralHash ?? null,
-        payload.projectMemoryEpoch,
-        payload.workspaceFingerprint ?? null,
-        payload.projectUserProfileVersion,
-        payload.maxCompartmentSeq,
-        payload.maxMemoryId,
-        payload.maxMutationId,
-        payload.maxMemoryMutationId ?? null,
-        payload.m1Bytes ? Buffer.from(payload.m1Bytes) : null,
-        payload.projectDocsHash,
-        payload.materializedAt,
-        payload.sessionFactsVersion,
-        payload.upgradeState,
-        payload.systemHash ?? "",
-        payload.toolSetHash ?? "",
-        payload.modelKey ? piModelRefToCanonical(payload.modelKey) : "",
-        payload.projectIdentity ?? null,
-        sessionId,
-    );
+        ).run(
+            payload.muralHash ?? null,
+            payload.projectMemoryEpoch,
+            payload.workspaceFingerprint ?? null,
+            payload.projectUserProfileVersion,
+            payload.maxCompartmentSeq,
+            payload.maxMemoryId,
+            payload.maxMutationId,
+            payload.maxMemoryMutationId ?? null,
+            payload.projectDocsHash,
+            payload.materializedAt,
+            payload.sessionFactsVersion,
+            payload.systemHash ?? "",
+            payload.toolSetHash ?? "",
+            payload.modelKey ? piModelRefToCanonical(payload.modelKey) : "",
+            payload.projectIdentity ?? null,
+            sessionId,
+        );
+    }).immediate();
 }
 
 export function clearCachedM0M1(db: Database, sessionId: string): void {
-    ensureSessionMetaRow(db, sessionId);
-    const existingColumns = new Set(
-        (db.prepare("PRAGMA table_info(session_meta)").all() as Array<{ name?: string }>).map(
-            (column) => column.name,
-        ),
-    );
-    const clears: Array<[string, string | number | null]> = [
-        ["cached_m0_bytes", null],
-        ["cached_m0_mural_data_url", null],
-        ["cached_m0_mural_hash", null],
-        ["cached_m1_bytes", null],
-        ["cached_m0_project_memory_epoch", null],
-        ["cached_m0_workspace_fingerprint", null],
-        ["cached_m0_project_user_profile_version", null],
-        ["cached_m0_max_compartment_seq", null],
-        ["cached_m0_max_memory_id", null],
-        ["cached_m0_max_mutation_id", null],
-        ["cached_m0_max_memory_mutation_id", null],
-        ["cached_m0_project_docs_hash", null],
-        ["cached_m0_materialized_at", null],
-        ["cached_m0_session_facts_version", null],
-        ["cached_m0_upgrade_state", null],
-        ["cached_m0_system_hash", null],
-        ["cached_m0_tool_set_hash", null],
-        ["cached_m0_model_key", null],
-        ["cached_m0_project_identity", null],
-        ["cached_m0_last_baseline_end_message_id", null],
-        ["memory_block_cache", ""],
-        ["memory_block_count", 0],
-        ["memory_block_ids", ""],
-    ];
-    const setClauses: string[] = [];
-    const values: Array<string | number | null> = [];
-    for (const [column, value] of clears) {
-        if (!existingColumns.has(column)) continue;
-        setClauses.push(`${column} = ?`);
-        values.push(value);
-    }
-    if (setClauses.length === 0) return;
-    db.prepare(`UPDATE session_meta SET ${setClauses.join(", ")} WHERE session_id = ?`).run(
-        ...values,
-        sessionId,
-    );
+    db.transaction(() => {
+        ensureSessionMetaRow(db, sessionId);
+        if (db.prepare("SELECT 1 FROM sqlite_master WHERE name = 'session_render_cache'").get())
+            clearSessionRenderCache(db, sessionId);
+        const existingColumns = new Set(
+            (db.prepare("PRAGMA table_info(session_meta)").all() as Array<{ name?: string }>).map(
+                (column) => column.name,
+            ),
+        );
+        if (
+            existingColumns.has("memory_block_ids") ||
+            db.prepare("SELECT 1 FROM sqlite_master WHERE name='session_meta_chunks'").get()
+        ) {
+            writeSessionMetaCollection(db, sessionId, "memory_block_ids", "");
+        }
+        const clears: Array<[string, string | number | null]> = [
+            ["cached_m0_bytes", null],
+            ["cached_m1_bytes", null],
+            ["cached_m0_mural_data_url", null],
+            ["memory_block_cache", ""],
+            ["cached_m0_mural_hash", null],
+            ["cached_m0_project_memory_epoch", null],
+            ["cached_m0_workspace_fingerprint", null],
+            ["cached_m0_project_user_profile_version", null],
+            ["cached_m0_max_compartment_seq", null],
+            ["cached_m0_max_memory_id", null],
+            ["cached_m0_max_mutation_id", null],
+            ["cached_m0_max_memory_mutation_id", null],
+            ["cached_m0_project_docs_hash", null],
+            ["cached_m0_materialized_at", null],
+            ["cached_m0_session_facts_version", null],
+            ["cached_m0_upgrade_state", null],
+            ["cached_m0_system_hash", null],
+            ["cached_m0_tool_set_hash", null],
+            ["cached_m0_model_key", null],
+            ["cached_m0_project_identity", null],
+            ["cached_m0_last_baseline_end_message_id", null],
+            ["memory_block_count", 0],
+            ["memory_block_ids", ""],
+        ];
+        const setClauses: string[] = [];
+        const values: Array<string | number | null> = [];
+        for (const [column, value] of clears) {
+            if (!existingColumns.has(column)) continue;
+            setClauses.push(`${column} = ?`);
+            values.push(value);
+        }
+        if (setClauses.length === 0) return;
+        db.prepare(`UPDATE session_meta SET ${setClauses.join(", ")} WHERE session_id = ?`).run(
+            ...values,
+            sessionId,
+        );
+    }).immediate();
 }
 
 export function clearCachedM0(db: Database, sessionId: string): void {

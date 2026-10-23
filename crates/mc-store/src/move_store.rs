@@ -576,6 +576,26 @@ impl MoveStore {
         })
     }
     pub fn capture(&self, cut: &str, path: &Path) -> Result<u64, MoveError> {
+        self.capture_inner(cut, path, |_| {})
+    }
+
+    // The test commits through a peer store after the read snapshot is pinned.
+    #[cfg(test)]
+    fn capture_with_snapshot_hook(
+        &self,
+        cut: &str,
+        path: &Path,
+        on_snapshot_ready: impl FnOnce(&Connection),
+    ) -> Result<u64, MoveError> {
+        self.capture_inner(cut, path, on_snapshot_ready)
+    }
+
+    fn capture_inner(
+        &self,
+        cut: &str,
+        path: &Path,
+        on_snapshot_ready: impl FnOnce(&Connection),
+    ) -> Result<u64, MoveError> {
         let mut reader = Connection::open_with_flags(
             &self.path,
             OpenFlags::SQLITE_OPEN_READ_ONLY | OpenFlags::SQLITE_OPEN_NO_MUTEX,
@@ -588,6 +608,7 @@ impl MoveStore {
             )
             .optional()?
             .ok_or_else(|| MoveError::refusal("session_moving"))?;
+        let session_for_check = session.as_str();
         let file = crate::private_permissions::create_file(path, true)?;
         let mut out = BufWriter::new(file);
         let result = codec::capture_half_checked(
@@ -595,8 +616,8 @@ impl MoveStore {
             Store::Module,
             &session,
             &mut out,
-            |conn| {
-                let frozen: bool = conn.query_row("SELECT EXISTS(SELECT 1 FROM mc_move_fences WHERE cut_id = ?1 AND session_id = ?2 AND phase = 'frozen')",params![cut,session],|r|r.get(0))?;
+            move |conn| {
+                let frozen: bool = conn.query_row("SELECT EXISTS(SELECT 1 FROM mc_move_fences WHERE cut_id = ?1 AND session_id = ?2 AND phase = 'frozen')",params![cut,session_for_check],|r|r.get(0))?;
                 if !frozen {
                     return Err(SnapshotError::Invalid("session_moving"));
                 }
@@ -605,6 +626,7 @@ impl MoveStore {
                 {
                     return Err(SnapshotError::Invalid("schema_mismatch"));
                 }
+                on_snapshot_ready(conn);
                 Ok(())
             },
         );

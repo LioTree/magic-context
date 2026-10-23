@@ -16,6 +16,7 @@ import {
     type PendingPiCompactionMarker,
 } from "../../features/magic-context/storage-meta-persisted";
 import { clearCachedM0M1 } from "../../features/magic-context/storage-meta-shared";
+import { sessionRenderCacheValueSql } from "../../features/magic-context/storage-session-cache";
 import { sessionLog } from "../../shared/logger";
 import type { Database } from "../../shared/sqlite";
 import { getActiveCompartmentRun } from "./compartment-runner";
@@ -95,7 +96,7 @@ type HistoryAnchor = HistoryBoundary & Pick<Compartment, "endMessage">;
 function readBaseline(db: Database, sessionId: string): BaselineRow {
     const row = db
         .prepare(
-            "SELECT cached_m0_bytes IS NOT NULL AS hasM0, cached_m0_last_baseline_end_message_id AS boundary FROM session_meta WHERE session_id = ?",
+            `SELECT ${sessionRenderCacheValueSql("cached_m0_bytes")} IS NOT NULL AS hasM0, cached_m0_last_baseline_end_message_id AS boundary FROM session_meta WHERE session_id = ?`,
         )
         .get(sessionId) as { hasM0: number | null; boundary: string | null } | null | undefined;
     return {

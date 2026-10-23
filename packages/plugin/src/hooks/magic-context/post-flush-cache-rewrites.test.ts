@@ -173,6 +173,86 @@ for (const order of ["system-first", "messages-first"] as const) {
     });
 }
 
+// A date line is part of the system prompt, so changing it invalidates every
+// signed thinking block still served. A busting pass that keeps such a block
+// withholds a date-only refresh; the refresh lands on a later busting pass that
+// serves none, such as one whose landed edit also removed the older thinking.
+for (const order of ["system-first", "messages-first"] as const) {
+    it(`a date-only refresh waits while signed thinking is served (${order})`, async () => {
+        const db = setup();
+        const signals = promptHandler(db, () => order === "messages-first");
+        registerSystemDateRefresh(signals.historyRefreshSessions);
+        const prompt = (date: string) => [`Base\nToday's date: ${date}`];
+        const base = { system: prompt("2026-10-12") };
+        await signals.handler({ sessionID: sessionId }, base);
+        const pass = async (keptSignedThinking: boolean) => {
+            signals.systemPromptRefreshSessions.add(sessionId);
+            const output = { system: prompt("2026-10-13") };
+            const messages = () =>
+                beginSystemDateRequest(
+                    signals.historyRefreshSessions,
+                    sessionId,
+                    "messages",
+                    "user",
+                    output,
+                );
+            // The messages transform busted the cache on both passes.
+            if (order === "messages-first")
+                finishSystemDateRefresh(
+                    signals.historyRefreshSessions,
+                    messages(),
+                    true,
+                    keptSignedThinking,
+                );
+            await signals.handler({ sessionID: sessionId, dateRefreshRequest: output }, output);
+            if (order === "system-first")
+                finishSystemDateRefresh(
+                    signals.historyRefreshSessions,
+                    messages(),
+                    true,
+                    keptSignedThinking,
+                );
+            return output.system;
+        };
+        expect(await pass(true)).toEqual(base.system);
+        expect(signals.systemPromptRefreshSessions.has(sessionId)).toBe(true);
+        expect((await pass(false)).join("\n")).toContain("Today's date: 2026-10-13");
+        expect(signals.systemPromptRefreshSessions.has(sessionId)).toBe(false);
+    });
+}
+
+for (const keptSignedThinking of [true, false]) {
+    it(`an idle-expired request ${keptSignedThinking ? "keeps" : "advances"} the date when its messages ${keptSignedThinking ? "kept" : "kept no"} signed thinking`, async () => {
+        const db = setup();
+        const signals = promptHandler(db, () => true);
+        registerSystemDateRefresh(signals.historyRefreshSessions);
+        const base = { system: ["Base\nToday's date: 2026-10-12"] };
+        await signals.handler({ sessionID: sessionId }, base);
+        updateSessionMeta(db, sessionId, {
+            cacheTtl: "5m",
+            lastResponseTime: Date.now() - 600_000,
+        });
+        const output = { system: ["Base\nToday's date: 2026-10-13"] };
+        // OpenCode 1 order: the messages transform already served this request.
+        finishSystemDateRefresh(
+            signals.historyRefreshSessions,
+            beginSystemDateRequest(
+                signals.historyRefreshSessions,
+                sessionId,
+                "messages",
+                "user",
+                output,
+            ),
+            false,
+            keptSignedThinking,
+        );
+        await signals.handler({ sessionID: sessionId, dateRefreshRequest: output }, output);
+        expect(output.system.join("\n")).toContain(
+            `Today's date: ${keptSignedThinking ? "2026-10-12" : "2026-10-13"}`,
+        );
+    });
+}
+
 it("opaque thinking uses assistant usage, then a signature-length-independent fallback", () => {
     const row = (
         type: "thinking" | "redacted_thinking",
@@ -419,6 +499,10 @@ for (const contentChange of [false, true]) {
                 );
             mkdirSync(join(root!, "opencode"), { recursive: true });
             const hostDb = new Database(join(root!, "opencode", "opencode.db"));
+            // Create the fixture in WAL mode like OpenCode. Schema writes create the
+            // -wal/-shm files; without them, macOS SQLite can reject a readonly worker's
+            // first read after a late switch from rollback journaling to WAL.
+            hostDb.exec("PRAGMA journal_mode=WAL");
             hostDb.exec(
                 "CREATE TABLE message (id TEXT PRIMARY KEY, session_id TEXT, time_created INTEGER, time_updated INTEGER, data TEXT); CREATE TABLE part (id TEXT PRIMARY KEY, message_id TEXT, session_id TEXT, time_created INTEGER, time_updated INTEGER, data TEXT)",
             );

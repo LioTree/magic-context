@@ -17,6 +17,7 @@ import {
 	statusColumnsFor,
 } from "@magic-context/core/shared/status-view";
 import { checkLocalStatusSource } from "@magic-context/core/shared/status-view-check";
+import { patchSessionMeta } from "../../../plugin/src/features/magic-context/__tests__/session-meta-fixture";
 import {
 	clearPiChannel1State,
 	setPiChannel1Baseline,
@@ -194,16 +195,13 @@ describe("Pi status dialog", () => {
 			const newCompartments =
 				"<new-compartments>\n## 11-14 · Continued runtime inspection\nRead production, gear and ABI record code before implementing the plan.\n</new-compartments>";
 			getOrCreateSessionMeta(db, sessionId);
-			db.prepare(
-				"UPDATE session_meta SET cached_m0_bytes = ?, cached_m1_bytes = ? WHERE session_id = ?",
-			).run(
-				Buffer.from(m0History, "utf8"),
-				Buffer.from(
+			patchSessionMeta(db, sessionId, {
+				cached_m0_bytes: Buffer.from(m0History, "utf8"),
+				cached_m1_bytes: Buffer.from(
 					`<session-history-since>\n${newCompartments}\n</session-history-since>`,
 					"utf8",
 				),
-				sessionId,
-			);
+			});
 			const detail = buildPiStatusDetail(
 				{ getAllTools: () => [] } as never,
 				fakeContext(sessionId) as never,

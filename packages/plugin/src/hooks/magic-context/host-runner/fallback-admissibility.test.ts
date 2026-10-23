@@ -1,4 +1,9 @@
 import { describe, expect, test } from "bun:test";
+import {
+    deriveMarkerEnvelopeReading,
+    type MarkerEnvelope,
+    markerEnvelopeKey,
+} from "../marker-envelope";
 import type { MessageLike } from "../transform-operations";
 import { isFallbackAdmissible, recordProviderUsage } from "./fallback-admissibility";
 import {
@@ -78,6 +83,145 @@ function measuredFixture() {
 }
 
 describe("host-runner fallback admissibility", () => {
+    test("material bound is never replaced by smaller matching usage", () => {
+        const { record, messages } = fixture();
+        const material = { system: ["Final system instructions. ".repeat(200)], tools: [] };
+        const envelope = markerEnvelopeKey(material);
+        const input = { messages, model: defaults.model, envelope, material, contextWindow: 300 };
+        recordProviderUsage(record, {
+            model: input.model,
+            envelope,
+            inputTokens: 1,
+            messages: assemble(record),
+        });
+        expect(isFallbackAdmissible(record, input)).toMatchObject({
+            admissible: false,
+            reason: "fit_unproven",
+        });
+        expect(isFallbackAdmissible(record, { ...input, contextWindow: 10000 }).admissible).toBe(
+            true,
+        );
+    });
+
+    test("same-view usage can raise the material floor but unrelated usage cannot", () => {
+        const { record, messages } = fixture();
+        const material = { system: ["Final system"], tools: [] };
+        const envelope = markerEnvelopeKey(material);
+        const input = { messages, model: defaults.model, envelope, material, contextWindow: 1000 };
+        expect(isFallbackAdmissible(record, input).admissible).toBe(true);
+        recordProviderUsage(record, {
+            model: input.model,
+            envelope,
+            inputTokens: 2000,
+            messages: assemble(record),
+        });
+        expect(isFallbackAdmissible(record, input).admissible).toBe(false);
+        for (const changed of [
+            { model: "another/model" },
+            { envelope: "other-envelope" },
+            { messages: [message("other-view")] },
+        ]) {
+            recordProviderUsage(record, {
+                model: input.model,
+                envelope,
+                inputTokens: 2000,
+                messages: assemble(record),
+                ...changed,
+            });
+            expect(isFallbackAdmissible(record, input).admissible).toBe(true);
+        }
+    });
+
+    describe("usage-derived envelope reading", () => {
+        const builtIns: MarkerEnvelope = {
+            system: ["Final system"],
+            tools: [{ name: "ctx_search", description: "Search", inputSchema: { type: "object" } }],
+            unobserved_tools: ["task", "bash", "read"],
+        };
+        function readingFixture(served: MarkerEnvelope, model = defaults.model) {
+            const f = fixture();
+            const messages = assemble(f.record);
+            recordProviderUsage(f.record, {
+                model,
+                envelope: markerEnvelopeKey(served),
+                inputTokens: 400,
+                messages,
+                envelopeReading: deriveMarkerEnvelopeReading({
+                    material: served,
+                    messages,
+                    totalInput: 400,
+                    model,
+                }),
+            });
+            return f;
+        }
+        const query = (material: MarkerEnvelope, contextWindow = 3000) => ({
+            messages: fixture().messages,
+            model: defaults.model,
+            envelope: markerEnvelopeKey(material),
+            material,
+            contextWindow,
+        });
+
+        test("unobserved tools without a reading defer as evidence unavailable", () => {
+            const { record } = fixture();
+            expect(isFallbackAdmissible(record, query(builtIns))).toMatchObject({
+                admissible: false,
+                reason: "fit_unproven",
+                detail: expect.stringContaining("native-marker-evidence-unavailable"),
+            });
+        });
+
+        test("a qualifying reading bounds unobserved tools and its envelope bound is enforced", () => {
+            const { record } = readingFixture(builtIns);
+            expect(isFallbackAdmissible(record, query(builtIns)).admissible).toBe(true);
+            // Unknown models price 400 total input minus message text at the 0.5 floor,
+            // so the envelope alone exceeds a 300-token window.
+            expect(isFallbackAdmissible(record, query(builtIns, 300))).toMatchObject({
+                admissible: false,
+                reason: "fit_unproven",
+            });
+            // Tool names are a set: listing order does not reset the reading.
+            expect(
+                isFallbackAdmissible(
+                    record,
+                    query({ ...builtIns, unobserved_tools: ["read", "task", "bash"] }),
+                ).admissible,
+            ).toBe(true);
+        });
+
+        test("a reading with a different tool-name set does not qualify", () => {
+            const { record } = readingFixture({ ...builtIns, unobserved_tools: ["bash", "read"] });
+            expect(isFallbackAdmissible(record, query(builtIns))).toMatchObject({
+                admissible: false,
+                detail: expect.stringContaining("native-marker-evidence-unavailable"),
+            });
+        });
+
+        test("a reading with a different system digest does not qualify", () => {
+            const { record } = readingFixture({ ...builtIns, system: ["Earlier system"] });
+            expect(isFallbackAdmissible(record, query(builtIns))).toMatchObject({
+                admissible: false,
+                detail: expect.stringContaining("native-marker-evidence-unavailable"),
+            });
+        });
+
+        test("a reading with another model or visible tool schema does not qualify", () => {
+            for (const { record } of [
+                readingFixture(builtIns, "another/model"),
+                readingFixture({
+                    ...builtIns,
+                    tools: [{ ...builtIns.tools[0], inputSchema: { type: "object", v: 2 } }],
+                }),
+            ]) {
+                expect(isFallbackAdmissible(record, query(builtIns))).toMatchObject({
+                    admissible: false,
+                    detail: expect.stringContaining("native-marker-evidence-unavailable"),
+                });
+            }
+        });
+    });
+
     test("OpenCode retained pre-C tail serves the applied view and raw tail in append order", () => {
         const { record, messages } = fixture();
         const cut = {

@@ -615,13 +615,34 @@ for (const cause of ["ttl", "model"] as const)
         });
 
 // This fixture's pressure passes do not drain the queued drop even without an
-// edit, so the claim checked here is equivalence with that baseline.
+// edit, so the claim checked here is equivalence with that baseline. The one
+// difference is the thinking signed under the old system prompt: once that turn
+// is complete, the changed system prompt carries the removal of that thinking,
+// while the unedited session keeps it.
+const isThinkingPart = (part: unknown) =>
+    ["reasoning", "thinking", "redacted_thinking"].includes(
+        String((part as { type?: unknown }).type),
+    );
+const withoutThinking = (messages: { parts: unknown[] }[]) =>
+    messages.map((m) =>
+        m.parts.filter(
+            (part) =>
+                !isThinkingPart(part) &&
+                // A removed reasoning part is served as an empty text sentinel.
+                !(
+                    (part as { type?: unknown }).type === "text" &&
+                    (part as { text?: unknown }).text === ""
+                ),
+        ),
+    );
 for (const cause of ["force-85", "emergency-95"] as const)
-    test(`system delivery: v1 accepted held edit leaves the ${cause} pass identical to the no-edit baseline`, async () => {
+    test(`system delivery: v1 accepted held edit leaves the ${cause} pass identical to the no-edit baseline except for its thinking removal`, async () => {
         const baseline = await independentCause(false, cause);
         const edited = await independentCause(true, cause);
         expect(edited.pending).toBe(baseline.pending);
-        expect(edited.messages.map((m) => m.parts)).toEqual(baseline.messages.map((m) => m.parts));
+        expect(withoutThinking(edited.messages)).toEqual(withoutThinking(baseline.messages));
+        expect(baseline.messages.some((m) => m.parts.some(isThinkingPart))).toBe(true);
+        expect(edited.messages.some((m) => m.parts.some(isThinkingPart))).toBe(false);
     });
 
 test("system delivery: a conflicting producer hash under a held identity cannot replace its delivery", async () => {

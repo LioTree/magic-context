@@ -830,6 +830,11 @@ pub async fn dispatch(state: &AppState, cmd: &str, args: Value) -> Result<Value,
             parse_args::<NoArgs>(args)?;
             json(commands::get_model_catalogs().await)
         }
+        "refresh_project_names" => {
+            parse_args::<NoArgs>(args)?;
+            commands::refresh_project_names().await;
+            json(())
+        }
         "test_embedding_endpoint" => {
             let a: TestEmbeddingEndpointArgs = parse_args(args)?;
             let options = match commands::prepare_embedding_probe_options(
@@ -906,7 +911,10 @@ pub async fn dispatch(state: &AppState, cmd: &str, args: Value) -> Result<Value,
 pub fn uses_subprocess_or_network_probe(cmd: &str) -> bool {
     matches!(
         cmd,
-        "get_opencode_install_state" | "get_model_catalogs" | "test_embedding_endpoint"
+        "get_opencode_install_state"
+            | "get_model_catalogs"
+            | "test_embedding_endpoint"
+            | "refresh_project_names"
     )
 }
 

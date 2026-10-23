@@ -67,6 +67,15 @@ const { openDatabase, closeDatabase, getOrCreateSessionMeta } = await imp<
     typeof import("../../src/features/magic-context/storage")
 >("features/magic-context/storage.ts");
 const { appendCompartments } = await imp<typeof import("../../src/features/magic-context/compartment-storage")>("features/magic-context/compartment-storage.ts");
+// Context migration 103 moved the cached heads and their upgrade identity out of
+// session_meta into session_render_cache rows. A revision from before the move has no
+// render-cache accessors and keeps these values in session_meta columns.
+const renderCache = await imp<typeof import("../../src/features/magic-context/storage-session-cache")>(
+    "features/magic-context/storage-session-cache.ts",
+).catch(() => undefined);
+type CachedHeadColumn = "cached_m0_bytes" | "cached_m1_bytes" | "cached_m0_upgrade_state";
+const cachedHeadSelect = (column: CachedHeadColumn): string =>
+    renderCache ? renderCache.sessionRenderCacheSelect(column, column, db) : column;
 const { createTagger } = await imp<typeof import("../../src/features/magic-context/tagger")>("features/magic-context/tagger.ts");
 const { createMessagesTransformHandler } = await imp<typeof import("../../src/plugin/messages-transform")>("plugin/messages-transform.ts");
 const { createTransform } = await imp<typeof import("../../src/hooks/magic-context/transform")>("hooks/magic-context/transform.ts");
@@ -143,13 +152,14 @@ const passes = phase === "seed" ? ["cold", "defer", "rebuild", "after-rebuild-de
 const results: unknown[] = [];
 for (const pass of passes) {
     if (pass === "rebuild") {
-        db.prepare("UPDATE session_meta SET cached_m0_upgrade_state='ready' WHERE session_id=?").run(session.sessionId);
+        if (renderCache) renderCache.writeSessionRenderCache(db, session.sessionId, "cached_m0_upgrade_state", "ready");
+        else db.prepare("UPDATE session_meta SET cached_m0_upgrade_state='ready' WHERE session_id=?").run(session.sessionId);
     }
     lines.length = 0;
     const messages = loadMessages(session);
     await handler({}, { messages } as never);
     const providerView = JSON.stringify(messages.map(providerVisibleMessage));
-    const cached = db.prepare("SELECT cached_m0_bytes, cached_m1_bytes, cached_m0_upgrade_state FROM session_meta WHERE session_id=?").get(session.sessionId) as { cached_m0_bytes: string | Uint8Array | null; cached_m1_bytes: string | Uint8Array | null; cached_m0_upgrade_state: string };
+    const cached = db.prepare(`SELECT ${cachedHeadSelect("cached_m0_bytes")}, ${cachedHeadSelect("cached_m1_bytes")}, ${cachedHeadSelect("cached_m0_upgrade_state")} FROM session_meta WHERE session_id=?`).get(session.sessionId) as { cached_m0_bytes: string | Uint8Array | null; cached_m1_bytes: string | Uint8Array | null; cached_m0_upgrade_state: string };
     if (cached.cached_m0_bytes === null) throw new Error("m[0] was not materialized");
     const decode = (bytes: string | Uint8Array | null): string => bytes instanceof Uint8Array ? Buffer.from(bytes).toString("utf8") : (bytes ?? "");
     const m0 = computeM0BlockTokens(db, session.sessionId, { m0Text: decode(cached.cached_m0_bytes), m1Text: decode(cached.cached_m1_bytes), projectIdentity: undefined, injectionBudgetTokens: undefined, memoryBlockCount: 0 });

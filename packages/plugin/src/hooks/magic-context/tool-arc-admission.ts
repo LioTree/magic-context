@@ -100,9 +100,12 @@ export function toolBatchCoordinates<M>(args: {
 export function protectToolBatchMutations(
     targets: Map<number, TagTarget>,
     admission: EditAdmission,
-    batches: ToolBatchCoordinates,
+    batches: ToolBatchCoordinates | (() => ToolBatchCoordinates),
 ): Map<number, TagTarget> {
     if (admission.admit({ kind: "prefix" })) return targets;
+    // If prefix edits are permitted, no tool group needs extra signature checks.
+    // Scan the full tool history only when an edit could invalidate retained thinking.
+    const coordinates = typeof batches === "function" ? batches() : batches;
     return new Map(
         [...targets].map(([tag, target]) => {
             if (!target.canDrop) return [tag, target];
@@ -116,7 +119,7 @@ export function protectToolBatchMutations(
                     typeof part.id === "string"
                         ? part.id
                         : undefined);
-                return callId ? (batches.get(message.info.id ?? "")?.get(callId) ?? []) : [];
+                return callId ? (coordinates.get(message.info.id ?? "")?.get(callId) ?? []) : [];
             });
             if (admitCompound(admission, sources)) return [tag, target];
             return [

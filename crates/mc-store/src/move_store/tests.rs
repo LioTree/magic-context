@@ -5,7 +5,7 @@ use crate::move_snapshot::{
 use crate::{ModuleMeta, TagMintInput};
 use cortexkit_cache_core::CoreState;
 use cortexkit_store_types::{Isolation, StorageBackend, StorageDescriptor};
-use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicBool, Ordering};
 
 fn open(dir: &Path) -> McStore {
     McStore::open(&StorageDescriptor {
@@ -53,6 +53,19 @@ fn seeded(dir: &Path, count: usize, bytes: usize) -> McStore {
         )
         .unwrap();
     store
+}
+fn commit_peer(store: &McStore, expected_version: Option<u64>) -> u64 {
+    store
+        .commit(
+            "a6_peer_progress",
+            expected_version,
+            &CoreState::default(),
+            &ModuleMeta {
+                last_system_prompt_hash: format!("peer {}", expected_version.unwrap_or(0)),
+                ..Default::default()
+            },
+        )
+        .unwrap()
 }
 fn capture(store: &McStore, cut: &str, path: &Path) -> MoveStore {
     let mut mover = store.move_store().unwrap();
@@ -416,20 +429,35 @@ fn failed_install_batch_rolls_back_rows_key_map_and_source_cursor_together() {
     mover
         .reserve_install(&binding("cut"), "digest", &staging)
         .unwrap();
-    let before = read_cursor(&mover.writer, "cut").unwrap();
     mover.writer.execute_batch("CREATE TEMP TRIGGER fail_mid_batch BEFORE INSERT ON mc_tags WHEN NEW.tag_number = 3 BEGIN SELECT RAISE(ABORT,'injected write failure'); END").unwrap();
-    assert!(mover.install_batch("cut").is_err());
-    assert_eq!(read_cursor(&mover.writer, "cut").unwrap(), before);
-    let maps: usize = mover
-        .writer
-        .query_row(
-            "SELECT COUNT(*) FROM mc_move_key_map WHERE cut_id = 'cut'",
-            [],
-            |r| r.get(0),
-        )
-        .unwrap();
-    assert_eq!(maps, 0);
-    assert!(dst.load_tags_for_session("ses_move").unwrap().is_empty());
+    loop {
+        // install_batch may commit a successful partial batch when its time budget expires.
+        let before = read_cursor(&mover.writer, "cut").unwrap();
+        let maps_before: usize = mover
+            .writer
+            .query_row(
+                "SELECT COUNT(*) FROM mc_move_key_map WHERE cut_id = 'cut'",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap();
+        let tags_before = dst.load_tags_for_session("ses_move").unwrap();
+        if mover.install_batch("cut").is_err() {
+            assert_eq!(read_cursor(&mover.writer, "cut").unwrap(), before);
+            let maps_after: usize = mover
+                .writer
+                .query_row(
+                    "SELECT COUNT(*) FROM mc_move_key_map WHERE cut_id = 'cut'",
+                    [],
+                    |r| r.get(0),
+                )
+                .unwrap();
+            assert_eq!(maps_after, maps_before);
+            assert_eq!(dst.load_tags_for_session("ses_move").unwrap(), tags_before);
+            break;
+        }
+        assert!(!read_cursor(&mover.writer, "cut").unwrap().complete);
+    }
     drop(mover);
     let mut resumed = dst.move_store().unwrap();
     install(&mut resumed, "cut");
@@ -897,15 +925,28 @@ fn run_a6_fixture() -> [LockMetrics; 2] {
             .unwrap();
     }
     let staging = destination.path().join("staging");
+    let mut exporting = src.move_store().unwrap();
+    exporting
+        .writer
+        .busy_timeout(Duration::from_secs(30))
+        .unwrap();
+    let source_probe = TransactionProbe::attach(&mut exporting);
+    exporting.acquire_fence(&binding("cut")).unwrap();
+    exporting.freeze("cut").unwrap();
+    let mut importing = dst.move_store().unwrap();
+    importing
+        .writer
+        .busy_timeout(Duration::from_secs(30))
+        .unwrap();
+    let destination_probe = TransactionProbe::attach(&mut importing);
+
+    // Open and configure both move connections before starting competing writers.
     let running = Arc::new(AtomicBool::new(true));
-    let source_commits = Arc::new(AtomicUsize::new(0));
-    let destination_commits = Arc::new(AtomicUsize::new(0));
     let workers = FixtureWriters {
         running: running.clone(),
         workers: [src.clone(), dst.clone()]
             .into_iter()
-            .zip([source_commits.clone(), destination_commits.clone()])
-            .map(|(store, committed)| {
+            .map(|store| {
                 let running = running.clone();
                 std::thread::spawn(move || {
                     let mut version = None;
@@ -926,7 +967,6 @@ fn run_a6_fixture() -> [LockMetrics; 2] {
                                 )
                                 .unwrap(),
                         );
-                        committed.fetch_add(1, Ordering::Relaxed);
                         // Continuous ordinary turns, not a synthetic maximum-rate
                         // fsync/checkpoint storm competing with the size fixture.
                         std::thread::park_timeout(Duration::from_millis(2));
@@ -935,39 +975,57 @@ fn run_a6_fixture() -> [LockMetrics; 2] {
             })
             .collect::<Vec<_>>(),
     };
-    let before_capture = source_commits.load(Ordering::Relaxed);
-    let mut exporting = src.move_store().unwrap();
-    exporting
-        .writer
-        .busy_timeout(Duration::from_secs(30))
+
+    let mut source_peer_version = None;
+    // The callback runs with capture's read snapshot open while the peer commits.
+    let shipped = exporting
+        .capture_with_snapshot_hook("cut", &staging, |reader| {
+            assert!(!reader.is_autocommit());
+            source_peer_version = Some(commit_peer(&src, None));
+        })
         .unwrap();
-    let source_probe = TransactionProbe::attach(&mut exporting);
-    exporting.acquire_fence(&binding("cut")).unwrap();
-    exporting.freeze("cut").unwrap();
-    exporting.capture("cut", &staging).unwrap();
-    assert!(source_commits.load(Ordering::Relaxed) > before_capture);
-    let shipped = std::fs::metadata(&staging).unwrap().len();
+    assert!(source_peer_version.unwrap() > 0);
     assert!(shipped >= 155 * 1024 * 1024);
-    let mut importing = dst.move_store().unwrap();
-    importing
-        .writer
-        .busy_timeout(Duration::from_secs(30))
-        .unwrap();
-    let destination_probe = TransactionProbe::attach(&mut importing);
     importing
         .reserve_install(&binding("cut"), "digest", &staging)
         .unwrap();
-    let before_install = destination_commits.load(Ordering::Relaxed);
-    install(&mut importing, "cut");
+    let mut install_progress = importing.install_batch("cut").unwrap();
+    assert!(
+        !install_progress.complete,
+        "size fixture must span install batches"
+    );
+    // A separate session must commit after one install batch and before the next.
+    let install_peer_version = commit_peer(&dst, None);
+    assert!(install_peer_version > 0);
+    assert!(!read_cursor(&importing.writer, "cut").unwrap().complete);
+    while !install_progress.complete {
+        install_progress = importing.install_batch("cut").unwrap();
+    }
     for events in destination_probe.transactions() {
         assert_install_transaction_bounds(&events);
     }
-    assert!(destination_commits.load(Ordering::Relaxed) > before_install);
     assert_eq!(dst.tag_cache_summary("ses_move").unwrap().count, 620);
-    let before_discard = destination_commits.load(Ordering::Relaxed);
     let before_discard_transactions = destination_probe.transactions().len();
-    discard(&mut importing, "cut");
-    assert!(destination_commits.load(Ordering::Relaxed) > before_discard);
+    importing.begin_discard("cut").unwrap();
+    assert!(
+        !importing.discard_batch("cut").unwrap(),
+        "size fixture must span discard batches"
+    );
+    // A peer commit must fit between discard batches while the cut remains open.
+    let discard_peer_version = commit_peer(&dst, Some(install_peer_version));
+    assert!(discard_peer_version > install_peer_version);
+    let discard_state: String = importing
+        .writer
+        .query_row(
+            "SELECT state FROM mc_move_cuts WHERE cut_id = 'cut'",
+            [],
+            |row| row.get(0),
+        )
+        .unwrap();
+    assert_eq!(discard_state, "discarding");
+    while !importing.discard_batch("cut").unwrap() {}
+    while !importing.discard_key_map_batch("cut").unwrap() {}
+    importing.finish_discard("cut").unwrap();
     exporting
         .record_capture("cut", "digest", &source.path().join("missing"), "receipt")
         .unwrap();
@@ -1252,6 +1310,7 @@ fn review_module_move_preserves_populated_projection_and_fragment_references() {
         m0_sha256: "opaque-baseline-binding".into(),
         fragment_watermark: 40,
         committed: vec![crate::memory_projection::CommittedFragment {
+            dashboard_log_id: None,
             id: 42,
             form: "marker".into(),
             overflow_ids: Vec::new(),
@@ -1285,12 +1344,15 @@ fn review_module_move_preserves_populated_projection_and_fragment_references() {
 
 #[test]
 fn inventory_versions_six_and_seven_refuse_cross_order_before_writes() {
-    assert_eq!(move_inventory::INVENTORY_VERSION, 7);
     let source_dir = tempfile::tempdir().unwrap();
     let source = seeded(source_dir.path(), 1, 10);
     let payload_dir = tempfile::tempdir().unwrap();
     let current = payload_dir.path().join("v7");
-    let _source_move = capture(&source, "version-cut", &current);
+    let source_move = capture(&source, "version-cut", &current);
+    assert_eq!(
+        source_move.schema_version().unwrap(),
+        move_inventory::STORE_SCHEMA_VERSION
+    );
     let bytes = std::fs::read(&current).unwrap();
     let mut input = std::io::Cursor::new(&bytes);
     let mut sections = Vec::new();

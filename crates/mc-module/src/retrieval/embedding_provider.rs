@@ -4,6 +4,7 @@
 //! encoders require a separate inference runtime; both remain explicitly unavailable.
 
 use std::future::Future;
+use std::hash::{BuildHasher, Hasher};
 use std::pin::Pin;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
@@ -18,6 +19,21 @@ use mc_store::parity_schema_manifest::StoredVector;
 const FETCH_TIMEOUT: Duration = Duration::from_secs(30);
 const FAILURE_WINDOW: Duration = Duration::from_secs(60);
 const OPEN_DURATION: Duration = Duration::from_secs(300);
+// HTTP 429 handling, matching embedding-openai.ts. A rate limit means the
+// endpoint is healthy but asks for a pause, so it never counts toward the circuit
+// above. The endpoint enters a cooldown taken from Retry-After (delta-seconds or
+// an HTTP date, capped at RETRY_AFTER_CAP). Without a usable header the cooldown
+// is an exponential backoff from RATE_LIMIT_BACKOFF_BASE, doubled per
+// consecutive 429 and capped at RATE_LIMIT_BACKOFF_CAP, plus up to
+// RATE_LIMIT_BACKOFF_JITTER of extra delay so separate processes spread out.
+// Query embeds never wait: a 429, or a call during the cooldown, fails at once
+// with RateLimited and sends nothing more. Passage embeds wait out the cooldown
+// and resend the same batch until a real result arrives or the caller cancels or
+// its deadline passes.
+const RETRY_AFTER_CAP: Duration = Duration::from_secs(60);
+const RATE_LIMIT_BACKOFF_BASE_MS: f64 = 1_000.0;
+const RATE_LIMIT_BACKOFF_CAP_MS: f64 = 30_000.0;
+const RATE_LIMIT_BACKOFF_JITTER: f64 = 0.25;
 // Send the entire supplied batch in one POST, matching embedding-openai.ts.
 // Introducing a limit here would change provider requests and batch failure scope.
 const HTTP_BATCH_SIZE: usize = usize::MAX;
@@ -83,7 +99,9 @@ pub enum EmbeddingError {
     Cancelled,
     Timeout,
     Transport,
-    Http { status: u16 },
+    Http {
+        status: u16,
+    },
     InvalidEnvelope,
     EmptyResult,
     SubstitutionRejected,
@@ -93,6 +111,9 @@ pub enum EmbeddingError {
     ContractVersion,
     EmptyInput,
     CircuitOpen,
+    /// The endpoint answered HTTP 429, or its cooldown from an earlier 429 is
+    /// still running. Back-pressure, not an endpoint failure.
+    RateLimited,
 }
 
 impl EmbeddingError {
@@ -156,6 +177,10 @@ impl EmbeddingError {
                 "Embedding request must contain at least one input",
             ),
             Self::CircuitOpen => ("circuit_open", "Embedding endpoint circuit is open"),
+            Self::RateLimited => (
+                "rate_limited",
+                "Embedding endpoint is rate limited; requests pause until its cooldown ends",
+            ),
         };
         CapabilityReason {
             code: code.into(),
@@ -164,8 +189,10 @@ impl EmbeddingError {
     }
 
     pub fn retryable(self) -> bool {
-        matches!(self, Self::Timeout | Self::Transport | Self::EmptyResult)
-            || matches!(self, Self::Http { status } if status >= 500 || status == 408 || status == 429)
+        matches!(
+            self,
+            Self::Timeout | Self::Transport | Self::EmptyResult | Self::RateLimited
+        ) || matches!(self, Self::Http { status } if status >= 500 || status == 408 || status == 429)
     }
 }
 
@@ -205,6 +232,14 @@ impl Drop for Probe<'_> {
     }
 }
 
+#[derive(Default)]
+struct RateLimit {
+    /// No request may be sent to the endpoint before this instant.
+    until: Option<Instant>,
+    /// 429s received since the last successful response; drives the backoff.
+    consecutive: u32,
+}
+
 pub struct RemoteEmbeddingProvider {
     config: ResolvedEmbeddingConfig,
     transport: Option<Arc<dyn HttpTransport>>,
@@ -212,6 +247,11 @@ pub struct RemoteEmbeddingProvider {
     config_generation: Generation,
     live_generation: Arc<AtomicU64>,
     circuit: Mutex<Circuit>,
+    // Per provider instance. TypeScript shares one cooldown between every
+    // provider on the same endpoint and API key; this client keeps no
+    // process-wide state and never derives anything from the key, so an owner
+    // that wants the cooldown shared must share the provider.
+    rate_limit: Mutex<RateLimit>,
 }
 
 impl RemoteEmbeddingProvider {
@@ -237,6 +277,7 @@ impl RemoteEmbeddingProvider {
             config_generation,
             live_generation,
             circuit: Mutex::default(),
+            rate_limit: Mutex::default(),
         }
     }
 
@@ -316,6 +357,9 @@ impl RemoteEmbeddingProvider {
     }
 
     fn record(&self, result: &Result<Vec<Vec<f32>>, EmbeddingError>, probe: &Probe<'_>) {
+        if result.is_ok() {
+            self.rate_limit.lock().unwrap().consecutive = 0;
+        }
         let mut circuit = self.circuit.lock().unwrap();
         match result {
             Ok(_) => {
@@ -337,6 +381,41 @@ impl RemoteEmbeddingProvider {
         }
     }
 
+    /// Time left in the rate-limit cooldown, or None when requests may be sent.
+    fn cooldown_remaining(&self) -> Option<Duration> {
+        let until = self.rate_limit.lock().unwrap().until?;
+        until
+            .checked_duration_since(Instant::now())
+            .filter(|left| !left.is_zero())
+    }
+
+    /// Start or extend the cooldown after an HTTP 429.
+    fn note_rate_limit(&self, headers: &[(String, String)]) {
+        let header_delay = headers
+            .iter()
+            .find(|(key, _)| key.eq_ignore_ascii_case("retry-after"))
+            .and_then(|(_, value)| parse_retry_after(value, chrono::Utc::now()));
+        let mut state = self.rate_limit.lock().unwrap();
+        let delay =
+            header_delay.unwrap_or_else(|| rate_limit_backoff(state.consecutive, jitter_sample()));
+        state.consecutive = state.consecutive.saturating_add(1);
+        let until = Instant::now() + delay;
+        state.until = Some(state.until.map_or(until, |current| current.max(until)));
+    }
+
+    /// Sleep through `wait`, returning early when the caller cancels or its
+    /// deadline arrives. The caller re-runs its fence afterwards to report which.
+    async fn pause(&self, context: &RequestContext, wait: Duration) {
+        let deadline = Duration::from_millis(
+            (context.control.deadline_at_ms - chrono::Utc::now().timestamp_millis()).max(0) as u64,
+        );
+        tokio::select! {
+            biased;
+            _ = until_cancelled(&context.control) => {}
+            _ = tokio::time::sleep(wait.min(deadline)) => {}
+        }
+    }
+
     pub async fn embed_checked(
         &self,
         context: &RequestContext,
@@ -348,37 +427,55 @@ impl RemoteEmbeddingProvider {
             return Err(EmbeddingError::EmptyInput);
         }
         let mut vectors = Vec::with_capacity(request.inputs.len());
+        let is_query = request.kind == EmbeddingInputKind::Query;
         for inputs in request.inputs.chunks(HTTP_BATCH_SIZE) {
-            self.fence(context, request)?;
-            let probe = self.claim()?;
-            let timeout = FETCH_TIMEOUT.min(Duration::from_millis(
-                (context.control.deadline_at_ms - chrono::Utc::now().timestamp_millis()).max(0)
-                    as u64,
-            ));
-            let http = make_request(config, request.kind, inputs);
-            let transport = self.transport.as_ref().unwrap();
-            let send = transport.send(http, &context.control, timeout);
-            // CallbackControl has no async notification. Poll its shared flag while
-            // awaiting IO, then drop the transport future to abort the underlying POST.
-            let cancelled = async {
-                loop {
-                    if context.control.is_cancelled() {
-                        break;
+            // Each turn either returns, waits out a rate-limit cooldown and
+            // resends (passages only), or ends with this batch's vectors.
+            let batch = loop {
+                self.fence(context, request)?;
+                if let Some(wait) = self.cooldown_remaining() {
+                    if is_query {
+                        return Err(EmbeddingError::RateLimited);
                     }
-                    tokio::time::sleep(Duration::from_millis(2)).await;
+                    self.pause(context, wait).await;
+                    continue;
                 }
+                let probe = self.claim()?;
+                let timeout = FETCH_TIMEOUT.min(Duration::from_millis(
+                    (context.control.deadline_at_ms - chrono::Utc::now().timestamp_millis()).max(0)
+                        as u64,
+                ));
+                let http = make_request(config, request.kind, inputs);
+                let transport = self.transport.as_ref().unwrap();
+                let send = transport.send(http, &context.control, timeout);
+                let result = tokio::select! {
+                    biased;
+                    _ = until_cancelled(&context.control) => Err(EmbeddingError::Cancelled),
+                    _ = tokio::time::sleep(timeout) => Err(EmbeddingError::Timeout),
+                    response = send => response.and_then(|response| {
+                        if response.status == 429 {
+                            self.note_rate_limit(&response.headers);
+                            return Err(EmbeddingError::RateLimited);
+                        }
+                        parse_response(config, response, inputs.len())
+                    }),
+                };
+                // Caller cancellation/deadline and configuration reload are checked
+                // before recording health, so they cannot open the endpoint circuit.
+                self.fence(context, request)?;
+                if matches!(result, Err(EmbeddingError::RateLimited)) {
+                    // Never recorded: a 429 leaves the circuit as it was. Dropping
+                    // the probe frees a half-open slot without re-opening it.
+                    drop(probe);
+                    if is_query {
+                        return Err(EmbeddingError::RateLimited);
+                    }
+                    continue;
+                }
+                self.record(&result, &probe);
+                break result?;
             };
-            let result = tokio::select! {
-                biased;
-                _ = cancelled => Err(EmbeddingError::Cancelled),
-                _ = tokio::time::sleep(timeout) => Err(EmbeddingError::Timeout),
-                response = send => response.and_then(|response| parse_response(config, response, inputs.len())),
-            };
-            // Caller cancellation/deadline and configuration reload are checked
-            // before recording health, so they cannot open the endpoint circuit.
-            self.fence(context, request)?;
-            self.record(&result, &probe);
-            for (input, values) in inputs.iter().zip(result?) {
+            for (input, values) in inputs.iter().zip(batch) {
                 vectors.push(StoredVector {
                     source: input.source.clone(),
                     embedding: request.identity.clone(),
@@ -447,6 +544,66 @@ fn option_text(text: &Option<String>) -> &str {
 }
 fn endpoint(config: &OpenAiConfig) -> &str {
     trim(&config.endpoint).trim_end_matches('/')
+}
+
+/// Resolves once the caller cancels. CallbackControl has no async notification,
+/// so poll its shared flag; the select that awaits this drops the transport
+/// future, which aborts the underlying POST.
+async fn until_cancelled(control: &CallbackControl) {
+    while !control.is_cancelled() {
+        tokio::time::sleep(Duration::from_millis(2)).await;
+    }
+}
+
+/// Delay requested by a Retry-After header, capped at RETRY_AFTER_CAP. None when
+/// the value is empty, unparseable or asks for no delay, so the caller falls back
+/// to exponential backoff instead of resending at once. Same rules as
+/// parseRetryAfterMs in embedding-openai.ts: delta-seconds may be fractional and
+/// the delay is rounded up to whole milliseconds.
+fn parse_retry_after(value: &str, now: chrono::DateTime<chrono::Utc>) -> Option<Duration> {
+    let value = trim(value);
+    if value.is_empty() {
+        return None;
+    }
+    let is_seconds = {
+        let (whole, fraction) = value.split_once('.').unwrap_or((value, "0"));
+        !whole.is_empty()
+            && !fraction.is_empty()
+            && whole.bytes().all(|byte| byte.is_ascii_digit())
+            && fraction.bytes().all(|byte| byte.is_ascii_digit())
+    };
+    let delay_ms = if is_seconds {
+        value.parse::<f64>().ok()? * 1_000.0
+    } else {
+        let at = chrono::DateTime::parse_from_rfc2822(value)
+            .or_else(|_| chrono::DateTime::parse_from_rfc3339(value))
+            .ok()?;
+        (at.timestamp_millis() - now.timestamp_millis()) as f64
+    };
+    if delay_ms.is_nan() || delay_ms <= 0.0 {
+        return None;
+    }
+    Some(Duration::from_millis(delay_ms.ceil() as u64).min(RETRY_AFTER_CAP))
+}
+
+/// Backoff for a 429 without a usable Retry-After. `consecutive` counts the 429s
+/// already seen in this streak (0 for the first) and `random` is a sample in
+/// [0, 1]. The result lies in [nominal, nominal * (1 + jitter)] with nominal =
+/// 1 s * 2^consecutive, and never exceeds RATE_LIMIT_BACKOFF_CAP_MS.
+fn rate_limit_backoff(consecutive: u32, random: f64) -> Duration {
+    let nominal = RATE_LIMIT_BACKOFF_CAP_MS
+        .min(RATE_LIMIT_BACKOFF_BASE_MS * 2f64.powi(consecutive.min(30) as i32));
+    let jitter = random.clamp(0.0, 1.0) * RATE_LIMIT_BACKOFF_JITTER;
+    Duration::from_millis(RATE_LIMIT_BACKOFF_CAP_MS.min((nominal * (1.0 + jitter)).round()) as u64)
+}
+
+/// A sample in [0, 1) for backoff jitter. It only spreads processes apart, so the
+/// standard library's randomly keyed hasher is enough; no RNG dependency is needed.
+fn jitter_sample() -> f64 {
+    let bits = std::collections::hash_map::RandomState::new()
+        .build_hasher()
+        .finish();
+    (bits >> 11) as f64 / (1u64 << 53) as f64
 }
 
 fn model_parts(model: &str) -> (&str, Option<&str>) {
@@ -852,5 +1009,52 @@ mod tests {
         assert!(provider.circuit.lock().unwrap().open_until.is_none());
         provider.record(&Ok(vec![vec![1.0]]), &probe);
         assert!(provider.circuit.lock().unwrap().failures.is_empty());
+    }
+
+    #[test]
+    fn retry_after_matches_the_typescript_parser() {
+        let now = chrono::DateTime::parse_from_rfc3339("2024-01-01T00:00:00Z")
+            .unwrap()
+            .with_timezone(&chrono::Utc);
+        let ms = |value: &str| parse_retry_after(value, now).map(|delay| delay.as_millis());
+        assert_eq!(ms(" 2 "), Some(2_000));
+        assert_eq!(ms("0.0015"), Some(2), "fractional seconds round up");
+        assert_eq!(ms("120"), Some(60_000), "capped at sixty seconds");
+        assert_eq!(ms("Mon, 01 Jan 2024 00:00:05 GMT"), Some(5_000));
+        for no_delay in ["", "0", "-1", "1.", "soon", "Sun, 31 Dec 2023 23:59:59 GMT"] {
+            assert_eq!(ms(no_delay), None, "{no_delay:?}");
+        }
+    }
+
+    #[test]
+    fn backoff_doubles_per_consecutive_429_with_bounded_jitter() {
+        assert_eq!(rate_limit_backoff(0, 0.0), Duration::from_secs(1));
+        assert_eq!(rate_limit_backoff(0, 1.0), Duration::from_millis(1_250));
+        assert_eq!(rate_limit_backoff(3, 0.0), Duration::from_secs(8));
+        assert_eq!(rate_limit_backoff(40, 1.0), Duration::from_secs(30));
+        let sample = jitter_sample();
+        assert!((0.0..1.0).contains(&sample));
+    }
+
+    #[test]
+    fn a_429_extends_the_cooldown_and_success_resets_the_streak() {
+        let provider = RemoteEmbeddingProvider::new(
+            ResolvedEmbeddingConfig::Off,
+            None,
+            Generation(1),
+            Arc::new(AtomicU64::new(1)),
+        );
+        assert!(provider.cooldown_remaining().is_none());
+        provider.note_rate_limit(&[("Retry-After".into(), "30".into())]);
+        provider.note_rate_limit(&[("retry-after".into(), "1".into())]);
+        let left = provider.cooldown_remaining().unwrap();
+        assert!(
+            left > Duration::from_secs(28),
+            "a shorter pause never shortens the cooldown"
+        );
+        assert_eq!(provider.rate_limit.lock().unwrap().consecutive, 2);
+        let probe = provider.claim().unwrap();
+        provider.record(&Ok(vec![vec![1.0]]), &probe);
+        assert_eq!(provider.rate_limit.lock().unwrap().consecutive, 0);
     }
 }

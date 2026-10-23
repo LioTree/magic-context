@@ -9,8 +9,9 @@ import { escapeXmlAttr, escapeXmlContent } from "../compartment-storage";
  *
  * The prompt shows memory changes only two ways. A HARD fold reads current
  * memory rows into a new m[0]. Between HARD folds, a busting SOFT pass appends
- * that session's own agent fragments to m[1]; it never reads memory rows or the
- * mutation log. Automated writers (historian, dreamer verify, expiry) write no
+ * that session's own agent fragments to m[1]. Dashboard operations separately
+ * enter through tagged mutation-log payloads on the same authorized refresh.
+ * Automated writers (historian, dreamer verify, expiry) write no
  * fragment, so their changes stay out of the prompt until the next natural HARD.
  * Fragments are written in the same transaction as the canonical change, so a
  * fragment exists exactly when its operation committed.
@@ -32,6 +33,7 @@ export interface AgentFragmentInput {
 }
 
 export interface AgentFragment {
+    dashboardLogId?: number;
     id: number;
     operationKey: string;
     memoryIds: number[];
@@ -153,4 +155,72 @@ export function renderStaleFragmentMarker(
 ): string {
     const current = fragment.currentId === null ? "" : ` current="${fragment.currentId}"`;
     return `  <stale-memory ids="${fragment.memoryIds.join(",")}"${current} read-with="ctx_search"/>`;
+}
+
+/** Dashboard operations are admitted only on an authorized refresh, then frozen
+ * in the served projection. Read the log payload, never the live memory text. */
+export function loadDashboardFragmentsAfter(
+    db: Database,
+    projectPath: string,
+    afterId: number,
+    baselineIds: readonly number[],
+    maxMemoryId: number,
+): AgentFragment[] {
+    const ids = new Set(baselineIds);
+    const rows = db
+        .prepare(`SELECT id, project_path, target_memory_id, mutation_type, superseded_by_id,
+            category, new_content, operation_id FROM memory_mutation_log
+        WHERE id > ? AND operation_id LIKE 'dashboard:%'
+          AND (project_path = ? OR target_memory_id IN (SELECT value FROM json_each(?)))
+        ORDER BY id`)
+        .all(afterId, projectPath, JSON.stringify(baselineIds)) as Array<{
+        id: number;
+        project_path: string;
+        target_memory_id: number;
+        mutation_type: string;
+        superseded_by_id: number | null;
+        category: string | null;
+        new_content: string | null;
+        operation_id: string;
+    }>;
+    const fragments = rows.map((row) => {
+        const id = row.target_memory_id;
+        const removed =
+            row.project_path !== projectPath ||
+            row.mutation_type === "archive" ||
+            row.mutation_type === "delete";
+        const line = removed
+            ? renderRemovedFragmentLine(id)
+            : row.mutation_type === "superseded" && row.superseded_by_id !== null
+              ? renderSupersededFragmentLine(id, row.superseded_by_id)
+              : ids.has(id) && id <= maxMemoryId
+                ? renderUpdatedFragmentLine(id, row.category, row.new_content ?? "")
+                : renderAddedFragmentLine(id, row.category, row.new_content ?? "");
+        return {
+            id: 0,
+            dashboardLogId: row.id,
+            operationKey: row.operation_id,
+            memoryIds: [id],
+            currentId: removed ? null : id,
+            lines: [line],
+            visibleTexts:
+                removed || row.mutation_type === "superseded"
+                    ? []
+                    : [{ id, text: row.new_content ?? "" }],
+        };
+    });
+    // Keep a multi-row edit or undo indivisible when the correction budget fills.
+    const grouped = new Map<string, AgentFragment>();
+    for (const fragment of fragments) {
+        const prior = grouped.get(fragment.operationKey);
+        if (!prior) grouped.set(fragment.operationKey, fragment);
+        else {
+            prior.dashboardLogId = fragment.dashboardLogId;
+            prior.memoryIds.push(...fragment.memoryIds);
+            prior.lines.push(...fragment.lines);
+            prior.visibleTexts.push(...fragment.visibleTexts);
+            prior.currentId = fragment.currentId;
+        }
+    }
+    return [...grouped.values()];
 }

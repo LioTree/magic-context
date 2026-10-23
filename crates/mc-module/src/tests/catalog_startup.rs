@@ -243,9 +243,17 @@ impl LiveRoute {
         bytes
     }
 
-    async fn setup(&self) -> Result<Vec<u8>, subc_client_rs::CallError> {
-        self.call(json!({"method":"compaction.setup","params":{"session":"s","harness":"broca","request_id":"setup",
-            "params":{},"composition":{},"model":"fixture","context_window":100_000,"now":1}})).await
+    fn catalog_refusal(&self) -> Option<HandlerOutcome> {
+        let binding = self
+            .handler
+            .bindings
+            .lock()
+            .unwrap()
+            .values()
+            .next()
+            .unwrap()
+            .clone();
+        self.handler.provider_store.catalog_refusal(&binding, "s")
     }
 
     fn assert_catalog_before_store_and_transform(&self) {
@@ -276,8 +284,7 @@ async fn first_composition_catalog_on_a_real_route_awaits_the_startup_open_witho
         .load_provider_catalog(&route.identity.project_root.to_string_lossy(), "s")
         .unwrap()
         .is_some());
-    let setup: Value = serde_json::from_slice(&route.setup().await.unwrap()).unwrap();
-    assert_eq!(setup["answer"], "ready");
+    assert!(route.catalog_refusal().is_none());
     route.consumer.close().await;
 }
 
@@ -288,9 +295,8 @@ async fn catalog_store_faults_preserve_pin_bytes_and_refuse_provider_by_name() {
         route.catalog().await;
         route.assert_catalog_before_store_and_transform();
         assert!(route.handler.store.get().is_none());
-        assert_eq!(
-            route.setup().await.unwrap_err().code(),
-            Some("provider_catalog_unpersisted")
+        assert!(
+            matches!(route.catalog_refusal(), Some(HandlerOutcome::ErrorWithDetail { code, .. }) if code == "provider_catalog_unpersisted")
         );
         // Once the failure is known, a second fetch must still bypass a fence
         // refusal rather than changing the catalog into a storage error.
@@ -313,12 +319,10 @@ async fn unpersisted_catalog_blocks_provider_even_after_open_until_a_full_refetc
             ..Default::default()
         });
     route.handler.store_for_request().await.unwrap();
-    assert_eq!(
-        route.setup().await.unwrap_err().code(),
-        Some("provider_catalog_unpersisted")
+    assert!(
+        matches!(route.catalog_refusal(), Some(HandlerOutcome::ErrorWithDetail { code, .. }) if code == "provider_catalog_unpersisted")
     );
     route.catalog().await;
-    let setup: Value = serde_json::from_slice(&route.setup().await.unwrap()).unwrap();
-    assert_eq!(setup["answer"], "ready");
+    assert!(route.catalog_refusal().is_none());
     route.consumer.close().await;
 }

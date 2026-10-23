@@ -39,10 +39,14 @@ rust-embed = "8"
 getrandom = "0.2"
 open = "5"
 sha2 = "0.10"
+subc-client-rs = "=0.26.1"
+subc-protocol = "=0.29.1"
 
 [dev-dependencies]
 mc-store = { path = "../../../crates/mc-store", features = ["test-support"] }
 tempfile = "3"
+subc-control = "=0.28.0"
+subc-transport = "=0.10.0"
 
 [features]
 custom-protocol = ["tauri/custom-protocol"]

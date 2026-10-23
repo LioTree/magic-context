@@ -7,7 +7,6 @@ import {
     type ScenarioHarness,
 } from "../src/scenario-hosts";
 import { buildMockHistorianPayload, findHistorianOrdinalRange } from "../src/mock-historian";
-import { FOLD_SKIP_REASON } from "../src/rust-scenario-support";
 
 /**
  * Historian publishes a compartment end-to-end.
@@ -156,17 +155,8 @@ forEachHost(import.meta.url, "historian success path", (host) => {
             // in v0.14.1, tests need to provide the follow-up turn explicitly.
             await h.sendPrompt(sessionId, "turn 12: post-trigger follow-up.");
 
-            // The main-agent requests and trigger setup are fold-independent. In
-            // Rust mode the producer runs outside this mock, so completion belongs
-            // to rust-historian-producer.test.ts rather than this mock-capture test.
             const mainRequests = h.mock.requests().filter((request) => !isHistorianRequest(request.body));
             expect(mainRequests.length).toBeGreaterThanOrEqual(12);
-            if (process.env.MC_E2E_MODE === "rust") {
-                // The hermetic producer bypasses this OpenCode model mock; report
-                // that this mock-capture assertion is intentionally not applicable.
-                console.log(`[rust-e2e] historian publication assertions SKIPPED: ${FOLD_SKIP_REASON}`);
-                return;
-            }
 
             // Wait for the historian run to REACH ITS TERMINAL STATE: at least
             // one compartment published AND compartment_in_progress cleared.

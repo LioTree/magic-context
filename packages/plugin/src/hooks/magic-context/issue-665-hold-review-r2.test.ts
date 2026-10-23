@@ -325,6 +325,9 @@ export async function runOpenCodeHoldDriver(options: {
     const violations: Violation[] = [];
     let previous: Message[] | null = null;
     userTurn();
+    // A signed reply can exist only after its user-only request was served.
+    // Record that provider prelude before adding the simulated tool response.
+    await transform({}, { messages: structuredClone(source) } as never);
     toolStep();
     for (let pass = 0; pass < options.passes; pass++) {
         const events: string[] = [];
@@ -335,6 +338,9 @@ export async function runOpenCodeHoldDriver(options: {
             let servedUserTail = false;
             if (random() < 0.15) {
                 userTurn();
+                const prelude = structuredClone(source);
+                await transform({}, { messages: prelude } as never);
+                previous = prelude;
                 events.push("user");
                 // Sometimes serve the new user message as the tail: the turn has no
                 // thinking yet, so this pass is not held and may apply queued work.

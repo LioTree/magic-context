@@ -137,7 +137,7 @@ export interface MemoryRestorePreview {
     before: MemoryHistorySnapshot;
     after: MemoryHistorySnapshot;
   }>;
-  adoption: "next_natural_hard";
+  adoption: "next_allowed_bust" | "dashboard_epoch_hard";
 }
 
 export interface MemoryRestoreRequest {
@@ -159,7 +159,7 @@ export interface MemoryRestoreReceipt {
   restoredDecisionKey: string | null;
   revisions: MemoryRevisionRef[];
   conflicts: MemoryRevisionConflict[];
-  adoption: "next_natural_hard";
+  adoption: "next_allowed_bust" | "dashboard_epoch_hard";
 }
 
 /** Reply of every dashboard memory setter (status, category, content,
@@ -649,6 +649,15 @@ export interface DbCacheEvent {
    *  segmenting/scaling the timeline (see normalizeEstimatedContextLimits). */
   context_limit_estimated: boolean;
   is_drop: boolean;
+  /** True when Magic Context manages this session's context, so a drop
+   *  (`is_drop`) is Magic Context's own reclaim. False when Magic Context
+   *  does not manage the session, so a drop there is not its doing. Not the
+   *  same as `SessionCacheStats.managed`,
+   *  which only decides whether the Cache list shows the session by default. */
+  context_reduced_by_mc: boolean;
+  /** On a drop, whether the request actually sent got smaller than the
+   *  previous step's. Null unless the source recorded both request sizes. */
+  drop_request_size: "not_smaller" | "smaller" | null;
   /** True when the row sums several provider requests (a whole Broca run)
    *  rather than describing one. `hit_ratio` is then the run's total cached
    *  share and `severity` is "aggregate"; it is never a STABLE/BUST verdict. */

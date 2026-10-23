@@ -5,6 +5,7 @@ import { join } from "node:path";
 import { fileURLToPath } from "node:url";
 import { Worker } from "node:worker_threads";
 import ts from "typescript";
+import { seedSessionMeta } from "../../features/magic-context/__tests__/session-meta-fixture";
 import { insertMemory } from "../../features/magic-context/memory/storage-memory";
 import { runMigrations } from "../../features/magic-context/migrations";
 import { initializeDatabase } from "../../features/magic-context/storage-db";
@@ -14,6 +15,10 @@ import {
     getAutoSearchHintDecisions,
 } from "../../features/magic-context/storage-meta-persisted";
 import { getOrCreateSessionMeta } from "../../features/magic-context/storage-meta-session";
+import {
+    readSessionMetaCollection,
+    sessionMetaCollectionSelect,
+} from "../../features/magic-context/storage-session-collections";
 import { _resetHarnessForTesting, setHarness } from "../../shared/harness";
 import { Database } from "../../shared/sqlite";
 import { createTestTempDirFromPath } from "../../shared/test-temp-dir";
@@ -81,10 +86,30 @@ function olderGetter() {
             compilerOptions: { target: ts.ScriptTarget.ES2022, module: ts.ModuleKind.None },
         },
     ).outputText;
-    return new Function(`${javascript}\nreturn getAutoSearchHintDecisions;`)() as (
+    const historical = new Function(`${javascript}\nreturn getAutoSearchHintDecisions;`)() as (
         db: Database,
         sessionId: string,
     ) => AutoSearchHintDecision[];
+    return (db: Database, sessionId: string) => {
+        // The historical accessor owns an inline schema; feed it the exact reconstructed JSON.
+        const legacy = new Database(":memory:");
+        try {
+            legacy.exec(
+                "CREATE TABLE session_meta(session_id TEXT PRIMARY KEY,auto_search_hint_decisions TEXT)",
+            );
+            seedSessionMeta(legacy, {
+                session_id: sessionId,
+                auto_search_hint_decisions: readSessionMetaCollection(
+                    db,
+                    sessionId,
+                    "auto_search_hint_decisions",
+                ) as string | null,
+            });
+            return historical(legacy, sessionId);
+        } finally {
+            legacy.close();
+        }
+    };
 }
 
 // These five findings required the worker to write a decision or backfill while
@@ -148,7 +173,7 @@ test("owner decisions retain master's exact JSON and older-reader replay", async
     expect(
         db
             .prepare(
-                "SELECT auto_search_hint_decisions AS decisions FROM session_meta WHERE session_id='owner'",
+                `SELECT ${sessionMetaCollectionSelect("auto_search_hint_decisions", "decisions", db)} FROM session_meta WHERE session_id='owner'`,
             )
             .get(),
     ).toEqual({ decisions: '[{"decision":"hint","messageId":"user","text":"served"}]' });

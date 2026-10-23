@@ -316,7 +316,6 @@ test.skipIf(process.env.REVIEW_OUTPUT === undefined)(
 			);
 		} finally {
 			io.restore();
-			transform.disposeRust();
 			resetLkgSlotsForTest();
 			resetCtxReduceRegisteredGloballyForTest();
 			closeDatabase();

@@ -1,5 +1,3 @@
-import { createHash } from "node:crypto";
-
 import { DREAMER_CLASSIFIER_AGENT } from "../../../agents/dreamer";
 import { withContentLanguageDirective } from "../../../agents/language-directive";
 import { resolveHiddenCompletionExecutor } from "../../../hooks/magic-context/compartment-runner-historian";
@@ -9,21 +7,15 @@ import {
     HiddenCompletionRefusal,
     type HiddenRunHandle,
 } from "../../../hooks/magic-context/compartment-runner-types";
-import { isRustAuthorityDrainingError } from "../../../plugin/rust-tool-backends";
 import type { PluginContext } from "../../../plugin/types";
 import * as shared from "../../../shared";
-import { describeError, getErrorMessage } from "../../../shared/error-message";
+import { describeError } from "../../../shared/error-message";
 import { log } from "../../../shared/logger";
 import type { ModelInput } from "../../../shared/model-resolution";
 import { hasShareabilitySensitiveText } from "../../../shared/redaction";
-import {
-    modelBodyField,
-    parseProviderModel,
-    toModelEntry,
-} from "../../../shared/resolve-fallbacks";
+import { modelBodyField } from "../../../shared/resolve-fallbacks";
 import { formatRunTokenLog, runTokenLog } from "../../../shared/run-token-log";
 import type { Database } from "../../../shared/sqlite";
-import { renderCapabilityRefusal } from "../../../shared/user-facing-codes";
 import {
     getMemoriesByProject,
     getUnclassifiedMemoryIds,
@@ -32,11 +24,7 @@ import {
 } from "../memory";
 import { memoriesWithOpenClassificationItems } from "../memory/turn-two-scoring";
 import type { SubagentInvocationStatus } from "../storage-subagent-invocations";
-import {
-    failedInvocationStatus,
-    recordChildInvocation,
-    type TokenTotals,
-} from "../subagent-token-capture";
+import { failedInvocationStatus, recordChildInvocation } from "../subagent-token-capture";
 import {
     buildClassifyPrompt,
     CLASSIFY_SYSTEM_PROMPT,
@@ -79,50 +67,6 @@ const STAGE3_ANCHOR_COUNT = 30; // calibration anchors shown in Stage 3
 // >100 to-classify Stage-3 backlog splits into chunks of this size.
 const CLASSIFY_CHUNK_SIZE = 100;
 
-// Module-side classify awaits a full broca producer run (CLASSIFY_AWAIT_TIMEOUT is
-// 600s in the module); the transport request must outlive it plus dispatch slack.
-const CLASSIFY_MODULE_RUN_TIMEOUT_MS = 660_000;
-
-/** The `dreamer.run_task` code a module with no completion runner answers with. */
-const HOST_COMPLETION_REQUIRED = "host_completion_required";
-
-/** A classify completion this host ran, in the shape `dreamer.run_task` takes it back. */
-interface HostClassifyCompletion {
-    text: string;
-    model: string;
-    length_capped: boolean;
-    usage: { input: number; output: number; cache_read: number; cache_write: number };
-}
-
-export interface ClassifyModuleCallArgs {
-    sessionId: string;
-    projectRoot: string;
-    method: string;
-    body: unknown;
-    signal?: AbortSignal;
-    timeoutMs?: number;
-}
-
-export interface ClassifyModuleClient {
-    call(args: ClassifyModuleCallArgs): Promise<unknown>;
-}
-
-/**
- * A module-backed classification failure must reach the task scheduler as a
- * transient error. The TypeScript child path is intentionally not a fallback:
- * when MODULE owns memories, writing through the child would violate the
- * authority boundary (or hide a module outage behind a misleading success).
- */
-export class ClassifyModuleFailureError extends Error {
-    readonly transient = true;
-
-    constructor(operation: string, cause: unknown) {
-        super(`Rust classify ${operation} failed: ${getErrorMessage(cause)}`);
-        this.name = "ClassifyModuleFailureError";
-        (this as Error & { cause?: unknown }).cause = cause;
-    }
-}
-
 export interface ClassifyArgs {
     db: Database;
     client?: PluginContext["client"];
@@ -137,11 +81,6 @@ export interface ClassifyArgs {
     model?: ModelInput;
     fallbackModels?: readonly ModelInput[];
     language?: string;
-    /** Optional Rust writer for the shared context.db rows. */
-    moduleClient?: ClassifyModuleClient;
-    moduleSessionId?: string;
-    moduleProjectRoot?: string;
-    moduleCommandId?: string;
     onProgress?: (processed: number) => void;
 }
 
@@ -162,14 +101,6 @@ interface ClassifyCandidate {
     normalizedHash: string;
     /** Already scored, or reserved for historian scoring; assess safety only. */
     safetyOnly?: boolean;
-}
-
-function isModuleRoute(args: ClassifyArgs): boolean {
-    return (
-        args.moduleClient !== undefined &&
-        args.moduleSessionId !== undefined &&
-        args.moduleProjectRoot !== undefined
-    );
 }
 
 function getClassifyCandidates(args: ClassifyArgs): ClassifyCandidate[] {
@@ -336,16 +267,13 @@ async function classifyOneChunk(
     let closeExecutor: HiddenCompletionExecutor | undefined;
     let promptSettled = false;
     const startedAt = Date.now();
-    const moduleRoute = isModuleRoute(args);
     try {
         const prompt = buildClassifyPrompt({
             projectPath: args.projectIdentity,
             memories: chunk.map(toPromptMemory),
             anchors,
         });
-        // Runs the classify prompt on this host's own carrier. The module route uses
-        // it too when the module has no completion runner of its own (under
-        // historian.runner = host) and asks the host to run the completion.
+        // Runs the classify prompt on this host's own carrier.
         const runOnHostCarrier = async (system: string) => {
             const executor = resolveHiddenCompletionExecutor(
                 args.hiddenCompletionExecutor,
@@ -436,40 +364,6 @@ async function classifyOneChunk(
             return run;
         };
 
-        if (moduleRoute) {
-            const { accounting, ...run } = await runClassifyThroughModule(
-                args,
-                chunk,
-                anchors,
-                signal,
-                async (system) => {
-                    const run = await runOnHostCarrier(system);
-                    const output = run.output;
-                    return {
-                        text: run.validated,
-                        model:
-                            output.providerId && output.modelId
-                                ? `${output.providerId}/${output.modelId}`
-                                : run.attempt.label,
-                        length_capped: output.lengthCapped === true,
-                        // A carrier that reported no usage sends zeros, as the module's
-                        // own runner reports nothing it was not given.
-                        usage: {
-                            input: output.usage?.input ?? 0,
-                            output: output.usage?.output ?? 0,
-                            cache_read: output.usage?.cacheRead ?? 0,
-                            cache_write: output.usage?.cacheWrite ?? 0,
-                        },
-                    };
-                },
-            );
-            recordInvocation(args, startedAt, {
-                status: "completed",
-                moduleAccounting: accounting,
-            });
-            return run;
-        }
-
         const run = await runOnHostCarrier(
             withContentLanguageDirective(CLASSIFY_SYSTEM_PROMPT, args.language),
         );
@@ -488,7 +382,7 @@ async function classifyOneChunk(
             ),
         );
     } catch (error) {
-        const failure = moduleRoute ? new ClassifyModuleFailureError("module", error) : error;
+        const failure = error;
         const desc = describeError(failure);
         log(
             `[dreamer] classify chunk failed: ${desc.brief}`,
@@ -503,11 +397,7 @@ async function classifyOneChunk(
                 ? undefined
                 : await readFailedChildMessages(args.client, agentSessionId, args.sessionDirectory),
         });
-        // A MODULE-authority failure is not safe to downgrade to the guarded
-        // TypeScript child path. Surface it so the scheduler records a
-        // transient failure and retries the same task instead.
         if (
-            moduleRoute ||
             failure instanceof HiddenCompletionRefusal ||
             signal.aborted ||
             failure instanceof DreamerProviderOutputFailureError ||
@@ -524,236 +414,6 @@ async function classifyOneChunk(
             log,
         });
     }
-}
-
-/** The module writes classification to the shared rows; the host must not apply it a second time. */
-async function runClassifyThroughModule(
-    args: ClassifyArgs,
-    chunk: ClassifyCandidate[],
-    anchors: ClassifyAnchorMemory[],
-    signal: AbortSignal,
-    runOnHost: (system: string) => Promise<HostClassifyCompletion>,
-): Promise<{ classified: number; changed: number; accounting: ModuleClassifyAccounting }> {
-    const prompt = buildClassifyPrompt({
-        projectPath: args.projectIdentity,
-        memories: chunk.map(toPromptMemory),
-        anchors,
-    });
-    const modelEntries = [args.model, ...(args.fallbackModels ?? [])]
-        .map(toModelEntry)
-        .filter((entry) => entry !== undefined);
-    const resolvedModelChain = [...new Set(modelEntries.map((entry) => entry.model))];
-    // Each chain model's configured variant (e.g. a reasoning effort), keyed like the
-    // chain. The module sends it as the runner's `model.variant`. The chain keeps the
-    // first entry for a repeated model, so that entry's variant wins here too.
-    const modelVariants: Record<string, string> = {};
-    const variantSeen = new Set<string>();
-    for (const entry of modelEntries) {
-        if (variantSeen.has(entry.model)) continue;
-        variantSeen.add(entry.model);
-        if (entry.qualifier) modelVariants[entry.model] = entry.qualifier;
-    }
-    const commandId = `classify:${args.moduleCommandId ?? Date.now()}:${createHash("sha256")
-        .update(chunk.map((candidate) => candidate.id).join(","))
-        .digest("hex")
-        .slice(0, 24)}`;
-    const runTask = (hostCompletion?: HostClassifyCompletion) =>
-        args.moduleClient?.call({
-            sessionId: args.moduleSessionId as string,
-            projectRoot: args.moduleProjectRoot as string,
-            method: "dreamer.run_task",
-            body: {
-                method: "dreamer.run_task",
-                v: 1,
-                session_id: args.moduleSessionId,
-                task: "classify",
-                // Chunk membership must stay in the id for retry idempotency, but a large
-                // chunk's literal id list can exceed the module's 256-byte command-id cap,
-                // so the membership rides as a digest.
-                command_id: commandId,
-                // Always sent, even when empty: the module has no chain of its own and
-                // refuses a request without one, while an empty chain reports "no models".
-                model_chain: resolvedModelChain,
-                ...(Object.keys(modelVariants).length > 0 ? { model_variants: modelVariants } : {}),
-                payload: {
-                    prompt_body: prompt,
-                    items: chunk.map((candidate) => ({
-                        memory_id: candidate.id,
-                        content_hash: candidate.normalizedHash,
-                    })),
-                },
-                ...(hostCompletion ? { host_completion: hostCompletion } : {}),
-            },
-            signal,
-            // Each model attempt can spend 600 seconds awaiting its provider run and
-            // another 60 seconds recovering its response. Allow every fallback to finish.
-            timeoutMs:
-                Math.max(1, resolvedModelChain.length) * CLASSIFY_MODULE_RUN_TIMEOUT_MS + 30_000,
-        });
-    const unwrap = (response: unknown) =>
-        (response as { result?: unknown } | null)?.result ?? response;
-    let result = unwrap(await runTask());
-    // Under historian.runner = host the module has no completion runner: it answers
-    // with the system prompt to use, this host runs the completion on its own carrier,
-    // and the text goes back to the module under the same command id.
-    const asked = result as { code?: unknown; system_prompt?: unknown } | null;
-    if (asked?.code === HOST_COMPLETION_REQUIRED) {
-        if (typeof asked.system_prompt !== "string")
-            throw new Error("module asked for a host classify completion without a system prompt");
-        result = unwrap(await runTask(await runOnHost(asked.system_prompt)));
-    }
-    if (!result || typeof result !== "object")
-        throw new Error("module returned invalid classify result");
-    const manifestText = (result as { manifest_text?: unknown }).manifest_text;
-    if (typeof manifestText !== "string") throw new Error("module returned no classify manifest");
-    if ((result as { truncated?: unknown }).truncated === true) {
-        throw new Error("classify returned length-capped output");
-    }
-    const accounting = moduleClassifyAccounting(result as Record<string, unknown>);
-    const parsed = validateClassifyManifest(
-        manifestText,
-        new Set(chunk.map((candidate) => candidate.id)),
-    );
-    const rows = parsed.map((entry) => {
-        const candidate = chunk.find((item) => item.id === entry.id);
-        if (!candidate) throw new Error(`classify returned unknown memory ${entry.id}`);
-        return {
-            memory_id: entry.id,
-            content_hash_at_prompt: candidate.normalizedHash,
-            ...(entry.safety_critical !== undefined
-                ? { safety_critical: entry.safety_critical }
-                : {}),
-            ...(candidate.safetyOnly
-                ? {}
-                : {
-                      importance: entry.importance,
-                      scope: entry.scope,
-                      // The host forces shareable to false whenever the memory text is sensitive,
-                      // regardless of whether classification runs through the module or provider path.
-                      shareable:
-                          entry.shareable === true &&
-                          hasShareabilitySensitiveText(candidate.contextMemory.content)
-                              ? false
-                              : entry.shareable,
-                  }),
-        };
-    });
-    let applied: unknown;
-    try {
-        applied = await args.moduleClient?.call({
-            sessionId: args.moduleSessionId as string,
-            projectRoot: args.moduleProjectRoot as string,
-            method: "memory.set_classification",
-            body: {
-                name: "memory.set_classification",
-                arguments: {
-                    memory_project: args.projectIdentity,
-                    rows,
-                },
-            },
-            signal,
-        });
-    } catch (error) {
-        if (isRustAuthorityDrainingError(error)) {
-            throw new Error(renderCapabilityRefusal("memory_write"));
-        }
-        throw error;
-    }
-    if (isRustAuthorityDrainingError(applied)) {
-        throw new Error(renderCapabilityRefusal("memory_write"));
-    }
-    const applyResult = (applied as { result?: unknown } | null)?.result ?? applied;
-    if (!applyResult || typeof applyResult !== "object") {
-        throw new Error("module returned invalid classification apply result");
-    }
-    const accepted = (applyResult as { accepted?: unknown }).accepted;
-    if (!Array.isArray(accepted))
-        throw new Error("module returned no classification acceptance list");
-    const acceptedIds = accepted.map((id) => {
-        if (!Number.isInteger(id)) throw new Error("module returned an invalid accepted memory id");
-        return id as number;
-    });
-    const rejected = (applyResult as { rejected?: unknown }).rejected;
-    const rejectedRows = Array.isArray(rejected) ? rejected : [];
-    const rejectionCounts = new Map<string, number>();
-    for (const row of rejectedRows) {
-        const reason =
-            row &&
-            typeof row === "object" &&
-            typeof (row as { reason?: unknown }).reason === "string"
-                ? (row as { reason: string }).reason
-                : "unknown";
-        rejectionCounts.set(reason, (rejectionCounts.get(reason) ?? 0) + 1);
-    }
-    const nonStaleRejections = [...rejectionCounts].some(([reason]) => reason !== "stale");
-    if (nonStaleRejections) {
-        const knownReasons = ["not_found", "not_owned", "stale"];
-        const known = knownReasons.map((reason) => `${reason}=${rejectionCounts.get(reason) ?? 0}`);
-        const unknown = [...rejectionCounts]
-            .filter(([reason]) => !knownReasons.includes(reason))
-            .map(([reason, count]) => `${reason}=${count}`);
-        throw new Error(`module rejected classification (${[...known, ...unknown].join(", ")})`);
-    }
-
-    // Validate the module's accepted ids against the submitted chunk. Its write
-    // already updated classified_at in context.db, so there is no local replay.
-    const byModuleId = new Map(chunk.map((candidate) => [candidate.id, candidate]));
-    const acceptedContextIds = acceptedIds.map((moduleId) => {
-        const candidate = byModuleId.get(moduleId);
-        if (!candidate) throw new Error(`module accepted unknown memory ${moduleId}`);
-        return candidate.contextMemory.id;
-    });
-    return {
-        classified: acceptedContextIds.length,
-        changed: acceptedContextIds.length,
-        accounting,
-    };
-}
-
-/** Spend and model the module reports for a classify run, in the shape the
- *  invocation record takes. */
-export interface ModuleClassifyAccounting {
-    tokens?: TokenTotals;
-    providerId?: string;
-    modelId?: string;
-}
-
-function nonNegativeCount(value: unknown): number {
-    return typeof value === "number" && Number.isFinite(value) && value >= 0 ? value : 0;
-}
-
-/** Reads the `dreamer.run_task` response's `usage` (input / output / cache_read /
- *  cache_write) and `diagnostics.model` ("provider/model"). Either may be absent:
- *  modules that predate `usage` omit it, and the row then keeps zero tokens. */
-export function moduleClassifyAccounting(
-    result: Record<string, unknown>,
-): ModuleClassifyAccounting {
-    const accounting: ModuleClassifyAccounting = {};
-    const usage = result.usage;
-    if (usage && typeof usage === "object") {
-        const record = usage as Record<string, unknown>;
-        accounting.tokens = {
-            input: nonNegativeCount(record.input),
-            output: nonNegativeCount(record.output),
-            cacheRead: nonNegativeCount(record.cache_read),
-            cacheWrite: nonNegativeCount(record.cache_write),
-        };
-    }
-    const diagnostics = result.diagnostics;
-    const model =
-        diagnostics && typeof diagnostics === "object"
-            ? (diagnostics as Record<string, unknown>).model
-            : undefined;
-    if (typeof model === "string") {
-        const parsed = parseProviderModel(model);
-        if (parsed) {
-            accounting.providerId = parsed.providerID;
-            accounting.modelId = parsed.modelID;
-        } else if (model.trim()) {
-            accounting.modelId = model.trim();
-        }
-    }
-    return accounting;
 }
 
 export function applyClassifications(
@@ -812,7 +472,6 @@ function recordInvocation(
         messages?: unknown[];
         error?: unknown;
         completion?: HiddenCompletion;
-        moduleAccounting?: ModuleClassifyAccounting;
     },
 ): void {
     if (!args.parentSessionId) return;
@@ -830,13 +489,6 @@ function recordInvocation(
                   tokens: params.completion.usage,
                   providerId: params.completion.providerId,
                   modelId: params.completion.modelId,
-              }
-            : {}),
-        ...(params.moduleAccounting
-            ? {
-                  tokens: params.moduleAccounting.tokens,
-                  providerId: params.moduleAccounting.providerId,
-                  modelId: params.moduleAccounting.modelId,
               }
             : {}),
         error: params.error,

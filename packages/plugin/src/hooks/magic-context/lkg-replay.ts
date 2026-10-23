@@ -2,6 +2,7 @@ import { piModelRefToCanonical } from "../../shared/harness-provider-map";
 import { claimLkgRequestIdentity, noteCapturedLkgRequest } from "./lkg-measured-request";
 import {
     captureSlot,
+    discardWithheldServedCapture,
     dropSlot,
     getSlot,
     isLegacyLkgDigest,
@@ -186,6 +187,7 @@ export interface LkgCaptureInput {
 }
 
 export type LkgValidationFailure =
+    | "lkg_dispatch_unconfirmed"
     | "lkg_model_mismatch"
     | "lkg_invalidated_reshape"
     | "lkg_content_mismatch"
@@ -332,6 +334,7 @@ export function buildLkgPrefix(
     inputIdSeq: string[];
     inputContentDigests: string[];
     jsonPrefix: string;
+    prefixMessageCount?: number;
 } | null {
     const projected = asEntryProjection(input);
     const anchorIndex =
@@ -374,6 +377,10 @@ export function buildLkgPrefix(
         inputIdSeq: validIds.slice(0, anchorIndex + 1),
         inputContentDigests: inputContentDigests as string[],
         jsonPrefix,
+        // This is the array just serialized, not the number of input messages:
+        // synthesis and drops can change the output length. A custom array
+        // serializer must still be counted from its actual serialized value.
+        prefixMessageCount: "toJSON" in prefix ? undefined : prefix.length,
     };
 }
 
@@ -405,6 +412,7 @@ export function captureLkgSlot(args: LkgCaptureInput): boolean {
         noteCapturedLkgRequest({
             sessionId: args.sessionId,
             slot,
+            prefixMessageCount: built.prefixMessageCount,
             // In TypeScript mode the saved last-known-good copy can stop before the
             // tool calls still running at the end of the request. Such a partial copy
             // is not what the provider measured, so it gets no usage identity.
@@ -631,6 +639,10 @@ export function replayLkg(args: {
     /** Reapply persisted thinking-strip decisions before validating the candidate's wire shape. */
     prepareReplay?: (messages: MessageLike[]) => void;
 }): { ok: true; messages: MessageLike[] } | { ok: false; reason: LkgValidationFailure } {
+    // A capture its pass never returned (withheld, then the pass threw or was
+    // refused) was never sent. Replay the last request actually sent instead,
+    // which is the saved one.
+    discardWithheldServedCapture(args.sessionId);
     const slot = getSlot(args.sessionId);
     if (!slot) return { ok: false, reason: "lkg_invalidated_reshape" };
     const requestedModelKeys = canonicalLkgModelKeys(args.modelKey, args.providerKey);
@@ -643,6 +655,15 @@ export function replayLkg(args: {
         return { ok: false, reason: "lkg_model_mismatch" };
     }
     const entry = args.entry ?? noteEntry(args.sessionId, args.messages);
+    // When dispatch status is unknown, replay saved bytes only for the exact
+    // input they were saved for, never as the prefix of a newer request.
+    if (
+        slot.dispatchUnconfirmed &&
+        entry &&
+        (entry.entryInputIds.length !== slot.inputIdSeq.length ||
+            !slot.inputIdSeq.every((id, index) => id === entry.entryInputIds[index]))
+    )
+        return { ok: false, reason: "lkg_dispatch_unconfirmed" };
     if (
         !entry ||
         entry.anchorIndex !== slot.inputIdSeq.length - 1 ||

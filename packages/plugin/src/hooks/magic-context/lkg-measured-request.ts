@@ -21,11 +21,46 @@ export type LkgRequestIdentity =
 
 const requests = new BoundedSessionMap<LkgRequestIdentity>(1000);
 const claimedRequests = new WeakSet<LkgRequestIdentity>();
+/** The identity each session's current request replaced. Only the newest link is
+ * kept: the replaced identity's own link is dropped, so older identities are not
+ * retained through a chain. */
+const predecessors = new WeakMap<LkgRequestIdentity, LkgRequestIdentity>();
+
+function setRequest(sessionId: string, request: LkgRequestIdentity): void {
+    const previous = requests.get(sessionId);
+    if (previous) {
+        predecessors.set(request, previous);
+        predecessors.delete(previous);
+    }
+    requests.set(sessionId, request);
+}
+
+/** True when `candidate` is `request` or the identity `request` directly replaced
+ * as its session's current request. */
+export function isSameOrPreviousLkgRequest(
+    request: LkgRequestIdentity | undefined,
+    candidate: LkgRequestIdentity | undefined,
+): boolean {
+    if (!request || !candidate) return false;
+    return candidate === request || candidate === predecessors.get(request);
+}
+/** Identity of a served request's system/tool envelope, compared before its usage
+ * may bound a later request's envelope (see standalone-marker-envelope.ts). */
+export interface LkgMarkerIdentity {
+    model: string;
+    systemDigest: string;
+    toolNames: readonly string[];
+}
+
 const captures = new BoundedSessionMap<{
     request: LkgRequestIdentity;
     slot: string;
     prefixCount: number;
     envelope: string;
+    /** The exact message array returned to the host for this request. Set only when
+     * `marker` is, so a reading never subtracts messages the host did not receive. */
+    jsonPrefix?: string;
+    marker?: LkgMarkerIdentity;
     usage?: { responseId: string; inputTokens: number };
 }>(1000);
 
@@ -80,7 +115,7 @@ export function beginV2LkgRequest(
     previousResponseId?: string,
     responseAfterSequence?: number,
 ): void {
-    requests.set(sessionId, {
+    setRequest(sessionId, {
         kind: "v2",
         previousResponseId,
         startedAt: Date.now(),
@@ -104,12 +139,33 @@ export function currentLkgRequestIdentity(sessionId: string): LkgRequestIdentity
     return requests.get(sessionId);
 }
 
+/** True when `request` is the session's current request identity or the one it
+ * directly replaced. The system-prompt hook records each request's final system
+ * strings under the identity current at that moment, and the messages transform
+ * reads them back. On OpenCode 1 the messages transform runs before the system
+ * hook, so it can only read what the previous request's hook recorded. On
+ * OpenCode 2 the context hook starts a second identity after its system stage and
+ * before the transform, so the recording carries the identity just replaced. */
+export function isCurrentOrPreviousLkgRequest(
+    sessionId: string,
+    request: LkgRequestIdentity | undefined,
+): boolean {
+    const current = requests.get(sessionId);
+    if (!request || !current) return false;
+    return request === current || request === predecessors.get(current);
+}
+
 export function noteCapturedLkgRequest(args: {
     sessionId: string;
     slot: LkgSlot;
+    /** Length of the plain output array serialized into this slot, when already known. */
+    prefixMessageCount?: number;
     request?: LkgRequestIdentity;
     systemPromptTokens: number;
     agentName?: string;
+    /** Only for the array actually returned to the host. Once this request completes,
+     * its usage can bound the system/tool envelope of later requests. */
+    marker?: LkgMarkerIdentity;
 }): void {
     const request = args.request;
     if (!request || request.modelKey !== args.slot.modelKey) {
@@ -119,9 +175,35 @@ export function noteCapturedLkgRequest(args: {
     captures.set(args.sessionId, {
         request,
         slot: identity(args.slot),
-        prefixCount: (JSON.parse(args.slot.jsonPrefix) as unknown[]).length,
+        prefixCount:
+            args.prefixMessageCount ?? (JSON.parse(args.slot.jsonPrefix) as unknown[]).length,
         envelope: envelope(request.modelKey, args.systemPromptTokens, args.agentName),
+        ...(args.marker ? { marker: args.marker, jsonPrefix: args.slot.jsonPrefix } : {}),
     });
+}
+
+interface LkgMarkerReading {
+    responseId: string;
+    inputTokens: number;
+    jsonPrefix: string;
+    marker: LkgMarkerIdentity;
+}
+
+// The most recent successfully completed request per session, frozen when its
+// usage is attributed. A newer request that has only been captured leaves it in
+// place; the next successful completion replaces it, or clears it when that
+// request's returned array or envelope identity is unknown.
+const markerReadings = new BoundedSessionMap<LkgMarkerReading>(1000);
+
+/** Usage, returned message array and envelope identity of the session's most
+ * recent successfully completed request, when all three are known. */
+export function lkgMarkerReading(sessionId: string): LkgMarkerReading | undefined {
+    return markerReadings.get(sessionId);
+}
+
+/** Test helper: install a completed-request reading without a provider response. */
+export function __setLkgMarkerReadingForTests(sessionId: string, reading: LkgMarkerReading): void {
+    markerReadings.set(sessionId, reading);
 }
 
 /** Record the provider's measured input size (cache reads and writes, system
@@ -148,7 +230,7 @@ export function noteLkgProviderResponse(args: {
             previous.modelKey === args.modelKey
         )
             return;
-        requests.set(args.sessionId, {
+        setRequest(args.sessionId, {
             kind: "v1",
             responseId: args.responseId,
             modelKey: args.modelKey,
@@ -156,6 +238,16 @@ export function noteLkgProviderResponse(args: {
         return;
     }
     acknowledgeSystemPromptDelivery({ ...args, request: requests.get(args.sessionId) });
+    const succeeded =
+        Number.isSafeInteger(args.inputTokens) &&
+        args.inputTokens > 0 &&
+        !providerResponseFailed(args) &&
+        Boolean(args.completedAt || args.finish);
+    // Any other successful completion becomes the most recent completed request;
+    // an unattributable one leaves no envelope reading. Repeated updates of the
+    // reading's own response keep it.
+    if (succeeded && markerReadings.get(args.sessionId)?.responseId !== args.responseId)
+        markerReadings.delete(args.sessionId);
     const capture = captures.get(args.sessionId);
     if (
         !capture ||
@@ -179,6 +271,13 @@ export function noteLkgProviderResponse(args: {
     )
         return;
     capture.usage = { responseId: args.responseId, inputTokens: args.inputTokens };
+    if (capture.marker && capture.jsonPrefix !== undefined)
+        markerReadings.set(args.sessionId, {
+            responseId: args.responseId,
+            inputTokens: args.inputTokens,
+            jsonPrefix: capture.jsonPrefix,
+            marker: capture.marker,
+        });
 }
 
 export function measuredLkgPrefix(args: {
@@ -213,6 +312,7 @@ export function measuredLkgPrefix(args: {
 export function clearLkgMeasuredRequest(sessionId: string): void {
     requests.delete(sessionId);
     captures.delete(sessionId);
+    markerReadings.delete(sessionId);
     clearSystemPromptDelivery(sessionId);
 }
 

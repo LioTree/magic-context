@@ -70,6 +70,8 @@ pub(crate) enum PendingContextWrite {
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub(crate) struct FoldWrite {
     #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub fence: Option<HistorianFoldFence>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub lifecycle_publication_id: Option<String>,
     pub project_path: String,
     /// The harness label for the fold's rows; `None` falls back to the session's own.
@@ -83,6 +85,24 @@ pub(crate) struct FoldWrite {
     pub events: Vec<HistorianEventCandidate>,
     pub primer_candidates: Vec<HistorianPrimerCandidate>,
     pub user_memory_candidates: Vec<HistorianUserMemoryCandidate>,
+}
+
+/// Preserve assembly-time history identity and shared lease ownership across the
+/// store.db intent commit and the later context.db compartment commit.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub(crate) struct HistorianFoldFence {
+    pub firing_seq: u64,
+    pub prior_publication_floor_ordinal: Option<u64>,
+    pub producer_run_id: String,
+    pub holder_id: String,
+    pub generation: crate::CompartmentSetGeneration,
+    pub revert_epoch: u64,
+}
+
+pub(crate) enum ActivatedFoldOutcome {
+    Applied(Vec<PromotedRef>),
+    Deferred(String),
+    Discarded(String),
 }
 
 /// Why a stored compartment and a desired one are the same row: every column the renderer,
@@ -424,7 +444,7 @@ fn apply_lineage_copy_tx(
     Ok(())
 }
 
-fn apply_pending_tx(
+pub(crate) fn apply_pending_tx(
     tx: &rusqlite::Connection,
     session_id: &str,
     write: &PendingContextWrite,
@@ -549,6 +569,15 @@ impl McStore {
         write: &PendingContextWrite,
         recorded: &str,
     ) -> Result<Vec<PromotedRef>, McStoreError> {
+        if let PendingContextWrite::Fold(fold) = write {
+            if fold.fence.is_some() {
+                return match self.complete_activated_fold(session_id, fold, recorded)? {
+                    ActivatedFoldOutcome::Applied(promoted) => Ok(promoted),
+                    ActivatedFoldOutcome::Discarded(_) => Ok(Vec::new()),
+                    ActivatedFoldOutcome::Deferred(_) => Ok(Vec::new()),
+                };
+            }
+        }
         let mut tables = HISTORY_TABLES.to_vec();
         if matches!(write, PendingContextWrite::Fold(fold) if fold.lifecycle_publication_id.is_some())
         {
@@ -570,6 +599,118 @@ impl McStore {
         Ok(promoted)
     }
 
+    pub(crate) fn complete_activated_fold(
+        &self,
+        session_id: &str,
+        fold: &FoldWrite,
+        recorded: &str,
+    ) -> Result<ActivatedFoldOutcome, McStoreError> {
+        let fence = fold.fence.as_ref().expect("activated fold has a fence");
+        let Some(_lease) = self.acquire_historian_lease(session_id, &fence.holder_id)? else {
+            return Ok(ActivatedFoldOutcome::Deferred(
+                "compartment lease busy".into(),
+            ));
+        };
+        #[cfg(test)]
+        crate::HISTORIAN_FOLD_TEST_HOOK.with(|hook| {
+            let hook = hook.borrow_mut().take();
+            if let Some(hook) = hook {
+                hook(self);
+            }
+        });
+        let mut tables = HISTORY_TABLES.to_vec();
+        if fold.lifecycle_publication_id.is_some() {
+            tables.extend([
+                "memory_publications",
+                "memory_pending_facts",
+                "memory_activity_ledger",
+            ]);
+        }
+        // Lock store.db before context.db, and keep both locks until the context
+        // commit. A revert cannot move its store-side epoch during the append.
+        let mut failure = None;
+        let result = self.inner.with_conn_fenced(|store_tx| {
+            let outcome = self.context_write(&tables, |tx| {
+                if !crate::historian_lease_held(tx, session_id, &fence.holder_id)? {
+                    return Ok(ActivatedFoldOutcome::Deferred("compartment lease ownership lost".into()));
+                }
+                if crate::historian_wrapup_active(tx, session_id)? {
+                    return Ok(ActivatedFoldOutcome::Deferred("wrapup in progress".into()));
+                }
+                let epoch: u64 = store_tx.query_row(
+                    "SELECT COALESCE((SELECT json_extract(meta, '$.revert_epoch') FROM mc_cache_state WHERE session_id = ?1), 0)",
+                    params![session_id], |row| row.get(0),
+                )?;
+                if epoch != fence.revert_epoch {
+                    return Ok(ActivatedFoldOutcome::Discarded("revert epoch changed after firing".into()));
+                }
+                let generation = tx.query_row(
+                    "SELECT COALESCE(MAX(sequence), 0), COUNT(*) FROM compartments WHERE session_id = ?1",
+                    params![session_id], |row| Ok(crate::CompartmentSetGeneration { max_sequence: row.get(0)?, count: row.get(1)? }),
+                )?;
+                // A crash after the context commit but before deleting the intent
+                // must not run fact promotion or other side channels a second time.
+                if !fold.compartments.is_empty() {
+                    let stored = read_session_compartments(tx, session_id, fence.generation.max_sequence + 1)?;
+                    if fold.compartments.iter().all(|desired| stored.iter().any(|(_, row)| same_compartment(row, desired))) {
+                        return Ok(ActivatedFoldOutcome::Applied(Vec::new()));
+                    }
+                }
+                if generation != fence.generation {
+                    return Ok(ActivatedFoldOutcome::Discarded("compartment set changed after firing".into()));
+                }
+                apply_fold_tx(tx, session_id, fold).map(ActivatedFoldOutcome::Applied)
+            });
+            let outcome = match outcome {
+                Ok(outcome) => outcome,
+                Err(error) => {
+                    failure = Some(error);
+                    return Err(rusqlite::Error::InvalidQuery);
+                }
+            };
+            if !matches!(outcome, ActivatedFoldOutcome::Deferred(_)) {
+                if matches!(outcome, ActivatedFoldOutcome::Discarded(_)) {
+                    let (version, encoded): (i64, String) = store_tx.query_row("SELECT row_version, meta FROM mc_cache_state WHERE session_id = ?1", params![session_id], |row| Ok((row.get(0)?, row.get(1)?)))?;
+                    let mut meta: crate::ModuleMeta = serde_json::from_str(&encoded).map_err(|e| rusqlite::Error::ToSqlConversionFailure(Box::new(e)))?;
+                    if meta.historian.state == crate::HistorianPhase::Idle && meta.historian.firing_seq == fence.firing_seq {
+                        // An unapplied fold must not advance the next assembly's
+                        // raw-message floor. Do not undo a newer firing's progress.
+                        meta.publication_floor_ordinal = fence.prior_publication_floor_ordinal;
+                        let encoded = serde_json::to_string(&meta).map_err(|e| rusqlite::Error::ToSqlConversionFailure(Box::new(e)))?;
+                        store_tx.execute("UPDATE mc_cache_state SET row_version = ?2, meta = ?3 WHERE session_id = ?1", params![session_id, version + 1, encoded])?;
+                        crate::advance_row_state_digest_tx(store_tx, session_id, version, version + 1)?;
+                    }
+                    // The intent staged transcripts and boundary dates, but no Rust
+                    // compartment was appended to own them. Remove them rather than
+                    // attach stale recovery text or dates to TypeScript compartments.
+                    for compartment in &fold.compartments {
+                        store_tx.execute("DELETE FROM mc_chunk_transcripts WHERE session_id = ?1 AND compartment_seq = ?2", params![session_id, compartment.sequence])?;
+                        store_tx.execute("DELETE FROM mc_compartment_dates WHERE session_id = ?1 AND sequence = ?2", params![session_id, compartment.sequence])?;
+                    }
+                }
+                store_tx.execute(
+                    "DELETE FROM mc_single_store_pending_publish WHERE session_id = ?1 AND publish_json = ?2",
+                    params![session_id, recorded],
+                )?;
+                store_tx.execute("DELETE FROM mc_historian_pending_run WHERE run_id = ?1 AND session_id = ?2", params![fence.producer_run_id, session_id])?;
+            }
+            Ok(outcome)
+        });
+        if let Some(error) = failure {
+            return Err(error);
+        }
+        let outcome = result?;
+        if let ActivatedFoldOutcome::Discarded(reason) = &outcome {
+            tracing::warn!(
+                session_id,
+                holder_id = fence.holder_id,
+                reason,
+                "discarded stale activated historian fold"
+            );
+        }
+        Ok(outcome)
+    }
+
     /// Finish the session's pending `context.db` write, if a crash or a busy `context.db`
     /// left one. Returns whether there was one.
     pub fn resume_pending_context_write(&self, session_id: &str) -> Result<bool, McStoreError> {
@@ -586,6 +727,14 @@ impl McStore {
         };
         let write: PendingContextWrite =
             serde_json::from_str(&json).map_err(|error| McStoreError::Serde(error.to_string()))?;
+        if let PendingContextWrite::Fold(fold) = &write {
+            if fold.fence.is_some() {
+                return Ok(!matches!(
+                    self.complete_activated_fold(session_id, fold, &json)?,
+                    ActivatedFoldOutcome::Deferred(_)
+                ));
+            }
+        }
         // The stored text, not a re-serialization: a row an older binary wrote may not
         // round-trip byte for byte, and then it would never be deleted.
         self.complete_recorded_context_write(session_id, &write, &json)?;
@@ -682,6 +831,7 @@ mod tests {
 
     fn fold() -> PendingContextWrite {
         PendingContextWrite::Fold(FoldWrite {
+            fence: None,
             lifecycle_publication_id: None,
             project_path: "git:proj".to_string(),
             harness: None,

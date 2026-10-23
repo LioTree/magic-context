@@ -330,6 +330,9 @@ describe("Pi incremental LKG capture", () => {
 			servedCaptureId: 1,
 			fullCoverage: true,
 			slotState: "captured",
+			// The deferred save has not written bytes under served capture id 1 yet, so
+			// the marker is unbound and certifies nothing.
+			servedDigest: null,
 		});
 		expect(checkLkgDurability(harness.db, "move-pi")).toEqual({
 			durable: true,

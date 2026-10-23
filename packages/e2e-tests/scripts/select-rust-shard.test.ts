@@ -1,26 +1,57 @@
 import { describe, expect, test } from "bun:test";
 
-import { filesForMode, validateModeManifest } from "./validate-mode-manifest";
-import { selectRustShard } from "./select-rust-shard";
+import { filesForMode, type ValidationResult, validateModeManifest } from "./validate-mode-manifest";
+import { selectManifestRustShard, selectRustShard } from "./select-rust-shard";
 import { selectWeightedShard } from "./select-weighted-shard";
 
+/**
+ * The live manifest's Rust lane is retired and selects nothing, so shard
+ * coverage is checked on a copy whose first twelve entries run in Rust.
+ */
+function activeRustManifest(): ValidationResult {
+    const live = validateModeManifest();
+    const entries = live.manifest.entries.map((entry, index) =>
+        index < 12 ? { ...entry, invocation: { ...entry.invocation, rust: true } } : entry,
+    );
+    return { files: live.files, manifest: { schema: 1, header: live.manifest.header, entries } };
+}
+
 describe("rust hermetic shard coverage", () => {
-    test("four disjoint shards cover the manifest rust list exactly once", () => {
+    test("the retired manifest selects no Rust files and every shard reports the retired lane", () => {
         const validation = validateModeManifest();
+        expect(filesForMode(validation, "rust")).toEqual([]);
+        for (let i = 0; i < 4; i += 1) {
+            expect(selectManifestRustShard(validation, `${i}/4`)).toEqual({ files: [], retired: true });
+        }
+    });
+
+    test("an empty Rust list without the retired marker still fails shard selection", () => {
+        const live = validateModeManifest();
+        const unmarked: ValidationResult = {
+            files: live.files,
+            manifest: { schema: 1, header: live.manifest.header, entries: live.manifest.entries },
+        };
+        expect(() => selectManifestRustShard(unmarked, "0/4")).toThrow(/invalid shard/);
+    });
+
+    test("four disjoint shards cover an active manifest's rust list exactly once", () => {
+        const validation = activeRustManifest();
         const files = filesForMode(validation, "rust");
-        const shards = Array.from({ length: 4 }, (_, i) => selectRustShard(files, `${i}/4`));
-        const selected = shards.flat();
+        expect(files).toHaveLength(12);
+        const shards = Array.from({ length: 4 }, (_, i) => selectManifestRustShard(validation, `${i}/4`));
+        expect(shards.every((shard) => !shard.retired)).toBe(true);
+        const selected = shards.flatMap((shard) => shard.files);
         expect(selected.length).toBe(files.length);
         expect(new Set(selected).size).toBe(files.length);
         expect([...selected].sort()).toEqual(files);
-        expect(shards.every((shard) => shard.length > 0)).toBe(true);
+        expect(shards.every((shard) => shard.files.length > 0)).toBe(true);
         for (const entry of validation.manifest.entries) {
             if (!entry.invocation.rust) expect(selected).not.toContain(entry.path);
         }
     });
 
     test("rejects invalid and empty shard specifications", () => {
-        const files = filesForMode(validateModeManifest(), "rust");
+        const files = filesForMode(activeRustManifest(), "rust");
         for (const spec of ["", "1", "4/4", "-1/4", "0/0", "0/999", "1/1/1"]) {
             expect(() => selectRustShard(files, spec)).toThrow();
         }

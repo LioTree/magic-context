@@ -1,5 +1,6 @@
-// Randomized multi-pass driver for the signed-prefix hold on Pi (issues 665 and
-// 664, second review). Each run drives one session through the real context
+import { rejectSessionRenderCacheWrites } from "../../plugin/src/features/magic-context/__tests__/session-meta-faults";
+// Randomized multi-pass driver for Pi turns whose signed thinking binds every
+// preceding provider-visible byte. Each run drives the real context
 // handler with a seeded sequence of tool steps, user turns, queued drops,
 // execute crossings, flushes, history refreshes, idle expiry, discarded
 // m[0]/m[1] pairs (first renders), carried tag-identity repairs and restarts.
@@ -8,16 +9,20 @@
 // - a held pass (unfinished signed thinking turn on a prefix-bound model, below
 //   the force band, with nothing that rewrites the prefix anyway) serves the
 //   previous array byte for byte, with only new raw messages after it;
+//   an actually rejected, calibrated over-window replay is exempt only after a
+//   declared, permitted rebuild removes every active-turn signed block;
 // - strict thinking binding: a signed thinking block served on two consecutive
 //   passes must have identical provider-visible bytes before it on both;
 // - no pass is refused for more than one user turn.
 //
 // With R2_TRACE set, every pass is also appended to that file as one JSON line,
 // so two checkouts can be compared pass by pass without changing the driver.
+
 import { afterEach, expect, spyOn, test } from "bun:test";
 import { createHash } from "node:crypto";
 import { appendFileSync } from "node:fs";
 import { appendCompartments } from "@magic-context/core/features/magic-context/compartment-storage";
+import { sessionDecisionCalibration } from "@magic-context/core/features/magic-context/session-decision-calibration";
 import {
 	getOrCreateSessionMeta,
 	getPendingOps,
@@ -31,15 +36,24 @@ import {
 	getSlot,
 	resetLkgSlotsForTest,
 } from "@magic-context/core/hooks/magic-context/lkg-slot";
+import { readServedPrefix } from "@magic-context/core/hooks/magic-context/served-prefix";
+import {
+	_resetHarnessForTesting,
+	setHarness,
+} from "@magic-context/core/shared/harness";
 import * as logger from "@magic-context/core/shared/logger";
 import type { Database } from "@magic-context/core/shared/sqlite";
+import { servedMessageDigest } from "../../plugin/src/hooks/magic-context/__tests__/served-prefix-evidence";
 import {
 	clearContextHandlerSession,
+	__test as contextHandlerInternals,
 	registerPiContextHandler,
 	signalPiHistoryRefresh,
 	signalPiPendingMaterialization,
 } from "./context-handler";
 import { clearM0M1PiCache } from "./inject-compartments-pi";
+import { readPiLkgFitEnvelope } from "./pi-lkg-fit-envelope";
+import * as piFit from "./pi-raw-fallback";
 import {
 	queuePiIdentityRebuild,
 	readPiIdentityRebuilds,
@@ -85,6 +99,22 @@ interface PassRecord {
 	wireHash?: string;
 	decision?: string;
 	rawInputBytes?: number;
+	overWindowRebuild?: {
+		tokens: number;
+		limit: number;
+		activeSignedBlocks: number;
+		declaredRebuild: boolean;
+		bustPermitted: boolean;
+		bustedThisPass: boolean;
+		signedPrefixRewritten: boolean;
+	};
+}
+
+interface RejectedReplay {
+	tokens: number;
+	limit: number;
+	calibrated: boolean;
+	replaysPrevious: boolean;
 }
 
 interface Violation {
@@ -169,6 +199,15 @@ function signedPrefixes(messages: readonly unknown[]): Map<string, string> {
 	return out;
 }
 
+function activeTurnSignedBlocks(messages: readonly unknown[]): number {
+	let lastUser = -1;
+	for (let index = 0; index < messages.length; index++) {
+		if ((messages[index] as { role?: string })?.role === "user")
+			lastUser = index;
+	}
+	return signedPrefixes(messages.slice(lastUser + 1)).size;
+}
+
 const PREFIX_BOUND = "claude-opus-5-5";
 const UNBOUND = "claude-sonnet-5";
 const BULK = "BULK const value = compute(input, options); // line\n".repeat(80);
@@ -238,6 +277,15 @@ export async function runPiHoldDriver(options: {
 	let percent = 20;
 	let compartmentEnd = -1;
 	let compartmentSequence = 0;
+	let rejectedReplays: RejectedReplay[] = [];
+	let pipelineProof:
+		| {
+				prefixBustPermitted: boolean;
+				bustedThisPass: boolean;
+				identityRebuilt: boolean;
+				signedPrefixRewritten: boolean;
+		  }
+		| undefined;
 	const assistantExtra = (content: unknown[]) => ({
 		provider: "anthropic",
 		model: modelId,
@@ -305,7 +353,12 @@ export async function runPiHoldDriver(options: {
 					),
 			);
 	};
+	let servedRequests = 0;
 	const serve = async (): Promise<unknown[]> => {
+		const recordBefore =
+			process.env.R2_SERVED_EVIDENCE === "1"
+				? readServedPrefix(db, sessionId)
+				: null;
 		const messages = structuredClone(source);
 		const ctx = {
 			...fakeContext(sessionId, process.cwd(), [...ids], messages),
@@ -327,10 +380,113 @@ export async function runPiHoldDriver(options: {
 			}),
 		};
 		const handler = fake.handlers.get("context")!;
-		const result = (await handler({ messages } as never, ctx as never)) as {
-			messages: unknown[];
-		};
-		return result.messages;
+		rejectedReplays = [];
+		pipelineProof = undefined;
+		const restoreResultObserver =
+			contextHandlerInternals.setPipelineResultObserverForTests(
+				(observedSession, result) => {
+					if (observedSession === sessionId)
+						pipelineProof = {
+							...result,
+							identityRebuilt: result.identityRebuilt === true,
+						};
+				},
+			);
+		const assertFits = piFit.assertPiRawFallbackFits;
+		const fitSpy = spyOn(piFit, "assertPiRawFallbackFits").mockImplementation(
+			(...args) => {
+				try {
+					return assertFits(...args);
+				} catch (error) {
+					const [replayMessages, limit] = args;
+					if (limit !== undefined && Number.isFinite(limit) && limit > 0) {
+						const estimate = piFit.estimatePiOutgoingInputTokens(
+							replayMessages,
+							args[4],
+							args[5],
+							limit,
+						);
+						rejectedReplays.push({
+							tokens: estimate.refusalTokens ?? estimate.tokens,
+							limit,
+							calibrated:
+								estimate.trusted &&
+								estimate.refusalGrade === true &&
+								estimate.refusalBasis === "calibrated",
+							replaysPrevious:
+								previous !== null &&
+								replayMessages.length >= previous.length &&
+								previous.every(
+									(message, index) =>
+										providerKey(message) === providerKey(replayMessages[index]),
+								),
+						});
+					}
+					throw error;
+				}
+			},
+		);
+		try {
+			const result = (await handler({ messages } as never, ctx as never)) as {
+				messages: unknown[];
+			};
+			if (process.env.R2_SERVED_EVIDENCE === "1") {
+				const envelope = readPiLkgFitEnvelope(
+					ctx as never,
+					fake.pi as never,
+					`anthropic/${modelId}`,
+					sessionDecisionCalibration(db, sessionId),
+				);
+				if (!envelope)
+					throw new Error(
+						"Served-window witness has no complete host envelope",
+					);
+				// Disable only the estimator's early cutoff: every returned array
+				// receives the guard's full calibrated count, never a partial proxy.
+				const estimate = piFit.estimatePiOutgoingInputTokens(
+					result.messages,
+					envelope,
+				);
+				const calibrated =
+					estimate.trusted &&
+					estimate.refusalGrade === true &&
+					estimate.refusalBasis === "calibrated";
+				const tokens = estimate.refusalTokens ?? estimate.tokens;
+				expect(calibrated).toBe(true);
+				expect(tokens).toBeLessThanOrEqual(contextWindow);
+				const record = readServedPrefix(db, sessionId);
+				if (!record?.first_kept)
+					throw new Error(
+						"Served-window witness has no recorded first raw message",
+					);
+				const first = result.messages[record.head.length];
+				expect(record.first_kept.digest).toBe(
+					servedMessageDigest(first, record.provenance),
+				);
+				const held = activeTurnSignedBlocks(result.messages) > 0;
+				if (held) {
+					expect(record).toEqual(recordBefore);
+					expect(result.messages.slice(0, record.head.length)).toEqual(
+						record.head,
+					);
+				}
+				console.log(
+					"PI_SERVED_WINDOW",
+					JSON.stringify({
+						request: ++servedRequests,
+						tokens,
+						limit: contextWindow,
+						calibrated,
+						held,
+						recordValid: true,
+					}),
+				);
+			}
+			return result.messages;
+		} finally {
+			fitSpy.mockRestore();
+			restoreResultObserver();
+		}
 	};
 
 	// The cached m[0]/m[1] bytes and the system hash they were folded with.
@@ -355,6 +511,9 @@ export async function runPiHoldDriver(options: {
 	let refusalTurns = 0;
 	let refusalTurnOpen = false;
 	userTurn();
+	// Publish each user request before simulating its signed response. Cached
+	// history/knowledge messages do not record which raw message was first sent.
+	await serve();
 	toolStep();
 	for (let pass = 0; pass < options.passes; pass++) {
 		const events: string[] = [];
@@ -364,6 +523,7 @@ export async function runPiHoldDriver(options: {
 			let servedUserTail = false;
 			if (random() < 0.15) {
 				userTurn();
+				previous = await serve();
 				events.push("user");
 				refusalTurnOpen = false;
 				// Sometimes serve the new user message as the tail: the turn has no
@@ -490,6 +650,7 @@ export async function runPiHoldDriver(options: {
 		const logStart = options.logCalls?.length ?? 0;
 		let served: unknown[] | null = null;
 		let refused: string | null = null;
+		let overWindowRebuild: PassRecord["overWindowRebuild"];
 		try {
 			served = await serve();
 		} catch (error) {
@@ -517,6 +678,51 @@ export async function runPiHoldDriver(options: {
 			if (held) {
 				for (let index = 0; index < previous.length; index++) {
 					if (providerKey(served[index]) !== providerKey(previous[index])) {
+						const overWindow = rejectedReplays.find(
+							(replay) =>
+								replay.replaysPrevious &&
+								replay.calibrated &&
+								replay.tokens > replay.limit,
+						);
+						const declaredRebuild =
+							pipelineProof?.identityRebuilt === true &&
+							(options.logCalls?.slice(logStart) ?? []).some((call) => {
+								const line = String(call[1]);
+								return (
+									line.startsWith(
+										"Pi held identity rebuild: prior prefix cannot fit",
+									) && line.endsWith("applying the declared rebuild")
+								);
+							});
+						const bustPermitted =
+							pipelineProof?.prefixBustPermitted === true &&
+							pipelineProof.bustedThisPass;
+						if (overWindow && declaredRebuild && bustPermitted) {
+							// The real replay guard must reject a calibrated token count
+							// above the same window; verify the outgoing strip and actual
+							// rebuild permission before allowing any changed prefix.
+							expect(overWindow.limit).toBe(contextWindow);
+							expect(overWindow.tokens).toBeGreaterThan(overWindow.limit);
+							expect(pipelineProof?.signedPrefixRewritten).toBe(true);
+							const activeSignedBlocks = activeTurnSignedBlocks(served);
+							expect(activeSignedBlocks).toBe(0);
+							overWindowRebuild = {
+								tokens: overWindow.tokens,
+								limit: overWindow.limit,
+								activeSignedBlocks,
+								declaredRebuild,
+								bustPermitted,
+								bustedThisPass: pipelineProof?.bustedThisPass === true,
+								signedPrefixRewritten:
+									pipelineProof?.signedPrefixRewritten === true,
+							};
+							if (process.env.R2_REBUILD_EVIDENCE === "1")
+								console.log(
+									"PI_OVER_WINDOW_REBUILD",
+									JSON.stringify({ pass, ...overWindowRebuild }),
+								);
+							break;
+						}
 						if (process.env.R2_DEBUG) {
 							const a = providerKey(previous[index]);
 							const b = providerKey(served[index]);
@@ -533,7 +739,7 @@ export async function runPiHoldDriver(options: {
 						violations.push({
 							pass,
 							kind: "held-prefix-changed",
-							detail: `first changed message ${index} of ${previous.length}`,
+							detail: `first changed message ${index} of ${previous.length}; over-window=${overWindow ? `${overWindow.tokens}/${overWindow.limit}` : "none"} declared=${declaredRebuild} permitted=${bustPermitted}`,
 							events,
 							unavoidable,
 						});
@@ -615,6 +821,7 @@ export async function runPiHoldDriver(options: {
 			held,
 			unavoidable,
 			refused,
+			...(overWindowRebuild ? { overWindowRebuild } : {}),
 			hash: served
 				? createHash("sha256")
 						.update(served.map(providerKey).join("\n"))
@@ -786,7 +993,7 @@ test("Pi held drivers: m[0]/m[1] is never re-rendered while signed thinking is k
 // and optionally a carried tag-identity repair) before the held passes, then
 // checks the cached pair and the served head. The release pass at the end is
 // the positive control: once the turn ends the same inputs do rebuild the pair.
-async function piRulingFixture(withCarriedRepair: boolean) {
+async function piRulingFixture(withCarriedRepair: boolean, heldSteps = 1) {
 	const sessionId = `r2-pi-ruling-${withCarriedRepair ? "carried" : "plain"}`;
 	const db = createTestDb();
 	getOrCreateSessionMeta(db, sessionId);
@@ -844,6 +1051,7 @@ async function piRulingFixture(withCarriedRepair: boolean) {
 	];
 	const ids = ["u1", "a1", "u2", "a2", "u3"];
 	let percent = 40;
+	let contextWindow = 100000;
 	const serve = async () => {
 		const messages = structuredClone(source);
 		const ctx = {
@@ -854,12 +1062,12 @@ async function piRulingFixture(withCarriedRepair: boolean) {
 				provider: "anthropic",
 				id: PREFIX_BOUND,
 				api: "anthropic-messages",
-				contextWindow: 100000,
+				contextWindow,
 			},
 			getContextUsage: () => ({
 				tokens: percent * 1000,
 				percent,
-				contextWindow: 100000,
+				contextWindow,
 			}),
 		};
 		const handler = fake.handlers.get("context")!;
@@ -903,8 +1111,10 @@ async function piRulingFixture(withCarriedRepair: boolean) {
 		ids.push(`active-assistant-${step}`, `active-result-${step}`);
 	};
 	await serve();
-	heldStep();
-	await serve();
+	for (let index = 0; index < heldSteps; index++) {
+		heldStep();
+		await serve();
+	}
 	appendCompartments(db, sessionId, [
 		{
 			sequence: 0,
@@ -939,6 +1149,9 @@ async function piRulingFixture(withCarriedRepair: boolean) {
 		heldStep,
 		source,
 		ids,
+		setWindow: (value: number) => {
+			contextWindow = value;
+		},
 		setPercent: (value: number) => {
 			percent = value;
 		},
@@ -1047,8 +1260,14 @@ test("Pi carried identity repair: a failing declared rebuild refuses at most one
 		}
 	};
 	try {
-		fixture.db.exec(
-			"CREATE TRIGGER r2_fail_m0_clear BEFORE UPDATE OF cached_m0_bytes ON session_meta WHEN NEW.cached_m0_bytes IS NULL BEGIN SELECT RAISE(FAIL, 'injected m0 clear failure'); END",
+		rejectSessionRenderCacheWrites(
+			fixture.db,
+			"cached_m0_bytes",
+			"r2_fail_m0_clear",
+			{
+				error: "injected m0 clear failure",
+				when: (value, previous) => value === null,
+			},
 		);
 		dropSlot(fixture.sessionId, "r2-no-lkg");
 		fixture.heldStep();
@@ -1087,3 +1306,116 @@ test("Pi carried identity repair: a failing declared rebuild refuses at most one
 		fixture.db.close();
 	}
 }, 60_000);
+
+test("Pi held replay over a shrunken window rebuilds or refuses before dispatch", async () => {
+	setHarness("pi");
+	const f = await piRulingFixture(true, 16);
+	const window = 16000;
+	const record = f.db
+		.prepare("SELECT served_prefix FROM session_meta WHERE session_id = ?")
+		.get(f.sessionId);
+	const assertFits = piFit.assertPiRawFallbackFits;
+	const probes: Array<{
+		messages: readonly unknown[];
+		envelope: Parameters<typeof assertFits>[4];
+		measured: Parameters<typeof assertFits>[5];
+		tokens: number;
+		limit: number;
+		calibrated: boolean;
+		refused: boolean;
+	}> = [];
+	const guard = spyOn(piFit, "assertPiRawFallbackFits").mockImplementation(
+		(...args) => {
+			const estimate = piFit.estimatePiOutgoingInputTokens(
+				args[0],
+				args[4],
+				args[5],
+			);
+			const probe = {
+				messages: structuredClone(args[0]),
+				envelope: args[4],
+				measured: args[5],
+				tokens: estimate.refusalTokens ?? estimate.tokens,
+				limit: args[1] ?? Number.POSITIVE_INFINITY,
+				calibrated:
+					estimate.trusted &&
+					estimate.refusalGrade === true &&
+					estimate.refusalBasis === "calibrated",
+				refused: false,
+			};
+			probes.push(probe);
+			try {
+				return assertFits(...args);
+			} catch (error) {
+				probe.refused = true;
+				throw error;
+			}
+		},
+	);
+	let proof:
+		| { prefixBustPermitted: boolean; signedPrefixRewritten: boolean }
+		| undefined;
+	const restore = contextHandlerInternals.setPipelineResultObserverForTests(
+		(sessionId, result) => {
+			if (sessionId === f.sessionId) proof = result;
+		},
+	);
+	try {
+		// The request was accepted at the old window. The carried identity repair
+		// must now price that exact saved request against the smaller window.
+		f.setWindow(window);
+		let served: unknown[] | undefined;
+		let refusal: unknown;
+		try {
+			served = await f.serve();
+		} catch (error) {
+			refusal = error;
+		}
+		const over = probes.find(
+			(probe) => probe.calibrated && probe.tokens > probe.limit,
+		);
+		expect(
+			over,
+			JSON.stringify(probes.map(({ messages: _messages, ...probe }) => probe)),
+		).toBeDefined();
+		if (!over)
+			throw new Error("The real held-replay fit guard was not reached");
+		expect(over.limit).toBe(window);
+		if (served) {
+			const same =
+				JSON.stringify(served.map(providerKey)) ===
+				JSON.stringify(over.messages.map(providerKey));
+			const estimate = piFit.estimatePiOutgoingInputTokens(
+				served,
+				over.envelope,
+				same ? over.measured : undefined,
+			);
+			expect(estimate.refusalTokens ?? estimate.tokens).toBeLessThanOrEqual(
+				window,
+			);
+			expect(activeTurnSignedBlocks(served)).toBe(0);
+			expect(proof).toMatchObject({
+				prefixBustPermitted: true,
+				signedPrefixRewritten: true,
+			});
+		} else {
+			expect(["PiStorageBusyError", "EmergencyFailClosedError"]).toContain(
+				(refusal as Error)?.name,
+			);
+			expect(
+				f.db
+					.prepare(
+						"SELECT served_prefix FROM session_meta WHERE session_id = ?",
+					)
+					.get(f.sessionId),
+			).toEqual(record);
+		}
+		expect(over.refused).toBe(true);
+	} finally {
+		guard.mockRestore();
+		restore();
+		clearContextHandlerSession(f.sessionId);
+		f.db.close();
+		_resetHarnessForTesting();
+	}
+}, 30000);

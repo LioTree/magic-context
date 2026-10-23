@@ -13,16 +13,10 @@ import { loadPiConfig } from "./config/index";
 import { resolveHistorianFromConfig } from "./index";
 
 /**
- * Where a Pi session stands when the shared config puts the historian in the
- * host lane.
- *
- * The host lane is a Rust-transform arrangement: the module queues a run and a
- * host process claims it. Pi has no Rust transform mode, no module client and no
- * claim-lane caller, so nothing in a Pi session can queue a run — which means the
- * failure this pins against is not "Pi claims badly" but "a run is queued with
- * nobody to answer it". These tests state what a Pi session actually does with
- * `historian.runner: "host"`, so a later change that makes Pi queue without
- * giving it a claimant cannot land quietly.
+ * A standalone Pi extension still resolves its own subagent historian when the
+ * shared config selects `historian.runner: "host"`. It must not queue jobs in a
+ * Rust module with no external worker to execute them. Rust transforms must not
+ * enter the standalone extension's imports.
  */
 
 const tempRoots: string[] = [];
@@ -78,7 +72,7 @@ function piSourceFiles(): string[] {
 	return found;
 }
 
-describe("Pi and the historian host lane", () => {
+describe("standalone Pi and the historian host lane", () => {
 	it("runs its own historian and never queues a run for a claimant", () => {
 		// A claim lane needs two halves: something that queues a run and something
 		// that claims it. Pi has neither, so a Pi session cannot leave a run queued
@@ -94,16 +88,15 @@ describe("Pi and the historian host lane", () => {
 		});
 		expect(offenders).toEqual([]);
 
-		// The other half of the same fact: Pi has no Rust transform mode, so there is
-		// no module for a run to be queued in.
-		const rustModeCallers = piSourceFiles().filter((path) => {
+		// The standalone extension must not import the Rust module-session kernel.
+		const kernelCallers = piSourceFiles().filter((path) => {
 			const source = readFileSync(path, "utf-8");
 			return (
-				source.includes("RustModeModuleClient") ||
-				source.includes("createRustModeTransform")
+				source.includes("ModuleSessionClient") ||
+				source.includes("createModuleSessionKernel")
 			);
 		});
-		expect(rustModeCallers).toEqual([]);
+		expect(kernelCallers).toEqual([]);
 	});
 
 	it("accepts historian.runner=host in shared config and resolves the Pi subagent historian anyway", () => {

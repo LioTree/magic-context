@@ -33,7 +33,6 @@ import {
 import { saveLkgSlotToDb } from "../hooks/magic-context/lkg-persist";
 import { captureLkgSlot } from "../hooks/magic-context/lkg-replay";
 import { dropSlot, getSlot } from "../hooks/magic-context/lkg-slot";
-import { RawFallbackContextLimitError } from "../hooks/magic-context/raw-fallback-context-limit";
 import { StorageBusyRefusalError } from "../hooks/magic-context/storage-busy-refusal";
 import { finalizeMessageRepresentation } from "../hooks/magic-context/transform-postprocess-phase";
 import { UnresolvedHistoryBoundaryError } from "../hooks/magic-context/unresolved-history-boundary";
@@ -140,7 +139,6 @@ describe("TypeScript wrapper measured LKG admission", () => {
                         );
                     },
                 },
-                rustReplayParticipant: () => null,
                 onLkgReplay: () => {
                     replayed = true;
                 },
@@ -255,20 +253,6 @@ describe("createMessagesTransformHandler — error boundary (issue #23)", () => 
         const output = makeOutput();
         delete output.messages[0].info.sessionID;
         await expect(handler({}, output)).rejects.toBeInstanceOf(DegradedPassRefusalError);
-    });
-
-    it("surfaces an oversized raw-fallback refusal to the prompt loop", async () => {
-        const handler = createMessagesTransformHandler({
-            magicContext: {
-                "experimental.chat.messages.transform": async () => {
-                    throw new RawFallbackContextLimitError(3_300_000, 1_000_000);
-                },
-            },
-        });
-
-        await expect(handler({}, makeOutput())).rejects.toBeInstanceOf(
-            RawFallbackContextLimitError,
-        );
     });
 
     it("refuses an uncut over-window request when no last good request can stand in", async () => {

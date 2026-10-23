@@ -165,6 +165,8 @@ pub enum CodecError {
     MovedKeyInSmallBlob { key: &'static str },
     /// A small blob is not valid JSON of its type.
     Serde(String),
+    /// The native section and the small row certify different frozen prefixes.
+    NativeReferenceMismatch,
 }
 
 impl std::fmt::Display for CodecError {
@@ -175,6 +177,9 @@ impl std::fmt::Display for CodecError {
                 "cache state small blob carries `{key}`, which is stored in its own rows"
             ),
             CodecError::Serde(detail) => write!(f, "cache state blob: {detail}"),
+            CodecError::NativeReferenceMismatch => {
+                f.write_str("native tail section and small-row marker disagree")
+            }
         }
     }
 }
@@ -374,6 +379,37 @@ pub(crate) struct StoredRow {
     pub section_index: String,
 }
 
+pub(crate) enum BoundedSmallRow {
+    Missing,
+    Oversized,
+    Present(StoredRow),
+}
+
+/// Check byte lengths and fetch in one read snapshot, before allocating strings
+/// in the caller. An oversized row is distinct from an absent row; no substring
+/// or partially decoded metadata is returned.
+pub(crate) fn read_small_row_bounded(
+    conn: &rusqlite::Connection,
+    session_id: &str,
+    byte_limit: usize,
+) -> rusqlite::Result<BoundedSmallRow> {
+    let tx = conn.unchecked_transaction()?;
+    let oversized = tx.query_row(
+        "SELECT length(CAST(meta AS BLOB)) > ?2 OR length(CAST(core_state AS BLOB)) > ?2 FROM mc_cache_state WHERE session_id=?1",
+        params![session_id,byte_limit as i64], |row| row.get::<_,bool>(0),
+    ).optional()?;
+    let result = match oversized {
+        None => BoundedSmallRow::Missing,
+        Some(true) => BoundedSmallRow::Oversized,
+        Some(false) => match read_small_row(&tx, session_id)? {
+            Some(row) => BoundedSmallRow::Present(row),
+            None => BoundedSmallRow::Missing,
+        },
+    };
+    tx.commit()?;
+    Ok(result)
+}
+
 /// The split rows of one session as stored.
 #[derive(Debug, Clone, Default)]
 pub(crate) struct StoredSections {
@@ -410,6 +446,23 @@ pub(crate) fn read_small_row(
         })
     })
     .optional()
+}
+
+/// An identity of the tail hygiene baseline a full decode of `row` would
+/// produce: the sections version, the tail section's index entry (with its
+/// digest) and the native-tail reference in the small meta. Equal identities
+/// decode to equal baselines. `None` when the row cannot be read this way.
+pub(crate) fn tail_baseline_identity(row: &StoredRow) -> Option<String> {
+    let index = SectionIndex::parse(&row.section_index)?;
+    let native = native_tail::reference(&row.meta).ok()?;
+    Some(
+        serde_json::json!([
+            index.sv,
+            index.t,
+            native.map(|native| (native.cut_id, native.prefix_count))
+        ])
+        .to_string(),
+    )
 }
 
 /// Read one section body, without touching the small row's blobs.
@@ -551,22 +604,84 @@ pub(crate) fn read_native_decoded(
     conn: &rusqlite::Connection,
     session_id: &str,
     prefix: &crate::provider_log::ProviderNativePrefix,
-) -> rusqlite::Result<Option<DecodedRow>> {
+) -> Result<Option<DecodedRow>, NativeSnapshotError> {
     let Some(row) = read_small_row(conn, session_id)? else {
-        return Ok(None);
+        return Err(NativeSnapshotRejection::MissingReference.into());
     };
-    let reference = native_tail::reference(&row.meta)?.ok_or(rusqlite::Error::InvalidQuery)?;
+    let reference =
+        native_tail::reference(&row.meta)?.ok_or(NativeSnapshotRejection::MissingReference)?;
     if reference.cut_id != prefix.cut_id || reference.prefix_count != prefix.parts {
-        return Err(rusqlite::Error::InvalidQuery);
+        return Err(NativeSnapshotRejection::ReferenceMismatch.into());
     }
     let through: Option<u64> = conn.query_row(
         "SELECT frozen_through_ordinal FROM mc_provider_policy_cuts_v1 WHERE cut_id=?1 AND conv_key IN (SELECT conv_key FROM mc_provider_conversations_v2 WHERE engine_namespace=?2)",
-        params![prefix.cut_id, session_id], |row| row.get(0))?;
+              params![prefix.cut_id, session_id], |row| row.get(0)).optional()?.flatten();
     if through != Some(prefix.through) {
-        return Err(rusqlite::Error::InvalidQuery);
+        return Err(NativeSnapshotRejection::CoverageMismatch.into());
     }
     let sections = read_sections(conn, session_id)?;
-    Ok(Some(decode_row(row, sections)?))
+    let decoded = decode_row(row, sections)?;
+    if decoded.sections.tail.discard_reason().is_some() {
+        return Err(NativeSnapshotRejection::ReferenceMismatch.into());
+    }
+    Ok(Some(decoded))
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum NativeSnapshotRejection {
+    MissingReference,
+    ReferenceMismatch,
+    CoverageMismatch,
+}
+
+impl NativeSnapshotRejection {
+    pub fn reason(self) -> &'static str {
+        match self {
+            Self::MissingReference => "native_reference_missing",
+            Self::ReferenceMismatch => "native_reference_mismatch",
+            Self::CoverageMismatch => "native_coverage_mismatch",
+        }
+    }
+}
+
+#[derive(Debug)]
+pub(crate) enum NativeSnapshotError {
+    Unavailable(NativeSnapshotRejection),
+    Sqlite(rusqlite::Error),
+}
+
+impl std::fmt::Display for NativeSnapshotError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Unavailable(reason) => f.write_str(reason.reason()),
+            Self::Sqlite(error) => error.fmt(f),
+        }
+    }
+}
+
+impl std::error::Error for NativeSnapshotError {}
+
+impl From<NativeSnapshotRejection> for NativeSnapshotError {
+    fn from(reason: NativeSnapshotRejection) -> Self {
+        Self::Unavailable(reason)
+    }
+}
+
+impl From<rusqlite::Error> for NativeSnapshotError {
+    fn from(error: rusqlite::Error) -> Self {
+        Self::Sqlite(error)
+    }
+}
+
+impl From<CodecError> for NativeSnapshotError {
+    fn from(error: CodecError) -> Self {
+        match error {
+            CodecError::NativeReferenceMismatch => {
+                Self::Unavailable(NativeSnapshotRejection::ReferenceMismatch)
+            }
+            error => Self::Sqlite(error.into()),
+        }
+    }
 }
 
 #[cfg(any(test, feature = "test-support"))]

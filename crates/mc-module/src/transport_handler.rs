@@ -1,7 +1,7 @@
 //! Keep synchronous store and encoding work off the module's control-plane runtime.
 
 use crate::{
-    reply_pages::{accepts_reply_pages, ReplyPages},
+    reply_pages::{accepts_reply_pages, bound_health, ReplyPages},
     McHandler,
 };
 use std::{
@@ -19,7 +19,6 @@ use subc_protocol::ModuleHelloAckBody;
 pub struct McTransportHandler<H: ModuleHandler = McHandler> {
     inner: Arc<H>,
     replies: Arc<Mutex<ReplyPages>>,
-    admission: Option<Arc<crate::transport_admission::Admission>>,
 }
 
 impl<H: ModuleHandler> McTransportHandler<H> {
@@ -27,16 +26,7 @@ impl<H: ModuleHandler> McTransportHandler<H> {
         Self {
             inner: Arc::new(inner),
             replies: Arc::new(Mutex::new(ReplyPages::default())),
-            admission: None,
         }
-    }
-
-    /// Use the same trusted startup flag as the inner handler's resident lane.
-    /// Disabled adapters retain their original dispatch path without admission.
-    pub fn with_resident_admission(mut self, enabled: bool) -> Self {
-        self.admission =
-            enabled.then(|| Arc::new(crate::transport_admission::Admission::default()));
-        self
     }
 
     async fn remove_reply_channel(&self, channel: u16) {
@@ -58,15 +48,9 @@ impl<H: ModuleHandler> ModuleHandler for McTransportHandler<H> {
     }
     async fn on_bind(&self, req: &RouteBindRequest) -> subc_client_rs::BindDecision {
         self.remove_reply_channel(req.handle.channel).await;
-        if let Some(admission) = &self.admission {
-            admission.bind(req);
-        }
         self.inner.on_bind(req).await
     }
     async fn on_route_gone(&self, handle: &RouteHandle) {
-        if let Some(admission) = &self.admission {
-            admission.remove(handle);
-        }
         self.remove_reply_channel(handle.channel).await;
         self.inner.on_route_gone(handle).await;
     }
@@ -80,7 +64,8 @@ impl<H: ModuleHandler> ModuleHandler for McTransportHandler<H> {
         self.inner.on_connection_end(end).await;
     }
     async fn health(&self) -> HealthReport {
-        self.inner.health().await
+        // The SDK sends health outside the ordinary data-response adapter.
+        bound_health(self.inner.health().await)
     }
     async fn handle(&self, ctx: RequestCtx, body: Vec<u8>) -> HandlerOutcome {
         let inner = Arc::clone(&self.inner);
@@ -88,21 +73,7 @@ impl<H: ModuleHandler> ModuleHandler for McTransportHandler<H> {
         let runtime = tokio::runtime::Handle::current();
         let route = ctx.route_handle();
         let channel = (route.channel, route.epoch);
-        let admitted = if let Some(admission) = &self.admission {
-            match admission.admit(&route, &body).await {
-                Ok(admitted) => admitted,
-                Err(refusal) => return refusal,
-            }
-        } else {
-            None
-        };
         match tokio::task::spawn_blocking(move || {
-            #[cfg(test)]
-            crate::transport_admission::LAST_WAIT_MS
-                .with(|last| last.set(admitted.as_ref().map_or(0.0, |a| a.wait_ms)));
-            // Keep ownership through cancellation: dropping the response future
-            // must not release ordering or CPU slots while its worker still runs.
-            let _admitted = admitted;
             if let Ok(request) =
                 serde_json::from_slice::<serde_json::Value>(if body.len() <= 1024 {
                     &body
@@ -152,10 +123,63 @@ impl<H: ModuleHandler> ModuleHandler for McTransportHandler<H> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use subc_client_rs::HealthStatus;
 
-    #[test]
-    fn disabled_resident_adapter_has_no_admission_layer() {
-        let adapter = McTransportHandler::new(McHandler::new()).with_resident_admission(false);
-        assert!(adapter.admission.is_none());
+    struct HealthFixture(HealthReport);
+    #[async_trait]
+    impl ModuleHandler for HealthFixture {
+        async fn health(&self) -> HealthReport {
+            self.0.clone()
+        }
+        async fn handle(&self, _: RequestCtx, _: Vec<u8>) -> HandlerOutcome {
+            HandlerOutcome::Error {
+                code: "unused".into(),
+                message: "health fixture".into(),
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn oversized_health_is_bounded_through_the_real_transport_adapter() {
+        for status in [HealthStatus::Ok, HealthStatus::Failing] {
+            let original = HealthReport {
+                status,
+                detail: None,
+                metrics: Some(serde_json::json!({"runner_choices":"x".repeat(4*1024*1024)})),
+            };
+            assert!(
+                serde_json::to_vec(&original).unwrap().len() + subc_protocol::HEADER_LEN
+                    > 4 * 1024 * 1024
+            );
+            let report = McTransportHandler::new(HealthFixture(original))
+                .health()
+                .await;
+            assert!(
+                serde_json::to_vec(&report).unwrap().len() + subc_protocol::HEADER_LEN
+                    < 4 * 1024 * 1024
+            );
+            assert!(report.detail.unwrap().starts_with("frame_too_large"));
+            assert!(report.metrics.is_none());
+            assert_eq!(
+                report.status,
+                if status == HealthStatus::Failing {
+                    HealthStatus::Failing
+                } else {
+                    HealthStatus::Degraded
+                }
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn ordinary_health_remains_byte_identical_through_transport() {
+        let original = HealthReport::ok();
+        let report = McTransportHandler::new(HealthFixture(original.clone()))
+            .health()
+            .await;
+        assert_eq!(
+            serde_json::to_vec(&report).unwrap(),
+            serde_json::to_vec(&original).unwrap()
+        );
     }
 }

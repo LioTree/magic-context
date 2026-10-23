@@ -723,7 +723,7 @@ describe("SubcModuleTransport", () => {
                 );
             expect(failure).toBeInstanceOf(SingleStoreMigrationRequiredError);
             expect((failure as Error).message).toBe(
-                "Magic Context's Rust mode needs a one-time migration of its store. Quit OpenCode and every ck-mc process, then run `magic-context doctor single-store migrate`. (MC-C14)",
+                "Magic Context needs a one-time migration of its store. Quit OpenCode and every ck-mc process, then run `magic-context doctor single-store migrate`. (MC-C14)",
             );
             expect(requestCount).toBe(1);
         }
@@ -1896,8 +1896,18 @@ it("attributes encode, route, request issue, response wait and settlement on one
     const transport = new SubcModuleTransport("unused");
     const route = { channel: 7, epoch: 77 } as RouteHandle;
     const samples: import("./module-transport").ModuleCallTimings[] = [];
+    let now = 0;
+    let resolveResponse!: (response: { ok: boolean }) => void;
+    let signalRequestIssued!: () => void;
+    const requestIssued = new Promise<void>((resolve) => {
+        signalRequestIssued = resolve;
+    });
     const client = {
-        request: async (_route: RouteHandle, body: unknown, options: { binary?: boolean }) => {
+        request: (_route: RouteHandle, body: unknown, options: { binary?: boolean }) => {
+            const response = new Promise<{ ok: boolean }>((resolve) => {
+                resolveResponse = resolve;
+            });
+            signalRequestIssued();
             expect(body).toBeInstanceOf(Uint8Array);
             expect(options.binary).not.toBe(true);
             expect(decodedBody(body)).toEqual({
@@ -1905,8 +1915,7 @@ it("attributes encode, route, request issue, response wait and settlement on one
                 text: "🚀",
                 accept_reply_pages: true,
             });
-            await Bun.sleep(20);
-            return { ok: true };
+            return response;
         },
     } as unknown as SubcClient;
     const internals = transport as unknown as {
@@ -1920,32 +1929,37 @@ it("attributes encode, route, request issue, response wait and settlement on one
     };
     internals.client = client;
     internals.ensureRoute = async () => {
-        await Bun.sleep(10);
+        now += 10;
         return { client, route, routeKey: "timing", generation: 0 };
     };
-    const start = performance.now();
-    expect(
-        await transport.call({
+    __moduleTransportTest.setMonotonicClockForTests(() => now);
+    const startedAt = now;
+    try {
+        const pending = transport.call({
             sessionId: "timing",
             projectRoot: ".",
             method: "transform",
             body: { method: "transform", text: "🚀" },
             onTimings: (timings) => samples.push(timings),
-        }),
-    ).toEqual({ ok: true });
-    const elapsed = performance.now() - start;
-    expect(samples).toHaveLength(1);
-    expect(samples[0].route).toBeGreaterThanOrEqual(8);
-    expect(samples[0].responseWait).toBeGreaterThanOrEqual(18);
-    expect(Object.keys(samples[0]).sort()).toEqual([
-        "encode",
-        "issue",
-        "lane",
-        "responseWait",
-        "route",
-        "settle",
-    ]);
-    const sum = Object.values(samples[0]).reduce((a, b) => a + b, 0);
-    expect(sum).toBeLessThanOrEqual(elapsed);
-    expect(elapsed - sum).toBeLessThan(10);
+        });
+        await requestIssued;
+        now += 20;
+        resolveResponse({ ok: true });
+        expect(await pending).toEqual({ ok: true });
+
+        const elapsed = now - startedAt;
+        expect(samples).toHaveLength(1);
+        expect(samples[0]).toEqual({
+            lane: 0,
+            route: 10,
+            encode: 0,
+            issue: 0,
+            responseWait: 20,
+            settle: 0,
+        });
+        const sum = Object.values(samples[0]).reduce((a, b) => a + b, 0);
+        expect(sum).toBe(elapsed);
+    } finally {
+        __moduleTransportTest.setMonotonicClockForTests(null);
+    }
 });

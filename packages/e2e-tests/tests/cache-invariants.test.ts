@@ -30,7 +30,7 @@
 import { Database } from "bun:sqlite";
 import { afterEach, beforeEach, describe, expect, it } from "bun:test";
 import { realpathSync } from "node:fs";
-import { resolve as pathResolve } from 'node:path';
+import { join, resolve as pathResolve } from 'node:path';
 import { computeNormalizedHash } from "../../plugin/src/features/magic-context/memory/normalize-hash";
 import { resolveProjectIdentity } from "../../plugin/src/features/magic-context/memory/project-identity";
 import {
@@ -197,9 +197,9 @@ function queueMemoryUpdate(targetId: number, newContent: string): void {
 }
 
 /**
- * Bump the project memory epoch — the cross-process HARD-bust signal an external
- * (dashboard) memory mutation fires. Unlike the in-session supersede-delta path
- * (B11), this MUST force a full m[0] re-materialization.
+ * Bump the project memory epoch, as an external (dashboard) memory mutation
+ * does. It no longer forces an m[0] rebuild in TypeScript mode; only the
+ * Rust-mode branch below still uses it, to show the bump stays inert there.
  */
 function bumpProjectEpoch(): void {
     writeContextDb((db) => {
@@ -209,6 +209,41 @@ function bumpProjectEpoch(): void {
              ON CONFLICT(project_path) DO UPDATE SET project_memory_epoch = project_memory_epoch + 1`,
         ).run(projectIdentity());
     });
+}
+
+/**
+ * Age the session past its prompt-cache TTL: the idle-expiry rebuild, a
+ * genuine HARD trigger. An external (dashboard) memory change no longer forces
+ * a HARD of its own; it waits for the next natural rebuild, and an expired
+ * cache is one. The fold clock moves with the response clock, so the last
+ * response stays newer than the last fold and the next pass treats the expiry
+ * as unconsumed.
+ */
+function expireCache(sessionId: string): void {
+    const idle = 16.5 * 60 * 60 * 1000;
+    writeContextDb((db) => {
+        const result = db
+            .prepare(
+                "UPDATE session_meta SET last_response_time = last_response_time - ?, cached_m0_materialized_at = cached_m0_materialized_at - ? WHERE session_id = ? AND harness = ? AND last_response_time > 0",
+            )
+            .run(idle, idle, sessionId, h.harnessId);
+        expect(result.changes).toBe(1);
+    });
+    if (h.host === "opencode2") {
+        // OpenCode 2 re-reads the last reply's completion time before scheduling;
+        // age that host copy too, or it replaces the aged response clock.
+        const env = (h as unknown as { opencode: { env: { OPENCODE_DB: string } } }).opencode.env;
+        const hostDb = openTestDb(join(h.dataDir, "opencode", env.OPENCODE_DB));
+        try {
+            hostDb
+                .prepare(
+                    "UPDATE session_message SET data = json_set(data, '$.time.completed', json_extract(data, '$.time.completed') - ?) WHERE session_id = ? AND type = 'assistant'",
+                )
+                .run(idle, sessionId);
+        } finally {
+            hostDb.close();
+        }
+    }
 }
 
 /** Emit a single ctx_reduce tool call on the first main-agent request that exposes it. */
@@ -675,10 +710,10 @@ describe("cache invariants — m[0]/m[1] taxonomy (B class)", () => {
                 for (const request of replayPair)
                     expect(extractM1(request.body) ?? "").not.toContain("B10 fresh rule");
 
-                //#then — a genuine HARD trigger (an epoch bump) folds it into m[0].
+                //#then — a genuine HARD trigger (an idle cache expiry) folds it into m[0].
                 h.mock.setDefault({ text: "B10 hard-pressure", usage: EXECUTE_USAGE });
                 await h.sendPrompt(sessionId, "B10 turn 8: high usage marks the next pass execute.");
-                bumpProjectEpoch();
+                expireCache(sessionId);
                 setDefer("B10 refold");
                 await h.sendPrompt(sessionId, "B10 turn 9: execute pass HARD-refolds m[0].");
                 requests = mainAgentRequests(h.mock.requests());
@@ -857,10 +892,10 @@ describe("cache invariants — m[0]/m[1] taxonomy (B class)", () => {
                 }
                 expect(busts.length).toBe(0);
 
-                //#then — a genuine HARD trigger (an epoch bump) shows the new text.
+                //#then — a genuine HARD trigger (an idle cache expiry) shows the new text.
                 h.mock.setDefault({ text: "B11 hard-pressure", usage: EXECUTE_USAGE });
                 await h.sendPrompt(sessionId, "B11 turn 8: high usage marks the next pass execute.");
-                bumpProjectEpoch();
+                expireCache(sessionId);
                 setDefer("B11 refold");
                 await h.sendPrompt(sessionId, "B11 turn 9: execute pass HARD-refolds m[0].");
                 requests = mainAgentRequests(h.mock.requests());
@@ -871,8 +906,8 @@ describe("cache invariants — m[0]/m[1] taxonomy (B class)", () => {
         });
     });
 
-    describe("#given a genuine HARD trigger — project epoch bump (B12 — the fold direction)", () => {
-        describe("#when another writer's memory waited out a SOFT, then the epoch bumps", () => {
+    describe("#given a genuine HARD trigger — idle cache expiry (B12 — the fold direction)", () => {
+        describe("#when another writer's memory waited out a SOFT, then the cache expires", () => {
             it("#then m[0] re-materializes with the memory, m[1] stays the placeholder, and defer re-stabilizes", async () => {
                 //#given — materialize an empty m[0], add a memory from another writer,
                 // and run an execute (SOFT) pass: the memory stays out of the prompt.
@@ -920,17 +955,17 @@ describe("cache invariants — m[0]/m[1] taxonomy (B class)", () => {
 
                 let requests = mainAgentRequests(h.mock.requests());
                 const surfaceReq = requests.at(-1)!;
-                // Pre-bump: the memory is neither in the empty m[0] nor in m[1].
+                // Before the expiry: the memory is neither in the empty m[0] nor in m[1].
                 expect(extractM0(surfaceReq.body)).toContain("<session-history></session-history>");
                 expect(extractM0(surfaceReq.body)).not.toContain("B12 delta rule");
                 expect(extractM1(surfaceReq.body) ?? "").not.toContain("B12 delta rule");
 
-                //#when — a HARD trigger fires (epoch bump = external/dashboard
-                // mutation). Turn 6 records high usage so turn 7 is cache-busting;
-                // mustMaterialize must re-materialize m[0] on the epoch change.
+                //#when — a HARD trigger fires (the prompt cache expired while idle).
+                // Turn 6 records high usage so turn 7 is cache-busting;
+                // mustMaterialize must re-materialize m[0] on the expiry.
                 h.mock.setDefault({ text: "B12 hard-pressure", usage: EXECUTE_USAGE });
                 await h.sendPrompt(sessionId, "B12 turn 6: high usage marks the next pass execute.");
-                bumpProjectEpoch();
+                expireCache(sessionId);
                 setDefer("B12 refold");
                 await h.sendPrompt(sessionId, "B12 turn 7: execute pass HARD-refolds m[0].");
 

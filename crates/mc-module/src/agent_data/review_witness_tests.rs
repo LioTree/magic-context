@@ -100,13 +100,16 @@ fn manifest_before_participant(
     if !smart_notes {
         crate::prompt_surface::disable_smart_notes_in_tools(&mut tools, PromptSurfacePreset::Full);
     }
-    // Reproduce the pre-agent-data manifest, which registered only the model
-    // tools and provider roles (source revision 47486760). Pin its route list
-    // independently so an extra disabled route cannot change both manifests.
+    // Without agent-data, model tools and provider roles still use optional
+    // project lookup, model catalog, bus bootstrap and non-served Synapse retrieval. Pin routes independently
+    // so a disabled participant route cannot change both manifests.
     let mut targets = vec!["thalamus".to_string()];
     for id in [
         config.runner_module_id(),
         Some(config.provider_runner_module_id()),
+        Some("fusiform"),
+        Some("ckbus"),
+        Some("entorhinal"),
     ]
     .into_iter()
     .flatten()
@@ -115,6 +118,7 @@ fn manifest_before_participant(
             targets.push(id.to_string());
         }
     }
+    targets.push("synapse".into());
     ModuleManifest::builder(
         DEFAULT_MODULE_ID.to_string(),
         env!("CARGO_PKG_VERSION").to_string(),
@@ -122,9 +126,13 @@ fn manifest_before_participant(
     .trust_tier(Some(TrustTier::FirstParty))
     .protocol_ver(subc_protocol::PROTOCOL_VERSION)
     .capabilities(Some(subc_protocol::manifest::CapabilityDeclarations {
+        // The facades' conversation binding is a declared capability since
+        // mcp-conversation-binding/v1; it changes no route or service.
         provides: vec![
             cortexkit_role_compaction_provider::PROVIDES.to_string(),
-            cortexkit_role_step_transform_provider::PROVIDES.to_string(),
+            crate::MCP_CONVERSATION_BINDING_V1.to_string(),
+            // Declared with the flow fence; the agent-data feature changes nothing here.
+            subc_protocol::scope::FLOW_SCOPES_CAPABILITY.to_string(),
         ],
         requires: vec![],
         must_never_reach: vec![],
@@ -135,13 +143,18 @@ fn manifest_before_participant(
             .ok()
             .map(|p| p.with_launch_nonce_source(subc_client_rs::launch_nonce_source())),
     )
-    .provides(vec![ProviderRole::ToolProvider {
-        tools,
-        identity_scope: vec![IdentityScope::Project, IdentityScope::Session],
-        concurrency: Concurrency::ModuleManaged,
-        emits_push: false,
-        sub_supervises: false,
-    }])
+    .provides(vec![
+        ProviderRole::ToolProvider {
+            tools,
+            identity_scope: vec![IdentityScope::Project, IdentityScope::Session],
+            concurrency: Concurrency::ModuleManaged,
+            emits_push: false,
+            sub_supervises: false,
+        },
+        // Added after the participant and independent of it: the read-only
+        // management query basal flows call. The agent-data feature changes nothing here.
+        crate::subagent_invocations_read::management_role(),
+    ])
     .consumes(vec![ConsumerRole::ServiceClient { of: targets }])
     .build()
 }
@@ -734,7 +747,7 @@ async fn review_feature_off_normal_dispatch_preserves_business_write_footprints(
             .commit(SESSION, loaded.row_version, &loaded.core, &meta)
             .unwrap();
         let binding = h.facade_binding(1).unwrap();
-        let project = h.historian_lane_project(&binding, store).unwrap();
+        let project = h.historian_lane_project(1, &binding, store).unwrap();
         store
             .publish_pending_historian_run(&mc_store::NewHistorianPendingRun {
                 run_id: "review-run".into(),

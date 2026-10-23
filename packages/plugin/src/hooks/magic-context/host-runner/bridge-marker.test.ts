@@ -216,3 +216,49 @@ test("unknown cut remains distinct across restart and missing fit", () => {
         ).kind,
     ).toBe("applied");
 });
+
+test("equal coverage ordinal with a different raw end identity defers", () => {
+    const f = fixture((r) => {
+        r.coverage = { ordinal: target.ordinal, end_mid: "different" };
+    });
+    const { outcome, apply } = f.advance();
+    expect(outcome).toEqual({ kind: "deferred", reason: "coverage-does-not-cover-target" });
+    expect(apply).not.toHaveBeenCalled();
+});
+
+test("new lineage publication does not borrow the previous clean frontier", () => {
+    const f = fixture();
+    const next = f.store.publish({ ...f.receipt, lineage_id: "fork" }, delivered, 9);
+    expect(next.served_through_ordinal).toBe(0);
+    expect(next.delivery).toBe("pending");
+    expect(next.request_id).not.toBe(f.receipt.request_id);
+});
+
+test("admissible fit for different delivered bytes cannot authorize a native cut", () => {
+    const f = fixture();
+    const changed = [
+        message("summary", [{ id: "summary-text", type: "text", text: "not the published bytes" }]),
+        raw[1],
+    ];
+    const { outcome, apply } = f.advance(f.receipt, true, changed);
+    expect(outcome).toEqual({ kind: "deferred", reason: "fit-unproven" });
+    expect(apply).not.toHaveBeenCalled();
+});
+
+test("an empty applied range cannot authorize a native cut", () => {
+    const f = fixture((r) => {
+        if (r.last_applied) r.last_applied.range = { from: 3, to: 3 };
+    });
+    const { outcome, apply } = f.advance();
+    expect(outcome).toEqual({ kind: "deferred", reason: "coverage-does-not-cover-target" });
+    expect(apply).not.toHaveBeenCalled();
+});
+
+test("insufficient raw ordinal coverage defers even when the end identity exists", () => {
+    const f = fixture((r) => {
+        r.coverage = { ordinal: target.ordinal - 1, end_mid: target.end_mid };
+    });
+    const { outcome, apply } = f.advance();
+    expect(outcome).toEqual({ kind: "deferred", reason: "coverage-does-not-cover-target" });
+    expect(apply).not.toHaveBeenCalled();
+});

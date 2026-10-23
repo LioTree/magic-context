@@ -40,14 +40,15 @@ passes it with runtime-global updates disabled and never changes `process.env`.
 The bridge does not run config-location migration or install reload timers.
 
 The bridge **always selects the provider lane**. `transform_mode` and
-`rust_pipeline` select the in-tree plugin renderer and do not apply to the bridge;
-the harness's own off-by-default bridge flag owns opt-in. `kind` has exactly one
+`rust_pipeline` are retired: the in-tree plugin ignores them, logs one warning and
+runs its TypeScript transform. They never applied to the bridge; the harness's own
+off-by-default bridge flag owns opt-in. `kind` has exactly one
 supported value, **`"model"`**, because the OpenCode messages-transform hook has no
 caller kind and the provider adapter emits model steps. Rebuilds are not another
 kind: the adapter compares the host window to saved message identities and checks
 whether the selected model, system/tool fingerprint or persisted source state has
 changed. Idle-cache time and token pressure can also require a rebuilt history
-view, using the same rules as the in-tree provider path.
+view, using the same rules as the low-level provider adapter.
 `run` owns `SessionMeta`, publication, normalization through `providerIncoming`,
 and the bootstrap/rebuild record; it returns `Promise<{ messages: MessageLike[],
 kind: "ordinary" | "bootstrap" | "rebuild" }>`.
@@ -258,10 +259,11 @@ the bridge dispatches them after durable commit, as described above.
 
 ### Refused provider handoffs
 
-The native adapter's "legacy transform" is the Rust **full-request** transform.
-It caches message-id to canonical-ordinal mappings for bootstrap, but also normally
-runs when provider selection is off or bootstrap/exit hands off. The bridge
-constructs that same Rust transform internally for its ordinal cache only. It
+The low-level adapter still takes a "legacy transform": the Rust **full-request**
+transform. Rust transform mode is retired, so no in-tree host selects that transform.
+The adapter uses its message-id to canonical-ordinal cache for bootstrap. The
+low-level adapter can also hand a session to it when bootstrap is declined or the
+provider exits. The bridge constructs that transform for its ordinal cache only and
 **never executes a full-request handoff**. These throw `BridgeRefusalError` (an emergency fail-closed error) with
 stable `code` and `reason` fields:
 
@@ -276,12 +278,27 @@ stable `code` and `reason` fields:
 | `bridge_rollback` | `rollback`: a previously rolled-back provider record cannot complete re-entry |
 | `bridge_provider_disabled` | `provider_disabled`: defensive low-level reason; unreachable with the bridge's fixed provider lane |
 | `bridge_raw_history_provider_missing` | `raw_history_provider_missing`: OpenCode 2 session has no registered raw-history provider |
+| `bridge_served_bytes_changed` | `served_bytes_changed`: the new view changes a message the bridge already returned, outside a rebuild, or a rebuild puts such a message back to the host's raw text (tags or other hook edits stripped); `retryable: true` |
 
 No handoff refusal authorizes sending raw history. The caller may ask
 `isFallbackAdmissible` and send **only** its returned admissible view, or refuse the
 step. Other native failures (durability, store-ahead, transport and explicit
 provider refusal) retain their native error codes; they are not disguised as a
 full-request handoff.
+
+**Served bytes.** Across all lineages of a session, every admitted message the bridge returned in
+its last view comes back byte for byte unless the step rebuilds history (the step
+is classified `rebuild`, or the module applies a new view). Even a rebuild may not
+put such a message back to the host's raw text. ck-mc rebuilds history from hook
+answers whose delivery the host confirmed; while delivery stays pending
+(`served_through_ordinal` 0), a rebuild would render those messages raw, so `run()`
+refuses it with `bridge_served_bytes_changed` (`retryable: true`; nothing is
+committed). After `completeRequest` confirms a clean delivery, the same step renders
+the confirmed tags and is served. Messages no longer in the host's history are not
+compared. The bridge saves the last served baseline atomically with its pending
+receipt in the existing store, so restarting an adapter does not clear this guard.
+Receipts written by older versions have no such snapshot; their baseline becomes
+durable on the first successful publication with the new adapter.
 
 ### OpenCode 1 measured usage is not an automatic bridge witness
 

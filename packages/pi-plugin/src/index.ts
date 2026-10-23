@@ -28,6 +28,7 @@ import {
 	isCompactionEnabled,
 	isDreamerRunnable,
 } from "@magic-context/core/config/agent-disable";
+import { logConfigDependencyNotesOnce } from "@magic-context/core/config/dependency-notes";
 import {
 	changedLiveKeys,
 	dreamerRunConfig,
@@ -44,6 +45,8 @@ import type {
 import {
 	summarizeDreamSchedule,
 	userMemoryCollectionEnabled,
+	userObservationCollectionEnabled,
+	userObservationsRequested,
 } from "@magic-context/core/features/magic-context/dreamer/task-config";
 import {
 	type FailClosedReason,
@@ -54,6 +57,11 @@ import {
 	resolveProjectIdentityForSession,
 	setHomeProjectPermission,
 } from "@magic-context/core/features/magic-context/memory/project-identity";
+import {
+	awaitSessionIdentityDecision,
+	forgetSessionIdentityDecision,
+	readSessionIdentityDecision,
+} from "@magic-context/core/features/magic-context/memory/session-identity-decision";
 import { detectOverflow } from "@magic-context/core/features/magic-context/overflow-detection";
 import { resolveSessionCacheTtl } from "@magic-context/core/features/magic-context/session-cache-ttl";
 import { runSessionProjectBackfill } from "@magic-context/core/features/magic-context/session-project-backfill";
@@ -106,7 +114,11 @@ import {
 	claimConfigParseFailuresOnce,
 	formatConfigParseNotice,
 } from "@magic-context/core/shared/config-diagnostics";
-import { getMagicContextStorageDir } from "@magic-context/core/shared/data-path";
+import {
+	claimStorageBackupWarningCheck,
+	getMagicContextStorageDir,
+	isMagicContextStorageOutsideEngram,
+} from "@magic-context/core/shared/data-path";
 import { setEmbeddingSessionBusy } from "@magic-context/core/shared/embedding-activity";
 import { setHarness } from "@magic-context/core/shared/harness";
 import { piModelRefToCanonical } from "@magic-context/core/shared/harness-provider-map";
@@ -144,6 +156,7 @@ import {
 	registerCtxStatusLifecycleSignal,
 	resolveSessionId,
 } from "./commands/pi-command-utils";
+import { composePiSystemPrompt } from "./compose-system-prompt-pi";
 import { loadPiConfig, loadPiConfigDetailed } from "./config";
 import {
 	abortInFlightHistorians,
@@ -206,6 +219,7 @@ import {
 	type PiHarnessKind,
 	resolvePiHarnessDetection,
 } from "./pi-harness-kind";
+import { buildPiHistorianCommandOptions } from "./pi-historian-command-options";
 import { recoverLostPiRpcStages } from "./pi-historian-turn-two";
 import { notePiLkgProviderUsage } from "./pi-lkg";
 import {
@@ -238,12 +252,7 @@ import {
 	MAGIC_CONTEXT_PI_SUBAGENT_ENV,
 	PiSubagentRunner,
 } from "./subagent-runner";
-import {
-	buildMagicContextBlock,
-	clearPiSystemPromptSession,
-	composeMagicContextSystemPrompt,
-	processSystemPromptForCache,
-} from "./system-prompt";
+import { clearPiSystemPromptSession } from "./system-prompt";
 import {
 	acknowledgePiPendingSystemPromptResponses,
 	acknowledgePiSystemPromptResponse,
@@ -345,19 +354,6 @@ function clearPiStartupMaintenanceClaim(): void {
 	delete (globalThis as Record<symbol, unknown>)[
 		PI_STARTUP_MAINTENANCE_SCHEDULED
 	];
-}
-
-function resolveCurrentProject(
-	ctx: { cwd: string },
-	allowHomeProject = false,
-): {
-	projectDir: string;
-	projectIdentity: string;
-} {
-	const projectDir = ctx.cwd;
-	const projectIdentity =
-		resolveProjectIdentityForSession(projectDir, allowHomeProject) ?? "";
-	return { projectDir, projectIdentity };
 }
 
 export { createPiBridgeMarkerOwner } from "./bridge-marker-pi";
@@ -1116,7 +1112,8 @@ export function resolveHistorianFromConfig(
 		historyBudgetPercentage: config.history_budget_percentage,
 		memoryEnabled: config.memory.enabled,
 		autoPromote: config.memory.auto_promote,
-		userMemoriesEnabled: userMemoryCollectionEnabled(config.dreamer),
+		userMemoriesEnabled: userObservationCollectionEnabled(config.dreamer),
+		userObservationsRequested: userObservationsRequested(config.dreamer),
 		language: config.language,
 		allowHomeProject: config.allow_home_project,
 	};
@@ -1204,6 +1201,15 @@ export default async function (pi: ExtensionAPI): Promise<void> {
 		databaseExitHookRegistered = true;
 	}
 	const storageDir = getMagicContextStorageDir();
+	if (
+		claimStorageBackupWarningCheck() &&
+		isMagicContextStorageOutsideEngram(storageDir)
+	) {
+		warn(
+			`Magic Context storage is at ${storageDir}, outside the folder Engram backs up (~/.local/share/cortexkit/magic-context). It is not included in CortexKit backups.`,
+		);
+		flushLogger();
+	}
 	const dbPath = join(storageDir, "context.db");
 	let openFailureCause: string | null = null;
 	const openStorage = async (): Promise<ContextDatabase | null> => {
@@ -1403,6 +1409,9 @@ async function startPiMagicContextRuntime(
 		`loaded v${PLUGIN_VERSION} | harness=${PI_HARNESS_KIND} (via ${PI_HARNESS_DETECTION.via}) | db=${dbPath} | ` +
 			`project=${projectIdentity || "(none)"} | dir=${projectDir}`,
 	);
+	// Settings that are on but inert because another section turns off what
+	// they rely on (for example smart notes with the dreamer disabled).
+	logConfigDependencyNotesOnce(config, log);
 	// Pi tools are registered once per process, so this mode is intentionally
 	// boot-resolved rather than following later /cd project config changes.
 	const compactionOff = !isCompactionEnabled(config);
@@ -1462,9 +1471,8 @@ async function startPiMagicContextRuntime(
 		logNoProjectIdentityOnce(projectDir);
 	}
 
-	type ResolvedPiProjectDeps = {
+	type PiProjectConfigDeps = {
 		projectDir: string;
-		projectIdentity: string;
 		config: MagicContextConfig;
 		historianConfig: PiHistorianOptions | undefined;
 		autoSearchConfig: PiAutoSearchHandlerOptions;
@@ -1475,12 +1483,15 @@ async function startPiMagicContextRuntime(
 		cacheTtlConfigured: boolean;
 		hasDeprecatedProtectedTags: boolean;
 	};
+	type ResolvedPiProjectDeps = PiProjectConfigDeps & {
+		projectIdentity: string;
+	};
 
 	// Per-cwd runtime deps. Pi can switch projects mid-process (`/cd`,
 	// multi-root), while tools and slash commands are registered only once.
 	// Resolve all project-sensitive config through this memoized accessor so
 	// every invocation reads the active cwd's config instead of the launch cwd's.
-	const projectDepsByDir = new Map<string, ResolvedPiProjectDeps>();
+	const projectDepsByDir = new Map<string, PiProjectConfigDeps>();
 	const liveReaders = new Map<string, LiveConfigReader<MagicContextConfig>>();
 	function liveReaderFor(dir: string, boot: MagicContextConfig) {
 		let reader = liveReaders.get(dir);
@@ -1554,6 +1565,7 @@ async function startPiMagicContextRuntime(
 		todowriteEnabled: cfg.todowrite.enabled,
 		compactionOff,
 		allowHomeProject: cfg.allow_home_project,
+		subcConnectionFile: cfg.subc?.connection_file,
 		// Automatic history embedding: silent (no timeline messages) and not
 		// gated on `memory.enabled`; only the embedding provider decides.
 		maybeAutoEmbedSession: (sessionId, dir, identity) => {
@@ -1572,30 +1584,26 @@ async function startPiMagicContextRuntime(
 
 	function buildProjectDeps(
 		dir: string,
-		identity: string,
 		cfg: MagicContextConfig,
 		loadMetadata: {
 			configParseFailures: typeof configParseFailures;
 			cacheTtlConfigured: boolean;
 			hasDeprecatedProtectedTags?: boolean;
 		},
-	): ResolvedPiProjectDeps {
+	): PiProjectConfigDeps {
 		const hist = resolveHistorianFromConfig(cfg);
 		liveReaderFor(dir, cfg);
 		if (hist) {
 			hist.onStatusChange = (ctx) => {
 				updateStatusLine(ctx, {
 					db: database,
-					projectIdentity:
-						resolveCurrentProject(ctx, cfg.allow_home_project)
-							.projectIdentity ?? "",
+					projectIdentity: resolveCurrentProjectDeps(ctx).projectIdentity,
 				});
 			};
 		}
 		const auto = resolveAutoSearchFromConfig(cfg);
 		return {
 			projectDir: dir,
-			projectIdentity: identity,
 			config: cfg,
 			historianConfig: hist,
 			autoSearchConfig: auto,
@@ -1609,10 +1617,7 @@ async function startPiMagicContextRuntime(
 		};
 	}
 
-	function resolveProjectDepsForDir(
-		dir: string,
-		identityOverride?: string,
-	): ResolvedPiProjectDeps {
+	function resolveProjectDepsForDir(dir: string): PiProjectConfigDeps {
 		const cached = projectDepsByDir.get(dir);
 		if (cached) return cached;
 		ensureConfigLocationsMigrated(dir);
@@ -1626,14 +1631,7 @@ async function startPiMagicContextRuntime(
 		const switchedConfig = switchedLoad.config;
 		// A new cwd or session may reload config, but registered tool text belongs to this process's startup.
 		switchedConfig.smart_notes.enabled = config.smart_notes.enabled;
-		const switchedIdentity =
-			identityOverride ??
-			resolveProjectIdentityForSession(
-				dir,
-				switchedConfig.allow_home_project,
-			) ??
-			"";
-		const built = buildProjectDeps(dir, switchedIdentity, switchedConfig, {
+		const built = buildProjectDeps(dir, switchedConfig, {
 			configParseFailures: switchedLoad.configParseFailures,
 			cacheTtlConfigured: switchedLoad.cacheTtlConfigured,
 			hasDeprecatedProtectedTags: switchedLoad.hasDeprecatedProtectedTags,
@@ -1644,8 +1642,22 @@ async function startPiMagicContextRuntime(
 
 	function resolveCurrentProjectDeps(ctx: {
 		cwd: string;
+		sessionManager?: { getSessionId?: () => string | undefined };
 	}): ResolvedPiProjectDeps {
-		return resolveProjectDepsForDir(ctx.cwd);
+		const project = resolveProjectDepsForDir(ctx.cwd);
+		const sessionId = ctx.sessionManager?.getSessionId?.();
+		return {
+			...project,
+			// Config reloads are directory-scoped; identity belongs to the session.
+			projectIdentity: sessionId
+				? (readSessionIdentityDecision(sessionId, ctx.cwd, {
+						allowHomeProject: project.config.allow_home_project,
+					})?.identity ?? "")
+				: (resolveProjectIdentityForSession(
+						ctx.cwd,
+						project.config.allow_home_project,
+					) ?? ""),
+		};
 	}
 
 	let activeModelRegistry:
@@ -1689,7 +1701,7 @@ async function startPiMagicContextRuntime(
 	 */
 	function reportPiModelChains(
 		ctx: PiModelChainReportContext,
-		project: ResolvedPiProjectDeps,
+		project: PiProjectConfigDeps,
 	): void {
 		const registry = ctx.modelRegistry;
 		if (!registry) return;
@@ -1825,16 +1837,11 @@ async function startPiMagicContextRuntime(
 		};
 	}
 
-	const bootProjectDeps = buildProjectDeps(
-		projectDir,
-		projectIdentity,
-		config,
-		{
-			configParseFailures,
-			cacheTtlConfigured,
-			hasDeprecatedProtectedTags,
-		},
-	);
+	const bootProjectDeps = buildProjectDeps(projectDir, config, {
+		configParseFailures,
+		cacheTtlConfigured,
+		hasDeprecatedProtectedTags,
+	});
 	projectDepsByDir.set(projectDir, bootProjectDeps);
 
 	function syncDreamerProjectRegistration(
@@ -1849,7 +1856,9 @@ async function startPiMagicContextRuntime(
 			return;
 		}
 		seenDreamerProjectIdentities.add(current.projectIdentity);
-		if (!current.dreamerConfig) {
+		// A disabled dreamer still needs commit indexing and live timer settings.
+		const timerConfig = current.dreamerConfig ?? current.config.dreamer;
+		if (!timerConfig) {
 			unregisterPiDreamerProject({
 				projectIdentity: current.projectIdentity,
 				registrationOwner: dreamerRegistrationOwner,
@@ -1861,7 +1870,7 @@ async function startPiMagicContextRuntime(
 			projectDir: current.projectDir,
 			projectIdentity: current.projectIdentity,
 			registrationOwner: dreamerRegistrationOwner,
-			config: current.dreamerConfig,
+			config: timerConfig,
 			modelRegistry,
 			sampleDreamRun: () => {
 				const fresh = liveReaderFor(current.projectDir, current.config).poll()
@@ -1964,6 +1973,15 @@ async function startPiMagicContextRuntime(
 		// this cwd's config before setting the active tools so a memory.enabled
 		// change takes effect at the next session without restarting Pi.
 		projectDepsByDir.delete(ctx.cwd);
+		const sessionId = resolveSessionId(ctx);
+		const project = resolveProjectDepsForDir(ctx.cwd);
+		if (sessionId) {
+			await awaitSessionIdentityDecision(sessionId, ctx.cwd, {
+				allowHomeProject: project.config.allow_home_project,
+				connectionFile: project.config.subc?.connection_file,
+				db,
+			});
+		}
 		const current = resolveCurrentProjectDeps(ctx);
 		activeModelRegistry = ctx.modelRegistry;
 		activeModelChainContext = ctx;
@@ -1988,11 +2006,11 @@ async function startPiMagicContextRuntime(
 
 		// Inherit before saving cache-TTL preferences creates the child's metadata
 		// row: the clone guard uses that row to distinguish first open from resume.
+		// The project identity decision above writes only identity pins, not that row.
 		await handlePiCloneSessionStart(event, ctx, {
 			db,
 			signalPendingMarker: signalPiDeferredCompactionMarkerDrain,
 		});
-		const sessionId = resolveSessionId(ctx);
 		if (
 			!piMarkerRehydrationLogged &&
 			pendingPiMarkerSessions.length > 0 &&
@@ -2121,7 +2139,7 @@ async function startPiMagicContextRuntime(
 		smartNotesEnabled: config.smart_notes.enabled,
 		db,
 		projectIdentity,
-		resolveProject: resolveCurrentProject,
+		resolveProject: resolveCurrentProjectDeps,
 		protectedTags: bootProjectDeps.config.protected_tags,
 		executeThresholdPercentage:
 			bootProjectDeps.config.execute_threshold_percentage,
@@ -2218,13 +2236,10 @@ async function startPiMagicContextRuntime(
 	registerCtxRecompCommand(pi, {
 		db,
 		runner: recompRunner,
-		historianModel: bootProjectDeps.historianConfig?.model,
-		historianChunkTokens: deriveHistorianChunkTokens(
-			resolveHistorianContextLimit(bootProjectDeps.historianConfig?.model),
+		...buildPiHistorianCommandOptions(
+			bootProjectDeps.historianConfig,
+			bootProjectDeps.config,
 		),
-		historianFallbacks: bootProjectDeps.historianConfig?.fallbackModels,
-		historianTimeoutMs: bootProjectDeps.config.historian_timeout_ms,
-		historianThinkingLevel: bootProjectDeps.historianConfig?.thinkingLevel,
 		language: bootProjectDeps.config.language,
 		memoryEnabled: bootProjectDeps.config.memory.enabled,
 		autoPromote: bootProjectDeps.config.memory.auto_promote,
@@ -2243,16 +2258,7 @@ async function startPiMagicContextRuntime(
 			return {
 				db,
 				runner: recompRunner,
-				historianModel: historian?.model,
-				historianChunkTokens:
-					historian?.historianChunkTokens ??
-					deriveHistorianChunkTokens(
-						resolveHistorianContextLimit(historian?.model),
-					),
-				historianFallbacks: historian?.fallbackModels,
-				historianTimeoutMs:
-					historian?.timeoutMs ?? current.config.historian_timeout_ms,
-				historianThinkingLevel: historian?.thinkingLevel,
+				...buildPiHistorianCommandOptions(historian, current.config),
 				language: current.config.language,
 				memoryEnabled: current.config.memory.enabled,
 				autoPromote: fresh.memory.auto_promote,
@@ -2266,18 +2272,18 @@ async function startPiMagicContextRuntime(
 		shutdownSignal: commandLifecycleController.signal,
 		db,
 		runner: wrapupRunner,
-		historianModel: bootProjectDeps.historianConfig?.model,
-		historianChunkTokens: deriveHistorianChunkTokens(
-			resolveHistorianContextLimit(bootProjectDeps.historianConfig?.model),
+		...buildPiHistorianCommandOptions(
+			bootProjectDeps.historianConfig,
+			bootProjectDeps.config,
 		),
-		historianFallbacks: bootProjectDeps.historianConfig?.fallbackModels,
-		historianTimeoutMs: bootProjectDeps.config.historian_timeout_ms,
-		historianThinkingLevel: bootProjectDeps.historianConfig?.thinkingLevel,
 		language: bootProjectDeps.config.language,
 		memoryEnabled: bootProjectDeps.config.memory.enabled,
 		autoPromote: bootProjectDeps.config.memory.auto_promote,
 		compactionOff,
-		userMemoriesEnabled: userMemoryCollectionEnabled(
+		userMemoriesEnabled: userObservationCollectionEnabled(
+			bootProjectDeps.config.dreamer,
+		),
+		userObservationsRequested: userObservationsRequested(
 			bootProjectDeps.config.dreamer,
 		),
 		executeThresholdPercentage:
@@ -2297,21 +2303,15 @@ async function startPiMagicContextRuntime(
 			return {
 				db,
 				runner: wrapupRunner,
-				historianModel: historian?.model,
-				historianChunkTokens:
-					historian?.historianChunkTokens ??
-					deriveHistorianChunkTokens(
-						resolveHistorianContextLimit(historian?.model),
-					),
-				historianFallbacks: historian?.fallbackModels,
-				historianTimeoutMs:
-					historian?.timeoutMs ?? current.config.historian_timeout_ms,
-				historianThinkingLevel: historian?.thinkingLevel,
+				...buildPiHistorianCommandOptions(historian, current.config),
 				language: current.config.language,
 				memoryEnabled: current.config.memory.enabled,
 				autoPromote: fresh.memory.auto_promote,
 				compactionOff,
-				userMemoriesEnabled: userMemoryCollectionEnabled(
+				userMemoriesEnabled: userObservationCollectionEnabled(
+					current.config.dreamer,
+				),
+				userObservationsRequested: userObservationsRequested(
 					current.config.dreamer,
 				),
 				executeThresholdPercentage: current.config.execute_threshold_percentage,
@@ -2525,173 +2525,23 @@ async function startPiMagicContextRuntime(
 				}
 			}
 
-			// Use effectiveConfig (re-resolved from the CURRENT checkout's cwd on
-			// a project switch) for every system-prompt decision below — a
-			// switched-into project may carry its own .cortexkit/magic-context.jsonc
-			// (memory/docs/key-files/injection toggles). Reusing boot `config`
-			// would render the launch project's adjuncts in the new checkout.
-			if (effectiveConfig.system_prompt_injection?.enabled === false) {
-				return;
-			}
-			const skipSigs =
-				effectiveConfig.system_prompt_injection?.skip_signatures ?? [];
-			if (
-				skipSigs.some(
-					(sig) => sig.length > 0 && event.systemPrompt.includes(sig),
-				)
-			) {
-				return;
-			}
-
-			// PEEK the system-prompt refresh signal. Set by:
-			//   - `/ctx-flush`
-			//   - dreamer publication of new ARCHITECTURE.md / STRUCTURE.md
-			//   - user-memory promotion (dreamer)
-			//   - hash-change detection on the previous turn (signaled below)
-			//
-			// When set, we re-read disk-backed adjuncts on this turn. When
-			// not set, cached values are reused.
-			//
-			// PEEK-then-drain-on-success (Oracle audit Round 8 #6): we
-			// only `clearSystemPromptRefresh(...)` AFTER the rebuild
-			// (`buildMagicContextBlock` + `processSystemPromptForCache`)
-			// completes successfully. If either throws, the flag survives
-			// so the next prompt retries the rebuild.
-			const isCacheBusting = sessionId
-				? hasSystemPromptRefresh(sessionId)
-				: true; // first-pass-no-session: act as cache-busting (force fresh read)
-
-			const promptSurfaceModel = (
-				ctx as { model?: { provider?: unknown; id?: unknown } }
-			).model;
-			const promptSurfaceModelKey =
-				typeof promptSurfaceModel?.provider === "string" &&
-				promptSurfaceModel.provider.length > 0 &&
-				typeof promptSurfaceModel.id === "string" &&
-				promptSurfaceModel.id.length > 0
-					? canonicalPiModelKey(
-							promptSurfaceModel.provider,
-							promptSurfaceModel.id,
-						)
-					: undefined;
-			const promptSurface = sessionId
-				? promptSurfaceGuidanceEpochs.resolve(
-						sessionId,
-						effectiveConfig.prompt_surface,
-						promptSurfaceModelKey,
-					)
-				: promptSurfaceRuntime.resolveGuidance(
-						effectiveConfig.prompt_surface,
-						promptSurfaceModelKey,
-					);
-
-			const block = buildMagicContextBlock({
+			const result = composePiSystemPrompt({
 				db,
 				cwd: currentProject.projectDir,
 				sessionId,
-				memoryEnabled: effectiveConfig.memory.enabled,
-				includeGuidance: true,
-				protectedTags: effectiveConfig.protected_tags,
+				systemPrompt: event.systemPrompt,
+				systemPromptOptions: event.systemPromptOptions,
+				config: effectiveConfig,
+				model: ctx.model,
+				runtime: promptSurfaceRuntime,
 				ctxReduceCallable: !compactionOff,
 				dreamerEnabled: effectiveProjectDeps.dreamerEnabled,
 				smartNotesEnabled: config.smart_notes.enabled,
-				temporalAwarenessEnabled: effectiveConfig.temporal_awareness ?? false,
-				cavemanTextCompressionEnabled:
-					effectiveConfig.caveman_text_compression?.enabled === true,
-				language: effectiveConfig.language,
-				promptSurfacePreset: promptSurface.preset,
-				primaryGuidanceOverride: promptSurface.primaryOverride,
-				// Stable user memories rendered as <user-profile> — dreamer
-				// promotes recurring observations into this set, then the
-				// system prompt surfaces them across all sessions in the
-				// project. Gated on dreamer.user_memories.enabled.
-				userMemoriesEnabled: userMemoryCollectionEnabled(
-					effectiveConfig.dreamer,
-				),
-				isCacheBusting,
-				existingSystemPrompt: event.systemPrompt,
+				hasSystemPromptRefresh,
+				clearSystemPromptRefresh,
+				signalHashChange: signalPiSystemHashChange,
 			});
-
-			// Compose the reference system prompt (base prompt from Pi +
-			// our magic-context block) for hash detection. We always run
-			// hash detection on the composed string so even sessions with
-			// no data block (e.g. memories disabled, no docs, no key
-			// files) still get hash-change tracking.
-			const composedPrompt = composeMagicContextSystemPrompt(
-				event.systemPrompt,
-				block,
-			);
-
-			// Inject through the host's structured sections API when it has
-			// one. On Pi, returning `systemPrompt` from before_agent_start
-			// makes the host replace the WHOLE prompt with opaque text:
-			// sections set by later-registered extensions are then still
-			// recorded in the transcript but never sent to the provider
-			// (Pi renders forceSystemPrompt instead of the structured
-			// sections), so any extension registered after us silently
-			// loses its system-prompt section. Oh My Pi's before_agent_start
-			// event has no systemPromptOptions at all, and Pi releases
-			// before 0.87 have no `sections` field, so the forced prompt
-			// return below remains the only injection path on those hosts.
-			// The plugin compiles against Pi 0.83 types, which predate
-			// `sections`; the widened type below describes newer hosts
-			// without claiming the field always exists.
-			const promptOptions:
-				| (NonNullable<typeof event.systemPromptOptions> & {
-						sections?: Record<string, string>;
-				  })
-				| undefined = event.systemPromptOptions;
-			const hostSections = promptOptions?.sections;
-			if (block && hostSections) {
-				hostSections.magic_context = block;
-			}
-
-			if (!sessionId) {
-				// No session id yet — inject without cache logic. The
-				// next turn (with a session id) will compute the first
-				// hash and set sticky date.
-				if (block && !hostSections) return { systemPrompt: composedPrompt };
-				return;
-			}
-
-			const result = processSystemPromptForCache({
-				db,
-				sessionId,
-				systemPrompt: composedPrompt,
-				isCacheBusting,
-				promptSurfacePreset: promptSurface.preset,
-			});
-
-			if (result.hashChanged) {
-				// Real prompt-content or preset change. Signal all three
-				// independent refresh sets so the next pi.on("context") event
-				// rebuilds <session-history> + lets queued ops
-				// materialize, AND the next before_agent_start refreshes
-				// adjuncts (since this turn's adjunct read used the
-				// cached values that are now potentially stale).
-				signalPiSystemHashChange(sessionId, result.currentHash);
-			}
-
-			// PEEK-then-drain-on-success (Oracle audit Round 8 #6):
-			// drain only if the start-of-pass peek was true. Using the
-			// CAPTURED boolean (not a re-read of the set) so that a
-			// signal added later in the same pass — e.g. `result.hashChanged`
-			// just above — survives to the next prompt for retry.
-			if (isCacheBusting) {
-				clearSystemPromptRefresh(sessionId);
-			}
-
-			// On hosts with a sections API (Pi) the block already went
-			// out as a structured section above; returning a forced
-			// prompt here would hide later extensions' sections from the
-			// provider. Only hosts without that API
-			// (Oh My Pi) still need the forced return. Pi's prompt has
-			// no `Today's date:` line for processSystemPromptForCache
-			// to freeze, so dropping the force there loses nothing.
-			if (hostSections) {
-				return;
-			}
-			return { systemPrompt: result.systemPrompt };
+			if (result.force) return { systemPrompt: result.systemPrompt };
 		} catch (error) {
 			warn("failed to build magic-context block:", error);
 			return;
@@ -3206,6 +3056,7 @@ async function startPiMagicContextRuntime(
 				// this, sessions accumulate state across `session_shutdown`
 				// in long-lived Pi processes that re-init the extension.
 				clearContextHandlerSession(sessionId);
+				forgetSessionIdentityDecision(sessionId);
 			}
 		} catch {
 			// best-effort cleanup

@@ -62,11 +62,14 @@ export interface RegisterCtxWrapupDeps {
 	historianChunkTokens: number;
 	historianFallbacks?: readonly ModelInput[];
 	historianTimeoutMs?: number;
+	historianMaxOutputTokens?: number;
 	historianThinkingLevel?: string;
 	language?: string;
 	memoryEnabled: boolean;
 	autoPromote: boolean;
 	userMemoriesEnabled?: boolean;
+	/** False when the dreamer is not runnable; the historian then skips user observations. */
+	userObservationsRequested?: boolean;
 	executeThresholdPercentage?:
 		| number
 		| { default: number; [modelKey: string]: number };
@@ -320,19 +323,24 @@ export async function runPiWrapup(
 			}
 			return true;
 		};
-		const renewal = setInterval(() => {
-			try {
-				renewWrapupMarker({
-					lastCompartmentEnd: getLastCompartmentEndMessage(deps.db, sessionId),
-				});
-			} catch (err) {
-				// A missed renewal is safe because the wrapup marker has a five-minute TTL.
-				sessionLog(
-					sessionId,
-					`[pi] /ctx-wrapup marker renewal failed: ${err instanceof Error ? err.message : String(err)}`,
-				);
-			}
-		}, 60_000);
+		const renewal = inRootAsyncContext(() =>
+			setInterval(() => {
+				try {
+					renewWrapupMarker({
+						lastCompartmentEnd: getLastCompartmentEndMessage(
+							deps.db,
+							sessionId,
+						),
+					});
+				} catch (err) {
+					// A missed renewal is safe because the wrapup marker has a five-minute TTL.
+					sessionLog(
+						sessionId,
+						`[pi] /ctx-wrapup marker renewal failed: ${err instanceof Error ? err.message : String(err)}`,
+					);
+				}
+			}, 60_000),
+		);
 		const stopRenewal = () => clearInterval(renewal);
 		deps.shutdownSignal?.addEventListener("abort", stopRenewal, { once: true });
 		try {
@@ -440,17 +448,19 @@ export async function runPiWrapup(
 					break;
 				}
 				const leaseHolder = leaseResult.holderId;
-				const leaseRenewal = setInterval(() => {
-					try {
-						renewCompartmentLease(deps.db, sessionId, leaseHolder);
-					} catch (err) {
-						// A missed renewal is safe because the compartment lease has a five-minute TTL.
-						sessionLog(
-							sessionId,
-							`[pi] /ctx-wrapup compartment lease renewal failed: ${err instanceof Error ? err.message : String(err)}`,
-						);
-					}
-				}, COMPARTMENT_LEASE_RENEWAL_MS);
+				const leaseRenewal = inRootAsyncContext(() =>
+					setInterval(() => {
+						try {
+							renewCompartmentLease(deps.db, sessionId, leaseHolder);
+						} catch (err) {
+							// A missed renewal is safe because the compartment lease has a five-minute TTL.
+							sessionLog(
+								sessionId,
+								`[pi] /ctx-wrapup compartment lease renewal failed: ${err instanceof Error ? err.message : String(err)}`,
+							);
+						}
+					}, COMPARTMENT_LEASE_RENEWAL_MS),
+				);
 				const stopLeaseRenewal = () => clearInterval(leaseRenewal);
 				deps.shutdownSignal?.addEventListener("abort", stopLeaseRenewal, {
 					once: true,
@@ -485,10 +495,12 @@ export async function runPiWrapup(
 							}).snapshot,
 						currentContextLimit: contextLimit,
 						historianTimeoutMs: deps.historianTimeoutMs,
+						maxOutputTokens: deps.historianMaxOutputTokens,
 						thinkingLevel: deps.historianThinkingLevel,
 						memoryEnabled: deps.memoryEnabled,
 						autoPromote: deps.autoPromote,
 						userMemoriesEnabled: deps.userMemoriesEnabled,
+						userObservationsRequested: deps.userObservationsRequested,
 						language: deps.language,
 						compartmentLeaseHolderId: leaseHolder,
 						readBranchEntries: () => readPiWrapupBranchEntries(ctx),
@@ -648,3 +660,5 @@ export function readPiWrapupBranchEntries(
 		return [];
 	}
 }
+
+import { inRootAsyncContext } from "@magic-context/core/shared/sqlite";

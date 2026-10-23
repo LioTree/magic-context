@@ -201,6 +201,7 @@ fn signed_prefix_hold_keeps_a_marker_hard_pending() {
     let session = "signed-hold-marker";
     let baseline = signed_hold_baseline(&s, session, 66_000);
     signed_hold_edit_meta(&s, session, |meta| meta.project_memory_epoch_pending = true);
+    regate_mark_history_pending(&s, session);
     let mut request = signed_hold_request(session, 66_000);
     let held = transform(&s, &request, &ctx).unwrap();
     assert_signed_hold_deferred(&held, &baseline, &s, session, 0);
@@ -250,7 +251,7 @@ fn signed_hold_head(response: &TransformResponse) -> Vec<Vec<u8>> {
 /// Context-pressure relief inside the open turn, with both drops from
 /// `signed_hold_queue_both` queued. The late drop (after the kept signed thinking) is applied
 /// and the serve shrinks; the early drop, before it, stays withheld. The m0/m1 head replays byte
-/// for byte while that signed thinking is still served, so a pending project-memory marker
+/// for byte while that signed thinking is still served, so a pending structural history marker
 /// (a HARD fold trigger) waits for the next user turn, which then takes it.
 fn check_signed_hold_relief(session: &str, used: u64, recovery_armed: bool) {
     let dir = tempfile::tempdir().unwrap();
@@ -259,6 +260,7 @@ fn check_signed_hold_relief(session: &str, used: u64, recovery_armed: bool) {
     let baseline = signed_hold_baseline(&s, session, 20_000);
     signed_hold_queue_both(&s, session);
     signed_hold_edit_meta(&s, session, |meta| meta.project_memory_epoch_pending = true);
+    regate_mark_history_pending(&s, session);
     let mut request = signed_hold_request(session, used);
     request.emergency_recovery_armed = recovery_armed;
     let relieved = transform(&s, &request, &ctx).unwrap();
@@ -699,13 +701,12 @@ fn signed_hold_differential_digest(
     format!("{:x}", hasher.finalize())
 }
 
-/// Sessions the signed-prefix hold never covers (no thinking, or a model whose thinking is
-/// not prefix-bound) must serve exactly what the code served before the hold existed. The
-/// golden digests below were recorded from that code (commit dda49e3850) with this same
-/// seeded sequence. A mismatch means such a session changed behaviour; regenerate them only
-/// for an intended change to unheld sessions, from the assertion message.
+/// Pin sessions outside the signed-prefix hold under distance-based age reclaim.
+/// Their output intentionally retains more current-task bodies than the former
+/// rebuild-count policy. Regenerate these digests only for an intended change
+/// to unheld sessions; the signed-prefix invariants are tested separately.
 #[test]
-fn signed_prefix_hold_leaves_unheld_sessions_byte_identical() {
+fn signed_prefix_hold_unheld_distance_policy_golden() {
     let cases = [
         ("anthropic/claude-opus-4-5", true, false),
         ("anthropic/claude-opus-4-5", true, true),
@@ -713,10 +714,10 @@ fn signed_prefix_hold_leaves_unheld_sessions_byte_identical() {
         (SIGNED_HOLD_MODEL, false, true),
     ];
     let golden: [&str; 4] = [
-        "8c2c2a7fcb4b79cb90c9919c0be079f263bd6cc5d16189a083dec566b310b555f1ff7dda34907c007e42791bb27b4562c31f37624003cb638aaa39aa8d09eb42",
-        "8cdbcef220819f6b65e541f05babc4678c430d90cb8b3c75959001bf213efa2c45d0f2839701bced8576ccdf22bbae7688b44b01377a4e8d920e5390b05983f6",
-        "dd5c4068d06f89c544cc6fe21aa30e4ea81a8454bcfabfe7d7c4622eba3a6bbd90cd462a95a18b66499887ae09ec99531a3aa10c33478811feb5ca3f2b57cd51",
-        "3fcb4ffbcdac757fe3154bf9f8baa6741fd23a93331249e1b06767cb8e79b76459fdffe286cf31b24ae80448fda06c954369a2130fc6ea89ac698d796593aba8",
+        "25bbe1a8b56991017ff6373fbade8b5569f4b364eafcf5aeaaf5c89a3c13c2859d120561c64defb7098a2d980e22d2b0df97567815660608a513b85e4e1dc46c",
+        "39de76c542bfe5d3568981efa76ae765a5ddd39e0565626e17873e74fc371cadeabce589701cab5b9ee0f0264a1f8d3ff1404cfaa2f2cf21b525fa3dc0a1a62b",
+        "b29fdfa0ca15e5b1f6a3eca9381d0ef47ed04e400c3f1eef75fc69343418fc91fc5c37fd05c42358237c4b3679278aa84445a057c2e82da207e486a39f14726c",
+        "cf5dfef42cf7ee578c19bdc383b681bdaa841a3a7be088ad130652ab4bd061a1fef456a60bac4dd8e8a7676ca5f048826783f3dbb4e03c0257feb2234a1fce39",
     ];
     let mut actual = Vec::new();
     for (model, thinking, subagent) in cases {

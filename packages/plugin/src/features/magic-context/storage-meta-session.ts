@@ -7,6 +7,8 @@ import { getHarness, type HarnessId } from "../../shared/harness";
 import { piModelRefToCanonical } from "../../shared/harness-provider-map";
 import {
     type Database,
+    prepareCachedStatement,
+    type Statement,
     withoutSqliteTransformPass,
     withSqliteBackgroundWriter,
 } from "../../shared/sqlite";
@@ -30,6 +32,12 @@ import {
     SESSION_META_SELECT_COLUMNS,
     toSessionMeta,
 } from "./storage-meta-shared";
+import {
+    isSessionRenderCacheColumn,
+    type SessionRenderCacheColumn,
+    sessionRenderCacheSelect,
+    writeSessionRenderCache,
+} from "./storage-session-cache";
 import { deleteSessionScopedRows } from "./storage-session-tables";
 import type { SessionMeta } from "./types";
 
@@ -84,7 +92,12 @@ function getSessionMetaSelectColumns(db: Database): string {
             (column) => column.name,
         ),
     );
+    const separated = !!db
+        .prepare("SELECT 1 FROM sqlite_master WHERE name = 'session_render_cache'")
+        .get();
     const projection = SESSION_META_SELECT_COLUMNS.map((column) => {
+        if (separated && isSessionRenderCacheColumn(column))
+            return sessionRenderCacheSelect(column);
         if (existingColumns.has(column)) return column;
         return SESSION_META_FALLBACK_SELECTS[column] ?? `0 AS ${column}`;
     }).join(", ");
@@ -92,10 +105,21 @@ function getSessionMetaSelectColumns(db: Database): string {
     return projection;
 }
 
+// The projection is fixed per connection, and since migration 103 it reads each cached
+// payload through a subquery; compiling that statement again on every read cost more
+// than running it.
+const sessionMetaSelectStatements = new WeakMap<Database, Statement>();
+
 function findSessionMeta(db: Database, sessionId: string): SessionMeta | undefined {
-    const result = db
-        .prepare(`SELECT ${getSessionMetaSelectColumns(db)} FROM session_meta WHERE session_id = ?`)
-        .get(sessionId);
+    let statement = sessionMetaSelectStatements.get(db);
+    if (!statement) {
+        statement = prepareCachedStatement(
+            db,
+            `SELECT ${getSessionMetaSelectColumns(db)} FROM session_meta WHERE session_id = ?`,
+        );
+        sessionMetaSelectStatements.set(db, statement);
+    }
+    const result = statement.get(sessionId);
 
     return isSessionMetaRow(result) ? toSessionMeta(result) : undefined;
 }
@@ -160,10 +184,19 @@ export function updateSessionMeta(
 ): void {
     const setClauses: string[] = [];
     const values: Array<string | number | Buffer | null> = [];
+    const cacheUpdates: Array<[SessionRenderCacheColumn, Buffer | string | number | null]> = [];
 
     for (const [key, column] of Object.entries(META_COLUMNS)) {
         const value = updates[key as keyof SessionMeta];
         if (value === undefined) continue;
+        if (isSessionRenderCacheColumn(column)) {
+            const blob = column === "cached_m0_bytes" || column === "cached_m1_bytes";
+            if (blob && value instanceof Uint8Array)
+                cacheUpdates.push([column, Buffer.from(value)]);
+            else if (value === null || typeof value === "string" || typeof value === "number")
+                cacheUpdates.push([column, value]);
+            continue;
+        }
 
         if (value === null) {
             setClauses.push(`${column} = ?`);
@@ -187,16 +220,19 @@ export function updateSessionMeta(
         }
     }
 
-    if (setClauses.length === 0) {
+    if (setClauses.length === 0 && cacheUpdates.length === 0) {
         return;
     }
 
     db.transaction(() => {
         ensureSessionMetaRow(db, sessionId);
-        db.prepare(`UPDATE session_meta SET ${setClauses.join(", ")} WHERE session_id = ?`).run(
-            ...values,
-            sessionId,
-        );
+        if (setClauses.length > 0)
+            db.prepare(`UPDATE session_meta SET ${setClauses.join(", ")} WHERE session_id = ?`).run(
+                ...values,
+                sessionId,
+            );
+        for (const [column, value] of cacheUpdates)
+            writeSessionRenderCache(db, sessionId, column, value);
     }).immediate();
 }
 

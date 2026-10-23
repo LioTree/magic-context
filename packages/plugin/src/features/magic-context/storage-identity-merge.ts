@@ -683,7 +683,11 @@ export function mergeProjectIdentities(
                 `UPDATE git_sweep_coordinator SET lease_holder = NULL, lease_expires_at = NULL, last_swept_at = NULL WHERE project_path = ?`,
             ).run(toIdentity);
             db.prepare(
-                `UPDATE session_meta SET cached_m0_bytes = NULL, cached_m0_project_identity = NULL WHERE cached_m0_project_identity IN (?, ?)`,
+                `DELETE FROM session_render_cache WHERE cache_key = 'cached_m0_bytes'
+                 AND session_id IN (SELECT session_id FROM session_meta WHERE cached_m0_project_identity IN (?, ?))`,
+            ).run(fromIdentity, toIdentity);
+            db.prepare(
+                `UPDATE session_meta SET cached_m0_project_identity = NULL WHERE cached_m0_project_identity IN (?, ?)`,
             ).run(fromIdentity, toIdentity);
             db.prepare(
                 `INSERT INTO project_state

@@ -4,31 +4,30 @@ use super::*;
 use std::sync::{Arc, Mutex};
 
 #[derive(Default)]
-pub(crate) struct ResidentPolicy {
-    pub(crate) fold_prefix: Option<crate::providers::fold_prefix::FoldPrefix>,
-    pub(crate) fold_lineage: Option<String>,
-    pub(crate) fold_structure: Option<[u8; 32]>,
-    pub(crate) fold_source_raced: bool,
-    pub(in crate::providers) fold_view: Option<crate::providers::resident_view::ResidentView>,
+pub struct ResidentPolicy {
+    pub fold_prefix: Option<crate::providers::fold_prefix::FoldPrefix>,
+    pub fold_lineage: Option<String>,
+    pub fold_structure: Option<[u8; 32]>,
+    pub fold_source_raced: bool,
     pub(in crate::providers) fold_arena: crate::providers::resident_bytes::ByteArena,
     pub(crate) fold_hygiene:
         std::sync::Arc<std::sync::Mutex<crate::providers::hygiene_memo::HygieneMemo>>,
-    pub(crate) fold_data_version: Option<u64>,
+    pub fold_data_version: Option<u64>,
     pub(in crate::providers) fold_working: Option<crate::providers::fold_working::FoldWorking>,
     pub(crate) fold_output: Arc<Mutex<transform::SerializedOutputCache>>,
     #[cfg(test)]
-    pub(crate) fold_tail_passes: u64,
+    pub fold_tail_passes: u64,
     summary: Option<PolicySummary>,
     saved: Option<String>,
     before: HashMap<String, Option<ProviderPolicyPart>>,
     #[cfg(test)]
-    pub(crate) rebuilt_parts: usize,
+    pub rebuilt_parts: usize,
     #[cfg(test)]
-    pub(crate) replays: u64,
+    pub replays: u64,
 }
 
 impl ResidentPolicy {
-    pub(crate) fn rebuild(
+    pub fn rebuild(
         index: &ProviderPolicyIndex<'_>,
         counters: &Value,
         floor: u64,
@@ -71,7 +70,6 @@ impl ResidentPolicy {
             fold_lineage: None,
             fold_structure: None,
             fold_source_raced: false,
-            fold_view: None,
             fold_arena: Default::default(),
             fold_hygiene: Default::default(),
             fold_data_version: None,
@@ -91,7 +89,7 @@ impl ResidentPolicy {
         })
     }
 
-    pub(crate) fn retained_bytes(&self) -> usize {
+    pub fn retained_bytes(&self) -> usize {
         // Charge serialized payload and container overhead conservatively.
         // read_provider_resident_policy bounds input to 100,000 rows / 128 MiB
         // before allocating the temporary rebuild input.
@@ -105,10 +103,6 @@ impl ResidentPolicy {
                 .resident_retained_bytes()
             - std::mem::size_of::<transform::SerializedOutputCache>()
             + self.fold_lineage.as_ref().map_or(0, String::capacity)
-            + self.fold_view.as_ref().map_or(0, |view| {
-                view.retained_bytes()
-                    - std::mem::size_of::<crate::providers::resident_view::ResidentView>()
-            })
             + self.fold_arena.retained_bytes()
             - std::mem::size_of::<crate::providers::resident_bytes::ByteArena>()
             + crate::retained_size::ARC_ALLOCATION_OVERHEAD_BYTES
@@ -152,7 +146,7 @@ impl ResidentPolicy {
 mod tests;
 
 #[allow(clippy::too_many_arguments)]
-pub(crate) fn resident_channel1_inputs(
+pub fn resident_channel1_inputs(
     resident: &mut ResidentPolicy,
     index: &ProviderPolicyIndex<'_>,
     engine_policy: &Value,

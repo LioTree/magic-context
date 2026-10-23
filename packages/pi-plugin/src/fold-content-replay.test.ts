@@ -18,6 +18,8 @@ import {
 } from "@magic-context/core/features/magic-context/storage";
 import { stripTagPrefix } from "@magic-context/core/hooks/magic-context/tag-content-primitives";
 import { closeQuietly } from "@magic-context/core/shared/sqlite-helpers";
+import { patchSessionMeta } from "../../plugin/src/features/magic-context/__tests__/session-meta-fixture";
+import { updateSessionMetaCollection } from "../../plugin/src/features/magic-context/storage-session-collections";
 import {
 	clearContextHandlerSession,
 	__test as contextHandlerInternals,
@@ -482,9 +484,7 @@ describe("Pi fold content replay", () => {
 			db.prepare(
 				"UPDATE source_contents SET content = ? WHERE session_id = ? AND tag_id = ?",
 			).run(stripTagPrefix(preDeployReminder), sessionId, tag.tagNumber);
-			db.prepare(
-				"UPDATE session_meta SET merged_reasoning_stripped_ids = '[]' WHERE session_id = ?",
-			).run(sessionId);
+			patchSessionMeta(db, sessionId, { merged_reasoning_stripped_ids: "[]" });
 			expect(getPiContentDecisions(db, sessionId).size).toBe(0);
 			updateSessionMeta(db, sessionId, {
 				piStableIdScheme: 1,
@@ -594,9 +594,12 @@ describe("Pi fold content replay", () => {
 					insertTag(db, sessionId, messageId, "message", 1, 10_000 + index);
 					entries.push(encodePiContentDecision("reminder-strip", messageId));
 				}
-				db.prepare(
-					"UPDATE session_meta SET merged_reasoning_stripped_ids = ? WHERE session_id = ?",
-				).run(JSON.stringify(entries), sessionId);
+				updateSessionMetaCollection(
+					db,
+					sessionId,
+					"merged_reasoning_stripped_ids",
+					JSON.stringify(entries),
+				);
 			})();
 
 			signalPiPendingMaterialization(sessionId);
@@ -701,9 +704,12 @@ describe("Pi fold content replay", () => {
 				"head-1",
 			);
 			// Model an old version's persisted seam choice, not a newly derived cut.
-			db.prepare(
-				"UPDATE session_meta SET merged_reasoning_stripped_ids = ? WHERE session_id = ?",
-			).run(JSON.stringify([firstHeadDecision]), sessionId);
+			updateSessionMetaCollection(
+				db,
+				sessionId,
+				"merged_reasoning_stripped_ids",
+				JSON.stringify([firstHeadDecision]),
+			);
 			await pass();
 			expect(getPiContentDecisions(db, sessionId).has(firstHeadDecision)).toBe(
 				true,
@@ -736,9 +742,12 @@ describe("Pi fold content replay", () => {
 			expect(secondFoldHead).toBeDefined();
 			expect(textOf(secondFoldHead as never)).toContain("<!-- +10m -->");
 
-			db.prepare(
-				"UPDATE session_meta SET merged_reasoning_stripped_ids = ? WHERE session_id = ?",
-			).run(JSON.stringify([firstHeadDecision]), sessionId);
+			updateSessionMetaCollection(
+				db,
+				sessionId,
+				"merged_reasoning_stripped_ids",
+				JSON.stringify([firstHeadDecision]),
+			);
 			updateSessionMeta(db, sessionId, {
 				lastResponseTime: Date.now(),
 				cacheTtl: "59m",

@@ -54,10 +54,18 @@ const TEXT_REQUIRED_TOOLS: [&str; 3] = ["ctx_expand", "ctx_search", "ctx_note"];
 pub(crate) const FROZEN_CTX_REDUCE_SCHEMA_DIGEST: &str =
     "69c7dd3393dc8af19386eb80f849df7a1943126bfe1a14769bfff1182b88abf6";
 
-/// The params a tool item may carry: the role's shared vocabulary plus `model`.
-const TOOL_PARAMS: [&str; 5] = ["scope", "tool_descs", "exclude", "behavior", "model"];
+/// The params a tool item may carry: the role's shared vocabulary plus `model`
+/// and a compacting hint for preflight requests.
+const TOOL_PARAMS: [&str; 6] = [
+    "scope",
+    "tool_descs",
+    "exclude",
+    "behavior",
+    "model",
+    "compacting",
+];
 /// The params a system-text item may carry.
-const TEXT_PARAMS: [&str; 2] = ["surface", "model"];
+const TEXT_PARAMS: [&str; 3] = ["surface", "model", "compacting"];
 
 /// One tool as the shared definition declares it.
 #[derive(Debug, Deserialize)]
@@ -203,27 +211,58 @@ impl Preset {
     }
 }
 
-/// Only the plan's frozen compaction provider selects session compaction.
-/// A present value must be an object with a provider, never null.
+/// A preflight has no composition, so its compacting param previews the tools
+/// the eventual composition will request. Once a composition exists, its
+/// compaction provider remains authoritative and explicit params must agree.
 pub(crate) fn compacts_session(arguments: &Value) -> Result<bool, CatalogError> {
-    let Some(compaction) = arguments
+    let composition_compacting = if let Some(compaction) = arguments
         .get("composition")
         .and_then(|value| value.get("compaction"))
-    else {
-        return Ok(false);
+    {
+        let provider = compaction
+            .as_object()
+            .and_then(|item| item.get("provider"))
+            .and_then(Value::as_str)
+            .filter(|provider| !provider.is_empty())
+            .ok_or_else(|| {
+                CatalogError::invalid(
+                    "composition.compaction",
+                    "compaction must be an object with a non-empty provider",
+                )
+            })?;
+        provider == MODULE_ID
+    } else {
+        false
     };
-    let provider = compaction
-        .as_object()
-        .and_then(|item| item.get("provider"))
-        .and_then(Value::as_str)
-        .filter(|provider| !provider.is_empty())
-        .ok_or_else(|| {
-            CatalogError::invalid(
-                "composition.compaction",
-                "compaction must be an object with a non-empty provider",
-            )
-        })?;
-    Ok(provider == MODULE_ID)
+    let has_composition = arguments
+        .get("composition")
+        .and_then(Value::as_object)
+        .is_some();
+    let parameter_compacting = arguments
+        .get("params")
+        .and_then(|params| params.get("compacting"))
+        .and_then(Value::as_bool);
+    let text_parameter_compacting = arguments
+        .get("system_text")
+        .and_then(|item| item.get("params"))
+        .and_then(|params| params.get("compacting"))
+        .and_then(Value::as_bool);
+    if has_composition
+        && [parameter_compacting, text_parameter_compacting]
+            .into_iter()
+            .flatten()
+            .any(|compacting| compacting != composition_compacting)
+    {
+        return Err(CatalogError::invalid(
+            "params.compacting",
+            "compacting must agree with composition.compaction.provider",
+        ));
+    }
+    if has_composition {
+        Ok(composition_compacting)
+    } else {
+        Ok(parameter_compacting.unwrap_or(false))
+    }
 }
 
 /// Process-local copy of the admitted catalog, shared by the session's routes.
@@ -385,11 +424,11 @@ pub(crate) fn role_describe_bytes() -> Result<Vec<u8>, CatalogError> {
     jcs_bytes(&json!({
         "majors": [{
             "version": PROVIDES,
-            "ops": [ops::ROLE_DESCRIBE, ops::TOOL_CATALOG],
+            "ops": [ops::ROLE_DESCRIBE, ops::TOOL_CATALOG, ops::USER_COMMAND_INVOKE, ops::LATE_RESULTS, ops::LATE_RESULTS_ACK],
             "stability": "alpha",
         }],
         "implementation_version": crate::version_line(),
-        "capabilities": [],
+        "capabilities": ["compacting-preflight/v1"],
     }))
 }
 
@@ -443,8 +482,31 @@ pub(crate) fn catalog_answer(
         .map(|tool| catalog_tool(tool, surface, config))
         .collect::<Result<Vec<_>, _>>()?;
     content.insert("tools".to_string(), Value::Array(tools));
+    if compacting && preset == Preset::Head {
+        let declared = catalog::CatalogAnswer::new("", "").with_user_commands(vec![
+            cortexkit_role_tool_provider::user_command::UserCommand::new(
+                "ctx-status",
+                "Show magic context status, pending queue, cache TTL, and debug info",
+            ),
+            cortexkit_role_tool_provider::user_command::UserCommand::new(
+                "ctx-flush",
+                "Force-process all pending magic context operations immediately",
+            ),
+            cortexkit_role_tool_provider::user_command::UserCommand::new(
+                "ctx-wrapup",
+                "Summarize older history while keeping the newest N messages with optional keep-N",
+            ),
+        ]);
+        content.insert("user_commands".into(), json!(declared.user_commands));
+        content.insert("capabilities".into(), json!({"late_results":true}));
+    }
     if let Some(item) = &request.system_text {
-        let text = guidance_text(preset, compacting, item, &own, config)?;
+        let text_compacting = item
+            .params
+            .get("compacting")
+            .and_then(Value::as_bool)
+            .unwrap_or(compacting);
+        let text = guidance_text(preset, text_compacting, item, &own, config)?;
         let mut system_text = Map::new();
         system_text.insert("item_digest".to_string(), json!(sha256_hex(&text)));
         system_text.insert(
@@ -495,6 +557,7 @@ fn check_tool_params(params: &Map<String, Value>) -> Result<(), CatalogError> {
             "tool_descs" => one_of(value, &["concise", "full"]),
             "behavior" => one_of(value, &["autonomous", "interactive"]),
             "model" => value.is_string(),
+            "compacting" => value.is_boolean(),
             "exclude" => value.as_array().is_some_and(|names| {
                 names.iter().all(|name| {
                     name.as_str()
@@ -524,6 +587,7 @@ fn check_text_params(params: &Map<String, Value>) -> Result<(), CatalogError> {
         let valid = match key.as_str() {
             "surface" => one_of(value, &["light", "full"]),
             "model" => value.is_string(),
+            "compacting" => value.is_boolean(),
             _ => {
                 return Err(CatalogError::invalid(
                     field,

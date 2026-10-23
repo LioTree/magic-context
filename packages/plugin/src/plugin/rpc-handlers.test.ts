@@ -1,12 +1,15 @@
 /// <reference types="bun-types" />
 
-import { afterEach, describe, expect, mock, spyOn, test } from "bun:test";
+import { afterEach, describe, expect, spyOn, test } from "bun:test";
 import { execFileSync } from "node:child_process";
 import { createHash } from "node:crypto";
-import { rmSync } from "node:fs";
+import { mkdirSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
+import { loadPluginConfigDetailed } from "../config";
+import { pluginConfigReader } from "../config/live-run-config";
 import { MagicContextConfigSchema } from "../config/schema/magic-context";
+import { seedSessionMeta } from "../features/magic-context/__tests__/session-meta-fixture";
 import { replaceAllCompartmentState } from "../features/magic-context/compartment-storage";
 import { insertMemory } from "../features/magic-context/memory";
 import {
@@ -27,27 +30,27 @@ import {
     resetEpochFloorRegistryForTest,
     resolveEpochFloorForPass,
 } from "../features/magic-context/storage-meta-persisted";
+import type { HiddenCompletionExecutor } from "../hooks/magic-context/compartment-runner-types";
 import { createLiveSessionState } from "../hooks/magic-context/live-session-state";
+import { setRawMessageProvider } from "../hooks/magic-context/read-session-chunk";
 import { estimateTokens } from "../hooks/magic-context/read-session-formatting";
-import type { RustModeModuleClient } from "../hooks/magic-context/rust-mode-transform";
+import { _resetHarnessForTesting, setHarness } from "../shared/harness";
 import * as logger from "../shared/logger";
 import { clearModelsDevCache, refreshModelLimitsFromApi } from "../shared/models-dev-cache";
 import { pluginPackageVersion } from "../shared/plugin-package-version";
-import type { MagicContextRpcServer } from "../shared/rpc-server";
+import { MagicContextRpcServer } from "../shared/rpc-server";
 import { Database } from "../shared/sqlite";
 import { closeQuietly } from "../shared/sqlite-helpers";
 import { buildStatusViewFor } from "../shared/status-view";
 import { checkStatusDetailPayload } from "../shared/status-view-check";
 import { createTestTempDirFromPath } from "../shared/test-temp-dir";
+import { registerV2Commands } from "../v2/hooks/commands";
 import {
-    buildCompartmentCount,
     buildDebugMemoryUsage,
     buildSidebarSnapshot,
     buildSidebarSnapshotRpcResponse,
     buildStatusDetail,
-    executeRustRecompRpc,
     isDebugRpcEnabled,
-    loadRustSessionStatus,
     registerRpcHandlers,
 } from "./rpc-handlers";
 import { resetSidebarSnapshotCache } from "./sidebar-snapshot-cache";
@@ -81,6 +84,203 @@ function registeredRpcMethods(
     return handlers;
 }
 
+function createLiveHistorianConfig(targetMaxTokens: number | undefined) {
+    const root = createTestTempDirFromPath(join(tmpdir(), "mc-rpc-historian-cap-"));
+    const previousHome = process.env.HOME;
+    const previousConfigHome = process.env.XDG_CONFIG_HOME;
+    process.env.HOME = root;
+    process.env.XDG_CONFIG_HOME = join(root, "config");
+    const directory = join(root, "project");
+    const userConfigDirectory = join(root, "config", "cortexkit");
+    mkdirSync(directory, { recursive: true });
+    mkdirSync(userConfigDirectory, { recursive: true });
+    const configPath = join(userConfigDirectory, "magic-context.jsonc");
+    const writeConfig = (maxTokens: number | undefined): void => {
+        writeFileSync(
+            configPath,
+            JSON.stringify({
+                historian: {
+                    ...(maxTokens === undefined ? {} : { maxTokens }),
+                    opencode: { model: "test/rpc-historian" },
+                },
+            }),
+        );
+    };
+    writeConfig(4096);
+    const bootConfig = loadPluginConfigDetailed(directory, false).config;
+    const reader = pluginConfigReader(directory, bootConfig);
+    writeConfig(targetMaxTokens);
+    const effective = reader.poll().effective;
+    expect(effective.historian?.maxTokens).toBe(targetMaxTokens);
+
+    return {
+        root,
+        directory,
+        bootConfig,
+        restoreEnvironment() {
+            if (previousHome === undefined) delete process.env.HOME;
+            else process.env.HOME = previousHome;
+            if (previousConfigHome === undefined) delete process.env.XDG_CONFIG_HOME;
+            else process.env.XDG_CONFIG_HOME = previousConfigHome;
+        },
+    };
+}
+
+function terminalAwareLiveSessionState(sessionId: string) {
+    const liveSessionState = createLiveSessionState();
+    let resolveTerminal!: () => void;
+    const terminal = new Promise<void>((resolve) => {
+        resolveTerminal = resolve;
+    });
+    const progress = liveSessionState.recompProgressBySession;
+    liveSessionState.recompProgressBySession = new Proxy(progress, {
+        get(target, property) {
+            if (property === "set") {
+                return (id: string, value: { phase?: string }) => {
+                    const result = target.set(id, value as never);
+                    if (
+                        id === sessionId &&
+                        (value.phase === "done" ||
+                            value.phase === "failed" ||
+                            value.phase === "skipped")
+                    ) {
+                        resolveTerminal();
+                    }
+                    return result;
+                };
+            }
+            const value = Reflect.get(target, property, target) as unknown;
+            return typeof value === "function" ? value.bind(target) : value;
+        },
+    }) as typeof progress;
+    return { liveSessionState, terminal };
+}
+
+function outputCapExecutor(caps: Array<number | undefined>): HiddenCompletionExecutor {
+    let promptJson = "";
+    let childNumber = 0;
+    return {
+        capabilities: { tools: false, harness: "opencode" },
+        open: async (run) => {
+            caps.push(run.maxOutputTokens);
+            childNumber += 1;
+            return {
+                id: `rpc-cap-child-${childNumber}`,
+                childSessionId: `rpc-cap-child-${childNumber}`,
+            };
+        },
+        attempt: async (_handle, request) => {
+            promptJson = JSON.stringify(request);
+        },
+        collect: async () => {
+            const range = promptJson.match(/Messages (\d+)-(\d+):/);
+            if (!range) throw new Error("historian prompt did not include a message range");
+            return {
+                text: `<output><compartment start="${range[1]}" end="${range[2]}" title="Rebuilt"><p1>Rebuilt ${range[1]}-${range[2]}.</p1></compartment></output>`,
+                reasoning: null,
+                lengthCapped: false,
+                usage: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0 },
+            };
+        },
+        close: async () => {},
+    };
+}
+
+async function exerciseManagedOutputCap(args: {
+    surface: "tui-rpc" | "opencode2-command";
+    method: "recomp" | "wrapup";
+    maxTokens: number | undefined;
+}): Promise<void> {
+    const liveConfig = createLiveHistorianConfig(args.maxTokens);
+    const db = createTestDb();
+    const sessionId = `rpc-cap-${args.surface}-${args.method}-${String(args.maxTokens ?? "unset")}`;
+    const rawMessages = Array.from({ length: 8 }, (_, index) => ({
+        ordinal: index + 1,
+        id: `message-${index + 1}`,
+        role: "user",
+        parts: [{ type: "text", text: `message ${index + 1} alpha beta gamma delta` }],
+    }));
+    const unregisterProvider = setRawMessageProvider(sessionId, {
+        readMessages: () => rawMessages,
+        getMessageCount: () => rawMessages.length,
+    });
+    const { liveSessionState, terminal } = terminalAwareLiveSessionState(sessionId);
+    const caps: Array<number | undefined> = [];
+    const rpc = new MagicContextRpcServer(join(liveConfig.root, "storage"), liveConfig.directory);
+    try {
+        setHarness(args.surface === "opencode2-command" ? "opencode2" : "opencode");
+        registerRpcHandlers(rpc, {
+            directory: liveConfig.directory,
+            config: liveConfig.bootConfig,
+            client: undefined,
+            hiddenCompletionExecutor: outputCapExecutor(caps),
+            liveSessionState,
+            getDatabase: () => db,
+        });
+
+        if (args.surface === "tui-rpc") {
+            await rpc.dispatch(
+                args.method,
+                args.method === "recomp" ? { sessionId } : { sessionId, messagesToKeep: 2 },
+            );
+        } else {
+            const registered: Array<{
+                name: string;
+                execute: (input: {
+                    sessionID: string;
+                    prompt: { text: string };
+                    delivery: "steer";
+                }) => Promise<void>;
+            }> = [];
+            const commandDomain = {
+                async transform(callback: (editor: { add: (definition: never) => void }) => void) {
+                    callback({ add: (definition) => registered.push(definition as never) });
+                    return {};
+                },
+                async reload() {},
+            };
+            await registerV2Commands({
+                command: commandDomain as never,
+                rpc,
+                directory: liveConfig.directory,
+                compactionEnabled: true,
+            });
+            const command = registered.find((entry) => entry.name === `ctx-${args.method}`);
+            if (!command) throw new Error(`OpenCode 2 did not register ctx-${args.method}`);
+            await command.execute({
+                sessionID: sessionId,
+                prompt: { text: args.method === "recomp" ? "" : "/ctx-wrapup 2" },
+                delivery: "steer",
+            });
+        }
+
+        await terminal;
+        expect(caps.length, `${args.surface} ${args.method}`).toBeGreaterThan(0);
+        expect(
+            caps.every((cap) => cap === args.maxTokens),
+            `${args.surface} ${args.method}`,
+        ).toBe(true);
+    } finally {
+        unregisterProvider();
+        closeQuietly(db);
+        _resetHarnessForTesting();
+        liveConfig.restoreEnvironment();
+        rmSync(liveConfig.root, { recursive: true, force: true });
+    }
+}
+
+describe("manual historian cap reaches the OpenCode historian executor", () => {
+    for (const surface of ["tui-rpc", "opencode2-command"] as const) {
+        for (const method of ["recomp", "wrapup"] as const) {
+            for (const maxTokens of [65_536, undefined]) {
+                test(`${surface} ${method} passes ${maxTokens ?? "unset"} from live config`, async () => {
+                    await exerciseManagedOutputCap({ surface, method, maxTokens });
+                });
+            }
+        }
+    }
+});
+
 afterEach(() => {
     resetSidebarSnapshotCache();
     clearModelsDevCache();
@@ -108,6 +308,42 @@ describe("home project sidebar", () => {
 });
 
 describe("session-owner", () => {
+    test("moved-session recomp and recovery use fresh host ownership before opening local state", async () => {
+        const root = createTestTempDirFromPath(join(tmpdir(), "moved-history-owner-"));
+        const handlers = new Map<string, TestRpcHandler>();
+        const liveSessionState = createLiveSessionState();
+        liveSessionState.sessionDirectoryBySession.set("moved", "/old");
+        try {
+            registerRpcHandlers(
+                {
+                    handle: (method: string, handler: TestRpcHandler) =>
+                        handlers.set(method, handler),
+                } as unknown as MagicContextRpcServer,
+                {
+                    directory: "/old",
+                    config: MagicContextConfigSchema.parse({}),
+                    client: undefined,
+                    liveSessionState,
+                    storageDir: root,
+                    readSessionDirectory: async () => "/new",
+                    getDatabase: () => {
+                        throw new Error("old instance must not open history state");
+                    },
+                },
+            );
+            expect(await handlers.get("session-owner")!({ sessionId: "moved" })).toEqual({
+                owner: false,
+            });
+            for (const method of ["recomp", "wrapup"]) {
+                const reply = await handlers.get(method)!({ sessionId: "moved" });
+                expect(reply.ok).toBe(false);
+                expect(reply.error).toContain("current project directory (/new)");
+            }
+        } finally {
+            rmSync(root, { recursive: true, force: true });
+        }
+    });
+
     function ownerHandler(directory: string, sessionDirectories: Record<string, string>) {
         const handlers = new Map<string, TestRpcHandler>();
         const rpcServer = {
@@ -244,67 +480,6 @@ describe("debug RPC guard", () => {
     });
 });
 
-describe("Rust maintenance RPC routing", () => {
-    test("routes recomp to the module with a replay-safe command id", async () => {
-        const call = mock(async () => ({ ok: true, disposition: "started" }));
-
-        expect(
-            await executeRustRecompRpc(
-                { call } as unknown as RustModeModuleClient,
-                "ses-rust-recomp-rpc",
-                "/fixture/project",
-            ),
-        ).toEqual({ ok: true });
-        expect(call).toHaveBeenCalledTimes(1);
-        expect(call.mock.calls[0]?.[0]).toMatchObject({
-            sessionId: "ses-rust-recomp-rpc",
-            projectRoot: "/fixture/project",
-            method: "session.recomp",
-            body: {
-                method: "session.recomp",
-                v: 1,
-                session_id: "ses-rust-recomp-rpc",
-                command_id: expect.stringMatching(/^rpc-recomp:/),
-            },
-        });
-    });
-
-    test("fails closed when the module transport is unavailable", async () => {
-        expect(
-            await executeRustRecompRpc(undefined, "ses-rust-recomp-rpc", "/fixture/project"),
-        ).toEqual({ ok: false, error: "Rust module client is unavailable" });
-    });
-});
-
-describe("Rust session status reads", () => {
-    test("coalesces overlapping reads without reusing a completed store snapshot", async () => {
-        let callCount = 0;
-        let releaseFirst!: (value: Record<string, unknown>) => void;
-        const firstResponse = new Promise<Record<string, unknown>>((resolve) => {
-            releaseFirst = resolve;
-        });
-        const client = {
-            call: () => {
-                callCount += 1;
-                return callCount === 1
-                    ? firstResponse
-                    : Promise.resolve({ ok: true, tag_count: 8_842 });
-            },
-        } as unknown as RustModeModuleClient;
-
-        const first = loadRustSessionStatus(client, "ses-status-fresh", "/project");
-        const overlapping = loadRustSessionStatus(client, "ses-status-fresh", "/project");
-        expect(callCount).toBe(1);
-        releaseFirst({ ok: true, tag_count: 1_666 });
-        expect((await first)?.tag_count).toBe(1_666);
-        expect((await overlapping)?.tag_count).toBe(1_666);
-
-        const refreshed = await loadRustSessionStatus(client, "ses-status-fresh", "/project");
-        expect(callCount).toBe(2);
-        expect(refreshed?.tag_count).toBe(8_842);
-    });
-});
-
 describe("sidebar snapshot RPC failures", () => {
     test("unborn repo sidebar loads existing directory memories", () => {
         const directory = createTestTempDirFromPath(join(tmpdir(), "sidebar-unborn-"));
@@ -329,6 +504,22 @@ describe("sidebar snapshot RPC failures", () => {
     test("paused sidebar logs once per directory and reason without stacks", () => {
         const directory = createTestTempDirFromPath(join(tmpdir(), "sidebar-paused-"));
         execFileSync("git", ["init", "-q", directory], { windowsHide: true });
+        // A repository with commits: one with none is recognized from its files and gets its
+        // directory identity without asking git, so a failing git could not pause it.
+        execFileSync(
+            "git",
+            [
+                "-c",
+                "user.name=Test",
+                "-c",
+                "user.email=test@example.invalid",
+                "commit",
+                "--allow-empty",
+                "-qm",
+                "first",
+            ],
+            { cwd: directory, windowsHide: true },
+        );
         const db = createTestDb();
         const logged = spyOn(logger, "log").mockImplementation(() => {});
         try {
@@ -388,6 +579,56 @@ describe("sidebar snapshot RPC failures", () => {
     });
 });
 
+describe("buildStatusDetail — per-model execute threshold", () => {
+    test.each([
+        {
+            name: "persisted model",
+            persisted: "test/model-a",
+            explicit: undefined,
+            threshold: 50,
+            tokens: 250_000,
+        },
+        {
+            name: "explicit model takes precedence",
+            persisted: "test/model-a",
+            explicit: "test/model-b",
+            threshold: 20,
+            tokens: 100_000,
+        },
+        {
+            name: "unknown model keeps the default",
+            persisted: null,
+            explicit: undefined,
+            threshold: 65,
+            tokens: undefined,
+        },
+    ])("$name", ({ persisted, explicit, threshold, tokens }) => {
+        const db = createTestDb();
+        try {
+            const sessionId = "ses-status-threshold";
+            // 100K input tokens at 20% gives the 500K context limit that tokens-mode
+            // thresholds are converted against.
+            db.prepare(
+                "INSERT INTO session_meta (session_id, last_observed_model_key, last_input_tokens, last_context_percentage) VALUES (?, ?, 100000, 20)",
+            ).run(sessionId, persisted);
+            const detail = buildStatusDetail(db, sessionId, process.cwd(), explicit, {
+                execute_threshold_tokens: {
+                    "test/model-a": 250_000,
+                    "test/model-b": 100_000,
+                },
+            });
+
+            expect(detail.executeThreshold).toBe(threshold);
+            expect(detail.executeThresholdTokens).toBe(tokens);
+            expect(detail.executeThresholdMode).toBe(
+                tokens === undefined ? "percentage" : "tokens",
+            );
+        } finally {
+            closeQuietly(db);
+        }
+    });
+});
+
 describe("buildStatusDetail — active profile", () => {
     test("includes the resolved profile name in the RPC status payload", () => {
         const db = createTestDb();
@@ -400,110 +641,6 @@ describe("buildStatusDetail — active profile", () => {
             expect(
                 buildStatusDetail(db, "ses-base-status", process.cwd()).activeProfile,
             ).toBeNull();
-        } finally {
-            closeQuietly(db);
-        }
-    });
-});
-
-describe("buildStatusDetail — historian refusal provenance", () => {
-    test("preserves the runner stage and received text from module status", () => {
-        const db = createTestDb();
-        try {
-            const refusal =
-                "historian refusal stage=credential provider=google model=google/model-a received=\"open_failed: no apikey credential for provider 'google'\"";
-            const detail = buildStatusDetail(
-                db,
-                "ses-refusal-status",
-                process.cwd(),
-                undefined,
-                { transform_mode: "rust" },
-                undefined,
-                undefined,
-                {
-                    historian: {
-                        last_failure: refusal,
-                        refusal_stage: "credential",
-                        canonical_cause: "credential_unavailable",
-                    },
-                },
-            );
-
-            expect(detail.historianRefusal).toEqual({
-                stage: "credential",
-                canonicalCause: "credential_unavailable",
-                detail: refusal,
-            });
-        } finally {
-            closeQuietly(db);
-        }
-    });
-});
-
-describe("buildStatusDetail — completion runner provenance", () => {
-    test("carries which runner the module used for the session and why", () => {
-        const db = createTestDb();
-        try {
-            const detail = buildStatusDetail(
-                db,
-                "ses-runner-status",
-                process.cwd(),
-                undefined,
-                { transform_mode: "rust" },
-                undefined,
-                undefined,
-                {
-                    historian: {
-                        runner: {
-                            runner: "host",
-                            source: "default_for_harness",
-                            harness: "opencode2",
-                            observed: "last_completion",
-                        },
-                    },
-                    dreamer: {
-                        runner: {
-                            runner: "broca",
-                            source: "configured",
-                            harness: "opencode2",
-                            observed: "resolved_for_route",
-                        },
-                    },
-                },
-            );
-
-            expect(detail.historianRunner).toEqual({
-                runner: "host",
-                source: "default_for_harness",
-                harness: "opencode2",
-                observed: "last_completion",
-            });
-            expect(detail.dreamerRunner).toEqual({
-                runner: "broca",
-                source: "configured",
-                harness: "opencode2",
-                observed: "resolved_for_route",
-            });
-        } finally {
-            closeQuietly(db);
-        }
-    });
-
-    test("drops a runner value it does not recognise instead of rendering it", () => {
-        const db = createTestDb();
-        try {
-            const detail = buildStatusDetail(
-                db,
-                "ses-runner-unknown",
-                process.cwd(),
-                undefined,
-                { transform_mode: "rust" },
-                undefined,
-                undefined,
-                { historian: { runner: { runner: "llm", source: "configured" } } },
-            );
-            expect(detail.historianRunner).toBeUndefined();
-            expect(detail.dreamerRunner).toBeUndefined();
         } finally {
             closeQuietly(db);
         }
@@ -674,44 +811,6 @@ describe("buildSidebarSnapshot — persisted tail hygiene", () => {
             closeQuietly(db);
         }
     });
-
-    test("prefers the durable Rust baseline when module authority is active", () => {
-        const db = createTestDb();
-        try {
-            const snapshot = buildSidebarSnapshot(
-                db,
-                "ses-hygiene-rust",
-                process.cwd(),
-                createLiveSessionState(),
-                undefined,
-                undefined,
-                {
-                    tail_hygiene: {
-                        u: 65_100,
-                        t: 100_000,
-                        severity: 0.651,
-                        evaluable: true,
-                        generation_invalidated: false,
-                        baseline_generation: 7,
-                        computed_at_ms: 123,
-                    },
-                },
-            );
-
-            expect(snapshot.tailHygiene).toEqual({
-                u: 65_100,
-                t: 100_000,
-                severity: 0.651,
-                evaluable: true,
-                generationInvalidated: false,
-                baselineGeneration: 7,
-                computedAt: 123,
-                reclaimableToolOutputCount: 0,
-            });
-        } finally {
-            closeQuietly(db);
-        }
-    });
 });
 
 describe("buildSidebarSnapshot — compartments served in m[1]", () => {
@@ -722,20 +821,19 @@ describe("buildSidebarSnapshot — compartments served in m[1]", () => {
             const m0History = "<session-history>\n</session-history>";
             const newCompartments =
                 "<new-compartments>\n## 11-14 · Continued runtime inspection\nRead production, gear and ABI record code before implementing the plan.\n</new-compartments>";
-            db.prepare(
-                `INSERT INTO session_meta (
-                    session_id, last_input_tokens, last_context_percentage,
-                    system_prompt_tokens, memory_block_cache, memory_block_count,
-                    cached_m0_bytes, cached_m1_bytes
-                ) VALUES (?, 50000, 25, 5000, '', 0, ?, ?)`,
-            ).run(
-                sessionId,
-                Buffer.from(m0History, "utf8"),
-                Buffer.from(
+            seedSessionMeta(db, {
+                session_id: sessionId,
+                last_input_tokens: 50000,
+                last_context_percentage: 25,
+                system_prompt_tokens: 5000,
+                memory_block_cache: "",
+                memory_block_count: 0,
+                cached_m0_bytes: Buffer.from(m0History, "utf8"),
+                cached_m1_bytes: Buffer.from(
                     `<session-history-since>\n${newCompartments}\n</session-history-since>`,
                     "utf8",
                 ),
-            );
+            });
 
             const snapshot = buildSidebarSnapshot(db, sessionId, process.cwd(), undefined, 4000);
             expect(snapshot.compartmentTokens).toBe(
@@ -778,12 +876,14 @@ describe("buildSidebarSnapshot — memory tokens fallback (bug #1)", () => {
             // Seed session_meta with the regression-trigger shape:
             //   memory_block_cache = ''  (cleared by historian/recomp/etc.)
             //   memory_block_count > 0  (preserved across cache busts)
-            db.prepare(
-                `INSERT INTO session_meta (
-                    session_id, last_input_tokens, last_context_percentage,
-                    system_prompt_tokens, memory_block_cache, memory_block_count
-                ) VALUES (?, 50000, 25, 5000, '', 2)`,
-            ).run(sessionId);
+            seedSessionMeta(db, {
+                session_id: sessionId,
+                last_input_tokens: 50000,
+                last_context_percentage: 25,
+                system_prompt_tokens: 5000,
+                memory_block_cache: "",
+                memory_block_count: 2,
+            });
 
             const snapshot = buildSidebarSnapshot(
                 db,
@@ -809,12 +909,14 @@ describe("buildSidebarSnapshot — memory tokens fallback (bug #1)", () => {
             const sessionId = "ses-test-2";
             const directory = process.cwd();
 
-            db.prepare(
-                `INSERT INTO session_meta (
-                    session_id, last_input_tokens, last_context_percentage,
-                    system_prompt_tokens, memory_block_cache, memory_block_count
-                ) VALUES (?, 0, 0, 0, '', 0)`,
-            ).run(sessionId);
+            seedSessionMeta(db, {
+                session_id: sessionId,
+                last_input_tokens: 0,
+                last_context_percentage: 0,
+                system_prompt_tokens: 0,
+                memory_block_cache: "",
+                memory_block_count: 0,
+            });
 
             const snapshot = buildSidebarSnapshot(db, sessionId, directory, undefined, 4000);
             expect(snapshot.memoryBlockCount).toBe(0);
@@ -829,12 +931,14 @@ describe("buildSidebarSnapshot — memory tokens fallback (bug #1)", () => {
         try {
             const sessionId = "ses-sidebar-no-fact-count";
             const directory = process.cwd();
-            db.prepare(
-                `INSERT INTO session_meta (
-                    session_id, last_input_tokens, last_context_percentage,
-                    system_prompt_tokens, memory_block_cache, memory_block_count
-                ) VALUES (?, 50000, 25, 5000, '', 0)`,
-            ).run(sessionId);
+            seedSessionMeta(db, {
+                session_id: sessionId,
+                last_input_tokens: 50000,
+                last_context_percentage: 25,
+                system_prompt_tokens: 5000,
+                memory_block_cache: "",
+                memory_block_count: 0,
+            });
 
             const snapshot = buildSidebarSnapshot(db, sessionId, directory, undefined, 4000);
             expect(Object.hasOwn(snapshot as object, "factCount")).toBe(false);
@@ -856,12 +960,15 @@ describe("buildSidebarSnapshot — memory tokens fallback (bug #1)", () => {
             // the token bucket now (it under-counts the real injected cost).
             const v1Cache = "<project-memory>\n- a durable architectural fact\n</project-memory>";
 
-            db.prepare(
-                `INSERT INTO session_meta (
-                    session_id, last_input_tokens, last_context_percentage,
-                    system_prompt_tokens, memory_block_cache, memory_block_count, cached_m0_bytes
-                ) VALUES (?, 50000, 25, 5000, ?, 1, ?)`,
-            ).run(sessionId, v1Cache, Buffer.from(m0, "utf8"));
+            seedSessionMeta(db, {
+                session_id: sessionId,
+                last_input_tokens: 50000,
+                last_context_percentage: 25,
+                system_prompt_tokens: 5000,
+                memory_block_cache: v1Cache,
+                memory_block_count: 1,
+                cached_m0_bytes: Buffer.from(m0, "utf8"),
+            });
 
             const snapshot = buildSidebarSnapshot(db, sessionId, directory, undefined, 4000);
             expect(snapshot.memoryBlockCount).toBe(1);
@@ -883,12 +990,14 @@ describe("buildSidebarSnapshot — context limit", () => {
         const db = createTestDb();
         try {
             const sessionId = "ses-sidebar-native-full-window";
-            db.prepare(
-                `INSERT INTO session_meta (
-                    session_id, last_input_tokens, last_context_percentage,
-                    system_prompt_tokens, memory_block_cache, memory_block_count
-                ) VALUES (?, 120000, 80, 0, '', 0)`,
-            ).run(sessionId);
+            seedSessionMeta(db, {
+                session_id: sessionId,
+                last_input_tokens: 120000,
+                last_context_percentage: 80,
+                system_prompt_tokens: 0,
+                memory_block_cache: "",
+                memory_block_count: 0,
+            });
             await refreshModelLimitsFromApi({
                 config: {
                     providers: async () => ({
@@ -930,12 +1039,14 @@ describe("buildSidebarSnapshot — context limit", () => {
         try {
             const sessionId = "ses-sidebar-context-limit";
             const directory = process.cwd();
-            db.prepare(
-                `INSERT INTO session_meta (
-                    session_id, last_input_tokens, last_context_percentage,
-                    system_prompt_tokens, memory_block_cache, memory_block_count
-                ) VALUES (?, 80000, 40, 5000, '', 0)`,
-            ).run(sessionId);
+            seedSessionMeta(db, {
+                session_id: sessionId,
+                last_input_tokens: 80000,
+                last_context_percentage: 40,
+                system_prompt_tokens: 5000,
+                memory_block_cache: "",
+                memory_block_count: 0,
+            });
             await refreshModelLimitsFromApi({
                 config: {
                     providers: async () => ({
@@ -961,69 +1072,6 @@ describe("buildSidebarSnapshot — context limit", () => {
             const snapshot = buildSidebarSnapshot(db, sessionId, directory, live, 4000);
 
             expect(snapshot.contextLimit).toBe(200_000);
-        } finally {
-            closeQuietly(db);
-        }
-    });
-});
-
-describe("buildSidebarSnapshot — Rust module status merge", () => {
-    test("uses module pressure, boundary, coverage, and compartment counts", () => {
-        const db = createTestDb();
-        try {
-            const sessionId = "ses-sidebar-rust-status";
-            db.prepare(
-                `INSERT INTO session_meta (
-                    session_id, last_input_tokens, last_context_percentage,
-                    system_prompt_tokens, memory_block_cache, memory_block_count
-                ) VALUES (?, 1, 1, 5000, '', 0)`,
-            ).run(sessionId);
-
-            const moduleStatus = {
-                usage: {
-                    current_total_input_tokens: 42_000,
-                    context_limit_tokens: 100_000,
-                },
-                boundary_present: true,
-                coverage_ordinal: 17,
-                compartment_count: 4,
-                compartment_tokens: 23,
-                pending_drop_count: 2,
-                tag_count: 9,
-            };
-            const snapshot = buildSidebarSnapshot(
-                db,
-                sessionId,
-                process.cwd(),
-                undefined,
-                4000,
-                undefined,
-                moduleStatus,
-            );
-            const detail = buildStatusDetail(
-                db,
-                sessionId,
-                process.cwd(),
-                undefined,
-                undefined,
-                undefined,
-                4000,
-                moduleStatus,
-            );
-
-            expect(snapshot.inputTokens).toBe(42_000);
-            expect(snapshot.usagePercentage).toBe(42);
-            expect(snapshot.contextLimit).toBe(100_000);
-            expect(snapshot.compartmentCount).toBe(4);
-            expect(snapshot.compartmentTokens).toBe(23);
-            expect(snapshot.pendingOpsCount).toBe(2);
-            expect(snapshot.boundaryPresent).toBe(true);
-            expect(snapshot.coverageOrdinal).toBe(17);
-            expect(buildCompartmentCount(db, sessionId, moduleStatus)).toBe(4);
-            expect(detail.totalTags).toBe(9);
-            expect(detail.activeTags).toBe(0);
-            expect(detail.droppedTags).toBe(0);
-            expect(detail.tagCountsAuthoritative).toBe(false);
         } finally {
             closeQuietly(db);
         }
@@ -1065,12 +1113,6 @@ describe("compaction-off sidebar RPC data", () => {
                 undefined,
                 4000,
                 { execute_threshold_percentage: 65 },
-                {
-                    usage: {
-                        current_total_input_tokens: 41_000,
-                        context_limit_tokens: 100_000,
-                    },
-                },
                 false,
             );
             const detail = buildStatusDetail(
@@ -1081,23 +1123,11 @@ describe("compaction-off sidebar RPC data", () => {
                 { execute_threshold_percentage: 65 },
                 undefined,
                 4000,
-                {
-                    usage: {
-                        current_total_input_tokens: 41_000,
-                        context_limit_tokens: 100_000,
-                    },
-                },
                 false,
             );
-            const thresholdFillPercentage = (41_000 / (100_000 * 0.65)) * 100;
 
             expect(snapshot.compaction_enabled).toBe(false);
             expect(detail.compaction_enabled).toBe(false);
-            expect(snapshot.native_context_usage_percentage).toBe(41);
-            expect(detail.native_context_usage_percentage).toBe(41);
-            expect(snapshot.native_context_usage_percentage).not.toBeCloseTo(
-                thresholdFillPercentage,
-            );
             expect(snapshot.archivedCompartmentCount).toBe(1);
 
             const enabledDetail = buildStatusDetail(db, "ses-native-sidebar-on", process.cwd());
@@ -1261,29 +1291,6 @@ describe("buildStatusDetail — cacheNeverExpires with 'never' TTL", () => {
             const roundTripped = JSON.parse(JSON.stringify(detail));
             expect(roundTripped.cacheRemainingMs).toBe(-1);
             expect(roundTripped.cacheRemainingMs).not.toBeNull();
-        } finally {
-            closeQuietly(db);
-        }
-    });
-});
-
-describe("buildStatusDetail — Rust host paths", () => {
-    test("marks host paths module-side only for Rust mode", () => {
-        const db = createTestDb();
-        try {
-            const rustDetail = buildStatusDetail(
-                db,
-                "ses-rust-host-paths",
-                process.cwd(),
-                undefined,
-                { transform_mode: "rust" },
-            );
-            const tsDetail = buildStatusDetail(db, "ses-ts-host-paths", process.cwd(), undefined, {
-                transform_mode: "ts",
-            });
-
-            expect(rustDetail.hostBackendsModuleSide).toBe(true);
-            expect(tsDetail.hostBackendsModuleSide).toBe(false);
         } finally {
             closeQuietly(db);
         }

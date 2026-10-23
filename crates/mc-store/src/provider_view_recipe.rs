@@ -8,8 +8,76 @@ use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use std::collections::{BTreeMap, BTreeSet};
 
+#[cfg(test)]
+#[path = "provider_view_recipe_tests.rs"]
+mod tests;
+
 pub const MAX_VIEW_BASE_DEPTH: usize = 16;
 pub const MAX_VIEW_ANCESTOR_BYTES: usize = 8 * 1024 * 1024;
+
+/// Key in a conversation's `hook_counters_json`: an object mapping each lineage
+/// ID to the view version named in that lineage's newest step answer.
+///
+/// The conversation keeps one step receipt, so when two lineages of one
+/// conversation (a fork and its parent) step in turn, the receipt names only
+/// the last one. A host reads a view right after the step that answered it,
+/// so the version each lineage was last answered must stay readable, and kept
+/// by pruning, until that same lineage steps again. The map holds at most one
+/// version per lineage. An entry counts only while its lineage row is still
+/// held, so removing a lineage releases its view.
+pub const LINEAGE_ANSWERED_VIEWS: &str = "lineage_answered_views";
+
+/// Record in parsed hook counters the view a lineage's step answer named.
+/// `None` (an answer naming no view) clears the lineage's entry: its earlier
+/// answer is superseded by this step.
+pub fn record_lineage_answered_view(counters: &mut Value, lineage_id: &str, version: Option<u64>) {
+    let Some(fields) = counters.as_object_mut() else {
+        return;
+    };
+    let entry = fields
+        .entry(LINEAGE_ANSWERED_VIEWS)
+        .or_insert_with(|| Value::Object(Default::default()));
+    if !entry.is_object() {
+        *entry = Value::Object(Default::default());
+    }
+    let map = entry.as_object_mut().expect("object");
+    match version {
+        Some(version) => {
+            map.insert(lineage_id.to_string(), Value::from(version));
+        }
+        None => {
+            map.remove(lineage_id);
+        }
+    }
+}
+
+/// The per-lineage answered views in parsed hook counters whose lineage is
+/// still held by the conversation.
+fn lineage_answered_views_tx(
+    conn: &rusqlite::Connection,
+    conv: &str,
+    counters: &Value,
+) -> Result<BTreeMap<String, u64>, ProviderError> {
+    let mut held = conn.prepare_cached(
+        "SELECT EXISTS(SELECT 1 FROM mc_provider_lineages_v1 WHERE conv_key=?1 AND lineage_id=?2)",
+    )?;
+    let mut answered = BTreeMap::new();
+    let Some(map) = counters
+        .get(LINEAGE_ANSWERED_VIEWS)
+        .and_then(Value::as_object)
+    else {
+        return Ok(answered);
+    };
+    for (lineage, version) in map {
+        let Some(version) = version.as_u64() else {
+            continue;
+        };
+        if held.query_row(params![conv, lineage], |r| r.get::<_, bool>(0))? {
+            answered.insert(lineage.clone(), version);
+        }
+    }
+    Ok(answered)
+}
 
 #[derive(Clone, Debug, Serialize, Deserialize, PartialEq)]
 #[serde(tag = "kind", rename_all = "snake_case")]
@@ -52,6 +120,14 @@ pub struct ProviderViewRecipe {
     pub render_key: String,
     pub tokenizer_key: String,
     pub state: String,
+}
+
+/// Replayable view versions and the native `(lineage, from, to)` ordinal
+/// ranges they stream, taken from one transaction.
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct ProviderViewSourceRoots {
+    pub versions: BTreeSet<u64>,
+    pub sources: BTreeSet<(String, u64, u64)>,
 }
 
 #[derive(Clone, Debug)]
@@ -247,6 +323,41 @@ impl McStore {
             raw.map(|raw|serde_json::from_str(&raw).map_err(|_|rusqlite::Error::InvalidQuery)).transpose()
         }).map_err(|error|ProviderError::Storage(error.into()))
     }
+    /// The view version each still-held lineage of the conversation was named
+    /// in its newest step answer. See `LINEAGE_ANSWERED_VIEWS`.
+    pub fn provider_lineage_answered_views(
+        &self,
+        key: &ProviderSessionKey,
+    ) -> Result<BTreeMap<String, u64>, ProviderError> {
+        let mut refusal = None;
+        self.inner
+            .with_conn(|conn| {
+                let tx = conn.unchecked_transaction()?;
+                let conv = key.conversation_key();
+                let read = || -> Result<BTreeMap<String, u64>, ProviderError> {
+                    let counters: Option<String> = tx
+                        .query_row(
+                            "SELECT hook_counters_json FROM mc_provider_conversations_v2 WHERE conv_key=?1",
+                            [&conv],
+                            |r| r.get(0),
+                        )
+                        .optional()?;
+                    let Some(counters) = counters else {
+                        return Ok(BTreeMap::new());
+                    };
+                    let counters: Value = serde_json::from_str(&counters).map_err(invalid)?;
+                    lineage_answered_views_tx(&tx, &conv, &counters)
+                };
+                let answered = read().map_err(|e| {
+                    refusal = Some(e);
+                    rusqlite::Error::InvalidQuery
+                })?;
+                tx.commit()?;
+                Ok(answered)
+            })
+            .map_err(|e| refusal.unwrap_or_else(|| ProviderError::Storage(e.into())))
+    }
+
     /// List stored model-view recipe versions without decoding native message bodies.
     pub fn load_provider_view_recipe_versions(
         &self,
@@ -265,48 +376,73 @@ impl McStore {
             .map_err(|error| ProviderError::Storage(error.into()))
     }
 
+    /// Prune with roots read in the same fenced transaction as the deletion, so
+    /// an acknowledgement, receipt or record write cannot slip between the
+    /// snapshot of references and the removal of the recipes they name.
     pub fn prune_provider_views_from_conversation(
         &self,
         key: &ProviderSessionKey,
     ) -> Result<usize, ProviderError> {
-        let Some(c) = self
-            .load_provider_conversation(key)
-            .map_err(ProviderError::Storage)?
-        else {
-            return Ok(0);
-        };
-        let mut roots = BTreeSet::new();
-        if let Some(raw) = c.setup_json {
-            let setup: Value = serde_json::from_str(&raw).map_err(invalid)?;
-            for path in ["/applied/version", "/produced/version"] {
-                if let Some(version) = setup.pointer(path).and_then(Value::as_u64) {
-                    roots.insert(version);
-                }
-            }
-        }
-        if let Some(raw) = c.last_answer_json {
-            let receipt: Value = serde_json::from_str(&raw).map_err(invalid)?;
-            for path in ["/compaction/version", "/initial/version"] {
-                if let Some(version) = receipt.pointer(path).and_then(Value::as_u64) {
-                    roots.insert(version);
-                }
-            }
-        }
-        let counters: Value = serde_json::from_str(&c.hook_counters_json).map_err(invalid)?;
-        if let Some(lkg) = counters.get("lkg_view_versions").and_then(Value::as_array) {
-            roots.extend(lkg.iter().filter_map(Value::as_u64));
-        }
-        // Keep the previous applied version while the host replaces its saved
-        // last-good request with the newly acknowledged outgoing view.
-        roots.extend(self.inner.with_conn(|conn| {
-            let mut q=conn.prepare_cached("SELECT version FROM mc_provider_views_v2 WHERE conv_key=?1 AND state='applied' ORDER BY version DESC LIMIT 2")?;
-            let rows=q.query_map([key.conversation_key()],|r|r.get::<_,u64>(0))?.collect::<rusqlite::Result<Vec<_>>>()?;
-            Ok(rows)
-        }).map_err(|e|ProviderError::Storage(e.into()))?);
-        if roots.is_empty() {
-            return Ok(0);
-        };
-        self.prune_provider_view_recipes(key, &roots)
+        let mut refusal = None;
+        self.inner
+            .with_conn_fenced(|conn| {
+                let conv = key.conversation_key();
+                let prune = || -> Result<usize, ProviderError> {
+                    let roots = view_roots_tx(conn, &conv)?;
+                    if roots.is_empty() {
+                        return Ok(0);
+                    }
+                    prune_tx(conn, &conv, &roots)
+                };
+                prune().map_err(|e| {
+                    refusal = Some(e);
+                    rusqlite::Error::InvalidQuery
+                })
+            })
+            .map_err(|e| refusal.unwrap_or_else(|| ProviderError::Storage(e.into())))
+    }
+
+    /// One read snapshot of the view versions that can still be replayed and the
+    /// stored native message ranges those views read their bytes from. Any later
+    /// rewrite of stored native messages must leave every row in `sources`
+    /// unchanged while a version in `versions` can still be served.
+    pub fn provider_view_source_roots(
+        &self,
+        key: &ProviderSessionKey,
+    ) -> Result<ProviderViewSourceRoots, ProviderError> {
+        let mut refusal = None;
+        self.inner
+            .with_conn(|conn| {
+                let tx = conn.unchecked_transaction()?;
+                let conv = key.conversation_key();
+                let read = || -> Result<ProviderViewSourceRoots, ProviderError> {
+                    let versions = view_roots_tx(&tx, &conv)?;
+                    let mut sources = BTreeSet::new();
+                    for version in &versions {
+                        if let Some(recipe) = load_recipe_tx(&tx, &conv, *version)? {
+                            for segment in recipe.segments {
+                                if let ProviderViewSegment::NativeRange {
+                                    source_lineage_id,
+                                    from,
+                                    to,
+                                    ..
+                                } = segment
+                                {
+                                    sources.insert((source_lineage_id, from, to));
+                                }
+                            }
+                        }
+                    }
+                    Ok(ProviderViewSourceRoots { versions, sources })
+                };
+                let roots = read().map_err(|e| {
+                    refusal = Some(e);
+                    rusqlite::Error::InvalidQuery
+                })?;
+                tx.commit()?;
+                Ok(roots)
+            })
+            .map_err(|e| refusal.unwrap_or_else(|| ProviderError::Storage(e.into())))
     }
 
     pub fn resolve_provider_view(
@@ -349,47 +485,14 @@ impl McStore {
         recipe: &ProviderViewRecipe,
     ) -> Result<usize, ProviderError> {
         let mut refusal = None;
-        self.inner.with_conn_fenced(|conn| {
-            let save=||->Result<usize,ProviderError> {
-                let conv=key.conversation_key();
-                let mut recipe=recipe.clone();
-                if let Some(base)=recipe.base_version {
-                    let resolved=resolve_tx(conn,&conv,base,false)?.ok_or_else(||invalid("provider view base is missing"))?;
-                    let new_bytes=serde_json::to_vec(&recipe.synthetic).map_err(invalid)?.len()+serde_json::to_vec(&recipe.treatments).map_err(invalid)?.len();
-                    let base_bytes=serde_json::to_vec(&resolved.recipe.synthetic).map_err(invalid)?.len()+serde_json::to_vec(&resolved.recipe.treatments).map_err(invalid)?.len()+serde_json::to_vec(&resolved.recipe.segments).map_err(invalid)?.len()+resolved.recipe.metadata.to_string().len();
-                    let old_native:u64=resolved.recipe.segments.iter().map(|s|match s {ProviderViewSegment::NativeRange {from,to,..}=>to-from,_=>0}).sum();
-                    let new_native:u64=recipe.segments.iter().map(|s|match s {ProviderViewSegment::NativeRange {from,to,..}=>to-from,_=>0}).sum();
-                    if resolved.depth+1>MAX_VIEW_BASE_DEPTH || resolved.ancestor_bytes+base_bytes+new_bytes>MAX_VIEW_ANCESTOR_BYTES || old_native>new_native.saturating_mul(2).max(1) {
-                        for (slot,value) in resolved.recipe.synthetic {recipe.synthetic.entry(slot).or_insert(value);}
-                        let mut treatments=BTreeMap::new();
-                        for t in recipe.treatments {treatments.insert((t.source_lineage_id.clone(),t.mid.clone(),t.block_index),t);}
-                        for t in resolved.recipe.treatments {treatments.entry((t.source_lineage_id.clone(),t.mid.clone(),t.block_index)).or_insert(t);}
-                        recipe.treatments=treatments.into_values().filter(|t|t.patch.is_some() && recipe.segments.iter().any(|s|matches!(s,ProviderViewSegment::NativeRange {source_lineage_id,from,to,..} if &t.source_lineage_id==source_lineage_id && t.ordinal>=*from && t.ordinal<*to))).collect();
-                        recipe.synthetic.retain(|slot,_|recipe.segments.iter().any(|s|matches!(s,ProviderViewSegment::Synthetic {slot:needed} if slot==needed)));
-                        recipe.base_version=None;
-                    }
-                }
-                let cut=if let Some(cut)=recipe.policy_cut_id {cut} else {
-                    // Setup creates a synthetic head before receiving native messages.
-                    // Its empty lineage ID cannot be supplied by host ingest.
-                    conn.execute("INSERT INTO mc_provider_lineages_v1 SELECT ?1,'',0,NULL,NULL,json_extract(?1,'$[1]') WHERE NOT EXISTS(SELECT 1 FROM mc_provider_lineages_v1 WHERE conv_key=?1 AND lineage_id='')",[&conv])?;
-                    let cut:u64=conn.query_row("SELECT coalesce(max(cut_id),-1)+1 FROM mc_provider_policy_cuts_v1 WHERE conv_key=?1",[&conv],|r|r.get(0))?;
-                    conn.execute("INSERT INTO mc_provider_policy_cuts_v1 VALUES (?1,?2,'',NULL,0,'{}','{}','{}','setup',json_extract(?1,'$[1]'))",params![conv,cut])?;
-                    recipe.lineage_id=String::new(); cut
-                };
-                let metadata=recipe.metadata.to_string();
-                let sequence=serde_json::to_string(&recipe.segments).map_err(invalid)?;
-                let synthetic=(!recipe.synthetic.is_empty()).then(||serde_json::to_vec(&recipe.synthetic)).transpose().map_err(invalid)?;
-                let mut bytes=metadata.len()+sequence.len()+synthetic.as_ref().map_or(0,Vec::len);
-                conn.execute("INSERT INTO mc_provider_views_v2 VALUES (?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,1,?11,?12,?13,?14,json_extract(?1,'$[1]'))",params![conv,recipe.version,recipe.lineage_id,recipe.range_from,recipe.range_to,recipe.base_version,cut,metadata,sequence,synthetic,recipe.serializer_profile,recipe.render_key,recipe.tokenizer_key,recipe.state])?;
-                for treatment in recipe.treatments {
-                    let patch=treatment.patch.map(|v|v.to_string()); bytes+=patch.as_ref().map_or(0,String::len);
-                    conn.execute("INSERT INTO mc_provider_view_overrides_v1 VALUES (?1,?2,?3,?4,?5,?6,?7,?8,?9,json_extract(?1,'$[1]'))",params![conv,recipe.version,treatment.source_lineage_id,treatment.mid,treatment.ordinal,treatment.block_index,treatment.block_id,if patch.is_some(){"set"}else{"reset"},patch])?;
-                }
-                Ok(bytes)
-            };
-            save().map_err(|e|{refusal=Some(e);rusqlite::Error::InvalidQuery})
-        }).map_err(|e|refusal.unwrap_or_else(||ProviderError::Storage(e.into())))
+        self.inner
+            .with_conn_fenced(|conn| {
+                save_recipe_tx(conn, &key.conversation_key(), recipe).map_err(|e| {
+                    refusal = Some(e);
+                    rusqlite::Error::InvalidQuery
+                })
+            })
+            .map_err(|e| refusal.unwrap_or_else(|| ProviderError::Storage(e.into())))
     }
 
     /// Reachability, not age, controls retention. Callers pass applied, produced,
@@ -401,35 +504,252 @@ impl McStore {
         roots: &BTreeSet<u64>,
     ) -> Result<usize, ProviderError> {
         let mut refusal = None;
-        self.inner.with_conn_fenced(|conn| {
-            let prune=||->Result<usize,ProviderError> {
-                let conv=key.conversation_key();
-                let mut keep=roots.clone();
-                for root in roots {
-                    let mut current=Some(*root);
-                    let mut depth=0;
-                    while let Some(version)=current {
-                        if depth>MAX_VIEW_BASE_DEPTH {return Err(invalid("provider view retention inheritance exceeds bound"));}
-                        let base = conn.prepare_cached("SELECT base_version FROM mc_provider_views_v2 WHERE conv_key=?1 AND version=?2")?
+        self.inner
+            .with_conn_fenced(|conn| {
+                prune_tx(conn, &key.conversation_key(), roots).map_err(|e| {
+                    refusal = Some(e);
+                    rusqlite::Error::InvalidQuery
+                })
+            })
+            .map_err(|e| refusal.unwrap_or_else(|| ProviderError::Storage(e.into())))
+    }
+}
+
+/// Insert one immutable recipe. Shared by the host view writer and the runner
+/// record writer so both commit the view in the caller's transaction.
+pub(crate) fn save_recipe_tx(
+    conn: &rusqlite::Connection,
+    conv: &str,
+    recipe: &ProviderViewRecipe,
+) -> Result<usize, ProviderError> {
+    let conv = conv.to_string();
+    let mut recipe = recipe.clone();
+    if let Some(base) = recipe.base_version {
+        let resolved = resolve_tx(conn, &conv, base, false)?
+            .ok_or_else(|| invalid("provider view base is missing"))?;
+        let new_bytes = serde_json::to_vec(&recipe.synthetic)
+            .map_err(invalid)?
+            .len()
+            + serde_json::to_vec(&recipe.treatments)
+                .map_err(invalid)?
+                .len();
+        let base_bytes = serde_json::to_vec(&resolved.recipe.synthetic)
+            .map_err(invalid)?
+            .len()
+            + serde_json::to_vec(&resolved.recipe.treatments)
+                .map_err(invalid)?
+                .len()
+            + serde_json::to_vec(&resolved.recipe.segments)
+                .map_err(invalid)?
+                .len()
+            + resolved.recipe.metadata.to_string().len();
+        let old_native: u64 = resolved
+            .recipe
+            .segments
+            .iter()
+            .map(|s| match s {
+                ProviderViewSegment::NativeRange { from, to, .. } => to - from,
+                _ => 0,
+            })
+            .sum();
+        let new_native: u64 = recipe
+            .segments
+            .iter()
+            .map(|s| match s {
+                ProviderViewSegment::NativeRange { from, to, .. } => to - from,
+                _ => 0,
+            })
+            .sum();
+        if resolved.depth + 1 > MAX_VIEW_BASE_DEPTH
+            || resolved.ancestor_bytes + base_bytes + new_bytes > MAX_VIEW_ANCESTOR_BYTES
+            || old_native > new_native.saturating_mul(2).max(1)
+        {
+            for (slot, value) in resolved.recipe.synthetic {
+                recipe.synthetic.entry(slot).or_insert(value);
+            }
+            let mut treatments = BTreeMap::new();
+            for t in recipe.treatments {
+                treatments.insert(
+                    (t.source_lineage_id.clone(), t.mid.clone(), t.block_index),
+                    t,
+                );
+            }
+            for t in resolved.recipe.treatments {
+                treatments
+                    .entry((t.source_lineage_id.clone(), t.mid.clone(), t.block_index))
+                    .or_insert(t);
+            }
+            recipe.treatments=treatments.into_values().filter(|t|t.patch.is_some() && recipe.segments.iter().any(|s|matches!(s,ProviderViewSegment::NativeRange {source_lineage_id,from,to,..} if &t.source_lineage_id==source_lineage_id && t.ordinal>=*from && t.ordinal<*to))).collect();
+            recipe.synthetic.retain(|slot, _| {
+                recipe.segments.iter().any(
+                    |s| matches!(s,ProviderViewSegment::Synthetic {slot:needed} if slot==needed),
+                )
+            });
+            recipe.base_version = None;
+        }
+    }
+    // Every recipe row must name a policy cut. A view saved without the
+    // conversation's baseline cut links to its newest cut instead. Only a
+    // conversation with no cut gets a new placeholder "setup" cut: the
+    // newest cut is the one policy and fold reads treat as current, so
+    // adding one on every view save would change what they read.
+    let current = match recipe.policy_cut_id {
+        Some(cut) => Some(cut),
+        None => crate::provider_policy_overlay::current_cut_tx(conn, &conv)?,
+    };
+    if current.is_some() {
+        let held:bool=conn.query_row("SELECT EXISTS(SELECT 1 FROM mc_provider_lineages_v1 WHERE conv_key=?1 AND lineage_id=?2)",params![conv,recipe.lineage_id],|r|r.get(0))?;
+        if !held {
+            conn.execute("INSERT INTO mc_provider_lineages_v1 SELECT ?1,'',0,NULL,NULL,json_extract(?1,'$[1]') WHERE NOT EXISTS(SELECT 1 FROM mc_provider_lineages_v1 WHERE conv_key=?1 AND lineage_id='')",[&conv])?;
+            recipe.lineage_id = String::new();
+        }
+    }
+    let cut = if let Some(cut) = current {
+        cut
+    } else {
+        // Setup creates a synthetic head before receiving native messages.
+        // Its empty lineage ID cannot be supplied by host ingest.
+        conn.execute("INSERT INTO mc_provider_lineages_v1 SELECT ?1,'',0,NULL,NULL,json_extract(?1,'$[1]') WHERE NOT EXISTS(SELECT 1 FROM mc_provider_lineages_v1 WHERE conv_key=?1 AND lineage_id='')",[&conv])?;
+        let cut: u64 = conn.query_row(
+            "SELECT coalesce(max(cut_id),-1)+1 FROM mc_provider_policy_cuts_v1 WHERE conv_key=?1",
+            [&conv],
+            |r| r.get(0),
+        )?;
+        conn.execute("INSERT INTO mc_provider_policy_cuts_v1 VALUES (?1,?2,'',NULL,0,'{}','{}','{}','setup',json_extract(?1,'$[1]'))",params![conv,cut])?;
+        recipe.lineage_id = String::new();
+        cut
+    };
+    let metadata = recipe.metadata.to_string();
+    let sequence = serde_json::to_string(&recipe.segments).map_err(invalid)?;
+    let synthetic = (!recipe.synthetic.is_empty())
+        .then(|| serde_json::to_vec(&recipe.synthetic))
+        .transpose()
+        .map_err(invalid)?;
+    let mut bytes = metadata.len() + sequence.len() + synthetic.as_ref().map_or(0, Vec::len);
+    conn.execute("INSERT INTO mc_provider_views_v2 VALUES (?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,1,?11,?12,?13,?14,json_extract(?1,'$[1]'))",params![conv,recipe.version,recipe.lineage_id,recipe.range_from,recipe.range_to,recipe.base_version,cut,metadata,sequence,synthetic,recipe.serializer_profile,recipe.render_key,recipe.tokenizer_key,recipe.state])?;
+    for treatment in recipe.treatments {
+        let patch = treatment.patch.map(|v| v.to_string());
+        bytes += patch.as_ref().map_or(0, String::len);
+        conn.execute("INSERT INTO mc_provider_view_overrides_v1 VALUES (?1,?2,?3,?4,?5,?6,?7,?8,?9,json_extract(?1,'$[1]'))",params![conv,recipe.version,treatment.source_lineage_id,treatment.mid,treatment.ordinal,treatment.block_index,treatment.block_id,if patch.is_some(){"set"}else{"reset"},patch])?;
+    }
+    Ok(bytes)
+}
+
+/// Delete recipes that no root reaches through its base chain, then delete the
+/// policy cuts that no remaining recipe or policy override references. See
+/// `prune_provider_view_recipes`.
+pub(crate) fn prune_tx(
+    conn: &rusqlite::Connection,
+    conv: &str,
+    roots: &BTreeSet<u64>,
+) -> Result<usize, ProviderError> {
+    let conv = conv.to_string();
+    let mut keep = roots.clone();
+    for root in roots {
+        let mut current = Some(*root);
+        let mut depth = 0;
+        while let Some(version) = current {
+            if depth > MAX_VIEW_BASE_DEPTH {
+                return Err(invalid("provider view retention inheritance exceeds bound"));
+            }
+            let base = conn.prepare_cached("SELECT base_version FROM mc_provider_views_v2 WHERE conv_key=?1 AND version=?2")?
                             .query_row(params![conv,version], |row| row.get::<_,Option<u64>>(0)).optional()?
                             .ok_or_else(||invalid("still-referenced provider view is missing"))?;
-                        keep.insert(version); current=base; depth+=1;
-                    }
-                }
-                let mut q=conn.prepare_cached("SELECT version FROM mc_provider_views_v2 WHERE conv_key=?1 ORDER BY version DESC")?;
-                let versions=q.query_map([&conv],|r|r.get::<_,u64>(0))?.collect::<rusqlite::Result<Vec<_>>>()?;
-                let mut removed=0;
-                for version in versions.into_iter().filter(|v|!keep.contains(v)) {
-                    conn.execute("DELETE FROM mc_provider_view_overrides_v1 WHERE conv_key=?1 AND version=?2",params![conv,version])?;
-                    removed+=conn.execute("DELETE FROM mc_provider_views_v2 WHERE conv_key=?1 AND version=?2",params![conv,version])?;
-                }
-                let current=crate::provider_policy_overlay::current_cut_tx(conn,&conv)?;
-                let namespace: String = conn.query_row("SELECT engine_namespace FROM mc_provider_conversations_v2 WHERE conv_key=?1", [&conv], |row| row.get(0))?;
-                let cache_cut = crate::cache_codec::native_tail_cut(conn, &namespace)?;
-                conn.execute("DELETE FROM mc_provider_policy_cuts_v1 WHERE conv_key=?1 AND (?2 IS NULL OR cut_id<>?2) AND NOT EXISTS(SELECT 1 FROM mc_provider_views_v2 v WHERE v.conv_key=?1 AND v.policy_cut_id=mc_provider_policy_cuts_v1.cut_id) AND NOT EXISTS(SELECT 1 FROM mc_provider_policy_overrides_v1 o WHERE o.conv_key=?1 AND o.cut_id=mc_provider_policy_cuts_v1.cut_id) AND (?3 IS NULL OR cut_id<>?3)",params![conv,current,cache_cut])?;
-                Ok(removed)
-            };
-            prune().map_err(|e|{refusal=Some(e);rusqlite::Error::InvalidQuery})
-        }).map_err(|e|refusal.unwrap_or_else(||ProviderError::Storage(e.into())))
+            keep.insert(version);
+            current = base;
+            depth += 1;
+        }
     }
+    let mut q = conn.prepare_cached(
+        "SELECT version FROM mc_provider_views_v2 WHERE conv_key=?1 ORDER BY version DESC",
+    )?;
+    let versions = q
+        .query_map([&conv], |r| r.get::<_, u64>(0))?
+        .collect::<rusqlite::Result<Vec<_>>>()?;
+    let mut removed = 0;
+    for version in versions.into_iter().filter(|v| !keep.contains(v)) {
+        conn.execute(
+            "DELETE FROM mc_provider_view_overrides_v1 WHERE conv_key=?1 AND version=?2",
+            params![conv, version],
+        )?;
+        removed += conn.execute(
+            "DELETE FROM mc_provider_views_v2 WHERE conv_key=?1 AND version=?2",
+            params![conv, version],
+        )?;
+    }
+    let current = crate::provider_policy_overlay::current_cut_tx(conn, &conv)?;
+    let namespace: String = conn.query_row(
+        "SELECT engine_namespace FROM mc_provider_conversations_v2 WHERE conv_key=?1",
+        [&conv],
+        |row| row.get(0),
+    )?;
+    let cache_cut = crate::cache_codec::native_tail_cut(conn, &namespace)?;
+    conn.execute("DELETE FROM mc_provider_policy_cuts_v1 WHERE conv_key=?1 AND (?2 IS NULL OR cut_id<>?2) AND NOT EXISTS(SELECT 1 FROM mc_provider_views_v2 v WHERE v.conv_key=?1 AND v.policy_cut_id=mc_provider_policy_cuts_v1.cut_id) AND NOT EXISTS(SELECT 1 FROM mc_provider_policy_overrides_v1 o WHERE o.conv_key=?1 AND o.cut_id=mc_provider_policy_cuts_v1.cut_id) AND (?3 IS NULL OR cut_id<>?3)",params![conv,current,cache_cut])?;
+    Ok(removed)
+}
+
+/// Every view version that something outside the recipe table can still ask to
+/// replay, read inside the caller's transaction:
+/// - host Setup's applied and produced summaries (acknowledgements and the
+///   not-applied replay of the produced view);
+/// - the last step or Setup receipt (a retried request answers from it);
+/// - the view each still-held lineage was named in its newest step answer
+///   (`LINEAGE_ANSWERED_VIEWS`), which the receipt alone loses once a sibling
+///   lineage of the same conversation steps;
+/// - the two newest applied rows, because the host keeps the previous applied
+///   request until it saves the newly acknowledged one;
+/// - the runner record's produced, applied and waiting views.
+pub(crate) fn view_roots_tx(
+    conn: &rusqlite::Connection,
+    conv: &str,
+) -> Result<BTreeSet<u64>, ProviderError> {
+    let mut roots = BTreeSet::new();
+    let row: Option<(Option<String>, Option<String>, String, String)> = conn
+        .query_row(
+            "SELECT setup_json,last_answer_json,hook_counters_json,legacy_shape_json FROM mc_provider_conversations_v2 WHERE conv_key=?1",
+            [conv],
+            |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?)),
+        )
+        .optional()?;
+    let Some((setup, receipt, counters, shape)) = row else {
+        return Ok(roots);
+    };
+    let mut collect = |raw: &str, paths: &[&str]| -> Result<(), ProviderError> {
+        let value: Value = serde_json::from_str(raw).map_err(invalid)?;
+        for path in paths {
+            if let Some(version) = value.pointer(path).and_then(Value::as_u64) {
+                roots.insert(version);
+            }
+        }
+        Ok(())
+    };
+    if let Some(raw) = setup {
+        collect(&raw, &["/applied/version", "/produced/version"])?;
+    }
+    if let Some(raw) = receipt {
+        collect(&raw, &["/compaction/version", "/initial/version"])?;
+    }
+    collect(
+        &shape,
+        &["/produced_version", "/applied_version", "/wait_version"],
+    )?;
+    let counters: Value = serde_json::from_str(&counters).map_err(invalid)?;
+    roots.extend(lineage_answered_views_tx(conn, conv, &counters)?.into_values());
+    let mut q = conn.prepare_cached("SELECT version FROM mc_provider_views_v2 WHERE conv_key=?1 AND state='applied' ORDER BY version DESC LIMIT 2")?;
+    for version in q.query_map([conv], |r| r.get::<_, u64>(0))? {
+        roots.insert(version?);
+    }
+    // A version named by a reference but never stored has nothing to protect.
+    // Leave it out: `prune_tx` refuses a root whose recipe is missing, and the
+    // record and view readers already treat that version as absent.
+    let mut exists = conn.prepare_cached(
+        "SELECT EXISTS(SELECT 1 FROM mc_provider_views_v2 WHERE conv_key=?1 AND version=?2)",
+    )?;
+    let mut held = BTreeSet::new();
+    for version in roots {
+        if exists.query_row(params![conv, version], |r| r.get::<_, bool>(0))? {
+            held.insert(version);
+        }
+    }
+    Ok(held)
 }

@@ -16,6 +16,7 @@ import {
     releaseLease,
 } from "./lease";
 import { withDreamerModelCooldown } from "./provider-output-failure";
+import type { RunRustOwnedDreamTask } from "./rust-ownership";
 import { getDreamState } from "./storage-dream-state";
 import {
     getTaskScheduleState,
@@ -30,6 +31,7 @@ import {
     type DreamTaskBacklog,
     type DreamTaskBacklogMap,
     type DreamTaskName,
+    dreamTaskAllowedBySettings,
     leaseKeyFor,
     leaseKindFor,
 } from "./task-registry";
@@ -105,12 +107,37 @@ export interface RunDueTasksDeps {
     projectIdentity: string;
     tasks: readonly DreamTaskRuntimeConfig[];
     executor: TaskExecutor;
+    /**
+     * Tasks the ck-mc module published as its own, read once per run (see
+     * rust-ownership.ts). Exactly these are skipped: they are neither planned,
+     * seeded, advanced nor executed here. Absent or empty runs every task.
+     */
+    rustOwnedTasks?: ReadonlySet<DreamTaskName>;
     now?: number;
     /**
      * The host's `memory.enabled` for this project. `false` means this caller
-     * schedules nothing (existing rows are kept); omitted means on.
+     * leaves the project-memory tasks alone (their existing rows are kept) and
+     * still runs the tasks that serve other settings; omitted means on.
      */
     projectMemoryEnabled?: boolean;
+    /** The host's `smart_notes.enabled`. `false` drops evaluate-smart-notes; omitted means on. */
+    smartNotesEnabled?: boolean;
+}
+
+/**
+ * The caller's tasks that the project's settings allow: projectMemoryEnabled
+ * gates the project-memory tasks and smartNotesEnabled gates
+ * evaluate-smart-notes (see dreamTaskAllowedBySettings). A task left out here
+ * is not seeded, run or advanced, so its schedule rows stay untouched for any
+ * other worktree or host whose caller shares the same project identity.
+ */
+function tasksAllowedBySettings(deps: RunDueTasksDeps): readonly DreamTaskRuntimeConfig[] {
+    return deps.tasks.filter((config) =>
+        dreamTaskAllowedBySettings(config.task, {
+            projectMemoryEnabled: deps.projectMemoryEnabled,
+            smartNotesEnabled: deps.smartNotesEnabled,
+        }),
+    );
 }
 
 /** First-seed a task's schedule row if absent. next_due_at from cron(after now);
@@ -373,6 +400,11 @@ interface DomainGroupCallbacks {
     /** Manual single-task run ignores the post-lease activity gate re-check. */
     forceGate?: boolean;
     /**
+     * Manual runs ignore the schedule, so they skip the post-lease check that
+     * the planned slot is still due.
+     */
+    ignoreSchedule?: boolean;
+    /**
      * How long a manual run may wait for a busy domain lease before giving
      * up. Scheduled ticks leave this unset (the next tick retries anyway).
      */
@@ -440,6 +472,22 @@ async function runDomainGroupWithCooldown(
             }
 
             acquisition = { acquiredAt: Date.now(), generation: acquisition.generation };
+
+            // Re-read the slot now that we hold the lease. Another runtime sharing
+            // this store (another host process, or ck-mc's Rust dreamer, which may
+            // own the task without this host knowing) can run the planned slot
+            // between planning and taking the lease; it moves next_due_at past the
+            // slot before it releases the lease, so a later next_due_at means the
+            // slot is already done. Leave the row as that runtime wrote it.
+            if (!cb?.ignoreSchedule) {
+                const current = getTaskScheduleState(db, projectIdentity, due.config.task);
+                if (current?.nextDueAt != null && current.nextDueAt > due.scheduledAt) {
+                    log(
+                        `[dreamer] ${due.config.task} slot already run by another dreamer — skipping`,
+                    );
+                    continue;
+                }
+            }
 
             // Re-evaluate the gate now that we hold the lease: a sibling/other
             // process may have just consumed the work (critical for the global
@@ -563,8 +611,16 @@ export interface ManualRunResult {
  * Still advances next_due_at on completion so the manual run resets the cadence.
  */
 export async function runManualDream(
-    deps: Omit<RunDueTasksDeps, "now"> & { task?: DreamTaskName },
+    deps: Omit<RunDueTasksDeps, "now"> & {
+        task?: DreamTaskName;
+        /**
+         * Present only when this host is attached to ck-mc: asks ck-mc to run a
+         * task it owns now. Without it an owned task is reported as run by ck-mc.
+         */
+        runRustOwnedTask?: RunRustOwnedDreamTask;
+    },
 ): Promise<ManualRunResult> {
+    const rustOwned = deps.rustOwnedTasks;
     const now = Date.now();
     const result: ManualRunResult = {
         ran: [],
@@ -578,16 +634,41 @@ export async function runManualDream(
     };
 
     if (!isUsableProjectIdentity(deps.projectIdentity)) return result;
+    // The same per-task settings gate as scheduled runs: a forced project-memory
+    // task still honors the project's memory opt-out, while docs, smart-note and
+    // user-memory tasks stay available with memory off.
+    const allowed = tasksAllowedBySettings(deps);
     let selected: readonly DreamTaskRuntimeConfig[];
     let forceGate = false;
     if (deps.task) {
-        const cfg = deps.tasks.find((t) => t.task === deps.task);
+        const cfg = allowed.find((t) => t.task === deps.task);
         if (!cfg) return result;
         selected = [cfg];
         forceGate = true; // explicit single-task run ignores the activity gate
     } else {
         // All enabled tasks (schedule != ""); disabled tasks stay off even manually.
-        selected = deps.tasks.filter((t) => t.schedule.trim() !== "");
+        selected = allowed.filter((t) => t.schedule.trim() !== "");
+    }
+    if (rustOwned && rustOwned.size > 0) {
+        // Rust runs these on its own schedule. A host attached to ck-mc asks it
+        // to run them now; otherwise reporting them keeps a manual run from
+        // looking as if the task were silently dropped.
+        for (const config of selected) {
+            if (!rustOwned.has(config.task)) continue;
+            if (!deps.runRustOwnedTask) {
+                (result.skipped ??= []).push(`${config.task}: run by ck-mc`);
+                continue;
+            }
+            const outcome = await deps.runRustOwnedTask(config.task);
+            if (outcome.started) {
+                (result.details ??= []).push(`${config.task}: started in ck-mc`);
+            } else {
+                (result.skipped ??= []).push(
+                    `${config.task}: ck-mc did not start it (${outcome.reason})`,
+                );
+            }
+        }
+        selected = selected.filter((config) => !rustOwned.has(config.task));
     }
     if (selected.length === 0) return result;
 
@@ -648,8 +729,9 @@ export async function runManualDream(
 
     await Promise.all(
         [...groups.values()].map((group) =>
-            runDomainGroup({ ...deps, executor: deps.executor }, group, {
+            runDomainGroup(deps, group, {
                 forceGate,
+                ignoreSchedule: true,
                 leaseWaitMs: MANUAL_RUN_LEASE_WAIT_MS,
                 onRan: (t, detail, backlog) => {
                     result.ran.push(t);
@@ -683,16 +765,19 @@ export async function runDueTasksForProject(deps: RunDueTasksDeps): Promise<numb
     // A blank identity is an unresolved directory, not a project; running tasks
     // for it would read and write project-scoped rows under the key "".
     if (!isUsableProjectIdentity(deps.projectIdentity)) return 0;
-    // Project memory is off for this caller: schedule nothing and leave the
-    // rows alone. A `git:` identity is shared by every worktree and host of the
+    // Each task follows the setting of what it serves. With project memory off
+    // the memory tasks are neither seeded, run nor advanced and their rows are
+    // left alone: a `git:` identity is shared by every worktree and host of the
     // repository, and one with memory on keeps using those rows and the progress
     // they record (retrospective watermark, open verify-broad cycle, curate
     // rotation). An identity with no memories and nothing else to do loses its
     // rows to the daily idle prune instead.
-    if (deps.projectMemoryEnabled === false) return 0;
+    const allowedTasks = tasksAllowedBySettings(deps);
+    if (allowedTasks.length === 0) return 0;
     // Idle expiry ticks must not take a write lease. The executor rechecks the
     // expired rows under the lease before archiving them.
     if (
+        deps.projectMemoryEnabled !== false &&
         deps.executor.expireMemories &&
         getExpiredActiveMemoryIds(deps.db, deps.projectIdentity).length > 0
     ) {
@@ -714,7 +799,16 @@ export async function runDueTasksForProject(deps: RunDueTasksDeps): Promise<numb
         }
     }
     const now = deps.now ?? Date.now();
-    const due = planDueTasks(deps.db, deps.projectIdentity, deps.tasks, now);
+    // Filter before planning: even a gated task would seed or advance its row.
+    const owned = deps.rustOwnedTasks;
+    const tasks =
+        owned && owned.size > 0
+            ? allowedTasks.filter((config) => !owned.has(config.task))
+            : allowedTasks;
+    // Rust owns every configured task: this pass has nothing of its own to plan,
+    // and planning would still write this store's schedule maintenance rows.
+    if (tasks.length === 0 && deps.tasks.length > 0) return 0;
+    const due = planDueTasks(deps.db, deps.projectIdentity, tasks, now);
     if (due.length === 0) return 0;
 
     // Pre-lease gate: cheap filter so we don't even acquire a lease for a task

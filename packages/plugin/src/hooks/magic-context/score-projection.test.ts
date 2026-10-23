@@ -8,6 +8,10 @@ import {
     renderM0Pi,
 } from "../../../../pi-plugin/src/inject-compartments-pi";
 import { runPiHistorian } from "../../../../pi-plugin/src/pi-historian-runner";
+import {
+    patchSessionMeta,
+    sessionMetaFixtureRow,
+} from "../../features/magic-context/__tests__/session-meta-fixture";
 import { acquireCompartmentLease } from "../../features/magic-context/compartment-lease";
 import { getCompartments } from "../../features/magic-context/compartment-storage";
 import { computeRescoreSourceIdentity } from "../../features/magic-context/rescore-identity";
@@ -134,7 +138,7 @@ function effectiveScores(db: Database, selector: "latest" | number = "latest"): 
 
 function snapshot(db: Database): string {
     return JSON.stringify({
-        meta: db.prepare("SELECT * FROM session_meta WHERE session_id = ?").get(SESSION),
+        meta: sessionMetaFixtureRow(db, SESSION),
         rows: getCompartments(db, SESSION),
         history: db
             .prepare("SELECT * FROM compartment_history_versions WHERE session_id = ?")
@@ -275,7 +279,6 @@ for (const runtime of ["TS", "Pi"] as const) {
             "ttl_idle",
             "model_change",
             "system_hash",
-            "project_memory_epoch",
             "m0_mutation",
             "host_compaction",
         ] as const) {
@@ -293,9 +296,7 @@ for (const runtime of ["TS", "Pi"] as const) {
                 };
                 const time = getOrCreateSessionMeta(db, SESSION).cachedM0MaterializedAt ?? 0;
                 if (reason === "missing_cache") {
-                    db.prepare(
-                        "UPDATE session_meta SET cached_m0_bytes = NULL WHERE session_id = ?",
-                    ).run(SESSION);
+                    patchSessionMeta(db, SESSION, { cached_m0_bytes: null });
                     h.restart();
                 }
                 if (reason === "ttl_idle") {
@@ -304,8 +305,6 @@ for (const runtime of ["TS", "Pi"] as const) {
                 }
                 if (reason === "model_change") signals.modelKey = "anthropic/claude-sonnet-4-5";
                 if (reason === "system_hash") signals.systemHash = "changed-system";
-                if (reason === "project_memory_epoch")
-                    setProjectState(db, PROJECT, { projectMemoryEpoch: 1 });
                 if (reason === "m0_mutation")
                     queueM0Mutation(db, {
                         sessionId: SESSION,
@@ -329,6 +328,30 @@ for (const runtime of ["TS", "Pi"] as const) {
                 );
             });
         }
+
+        it("project memory epoch holds pending scores until a natural HARD", () => {
+            const db = makeDb();
+            const h = harness(runtime, db);
+            const before = h.inject();
+            selectScore(db, 0, 100);
+            setProjectState(db, PROJECT, { projectMemoryEpoch: 1 });
+            expect(h.decide().value).toBe(false);
+            expect(h.inject()).toEqual({ ...before, committed: false });
+            expect(readAppliedScoreWatermark(db, SESSION)).toBe(0);
+            const time = getOrCreateSessionMeta(db, SESSION).cachedM0MaterializedAt ?? 0;
+            h.signal({
+                systemHash: "",
+                modelKey: "",
+                cacheExpired: true,
+                lastResponseTime: time + 1,
+            });
+            expect(h.decide().value).toBe(true);
+            const hard = h.inject();
+            expect(hard.committed).toBe(true);
+            expect(readAppliedScoreWatermark(db, SESSION)).toBe(1);
+            assertTiers(hard.m0, fixture.steps[4].tiers!);
+            expect(persistedM0(db)).toBe(hard.m0);
+        });
 
         it("captures L at acquisition and leaves a later publication pending", () => {
             const db = makeDb();

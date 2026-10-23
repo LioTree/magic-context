@@ -6,6 +6,14 @@ import { mkdirSync, rmSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import todoRideGolden from "../../../../../crates/mc-module/testdata/todo-ride-only.json";
+import {
+    clearSessionMetaFixtureFault,
+    rejectSessionMetaCollectionWrites,
+} from "../../features/magic-context/__tests__/session-meta-faults";
+import {
+    editCachedUpgradeFixture,
+    patchSessionMeta,
+} from "../../features/magic-context/__tests__/session-meta-fixture";
 import { appendCompartments } from "../../features/magic-context/compartment-storage";
 import * as embeddingModule from "../../features/magic-context/memory/embedding";
 import { runMigrations } from "../../features/magic-context/migrations";
@@ -60,6 +68,7 @@ import {
 } from "../../features/magic-context/storage-meta-persisted";
 import * as reasoningStorage from "../../features/magic-context/storage-reasoning-removal";
 import { getRemovedReasoningIds } from "../../features/magic-context/storage-reasoning-removal";
+import { updateSessionMetaCollection } from "../../features/magic-context/storage-session-collections";
 import * as storageTags from "../../features/magic-context/storage-tags";
 import {
     markWhitespaceAssistantTagInert,
@@ -97,6 +106,11 @@ import {
 } from "./inject-compartments";
 import * as noteNudger from "./note-nudger";
 import { createPassOutcome } from "./pass-outcome";
+import {
+    pendingMaterializationOrigin,
+    recordSystemPromptEdit,
+    requestPendingMaterialization,
+} from "./pending-materialization";
 import * as readSessionFormatting from "./read-session-formatting";
 import { snapshotTrailingBlankSourceDecisions } from "./strip-content";
 import { stripStructuralNoise } from "./strip-structural-noise";
@@ -125,8 +139,8 @@ import {
     finalizeMessageRepresentation,
     reconcileMarkerRepresentation,
     replayRustModeBindingMismatchStrips,
-    runPostTransformPhase,
     runRustModePostprocess,
+    runPostTransformPhase as runUnfinalizedPostTransformPhase,
 } from "./transform-postprocess-phase";
 
 const SESSION_ID = "ses-postprocess-drift";
@@ -156,6 +170,10 @@ function createOpenCodeDbWithoutMessages(prefix: string): void {
     process.env.XDG_DATA_HOME = dir;
     mkdirSync(join(dir, "opencode"), { recursive: true });
     const opencodeDb = new Database(join(dir, "opencode", "opencode.db"));
+    // Create the fixture in WAL mode like OpenCode. Schema writes create the
+    // -wal/-shm files; without them, macOS SQLite can reject a readonly worker's
+    // first read after a late switch from rollback journaling to WAL.
+    opencodeDb.exec("PRAGMA journal_mode=WAL");
     opencodeDb.exec(
         "CREATE TABLE message (id TEXT PRIMARY KEY, session_id TEXT, time_created INTEGER, time_updated INTEGER, data TEXT)",
     );
@@ -289,7 +307,60 @@ function makeDropTarget(message: MessageLike): TagTarget {
     };
 }
 
+import { prepareCachedM0M1Replay } from "./inject-compartments";
+import { prefixTurn, readServedPrefix, writeServedPrefix } from "./served-prefix";
+
+async function runPostTransformPhase(args: Parameters<typeof runUnfinalizedPostTransformPhase>[0]) {
+    const result = await runUnfinalizedPostTransformPhase(args);
+    // A completed request includes final record publication, which production
+    // performs after restoring any recovery prefix.
+    if (result.finalizeServedPrefix?.()) result.bustedThisPass = true;
+    return result;
+}
+
+// Production records the request's model in the provenance, and the first-kept
+// digest binds it, so a seeded record must name the model the test passes run on.
+const SEEDED_PREFIX_MODEL = { provider: "anthropic", id: "claude-opus-5-5" };
+
+function seedHeldServedPrefix(
+    db: Database,
+    sessionId: string,
+    messages: MessageLike[],
+    head?: MessageLike[],
+): void {
+    writeServedPrefix({
+        db,
+        sessionId,
+        head: head ?? prepareCachedM0M1Replay(db, sessionId)!.preparedMessages!,
+        summary: null,
+        firstKept: messages[0],
+        firstKeptId: messages[0]?.info.id,
+        turn: prefixTurn(messages, (message) => message.info.id),
+        provenance: {
+            host: "opencode-v1",
+            id_space: "opencode-v1-message",
+            generation: "v1",
+            projection: "messages",
+            model: SEEDED_PREFIX_MODEL,
+        },
+    });
+}
+
 type PostTransformArgs = Parameters<typeof runPostTransformPhase>[0];
+
+// What the system-prompt hook leaves behind when the host's top-level system
+// prompt changes: the system-prompt edit record and, unless the change was
+// adopted without a flush, a "system_hash" materialization request.
+function hostSystemChanged(
+    sessionId: string,
+    sessions = new Set<string>(),
+    options: { materialize?: boolean } = {},
+): Set<string> {
+    if (options.materialize !== false)
+        requestPendingMaterialization(sessions, sessionId, "system_hash");
+    recordSystemPromptEdit(sessions, sessionId);
+    return sessions;
+}
 
 function basePostTransformArgs(
     db: Database,
@@ -297,6 +368,19 @@ function basePostTransformArgs(
     messages: MessageLike[],
     overrides: Partial<PostTransformArgs> = {},
 ): PostTransformArgs {
+    // Raw set membership in these fixtures represents a command request. Use
+    // the production API so admission can distinguish it from deferred work.
+    if (
+        overrides.pendingMaterializationSessions?.has(sessionId) &&
+        pendingMaterializationOrigin(overrides.pendingMaterializationSessions, sessionId) ===
+            "pending_materialization"
+    ) {
+        requestPendingMaterialization(
+            overrides.pendingMaterializationSessions,
+            sessionId,
+            "user_flush",
+        );
+    }
     return {
         sessionId,
         db,
@@ -666,7 +750,11 @@ describe("postprocess replay-or-refuse", () => {
                     case "reasoning-removal-persistence-failure":
                     case "reasoning-removal-committed-read-failure":
                         args.resolvedProviderID = "openai";
-                        args.pendingMaterializationSessions.add(sessionId);
+                        requestPendingMaterialization(
+                            args.pendingMaterializationSessions,
+                            sessionId,
+                            "user_flush",
+                        );
                         args.keepReasoningTokens = 0;
                         messages.forEach((message, index) => {
                             args.messageTagNumbers.set(message, index + 1);
@@ -699,7 +787,11 @@ describe("postprocess replay-or-refuse", () => {
                         break;
                     case "merged-reasoning-strip-persistence-failure":
                     case "merged-reasoning-strip-exception":
-                        args.pendingMaterializationSessions.add(sessionId);
+                        requestPendingMaterialization(
+                            args.pendingMaterializationSessions,
+                            sessionId,
+                            "user_flush",
+                        );
                         spies.push(
                             spyOn(
                                 replayStorage,
@@ -714,7 +806,11 @@ describe("postprocess replay-or-refuse", () => {
                         expect(addTrailingBlankDecisions(db, sessionId, [["a1", "keep:2"]])).toBe(
                             true,
                         );
-                        args.pendingMaterializationSessions.add(sessionId);
+                        requestPendingMaterialization(
+                            args.pendingMaterializationSessions,
+                            sessionId,
+                            "user_flush",
+                        );
                         args.trailingBlankSourceDecisions = new Map([["a1", "strip"]]);
                         spies.push(
                             spyOn(
@@ -736,7 +832,12 @@ describe("postprocess replay-or-refuse", () => {
                         );
                         break;
                     case "proactive-thinking-strip-persistence-failure":
-                        args.pendingMaterializationSessions.add(sessionId);
+                        hostSystemChanged(sessionId, args.pendingMaterializationSessions);
+                        requestPendingMaterialization(
+                            args.pendingMaterializationSessions,
+                            sessionId,
+                            "user_flush",
+                        );
                         args.thinkingBindingRecoveryEnabledForModel = true;
                         // Isolate the proactive lane from merged-run detection.
                         messages.splice(2, 0, {
@@ -1094,23 +1195,37 @@ describe("postprocess replay snapshot", () => {
     it("serves byte-identical passes from one cached row and reloads after a database write", async () => {
         db = new Database(":memory:");
         initializeDatabase(db);
+        runMigrations(db);
         const sessionId = "ses-replay-snapshot";
         getOrCreateSessionMeta(db, sessionId);
-        db.prepare(
-            "UPDATE session_meta SET note_nudge_anchors = ?, trailing_blank_decisions = ? WHERE session_id = ?",
-        ).run(
-            JSON.stringify([{ messageId: "snapshot-user", text: "\nreplay-v1" }]),
-            JSON.stringify({ "snapshot-assistant": "strip" }),
-            sessionId,
-        );
+        patchSessionMeta(db, sessionId, {
+            note_nudge_anchors: JSON.stringify([
+                { messageId: "snapshot-user", text: "\nreplay-v1" },
+            ]),
+            trailing_blank_decisions: JSON.stringify({ "snapshot-assistant": "strip" }),
+        });
 
         const preparedSql: string[] = [];
+        const revisionReads: string[] = [];
         const spiedDb = new Proxy(db, {
             get(target, prop) {
                 if (prop !== "prepare") return Reflect.get(target, prop, target);
                 return (sql: string) => {
                     preparedSql.push(sql);
-                    return target.prepare.call(target, sql);
+                    const statement = target.prepare.call(target, sql);
+                    if (!sql.includes("session_meta_collection_revisions AS revisions"))
+                        return statement;
+                    return new Proxy(statement, {
+                        get(stmt, key) {
+                            if (key === "get")
+                                return (...params: Parameters<typeof stmt.get>) => {
+                                    revisionReads.push(String(params[0]));
+                                    return stmt.get(...params);
+                                };
+                            const value = Reflect.get(stmt, key);
+                            return typeof value === "function" ? value.bind(stmt) : value;
+                        },
+                    });
                 };
             },
         }) as Database;
@@ -1141,17 +1256,18 @@ describe("postprocess replay snapshot", () => {
         const second = await run();
         expect(digest(second)).toBe(digest(first));
         expect(
-            preparedSql.filter((sql) => sql.includes("SELECT stale_reduce_stripped_ids")).length,
-        ).toBe(1);
+            revisionReads.filter((column) => column === "stale_reduce_stripped_ids"),
+        ).toHaveLength(2);
+        expect(revisionReads.filter((column) => column === "note_nudge_anchors")).toHaveLength(2);
         expect(
-            preparedSql.some((sql) =>
-                /SELECT (?:note_nudge_anchors|trailing_blank_decisions) FROM/.test(sql),
-            ),
-        ).toBe(false);
+            preparedSql.filter((sql) => sql.includes("SELECT todo_permission_denied")),
+        ).toHaveLength(1);
 
-        db.prepare("UPDATE session_meta SET note_nudge_anchors = ? WHERE session_id = ?").run(
-            JSON.stringify([{ messageId: "snapshot-user", text: "\nreplay-v2" }]),
+        updateSessionMetaCollection(
+            db,
             sessionId,
+            "note_nudge_anchors",
+            JSON.stringify([{ messageId: "snapshot-user", text: "\nreplay-v2" }]),
         );
         const afterPassInvalidation = await run();
         expect(digest(afterPassInvalidation)).not.toBe(digest(second));
@@ -2506,6 +2622,7 @@ describe("deferred compaction marker representation", () => {
 
         mkdirSync(join(dataHome, "opencode"), { recursive: true });
         const opencodeDb = new Database(join(dataHome, "opencode", "opencode.db"));
+        opencodeDb.exec("PRAGMA journal_mode=WAL");
         opencodeDb.exec(
             "CREATE TABLE message (id TEXT PRIMARY KEY, session_id TEXT, time_created INTEGER, time_updated INTEGER, data TEXT)",
         );
@@ -2673,6 +2790,7 @@ describe("deferred compaction marker representation", () => {
         process.env.XDG_DATA_HOME = dataHome;
         mkdirSync(join(dataHome, "opencode"), { recursive: true });
         const opencodeDb = new Database(join(dataHome, "opencode", "opencode.db"));
+        opencodeDb.exec("PRAGMA journal_mode=WAL");
         opencodeDb.exec(
             "CREATE TABLE message (id TEXT PRIMARY KEY, session_id TEXT, time_created INTEGER, time_updated INTEGER, data TEXT)",
         );
@@ -2987,6 +3105,7 @@ describe("deferred compaction marker advance representation", () => {
         process.env.XDG_DATA_HOME = dataHome;
         mkdirSync(join(dataHome, "opencode"), { recursive: true });
         const opencodeDb = new Database(join(dataHome, "opencode", "opencode.db"));
+        opencodeDb.exec("PRAGMA journal_mode=WAL");
         opencodeDb.exec(
             "CREATE TABLE message (id TEXT PRIMARY KEY, session_id TEXT, time_created INTEGER, time_updated INTEGER, data TEXT)",
         );
@@ -4144,7 +4263,7 @@ describe("two-pass tool reclaim", () => {
         expect(tagStatuses(sessionId).get(1)).toBe("active");
     });
 
-    it("advances the watermark on a force-materialization bust even without execute", async () => {
+    it("does not age the current task on a force-materialization bust without distance", async () => {
         db = new Database(":memory:");
         initializeDatabase(db);
         const sessionId = "ses-reclaim-force-defer";
@@ -4161,7 +4280,7 @@ describe("two-pass tool reclaim", () => {
             }),
         );
 
-        expect(getOrCreateSessionMeta(db, sessionId).toolReclaimWatermark).toBe(1);
+        expect(getOrCreateSessionMeta(db, sessionId).toolReclaimWatermark).toBe(0);
     });
 });
 
@@ -4830,7 +4949,7 @@ describe("executed m[0] hard-fold folds the execute pass in", () => {
             const fold = await pass();
             expect(fold.result.materialized).toBe(true);
             expect(lines).toContain(
-                "heuristics WILL RUN — reason=pending_materialization origin=pending_materialization, context=20.0%, turn=null",
+                "heuristics WILL RUN — reason=pending_materialization origin=user_flush, context=20.0%, turn=null",
             );
             expect(getPendingOps(db, sessionId)).toHaveLength(0);
             expect(pendingMaterializationSessions.has(sessionId)).toBe(false);
@@ -5047,6 +5166,7 @@ describe("executed m[0] hard-fold folds the execute pass in", () => {
         process.env.XDG_DATA_HOME = dataHome;
         mkdirSync(join(dataHome, "opencode"), { recursive: true });
         const opencodeDb = new Database(join(dataHome, "opencode", "opencode.db"));
+        opencodeDb.exec("PRAGMA journal_mode=WAL");
         opencodeDb.exec(
             "CREATE TABLE message (id TEXT PRIMARY KEY, session_id TEXT, time_created INTEGER, time_updated INTEGER, data TEXT)",
         );
@@ -5551,7 +5671,7 @@ describe("executed m[0] hard-fold folds the execute pass in", () => {
         expect(advSha(shared)).toBe(advSha(exec.messages));
     });
 
-    it("ADV: a project_memory_epoch HARD fold with byte-identical m[0] does not convert legacy markers", async () => {
+    it("ADV: a project_memory_epoch bump with byte-identical m[0] does not convert legacy markers", async () => {
         db = new Database(":memory:");
         initializeDatabase(db);
         const sessionId = "ses-adv-epoch-identical";
@@ -5586,7 +5706,7 @@ describe("executed m[0] hard-fold folds the execute pass in", () => {
                 firstDiff,
             }),
         );
-        expect(hard.result.materialized).toBe(true);
+        expect(hard.result.materialized).toBe(false);
         // The fold re-rendered m[0]/m[1] byte-identically, so the prefix stays
         // cached. The conversion only rides a bust that already rewrites the
         // prefix: here it must not happen, and the served bytes stay identical.
@@ -5848,7 +5968,201 @@ describe("executed m[0] hard-fold folds the execute pass in", () => {
         );
     });
 
-    it("drains pending ops and age reclaim on the same low-usage TTL fold", async () => {
+    it.each([
+        2, 3, 5,
+    ])("OpenCode 1/2 distance bookmark keeps the current task through %i TTL rebuilds and a model switch", async (rebuilds) => {
+        db = new Database(":memory:");
+        initializeDatabase(db);
+        const sessionId = `ses-distance-idle-${rebuilds}`;
+        materializeBaseline(sessionId);
+        const tools = Array.from({ length: 8 }, (_, index) => makeToolMessage(`tool-${index + 1}`));
+        const messages: MessageLike[] = [
+            {
+                info: { id: "task", role: "user" },
+                parts: [{ type: "text", text: "implement the feature" }],
+            },
+            ...tools,
+        ];
+        const targets = new Map(
+            tools.map((message, index) => {
+                insertTag(db, sessionId, message.info.id, "tool", 4000, index + 1, 0, "bash");
+                return [
+                    index + 1,
+                    {
+                        ...makeDropTarget(message),
+                        mutationParts: [{ message, part: message.parts[0] }],
+                    },
+                ] as const;
+            }),
+        );
+        for (let pass = 0; pass <= rebuilds; pass++) {
+            await runPostTransformPhase(
+                basePostTransformArgs(db, sessionId, messages, {
+                    tags: getActiveTagsBySession(db, sessionId),
+                    targets,
+                    contextUsage: { percentage: 2, inputTokens: 4000 },
+                    usableWindow: 200_000,
+                    m0M1: {
+                        projectPath: FOLD_PROJECT,
+                        projectDirectory: FOLD_PROJECT,
+                        historyBudgetTokens: 98_000,
+                        hardSignals: {
+                            ...BASE_HARD,
+                            cacheExpired: pass < rebuilds,
+                            lastResponseTime: Number.MAX_SAFE_INTEGER,
+                            modelKey: pass === rebuilds ? "other/model" : BASE_HARD.modelKey,
+                        },
+                    },
+                }),
+            );
+            expect(getOrCreateSessionMeta(db, sessionId).toolReclaimWatermark).toBe(0);
+            expect(
+                getTagsBySession(db, sessionId).filter((tag) => tag.status === "active"),
+            ).toHaveLength(8);
+        }
+        queuePendingOp(db, sessionId, 1, "drop", 1);
+        await runPostTransformPhase(
+            basePostTransformArgs(db, sessionId, messages, {
+                tags: getActiveTagsBySession(db, sessionId),
+                targets,
+                pendingMaterializationSessions: new Set([sessionId]),
+            }),
+        );
+        expect(
+            getTagsBySession(db, sessionId)
+                .filter((tag) => tag.status === "dropped")
+                .map((tag) => tag.tagNumber),
+        ).toEqual([1]);
+    });
+
+    it("OpenCode 1/2 single-user tool loop ages by a quarter-window of newer tokens", async () => {
+        db = new Database(":memory:");
+        initializeDatabase(db);
+        const sessionId = "ses-oc-token-distance";
+        const tools = Array.from({ length: 4 }, (_, index) => makeToolMessage(`loop-${index}`));
+        const targets = new Map<number, TagTarget>();
+        for (const [index, message] of tools.entries()) {
+            (message.parts[0] as { state: { output: string } }).state.output =
+                `unique ${index} ${"payload ".repeat(index === 0 ? 500 : 17_000)}`;
+            insertTag(db, sessionId, message.info.id, "tool", 4000, index + 1, 0, "bash");
+            targets.set(index + 1, {
+                ...makeDropTarget(message),
+                mutationParts: [{ message, part: message.parts[0] }],
+            });
+        }
+        const messages: MessageLike[] = [
+            {
+                info: { id: "task", role: "user" },
+                parts: [{ type: "text", text: "one coding task" }],
+            },
+            ...tools,
+        ];
+        const pass = () =>
+            runPostTransformPhase(
+                basePostTransformArgs(db, sessionId, messages, {
+                    tags: getActiveTagsBySession(db, sessionId),
+                    targets,
+                    usableWindow: 200_000,
+                    pendingMaterializationSessions: new Set([sessionId]),
+                }),
+            );
+        await pass();
+        expect(getOrCreateSessionMeta(db, sessionId).toolReclaimWatermark).toBe(1);
+        expect(getTagsBySession(db, sessionId).map((tag) => tag.status)).toEqual(
+            Array(4).fill("active"),
+        );
+        await pass();
+        expect(getTagsBySession(db, sessionId).map((tag) => tag.status)).toEqual([
+            "dropped",
+            "active",
+            "active",
+            "active",
+        ]);
+    });
+
+    it("OpenCode 1/2 distant outputs and edits survive one free rebuild, then reclaim at low usage", async () => {
+        db = new Database(":memory:");
+        initializeDatabase(db);
+        const sessionId = "ses-distance-edit";
+        materializeBaseline(sessionId);
+        const tools = [
+            makeToolMessage("old-edit"),
+            makeToolMessage("new-edit"),
+            makeToolMessage("old-bash"),
+        ];
+        const tail: MessageLike[] = Array.from({ length: 24 }, (_, index) => ({
+            info: { id: `tail-${index}`, role: index < 3 ? "user" : "assistant" },
+            parts: [
+                {
+                    type: "text",
+                    text:
+                        index < 3
+                            ? "<system-reminder>Background task finished.</system-reminder>"
+                            : `continuation ${index}`,
+                },
+            ],
+        }));
+        const messages = [...tools, ...tail];
+        const targets = new Map<number, TagTarget>();
+        for (const [index, message] of tools.entries()) {
+            const tag = index + 1;
+            if (index < 2)
+                (message.parts[0] as { state: { output: string } }).state.output = "edited";
+            insertTag(
+                db,
+                sessionId,
+                message.info.id,
+                "tool",
+                index < 2 ? 24 : 4000,
+                tag,
+                0,
+                index < 2 ? "edit" : "bash",
+                0,
+                message.info.id,
+                null,
+                { tokenCount: index < 2 ? 100 : 1000, inputTokenCount: 0, reasoningTokenCount: 0 },
+            );
+            const target = makeDropTarget(message);
+            targets.set(tag, {
+                ...target,
+                mutationParts: [{ message, part: message.parts[0] }],
+                readInput: () => ({ filePath: "/feature.ts", oldString: "a", newString: "b" }),
+                editMarker: target.truncate,
+            });
+        }
+        tail.forEach((message, index) => {
+            insertTag(db, sessionId, message.info.id, "message", 50, index + 4);
+        });
+        const pass = (bust: boolean) =>
+            runPostTransformPhase(
+                basePostTransformArgs(db, sessionId, messages, {
+                    tags: getActiveTagsBySession(db, sessionId),
+                    targets,
+                    contextUsage: { percentage: 2, inputTokens: 4000 },
+                    usableWindow: 200_000,
+                    pendingMaterializationSessions: new Set(bust ? [sessionId] : []),
+                }),
+            );
+        await pass(true);
+        expect(getOrCreateSessionMeta(db, sessionId).toolReclaimWatermark).toBe(3);
+        expect(
+            getTagsBySession(db, sessionId)
+                .slice(0, 3)
+                .map((tag) => tag.status),
+        ).toEqual(["active", "active", "active"]);
+        const replay = JSON.stringify(messages);
+        await pass(false);
+        expect(JSON.stringify(messages)).toBe(replay);
+        expect(getOrCreateSessionMeta(db, sessionId).toolReclaimWatermark).toBe(3);
+        await pass(true);
+        expect(
+            getTagsBySession(db, sessionId)
+                .slice(0, 3)
+                .map((tag) => tag.status),
+        ).toEqual(["dropped", "active", "dropped"]);
+    });
+
+    it("drains pending ops and previously bookmarked age reclaim on the same low-usage TTL fold", async () => {
         db = new Database(":memory:");
         initializeDatabase(db);
         const sessionId = "ses-hardfold-reclaim-drain";
@@ -5895,7 +6209,7 @@ describe("executed m[0] hard-fold folds the execute pass in", () => {
         expect(statuses.get(1)).toBe("dropped");
         expect(statuses.get(2)).toBe("dropped");
         expect(statuses.get(3)).toBe("active");
-        expect(getOrCreateSessionMeta(db, sessionId).toolReclaimWatermark).toBe(3);
+        expect(getOrCreateSessionMeta(db, sessionId).toolReclaimWatermark).toBe(2);
 
         const deferReplayBytes = JSON.stringify(messages);
         await runPostTransformPhase(
@@ -6067,16 +6381,19 @@ describe("executed m[0] hard-fold folds the execute pass in", () => {
         const statusOf = (sessionId: string, tag: number) =>
             getTagsBySession(db, sessionId).find((row) => row.tagNumber === tag)?.status;
 
-        const bumpEpoch = async () => {
-            const { bumpEpochsForWorkspaceMembers } = await import(
-                "../../features/magic-context/workspaces"
-            );
-            bumpEpochsForWorkspaceMembers(db, FOLD_PROJECT);
+        const bumpStructuralMutation = async () => {
+            for (const row of db.prepare("SELECT session_id FROM session_meta").all() as Array<{
+                session_id: string;
+            }>)
+                queueM0Mutation(db, {
+                    sessionId: row.session_id,
+                    mutationType: "compartment_delete",
+                });
         };
         const setCachedUpgradeState = (sessionId: string, from: string, to: string) => {
-            db.prepare(
-                "UPDATE session_meta SET cached_m0_upgrade_state = replace(cached_m0_upgrade_state, ?, ?) WHERE session_id = ?",
-            ).run(from, to, sessionId);
+            editCachedUpgradeFixture(db, sessionId, (value) =>
+                value === null ? null : from.length > 0 ? value.replaceAll(from, to) : value,
+            );
         };
 
         // Each HARD trigger listed below is armed alone on a session whose
@@ -6087,14 +6404,6 @@ describe("executed m[0] hard-fold folds the execute pass in", () => {
             arm: (sessionId: string) => Promise<M0HardSignals | undefined>;
             identical: boolean;
         }> = [
-            {
-                reason: "project_memory_epoch",
-                arm: async () => {
-                    await bumpEpoch();
-                    return undefined;
-                },
-                identical: true,
-            },
             {
                 reason: "upgrade_state",
                 arm: async (sessionId) => {
@@ -6165,9 +6474,9 @@ describe("executed m[0] hard-fold folds the execute pass in", () => {
             const sessionId = "ses-identical-cached-m1-missing";
             materializeBaseline(sessionId);
             const defer = await pass(sessionId);
-            db.prepare("UPDATE session_meta SET cached_m1_bytes = NULL WHERE session_id = ?").run(
-                sessionId,
-            );
+            db.prepare(
+                "DELETE FROM session_render_cache WHERE cache_key = 'cached_m1_bytes' AND session_id = ?",
+            ).run(sessionId);
             const hard = await pass(sessionId);
             expect(hard.result.materialized).toBe(true);
             expect(hard.result.materializeReason).toBe("cached_m1_missing");
@@ -6199,7 +6508,7 @@ describe("executed m[0] hard-fold folds the execute pass in", () => {
             expect(head(exec.messages)).not.toBe(head(defer.messages));
         });
 
-        it("holds a queued ctx_reduce drop on an identical-bytes project_memory_epoch HARD; the served bytes stay identical", async () => {
+        it("holds a queued ctx_reduce drop on an identical-bytes max_mutation_id HARD; the served bytes stay identical", async () => {
             db = new Database(":memory:");
             initializeDatabase(db);
             const sessionId = "ses-identical-epoch-drain";
@@ -6211,7 +6520,7 @@ describe("executed m[0] hard-fold folds the execute pass in", () => {
             const held = await pass(sessionId);
             expect(sha(held.messages)).toBe(sha(defer.messages));
 
-            await bumpEpoch();
+            await bumpStructuralMutation();
             const hard = await pass(sessionId, { turn: "turn-epoch" });
             expect(hard.result.materialized).toBe(true);
             expect(head(hard.messages)).toBe(head(defer.messages));
@@ -6269,7 +6578,7 @@ describe("executed m[0] hard-fold folds the execute pass in", () => {
             expect(sha(after.messages.slice(0, hard.messages.length))).toBe(sha(hard.messages));
         });
 
-        it("still drains on a project_memory_epoch HARD that changes m[0]", async () => {
+        it("still drains on a max_mutation_id HARD that changes m[0]", async () => {
             db = new Database(":memory:");
             initializeDatabase(db);
             const sessionId = "ses-changed-epoch-drain";
@@ -6286,10 +6595,10 @@ describe("executed m[0] hard-fold folds the execute pass in", () => {
                 content: "EPOCH_CONTENT_CHANGE: new rule.",
                 importance: 50,
             });
-            await bumpEpoch();
+            await bumpStructuralMutation();
             const hard = await pass(sessionId, { turn: "turn-epoch-changed" });
             expect(hard.result.materialized).toBe(true);
-            expect(hard.result.materializeReason).toBe("project_memory_epoch");
+            expect(hard.result.materializeReason).toBe("max_mutation_id");
             expect(head(hard.messages)).not.toBe(head(defer.messages));
             expect(statusOf(sessionId, target)).toBe("dropped");
 
@@ -6389,7 +6698,7 @@ describe("executed m[0] hard-fold folds the execute pass in", () => {
             return { messages, result };
         }
 
-        // Re-gate: an identical-bytes epoch HARD on a session that serves a mural
+        // Re-gate: an identical-bytes structural HARD on a session that serves a mural
         // image. The fold re-renders the same text and the same image, so the
         // queued drop must stay held. The lean variant starts the pass from a
         // state whose mural field was never loaded (undefined rather than null):
@@ -6397,7 +6706,7 @@ describe("executed m[0] hard-fold folds the execute pass in", () => {
         // the missing field as "no image served" and the unchanged image counts
         // as a change.
         for (const lean of [false, true]) {
-            it(`REGATE mural unchanged (${lean ? "lean" : "hydrated"} state): an identical-bytes epoch HARD holds the drop`, async () => {
+            it(`REGATE mural unchanged (${lean ? "lean" : "hydrated"} state): an identical-bytes structural HARD holds the drop`, async () => {
                 const xdg = createTestTempDirFromPath(join(tmpdir(), "mc-regate-oc-mural-"));
                 tempDirs.push(xdg);
                 process.env.XDG_DATA_HOME = xdg;
@@ -6446,13 +6755,13 @@ describe("executed m[0] hard-fold folds the execute pass in", () => {
                             "UPDATE memories SET mural_cue = ?, mural_cue_hash = ? WHERE id = ?",
                         ).run(`cue-${i}`, cues.computeCueContentHash(content), memory.id);
                     }
-                    await bumpEpoch();
+                    await bumpStructuralMutation();
                     await pass(sessionId, { mural: true });
                     const defer = await pass(sessionId, { mural: true });
                     const muralA = getOrCreateSessionMeta(db, sessionId).cachedM0MuralDataUrl;
                     const target = toolTag(sessionId, "c-mid", "m-mid");
                     queuePendingOp(db, sessionId, target, "drop");
-                    await bumpEpoch();
+                    await bumpStructuralMutation();
                     const hard = await pass(sessionId, { mural: true, leanMural: lean });
                     const muralB = getOrCreateSessionMeta(db, sessionId).cachedM0MuralDataUrl;
                     const after = await pass(sessionId, { mural: true });
@@ -6536,7 +6845,7 @@ describe("executed m[0] hard-fold folds the execute pass in", () => {
                     });
                     setCue(memory.id, `cue-a-${i}`, cues.computeCueContentHash(content));
                 }
-                await bumpEpoch();
+                await bumpStructuralMutation();
                 await pass(sessionId, { mural: true });
                 const withMural = await pass(sessionId, { mural: true });
                 const muralA = getOrCreateSessionMeta(db, sessionId).cachedM0MuralDataUrl;
@@ -6564,14 +6873,17 @@ describe("executed m[0] hard-fold folds the execute pass in", () => {
                 modelsDev.clearModelsDevCache();
             }
         });
-        const bumpEpoch = async () => {
-            const { bumpEpochsForWorkspaceMembers } = await import(
-                "../../features/magic-context/workspaces"
-            );
-            bumpEpochsForWorkspaceMembers(db, FOLD_PROJECT);
+        const bumpStructuralMutation = async () => {
+            for (const row of db.prepare("SELECT session_id FROM session_meta").all() as Array<{
+                session_id: string;
+            }>)
+                queueM0Mutation(db, {
+                    sessionId: row.session_id,
+                    mutationType: "compartment_delete",
+                });
         };
 
-        // Baseline, then a queued drop, then an identical-bytes epoch HARD that
+        // Baseline, then a queued drop, then an identical-bytes structural HARD that
         // must hold the drop. Returns the pre-HARD defer bytes and the target.
         async function heldAfterIdenticalHard(sessionId: string) {
             db = new Database(":memory:");
@@ -6580,10 +6892,10 @@ describe("executed m[0] hard-fold folds the execute pass in", () => {
             const defer = await pass(sessionId);
             const target = toolTag(sessionId, "c-mid", "m-mid");
             queuePendingOp(db, sessionId, target, "drop");
-            await bumpEpoch();
+            await bumpStructuralMutation();
             const hard = await pass(sessionId, { turn: "t-hard" });
             expect(hard.result.materialized).toBe(true);
-            expect(hard.result.materializeReason).toBe("project_memory_epoch");
+            expect(hard.result.materializeReason).toBe("max_mutation_id");
             expect(head(hard.messages)).toBe(head(defer.messages));
             expect(statusOf(sessionId, target)).toBe("active");
             expect(sha(hard.messages)).toBe(sha(defer.messages));
@@ -6679,7 +6991,7 @@ describe("executed m[0] hard-fold folds the execute pass in", () => {
                 await pass(sessionId);
                 const target = toolTag(sessionId, "c-mid", "m-mid");
                 queuePendingOp(db, sessionId, target, "drop");
-                await bumpEpoch();
+                await bumpStructuralMutation();
                 const hard = await pass(sessionId, { pct });
                 expect(hard.result.materialized).toBe(true);
                 expect(statusOf(sessionId, target)).toBe("dropped");
@@ -6706,7 +7018,7 @@ describe("executed m[0] hard-fold folds the execute pass in", () => {
                 reason: "cached_m1_missing",
                 arm: async (sessionId) => {
                     db.prepare(
-                        "UPDATE session_meta SET cached_m1_bytes = NULL WHERE session_id = ?",
+                        "DELETE FROM session_render_cache WHERE cache_key = 'cached_m1_bytes' AND session_id = ?",
                     ).run(sessionId);
                     return undefined;
                 },
@@ -7922,6 +8234,56 @@ describe("final message representation", () => {
         expect(result.thinkingBindingRecovery).toBeNull();
         expect(JSON.stringify(messages)).toBe(before);
         expect(getMergedReasoningStrippedIds(db, sessionId)).toEqual(new Set());
+    });
+
+    // Holding the merged-reasoning strip behind kept current-turn thinking applies
+    // only when that thinking is bound to the bytes before it. Other Anthropic
+    // models report the same thinking boundary but hold no edit behind it, so
+    // their merged-reasoning strip still lands on a busting pass, as before.
+    it("a non-prefix-bound model keeps its merged-reasoning strip while current-turn thinking is kept", async () => {
+        db = new Database(":memory:");
+        initializeDatabase(db);
+        const sessionId = "ses-merged-reasoning-not-prefix-bound";
+        const messages = [
+            { info: { id: "user-old", role: "user" }, parts: [{ type: "text", text: "start" }] },
+            {
+                info: { id: "assistant-first", role: "assistant" },
+                parts: [{ type: "text", text: "first assistant content" }],
+            },
+            {
+                info: { id: "assistant-merged", role: "assistant" },
+                parts: [
+                    { type: "thinking", thinking: "merged reasoning", signature: "merged-sig" },
+                    { type: "text", text: "tool-use continuation" },
+                ],
+            },
+            { info: { id: "user", role: "user" }, parts: [{ type: "text", text: "continue" }] },
+            {
+                info: { id: "assistant-current", role: "assistant" },
+                parts: [
+                    { type: "thinking", thinking: "current reasoning", signature: "current-sig" },
+                    { type: "text", text: "current step" },
+                ],
+            },
+        ] as unknown as MessageLike[];
+        const current = JSON.stringify(findMessage(messages, "assistant-current").parts);
+        await runPostTransformPhase(
+            basePostTransformArgs(db, sessionId, messages, {
+                schedulerDecision: "execute",
+                pendingMaterializationSessions: new Set([sessionId]),
+                resolvedProviderID: "anthropic",
+                resolvedModelID: "claude-opus-4-6",
+                thinkingBindingRecoveryEnabledForModel: false,
+                signedThinkingHold: "on",
+                activeThinkingTurn: true,
+            }),
+        );
+        expect(findMessage(messages, "assistant-merged").parts[0]).toEqual({
+            type: "text",
+            text: "",
+        });
+        expect(getMergedReasoningStrippedIds(db, sessionId).has("assistant-merged")).toBe(true);
+        expect(JSON.stringify(findMessage(messages, "assistant-current").parts)).toBe(current);
     });
 
     it("freezes first merged-strip application onto a bust and replays it across fresh rebuilds", async () => {
@@ -9474,6 +9836,7 @@ describe("marker-drain reasoning representation", () => {
                 ...first,
                 tagger,
                 resolvedProviderID: "anthropic",
+                readLastServedMessages: () => source(),
                 deferredMaterializationSessions: new Set([sessionId]),
                 hiddenMessagesAtCompactionSeam: [applyingRaw[1]],
                 deferredHistoryWasPendingAtPassStart: true,
@@ -10000,18 +10363,15 @@ it("competing persisted pair cannot replace the previously served TypeScript pre
             beforePhase3ForTest: !options.messages
                 ? () => {
                       competingWrites += 1;
-                      db.prepare(
-                          `UPDATE session_meta
-                              SET cached_m0_bytes = ?, cached_m1_bytes = ?,
-                                  cached_m0_max_compartment_seq = 2,
-                                  cached_m0_last_baseline_end_message_id = ?
-                            WHERE session_id = ?`,
-                      ).run(
-                          Buffer.from("<session-history>PAIR_B</session-history>", "utf8"),
-                          Buffer.from(pairA!.m1Text!, "utf8"),
-                          "covered-b",
-                          sessionId,
-                      );
+                      patchSessionMeta(db, sessionId, {
+                          cached_m0_bytes: Buffer.from(
+                              "<session-history>PAIR_B</session-history>",
+                              "utf8",
+                          ),
+                          cached_m1_bytes: Buffer.from(pairA!.m1Text!, "utf8"),
+                          cached_m0_max_compartment_seq: 2,
+                          cached_m0_last_baseline_end_message_id: "covered-b",
+                      });
                       queueM0Mutation(db, {
                           sessionId,
                           mutationType: "compartment_merge",
@@ -10723,7 +11083,11 @@ describe("ride-only queued drops", () => {
                     await runPostTransformPhase({ ...args, schedulerDecision: "defer" });
                     expect(JSON.stringify(args.messages)).toBe(baseline);
                 }
-                args.pendingMaterializationSessions.add(sessionId);
+                requestPendingMaterialization(
+                    args.pendingMaterializationSessions,
+                    sessionId,
+                    "user_flush",
+                );
                 await runPostTransformPhase(args);
                 expect(getPendingOps(db, sessionId)).toHaveLength(0);
             } finally {
@@ -10770,7 +11134,7 @@ it("queued agent batches consume only one force episode", async () => {
     await runPostTransformPhase(args);
     expect(getPendingOps(db, sessionId)).toHaveLength(1);
     expect(JSON.stringify(args.messages)).toBe(frozen);
-    args.pendingMaterializationSessions.add(sessionId);
+    requestPendingMaterialization(args.pendingMaterializationSessions, sessionId, "user_flush");
     await runPostTransformPhase(args);
     expect(getPendingOps(db, sessionId)).toHaveLength(0);
 });
@@ -10938,6 +11302,9 @@ describe("pending-ops and heuristics permission labels", () => {
         initializeDatabase(db);
 
         const publishedHistory = await permissionLines("ses-ride-published-history", {
+            readLastServedMessages: () => [
+                { info: { role: "user" }, parts: [{ type: "text", text: "previous history" }] },
+            ],
             contextUsage: { percentage: 20, inputTokens: 1_000 },
             historyRebuiltThisPass: true,
             pendingCompartmentInjection: {
@@ -11056,26 +11423,103 @@ describe("proactive strip of thinking on busting passes", () => {
             },
         ] as unknown as MessageLike[];
 
-    const serve = (
+    // The host owns the top-level system string; each session keeps one
+    // pending set across passes, as the plugin's live session state does.
+    const hostSystems = new Map<string, string>();
+    const pendingBySession = new Map<string, Set<string>>();
+    const servedRequests = new Map<string, { system: string; messages: MessageLike[] }[]>();
+    const serve = async (
         sessionId: string,
         messages: MessageLike[],
         options: { busting: boolean; boundModel?: boolean; fullFeatureMode?: boolean },
-    ) =>
-        runPostTransformPhase(
+    ) => {
+        const pending = pendingBySession.get(sessionId) ?? new Set<string>();
+        pendingBySession.set(sessionId, pending);
+        if (options.busting) {
+            hostSystems.set(
+                sessionId,
+                `${hostSystems.get(sessionId) ?? "Original system prompt"}\nNext system revision`,
+            );
+            hostSystemChanged(sessionId, pending);
+        }
+        const result = await runPostTransformPhase(
             basePostTransformArgs(db, sessionId, messages, {
                 resolvedProviderID: "anthropic",
                 thinkingBindingRecoveryEnabledForModel: options.boundModel ?? true,
                 fullFeatureMode: options.fullFeatureMode ?? true,
-                ...(options.busting
-                    ? { pendingMaterializationSessions: new Set([sessionId]) }
-                    : { schedulerDecision: "defer" as const }),
+                pendingMaterializationSessions: pending,
+                ...(options.busting ? {} : { schedulerDecision: "defer" as const }),
             }),
         );
+        const requests = servedRequests.get(sessionId) ?? [];
+        requests.push({
+            system: hostSystems.get(sessionId) ?? "Original system prompt",
+            messages: structuredClone(messages),
+        });
+        servedRequests.set(sessionId, requests);
+        return result;
+    };
 
     const openDb = () => {
         db = new Database(":memory:");
         initializeDatabase(db);
+        hostSystems.clear();
+        pendingBySession.clear();
+        servedRequests.clear();
     };
+
+    it("a host system change strips older thinking with it; a failed strip refuses and the next pass retries", async () => {
+        openDb();
+        const sessionId = "ses-paired-system-request";
+        await serve(sessionId, buildSession(sessionId), { busting: false });
+        expect(servedRequests.get(sessionId)?.[0].system).toBe("Original system prompt");
+        const changed = await serve(sessionId, buildSession(sessionId), { busting: true });
+        expect(servedRequests.get(sessionId)?.[1].system).toBe(
+            "Original system prompt\nNext system revision",
+        );
+        expect(changed.proactiveThinkingStrip?.messageIds).toEqual(ALL_ASSISTANTS);
+        await serve(sessionId, buildSession(sessionId), { busting: false });
+        expect(servedRequests.get(sessionId)?.[2]).toEqual(servedRequests.get(sessionId)?.[1]);
+        await serve(sessionId, appendTurn(buildSession(sessionId), sessionId, "four"), {
+            busting: false,
+        });
+        expect(
+            reasoningCount(
+                findMessage(servedRequests.get(sessionId)![3].messages, "assistant-four"),
+            ),
+        ).toBe(1);
+        rejectSessionMetaCollectionWrites(
+            db,
+            "merged_reasoning_stripped_ids",
+            "reject_system_companion",
+            { error: "reject companion" },
+        );
+        await expect(
+            serve(sessionId, appendTurn(buildSession(sessionId), sessionId, "four"), {
+                busting: true,
+            }),
+        ).rejects.toMatchObject({ site: "proactive-thinking-strip-persistence-failure" });
+        expect(servedRequests.get(sessionId)?.length).toBe(4);
+        clearSessionMetaFixtureFault(db, "reject_system_companion");
+        // The host already serves the new system, so the next pass owes the strip.
+        const retried = await serve(
+            sessionId,
+            appendTurn(buildSession(sessionId), sessionId, "four"),
+            {
+                busting: false,
+            },
+        );
+        expect(retried.proactiveThinkingStrip?.messageIds).toEqual(["assistant-four"]);
+        const served = servedRequests.get(sessionId)![4];
+        expect(served.system).toBe(
+            "Original system prompt\nNext system revision\nNext system revision",
+        );
+        expect(reasoningCount(findMessage(served.messages, "assistant-four"))).toBe(0);
+        await serve(sessionId, appendTurn(buildSession(sessionId), sessionId, "four"), {
+            busting: false,
+        });
+        expect(servedRequests.get(sessionId)?.[5]).toEqual(served);
+    });
 
     it("a budget-shrink HARD strips thinking on the resizing pass and not the next replay", async () => {
         openDb();
@@ -11185,7 +11629,7 @@ describe("proactive strip of thinking on busting passes", () => {
                             resolvedProviderID: providerID,
                             thinkingBindingRecoveryEnabledForModel: enabled,
                             ...(busting
-                                ? { pendingMaterializationSessions: new Set([sessionId]) }
+                                ? { pendingMaterializationSessions: hostSystemChanged(sessionId) }
                                 : { schedulerDecision: "defer" as const }),
                         }),
                     );
@@ -11304,13 +11748,13 @@ describe("proactive strip of thinking on busting passes", () => {
         );
     });
 
-    it("refuses and remembers nothing when the proactive frozen set cannot be written", async () => {
+    it("refuses and persists no strip decision when the frozen set cannot be written; the owed strip lands on the next pass", async () => {
         openDb();
         const sessionId = "ses-proactive-persist-failure";
         await serve(sessionId, buildSession(sessionId), { busting: false });
-        db.exec(
-            "CREATE TRIGGER refuse_freeze BEFORE UPDATE OF merged_reasoning_stripped_ids ON session_meta BEGIN SELECT RAISE(FAIL, 'transient freeze write failure'); END",
-        );
+        rejectSessionMetaCollectionWrites(db, "merged_reasoning_stripped_ids", "refuse_freeze", {
+            error: "transient freeze write failure",
+        });
         const failed = buildSession(sessionId, "re-rendered first user message");
         const before = JSON.stringify(failed);
         await expect(serve(sessionId, failed, { busting: true })).rejects.toMatchObject({
@@ -11320,13 +11764,18 @@ describe("proactive strip of thinking on busting passes", () => {
         expect(JSON.stringify(failed)).toBe(before);
         expect(getMergedReasoningStrippedIds(db, sessionId)).toEqual(new Set());
 
-        // With the store writable again, a defer pass serves the same bytes: no
-        // strip decision survived the failed write anywhere.
-        db.exec("DROP TRIGGER refuse_freeze");
-        const defer = buildSession(sessionId, "re-rendered first user message");
-        const deferResult = await serve(sessionId, defer, { busting: false });
-        expect(deferResult.proactiveThinkingStrip).toBeNull();
-        expect(JSON.stringify(defer)).toBe(before);
+        // With the store writable again, the failed pass left no strip decision
+        // behind, but the host still serves the changed system prompt, so the
+        // next pass owes the strip and lands it.
+        clearSessionMetaFixtureFault(db, "refuse_freeze");
+        const retry = buildSession(sessionId, "re-rendered first user message");
+        const retryResult = await serve(sessionId, retry, { busting: false });
+        expect(retryResult.proactiveThinkingStrip).toEqual({ messageIds: ALL_ASSISTANTS });
+        const replay = buildSession(sessionId, "re-rendered first user message");
+        expect(
+            (await serve(sessionId, replay, { busting: false })).proactiveThinkingStrip,
+        ).toBeNull();
+        expect(JSON.stringify(replay)).toBe(JSON.stringify(retry));
     });
 
     it("leaves sessions on other models byte-identical on a busting pass", async () => {
@@ -11431,9 +11880,9 @@ describe("proactive strip of thinking on busting passes", () => {
         openDb();
         const sessionId = "ses-proactive-rust-persist-failure";
         getOrCreateSessionMeta(db, sessionId);
-        db.exec(
-            "CREATE TRIGGER refuse_freeze BEFORE UPDATE OF merged_reasoning_stripped_ids ON session_meta BEGIN SELECT RAISE(FAIL, 'transient freeze write failure'); END",
-        );
+        rejectSessionMetaCollectionWrites(db, "merged_reasoning_stripped_ids", "refuse_freeze", {
+            error: "transient freeze write failure",
+        });
         const busting = buildSession(sessionId);
         const before = JSON.stringify(busting);
         const result = runRustModePostprocess({
@@ -11861,7 +12310,9 @@ describe("prefix-bound all-or-none reasoning", () => {
                 contextUsage: options.force
                     ? { percentage: 96, inputTokens: 96_000 }
                     : { percentage: 20, inputTokens: 1000 },
-                ...(options.flush ? { pendingMaterializationSessions: new Set([sessionId]) } : {}),
+                ...(options.flush
+                    ? { pendingMaterializationSessions: hostSystemChanged(sessionId) }
+                    : {}),
                 ...options.overrides,
             }),
         );
@@ -11927,7 +12378,7 @@ describe("prefix-bound all-or-none reasoning", () => {
         for (const m of pass.messages.slice(1)) expect(reasoningCount(m)).toBe(0);
     });
 
-    it('"Change the top-level `system` string or blocks" is invalid, and a requested materialization cannot say whether it changed it, so a trimming pass that materializes strips every signed block', async () => {
+    it("a durable top-level system edit strips every signed block without changing the shared message prefix", async () => {
         openDb();
         const sessionId = "ses-bound-trim-and-flush";
         await serve(sessionId, boundLoop(sessionId, 8));
@@ -12037,7 +12488,7 @@ describe("prefix-bound all-or-none reasoning", () => {
         }
     });
 
-    it("review: a served hint still strips signed thinking and its defer replay is byte-identical", async () => {
+    it("a served hint rides a durable system edit and its defer replay is byte-identical", async () => {
         openDb();
         const embedding = await import("../../features/magic-context/memory/embedding");
         const worker = await import("./auto-search-worker-client");
@@ -12071,6 +12522,9 @@ describe("prefix-bound all-or-none reasoning", () => {
                 force: true,
                 clearReasoningAge: 999,
                 overrides: {
+                    pendingMaterializationSessions: hostSystemChanged(sessionId, new Set(), {
+                        materialize: false,
+                    }),
                     projectPath: "git:review-healthy",
                     autoSearch: { enabled: true, scoreThreshold: 0, minPromptChars: 1 },
                 },
@@ -12905,6 +13359,8 @@ describe("signed-prefix riders on unavoidable busts", () => {
                     };
                     const targets = new Map([[1, target]]);
                     const replayed = applyFlushedStatuses(sessionId, db, targets);
+                    if (cold && cause === "idle expiry")
+                        seedHeldServedPrefix(db, sessionId, source);
                     const result = await runPostTransformPhase(
                         basePostTransformArgs(db, sessionId, source, {
                             activeThinkingTurn: true,
@@ -13005,6 +13461,7 @@ it("an already-cold held pass runs safe routine cleanup without stripping thinki
         mutationParts: [{ message: old, part: old.parts[1] }],
         dropReasoningParts: [],
     };
+    seedHeldServedPrefix(db, sessionId, messages);
     const cleanup = spyOn(heuristicCleanup, "applyHeuristicCleanup");
     try {
         const result = await runPostTransformPhase(
@@ -13049,7 +13506,7 @@ it("an already-cold held pass runs safe routine cleanup without stripping thinki
     }
 });
 
-it("a first render reproducing the served pair keeps all signed thinking", async () => {
+it("a cleared cache replays the served record and keeps all signed thinking", async () => {
     db = new Database(":memory:");
     initializeDatabase(db);
     const sessionId = "first-render-same-binding-prefix";
@@ -13081,6 +13538,7 @@ it("a first render reproducing the served pair keeps all signed thinking", async
             parts: [{ type: "reasoning", text: "active signed" }],
         },
     ];
+    seedHeldServedPrefix(db, sessionId, messages, heads);
     const result = await runPostTransformPhase(
         basePostTransformArgs(db, sessionId, messages, {
             activeThinkingTurn: true,
@@ -13542,8 +14000,11 @@ describe("independent image cache safety through both host projections", () => {
             initializeDatabase(db);
             const sessionId = `independent-fault-${host}`;
             getOrCreateSessionMeta(db, sessionId);
-            db.exec(
-                `CREATE TRIGGER fail_independent_image_freeze BEFORE UPDATE OF processed_image_stripped_ids ON session_meta BEGIN SELECT RAISE(ABORT, 'independent image persistence fault'); END`,
+            rejectSessionMetaCollectionWrites(
+                db,
+                "processed_image_stripped_ids",
+                "fail_independent_image_freeze",
+                { error: "independent image persistence fault" },
             );
             const projected = project("openai");
             const before = projected.bytes();
@@ -13563,7 +14024,7 @@ describe("independent image cache safety through both host projections", () => {
             projected.commit();
             expect(projected.bytes()).toBe(before);
             expect([...getProcessedImageStrippedIds(db, sessionId)]).toEqual([]);
-            db.exec("DROP TRIGGER fail_independent_image_freeze");
+            clearSessionMetaFixtureFault(db, "fail_independent_image_freeze");
             const deferred = await serve(sessionId, false);
             expect(deferred.bytes()).toBe(deferred.before);
             const retry = await serve(sessionId, true);
@@ -13672,3 +14133,288 @@ describe("independent image cache safety through both host projections", () => {
         });
     }
 });
+
+it("served prefix replay keeps the summary and does not consume a pending marker", async () => {
+    db = new Database(":memory:");
+    initializeDatabase(db);
+    const sessionId = "record-marker-replay";
+    const injection = {
+        projectPath: "git:record-marker",
+        projectDirectory: "/nonexistent",
+        memoryEnabled: false,
+        injectDocs: false,
+    };
+    injectM0M1({
+        db,
+        sessionId,
+        state: getOrCreateSessionMeta(db, sessionId),
+        ...injection,
+        isCacheBustingPass: true,
+    });
+    const head = prepareCachedM0M1Replay(db, sessionId)!.preparedMessages!;
+    const first: MessageLike = {
+        info: { id: "turn", role: "user" },
+        parts: [{ type: "text", text: "Continue" }],
+    };
+    const summary: MessageLike = {
+        info: { id: "old-summary", role: "assistant", summary: true },
+        parts: [{ type: "text", text: "Frozen summary" }],
+    };
+    const marker = {
+        boundaryMessageId: "covered",
+        summaryMessageId: "old-summary",
+        compactionPartId: "old-compaction",
+        summaryPartId: "old-summary-part",
+        boundaryOrdinal: 1,
+        targetEndMessageId: "covered",
+    };
+    setPersistedCompactionMarkerState(db, sessionId, marker);
+    const pending = { ordinal: 1, endMessageId: "covered", publishedAt: 1 };
+    setPendingCompactionMarkerState(db, sessionId, pending);
+    const record = writeServedPrefix({
+        db,
+        sessionId,
+        head,
+        summary,
+        firstKept: first,
+        firstKeptId: "turn",
+        turn: "turn",
+        provenance: {
+            host: "opencode-v1",
+            id_space: "opencode-v1-message",
+            generation: "v1",
+            projection: "messages",
+            model: SEEDED_PREFIX_MODEL,
+        },
+        cut: { mode: "inclusive", id: "covered" },
+    });
+    setPersistedCompactionMarkerState(db, sessionId, null);
+    let drains = 0;
+    const deferred = new Set([sessionId]);
+    const messages: MessageLike[] = [
+        { info: { id: "covered", role: "user" }, parts: [{ type: "text", text: "Earlier work" }] },
+        structuredClone(first),
+        {
+            info: { id: "thinking", role: "assistant" },
+            parts: [
+                {
+                    type: "reasoning",
+                    text: "Current thought",
+                    metadata: { anthropic: { signature: "signed" } },
+                },
+            ],
+        },
+    ];
+    const result = await runPostTransformPhase(
+        basePostTransformArgs(db, sessionId, messages, {
+            m0M1: {
+                ...injection,
+                hardSignals: {
+                    cacheExpired: true,
+                    systemHash: "",
+                    modelKey: "",
+                    lastResponseTime: 1,
+                },
+            },
+            activeThinkingTurn: true,
+            activeThinkingPrefixHold: true,
+            freezeM0M1: true,
+            signedThinkingHold: "on",
+            resolvedProviderID: "anthropic",
+            resolvedModelID: "claude-opus-5-5",
+            thinkingBindingRecoveryEnabledForModel: true,
+            historyRebuiltThisPass: true,
+            canConsumeDeferredLate: true,
+            deferredHistoryWasPendingAtPassStart: true,
+            deferredHistoryRefreshSessions: deferred,
+            prefixTrimSourceOrder: capturePrefixTrimSourceOrder(messages),
+            pendingCompartmentInjection: {
+                block: "",
+                compartmentEndMessage: 1,
+                compartmentEndMessageId: "covered",
+                compartmentCount: 1,
+                skippedVisibleMessages: 0,
+                factCount: 0,
+                memoryCount: 0,
+                rebuiltFromDb: true,
+            },
+            compactionMarkerStrategy: {
+                reconcile: reconcileMarkerRepresentation,
+                applyDeferred: () => {
+                    drains++;
+                    setPersistedCompactionMarkerState(db!, sessionId, {
+                        ...marker,
+                        summaryMessageId: "moved-summary",
+                    });
+                    return { kind: "applied", markerOrdinal: 1 };
+                },
+            },
+        }),
+    );
+    expect(drains).toBe(0);
+    expect(result.historianFoldMaterializedThisPass).toBe(false);
+    expect(deferred.has(sessionId)).toBe(true);
+    expect(getPendingCompactionMarkerState(db, sessionId)).toEqual(pending);
+    expect(getPersistedCompactionMarkerState(db, sessionId)).toBeNull();
+    expect(getDeferredClearedCompactionMarkerState(db, sessionId)).toEqual(marker);
+    expect(messages.find((message) => message.info.summary === true)).toEqual(summary);
+    expect(readServedPrefix(db, sessionId)).toEqual(record);
+});
+
+it("compaction-off late digest failure serves the complete cached head, not raw input", async () => {
+    db = new Database(":memory:");
+    initializeDatabase(db);
+    const sessionId = "late-off-record";
+    const injection = {
+        projectPath: "git:off-record",
+        projectDirectory: "/nonexistent",
+        memoryEnabled: false,
+        injectDocs: false,
+    };
+    const first: MessageLike = {
+        info: { id: "turn", role: "user" },
+        parts: [{ type: "text", text: "Task" }],
+    };
+    const base = () =>
+        basePostTransformArgs(db!, sessionId, [structuredClone(first)], {
+            compactionOff: true,
+            m0M1: injection,
+            resolvedProviderID: "anthropic",
+            resolvedModelID: "claude-opus-5-5",
+            thinkingBindingRecoveryEnabledForModel: true,
+        });
+    await runPostTransformPhase(base());
+    const record = readServedPrefix(db, sessionId);
+    const args = base();
+    args.messages.push({
+        info: { id: "current", role: "assistant" },
+        parts: [
+            {
+                type: "reasoning",
+                text: "Active thought",
+                metadata: { anthropic: { signature: "active" } },
+            },
+        ],
+    });
+    args.activeThinkingTurn = true;
+    args.activeThinkingPrefixHold = true;
+    const result = await runUnfinalizedPostTransformPhase(args);
+    const raw = args.messages.find((message) => message.info.id === "turn")!;
+    (raw.parts[0] as { text: string }).text = "Changed after replay";
+    updateSessionMeta(db, sessionId, {
+        cachedM0Bytes: Buffer.from("<session-history>cached fallback</session-history>"),
+    });
+    expect(() => result.finalizeServedPrefix?.()).not.toThrow();
+    expect(args.messages[0].parts[0]).toMatchObject({
+        text: "<session-history>cached fallback</session-history>",
+    });
+    expect(args.messages).toContain(raw);
+    expect(readServedPrefix(db, sessionId)).toEqual(record);
+});
+
+for (const visible of [true, false])
+    it(
+        visible
+            ? "applying a marker alone pairs its new prefix with older-thinking omissions"
+            : "retiring an unserved marker does not strip thinking or originate a bust",
+        async () => {
+            db = new Database(":memory:");
+            initializeDatabase(db);
+            const sessionId = "record-marker-first-apply";
+            const injection = {
+                projectPath: "git:record-marker-apply",
+                projectDirectory: "/nonexistent",
+                memoryEnabled: false,
+                injectDocs: false,
+                hardSignals: {
+                    systemHash: "stable-system",
+                    modelKey: "anthropic/claude-opus-5-5",
+                    cacheExpired: false,
+                    lastResponseTime: Date.now(),
+                },
+            };
+            injectM0M1({
+                db,
+                sessionId,
+                state: getOrCreateSessionMeta(db, sessionId),
+                ...injection,
+                isCacheBustingPass: true,
+            });
+            const head = prepareCachedM0M1Replay(db, sessionId)!.preparedMessages!;
+            const first: MessageLike = {
+                info: { id: "old-user", role: "user" },
+                parts: [{ type: "text", text: "Earlier task" }],
+            };
+            writeServedPrefix({
+                db,
+                sessionId,
+                head,
+                summary: null,
+                firstKept: first,
+                firstKeptId: "old-user",
+                turn: "current-user",
+                provenance: {
+                    host: "opencode-v1",
+                    id_space: "opencode-v1-message",
+                    generation: "v1",
+                    projection: "messages",
+                },
+            });
+            setPersistedCompactionMarkerState(db, sessionId, {
+                boundaryMessageId: "old-user",
+                summaryMessageId: "new-summary",
+                compactionPartId: "compaction",
+                summaryPartId: "summary-part",
+                boundaryOrdinal: 1,
+                targetEndMessageId: null,
+            });
+            if (!visible) setPersistedCompactionMarkerState(db, sessionId, null);
+            const messages: MessageLike[] = [
+                structuredClone(first),
+                {
+                    info: { id: "old-thinking", role: "assistant" },
+                    parts: [
+                        {
+                            type: "reasoning",
+                            text: "Older signed thought",
+                            metadata: { anthropic: { signature: "old-signature" } },
+                        },
+                        { type: "text", text: "Earlier answer" },
+                    ],
+                },
+                {
+                    info: { id: "current-user", role: "user" },
+                    parts: [{ type: "text", text: "Next task" }],
+                },
+            ];
+            const result = await runPostTransformPhase(
+                basePostTransformArgs(db, sessionId, messages, {
+                    m0M1: injection,
+                    signedThinkingHold: "on",
+                    resolvedProviderID: "anthropic",
+                    resolvedModelID: "claude-opus-5-5",
+                    thinkingBindingRecoveryEnabledForModel: true,
+                    pendingMaterializationSessions: new Set([sessionId]),
+                }),
+            );
+            expect(messages.slice(0, head.length)).toEqual(head);
+            expect(messages.some((message) => message.info.summary === true)).toBe(visible);
+            expect(
+                messages
+                    .flatMap((message) => message.parts)
+                    .some((part) => (part as { type?: string }).type === "reasoning"),
+            ).toBe(!visible);
+            if (visible)
+                expect(getMergedReasoningStrippedIds(db, sessionId)).toContain(
+                    "binding_mismatch:old-thinking",
+                );
+            else
+                expect(getMergedReasoningStrippedIds(db, sessionId)).not.toContain(
+                    "binding_mismatch:old-thinking",
+                );
+            expect(result.bustedThisPass).toBe(visible);
+            expect(readServedPrefix(db, sessionId)?.summary).toEqual(
+                messages.find((message) => message.info.summary === true) ?? null,
+            );
+        },
+    );

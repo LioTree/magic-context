@@ -12,6 +12,12 @@ use std::{
     time::Duration,
 };
 
+use crate::runner_follow::{self, FollowCapabilities};
+use crate::runner_limits::RunnerLimits;
+use cortexkit_role_llm_runner::run::{
+    RunResult as RoleRunResult, RunState as RoleRunState, RunStatus as RoleRunStatus,
+};
+use cortexkit_role_llm_runner::send::SendRequest as RoleSendRequest;
 use serde::Serialize;
 use serde_json::{json, Value};
 use subc_control::{ClientControlRequest, ClientControlResponse, ConsumerIdentity};
@@ -24,7 +30,7 @@ use subc_transport::{
 };
 use tokio::net::TcpStream;
 
-use crate::route_targets::{RegisteredRoute, RouteTargetConfig};
+use crate::route_targets::{RegisteredRoute, RouteTargetConfig, SessionRunnerRoute};
 
 /// Output budget for a historian summarization pass. llm-runner's default (4k) truncated
 /// a real 50k-input chunk mid-XML on the rig: a tiered compartment doc for a full chunk
@@ -35,7 +41,8 @@ const HISTORIAN_SESSION_RETENTION_SECONDS: u64 = 86_400;
 
 #[derive(Serialize)]
 struct GenerationRequest {
-    max_output_tokens: u32,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    max_output_tokens: Option<u64>,
     #[serde(skip_serializing_if = "Option::is_none")]
     temperature: Option<f64>,
 }
@@ -63,16 +70,66 @@ struct SendParams<'a> {
     model: SendModel<'a>,
     #[serde(skip_serializing_if = "Option::is_none")]
     retention: Option<u64>,
-    tools: &'a [Value],
+    #[serde(skip_serializing_if = "Option::is_none")]
+    tools: Option<&'a [Value]>,
     generation: GenerationRequest,
     #[serde(skip_serializing_if = "str::is_empty")]
     system: &'a str,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    stop_when: Option<StopWhen>,
 }
+
+/// The runner-enforced step limit. A historian child has no tools, so it gets
+/// exactly one model step.
+#[derive(Serialize)]
+struct StopWhen {
+    max_steps: u64,
+}
+
+/// The step limit a historian child runs under on a session runner.
+const HISTORIAN_SESSION_RUNNER_MAX_STEPS: u64 = 1;
 
 #[derive(Serialize)]
 pub(crate) struct SendRequest<'a> {
     method: &'static str,
     params: SendParams<'a>,
+}
+
+impl<'a> SendRequest<'a> {
+    /// Apply the runner's declared limits to this historian `session.send` request.
+    pub(crate) fn for_session_runner(
+        mut self,
+        limits: RunnerLimits,
+    ) -> Result<Self, HistorianProducerError> {
+        limits.require_historian()?;
+        if self.params.model.provider == "opencode" {
+            return Err(crate::runner_limits::refusal(
+                "historian_zen_no_tools: OpenCode Zen requires an offered tool".into(),
+            ));
+        }
+        let mut run = RoleSendRequest::new(self.params.prompt, self.params.send_id)
+            .with_max_steps(HISTORIAN_SESSION_RUNNER_MAX_STEPS)
+            .with_no_tools();
+        if limits.max_output_tokens {
+            if let Some(cap) = self.params.generation.max_output_tokens {
+                run = run.with_max_output_tokens(cap);
+            }
+        }
+        // Validate limits with the role builders, then copy their values into
+        // SendParams to preserve the established wire-field order.
+        self.params.stop_when = run
+            .max_steps()
+            .map_err(run_parameter_error)?
+            .map(|max_steps| StopWhen { max_steps });
+        self.params.generation.max_output_tokens =
+            run.max_output_tokens().map_err(run_parameter_error)?;
+        self.params.tools = run
+            .no_tools()
+            .map_err(run_parameter_error)?
+            .filter(|empty| *empty)
+            .map(|_| &[][..]);
+        Ok(self)
+    }
 }
 
 /// Build one `session.send` request. `model` is the canonical `provider/model` string,
@@ -94,6 +151,9 @@ pub(crate) fn session_send_request<'a>(
             format!("model '{model}' is not in canonical provider/model form"),
         ))
     })?;
+    let run = RoleSendRequest::new(prompt, send_id)
+        .with_max_output_tokens(u64::from(max_output_tokens))
+        .with_no_tools();
     Ok(SendRequest {
         method: "session.send",
         params: SendParams {
@@ -105,14 +165,23 @@ pub(crate) fn session_send_request<'a>(
                 variant: variant.filter(|variant| !variant.is_empty()),
             },
             retention,
-            tools: &[],
+            tools: run
+                .no_tools()
+                .map_err(run_parameter_error)?
+                .filter(|empty| *empty)
+                .map(|_| &[][..]),
             generation: GenerationRequest {
-                max_output_tokens,
+                max_output_tokens: run.max_output_tokens().map_err(run_parameter_error)?,
                 temperature,
             },
             system,
+            stop_when: None,
         },
     })
+}
+
+fn run_parameter_error(field: String) -> HistorianProducerError {
+    HistorianProducerError::Subc(ProducerErrorBody::untagged("invalid_params", field))
 }
 const DEFAULT_HANDSHAKE_TIMEOUT: Duration = Duration::from_secs(2);
 const DEFAULT_REQUEST_TIMEOUT: Duration = Duration::from_secs(30);
@@ -394,9 +463,9 @@ fn stage_submission(handle: &str) -> Result<Option<Value>, HistorianProducerErro
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ProducerOutput {
     pub text: String,
-    /// True when any unit in the run reported a length-class finish reason. The run
-    /// terminal can still say completed while a model step hit its output ceiling and
-    /// cut the text mid-document, so validation failures need this to self-diagnose.
+    /// True when a completion transport reports an output-length finish. The role
+    /// result does not define that metadata, so llm-runner leaves this false rather
+    /// than inferring a finish reason from an open control event.
     pub length_capped: bool,
     /// Provider token spend for the run, when the runner reported any. `None` means
     /// nothing was reported, not a zero-cost run.
@@ -432,9 +501,31 @@ pub(crate) fn producer_token_log(
 }
 
 impl ProducerUsage {
+    pub(crate) fn from_contract_usage(
+        value: &cortexkit_role_llm_runner::usage::RunUsage,
+    ) -> Option<Self> {
+        if [
+            value.input_tokens,
+            value.output_tokens,
+            value.cached_input_tokens,
+            value.cache_write_tokens,
+        ]
+        .iter()
+        .all(Option::is_none)
+        {
+            return None;
+        }
+        Some(Self {
+            input: value.input_tokens.unwrap_or(0),
+            output: value.output_tokens.unwrap_or(0),
+            cache_read: value.cached_input_tokens.unwrap_or(0),
+            cache_write: value.cache_write_tokens.unwrap_or(0),
+        })
+    }
     /// Reads a runner usage object (`input_tokens`, `output_tokens`,
     /// `cached_input_tokens`, `cache_write_tokens`; each optional). Returns `None` when
     /// the value is not an object.
+    #[cfg(test)]
     fn from_runner_usage(value: &Value) -> Option<Self> {
         let object = value.as_object()?;
         let field = |name: &str| object.get(name).and_then(Value::as_u64).unwrap_or(0);
@@ -444,13 +535,6 @@ impl ProducerUsage {
             cache_read: field("cached_input_tokens"),
             cache_write: field("cache_write_tokens"),
         })
-    }
-
-    fn add(&mut self, other: Self) {
-        self.input = self.input.saturating_add(other.input);
-        self.output = self.output.saturating_add(other.output);
-        self.cache_read = self.cache_read.saturating_add(other.cache_read);
-        self.cache_write = self.cache_write.saturating_add(other.cache_write);
     }
 }
 
@@ -544,6 +628,11 @@ pub enum HistorianProducerError {
 }
 
 impl HistorianProducerError {
+    /// An llm-runner reply in the wrong envelope (`runner_reply_shape`).
+    pub(crate) fn is_runner_reply_shape(&self) -> bool {
+        matches!(self, Self::Subc(body) if body.code == crate::session_resolver::RUNNER_REPLY_SHAPE)
+    }
+
     pub(crate) fn unknown_send_outcome(&self) -> bool {
         matches!(
             self,
@@ -868,9 +957,15 @@ pub struct HistorianProducer {
     /// `None` means this route has not been queried; `Some(None)` means it declared no
     /// usable retention group. This cache belongs to a route and is cleared on close.
     route_retention: Option<Option<u64>>,
+    route_limits: RunnerLimits,
+    route_follow: FollowCapabilities,
+    control_pending: bool,
     /// Freeze the first send's policy for this session. In particular, a session that
     /// began without retention must not opt in on a later send.
     session_retention: Option<Option<u64>>,
+    /// When set, every route opens to this session's own runner instead of the
+    /// configured runner module. The child session remains its own bind identity.
+    session_runner: Option<SessionRunnerRoute>,
 }
 
 impl HistorianProducer {
@@ -913,16 +1008,21 @@ impl HistorianProducer {
         // does not record a retention. Giving stage sessions a retention would first require
         // persisting it in that stage request. Stage sends happen only while
         // `historian_stage::RUST_LIFECYCLE_ENABLED` is on, which it is not in production.
-        let request = serde_json::to_value(session_send_request(
-            stage_key,
-            system,
-            prompt,
-            model,
-            variant,
-            max_output_tokens,
-            temperature,
-            None,
-        )?)?;
+        self.retention_for_route(route).await?;
+        self.require_follow()?;
+        let request = serde_json::to_value(
+            session_send_request(
+                stage_key,
+                system,
+                prompt,
+                model,
+                variant,
+                max_output_tokens,
+                temperature,
+                None,
+            )?
+            .for_session_runner(self.route_limits)?,
+        )?;
         match self.unary_json(route, &request).await {
             Ok(response) => match send_outcome(&response) {
                 SendOutcome::Active(run_id) => Ok(RunHandle { run_id }),
@@ -1021,8 +1121,22 @@ impl HistorianProducer {
             command_route: None,
             subscribe_route: None,
             route_retention: None,
+            route_limits: RunnerLimits::default(),
+            route_follow: FollowCapabilities::default(),
+            control_pending: false,
             session_retention: None,
+            session_runner: None,
         })
+    }
+
+    /// Connect a producer whose routes go to a runner-lane conversation's own runner.
+    pub async fn connect_to_session_runner(
+        config: HistorianProducerConfig,
+        route: SessionRunnerRoute,
+    ) -> Result<Self, HistorianProducerError> {
+        let mut producer = Self::connect(config).await?;
+        producer.session_runner = Some(route);
+        Ok(producer)
     }
 
     /// Bind subsequent status/subscribe/cancel calls to an existing session. Reattach
@@ -1093,7 +1207,8 @@ impl HistorianProducer {
         // Check `role.describe` before building this send; include retention only when
         // the runner advertises support. Its first accepted send fixes the session's
         // lifetime, so repeat sends must keep that initial policy.
-        let declared_retention = self.retention_for_route(route).await;
+        let declared_retention = self.retention_for_route(route).await?;
+        self.require_follow()?;
         let retention = select_session_retention(&mut self.session_retention, declared_retention);
         // The route identity is the session. Keeping `session` out of this body avoids
         // a second, diverging source of truth for the run lineage.
@@ -1123,7 +1238,8 @@ impl HistorianProducer {
             max_output_tokens,
             temperature,
             retention,
-        )?;
+        )?
+        .for_session_runner(self.route_limits)?;
         let response = self.unary_json(route, body).await?;
         match send_outcome(&response) {
             SendOutcome::Active(run_id) => Ok(RunHandle { run_id }),
@@ -1198,6 +1314,8 @@ impl HistorianProducer {
             return Ok(RunState::Active);
         }
         let route = self.ensure_command_route().await?;
+        self.retention_for_route(route).await?;
+        self.require_follow()?;
         let response = self
             .unary_json(
                 route,
@@ -1246,18 +1364,33 @@ impl HistorianProducer {
             let _ = self.send_goodbye(route).await;
         }
         self.route_retention = None;
+        self.route_limits = RunnerLimits::default();
+        self.route_follow = FollowCapabilities::default();
+        self.control_pending = false;
     }
 
-    async fn retention_for_route(&mut self, route: OpenedRoute) -> Option<u64> {
+    /// Read and cache the route runner's `role.describe`: its retention, run
+    /// limits and follow groups. A reply in the wrong envelope is returned as
+    /// `runner_reply_shape` and nothing is cached; any other failure reads as a
+    /// runner declaring no groups, which `require_follow` then names.
+    async fn retention_for_route(
+        &mut self,
+        route: OpenedRoute,
+    ) -> Result<Option<u64>, HistorianProducerError> {
         if let Some(retention) = self.route_retention {
-            return retention;
+            return Ok(retention);
         }
 
         let described = self
             .unary_json(route, json!({ "method": "role.describe", "params": {} }))
             .await;
         let retention = match described {
-            Ok(answer) => retention_from_role_describe(&answer),
+            Ok(answer) => {
+                self.route_limits = RunnerLimits::from_describe(&answer);
+                self.route_follow = FollowCapabilities::from_describe(&answer);
+                retention_from_role_describe(&answer)
+            }
+            Err(error) if error.is_runner_reply_shape() => return Err(error),
             Err(_) => None,
         };
         if retention.is_none() {
@@ -1267,7 +1400,27 @@ impl HistorianProducer {
             });
         }
         self.route_retention = Some(retention);
-        retention
+        Ok(retention)
+    }
+
+    /// Reuse the route-local describe cache for both configured and session-owned
+    /// module runners. Discovery binds the next child, never the foreground session.
+    pub(crate) async fn session_runner_limits(
+        &mut self,
+        child: &str,
+    ) -> Result<Option<RunnerLimits>, HistorianProducerError> {
+        self.bind_session(child.to_string());
+        let route = self.ensure_command_route().await?;
+        self.retention_for_route(route).await?;
+        self.require_follow()?;
+        Ok(Some(self.route_limits))
+    }
+
+    fn require_follow(&self) -> Result<(), HistorianProducerError> {
+        match self.route_follow.missing() {
+            Some(reason) => Err(crate::runner_limits::refusal(reason.into())),
+            None => Ok(()),
+        }
     }
 
     async fn subscribe_from_start(
@@ -1275,28 +1428,26 @@ impl HistorianProducer {
         run_id: &str,
         timeout: Duration,
     ) -> Result<ProducerOutput, HistorianProducerError> {
-        if let Some(submission) = stage_submission(run_id)? {
-            return match tokio::time::timeout(timeout, async {
-                let resolved_run = self.reattach_submission(&submission).await?;
+        let follow = async {
+            let resolved = if let Some(submission) = stage_submission(run_id)? {
+                self.reattach_submission(&submission).await?
+            } else {
+                run_id.to_string()
+            };
+            let route = self.ensure_command_route().await?;
+            self.retention_for_route(route).await?;
+            self.require_follow()?;
+            let subscription = if self.route_follow.streaming {
                 let route = self.ensure_subscribe_route().await?;
                 let body = json!({ "method": "session.subscribe", "params": { "from": "start" } });
                 let corr = self.send_request(route, body).await?;
-                self.drain_subscribe(route, corr, &resolved_run).await
-            })
-            .await
-            {
-                Ok(result) => result,
-                Err(_) => Err(HistorianProducerError::TimedOut),
+                Some((route, corr))
+            } else {
+                None
             };
-        }
-        let route = self.ensure_subscribe_route().await?;
-        // Subscribe from "start" instead of a cursor. Replay after a cursor is
-        // exclusive, so persisting an advancing cursor can drop units at or before
-        // it on reattach. Re-draining from the start is safe because validation
-        // and compare-and-swap checks during publish are idempotent.
-        let body = json!({ "method": "session.subscribe", "params": { "from": "start" } });
-        let corr = self.send_request(route, body).await?;
-        match tokio::time::timeout(timeout, self.drain_subscribe(route, corr, run_id)).await {
+            self.drain_subscribe(subscription, &resolved).await
+        };
+        match tokio::time::timeout(timeout, follow).await {
             Ok(result) => result,
             Err(_) => Err(HistorianProducerError::TimedOut),
         }
@@ -1325,11 +1476,14 @@ impl HistorianProducer {
             .session_id
             .clone()
             .ok_or(HistorianProducerError::MissingSession)?;
-        let target = self
-            .config
-            .route_targets
-            .target(RegisteredRoute::HistorianRunner)
-            .ok_or(HistorianProducerError::HostRunnerRequiresHostTransport)?;
+        let target = match &self.session_runner {
+            Some(route) => route.target(),
+            None => self
+                .config
+                .route_targets
+                .target(RegisteredRoute::HistorianRunner)
+                .ok_or(HistorianProducerError::HostRunnerRequiresHostTransport)?,
+        };
         let request = ClientControlRequest::RouteOpen {
             target,
             identity: BindIdentity::new(
@@ -1342,8 +1496,8 @@ impl HistorianProducer {
             admission_facts: None,
             // Historian routes carry no session scope; they run under the module's own identity.
             scope: None,
-            // The historian runner is not a versioned role route.
-            role_versions: None,
+            // The historian runner is an llm-runner management surface.
+            role_versions: Some(crate::session_resolver::llm_runner_role_versions()),
         };
         let corr = self.next_corr();
         let body = serde_json::to_vec(&request)?;
@@ -1380,6 +1534,10 @@ impl HistorianProducer {
         }
     }
 
+    /// One llm-runner op on `route`, returning the answer inside its reply.
+    /// Every llm-runner reply is exactly `{"result": <answer>}`; a reply in any
+    /// other shape is refused as `runner_reply_shape` by
+    /// `session_resolver::read_runner_reply`, the one decoder of that envelope.
     async fn unary_json(
         &mut self,
         route: OpenedRoute,
@@ -1390,7 +1548,15 @@ impl HistorianProducer {
             .read_terminal_for(route, corr, self.config.request_timeout)
             .await?;
         match frame.header.ty {
-            FrameType::Response => Ok(serde_json::from_slice(&frame.body)?),
+            FrameType::Response => {
+                crate::session_resolver::read_runner_reply(serde_json::from_slice(&frame.body)?)
+                    .map_err(|shape| {
+                        HistorianProducerError::Subc(ProducerErrorBody::untagged(
+                            crate::session_resolver::RUNNER_REPLY_SHAPE,
+                            shape.to_string(),
+                        ))
+                    })
+            }
             FrameType::StreamEnd => Ok(Value::Null),
             FrameType::Error => Err(HistorianProducerError::Subc(error_body(&frame.body))),
             _ => Err(HistorianProducerError::UnexpectedControlResponse),
@@ -1411,102 +1577,83 @@ impl HistorianProducer {
 
     async fn drain_subscribe(
         &mut self,
-        route: OpenedRoute,
-        corr: u64,
+        mut subscription: Option<(OpenedRoute, u64)>,
         run_id: &str,
     ) -> Result<ProducerOutput, HistorianProducerError> {
-        let mut text = String::new();
-        let mut last_run_started: Option<String> = None;
-        let mut length_capped = false;
-        // The runner reports each model step's usage on its `step_finished` unit, never
-        // a running total, so the run's spend is their sum. The terminal's own `usage`
-        // is only used when no step unit carried any (for example an older runner).
-        let mut step_usage: Option<ProducerUsage> = None;
         loop {
-            let Some(frame) = read_frame(&mut self.stream).await? else {
-                return Err(HistorianProducerError::UnexpectedStreamEnd);
-            };
-            if frame.header.channel != route.channel
-                || frame.header.epoch != route.epoch
-                || frame.header.corr != corr
-            {
-                continue;
+            let route = self.ensure_command_route().await?;
+            let answer = self
+                .unary_json(
+                    route,
+                    json!({"method":"run.status", "params":{"run_id":run_id}}),
+                )
+                .await?;
+            let status: RoleRunStatus = serde_json::from_value(answer)?;
+            if status.run_state().is_terminal() {
+                let answer = self
+                    .unary_json(
+                        route,
+                        json!({"method":"run.result", "params":{"run_id":run_id}}),
+                    )
+                    .await?;
+                let result: RoleRunResult = serde_json::from_value(answer)?;
+                if result.run_id != run_id
+                    || result.state != status.state
+                    || !result.final_message_consistent()
+                {
+                    return Err(HistorianProducerError::Subc(ProducerErrorBody::untagged(
+                        "run_result_malformed",
+                        "run.result disagrees with the requested run or its terminal status",
+                    )));
+                }
+                return output_from_run_result(result, self.route_follow.run_usage);
             }
-            match frame.header.ty {
-                FrameType::StreamData => {
-                    let event: Value = serde_json::from_slice(&frame.body)?;
-                    let Some(unit) = control_unit(&event) else {
-                        continue;
-                    };
-                    if is_run_started_unit(unit) {
-                        last_run_started = unit_run_id(unit).map(ToString::to_string);
-                    }
-                    let terminal = is_terminal_unit(unit);
-                    if !terminal && unit_run_id(unit).is_some_and(|id| id != run_id) {
-                        continue;
-                    }
-                    if is_paused_unit(unit) && unit_run_id(unit) == Some(run_id) {
-                        // A paused run still holds the slot for this historian. Return
-                        // an error so callers stop waiting and retry later instead of
-                        // hanging forever on a run that is paused but not finished.
-                        let info = unit_error_info(unit);
-                        return Err(HistorianProducerError::RunPaused {
-                            run_id: run_id.to_string(),
-                            reason: paused_reason(unit).map(ToString::to_string),
-                            classification: info.classification,
-                            class_field_present: info.class_field_present,
-                        });
-                    }
-                    if let Some(piece) = unit_text(unit) {
-                        text.push_str(&piece);
-                    }
-                    if unit_is_length_capped(unit) {
-                        length_capped = true;
-                    }
-                    if is_step_finished_unit(unit) {
-                        if let Some(usage) =
-                            unit.get("usage").and_then(ProducerUsage::from_runner_usage)
-                        {
-                            step_usage
-                                .get_or_insert_with(ProducerUsage::default)
-                                .add(usage);
-                        }
-                    }
-                    if terminal {
-                        if last_run_started.as_deref() != Some(run_id) {
-                            return Err(HistorianProducerError::TerminalRunMismatch {
-                                expected: run_id.to_string(),
-                                found: last_run_started,
-                            });
-                        }
-                        if is_error_unit(unit) {
-                            let info = unit_error_info(unit);
-                            return Err(HistorianProducerError::RunFailed {
-                                run_id: run_id.to_string(),
-                                detail: info.detail.unwrap_or_else(|| "run failed".to_string()),
-                                classification: info.classification,
-                                class_field_present: info.class_field_present,
-                            });
-                        }
-                        // The run terminal control unit is authoritative. StreamEnd is only
-                        // route mechanics and can appear on detach/resubscribe without ending a run.
-                        let usage = step_usage.or_else(|| {
-                            unit.get("usage").and_then(ProducerUsage::from_runner_usage)
-                        });
-                        return Ok(ProducerOutput {
-                            text,
-                            length_capped,
-                            usage,
-                        });
-                    }
+            // Active, paused and unknown future states are all nonterminal. A
+            // quiet or ended subscription cannot make any of them terminal.
+            self.wait_for_control(&mut subscription).await?;
+        }
+    }
+
+    async fn wait_for_control(
+        &mut self,
+        subscription: &mut Option<(OpenedRoute, u64)>,
+    ) -> Result<(), HistorianProducerError> {
+        if std::mem::take(&mut self.control_pending) {
+            return Ok(());
+        }
+        let Some((route, corr)) = *subscription else {
+            tokio::time::sleep(runner_follow::POLL_INTERVAL).await;
+            return Ok(());
+        };
+        let wake = async {
+            loop {
+                let Some(frame) = read_frame(&mut self.stream).await? else {
+                    return Err(HistorianProducerError::UnexpectedStreamEnd);
+                };
+                if frame.header.channel != route.channel
+                    || frame.header.epoch != route.epoch
+                    || frame.header.corr != corr
+                {
+                    continue;
                 }
-                FrameType::Error => {
-                    return Err(HistorianProducerError::Subc(error_body(&frame.body)))
+                match frame.header.ty {
+                    FrameType::StreamData => {
+                        let event: Value = serde_json::from_slice(&frame.body)?;
+                        if runner_follow::control_wake(&event) {
+                            return Ok(true);
+                        }
+                    }
+                    FrameType::StreamEnd | FrameType::Error => return Ok(false),
+                    _ => {}
                 }
-                FrameType::StreamEnd => return Err(HistorianProducerError::UnexpectedStreamEnd),
-                _ => {}
+            }
+        };
+        if let Ok(connected) = tokio::time::timeout(runner_follow::POLL_INTERVAL, wake).await {
+            if !connected? {
+                *subscription = None;
             }
         }
+        Ok(())
     }
 
     async fn read_terminal_for(
@@ -1525,6 +1672,15 @@ impl HistorianProducer {
                     && frame.header.corr == corr
                 {
                     return Ok(frame);
+                }
+                if frame.header.ty == FrameType::StreamData
+                    && self.subscribe_route.is_some_and(|subscription| {
+                        subscription.channel == frame.header.channel
+                            && subscription.epoch == frame.header.epoch
+                    })
+                {
+                    let event: Value = serde_json::from_slice(&frame.body)?;
+                    self.control_pending |= runner_follow::control_wake(&event);
                 }
             }
         })
@@ -1577,9 +1733,9 @@ impl HistorianProducer {
 
 /// Return a policy only when `role.describe` names `retention` and provides positive
 /// limits. Older runners may not support the field, so omitting it when the group is
-/// absent keeps their `session.send` requests valid.
+/// absent keeps their `session.send` requests valid. `answer` is the answer inside
+/// the runner's reply envelope (see `unary_json`).
 fn retention_from_role_describe(answer: &Value) -> Option<u64> {
-    let answer = answer.get("result").unwrap_or(answer);
     let declares_retention = answer
         .get("capabilities")
         .and_then(Value::as_array)
@@ -1636,18 +1792,16 @@ enum SendOutcome {
     Unrecognized,
 }
 
-/// Decode a `session.send` reply.
+/// Decode a `session.send` answer (the answer inside the reply envelope, which
+/// `unary_json` has already removed).
 ///
-/// The runner answers with a `state`-tagged result inside a `result` envelope: `active`
-/// carries the run that started, `pending` means the session already had an active run and
-/// this prompt was durably QUEUED behind it under a submission id. Reading only `run_id`
+/// The runner answers with a `state`-tagged result. Any answer carrying a `run_id`
+/// names the run that started (`active`); `pending` with a `submission_id` means
+/// the session already had an active run and this prompt was durably QUEUED
+/// behind it under that submission id. Reading only `run_id`
 /// collapses those two into "no run id", which reports a queued (accepted) prompt as a
 /// malformed reply and hides the one fact that explains it — the session was busy.
-fn send_outcome(response: &Value) -> SendOutcome {
-    let body = match response.get("result") {
-        Some(result) if result.is_object() => result,
-        _ => response,
-    };
+fn send_outcome(body: &Value) -> SendOutcome {
     if let Some(run_id) = body.get("run_id").and_then(Value::as_str) {
         return SendOutcome::Active(run_id.to_string());
     }
@@ -1661,46 +1815,64 @@ fn send_outcome(response: &Value) -> SendOutcome {
     }
 }
 
-fn classify_run_state(run_id: &str, value: &Value) -> RunState {
-    let value = value.get("result").unwrap_or(value);
-    let state = value
-        .get("state")
-        .and_then(Value::as_str)
-        .unwrap_or("")
-        .to_ascii_lowercase();
-    let response_run_id = value.get("run_id").and_then(Value::as_str);
-    if response_run_id.is_some_and(|id| id != run_id) {
-        return RunState::Missing {
-            detail: Some("run.status returned a different run_id".to_string()),
-        };
+/// Classify a `run.status` answer (the answer inside the reply envelope).
+fn classify_run_state(_run_id: &str, value: &Value) -> RunState {
+    match serde_json::from_value::<RoleRunStatus>(value.clone()) {
+        Ok(status) if status.run_state().is_terminal() => RunState::Terminal,
+        Ok(_) => RunState::Active,
+        Err(error) => RunState::Missing {
+            detail: Some(error.to_string()),
+        },
     }
-    if state.contains("terminal")
-        || state.contains("interrupted")
-        || state == "completed"
-        || state == "finished"
-    {
-        RunState::Terminal
-    } else if state.contains("active")
-        || state.contains("paused")
-        || state.contains("pending")
-        || state.contains("running")
-    {
-        RunState::Active
-    } else if state.contains("error") {
-        RunState::Missing {
-            detail: value
-                .get("last_error")
-                .or_else(|| value.get("detail"))
-                .and_then(Value::as_str)
-                .map(ToString::to_string),
+}
+
+fn output_from_run_result(
+    result: RoleRunResult,
+    reports_usage: bool,
+) -> Result<ProducerOutput, HistorianProducerError> {
+    let usage = reports_usage
+        .then_some(result.usage.as_ref())
+        .flatten()
+        .and_then(ProducerUsage::from_contract_usage);
+    match result.run_state() {
+        RoleRunState::Completed => {
+            let final_message = result.final_message.ok_or_else(|| {
+                HistorianProducerError::Subc(ProducerErrorBody::untagged(
+                    "run_result_malformed",
+                    "completed run.result is missing final_message",
+                ))
+            })?;
+            Ok(ProducerOutput {
+                text: final_message.text,
+                length_capped: false,
+                usage,
+            })
         }
-    } else {
-        RunState::Missing {
-            detail: Some(state),
+        RoleRunState::ContextCeiling => Err(HistorianProducerError::context_overflow(
+            "run ended context_ceiling",
+        )),
+        _ => {
+            let error = result.error.map(|error| {
+                ProducerErrorBody::from_value(
+                    serde_json::to_value(error).expect("run error serializes"),
+                )
+            });
+            Err(HistorianProducerError::RunFailed {
+                run_id: result.run_id,
+                detail: error.as_ref().map_or_else(
+                    || format!("run ended {}", result.state),
+                    |error| format!("run ended {}: {}", result.state, error.message),
+                ),
+                classification: error.as_ref().and_then(ProducerErrorBody::classification),
+                class_field_present: error
+                    .as_ref()
+                    .is_some_and(|error| error.class_field_present),
+            })
         }
     }
 }
 
+#[cfg(test)]
 fn control_unit(event: &Value) -> Option<&Value> {
     let kind = event.get("kind").and_then(Value::as_str);
     if kind == Some("display") {
@@ -1713,25 +1885,21 @@ fn control_unit(event: &Value) -> Option<&Value> {
     Some(event.get("unit").unwrap_or(event))
 }
 
+#[cfg(test)]
 fn unit_type(unit: &Value) -> Option<&str> {
     unit.get("type")
         .or_else(|| unit.get("kind"))
         .and_then(Value::as_str)
 }
 
-fn unit_run_id(unit: &Value) -> Option<&str> {
-    unit.get("run_id")
-        .or_else(|| unit.get("runId"))
-        .and_then(Value::as_str)
-}
-
-/// Extract the assistant TEXT from a control unit. llm-runner's assistant_message
+/// Extract assistant text from the fake Broca script. Its assistant_message
 /// unit nests an assembled message with a content-block array; only `text` blocks are
 /// the historian's output. `reasoning` blocks are deliberately EXCLUDED: a reasoning
 /// model's thinking legitimately restates the prompt's format template and walks the
 /// seed examples, so folding it into the output would corrupt the parse with
 /// template/seed prose. Flat `text`/`content` fields are kept as a fallback for
 /// simpler unit shapes.
+#[cfg(test)]
 fn unit_text(unit: &Value) -> Option<String> {
     if !unit_type(unit).is_some_and(|ty| ty.eq_ignore_ascii_case("assistant_message")) {
         return None;
@@ -1755,6 +1923,7 @@ fn unit_text(unit: &Value) -> Option<String> {
         .map(ToString::to_string)
 }
 
+#[cfg(test)]
 fn is_terminal_unit(unit: &Value) -> bool {
     let Some(ty) = unit_type(unit).map(str::to_ascii_lowercase) else {
         return false;
@@ -1766,42 +1935,21 @@ fn is_terminal_unit(unit: &Value) -> bool {
         || ty == "error"
 }
 
-fn is_run_started_unit(unit: &Value) -> bool {
-    unit_type(unit)
-        .map(str::to_ascii_lowercase)
-        .is_some_and(|ty| ty == "run_started" || ty == "runstarted")
-}
-
+#[cfg(test)]
 fn is_step_finished_unit(unit: &Value) -> bool {
     unit_type(unit)
         .map(str::to_ascii_lowercase)
         .is_some_and(|ty| ty == "step_finished" || ty == "stepfinished")
 }
 
-/// A length-class finish reason on ANY unit (step or terminal): providers spell it
-/// "length", "max_tokens", or "max_output_tokens" depending on the wire family.
-fn unit_is_length_capped(unit: &Value) -> bool {
-    unit.get("finish_reason")
-        .or_else(|| unit.get("finishReason"))
-        .and_then(Value::as_str)
-        .is_some_and(|reason| {
-            let reason = reason.to_ascii_lowercase();
-            reason == "length" || reason == "max_tokens" || reason == "max_output_tokens"
-        })
-}
-
+#[cfg(test)]
 fn is_paused_unit(unit: &Value) -> bool {
     unit_type(unit)
         .map(str::to_ascii_lowercase)
         .is_some_and(|ty| ty == "paused")
 }
 
-fn paused_reason(unit: &Value) -> Option<&str> {
-    unit.get("reason")
-        .or_else(|| unit.get("detail"))
-        .and_then(Value::as_str)
-}
-
+#[cfg(test)]
 fn is_error_unit(unit: &Value) -> bool {
     unit_type(unit)
         .map(str::to_ascii_lowercase)
@@ -1809,12 +1957,14 @@ fn is_error_unit(unit: &Value) -> bool {
 }
 
 #[derive(Debug, Default)]
+#[cfg(test)]
 struct UnitErrorInfo {
     detail: Option<String>,
     classification: Option<ErrorClassification>,
     class_field_present: bool,
 }
 
+#[cfg(test)]
 fn unit_error_info(unit: &Value) -> UnitErrorInfo {
     if let Some(error) = unit.get("error") {
         let (classification, class_field_present) = classification_from_object(error);
@@ -1948,6 +2098,7 @@ fn provider_retry_at_ms(value: &Value, now_ms: i64, depth: usize) -> Option<i64>
     }
 }
 
+#[cfg(test)]
 fn classification_from_json_text(s: &str) -> Option<(Option<ErrorClassification>, bool)> {
     serde_json::from_str::<Value>(s)
         .ok()
@@ -1985,9 +2136,13 @@ fn retry_after_secs_from_value(value: &Value) -> Option<u64> {
 }
 
 #[cfg(test)]
-mod tests {
+pub(crate) mod tests {
     use super::*;
-    use std::{collections::VecDeque, net::SocketAddr, sync::Arc};
+    use std::{
+        collections::{BTreeMap, VecDeque},
+        net::SocketAddr,
+        sync::Arc,
+    };
 
     use serde_json::json;
     use subc_transport::{
@@ -2276,24 +2431,25 @@ mod tests {
 
     #[test]
     fn send_outcome_reads_the_runner_send_contract() {
-        // Both shapes ride a `result` envelope and are tagged by `state`.
+        // `send_outcome` reads the answer inside the reply envelope, which
+        // `unary_json` removes strictly; both shapes are tagged by `state`.
         assert_eq!(
-            send_outcome(&json!({"result":{"state":"active","run_id":"run-9"}})),
+            send_outcome(&json!({"state":"active","run_id":"run-9"})),
             SendOutcome::Active("run-9".to_string())
         );
         assert_eq!(
-            send_outcome(&json!({"result":{"state":"pending","submission_id":"sub-3"}})),
+            send_outcome(&json!({"state":"pending","submission_id":"sub-3"})),
             SendOutcome::Queued("sub-3".to_string()),
             "a queued prompt was ACCEPTED behind a busy session, not malformed"
         );
-        // An un-enveloped reply carrying the run directly stays readable.
+        // A second envelope inside the answer is not peeled: there is exactly one.
         assert_eq!(
-            send_outcome(&json!({"state":"active","run_id":"run-flat"})),
-            SendOutcome::Active("run-flat".to_string())
+            send_outcome(&json!({"result":{"state":"active","run_id":"run-9"}})),
+            SendOutcome::Unrecognized
         );
         // A submission id without the pending state is not a queue acknowledgement.
         assert_eq!(
-            send_outcome(&json!({"result":{"submission_id":"sub-4"}})),
+            send_outcome(&json!({"submission_id":"sub-4"})),
             SendOutcome::Unrecognized
         );
         assert_eq!(send_outcome(&json!({})), SendOutcome::Unrecognized);
@@ -2349,8 +2505,8 @@ mod tests {
         ];
         let server = fake_server(
             json!([
-                {"result":{"state":"pending","submission_id":"queued-1"}},
-                {"result":{"state":"active","run_id":"run-1"}}
+                {"state":"pending","submission_id":"queued-1"},
+                {"state":"active","run_id":"run-1"}
             ]),
             events,
         )
@@ -2474,18 +2630,150 @@ mod tests {
 
     #[derive(Debug, Default)]
     struct ServerLog {
+        route_project_roots: Vec<String>,
+        route_harnesses: Vec<String>,
         route_sessions: Vec<String>,
+        route_targets: Vec<subc_protocol::RouteTarget>,
+        route_role_versions: Vec<Option<BTreeMap<String, String>>>,
         role_describes: Vec<Value>,
         sends: Vec<Value>,
         subscribes: Vec<Value>,
         retracts: Vec<Value>,
         goodbyes: Vec<u16>,
+        statuses: Vec<Value>,
+        results: Vec<Value>,
     }
 
-    struct FakeServer {
+    #[derive(Default)]
+    struct FakeAnswers {
+        statuses: VecDeque<Value>,
+        result: Option<Value>,
+        describe: Option<Value>,
+        /// Answer every llm-runner op bare instead of inside `{"result": ...}`,
+        /// as a runner off the pinned reply shape would.
+        bare: bool,
+    }
+
+    fn result_for_script(events: &[Value]) -> Value {
+        use cortexkit_role_llm_runner::{
+            run::FinalMessage,
+            usage::{RunUsage, StepUsage},
+        };
+        let step_usage = |measured: &Value| {
+            let field = |name| measured.get(name).and_then(Value::as_u64);
+            let mut step = StepUsage::unreported();
+            if let Some(tokens) = field("input_tokens") {
+                step = step.with_input_tokens(tokens);
+            }
+            if let Some(tokens) = field("output_tokens") {
+                step = step.with_output_tokens(tokens);
+            }
+            if let Some(tokens) = field("cached_input_tokens") {
+                step = step.with_cached_input_tokens(tokens);
+            }
+            if let Some(tokens) = field("cache_write_tokens") {
+                step = step.with_cache_write_tokens(tokens);
+            }
+            step
+        };
+        let mut text = String::new();
+        let mut state = "completed";
+        let mut usage = RunUsage::new();
+        let mut terminal_usage = None;
+        let mut failure = None;
+        for event in events {
+            let Some(unit) = control_unit(event) else {
+                continue;
+            };
+            if let Some(piece) = unit_text(unit) {
+                text.push_str(&piece);
+            }
+            if is_step_finished_unit(unit) {
+                if let Some(measured) = unit.get("usage") {
+                    let step = step_usage(measured);
+                    usage.record_step("provider", "model", None, step);
+                }
+            }
+            if is_terminal_unit(unit) {
+                terminal_usage = unit.get("usage").cloned();
+            }
+            if is_error_unit(unit) {
+                state = "error";
+                failure = Some(unit_error_info(unit));
+            }
+            if is_paused_unit(unit) {
+                state = "paused";
+            }
+        }
+        if usage.steps == 0 {
+            if let Some(measured) = terminal_usage {
+                usage.record_step("provider", "model", None, step_usage(&measured));
+            }
+        }
+        let mut result = RoleRunResult::new("run-1", state);
+        if state == "completed" {
+            result = result.with_final_message(FinalMessage {
+                ordinal: 1,
+                mid: "answer".into(),
+                text,
+            });
+        }
+        if usage.steps > 0 {
+            result = result.with_usage(usage);
+        }
+        let mut result = serde_json::to_value(result).unwrap();
+        if let Some(failure) = failure {
+            result["error"] = json!({"class":failure.classification.map_or("permanent", |c| c.class.as_wire_str()),"message":failure.detail.unwrap_or_else(|| "run failed".into()),"provider_code":"provider_error"});
+        }
+        result
+    }
+
+    pub(crate) struct FakeServer {
         connection_file: PathBuf,
         log: Arc<Mutex<ServerLog>>,
+        answers: Arc<Mutex<FakeAnswers>>,
         _temp: TempDir,
+    }
+
+    impl FakeServer {
+        pub(crate) async fn follow_counts(&self) -> (usize, usize) {
+            let log = self.log.lock().await;
+            (log.statuses.len(), log.results.len())
+        }
+    }
+
+    pub(crate) async fn publication_follower(
+        output: &str,
+        open_controls: bool,
+    ) -> (HistorianProducer, FakeServer) {
+        let events = if open_controls {
+            vec![
+                json!({"kind":"control","event":{"vendor":"thalamus","opaque":true}}),
+                json!({"kind":"control","event":{"state":"not a role state","text":"not an answer"}}),
+            ]
+        } else {
+            vec![
+                json!({"kind":"control","unit":{"type":"run_started","run_id":"run-1"}}),
+                json!({"kind":"control","unit":{"type":"assistant_message","run_id":"run-1","text":output}}),
+                json!({"kind":"control","unit":{"type":"run_finished","run_id":"run-1"}}),
+            ]
+        };
+        let server = fake_server_with_role_describe(
+            json!({"state":"active","run_id":"run-1"}),
+            events,
+            json!({"capabilities":["no_tools","max_steps"]}),
+            false,
+        )
+        .await;
+        {
+            let mut answers = server.answers.lock().await;
+            answers.statuses = [json!({"state":"active"}), json!({"state":"completed"})].into();
+            answers.result = Some(
+                json!({"run_id":"run-1","state":"completed","final_message":{"ordinal":1,"mid":"answer","text":output}}),
+            );
+        }
+        let producer = session_runner_client(&server).await;
+        (producer, server)
     }
 
     async fn fake_server(send_response: Value, stream_events: Vec<Value>) -> FakeServer {
@@ -2500,7 +2788,7 @@ mod tests {
         fake_server_with_role_describe(
             send_response,
             stream_events,
-            json!({"capabilities": [], "retention": {"max_seconds": 2_592_000, "delete_within_ms": 3_600_000}}),
+            json!({"capabilities": ["no_tools","max_steps","max_output_tokens"], "retention": {"max_seconds": 2_592_000, "delete_within_ms": 3_600_000}}),
             lose_first_reply,
         )
         .await
@@ -2509,9 +2797,15 @@ mod tests {
     async fn fake_server_with_role_describe(
         send_response: Value,
         stream_events: Vec<Value>,
-        role_describe_response: Value,
+        mut role_describe_response: Value,
         mut lose_first_reply: bool,
     ) -> FakeServer {
+        // Each fixture independently chooses its run-limit declarations; all of
+        // these fake runners all answer run.status and run.result calls.
+        role_describe_response["capabilities"]
+            .as_array_mut()
+            .unwrap()
+            .extend(["run_ops", "run_status", "streaming", "run_usage"].map(|group| json!(group)));
         let temp = tempfile::tempdir().unwrap();
         let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
         let addr: SocketAddr = listener.local_addr().unwrap();
@@ -2536,6 +2830,9 @@ mod tests {
         .unwrap();
         let log = Arc::new(Mutex::new(ServerLog::default()));
         let log_task = Arc::clone(&log);
+        let answers = Arc::new(Mutex::new(FakeAnswers::default()));
+        let answers_task = answers.clone();
+        let run_result = result_for_script(&stream_events);
         tokio::spawn(async move {
             let mut stream_events: VecDeque<Value> = stream_events.into();
             let mut responses: VecDeque<Value> = send_response
@@ -2567,11 +2864,24 @@ mod tests {
                         FrameType::Request if frame.header.channel == 0 => {
                             let req: ClientControlRequest =
                                 serde_json::from_slice(&frame.body).unwrap();
-                            if let ClientControlRequest::RouteOpen { identity, .. } = req {
+                            if let ClientControlRequest::RouteOpen {
+                                identity,
+                                target,
+                                role_versions,
+                                ..
+                            } = req
+                            {
                                 let route = next_route;
                                 next_route += 1;
                                 route_sessions.insert(route, identity.session.clone());
-                                log_task.lock().await.route_sessions.push(identity.session);
+                                let mut log = log_task.lock().await;
+                                log.route_project_roots
+                                    .push(identity.project_root.to_string_lossy().into());
+                                log.route_harnesses.push(identity.harness);
+                                log.route_sessions.push(identity.session);
+                                log.route_targets.push(target);
+                                log.route_role_versions.push(role_versions);
+                                drop(log);
                                 send_response_frame(
                                     &mut stream,
                                     frame.header.channel,
@@ -2591,12 +2901,18 @@ mod tests {
                             match req.get("method").and_then(Value::as_str) {
                                 Some("role.describe") => {
                                     log_task.lock().await.role_describes.push(req.clone());
+                                    let described = answers_task
+                                        .lock()
+                                        .await
+                                        .describe
+                                        .clone()
+                                        .unwrap_or_else(|| role_describe_response.clone());
                                     send_response_frame(
                                         &mut stream,
                                         frame.header.channel,
                                         frame.header.epoch,
                                         frame.header.corr,
-                                        serde_json::to_vec(&role_describe_response).unwrap(),
+                                        runner_reply(&answers_task, described).await,
                                     )
                                     .await;
                                 }
@@ -2616,7 +2932,7 @@ mod tests {
                                         frame.header.channel,
                                         frame.header.epoch,
                                         frame.header.corr,
-                                        serde_json::to_vec(&response).unwrap(),
+                                        runner_reply(&answers_task, response).await,
                                     )
                                     .await;
                                 }
@@ -2641,17 +2957,40 @@ mod tests {
                                     .await;
                                 }
                                 Some("run.status") => {
+                                    log_task.lock().await.statuses.push(req["params"].clone());
+                                    let mut answers = answers_task.lock().await;
+                                    let status =
+                                        if answers.statuses.len() > 1 {
+                                            answers.statuses.pop_front().unwrap()
+                                        } else {
+                                            answers.statuses.front().cloned().unwrap_or_else(
+                                                || json!({"state":run_result["state"]}),
+                                            )
+                                        };
+                                    drop(answers);
                                     send_response_frame(
-                                    &mut stream,
-                                    frame.header.channel,
-                                    frame.header.epoch,
-                                    frame.header.corr,
-                                    serde_json::to_vec(
-                                        &json!({"state":"terminal","run_id":"run-1","head":"h"}),
+                                        &mut stream,
+                                        frame.header.channel,
+                                        frame.header.epoch,
+                                        frame.header.corr,
+                                        runner_reply(&answers_task, status).await,
                                     )
-                                    .unwrap(),
-                                )
-                                .await;
+                                    .await;
+                                }
+                                Some("run.result") => {
+                                    log_task.lock().await.results.push(req["params"].clone());
+                                    let mut result = run_result.clone();
+                                    result["run_id"] = req["params"]["run_id"].clone();
+                                    let result =
+                                        answers_task.lock().await.result.clone().unwrap_or(result);
+                                    send_response_frame(
+                                        &mut stream,
+                                        frame.header.channel,
+                                        frame.header.epoch,
+                                        frame.header.corr,
+                                        runner_reply(&answers_task, result).await,
+                                    )
+                                    .await;
                                 }
                                 Some("run.cancel") => {
                                     send_response_frame(
@@ -2659,7 +2998,7 @@ mod tests {
                                         frame.header.channel,
                                         frame.header.epoch,
                                         frame.header.corr,
-                                        serde_json::to_vec(&json!({"ack":true})).unwrap(),
+                                        runner_reply(&answers_task, json!({"ack":true})).await,
                                     )
                                     .await;
                                 }
@@ -2670,7 +3009,8 @@ mod tests {
                                         frame.header.channel,
                                         frame.header.epoch,
                                         frame.header.corr,
-                                        serde_json::to_vec(&json!({"result":"retracted"})).unwrap(),
+                                        runner_reply(&answers_task, json!({"state":"retracted"}))
+                                            .await,
                                     )
                                     .await;
                                 }
@@ -2688,8 +3028,20 @@ mod tests {
         FakeServer {
             connection_file,
             log,
+            answers,
             _temp: temp,
         }
+    }
+
+    /// The fake runner's reply body for `answer`: `{"result": answer}`, the
+    /// pinned llm-runner reply shape, unless the test asked for bare replies.
+    async fn runner_reply(answers: &Mutex<FakeAnswers>, answer: Value) -> Vec<u8> {
+        let reply = if answers.lock().await.bare {
+            answer
+        } else {
+            json!({ "result": answer })
+        };
+        serde_json::to_vec(&reply).unwrap()
     }
 
     async fn send_response_frame(
@@ -2762,7 +3114,7 @@ mod tests {
         let server = fake_server_with_role_describe(
             json!({"state":"active","run_id":"run-1"}),
             Vec::new(),
-            json!({"capabilities":["retention"],"retention":{"max_seconds":2_592_000,"delete_within_ms":3_600_000}}),
+            json!({"capabilities":["retention","no_tools","max_steps","max_output_tokens"],"retention":{"max_seconds":2_592_000,"delete_within_ms":3_600_000}}),
             true,
         )
         .await;
@@ -2803,7 +3155,7 @@ mod tests {
         let server = fake_server_with_role_describe(
             json!({"state":"active","run_id":"run-1"}),
             Vec::new(),
-            json!({"capabilities":["retention"],"retention":{"max_seconds":2_592_000,"delete_within_ms":3_600_000}}),
+            json!({"capabilities":["retention","no_tools","max_steps","max_output_tokens"],"retention":{"max_seconds":2_592_000,"delete_within_ms":3_600_000}}),
             false,
         )
         .await;
@@ -2843,7 +3195,7 @@ mod tests {
         let server = fake_server_with_role_describe(
             json!({"state":"active","run_id":"run-1"}),
             Vec::new(),
-            json!({"capabilities":["retention"],"retention":{"max_seconds":43_200,"delete_within_ms":3_600_000}}),
+            json!({"capabilities":["retention","no_tools","max_steps","max_output_tokens"],"retention":{"max_seconds":43_200,"delete_within_ms":3_600_000}}),
             false,
         )
         .await;
@@ -3016,7 +3368,7 @@ mod tests {
     #[tokio::test]
     async fn a_queued_send_is_named_as_such_and_its_submission_is_withdrawn() {
         let server = fake_server(
-            json!({"result":{"state":"pending","submission_id":"sub-77"}}),
+            json!({"state":"pending","submission_id":"sub-77"}),
             Vec::new(),
         )
         .await;
@@ -3050,6 +3402,297 @@ mod tests {
         let log = server.log.lock().await;
         assert_eq!(log.retracts.len(), 1);
         assert_eq!(log.retracts[0]["submission_id"], json!("sub-77"));
+    }
+
+    async fn session_runner_client(server: &FakeServer) -> HistorianProducer {
+        session_runner_client_with_harness(server, "opencode").await
+    }
+
+    async fn session_runner_client_with_harness(
+        server: &FakeServer,
+        harness: &str,
+    ) -> HistorianProducer {
+        HistorianProducer::connect_to_session_runner(
+            HistorianProducerConfig {
+                request_timeout: Duration::from_secs(2),
+                await_timeout: Duration::from_secs(2),
+                route_targets: RouteTargetConfig::default(),
+                ..HistorianProducerConfig::new(
+                    server.connection_file.clone(),
+                    std::env::current_dir().unwrap(),
+                    harness,
+                )
+            },
+            SessionRunnerRoute::for_principal(
+                Some(&subc_protocol::Principal::Reserved {
+                    module_id: "thalamus-harness".into(),
+                }),
+                "ses-parent",
+            )
+            .unwrap(),
+        )
+        .await
+        .unwrap()
+    }
+
+    async fn session_runner_client_with_identity(
+        server: &FakeServer,
+        identity: &crate::session_resolver::RunnerBindIdentity,
+        route: SessionRunnerRoute,
+    ) -> HistorianProducer {
+        let config = HistorianProducerConfig {
+            request_timeout: Duration::from_secs(2),
+            await_timeout: Duration::from_secs(2),
+            route_targets: RouteTargetConfig::default(),
+            ..HistorianProducerConfig::new(
+                server.connection_file.clone(),
+                identity.project_root.clone(),
+                identity.harness.clone(),
+            )
+        };
+        HistorianProducer::connect_to_session_runner(config, route)
+            .await
+            .unwrap()
+    }
+
+    /// A runner-lane historian uses the conversation's runner rather than the configured
+    /// `broca` module. It creates the child with the harness value supplied in Setup and
+    /// omits `parent`, which the runner does not declare. The historian caps each child
+    /// run at one step; retention is applied within the limits declared by the runner.
+    #[tokio::test]
+    async fn a_session_runner_child_uses_the_conversation_harness_without_parent_fields() {
+        let server = fake_server_with_role_describe(
+            json!({"state":"active","run_id":"run-1"}),
+            Vec::new(),
+            json!({"capabilities":["retention","no_tools","max_steps","max_output_tokens"],"retention":{"max_seconds":2_592_000,"delete_within_ms":3_600_000}}),
+            false,
+        )
+        .await;
+        let mut producer = session_runner_client_with_harness(&server, "claude-code").await;
+        producer
+            .start("mc-hist-1", "system", "prompt", "provider/model")
+            .await
+            .unwrap();
+        let log = server.log.lock().await;
+        assert_eq!(
+            log.route_targets,
+            vec![subc_protocol::RouteTarget::ManagementSurface {
+                module_id: "thalamus-harness".into()
+            }],
+            "the configured broca target must not be used for a THALAMUS session"
+        );
+        assert_eq!(
+            log.route_role_versions,
+            vec![Some(BTreeMap::from([(
+                "llm-runner".to_string(),
+                "v1".to_string()
+            )]))],
+            "a runner route declares it speaks llm-runner/v1"
+        );
+        assert_eq!(
+            log.route_project_roots,
+            vec![std::env::current_dir()
+                .unwrap()
+                .to_string_lossy()
+                .into_owned()]
+        );
+        assert_eq!(log.route_harnesses, vec!["claude-code"]);
+        assert_eq!(log.route_sessions, vec!["mc-hist-1".to_string()]);
+        let send = &log.sends[0];
+        assert!(send.get("parent").is_none(), "{send}");
+        assert_eq!(send["tools"], json!([]));
+        assert_eq!(send["stop_when"], json!({"max_steps": 1}));
+        assert_eq!(send["retention"], 86_400);
+        assert!(send.get("budget").is_none(), "{send}");
+    }
+
+    #[tokio::test]
+    async fn published_route_identity_child_vector_uses_setup_root_harness_and_child_session() {
+        const VECTORS: &[u8] =
+            include_bytes!("../testdata/compaction-provider-v1/route-identity.json");
+        assert_eq!(
+            crate::sha256_hex(VECTORS),
+            "edbdc38f28373431f07b8e2e72c5f5c781d6b7fd48d6b2b6d8e20a8f5cea577a"
+        );
+        let vectors: Value = serde_json::from_slice(VECTORS).unwrap();
+        let case = vectors["identity_cases"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|case| case["child_session"].as_str().is_some())
+            .unwrap();
+        let setup = &case["setup"];
+        let child_bind = &case["expected"]["child_bind"];
+        let child_session = case["child_session"].as_str().unwrap();
+        let parent_session = setup["session"].as_str().unwrap();
+        let identity = crate::session_resolver::RunnerBindIdentity {
+            project_root: PathBuf::from(child_bind["project_root"].as_str().unwrap()),
+            harness: child_bind["harness"].as_str().unwrap().into(),
+            session: child_session.into(),
+        };
+        assert_eq!(identity.session, child_bind["session"]);
+        assert_ne!(identity.session, child_bind["forbidden_child_bind_session"]);
+        let route = SessionRunnerRoute::for_principal(
+            Some(&subc_protocol::Principal::Reserved {
+                module_id: "broca".into(),
+            }),
+            parent_session,
+        )
+        .unwrap();
+        assert_eq!(route.parent_session(), parent_session);
+        let server = fake_server_with_role_describe(
+            json!({"state":"active","run_id":"run-1"}),
+            Vec::new(),
+            json!({"capabilities":["retention","no_tools","max_steps","max_output_tokens"],"retention":{"max_seconds":2_592_000,"delete_within_ms":3_600_000}}),
+            false,
+        )
+        .await;
+        let mut producer = session_runner_client_with_identity(&server, &identity, route).await;
+        producer
+            .start(child_session, "system", "prompt", "provider/model")
+            .await
+            .unwrap();
+        let log = server.log.lock().await;
+        assert_eq!(
+            log.route_targets,
+            vec![subc_protocol::RouteTarget::ManagementSurface {
+                module_id: "broca".into()
+            }]
+        );
+        assert_eq!(
+            log.route_project_roots,
+            vec![identity.project_root.to_string_lossy().into_owned()]
+        );
+        assert_eq!(log.route_harnesses, vec![identity.harness.clone()]);
+        assert_eq!(log.route_sessions, vec![child_session.to_string()]);
+        assert!(log.sends[0].get("parent").is_none(), "{}", log.sends[0]);
+    }
+
+    #[tokio::test]
+    async fn session_runner_limit_combinations_gate_every_historian_member() {
+        for mask in 0..8 {
+            let groups: Vec<_> = ["max_steps", "max_output_tokens", "no_tools"]
+                .into_iter()
+                .enumerate()
+                .filter_map(|(bit, group)| (mask & (1 << bit) != 0).then_some(group))
+                .collect();
+            let server = fake_server_with_role_describe(
+                json!({"state":"active","run_id":"run-1"}),
+                vec![],
+                json!({"capabilities":groups}),
+                false,
+            )
+            .await;
+            let mut producer = session_runner_client(&server).await;
+            let limits = producer
+                .session_runner_limits("child")
+                .await
+                .unwrap()
+                .unwrap();
+            assert_eq!(limits.max_output_tokens, mask & 2 != 0);
+            let result = producer
+                .start("child", "system", "prompt", "provider/model")
+                .await;
+            let log = server.log.lock().await;
+            assert_eq!(log.role_describes.len(), 1, "fit and send share discovery");
+            if mask & 5 == 5 {
+                result.unwrap();
+                assert_eq!(log.sends.len(), 1);
+                let send = &log.sends[0];
+                let typed: RoleSendRequest = serde_json::from_value(send.clone()).unwrap();
+                assert_eq!(typed.no_tools().unwrap(), Some(true));
+                assert_eq!(typed.max_steps().unwrap(), Some(1));
+                assert_eq!(
+                    typed.max_output_tokens().unwrap().is_some(),
+                    mask & 2 != 0,
+                    "mask={mask}: {send}"
+                );
+                if mask == 7 {
+                    let bytes = serde_json::to_string(
+                        &session_send_request(
+                            "child",
+                            "system",
+                            "prompt",
+                            "provider/model",
+                            None,
+                            32_000,
+                            None,
+                            None,
+                        )
+                        .unwrap()
+                        .for_session_runner(limits)
+                        .unwrap(),
+                    )
+                    .unwrap();
+                    assert_eq!(
+                        bytes,
+                        r#"{"method":"session.send","params":{"prompt":"prompt","send_id":"child","model":{"provider":"provider","model":"model"},"tools":[],"generation":{"max_output_tokens":32000},"system":"system","stop_when":{"max_steps":1}}}"#
+                    );
+                    assert_eq!(
+                        send,
+                        &json!({"prompt":"prompt","send_id":"child","model":{"provider":"provider","model":"model"},"tools":[],"generation":{"max_output_tokens":32000},"system":"system","stop_when":{"max_steps":1}})
+                    );
+                }
+            } else {
+                let error = result.unwrap_err().to_string();
+                assert!(error.contains("historian_runner_missing_groups"), "{error}");
+                for (bit, name) in [(1, "max_steps"), (4, "no_tools")] {
+                    if mask & bit == 0 {
+                        assert!(error.contains(name), "{error}");
+                    }
+                }
+                assert!(
+                    log.sends.is_empty(),
+                    "no unsafe raw-request fallback: mask={mask}"
+                );
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn session_runner_never_sends_a_tool_free_zen_request() {
+        let server = fake_server_with_role_describe(
+            json!({"state":"active","run_id":"run-1"}),
+            vec![],
+            json!({"capabilities":["no_tools","max_steps","max_output_tokens"]}),
+            false,
+        )
+        .await;
+        let mut producer = session_runner_client(&server).await;
+        let error = producer
+            .start("child", "", "prompt", "opencode/paid-model")
+            .await
+            .unwrap_err();
+        assert!(error.to_string().contains("historian_zen_no_tools"));
+        assert!(server.log.lock().await.sends.is_empty());
+    }
+
+    /// The configured `llm-runner` module route and the session-runner route both bind
+    /// each child to its own session, omit `parent`, and enforce a one-step limit.
+    #[tokio::test]
+    async fn a_configured_runner_send_has_no_parent_and_enforces_one_step() {
+        let server = fake_server(json!({"state":"active","run_id":"run-1"}), Vec::new()).await;
+        let mut producer = client(&server).await;
+        producer
+            .start("mc-hist-1", "system", "prompt", "provider/model")
+            .await
+            .unwrap();
+        let log = server.log.lock().await;
+        assert_eq!(
+            log.route_targets,
+            vec![subc_protocol::RouteTarget::ManagementSurface {
+                module_id: "llm-runner".into()
+            }]
+        );
+        assert_eq!(
+            log.route_role_versions,
+            vec![Some(BTreeMap::from([(
+                "llm-runner".to_string(),
+                "v1".to_string()
+            )]))]
+        );
+        assert!(log.sends[0].get("parent").is_none());
+        assert_eq!(log.sends[0]["stop_when"], json!({"max_steps":1}));
     }
 
     #[tokio::test]
@@ -3293,7 +3936,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn await_output_uses_control_terminal_not_stream_end() {
+    async fn await_output_reads_final_result_and_releases_stream_routes() {
         let terminal_text = r#"<output><compartments><compartment start="1" end="1" title="t"><p1>x</p1></compartment></compartments><meta><messages_processed>1-1</messages_processed></meta></output>"#;
         let events = vec![
             json!({"kind":"display","event":{"type":"text_delta","text":"ignored"}}),
@@ -3340,10 +3983,10 @@ mod tests {
         );
     }
 
-    /// Run spend is the sum of every step's usage (each step is billed separately); the
-    /// terminal's own usage is used only when no step reported any.
+    /// The fake runner sums scripted-step usage into run.result. The producer
+    /// reads that total, not the individual stream-event bodies.
     #[tokio::test]
-    async fn await_output_sums_step_usage_and_falls_back_to_terminal_usage() {
+    async fn await_output_reads_aggregated_result_usage() {
         let with_steps = vec![
             json!({"kind":"control","unit":{"type":"run_started","run_id":"run-1"}}),
             json!({"kind":"control","unit":{"type":"step_finished","step_id":"s1","finish_reason":"tool_calls",
@@ -3396,12 +4039,15 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn terminal_without_matching_run_started_fails_loud() {
+    async fn run_result_for_a_different_run_is_refused() {
         let events = vec![
             json!({"kind":"control","unit":{"type":"run_started","run_id":"other-run"}}),
             json!({"kind":"control","unit":{"type":"run_finished","finish_reason":"completed"}}),
         ];
         let server = fake_server(json!({"state":"active","run_id":"run-1"}), events).await;
+        server.answers.lock().await.result = Some(
+            json!({"run_id":"other-run","state":"completed","final_message":{"ordinal":1,"mid":"m","text":""}}),
+        );
         let mut client = client(&server).await;
         client
             .start("mc-historian:proj:3", "", "prompt", "prov/model-a")
@@ -3409,17 +4055,11 @@ mod tests {
             .unwrap();
 
         let err = client.await_output("run-1").await.unwrap_err();
-        assert!(matches!(
-            err,
-            HistorianProducerError::TerminalRunMismatch {
-                expected,
-                found: Some(found),
-            } if expected == "run-1" && found == "other-run"
-        ));
+        assert!(err.to_string().contains("run_result_malformed"));
     }
 
     #[tokio::test]
-    async fn paused_unit_returns_run_paused() {
+    async fn paused_status_is_nonterminal_until_the_follow_deadline() {
         let events = vec![
             json!({"kind":"control","unit":{"type":"run_started","run_id":"run-1"}}),
             json!({"kind":"control","unit":{"type":"paused","run_id":"run-1","reason":"auth_required"}}),
@@ -3431,14 +4071,192 @@ mod tests {
             .await
             .unwrap();
 
-        let err = client.await_output("run-1").await.unwrap_err();
-        assert!(matches!(
-            err,
-            HistorianProducerError::RunPaused {
-                run_id,
-                reason: Some(reason),
-                ..
-            } if run_id == "run-1" && reason == "auth_required"
-        ));
+        let err = client
+            .await_output_with_timeout("run-1", Duration::from_millis(500))
+            .await
+            .unwrap_err();
+        assert!(matches!(err, HistorianProducerError::TimedOut));
+        let (statuses, results) = server.follow_counts().await;
+        assert!(statuses >= 2);
+        assert_eq!(results, 0);
+    }
+
+    #[test]
+    fn run_status_uses_exact_role_states_and_keeps_unknown_states_nonterminal() {
+        for state in [
+            "completed",
+            "max_steps",
+            "budget_exhausted",
+            "context_ceiling",
+            "cancelled",
+            "error",
+            "interrupted",
+        ] {
+            assert_eq!(
+                classify_run_state("r", &json!({"state":state})),
+                RunState::Terminal
+            );
+        }
+        for state in [
+            "active",
+            "paused",
+            "unknown",
+            "future_state",
+            "terminal",
+            "finished",
+            "active_error",
+        ] {
+            assert_eq!(
+                classify_run_state("r", &json!({"state":state})),
+                RunState::Active
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn completed_empty_result_overrides_stream_text_and_costs_one_status_probe() {
+        let server = fake_server(json!({"run_id":"run-1"}), vec![json!({"kind":"control","unit":{"type":"assistant_message","text":"must not escape"}})]).await;
+        server.answers.lock().await.result = Some(
+            json!({"run_id":"run-1","state":"completed","final_message":{"ordinal":1,"mid":"empty","text":""}}),
+        );
+        let mut producer = client(&server).await;
+        producer
+            .start("child", "", "prompt", "provider/model")
+            .await
+            .unwrap();
+        assert_eq!(producer.await_output("run-1").await.unwrap().text, "");
+        assert_eq!(server.follow_counts().await, (1, 1));
+    }
+
+    #[tokio::test]
+    async fn quiet_stream_uses_bounded_status_timer_through_paused_and_unknown_states() {
+        let server = fake_server(json!({"run_id":"run-1"}), vec![]).await;
+        server.answers.lock().await.statuses = ["active", "paused", "unknown", "completed"]
+            .map(|state| json!({"state":state}))
+            .into();
+        let mut producer = client(&server).await;
+        producer
+            .start("child", "", "prompt", "provider/model")
+            .await
+            .unwrap();
+        producer
+            .await_output_with_timeout("run-1", Duration::from_secs(2))
+            .await
+            .unwrap();
+        assert_eq!(server.follow_counts().await, (4, 1));
+    }
+
+    #[tokio::test]
+    async fn both_module_transports_omit_the_undeclared_parent_field() {
+        for session_owned in [false, true] {
+            let server = fake_server_with_role_describe(
+                json!({"run_id":"run-1"}),
+                vec![],
+                json!({"capabilities":["max_steps","no_tools"]}),
+                false,
+            )
+            .await;
+            let mut producer = if session_owned {
+                session_runner_client(&server).await
+            } else {
+                client(&server).await
+            };
+            producer
+                .start("child", "", "prompt", "provider/model")
+                .await
+                .unwrap();
+            let log = server.log.lock().await;
+            let request: RoleSendRequest = serde_json::from_value(log.sends[0].clone()).unwrap();
+            assert_eq!(request.max_steps().unwrap(), Some(1));
+            assert_eq!(request.no_tools().unwrap(), Some(true));
+            assert_eq!(request.max_output_tokens().unwrap(), None);
+            assert!(log.sends[0].get("parent").is_none());
+        }
+    }
+
+    /// The error a bare llm-runner reply must produce.
+    fn assert_reply_shape(error: &HistorianProducerError) {
+        assert!(error.is_runner_reply_shape(), "{error:?}");
+        assert!(
+            error.to_string().contains("runner_reply_shape"),
+            "named in the message: {error}"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_bare_role_describe_reply_is_refused_by_name_before_any_send() {
+        // `role.describe` feeds `RunnerLimits::from_describe`,
+        // `FollowCapabilities::from_describe` and the retention policy.
+        let server = fake_server(json!({"state":"active","run_id":"run-1"}), vec![]).await;
+        server.answers.lock().await.bare = true;
+        let mut producer = client(&server).await;
+        let error = producer
+            .start("child", "", "prompt", "provider/model")
+            .await
+            .unwrap_err();
+        assert_reply_shape(&error);
+        let error = producer.session_runner_limits("child").await.unwrap_err();
+        assert_reply_shape(&error);
+        assert!(server.log.lock().await.sends.is_empty());
+        producer.close().await;
+    }
+
+    #[tokio::test]
+    async fn a_bare_send_reply_is_refused_by_name() {
+        let server = fake_server(json!({"state":"active","run_id":"run-1"}), vec![]).await;
+        let mut producer = client(&server).await;
+        // The describe is read wrapped; only the send's reply comes back bare.
+        producer.session_runner_limits("child").await.unwrap();
+        server.answers.lock().await.bare = true;
+        let error = producer
+            .start("child", "", "prompt", "provider/model")
+            .await
+            .unwrap_err();
+        assert_reply_shape(&error);
+        assert_eq!(server.log.lock().await.sends.len(), 1);
+        producer.close().await;
+    }
+
+    #[tokio::test]
+    async fn bare_run_status_and_result_replies_are_refused_by_name() {
+        let server = fake_server(json!({"state":"active","run_id":"run-1"}), vec![]).await;
+        let mut producer = client(&server).await;
+        let handle = producer
+            .start("child", "", "prompt", "provider/model")
+            .await
+            .unwrap();
+        server.answers.lock().await.bare = true;
+        assert_reply_shape(&producer.status(&handle.run_id).await.unwrap_err());
+        assert_reply_shape(&producer.await_output(&handle.run_id).await.unwrap_err());
+        assert_reply_shape(&producer.cancel(&handle.run_id).await.unwrap_err());
+        producer.close().await;
+    }
+
+    #[tokio::test]
+    async fn missing_follow_groups_are_named_before_any_send() {
+        for missing in ["run_ops", "run_status"] {
+            let server = fake_server(json!({"run_id":"run-1"}), vec![]).await;
+            let groups: Vec<_> = [
+                "run_ops",
+                "run_status",
+                "streaming",
+                "no_tools",
+                "max_steps",
+                "max_output_tokens",
+            ]
+            .into_iter()
+            .filter(|group| *group != missing)
+            .collect();
+            server.answers.lock().await.describe = Some(json!({"capabilities":groups}));
+            let mut producer = client(&server).await;
+            let error = producer
+                .start("child", "", "prompt", "provider/model")
+                .await
+                .unwrap_err();
+            assert!(error
+                .to_string()
+                .contains(&format!("background_runner_missing_groups: {missing}")));
+            assert!(server.log.lock().await.sends.is_empty());
+        }
     }
 }

@@ -1,5 +1,9 @@
 import type { Database } from "../../shared/sqlite";
 import { ensureSessionMetaRow } from "./storage-meta-shared";
+import {
+    readSessionMetaCollection,
+    updateSessionMetaCollection,
+} from "./storage-session-collections";
 
 const PREFIX = "pi-content-replay-v1:";
 export const PI_CONTENT_DECISION_LIMIT = 4096;
@@ -54,11 +58,9 @@ function readEntries(raw: string | null): string[] {
 }
 
 export function getPiContentDecisions(db: Database, sessionId: string): Set<string> {
-    const row = db
-        .prepare(
-            "SELECT merged_reasoning_stripped_ids AS decisions FROM session_meta WHERE session_id = ?",
-        )
-        .get(sessionId) as { decisions: string | null } | undefined;
+    const row = {
+        decisions: readSessionMetaCollection(db, sessionId, "merged_reasoning_stripped_ids"),
+    } as { decisions: string | null } | undefined;
     return new Set(
         readEntries(row?.decisions ?? null).filter(
             (value) => decodePiContentDecision(value) !== null,
@@ -79,11 +81,13 @@ export function freezePiContentDecision(
         return db
             .transaction(() => {
                 for (let attempt = 0; attempt < 5; attempt++) {
-                    const row = db
-                        .prepare(
-                            "SELECT merged_reasoning_stripped_ids AS decisions FROM session_meta WHERE session_id = ?",
-                        )
-                        .get(sessionId) as { decisions: string | null };
+                    const row = {
+                        decisions: readSessionMetaCollection(
+                            db,
+                            sessionId,
+                            "merged_reasoning_stripped_ids",
+                        ),
+                    } as { decisions: string | null };
                     const current = readEntries(row.decisions);
                     if (current.includes(entry)) return true;
                     // Tags survive compartment projection; only actual deletion invalidates a choice.
@@ -116,11 +120,13 @@ export function freezePiContentDecision(
                     )
                         return false;
                     kept.push(entry);
-                    const result = db
-                        .prepare(
-                            "UPDATE session_meta SET merged_reasoning_stripped_ids = ? WHERE session_id = ? AND merged_reasoning_stripped_ids IS ?",
-                        )
-                        .run(JSON.stringify(kept), sessionId, row.decisions);
+                    const result = updateSessionMetaCollection(
+                        db,
+                        sessionId,
+                        "merged_reasoning_stripped_ids",
+                        JSON.stringify(kept),
+                        { value: row.decisions },
+                    );
                     if (result.changes > 0) return true;
                 }
                 return false;
@@ -149,23 +155,23 @@ export function withdrawPiContentDecision(
     return db
         .transaction(() => {
             for (let attempt = 0; attempt < 5; attempt++) {
-                const row = db
-                    .prepare(
-                        "SELECT merged_reasoning_stripped_ids AS decisions FROM session_meta WHERE session_id = ?",
-                    )
-                    .get(sessionId) as { decisions: string | null } | undefined;
+                const row = {
+                    decisions: readSessionMetaCollection(
+                        db,
+                        sessionId,
+                        "merged_reasoning_stripped_ids",
+                    ),
+                } as { decisions: string | null } | undefined;
                 if (!row) return true;
                 const current = readEntries(row.decisions);
                 if (!current.includes(entry)) return true;
-                const result = db
-                    .prepare(
-                        "UPDATE session_meta SET merged_reasoning_stripped_ids = ? WHERE session_id = ? AND merged_reasoning_stripped_ids IS ?",
-                    )
-                    .run(
-                        JSON.stringify(current.filter((value) => value !== entry)),
-                        sessionId,
-                        row.decisions,
-                    );
+                const result = updateSessionMetaCollection(
+                    db,
+                    sessionId,
+                    "merged_reasoning_stripped_ids",
+                    JSON.stringify(current.filter((value) => value !== entry)),
+                    { value: row.decisions },
+                );
                 if (result.changes > 0) return true;
             }
             return false;

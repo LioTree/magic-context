@@ -1,6 +1,6 @@
 import { describe, expect, test } from "bun:test";
 import { Database } from "../../shared/sqlite";
-import { MIGRATIONS, runMigrations } from "./migrations";
+import { LATEST_MIGRATION_VERSION, MIGRATIONS, runMigrations } from "./migrations";
 import { enforceSchemaFence, initializeDatabase, LATEST_SUPPORTED_VERSION } from "./storage-db";
 import { TRIM_SOURCE_CANDIDATES_SQL } from "./storage-tags";
 
@@ -42,10 +42,10 @@ describe("migration 101", () => {
             const tags = db.prepare("SELECT * FROM tags ORDER BY id").all();
             const ops = db.prepare("SELECT * FROM pending_ops").all();
             runMigrations(db);
-            expect(LATEST_SUPPORTED_VERSION).toBe(102);
-            expect(MIGRATIONS.at(-1)?.version).toBe(102);
+            expect(LATEST_SUPPORTED_VERSION).toBe(LATEST_MIGRATION_VERSION);
+            expect(MIGRATIONS.filter((entry) => entry.version === 101)).toHaveLength(1);
             expect(db.prepare("SELECT MAX(version) AS v FROM schema_migrations").get()).toEqual({
-                v: 102,
+                v: LATEST_MIGRATION_VERSION,
             });
             expect(db.prepare("SELECT * FROM tags ORDER BY id").all()).toEqual(tags);
             expect(db.prepare("SELECT * FROM pending_ops").all()).toEqual(ops);
@@ -60,7 +60,7 @@ describe("migration 101", () => {
                 .all("s", '["new"]') as { detail: string }[];
             expect(plan.filter((row) => row.detail.includes("SEARCH t"))).toHaveLength(4);
             expect(enforceSchemaFence(db, ":previous:", 100)).toBe(false);
-            expect(enforceSchemaFence(db, ":current:", 102)).toBe(true);
+            expect(enforceSchemaFence(db, ":current:", LATEST_SUPPORTED_VERSION)).toBe(true);
             expect(db.prepare("PRAGMA quick_check").get()).toEqual({ quick_check: "ok" });
         } finally {
             db.close();

@@ -159,3 +159,16 @@ test("a rejected restoration is quarantined instead of entering a 400 loop", () 
     armLatestThinkingRecovery(db, "session");
     expect(prepare).toThrow("ANTHROPIC_LATEST_TURN_EDIT_UNSAFE");
 });
+
+test("entry-order metadata is not a missing thinking original", () => {
+    const { db, messages, prepare } = fixture();
+    addMergedReasoningStrippedIds(db, "session", [
+        "binding_mismatch:a",
+        "binding_mismatch_entry_order:end:a",
+    ]);
+    const before = JSON.stringify(messages);
+    expect(prepare()).toEqual({ restore: false, ended: false });
+    armLatestThinkingRecovery(db, "session");
+    expect(prepare()).toEqual({ restore: true, ended: false });
+    expect(JSON.stringify(messages)).toBe(before);
+});

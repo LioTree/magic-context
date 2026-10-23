@@ -37,6 +37,7 @@ import {
 import { createTagger } from "../../features/magic-context/tagger";
 import { cleanupTestTempDir, createTestTempDirFromPath } from "../../shared/test-temp-dir";
 import type { StoreRow } from "../../v2/store-reader";
+import stripGolden from "./fixtures/system-delivery-strip-gating-digests.json";
 import goldenDigests from "./fixtures/system-delivery-unheld-digests.json";
 import {
     beginV2LkgRequest,
@@ -82,6 +83,8 @@ function seedSafetyPool(db: Parameters<typeof insertMemory>[0], projectPath: str
         });
     db.exec("UPDATE memories SET classified_at=7");
 }
+const capturedWires = new Map<string, string>();
+const contentWires = new Map<string, string>();
 function random(seed: number) {
     let state = seed >>> 0;
     return () => {
@@ -103,8 +106,42 @@ function stable(value: unknown): string {
     }
     return JSON.stringify(value);
 }
-function digest(value: unknown) {
-    return createHash("sha256").update(stable(value)).digest("hex");
+function contentWire(value: unknown): string {
+    const body = value as { messages: Record<string, unknown>[] } & Record<string, unknown>;
+    const messages = body.messages.map((message) => {
+        if (message.role !== "assistant") return message;
+        const result = { ...message };
+        for (const field of ["parts", "content"]) {
+            if (!Array.isArray(result[field])) continue;
+            result[field] = (result[field] as Record<string, unknown>[]).filter(
+                (block) =>
+                    !["reasoning", "thinking", "redacted_thinking", "redactedThinking"].includes(
+                        String(block.type),
+                    ) && !(block.type === "text" && block.text === ""),
+            );
+        }
+        return result;
+    });
+    const canonical = (item: unknown): string => {
+        if (item === undefined) return "null";
+        if (Array.isArray(item)) return `[${item.map(canonical).join(",")}]`;
+        if (item && typeof item === "object")
+            return `{${Object.entries(item)
+                .filter(([, entry]) => entry !== undefined)
+                .sort(([a], [b]) => (a < b ? -1 : a > b ? 1 : 0))
+                .map(([key, entry]) => `${JSON.stringify(key)}:${canonical(entry)}`)
+                .join(",")}}`;
+        return JSON.stringify(item);
+    };
+    return canonical({ ...body, messages });
+}
+
+function digest(value: unknown, trackContent = false) {
+    const wire = stable(value);
+    const hash = createHash("sha256").update(wire).digest("hex");
+    if (process.env.REVIEW_WIRES_OUT) capturedWires.set(hash, wire);
+    if (trackContent) contentWires.set(hash, contentWire(value));
+    return hash;
 }
 function eventsFor(seed: number) {
     const rng = random(seed);
@@ -328,13 +365,16 @@ async function openCode(host: "oc1" | "oc2", signed: boolean, seed: number, acti
                         prompt,
                     );
                 bodies.push(
-                    digest({
-                        system: prompt.system,
-                        messages: output.messages.map((m) => ({
-                            role: m.info.role,
-                            parts: m.parts,
-                        })),
-                    }),
+                    digest(
+                        {
+                            system: prompt.system,
+                            messages: output.messages.map((m) => ({
+                                role: m.info.role,
+                                parts: m.parts,
+                            })),
+                        },
+                        signed && !active,
+                    ),
                 );
                 const markerBefore = getOrCreateSessionMeta(db, sessionId).cachedM0SystemHash;
                 if (host === "oc2") {
@@ -505,9 +545,21 @@ async function pi(signed: boolean, seed: number, active = false) {
                 } else if (!e.tool) user();
                 if (e.edit) instruction = `genuine instructions ${e.pass}`;
                 if (e.flush) piContext.signalPiPendingMaterialization(sessionId, "user_flush");
-                if (e.history) piContext.signalPiHistoryRefresh(sessionId);
-                if (e.model)
+                if (e.history) {
+                    piContext.signalPiHistoryRefresh(sessionId);
+                    // Removing thinking from completed signed replies requires
+                    // permission to rebuild the request. History can be unchanged,
+                    // so this case also requests an explicit user flush.
+                    if (signed && !active)
+                        piContext.signalPiPendingMaterialization(sessionId, "user_flush");
+                }
+                if (e.model) {
                     model = model === "claude-opus-5-5" ? "claude-sonnet-4-6" : "claude-opus-5-5";
+                    // Turns served by the other model have no protected-prefix
+                    // record. Start a real user request before simulating a new
+                    // signed reply on the protected model again.
+                    if (active && model === "claude-opus-5-5") user();
+                }
                 if (e.drop) {
                     const target = getTagsBySession(db, sessionId).find(
                         (tag) => tag.type === "tool" && tag.status === "active",
@@ -581,17 +633,20 @@ async function pi(signed: boolean, seed: number, active = false) {
                     });
                 }
                 bodies.push(
-                    digest({
-                        system: prompt.systemPrompt,
-                        messages: served.messages.map((m) => {
-                            const {
-                                timestamp: _timestamp,
-                                usage: _usage,
-                                ...wire
-                            } = m as unknown as Record<string, unknown>;
-                            return wire;
-                        }),
-                    }),
+                    digest(
+                        {
+                            system: prompt.systemPrompt,
+                            messages: served.messages.map((m) => {
+                                const {
+                                    timestamp: _timestamp,
+                                    usage: _usage,
+                                    ...wire
+                                } = m as unknown as Record<string, unknown>;
+                                return wire;
+                            }),
+                        },
+                        signed && !active,
+                    ),
                 );
                 const markerBefore = getOrCreateSessionMeta(db, sessionId).cachedM0SystemHash;
                 const response = {
@@ -619,7 +674,13 @@ async function pi(signed: boolean, seed: number, active = false) {
                     if (ackAt < 0) ackAt = e.pass;
                 }
             } catch (error) {
-                errors.push(`${e.pass}:${String(error)}`);
+                const causes: string[] = [];
+                let cause: unknown = error;
+                for (let depth = 0; cause && depth < 8; depth++) {
+                    causes.push(String(cause));
+                    cause = cause instanceof Error ? cause.cause : undefined;
+                }
+                errors.push(`${e.pass}:${causes.join(" caused by ")}`);
                 bodies.push(`ERROR:${String(error)}`);
             }
         }
@@ -663,17 +724,90 @@ for (const host of ["oc1", "oc2", "pi"] as const)
                 }
             }, 120_000);
         }
-it("independent differential matches unheld provider bodies to master", () => {
+it("independent differential retains base content across the admitted-thinking-strip change", () => {
     console.log(
         `REVIEW_DIFFERENTIAL ${JSON.stringify(process.env.REVIEW_DUMP === "1" ? summaries : summaries.map(({ bodies, ...row }) => ({ ...row, passes: bodies.length, sha256: createHash("sha256").update(bodies.join("\n")).digest("hex") })))}`,
     );
     if (process.env.REVIEW_OUT)
         require("node:fs").writeFileSync(process.env.REVIEW_OUT, JSON.stringify(summaries));
+    if (process.env.REVIEW_WIRES_OUT)
+        require("node:fs").writeFileSync(
+            process.env.REVIEW_WIRES_OUT,
+            JSON.stringify(Object.fromEntries(capturedWires)),
+        );
     expect(summaries).toHaveLength(seeds.length * (s02 ? 3 : 9));
-    if (!s02 && passes === 80 && !process.env.REVIEW_OUT)
+    if (!s02 && passes === 80 && !process.env.REVIEW_OUT) {
+        // Collect every row before asserting, so one run reports each drifted key.
+        const actual: Record<string, string | undefined> = {};
+        const expected: Record<string, string | undefined> = {};
         for (const row of summaries.filter((row) => !row.active)) {
             const key = `${row.host}-${row.signed}-${row.seed}` as keyof typeof goldenDigests;
             const hash = createHash("sha256").update(row.bodies.join("\n")).digest("hex");
-            expect({ key, hash }).toEqual({ key, hash: goldenDigests[key] });
+            if (!row.signed) {
+                actual[`wire ${key}`] = hash;
+                expected[`wire ${key}`] = goldenDigests[key];
+                continue;
+            }
+            const signedKey = key as keyof typeof stripGolden.signedWire;
+            actual[`wire ${key}`] = hash;
+            expected[`wire ${key}`] = stripGolden.signedWire[signedKey];
+            const bodies = row.bodies.map((body) =>
+                body.startsWith("ERROR:") ? body : contentWires.get(body),
+            );
+            expect(bodies.every((body) => typeof body === "string")).toBe(true);
+            actual[`content ${key}`] = createHash("sha256").update(bodies.join("\n")).digest("hex");
+            expected[`content ${key}`] = stripGolden.baseContent[signedKey];
         }
+        expect(actual).toEqual(expected);
+    }
+});
+
+it("the content oracle preserves thinking-shaped data quoted inside tool inputs", () => {
+    const request = {
+        system: "system",
+        messages: [
+            {
+                role: "assistant",
+                parts: [
+                    {
+                        type: "tool",
+                        state: {
+                            input: { items: [{ type: "thinking", thinking: "quoted data" }] },
+                        },
+                    },
+                ],
+            },
+        ],
+    };
+    const changed = structuredClone(request);
+    changed.messages[0].parts[0].state.input.items[0].thinking = "changed data";
+    expect(contentWire(changed)).not.toBe(contentWire(request));
+});
+
+it("the content oracle excludes only assistant thinking and its empty sentinels", () => {
+    const request = {
+        system: "system",
+        messages: [
+            {
+                role: "assistant",
+                content: [
+                    { type: "thinking", thinking: "signed", signature: "signature" },
+                    { type: "text", text: "answer" },
+                ],
+            },
+        ],
+    };
+    const omitted = {
+        system: "system",
+        messages: [
+            {
+                role: "assistant",
+                content: [
+                    { type: "text", text: "" },
+                    { type: "text", text: "answer" },
+                ],
+            },
+        ],
+    };
+    expect(contentWire(omitted)).toBe(contentWire(request));
 });

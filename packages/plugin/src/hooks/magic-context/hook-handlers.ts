@@ -23,6 +23,7 @@ import {
 } from "../../features/magic-context/storage-meta-persisted";
 import { clearSidebarSnapshotCache } from "../../plugin/sidebar-snapshot-cache";
 import type { PluginContext } from "../../plugin/types";
+import { isBridgedSession } from "../../shared/bridged-sessions";
 import { seedSessionCacheTtlIfUnsynced } from "../../shared/cache-ttl-seed";
 import { sessionLog } from "../../shared/logger";
 import { clearAutoSearchForSession } from "./auto-search-runner";
@@ -36,9 +37,9 @@ import {
     buildChannel1Reminder,
     CHANNEL1_SENTINEL,
     type Channel1State,
+    currentReclaimableToolOutputCount,
     decideChannel1,
     formatChannel1Evaluation,
-    reclaimableToolOutputCount,
     toolOutputTokens,
 } from "./ctx-reduce-nudge";
 import { annotateEmptyTaskOutput } from "./empty-task-output";
@@ -63,6 +64,31 @@ import {
 import { variantChangeBustsProviderCache } from "./sentinel";
 import { matchStrippedMagicContextCommand } from "./stripped-command";
 import { normalizeTodoStateJson } from "./todo-view";
+
+/**
+ * The raw-message source the event hook hands to message-index reconciliation.
+ *
+ * Reconciliation is scheduled when a session's first event arrives (for a
+ * fresh session that is `session.created`) but runs later, after the boot
+ * quiet period. Another product's bridge can enroll the session in between
+ * (see shared/bridged-sessions.ts); from then on Magic Context must not index
+ * it. Each read therefore checks enrollment when it runs: an enrolled session
+ * reports zero messages, so the deferred pass reads nothing and writes no index
+ * rows. Every other session reads through to `readRawSessionMessages` unchanged.
+ */
+const reconcileUnlessBridged = Object.assign(
+    (sessionId: string) => (isBridgedSession(sessionId) ? [] : readRawSessionMessages(sessionId)),
+    {
+        readPage: (...args: Parameters<typeof readRawSessionMessages.readPage>) =>
+            isBridgedSession(args[0]) ? [] : readRawSessionMessages.readPage(...args),
+        getCount: (sessionId: string) =>
+            isBridgedSession(sessionId) ? 0 : readRawSessionMessages.getCount(sessionId),
+        prepare: (sessionId: string) =>
+            isBridgedSession(sessionId)
+                ? Promise.resolve(true)
+                : readRawSessionMessages.prepare(sessionId),
+    },
+);
 
 export type LiveModelBySession = Map<string, { providerID: string; modelID: string }>;
 export type LatestAssistantMessageIdBySession = Map<string, string>;
@@ -448,7 +474,7 @@ export function createEventHook(args: {
         if (!sessionId) return;
 
         if (input.event.type !== "session.deleted") {
-            scheduleReconciliation(args.db, sessionId, readRawSessionMessages);
+            scheduleReconciliation(args.db, sessionId, reconcileUnlessBridged);
         }
 
         if (input.event.type === "session.deleted") {
@@ -592,7 +618,7 @@ function maybeInjectChannel1Nudge(
     out.output += buildChannel1Reminder(
         decision.level,
         decision.undroppedTokens,
-        reclaimableToolOutputCount(state.baselineParts),
+        currentReclaimableToolOutputCount(state),
         state.oldestReclaimableToolTags,
         decision.sticky,
     );
@@ -610,12 +636,6 @@ export function createToolExecuteAfterHook(args: {
     db: Parameters<typeof getOrCreateSessionMeta>[0];
     channel1StateBySession: Map<string, Channel1State>;
     client?: PluginContext["client"];
-    transformMode?: "ts" | "rust";
-    todoStateSet?: (input: {
-        sessionId: string;
-        stateJson: string;
-        ownerMessageId: string;
-    }) => Promise<unknown>;
 }) {
     return async (input: unknown, output?: unknown) => {
         const typedInput = input as {
@@ -723,36 +743,6 @@ export function createToolExecuteAfterHook(args: {
                     updateSessionMeta(args.db, typedInput.sessionID, {
                         lastTodoState: normalizedTodos,
                     });
-                    if (args.transformMode === "rust" && args.todoStateSet) {
-                        const todoSessionId = typedInput.sessionID;
-                        const rawArgs =
-                            typedInput.args && typeof typedInput.args === "object"
-                                ? (typedInput.args as Record<string, unknown>)
-                                : {};
-                        const ownerMessageId =
-                            (typeof rawArgs.owner_message_id === "string" &&
-                                rawArgs.owner_message_id) ||
-                            (typeof rawArgs.message_id === "string" && rawArgs.message_id) ||
-                            (typeof (typedInput as { messageID?: unknown }).messageID ===
-                                "string" &&
-                                (typedInput as { messageID: string }).messageID) ||
-                            (typeof (typedInput as { callID?: unknown }).callID === "string" &&
-                                (typedInput as { callID: string }).callID) ||
-                            typedInput.sessionID;
-                        void args
-                            .todoStateSet({
-                                sessionId: todoSessionId,
-                                stateJson: normalizedTodos,
-                                ownerMessageId,
-                            })
-                            .catch((error) => {
-                                sessionLog(
-                                    todoSessionId,
-                                    "rust todo_state.set failed (ignored):",
-                                    error,
-                                );
-                            });
-                    }
                 }
             }
             if (

@@ -537,10 +537,12 @@ describe("storage-db", () => {
                     return "seed";
                 });
                 const placeholders = insertedColumns.map(() => "?").join(", ");
-                // A seeded tag or compartment may already have created this row through
-                // its version trigger.
+                // Version triggers can create this row when tags, compartments or payloads are seeded;
+                // INSERT OR IGNORE tolerates only that already-created row while cleanup still checks every table.
                 const insertVerb =
-                    table === "session_meta" || table === "compartment_history_versions"
+                    table === "session_meta" ||
+                    table === "compartment_history_versions" ||
+                    table === "session_meta_collection_revisions"
                         ? "INSERT OR IGNORE"
                         : "INSERT";
                 db.prepare(

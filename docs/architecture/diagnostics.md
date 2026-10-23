@@ -26,7 +26,7 @@ Useful lines to know:
 - The materialisation reason for every `m[0]` fold.
 - `compartment trigger:` lines for every historian decision, including skips with their reason.
 - Channel 1 and Channel 2 evaluations with their band, `U`, `T` and verdict.
-- Refusals, fallbacks (`raw_fallback_...`, LKG replay) and Rust-mode park transitions.
+- Refusals and fallbacks (`raw_fallback_...`, LKG replay).
 
 ## Redaction
 
@@ -34,7 +34,7 @@ Useful lines to know:
 
 ## Decision records
 
-`transform_decisions` in `context.db` stores the cache-affecting decision of each pass (scheduler decision, materialisation reason and related fields), keeping the newest 2,000 rows per session and host. The dashboard reads it to attribute each cache bust to a cause. `/ctx-status diagnostics` prints the extended status view in a session. In Rust mode, status queries the module directly and fails closed rather than showing possibly stale host rows; the module keeps its own pass audit in `mc_pass_trace`.
+`transform_decisions` in `context.db` stores the cache-affecting decision of each pass (scheduler decision, materialisation reason and related fields), keeping the newest 2,000 rows per session and host. The dashboard reads it to attribute each cache bust to a cause. `/ctx-status diagnostics` prints the extended status view in a session. The Rust module, ck-mc, keeps its own pass audit in `mc_pass_trace` in `store.db` (see [rust-module.md](rust-module.md)).
 
 User-facing problems carry stable `MC-*` codes (`user-facing-codes.ts`), each with one sentence and one action. The same text appears in `/ctx-status`, the sidebar and `doctor`, so a code in a bug report identifies the problem without the log.
 
@@ -48,7 +48,7 @@ Flags and subcommands:
 - `store init` provisions `context.db` at the current schema fence without a host, and reports its path and version. Existing stores are inspected without changes; a newer schema is refused. It honours `XDG_DATA_HOME` and `MAGIC_CONTEXT_STORAGE_DIR`. Non-dry-run `setup` also runs this provisioning step.
 - `repair-db` repairs a corrupt `context.db` after copying it to a backup bundle.
 - `merge-identity` merges two project identities that are the same project.
-- `drain-authority <project>` returns memory and note authority from the Rust module to TypeScript.
+- `single-store migrate` runs the one-time offline migration that moves ck-mc's project data from `store.db` into `context.db` (`MC-C14`). It refuses while any process holds either database.
 - `list-hidden-sessions` lists Magic Context's hidden child sessions.
 - `migrate` moves OpenCode sessions to Pi or OMP; `migrate-session` re-homes an OpenCode session to another directory or project. Both journal their progress so a crash can resume.
 
@@ -58,7 +58,7 @@ Flags and subcommands:
 
 A cache bust shows up only as a provider bill. Two scripts attribute them from outside the plugin, both read-only:
 
-- **`scripts/analyze-cache-busts.ts <sessionIdPrefix>`** walks request dumps written by the authentication plugins (Anthropic and OpenAI request bodies), normalises both shapes to role and part summaries, and uses each response's reported cache usage to find where the cached prefix diverged. It lines those points up with the plugin log (scheduler decisions, `HARD` reasons, Rust-mode faults) to name the pass responsible. Per-request rotating header values are masked so they are not reported as divergences.
+- **`scripts/analyze-cache-busts.ts <sessionIdPrefix>`** walks request dumps written by the authentication plugins (Anthropic and OpenAI request bodies), normalises both shapes to role and part summaries, and uses each response's reported cache usage to find where the cached prefix diverged. It lines those points up with the plugin log (scheduler decisions and `HARD` reasons) to name the pass responsible. Per-request rotating header values are masked so they are not reported as divergences.
 - **`scripts/cache-bust-sentinel.ts`** watches OpenCode and Pi/OMP sessions continuously (or once with `--once`) and classifies each divergence against a fixed rule table: accounted busts such as `/ctx-flush`, a force-band batch, a HARD fold with a model or system-prompt change, versus unaccounted ones that point at a bug.
 
 For looking at a session directly: `scripts/tail-view.ts <session_id>` prints messages since the last compartment and marks dropped ones, and the root `scripts/context-dump.ts <session_id>` dumps what Magic Context holds for a session.

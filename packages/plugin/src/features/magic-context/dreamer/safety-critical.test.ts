@@ -99,7 +99,7 @@ test("normal classify flags historian-scored, legacy-classified and open-item ru
     }
 });
 
-test("module classify selection matches the Rust scored legacy and open-rule fixture", async () => {
+test("host classify selection matches the shared scored legacy and open-rule fixture", async () => {
     const f = fixture();
     try {
         const [scored, legacy, open] = f.rows;
@@ -116,18 +116,17 @@ test("module classify selection matches the Rust scored legacy and open-rule fix
                 )
                 .all(),
         ).toEqual(selectionCase.scored_inputs);
-        let submitted: Array<{ memory_id: number }> = [];
-        const selection = await classifySafetyFixture(f.db, f.project, {
-            call: async (request) => {
-                expect(request.method).toBe("memory.set_classification");
-                submitted = (request.body as { arguments: { rows: Array<{ memory_id: number }> } })
-                    .arguments.rows;
-                return { accepted: submitted.map((row) => row.memory_id), rejected: [] };
-            },
-        });
+        const selection = await classifySafetyFixture(f.db, f.project);
         expect(selection.result).toMatchObject(selectionCase.result);
         expect(selection.prompted.sort((a, b) => a - b)).toEqual(selectionCase.prompted);
-        expect(submitted.sort((a, b) => a.memory_id - b.memory_id)).toEqual(selectionCase.rows);
+        for (const row of selectionCase.rows) {
+            expect(getMemoryById(f.db, row.memory_id)).toMatchObject({
+                safetyCritical: row.safety_critical ? 1 : 0,
+                importance: row.memory_id === legacy.id ? 95 : row.safety_critical ? 80 : 1,
+                scope: row.memory_id <= open.id ? "ecosystem" : "universe",
+                shareable: row.memory_id <= open.id ? 0 : 1,
+            });
+        }
     } finally {
         f.db.close();
     }
@@ -197,7 +196,7 @@ test("classify migration leaves every existing memory safety assessment NULL", (
     const f = fixture();
     try {
         f.db.exec(
-            "ALTER TABLE memories DROP COLUMN safety_critical; DELETE FROM schema_migrations WHERE version=102",
+            "ALTER TABLE memories DROP COLUMN safety_critical; DELETE FROM schema_migrations WHERE version=104",
         );
         runMigrations(f.db);
         expect(

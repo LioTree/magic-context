@@ -6,7 +6,7 @@ import { loadHostRunnerRecord } from "../../../../features/magic-context/storage
 import { getOrCreateSessionMeta } from "../../../../features/magic-context/storage-meta";
 import { createTagger } from "../../../../features/magic-context/tagger";
 import { Database } from "../../../../shared/sqlite";
-import type { createRustModeTransform } from "../../rust-mode-transform";
+import type { createModuleSessionKernel } from "../../module-session-kernel";
 import type { TransformDeps } from "../../transform";
 import type { MessageLike } from "../../transform-operations";
 import { createOpenCodeProviderTransform } from "../opencode-adapter";
@@ -120,7 +120,7 @@ const legacy = {
         idOrdinalMemo: new Map(),
         ordinalMemoCheckpoints: [],
     }),
-} as unknown as ReturnType<typeof createRustModeTransform>;
+} as unknown as ReturnType<typeof createModuleSessionKernel>;
 const key = { session_id: "session", harness: host === "v1" ? "opencode" : "opencode2" };
 const adapter = createOpenCodeProviderTransform(deps, legacy, {
     persisted: () => true,

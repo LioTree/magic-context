@@ -9,6 +9,7 @@ import { OpenCode } from "@opencode/client";
 import { gaDatabasePath, V2StoreReader } from "../../../plugin/src/v2/store-reader";
 import { rawMessages } from "../../../plugin/src/v2/hooks/store";
 import { spawnOpencode2, waitForPluginActive, waitForPluginLog } from '../../src/opencode2-runner/spawn';
+import { readSessionMetaField, writeSessionMetaField } from "../../src/session-meta-fields";
 
 const sha = (value: unknown) => createHash("sha256").update(JSON.stringify(value)).digest("hex");
 for (const mode of ["local", "provider"] as const) {
@@ -131,7 +132,10 @@ for (const mode of ["local", "provider"] as const) {
                 expect(sha(frames().filter(frame => frame.kind === "context").at(-1).messages[0])).toBe(sha(hardHead));
             }
             const beforeUpgrade = snapshot().stamp;
-            hardDb.prepare("UPDATE session_meta SET cached_m0_upgrade_state = 'old-upgrade' || substr(cached_m0_upgrade_state, instr(cached_m0_upgrade_state, '|')) WHERE session_id = ?").run(session.id);
+            // Replace the identity before the first '|' (the whole value when there is none), as
+            // SQL `'old-upgrade' || substr(state, instr(state, '|'))` would.
+            const upgradeState = readSessionMetaField(hardDb, session.id, "cached_m0_upgrade_state") as string | null | undefined;
+            writeSessionMetaField(hardDb, session.id, "cached_m0_upgrade_state", upgradeState == null ? null : `old-upgrade${upgradeState.includes("|") ? upgradeState.slice(upgradeState.indexOf("|")) : upgradeState}`);
             await turn("HARD upgrade state");
             expect(snapshot().stamp).toBeGreaterThan(beforeUpgrade);
             const hostTimes = new Database(gaDatabasePath(host.env.XDG_DATA_HOME!, "latest", host.env));

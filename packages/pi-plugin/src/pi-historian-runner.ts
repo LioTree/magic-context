@@ -486,6 +486,9 @@ export interface PiHistorianDeps {
 	/** User-memory feature gate (`dreamer.user_memories.enabled`). Gates whether
 	 *  historian-extracted user observations are persisted as candidates. */
 	userMemoriesEnabled?: boolean;
+	/** False when the dreamer is not runnable, so the historian prompt asks it to
+	 *  skip user observations nothing could review. Undefined counts as true. */
+	userObservationsRequested?: boolean;
 	language?: string;
 	/** Optional callback invoked on successful publication for cache-bust signaling. */
 	onPublished?: () => void;
@@ -552,6 +555,7 @@ export async function runPiHistorian(deps: PiHistorianDeps): Promise<void> {
 		allowHomeProject,
 		autoPromote,
 		userMemoriesEnabled,
+		userObservationsRequested,
 		onPublished,
 		compartmentLeaseHolderId,
 		readBranchEntries,
@@ -797,14 +801,33 @@ export async function runPiHistorian(deps: PiHistorianDeps): Promise<void> {
 			);
 			const anchoredFacts =
 				turnOneLane === "enabled" && memoryEnabled !== false;
-			const memories =
-				projectPath && !anchoredFacts
-					? getMemoriesByProject(db, projectPath, ["active", "permanent"])
-					: [];
 			const fitModelKey = piModelRefToCanonical(historianModel ?? "");
 			const fitContext = fitModelKey
 				? resolveProducerContextLimit(fitModelKey)
 				: undefined;
+			// Every attempt in the chain (configured fallbacks, then the session
+			// model as the last resort) sends this same prompt, so size it for each
+			// of their windows too, resolved as the dispatch guard resolves them.
+			const fallbackWindows = [
+				...(fallbackModels ?? []).map((entry) =>
+					typeof entry === "string" ? entry : entry.model,
+				),
+				fallbackModelId,
+			]
+				.map((model) => (model ? piModelRefToCanonical(model) : ""))
+				.filter((key) => key.length > 0 && key !== fitModelKey)
+				.map((key) => {
+					const context = resolveProducerContextLimit(key);
+					return {
+						modelKey: key,
+						contextLimitTokens: context,
+						maxOutputTokens: historianProducerReserve(
+							context,
+							maxOutputTokens,
+							deps.resolveHostOutputLimit?.(key),
+						),
+					};
+				});
 			const promptFit = fitHistorianPrompt({
 				window: {
 					modelKey: fitModelKey || undefined,
@@ -815,6 +838,7 @@ export async function runPiHistorian(deps: PiHistorianDeps): Promise<void> {
 						deps.resolveHostOutputLimit?.(fitModelKey),
 					),
 				},
+				fallbackWindows,
 				systemPrompt: historianSystemPrompt,
 				requestedChunkTokens: historianChunkTokens,
 				sessionId,
@@ -825,9 +849,13 @@ export async function runPiHistorian(deps: PiHistorianDeps): Promise<void> {
 					sessionId,
 					priorCompartments,
 				),
-				memories,
+				memories: () =>
+					projectPath && !anchoredFacts
+						? getMemoriesByProject(db, projectPath, ["active", "permanent"])
+						: [],
 				memoryEnabled: memoryEnabled !== false,
 				anchoredFacts,
+				userObservationsRequested,
 			});
 			if (!promptFit.ok) {
 				telemetry.failureReason = promptFit.reason;
@@ -1018,6 +1046,7 @@ export async function runPiHistorian(deps: PiHistorianDeps): Promise<void> {
 				inputSource: `Messages ${chunk.startIndex}-${chunk.endIndex}:\n\n${chunkText}`,
 				memoryEnabled: memoryEnabled !== false,
 				anchoredFacts,
+				userObservationsRequested,
 			});
 
 			// Defensive: use MAX(sequence) + 1 over .length to survive any old

@@ -6,7 +6,6 @@ import {
     forEachHost,
     type ScenarioHarness,
 } from "../src/scenario-hosts";
-import { FOLD_SKIP_REASON } from "../src/rust-scenario-support";
 
 /**
  * Emergency handling when usage climbs to or above 95%.
@@ -143,9 +142,6 @@ forEachHost(import.meta.url, "emergency >=95%", (host) => {
                 // error here is expected, not a failure of the invariant.
             });
 
-             // The pressure observation is fold-independent and is asserted in
-             // both modes. Rust's module-side producer bypasses this mock, so its
-             // publication path is covered by the dedicated producer suite.
             const meta = h
                 .contextDb()
                 .prepare(
@@ -153,12 +149,6 @@ forEachHost(import.meta.url, "emergency >=95%", (host) => {
                 )
                 .get(sessionId) as { last_input_tokens: number } | null;
             expect(meta?.last_input_tokens ?? 0).toBeGreaterThan(0);
-            if (process.env.MC_E2E_MODE === "rust") {
-                // The Rust producer does not send its request through this mock;
-                // this test asserts only the shared pressure behavior.
-                console.log(`[rust-e2e] emergency historian assertions SKIPPED: ${FOLD_SKIP_REASON}`);
-                return;
-            }
 
             // Give historian's async fire a moment to land.
             await h.waitFor(

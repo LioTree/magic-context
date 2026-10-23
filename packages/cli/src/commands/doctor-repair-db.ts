@@ -339,11 +339,19 @@ function runRecoverShell(
         closeSync(recoveredSeedFd);
         const dumpReadFd = openSync(dumpPath, "r");
         try {
-            const replayed = spawnSync(sqliteExecutable, [recoveredPath], {
-                stdio: [dumpReadFd, "ignore", "pipe"],
-                encoding: "utf8",
-                windowsHide: true,
-            });
+            // .recover emits writable_schema SQL for SQLite-owned tables and FTS
+            // definitions. Defensive shells ignore that pragma unless explicitly
+            // disabled. Relax it only in this child, on the new disposable file;
+            // the source stays untouched and activation still requires integrity checks.
+            const replayed = spawnSync(
+                sqliteExecutable,
+                ["-cmd", ".dbconfig defensive off", recoveredPath],
+                {
+                    stdio: [dumpReadFd, "ignore", "pipe"],
+                    encoding: "utf8",
+                    windowsHide: true,
+                },
+            );
             if (replayed.error || replayed.status !== 0) {
                 return {
                     ok: false,

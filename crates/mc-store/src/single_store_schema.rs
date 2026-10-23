@@ -46,7 +46,7 @@ pub const SINGLE_STORE_MIGRATION_REQUIRED_REASON: &str = "single_store_migration
 pub const SINGLE_STORE_STATE_SPLIT_REASON: &str = "single_store_state_split";
 
 /// The user-facing sentence for [`SINGLE_STORE_MIGRATION_REQUIRED_REASON`].
-pub const SINGLE_STORE_MIGRATION_REQUIRED_SENTENCE: &str = "Magic Context's Rust mode needs a one-time migration of its store. Quit OpenCode and every ck-mc process, then run `magic-context doctor single-store migrate`. (MC-C14)";
+pub const SINGLE_STORE_MIGRATION_REQUIRED_SENTENCE: &str = "Magic Context needs a one-time migration of its store. Quit OpenCode and every ck-mc process, then run `magic-context doctor single-store migrate`. (MC-C14)";
 
 /// The tables whose rows now live in `context.db`. A store at version 60 or lower with a
 /// row in any of these has not been migrated and must not be opened.
@@ -229,11 +229,13 @@ pub fn first_populated_moved_table(
 
 /// Mark every session's cache state for one HARD after the migration.
 ///
-/// `project_memory_epoch_pending` drives the existing eager-HARD lane before any m1 is
-/// composed. The four id-bearing fields are store-space numbers (store memory ids and
-/// store mutation-log ids); zeroing them means nothing between load and that HARD compares
-/// a store id with a `context.db` id. Every other field is kept, and the meta is edited as
-/// JSON so fields this build does not know survive untouched. Returns the rows changed.
+/// `bootstrap_seed_fold_pending` requests the existing cold-baseline rebuild lane.
+/// The four id-bearing fields are store-space numbers (store memory ids and
+/// store mutation-log ids); zeroing them prevents a store id from being compared
+/// with a `context.db` id before that rebuild. The dashboard epoch flag cannot
+/// authorize this repair: ordinary external memory edits must remain held.
+/// Every other field is kept, and JSON editing preserves fields unknown to this
+/// build. Returns the number of rows changed.
 pub fn reset_cache_state_for_single_store(conn: &Connection) -> rusqlite::Result<usize> {
     let rows: Vec<(String, String)> = {
         let mut statement = conn.prepare("SELECT session_id, meta FROM mc_cache_state")?;
@@ -251,7 +253,7 @@ pub fn reset_cache_state_for_single_store(conn: &Connection) -> rusqlite::Result
             _ => serde_json::json!({}),
         };
         let object = value.as_object_mut().expect("checked above");
-        object.insert("project_memory_epoch_pending".into(), true.into());
+        object.insert("bootstrap_seed_fold_pending".into(), true.into());
         object.insert("max_memory_id".into(), 0.into());
         object.insert("memory_mutation_cursor".into(), 0.into());
         object.insert("m1_revision".into(), 0.into());

@@ -1,3 +1,8 @@
+import {
+	clearSessionMetaFixtureFault,
+	rejectSessionMetaCollectionWrites,
+	rejectSessionRenderCacheWrites,
+} from "../../plugin/src/features/magic-context/__tests__/session-meta-faults";
 /**
  * Signed-thinking prefix audit for the Pi context handler (Pi and OMP share
  * it). Same design as the OpenCode audit in
@@ -11,7 +16,9 @@
  * Findings: .cortexkit/internal-docs/investigations/reports/signed-thinking-prefix-edits-audit.md. Run with
  * MC_AUDIT_STRICT=1 to make every exposed lane fail on its strict-binding 400.
  */
-import { describe, it } from "bun:test";
+
+import { describe, it, spyOn } from "bun:test";
+import { createHash } from "node:crypto";
 import {
 	appendCompartments,
 	replaceAllCompartmentState,
@@ -26,7 +33,10 @@ import {
 	queuePendingOp,
 	updateSessionMeta,
 } from "@magic-context/core/features/magic-context/storage";
+import { getMergedReasoningStrippedIds } from "@magic-context/core/features/magic-context/storage-meta-persisted";
+import { readServedPrefix } from "@magic-context/core/hooks/magic-context/served-prefix";
 import { closeQuietly } from "@magic-context/core/shared/sqlite-helpers";
+import * as writeTiming from "@magic-context/core/shared/write-transaction-timing";
 import { assertAdmissionParity } from "../../plugin/src/hooks/magic-context/__tests__/admission-parity.test";
 import {
 	auditName,
@@ -34,6 +44,7 @@ import {
 	GOLDEN,
 	GoldenCapture,
 } from "../../plugin/src/hooks/magic-context/__tests__/golden-capture.test";
+import { servedMessageDigest } from "../../plugin/src/hooks/magic-context/__tests__/served-prefix-evidence";
 import {
 	type Block,
 	beforeLastThinking,
@@ -52,7 +63,11 @@ import {
 	registerPiContextHandler,
 	signalPiHistoryRefresh,
 	signalPiPendingMaterialization,
+	signalPiSystemHashChange,
 } from "./context-handler";
+import * as identityRepair from "./pi-tag-identity-repair";
+import { queuePiIdentityRebuild } from "./pi-tag-identity-repair";
+import { processSystemPromptForCache } from "./system-prompt";
 import {
 	createFakePi,
 	createTestDb,
@@ -61,6 +76,14 @@ import {
 	toolResultMessage,
 	userMessage,
 } from "./test-utils.test";
+
+// Postponing a content edit to preserve a current-turn signature must leave
+// completed-turn thinking unchanged too.
+const THINKING_STRIP_GATED = true;
+
+it("thinking strip gating stays enabled", () => {
+	expect(THINKING_STRIP_GATED).toBe(true);
+});
 
 const MODEL = {
 	provider: "anthropic",
@@ -154,9 +177,7 @@ type Lane =
  * Lanes whose mid-loop bust changes the request before a signed thinking block the
  * request still carries, which a strict-binding provider rejects.
  */
-const EXPOSED = new Set<Lane>([
-	"m[0]/m[1] re-render after a recomp clears the cached pair",
-]);
+const EXPOSED = new Set<Lane>();
 
 const PRIMARY_LANES: Lane[] = [
 	"ctx_reduce drop (full removal)",
@@ -324,11 +345,17 @@ async function fixture(
 			(await handler({ messages: source }, ctx as never))?.messages ?? source;
 		if (bustedThisPass === undefined)
 			throw new Error("audit pass did not reach postprocess");
+		const prefixRecord = readServedPrefix(db, sessionId);
+		const firstKept = prefixRecord && output[prefixRecord.head.length];
 		capture.write(
 			wire(output),
 			bustedThisPass,
 			mock.hasCurrentTurnThinking(wire(output)),
 			hasPiParkedBustTrigger(sessionId),
+			!!prefixRecord?.first_kept &&
+				!!firstKept &&
+				servedMessageDigest(firstKept, prefixRecord.provenance) ===
+					prefixRecord.first_kept.digest,
 		);
 		return { messages: output, bustedThisPass };
 	};
@@ -714,6 +741,348 @@ function withFixture(
 	};
 }
 
+it(
+	"Pi/OMP: bust permission without an admitted edit keeps completed thinking",
+	withFixture(
+		false,
+		"reasoning clearing (keep_reasoning_tokens)",
+		async (f) => {
+			await toolLoop(f, 4);
+			await nextUserTurn(f, "no-edit-turn");
+			const before = wire(f.served);
+			expect(thinkingBlocks(before)).not.toBe("[]");
+			signalPiPendingMaterialization(f.sessionId);
+			f.setPercent(20);
+			expect(wire((await f.pass()).messages)).toEqual(before);
+		},
+		"strip-no-edit",
+		false,
+	),
+);
+
+it(
+	"Pi/OMP: a host system-prompt change strips completed thinking on the pass that serves it",
+	withFixture(
+		false,
+		"reasoning clearing (keep_reasoning_tokens)",
+		async (f) => {
+			// What the plugin's before_agent_start hook does at the start of each
+			// user turn: hash the host's prompt and signal a changed one.
+			const agentStart = (systemPrompt: string) => {
+				const result = processSystemPromptForCache({
+					db: f.db,
+					sessionId: f.sessionId,
+					systemPrompt,
+					isCacheBusting: false,
+				});
+				if (result.hashChanged)
+					signalPiSystemHashChange(f.sessionId, result.currentHash);
+			};
+			agentStart("Original instructions");
+			await toolLoop(f, 4);
+			await nextUserTurn(f, "system-kept-turn");
+			expect(thinkingBlocks(wire(f.served))).not.toBe("[]");
+			f.respond((n) => [{ type: "text", text: `Step ${n}: done.` }]);
+			f.served = (await f.pass()).messages;
+			expect(thinkingBlocks(wire(f.served))).not.toBe("[]");
+			// Every kept block was signed over the original system prompt, so the
+			// first request that serves the changed prompt must omit them.
+			agentStart("Changed instructions");
+			f.userTurn("system-edit-turn", "Continue with the next part.");
+			const changed = wire((await f.pass()).messages);
+			expect(f.mock.check(changed)).toBeNull();
+			expect(thinkingBlocks(changed)).toBe("[]");
+			// The omission is persisted, so later passes keep serving it.
+			expect(thinkingBlocks(wire((await f.pass()).messages))).toBe("[]");
+		},
+		"strip-system-edit",
+		false,
+	),
+);
+
+// A pass that keeps current-turn signed thinking runs outside the companion
+// transaction, because admission holds every edit before that thinking. A
+// pending tag-identity repair still forces such a pass to omit every signed
+// block and rewrite its prefix. That rewrite and its omissions must commit
+// together: the attempt outside the transaction stops before writing the
+// omissions, and the pass reruns inside it.
+/** Spy the write-lock hold clock and collect the transaction sites it reports. */
+async function holdSites(run: () => Promise<unknown>): Promise<string[]> {
+	const sites: string[] = [];
+	const timing = spyOn(writeTiming, "logSlowWriteTransaction");
+	timing.mockImplementation((site: string) => {
+		sites.push(site);
+	});
+	try {
+		await run();
+	} finally {
+		timing.mockRestore();
+	}
+	return sites;
+}
+
+/** A mid-loop fixture with a pending tag-identity repair, which forces a rewrite. */
+async function forceHeldRewrite(f: Fixture): Promise<() => string[]> {
+	await toolLoop(f, 4);
+	expect(f.mock.hasCurrentTurnThinking(wire(f.served))).toBe(true);
+	const tool = getTagsBySession(f.db, f.sessionId).find(
+		(tag) => tag.type === "tool",
+	);
+	if (!tool) throw new Error("no tool tag to repair");
+	queuePiIdentityRebuild(f.db, f.sessionId, {
+		key: "forced-rewrite",
+		kept: tool.tagNumber,
+		removed: [],
+		kind: "tool",
+	});
+	// Thinking omissions only; a failed repair also records itself, on purpose,
+	// so that a persistent failure cannot refuse every later turn.
+	return () =>
+		[...getMergedReasoningStrippedIds(f.db, f.sessionId)]
+			.filter((id) => id.startsWith("binding_mismatch"))
+			.sort();
+}
+
+it(
+	"Pi/OMP: an ordinary held step opens no companion transaction",
+	withFixture(
+		false,
+		"ctx_reduce drop (full removal)",
+		async (f) => {
+			await toolLoop(f, 4);
+			expect(await holdSites(() => toolLoop(f, 1))).not.toContain(
+				"paired_thinking_edit",
+			);
+		},
+		"held-no-transaction",
+	),
+);
+
+it(
+	"Pi/OMP: a held pass forced into a prefix rewrite reruns inside the companion transaction",
+	withFixture(
+		false,
+		"ctx_reduce drop (full removal)",
+		async (f) => {
+			const thinkingOmissions = await forceHeldRewrite(f);
+			const before = thinkingOmissions();
+			let rewritten = "";
+			const sites = await holdSites(async () => {
+				rewritten = thinkingBlocks(wire((await f.pass()).messages));
+			});
+			expect(rewritten).toBe("[]");
+			expect(sites).toContain("paired_thinking_edit");
+			expect(thinkingOmissions().length).toBeGreaterThan(before.length);
+		},
+		"forced-rewrite",
+	),
+);
+
+// A held pass with no rewrite cause in its state runs outside the companion
+// transaction and takes no snapshot. If it still reaches a rewrite (here a
+// tag-identity repair that the pre-pass check did not see), the pass is refused
+// at that point: no omission is written, no tag number is spent, and the next
+// pass, which sees the repair, rewrites inside the transaction and numbers its
+// tags without a gap.
+it(
+	"Pi/OMP: an unpredicted rewrite on a held pass is refused before any omission or tag",
+	withFixture(
+		false,
+		"ctx_reduce drop (full removal)",
+		async (f) => {
+			const thinkingOmissions = await forceHeldRewrite(f);
+			const before = thinkingOmissions();
+			const tagNumbers = () =>
+				getTagsBySession(f.db, f.sessionId)
+					.map((tag) => tag.tagNumber)
+					.sort((a, b) => a - b);
+			const tagsBefore = tagNumbers();
+			// A new tool step whose result needs a new tag.
+			f.respond(
+				(n) => [read(`call-${n}`, `/project/src/file-${n}.ts`)],
+				(n) => [[`call-${n}`, `export const v${n} = ${n};\n`.repeat(400)]],
+			);
+			const readRepairs = identityRepair.readPiIdentityRebuilds;
+			const hidden = spyOn(
+				identityRepair,
+				"readPiIdentityRebuilds",
+			).mockImplementation((db, sessionId) =>
+				new Error().stack?.includes("piPassMayRewritePrefix")
+					? []
+					: readRepairs(db, sessionId),
+			);
+			const lastGood = wire(f.served);
+			let refused: Wire | "refused";
+			try {
+				// The refusal reaches the messages wrapper, which serves the last
+				// good request when it can and otherwise refuses the turn.
+				refused = wire((await f.pass()).messages);
+			} catch {
+				refused = "refused";
+			} finally {
+				hidden.mockRestore();
+			}
+			if (refused !== "refused") expect(refused).toEqual(lastGood);
+			expect(thinkingOmissions()).toEqual(before);
+			expect(tagNumbers()).toEqual(tagsBefore);
+			const served = wire((await f.pass()).messages);
+			expect(thinkingBlocks(served)).toBe("[]");
+			expect(thinkingOmissions().length).toBeGreaterThan(before.length);
+			const after = tagNumbers();
+			expect(after.length).toBeGreaterThan(tagsBefore.length);
+			expect(after).toEqual(after.map((_, index) => index + 1));
+		},
+		"unpredicted-rewrite",
+	),
+);
+
+// The pass outside the companion transaction must stop before the rewrite
+// writes its omissions: when the rewrite then fails, no omission survives it.
+it(
+	"Pi/OMP: a failed forced rewrite on a held pass leaves no thinking omission behind",
+	withFixture(
+		false,
+		"ctx_reduce drop (full removal)",
+		async (f) => {
+			const thinkingOmissions = await forceHeldRewrite(f);
+			const before = thinkingOmissions();
+			// The rewrite's own cache clear fails after its omissions were planned.
+			rejectSessionRenderCacheWrites(
+				f.db,
+				"cached_m0_bytes",
+				"reject_rewrite",
+				{
+					error: "reject rewrite",
+					when: (value, previous) => value === null && previous !== null,
+				},
+			);
+			let failed = false;
+			try {
+				await f.pass();
+			} catch {
+				failed = true;
+			}
+			expect(failed).toBe(true);
+			expect(thinkingOmissions()).toEqual(before);
+		},
+		"forced-rewrite-failure",
+	),
+);
+
+it(
+	"Pi/OMP: first-kept request digest survives held reasoning pressure, rebuild and replay",
+	withFixture(
+		false,
+		"reasoning clearing (keep_reasoning_tokens)",
+		async (f) => {
+			await toolLoop(f, 4);
+			const before = wire(f.served);
+			const storedBefore = readServedPrefix(f.db, f.sessionId);
+			const checkStored = (served: unknown[]) => {
+				if (GOLDEN) return;
+				const record = readServedPrefix(f.db, f.sessionId);
+				const actual = record && served[record.head.length];
+				expect(!!record?.first_kept && !!actual).toBe(true);
+				expect(record?.first_kept?.digest).toBe(
+					servedMessageDigest(actual, record!.provenance),
+				);
+			};
+			checkStored(f.served);
+			const firstKept = before.findIndex((message) =>
+				message.content.some((block) => block.type === "thinking"),
+			);
+			expect(firstKept).toBeGreaterThan(-1);
+			// Hash the serialized request message independently of prefix-record code.
+			const digest = (request: Wire) =>
+				createHash("sha256")
+					.update(JSON.stringify(request[firstKept]))
+					.digest("hex");
+			const heldDigest = digest(before);
+			armAndBust(f, "reasoning clearing (keep_reasoning_tokens)", false);
+			for (let repeat = 0; repeat < 3; repeat++) {
+				const held = await f.pass();
+				expect(held.bustedThisPass).toBe(false);
+				expect(wire(held.messages)).toEqual(before);
+				expect(digest(wire(held.messages))).toBe(heldDigest);
+				checkStored(held.messages);
+				expect(readServedPrefix(f.db, f.sessionId)).toEqual(storedBefore);
+			}
+			await nextUserTurn(f, "digest-release");
+			const rebuilt = wire(f.served);
+			expect(f.mock.check(rebuilt)).toBeNull();
+			expect(thinkingBlocks(rebuilt)).toBe("[]");
+			expect(digest(rebuilt)).not.toBe(heldDigest);
+			checkStored(f.served);
+			expect(readServedPrefix(f.db, f.sessionId)?.turn).toBe("digest-release");
+			const warm = (await f.pass()).messages;
+			checkStored(warm);
+			expect(f.mock.check(wire(warm))).toBeNull();
+			expect(wire(warm)).toEqual(rebuilt);
+		},
+		"reasoning-digest",
+	),
+);
+
+it(
+	"Pi/OMP: companion failure rolls back an admitted queued drop and preserves replay",
+	withFixture(
+		false,
+		"ctx_reduce drop (full removal)",
+		async (f) => {
+			await toolLoop(f, 4);
+			await nextUserTurn(f, "pair-failure-turn");
+			const before = wire(f.served);
+			expect(thinkingBlocks(before)).not.toBe("[]");
+			rejectSessionMetaCollectionWrites(
+				f.db,
+				"merged_reasoning_stripped_ids",
+				"reject_pair",
+				{ error: "reject companion" },
+			);
+			armAndBust(f, "ctx_reduce drop (full removal)", false);
+			let failed = false;
+			try {
+				await f.pass();
+			} catch {
+				failed = true;
+			}
+			expect(failed).toBe(true);
+			expect(getPendingOps(f.db, f.sessionId).length).toBe(1);
+			expect(f.tagStatus("old-read-b")).toBe("active");
+			clearSessionMetaFixtureFault(f.db, "reject_pair");
+			f.setPercent(20);
+			expect(wire((await f.pass()).messages)).toEqual(before);
+		},
+		"companion-failed-drop",
+	),
+);
+
+it(
+	"Pi/OMP: synthetic todo with completed-turn thinking after anchor setup",
+	withFixture(
+		false,
+		"synthetic todo",
+		async (f) => {
+			await prepareLane(f, "synthetic todo");
+			await toolLoop(f, 2);
+			await nextUserTurn(f, "todo-completed-turn");
+			await toolLoop(f, 4);
+			const before = wire(f.served);
+			expect(thinkingBlocks(before)).not.toBe("[]");
+			armAndBust(f, "synthetic todo", false);
+			const held = (await f.pass()).messages;
+			expect(f.mock.check(wire(held))).toBeNull();
+			expect(wire(held)).toEqual(before);
+			expect(wire((await f.pass()).messages)).toEqual(before);
+			f.served = held;
+			await nextUserTurn(f, "todo-completed-release");
+			expect(f.mock.check(wire(f.served))).toBeNull();
+			expect(landed(f, "synthetic todo", wire(f.served))).toBe(true);
+		},
+		"todo-completed-thinking",
+	),
+);
+
 for (const subagent of [false, true]) {
 	const scope = subagent ? "subagent run" : "primary mid tool loop";
 	describe(`signed prefix audit: Pi/OMP, ${scope}`, () => {
@@ -760,7 +1129,8 @@ for (const subagent of [false, true]) {
 						expect(beforeLastThinking(after)).toBe(beforeLastThinking(before));
 					} else expect(nonThinkingEdit).toBe(false);
 					// A held pass preserves every signed block, including completed turns.
-					expect(thinkingBlocks(after)).toBe(thinkingBlocks(before));
+					if (THINKING_STRIP_GATED)
+						expect(thinkingBlocks(after)).toBe(thinkingBlocks(before));
 					// A held edit is never recorded as served: repeating the pass with
 					// no new response serves exactly the same bytes.
 					expect(wire((await f.pass()).messages)).toEqual(after);
@@ -985,11 +1355,6 @@ for (const subagent of [false, true]) {
 					console.log(
 						`AUDIT-CUT Pi/OMP | mid tool loop: ${error ?? "accepted"}; cutMoved=${moved}`,
 					);
-					if (!GOLDEN && !STRICT_AUDIT) {
-						expect(moved).toBe(true);
-						expect(error).toBe(PREFIX_ERROR);
-						return;
-					}
 					expect(error).toBeNull();
 					expect(moved).toBe(false);
 					expect(withoutThinking(after)).toBe(withoutThinking(before));
@@ -1024,11 +1389,6 @@ for (const subagent of [false, true]) {
 					);
 					// No current-turn thinking yet, but the previous turn's signed blocks are
 					// still sent, and a defer pass strips none of them.
-					if (!GOLDEN && !STRICT_AUDIT) {
-						expect(moved).toBe(true);
-						expect(error).toBe(PREFIX_ERROR);
-						return;
-					}
 					expect(error).toBeNull();
 					expect(moved).toBe(false);
 					expect(withoutThinking(after)).toBe(withoutThinking(before));
@@ -1114,6 +1474,7 @@ describe("signed prefix parking: Pi/OMP", () => {
 			"frozen-sentinel first application",
 			async (f) => {
 				await toolLoop(f, 4);
+				appendCompartments(f.db, f.sessionId, [FIRST_TURN_COMPARTMENT]);
 				signalPiHistoryRefresh(f.sessionId);
 				const held = await f.pass();
 				expect(f.mock.check(wire(held.messages))).toBeNull();
@@ -1162,6 +1523,7 @@ describe("signed prefix parking: Pi/OMP", () => {
 			"frozen-sentinel first application",
 			async (f) => {
 				await toolLoop(f, 4);
+				appendCompartments(f.db, f.sessionId, [FIRST_TURN_COMPARTMENT]);
 				signalPiHistoryRefresh(f.sessionId);
 				f.served = (await f.pass()).messages;
 				expect(hasPiParkedBustTrigger(f.sessionId)).toBe(true);
@@ -1250,6 +1612,17 @@ describe("step2b review: Pi/OMP", () => {
 				await toolLoop(f, 4);
 				queuePendingOp(f.db, f.sessionId, f.tag("old-read-b"), "drop");
 				signalPiPendingMaterialization(f.sessionId);
+				// Give the live wall an editable suffix; the older queued drop stays held.
+				f.respond(
+					(n) => [
+						read(`call-${n}-a`, `/project/src/file-${n}a.ts`),
+						read(`call-${n}-b`, `/project/src/file-${n}b.ts`),
+					],
+					(n) => [
+						[`call-${n}-a`, `export const a${n} = ${n};\n`.repeat(400)],
+						[`call-${n}-b`, `export const b${n} = ${n};\n`.repeat(400)],
+					],
+				);
 				f.setPercent(85);
 				f.served = (await f.pass()).messages;
 				expect(hasPiParkedBustTrigger(f.sessionId)).toBe(true);

@@ -1,15 +1,11 @@
 import type { HiddenCompletionExecutor } from "../../../hooks/magic-context/compartment-runner-types";
 import type { Database } from "../../../shared/sqlite";
 import { getMemoryById } from "../memory";
-import { type ClassifyArgs, type ClassifyModuleClient, runClassify } from "./classify";
+import { type ClassifyArgs, runClassify } from "./classify";
 import { acquireLease } from "./lease";
 
-/** Run normal selection with a deterministic provider reply, on either writer route. */
-export async function classifySafetyFixture(
-    db: Database,
-    projectIdentity: string,
-    moduleClient?: ClassifyModuleClient,
-) {
+/** Run host selection with a deterministic provider reply. */
+export async function classifySafetyFixture(db: Database, projectIdentity: string) {
     const prompted: number[] = [];
     const anchorIds: number[] = [];
     const manifestFor = (ids: number[]) => {
@@ -59,27 +55,6 @@ export async function classifySafetyFixture(
         sessionDirectory: process.cwd(),
         deadline: Date.now() + 60_000,
         hiddenCompletionExecutor: executor,
-        ...(moduleClient
-            ? {
-                  moduleClient: {
-                      call: async (request) => {
-                          if (request.method === "dreamer.run_task") {
-                              const body = request.body as {
-                                  payload: { items: Array<{ memory_id: number }> };
-                              };
-                              return {
-                                  manifest_text: manifestFor(
-                                      body.payload.items.map((item) => item.memory_id),
-                                  ),
-                              };
-                          }
-                          return moduleClient.call(request);
-                      },
-                  },
-                  moduleSessionId: "safety-parent",
-                  moduleProjectRoot: process.cwd(),
-              }
-            : {}),
     };
     return { result: await runClassify(args), prompted, anchorIds };
 }

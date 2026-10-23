@@ -1,7 +1,9 @@
 import { describe, expect, test } from "bun:test";
 import { Database } from "../../shared/sqlite";
 import { closeQuietly } from "../../shared/sqlite-helpers";
-import { runMigrations } from "./migrations";
+import { MIGRATIONS } from "./migrations";
+import { sessionRenderCacheSelect } from "./storage-session-cache";
+import { sessionMetaCollectionSelect } from "./storage-session-collections";
 
 function columnNames(db: Database, table: string): string[] {
     return (db.prepare(`PRAGMA table_info(${table})`).all() as Array<{ name: string }>).map(
@@ -78,7 +80,9 @@ describe("migration v26 — memory mutation log and m[1] cache", () => {
                 );
             `);
 
-            runMigrations(db);
+            MIGRATIONS.find((step) => step.version === 26)!.up(db);
+            // v99 groups rows from one multi-row change with operation_id; apply it without later payload relocation.
+            MIGRATIONS.find((step) => step.version === 99)!.up(db);
 
             expect(tableExists(db, "memory_mutation_log")).toBe(true);
             const mutationColumns = columnNames(db, "memory_mutation_log");
@@ -100,21 +104,22 @@ describe("migration v26 — memory mutation log and m[1] cache", () => {
 
             const row = db
                 .prepare(
-                    `SELECT cached_m0_bytes, cached_m1_bytes,
-                            cached_m0_project_memory_epoch,
-                            cached_m0_project_user_profile_version,
-                            cached_m0_max_compartment_seq,
-                            cached_m0_max_memory_id,
-                            cached_m0_max_mutation_id,
-                            cached_m0_max_memory_mutation_id,
-                            cached_m0_project_docs_hash,
-                            cached_m0_materialized_at,
-                            cached_m0_session_facts_version,
-                            cached_m0_upgrade_state,
-                            memory_block_cache,
-                            memory_block_count,
-                            memory_block_ids
-                       FROM session_meta
+                    `SELECT ${sessionRenderCacheSelect("cached_m0_bytes", "cached_m0_bytes", db)},
+                        ${sessionRenderCacheSelect("cached_m1_bytes", "cached_m1_bytes", db)},
+                        cached_m0_project_memory_epoch,
+                        cached_m0_project_user_profile_version,
+                        cached_m0_max_compartment_seq,
+                        cached_m0_max_memory_id,
+                        cached_m0_max_mutation_id,
+                        cached_m0_max_memory_mutation_id,
+                        cached_m0_project_docs_hash,
+                        cached_m0_materialized_at,
+                        cached_m0_session_facts_version,
+                        ${sessionRenderCacheSelect("cached_m0_upgrade_state", "cached_m0_upgrade_state", db)},
+                        ${sessionRenderCacheSelect("memory_block_cache", "memory_block_cache", db)},
+                        memory_block_count,
+                        ${sessionMetaCollectionSelect("memory_block_ids", "memory_block_ids", db)}
+                    FROM session_meta
                       WHERE session_id = ?`,
                 )
                 .get("ses-v26") as {

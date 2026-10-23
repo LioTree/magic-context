@@ -38,11 +38,11 @@ use std::collections::{BTreeMap, BTreeSet, HashMap};
 mod policy_summary_preparation;
 #[path = "resident_policy.rs"]
 mod resident_policy;
-pub(crate) use resident_policy::{resident_channel1_inputs, ResidentPolicy};
+pub use resident_policy::{resident_channel1_inputs, ResidentPolicy};
 #[cfg(test)]
 #[path = "policy_summary_review_tests.rs"]
 mod review_tests;
-pub(crate) use policy_summary_preparation::prepare as prepare_policy;
+pub use policy_summary_preparation::prepare as prepare_policy;
 
 /// When more than this many policy rows changed since the summary was taken,
 /// rebuild it from every part instead of replaying the changes.
@@ -147,7 +147,7 @@ struct HintTier {
 }
 
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
-pub(crate) struct PolicySummary {
+pub struct PolicySummary {
     /// Inputs the summary depends on beyond the policy rows; see `summary_key`.
     key: String,
     totals: Totals,
@@ -1154,7 +1154,7 @@ fn scan_candidates(
 /// changes that cannot be replayed exactly take the full path; a pass that
 /// refreezes the baseline does too. Every other hook reads only the changed
 /// rows and the parts they affect.
-pub(crate) fn channel1_inputs(
+pub fn channel1_inputs(
     index: &ProviderPolicyIndex<'_>,
     engine_policy: &Value,
     protected_floor: u64,
@@ -1249,17 +1249,17 @@ thread_local! {
 /// Replayed hooks checked against the full computation on the current thread.
 /// The current-thread corpus runtimes cannot borrow another test's replay witness.
 #[cfg(test)]
-pub(crate) fn replay_checks() -> u64 {
+pub fn replay_checks() -> u64 {
     REPLAY_CHECKS.with(std::cell::Cell::get)
 }
 
 /// While held, replayed hooks on this thread skip the full-computation check,
 /// so a test can measure the store reads of the replay alone.
 #[cfg(test)]
-pub(crate) struct FullCheckOff;
+pub struct FullCheckOff;
 
 #[cfg(test)]
-pub(crate) fn without_full_check() -> FullCheckOff {
+pub fn without_full_check() -> FullCheckOff {
     FULL_CHECK_OFF.with(|off| off.set(true));
     FullCheckOff
 }

@@ -4,7 +4,7 @@ use std::collections::HashMap;
 use std::mem::size_of;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub(super) struct Document(pub u32);
+pub struct Document(pub u32);
 
 struct Token {
     start: u32,
@@ -22,7 +22,7 @@ struct JsonDocument {
 }
 
 #[derive(Default)]
-pub(super) struct ByteArena {
+pub struct ByteArena {
     bytes: Vec<u8>,
     tokens: Vec<Option<Token>>,
     vacant_tokens: Vec<u32>,

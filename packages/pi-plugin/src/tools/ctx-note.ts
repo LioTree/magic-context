@@ -18,7 +18,10 @@
  *   `features/magic-context/storage-notes.ts` for the underlying storage
  */
 
-import type { ToolDefinition } from "@earendil-works/pi-coding-agent";
+import type {
+	ExtensionContext,
+	ToolDefinition,
+} from "@earendil-works/pi-coding-agent";
 import { resolveProjectIdentityForSession } from "@magic-context/core/features/magic-context/memory/project-identity";
 import { getLastIndexedOrdinal } from "@magic-context/core/features/magic-context/message-index";
 import {
@@ -253,16 +256,27 @@ export interface CtxNoteToolDeps {
 	 *  smart-note support. */
 	resolveDreamerEnabled?: (ctx: { cwd: string }) => boolean | undefined;
 	/** Resolve a directory's project identity, allowing home only when user-level configuration enables it. */
-	resolveProjectIdentity?: (directory: string) => string | undefined;
+	resolveProjectIdentity?: (
+		directory: string,
+		ctx: ExtensionContext,
+	) => string | undefined;
 }
 
 export function createCtxNoteTool(
 	deps: CtxNoteToolDeps,
 ): ToolDefinition<typeof ParamsSchema> {
-	const resolveProject =
-		deps.resolveProjectIdentity ?? resolveProjectIdentityForSession;
+	const resolveProject = (directory: string, ctx: ExtensionContext) =>
+		deps.resolveProjectIdentity
+			? deps.resolveProjectIdentity(directory, ctx)
+			: resolveProjectIdentityForSession(directory);
 	const parameters = structuredClone(ParamsSchema);
-	if (deps.smartNotesEnabled === false) {
+	// The dreamer evaluates smart-note conditions, so a disabled dreamer hides the
+	// smart-note argument and text exactly as smart_notes.enabled=false does.
+	// Registration happens once, from the boot project's settings; an omitted
+	// dreamerEnabled counts as not disabled.
+	const smartNoteSurface =
+		deps.smartNotesEnabled !== false && deps.dreamerEnabled !== false;
+	if (!smartNoteSurface) {
 		delete (parameters.properties as Record<string, unknown>).surface_condition;
 		(
 			parameters.properties.filter as unknown as { description: string }
@@ -271,10 +285,9 @@ export function createCtxNoteTool(
 	return {
 		name: "ctx_note",
 		label: "Magic Context: Notes",
-		description:
-			deps.smartNotesEnabled === false
-				? withoutSmartNoteText(CTX_NOTE_DESCRIPTION)
-				: CTX_NOTE_DESCRIPTION,
+		description: smartNoteSurface
+			? CTX_NOTE_DESCRIPTION
+			: withoutSmartNoteText(CTX_NOTE_DESCRIPTION),
 		parameters,
 		async execute(_toolCallId, params: CtxNoteParams, _signal, _onUpdate, ctx) {
 			params = unwrapImitatedReducedArgs(params, ["action", "content"], {
@@ -338,7 +351,7 @@ export function createCtxNoteTool(
 							"Error: Smart notes require dreamer to be enabled. Enable dreamer in magic-context.jsonc to use surface_condition.",
 						);
 					}
-					const projectIdentity = resolveProject(ctx.cwd);
+					const projectIdentity = resolveProject(ctx.cwd, ctx);
 					if (!projectIdentity) {
 						return err(
 							"Error: Could not resolve project identity for smart note.",
@@ -371,7 +384,7 @@ export function createCtxNoteTool(
 			}
 
 			if (action === "dismiss") {
-				const projectIdentity = resolveProject(ctx.cwd);
+				const projectIdentity = resolveProject(ctx.cwd, ctx);
 				if (!projectIdentity) {
 					return err(
 						"Error: Could not resolve project identity for note dismiss.",
@@ -407,7 +420,7 @@ export function createCtxNoteTool(
 					| Awaited<ReturnType<typeof compileSurfaceCondition>>
 					| undefined;
 				if (params.surface_condition?.trim()) {
-					const project = resolveProject(ctx.cwd);
+					const project = resolveProject(ctx.cwd, ctx);
 					const existing = project
 						? getNoteByIdInScope(deps.db, noteId, {
 								projectPath: project,
@@ -430,7 +443,7 @@ export function createCtxNoteTool(
 						"Error: Provide 'content' and/or 'surface_condition' to update.",
 					);
 				}
-				const projectIdentity = resolveProject(ctx.cwd);
+				const projectIdentity = resolveProject(ctx.cwd, ctx);
 				if (!projectIdentity) {
 					return err(
 						"Error: Could not resolve project identity for note update.",
@@ -471,7 +484,7 @@ export function createCtxNoteTool(
 					? Math.floor(params.offset)
 					: 0;
 			const projectIdentity = Array.isArray(noteIds)
-				? resolveProject(ctx.cwd)
+				? resolveProject(ctx.cwd, ctx)
 				: undefined;
 			if (Array.isArray(noteIds) && !projectIdentity) {
 				return err("Error: Could not resolve project identity for note read.");
@@ -489,7 +502,8 @@ export function createCtxNoteTool(
 							db: deps.db,
 							sessionId,
 							cwd: ctx.cwd,
-							resolveProjectIdentity: resolveProject,
+							resolveProjectIdentity: (directory) =>
+								resolveProject(directory, ctx),
 							filter: params.filter,
 						}),
 						{ limit, offset, nowMs },

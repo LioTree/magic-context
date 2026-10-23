@@ -1,3 +1,4 @@
+import { readSessionMetaCollection } from "../../plugin/src/features/magic-context/storage-session-collections";
 /**
  * Pi-side `<session-history>` injection — mirrors OpenCode's
  * `prepareCompartmentInjection` + `renderCompartmentInjection`
@@ -68,6 +69,15 @@ import {
 } from "@magic-context/core/features/magic-context/storage";
 import { readSessionMeta } from "@magic-context/core/features/magic-context/storage-meta-session";
 import {
+	sessionRenderCacheSelect,
+	writeSessionRenderCache,
+} from "@magic-context/core/features/magic-context/storage-session-cache";
+import { sessionPayloadStatement } from "@magic-context/core/features/magic-context/storage-session-collection-state";
+import {
+	sessionMetaCollectionSelect,
+	writeSessionMetaCollection,
+} from "@magic-context/core/features/magic-context/storage-session-collections";
+import {
 	getActiveUserMemories,
 	type UserMemory,
 } from "@magic-context/core/features/magic-context/user-memory/storage-user-memory";
@@ -114,7 +124,10 @@ import {
 	trimWorkspaceMemoriesToBudgetV2,
 	type WorkspaceRenderContext,
 } from "@magic-context/core/hooks/magic-context/inject-compartments";
-
+import {
+	hasRawMessageProvider,
+	readRawSessionMessages,
+} from "@magic-context/core/hooks/magic-context/read-session-chunk";
 import { estimateTokens } from "@magic-context/core/hooks/magic-context/read-session-formatting";
 import {
 	projectCompartmentScores,
@@ -221,6 +234,30 @@ function trimPiMessagesToBoundary(
 		if (msg && resolveStableId(msg, i, entryIds) === effectiveCutoffId) {
 			cutoffIndex = i;
 			break;
+		}
+	}
+	if (cutoffIndex < 0 && sessionId && hasRawMessageProvider(sessionId)) {
+		// The active branch can still place a boundary omitted from event.messages.
+		// Never infer that position from the shortened live-array indices.
+		try {
+			const branch = readRawSessionMessages(sessionId);
+			const positions = new Map(
+				branch.map((message, index) => [message.id, index]),
+			);
+			const boundaryPosition = positions.get(cutoffMessageId);
+			if (boundaryPosition === undefined) return 0;
+			let previous = -1;
+			for (const [index, message] of piMessages.entries()) {
+				if (isPiSystemEntry(message)) continue;
+				const id = resolveStableId(message, index, entryIds);
+				const position =
+					positions.get(id) ?? positions.get(`${SYNTH_USER_ID_PREFIX}${id}`);
+				if (position === undefined || position <= previous) return 0;
+				previous = position;
+				if (position <= boundaryPosition) cutoffIndex = index;
+			}
+		} catch {
+			return 0;
 		}
 	}
 	if (cutoffIndex < 0) return 0;
@@ -898,9 +935,10 @@ export function trimPiMessagesToCachedBoundary(
 			}
 		: (db
 				.prepare(
-					`SELECT cached_m0_bytes AS m0, cached_m1_bytes AS m1,
-					        cached_m0_last_baseline_end_message_id AS boundary
-					 FROM session_meta WHERE session_id = ?`,
+					`SELECT ${sessionRenderCacheSelect("cached_m0_bytes", "m0")},
+					    ${sessionRenderCacheSelect("cached_m1_bytes", "m1")},
+					    cached_m0_last_baseline_end_message_id AS boundary
+					FROM session_meta WHERE session_id = ?`,
 				)
 				.get(sessionId) as
 				| { m0?: unknown; m1?: unknown; boundary?: unknown }
@@ -926,6 +964,46 @@ export function trimPiMessagesToCachedBoundary(
 		),
 		(ids) => queueAutoSearchHintDecisionRetirement(db, sessionId, ids),
 	);
+}
+
+/** Whether a cached or newly rendered history cut can hide a companion entry. */
+export function piTrimMayRemoveEntries(args: {
+	sessionId: string;
+	messages: PiAgentMessage[];
+	entryIds: (string | undefined)[];
+	snapshot: PiM0M1PassSnapshot;
+	isCandidate: (message: PiAgentMessage, index: number) => boolean;
+}): boolean {
+	const boundaries = new Set([
+		args.snapshot.cachedRow?.cached_m0_last_baseline_end_message_id,
+		lastBaselineEndMessageId(args.snapshot.compartments),
+	]);
+	for (const boundary of boundaries) {
+		if (!boundary) continue;
+		const projected = [...args.messages];
+		// Projection must not retire durable decisions or splice the caller's IDs.
+		trimPiMessagesToBoundary(
+			projected,
+			[...args.entryIds],
+			boundary,
+			false,
+			args.sessionId,
+			args.snapshot.compartments.some(
+				(compartment) =>
+					compartment.endMessageId === boundary &&
+					compartment.endBlockIndex != null,
+			),
+		);
+		const kept = new Set(projected);
+		if (
+			args.messages.some(
+				(message, index) =>
+					!kept.has(message) && args.isCandidate(message, index),
+			)
+		)
+			return true;
+	}
+	return false;
 }
 
 function setCachedBoundary(
@@ -1295,31 +1373,7 @@ export function mustMaterializePi(
 			current.upgradeState,
 		);
 	}
-	if (
-		current.workspaceFingerprint !== null ||
-		(meta.cachedM0WorkspaceFingerprint ?? null) !== null
-	) {
-		if (
-			current.workspaceFingerprint !==
-			(meta.cachedM0WorkspaceFingerprint ?? null)
-		) {
-			return piMaterializeMismatch(
-				"project_memory_change",
-				"workspaceFingerprint",
-				meta.cachedM0WorkspaceFingerprint ?? null,
-				current.workspaceFingerprint,
-			);
-		}
-	} else if (
-		current.projectMemoryEpoch !== (meta.cachedM0ProjectMemoryEpoch ?? 0)
-	) {
-		return piMaterializeMismatch(
-			"project_memory_change",
-			"projectMemoryEpoch",
-			meta.cachedM0ProjectMemoryEpoch ?? 0,
-			current.projectMemoryEpoch,
-		);
-	}
+	// External memory and workspace changes do not request a baseline rebuild.
 	// Use !== (not >), matching OpenCode mustMaterialize: a max-id that DECREASES
 	// (revert / message.removed shrinking the compartment or mutation set) must
 	// still invalidate m[0]. A '>' comparison would miss a decrease and serve a
@@ -1879,8 +1933,11 @@ export function materializeM0Pi(
 	steps.mark("pre_metadata");
 	state.beforeCacheCommitForTest?.();
 	// Validate the m[0] snapshot, render m[1], and persist the pair atomically.
+	let writer: ReturnType<typeof beginPrefixWrite>;
+	const nested = db.inTransaction;
 	try {
-		db.exec("BEGIN IMMEDIATE");
+		if (!nested) db.exec("BEGIN IMMEDIATE");
+		writer = beginPrefixWrite(db, nested);
 	} catch (error) {
 		if (isTransientSqliteLockError(error)) {
 			throw new PiMaterializeContentionError("begin immediate locked");
@@ -1919,7 +1976,7 @@ export function materializeM0Pi(
 			current.sessionFactsVersion !== snapshotMarkers.sessionFactsVersion ||
 			current.upgradeState !== snapshotMarkers.upgradeState;
 		if (stale) {
-			db.exec("ROLLBACK");
+			writer.rollback();
 			throw new PiMaterializeContentionError("snapshot changed before persist");
 		}
 		steps.mark("staleCheck");
@@ -1994,11 +2051,16 @@ export function materializeM0Pi(
 		// path, so they'd stay frozen at the last legacy value — wrong sidebar
 		// "Injected" count AND a stale ctx_search hide-already-visible filter after
 		// any memory change (e.g. migration delete+reinserts with new ids).
+		writeSessionMetaCollection(
+			db,
+			state.sessionId,
+			"memory_block_ids",
+			visibleIdsJson,
+		);
 		db.prepare(
-			"UPDATE session_meta SET memory_block_count = ?, memory_block_ids = ?, cached_m0_last_baseline_end_message_id = ?, cached_m0_score_selection_watermark = ? WHERE session_id = ?",
+			"UPDATE session_meta SET memory_block_count = ?, cached_m0_last_baseline_end_message_id = ?, cached_m0_score_selection_watermark = ? WHERE session_id = ?",
 		).run(
 			visibleMemoryIds.length,
-			visibleIdsJson,
 			snapshotMarkers.lastBaselineEndMessageId,
 			snapshotMarkers.scoreSelectionWatermark ?? 0,
 			state.sessionId,
@@ -2010,7 +2072,8 @@ export function materializeM0Pi(
 		// the next pass trims against the wrong point (under/over-trim). Atomic
 		// with the m[0] bytes + markers + m[1] bytes is the only correct placement.
 		steps.mark("sessionMeta");
-		db.exec("COMMIT");
+		if (nested) writer.commit();
+		else db.exec("COMMIT");
 		steps.mark("commit");
 		logSlowWriteTransaction(
 			"pi_materialize_cache",
@@ -2032,7 +2095,7 @@ export function materializeM0Pi(
 		};
 	} catch (error) {
 		try {
-			db.exec("ROLLBACK");
+			writer.rollback();
 		} catch {
 			// already rolled back
 		}
@@ -2255,11 +2318,10 @@ function renderNewUserProfileSectionPi(
 }
 
 /**
- * The m[1] of a busting SOFT pass. It reads no memory rows and no mutation log:
- * new compartments and the user profile render as usual, the HARD fold's memory
- * blocks replay byte for byte, and this session's newer agent fragments are
- * appended (composeSoftMemoryUpdates, shared with OpenCode). Memory changes by
- * anyone else, and by automated writers, reach the prompt at the next HARD fold.
+ * An authorized delta refresh replays frozen memory blocks and corrections.
+ * Only this session's agent fragments and dashboard log payloads can append
+ * corrections (composeSoftMemoryUpdates, shared with OpenCode); automated
+ * writers and other agents still wait for a baseline rebuild.
  */
 function renderSoftM1Pi(
 	state: PiM0M1State,
@@ -2268,6 +2330,7 @@ function renderSoftM1Pi(
 	projection: AppliedProjection,
 	m0Text: string,
 	compartments: readonly PiCompartment[],
+	renderedMemoryIds: readonly number[],
 ): { result: RenderM1PiResult; projection: AppliedProjection } {
 	const compartmentsSection = renderNewCompartmentsSectionPi(
 		state,
@@ -2298,6 +2361,10 @@ function renderSoftM1Pi(
 			: composeSoftMemoryUpdates({
 					db,
 					sessionId: state.sessionId,
+					projectPath: memoryProjectPath(state),
+					dashboardAfterId: markers.maxMemoryMutationId,
+					baselineMemoryIds: renderedMemoryIds,
+					maxMemoryId: markers.maxMemoryId,
 					projection,
 					memoryBudgetTokens:
 						state.injectionBudgetTokens ?? DEFAULT_MEMORY_BUDGET_TOKENS,
@@ -2494,30 +2561,35 @@ function readCachedPiM0M1Row(
 	db: ContextDatabase,
 	sessionId: string,
 ): CachedPiM0M1Row | null {
-	return db
-		.prepare(
-			`SELECT cached_m0_bytes, cached_m0_score_selection_watermark, cached_m0_mural_data_url,
-					cached_m0_mural_hash, cached_m1_bytes,
-					cached_m0_project_memory_epoch,
-					cached_m0_workspace_fingerprint,
-					cached_m0_project_user_profile_version,
-					cached_m0_max_compartment_seq,
-					cached_m0_max_memory_id,
-					cached_m0_max_mutation_id,
-					cached_m0_max_memory_mutation_id,
-					cached_m0_project_docs_hash,
-					cached_m0_materialized_at,
-					cached_m0_session_facts_version,
-					cached_m0_upgrade_state,
-					cached_m0_system_hash,
-					cached_m0_model_key,
-					cached_m0_project_identity,
-					cached_m0_last_baseline_end_message_id,
-					memory_block_ids
-			   FROM session_meta
+	// One statement reads the row and its memory-block ids from the same snapshot,
+	// so no transaction is needed to keep them coherent. The statement text is fixed
+	// per connection; compile it once rather than on every pass.
+	return (sessionPayloadStatement(
+		db,
+		`SELECT ${sessionRenderCacheSelect("cached_m0_bytes")},
+			    cached_m0_score_selection_watermark,
+			    ${sessionRenderCacheSelect("cached_m0_mural_data_url")},
+			    cached_m0_mural_hash,
+			    ${sessionRenderCacheSelect("cached_m1_bytes")},
+			    cached_m0_project_memory_epoch,
+			    cached_m0_workspace_fingerprint,
+			    cached_m0_project_user_profile_version,
+			    cached_m0_max_compartment_seq,
+			    cached_m0_max_memory_id,
+			    cached_m0_max_mutation_id,
+			    cached_m0_max_memory_mutation_id,
+			    cached_m0_project_docs_hash,
+			    cached_m0_materialized_at,
+			    cached_m0_session_facts_version,
+			    ${sessionRenderCacheSelect("cached_m0_upgrade_state")},
+			    cached_m0_system_hash,
+			    cached_m0_model_key,
+			    cached_m0_project_identity,
+			    cached_m0_last_baseline_end_message_id,
+			    ${sessionMetaCollectionSelect("memory_block_ids", "memory_block_ids", db)}
+			FROM session_meta
 			  WHERE session_id = ?`,
-		)
-		.get(sessionId) as CachedPiM0M1Row | null;
+	).get(sessionId) ?? null) as CachedPiM0M1Row | null;
 }
 
 export interface PiM0M1PassSnapshot {
@@ -2729,7 +2801,9 @@ function softRefreshCachedM1Pi(args: {
 } {
 	const steps = new WriteTransactionSteps();
 	args.state.beforeCacheCommitForTest?.();
-	args.db.exec("BEGIN IMMEDIATE");
+	const nested = args.db.inTransaction;
+	if (!nested) args.db.exec("BEGIN IMMEDIATE");
+	const writer = beginPrefixWrite(args.db, nested);
 	const transactionStartedAt = performance.now();
 	steps.reset();
 	try {
@@ -2743,7 +2817,7 @@ function softRefreshCachedM1Pi(args: {
 				compartmentsForNormalization: args.compartmentsForNormalization,
 			})
 		) {
-			args.db.exec("ROLLBACK");
+			writer.rollback();
 			const sibling = readCachedPiM0M1Row(args.db, args.state.sessionId);
 			if (!sibling) {
 				throw new PiMaterializeContentionError(
@@ -2807,6 +2881,7 @@ function softRefreshCachedM1Pi(args: {
 			projection,
 			m0Text,
 			compartments,
+			renderedM0Ids,
 		);
 		const rendered = soft.result;
 		const m1Bytes = Buffer.from(rendered.text, "utf8");
@@ -2829,18 +2904,33 @@ function softRefreshCachedM1Pi(args: {
 		steps.mark("m1Render");
 
 		args.db
-			.prepare(
-				`UPDATE session_meta SET cached_m1_bytes = ?, cached_m0_last_baseline_end_message_id = ?,
-				 memory_block_count = ?, memory_block_ids = ?, cached_m0_upgrade_state = ? WHERE session_id = ?`,
-			)
-			.run(
-				m1Bytes,
-				advancedBoundary,
-				visibleMemoryIds.length,
-				visibleIdsJson,
-				withCachedM0MemoryIds(row.cached_m0_upgrade_state, renderedM0Ids),
-				args.state.sessionId,
-			);
+			.transaction(() => {
+				writeSessionRenderCache(
+					args.db,
+					args.state.sessionId,
+					"cached_m1_bytes",
+					m1Bytes,
+				);
+				writeSessionMetaCollection(
+					args.db,
+					args.state.sessionId,
+					"memory_block_ids",
+					visibleIdsJson,
+				);
+				writeSessionRenderCache(
+					args.db,
+					args.state.sessionId,
+					"cached_m0_upgrade_state",
+					withCachedM0MemoryIds(row.cached_m0_upgrade_state, renderedM0Ids),
+				);
+				args.db
+					.prepare(
+						`UPDATE session_meta SET cached_m0_last_baseline_end_message_id = ?,
+				 memory_block_count = ? WHERE session_id = ?`,
+					)
+					.run(advancedBoundary, visibleMemoryIds.length, args.state.sessionId);
+			})
+			.immediate();
 		writeSoftProjection(args.db, {
 			sessionId: args.state.sessionId,
 			projectPath,
@@ -2848,7 +2938,8 @@ function softRefreshCachedM1Pi(args: {
 			projection: soft.projection,
 		});
 		steps.mark("sessionMeta");
-		args.db.exec("COMMIT");
+		if (nested) writer.commit();
+		else args.db.exec("COMMIT");
 		steps.mark("commit");
 		logSlowWriteTransaction(
 			"pi_soft_refresh_cache",
@@ -2866,7 +2957,7 @@ function softRefreshCachedM1Pi(args: {
 		};
 	} catch (error) {
 		try {
-			args.db.exec("ROLLBACK");
+			writer.rollback();
 		} catch {
 			// already rolled back
 		}
@@ -3395,11 +3486,13 @@ export function injectM0M1Pi(
 	// SOFT and defer passes that must not read them.
 	const memoryCount = parseMemoryBlockIds(
 		(
-			db
-				.prepare(
-					"SELECT memory_block_ids FROM session_meta WHERE session_id = ?",
-				)
-				.get(state.sessionId) as { memory_block_ids: string | null } | null
+			{
+				memory_block_ids: readSessionMetaCollection(
+					db,
+					state.sessionId,
+					"memory_block_ids",
+				),
+			} as { memory_block_ids: string | null } | null
 		)?.memory_block_ids ?? null,
 	).length;
 	const result: PiM0M1InjectionResult = {
@@ -3457,4 +3550,27 @@ export interface PiInjectionResult {
 	/** Exact canonical model-key operands when that comparison caused materialization. */
 	m0ModelKeyPrev?: string | null;
 	m0ModelKeyNew?: string | null;
+}
+
+let prefixWriteSequence = 0;
+
+/** A savepoint must not commit cached head messages separately from the caller's thinking removals. */
+function beginPrefixWrite(
+	db: ContextDatabase,
+	nested: boolean,
+): {
+	commit(): void;
+	rollback(): void;
+} {
+	const name = `pi_prefix_${++prefixWriteSequence}`;
+	if (nested) db.exec(`SAVEPOINT ${name}`);
+	return {
+		commit() {
+			db.exec(nested ? `RELEASE SAVEPOINT ${name}` : "COMMIT");
+		},
+		rollback() {
+			db.exec(nested ? `ROLLBACK TO SAVEPOINT ${name}` : "ROLLBACK");
+			if (nested) db.exec(`RELEASE SAVEPOINT ${name}`);
+		},
+	};
 }

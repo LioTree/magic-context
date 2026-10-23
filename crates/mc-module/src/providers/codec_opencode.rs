@@ -5,8 +5,8 @@ use crate::codec::DecodedHarnessMessages;
 /// Status identity is the runner's ordinal space, not the native store's
 /// absolute ordinal or the positional fallback used by full-request decoding.
 /// Retain the original native values so rendering never authors their metadata.
-pub(super) fn decode_messages(
-    messages: &[compact::status::StatusMessage],
+pub fn decode_messages(
+    messages: &[codec::InboundMessage],
 ) -> Result<DecodedHarnessMessages, HandlerOutcome> {
     for message in messages {
         let native = &message.message;
@@ -57,8 +57,7 @@ pub(super) fn decode_messages(
 
 /// Native finalization needs the engine's committed reasoning decisions and
 /// tag baseline, not a new tag mint or a second interpretation of hook ops.
-#[allow(dead_code)]
-pub(super) struct NativeRenderContext<'a> {
+pub struct NativeRenderContext<'a> {
     pub reasoning_clear_units: &'a [mc_core::FrozenUnit],
     pub tag_numbers: &'a BTreeMap<String, u64>,
     pub mutation_exempt_mid: Option<&'a str>,
@@ -80,12 +79,11 @@ impl<'a> From<&'a transform::TransformWithProjection> for NativeRenderContext<'a
     }
 }
 
-#[allow(dead_code)]
-pub(super) fn encode_view(
+pub fn encode_view(
     view: &transform::compaction::View,
     request: &TransformRequest,
     context: &NativeRenderContext<'_>,
-) -> Result<compact::answer::CompactionMessage, HandlerOutcome> {
+) -> Result<codec::OutboundMessage, HandlerOutcome> {
     if request.serializer_profile != SerializerProfile::OpencodeAiSdk.wire_id()
         || !request.serve_native
         || request.native_messages.is_none()
@@ -115,110 +113,12 @@ pub(super) fn encode_view(
         .into_iter()
         .map(|message| message.as_ref().clone())
         .collect();
-    Ok(compact::answer::CompactionMessage::new(
+    Ok(codec::OutboundMessage::new(
         &view.compaction_id,
         view.version,
-        compact::answer::Range::new(view.range.from, view.range.to),
+        codec::MessageRange::new(view.range.from, view.range.to),
         replacement,
     ))
-}
-
-pub(super) fn resident_render_key(
-    request: &TransformRequest,
-    context: &NativeRenderContext<'_>,
-    source: &super::fold_working::TailKey,
-) -> [u8; 32] {
-    use sha2::{Digest, Sha256};
-    let bytes = serde_json::to_vec(&(
-        request.model_key.as_deref(),
-        &request.render_config,
-        &request.upgrade_state,
-        request.mid_turn,
-        request.serializer_profile.as_str(),
-        context.reasoning_clear_units,
-        context.tag_numbers,
-        context.mutation_exempt_mid,
-        context.lineage_anchor_mid,
-        context.transition_consumed,
-        context.native_reasoning_keep_mids,
-        source.through,
-        source.newest,
-        source.answers,
-    ))
-    .expect("native render identity JSON");
-    Sha256::digest(bytes).into()
-}
-
-pub(super) fn encode_resident_view(
-    view: &transform::compaction::View,
-    request: &TransformRequest,
-    context: &NativeRenderContext<'_>,
-    previous: &super::resident_view::ResidentView,
-    arena: &super::resident_bytes::ByteArena,
-    key: [u8; 32],
-    engine_bytes: &[std::borrow::Cow<'_, [u8]>],
-) -> Result<Option<compact::answer::CompactionMessage>, HandlerOutcome> {
-    if previous.encoding_key != Some(key)
-        || view.replacement.len() < 2
-        || previous.engine.len() != view.replacement.len()
-        || previous.native.len() != view.replacement.len()
-    {
-        return Ok(None);
-    }
-    let heads = &view.replacement[..2];
-    if heads.iter().any(|head| {
-        !head.meta.synthetic
-            || head.role != "user"
-            || head.content.iter().any(|block| {
-                !matches!(
-                    block.kind,
-                    ck_wire::CkKind::Text { .. } | ck_wire::CkKind::Media(_)
-                )
-            })
-    }) {
-        return Ok(None);
-    }
-    if request.native_messages.as_ref().is_some_and(|native| {
-        native.iter().any(|source| {
-            heads.iter().any(|head| {
-                head.meta.harness_id.as_deref().is_some_and(|mid| {
-                    source.pointer("/info/id").and_then(Value::as_str) == Some(mid)
-                })
-            })
-        })
-    }) {
-        return Ok(None);
-    }
-    if !engine_bytes
-        .iter()
-        .enumerate()
-        .skip(2)
-        .all(|(position, bytes)| arena.equals(previous.engine[position], bytes))
-    {
-        return Ok(None);
-    }
-    // Only the history/memory frames changed; every later message still has
-    // identical CK bytes. These frames contain only user text or images, not
-    // tool calls or signed thinking, so rendering them separately cannot change
-    // the unchanged messages' order, signatures, or tool-call IDs.
-    let mut native =
-        crate::codec::opencode::encode_opencode_with_transition_state_and_reasoning_exemption(
-            heads,
-            &crate::codec::DecodeSidecar::new("opencode"),
-            Some(&request.session_id),
-            &[],
-            None,
-            context.transition_consumed,
-        );
-    for &document in previous.native.iter().skip(2) {
-        native.push(serde_json::from_slice(&arena.bytes(document)).map_err(transient)?);
-    }
-    Ok(Some(compact::answer::CompactionMessage::new(
-        &view.compaction_id,
-        view.version,
-        compact::answer::Range::new(view.range.from, view.range.to),
-        native,
-    )))
 }
 
 #[cfg(test)]
@@ -226,107 +126,13 @@ mod tests {
     use super::super::codec::Codec;
     use super::*;
 
-    #[test]
-    fn resident_native_reuse_invalidates_when_raw_reasoning_keep_epoch_changes() {
-        let native = json!({"info":{"id":"assistant","role":"assistant"},"parts":[{"id":"text","type":"text","text":"original source"}]});
-        let mut request: TransformRequest = decode(
-            &json!({"v":2,"kind":"compaction.step","serializer_profile":"opencode-aisdk",
-            "session_id":"s","render_config":"fixture","messages":[]}),
-        )
-        .unwrap();
-        Codec::OpencodeAiSdk
-            .prepare_request(
-                &mut request,
-                &[compact::status::StatusMessage {
-                    raw_message: None,
-                    mid: "assistant".into(),
-                    ordinal: 1,
-                    message: native,
-                }],
-            )
-            .unwrap();
-        let mut tail = request.messages[0].ck.clone();
-        if let ck_wire::CkKind::Text { text } = &mut tail.content[0].kind {
-            *text = "[mc:7] original source".into();
-        }
-        tail.mark_modified();
-        let view = transform::compaction::View {
-            compaction_id: "view".into(),
-            version: 1,
-            range: transform::compaction::Range {
-                lineage_id: "L".into(),
-                from: 1,
-                to: 2,
-            },
-            replacement: vec![
-                ck_wire::CkWireMessage::synthetic_user_text("history"),
-                ck_wire::CkWireMessage::synthetic_user_text("memory"),
-                tail,
-            ],
-        };
-        let tags = BTreeMap::new();
-        let keep = Vec::new();
-        let context = NativeRenderContext {
-            reasoning_clear_units: &[],
-            tag_numbers: &tags,
-            mutation_exempt_mid: None,
-            lineage_anchor_mid: None,
-            transition_consumed: false,
-            native_reasoning_keep_mids: &keep,
-        };
-        let source = super::super::fold_working::TailKey {
-            through: 0,
-            newest: Some(1),
-            answers: (0, 0),
-        };
-        let key = resident_render_key(&request, &context, &source);
-        let wire = encode_view(&view, &request, &context).unwrap();
-        assert_eq!(
-            wire.replacement[2]["parts"][0]["text"],
-            "[mc:7] original source"
-        );
-        let host = super::super::compaction::HostView {
-            engine: view.clone(),
-            wire,
-            coverage: None,
-            raw_replacement: None,
-            head_slots: None,
-            cut_replacement: None,
-        };
-        let mut arena = super::super::resident_bytes::ByteArena::default();
-        let previous =
-            super::super::resident_view::ResidentView::store(&mut arena, &host, Some(key), None)
-                .unwrap();
-        let keep = vec!["assistant".into()];
-        let context = NativeRenderContext {
-            native_reasoning_keep_mids: &keep,
-            ..context
-        };
-        let key = resident_render_key(&request, &context, &source);
-        let bytes = super::super::resident_view::canonical_engine_bytes(&view.replacement, &[]);
-        let cached =
-            encode_resident_view(&view, &request, &context, &previous, &arena, key, &bytes)
-                .unwrap();
-        let expected = encode_view(&view, &request, &context).unwrap();
-        let actual = cached.unwrap_or_else(|| encode_view(&view, &request, &context).unwrap());
-        assert_eq!(
-            expected.replacement[2]["parts"][0]["text"],
-            "original source"
-        );
-        assert_eq!(
-            actual.replacement, expected.replacement,
-            "cached native bytes must not cross a reasoning-keep epoch"
-        );
-    }
-
-    fn entries(messages: &[Value]) -> Vec<compact::status::StatusMessage> {
+    fn entries(messages: &[Value]) -> Vec<codec::InboundMessage> {
         messages
             .iter()
             .enumerate()
-            .map(|(index, message)| compact::status::StatusMessage {
-                raw_message: None,
+            .map(|(index, message)| codec::InboundMessage {
+                ordinal: 4000 + index as u64,
                 mid: message["info"]["id"].as_str().unwrap().into(),
-                ordinal: 4_000 + index as u64,
                 message: message.clone(),
             })
             .collect()
@@ -430,7 +236,7 @@ mod tests {
         codec: Codec,
         view: &transform::compaction::View,
         request: &TransformRequest,
-    ) -> compact::answer::CompactionMessage {
+    ) -> codec::OutboundMessage {
         let tags = BTreeMap::new();
         codec
             .encode_view(
@@ -606,8 +412,7 @@ mod tests {
             json!({"info":{"id":"m","role":"user"},"parts":{}}),
             json!({"info":{"id":"other","role":"user"},"parts":[]}),
         ] {
-            let entry = compact::status::StatusMessage {
-                raw_message: None,
+            let entry = codec::InboundMessage {
                 mid: "m".into(),
                 ordinal: 1,
                 message: native,

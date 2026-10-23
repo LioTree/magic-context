@@ -1,0 +1,28 @@
+{
+	"base": "919bc9862839c3c1820b4e673e3ba210782a1d7c",
+	"blob": "ab21e66ddc842bf78b34aa81879231a7a68e4b8f",
+	"ids": ["old", "next"],
+	"input": [
+		{
+			"role": "assistant",
+			"content": [
+				{
+					"type": "thinking",
+					"thinking": "old thought",
+					"thinkingSignature": "old-signature"
+				},
+				{ "type": "text", "text": "old answer" }
+			]
+		},
+		{ "role": "user", "content": "next turn" }
+	],
+	"order": "start",
+	"output": [
+		{
+			"role": "assistant",
+			"content": [{ "type": "text", "text": "old answer" }]
+		},
+		{ "role": "user", "content": "next turn" }
+	],
+	"ledger": ["binding_mismatch:old"]
+}

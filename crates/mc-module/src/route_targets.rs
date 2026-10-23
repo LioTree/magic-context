@@ -95,11 +95,91 @@ impl RouteTargetConfig {
                 service_id: "session-door".into(),
             });
         }
+        if route == RegisteredRoute::FusiformCatalog {
+            return Some(RouteTarget::ToolProvider {
+                module_id: "fusiform".into(),
+            });
+        }
         route
             .module_id(self)
             .map(|module_id| RouteTarget::ManagementSurface {
                 module_id: module_id.to_string(),
             })
+    }
+}
+
+/// The runner module that owns OpenCode and Pi sessions on a runner lane.
+pub const THALAMUS_HARNESS_MODULE_ID: &str = "thalamus-harness";
+
+/// Runner modules that can run a session's background model calls (historian and
+/// dreamer) as hidden children of that same session, inside the session's own host.
+/// A conversation is on a runner lane when the daemon stamped one of these modules as
+/// the principal of the route that admitted it. `thalamus` is the Claude Code
+/// gateway serving its sessions as a runner (`anthropic-messages`).
+pub const SESSION_RUNNER_MODULE_IDS: [&str; 3] = [
+    THALAMUS_HARNESS_MODULE_ID,
+    DEFAULT_RUNNER_MODULE_ID,
+    DEFAULT_THALAMUS_MODULE_ID,
+];
+
+/// Where a runner-lane conversation's background model calls go: the llm-runner
+/// management surface of the module that runs the conversation. Child routes bind their
+/// own generated sessions; the child routes' project root and harness come from the
+/// conversation's recorded identity. Child sends currently omit the parent session
+/// from the payload.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct SessionRunnerRoute {
+    module_id: String,
+    parent_session: String,
+}
+
+impl SessionRunnerRoute {
+    /// The route for a conversation admitted under `principal` with runner session
+    /// `parent_session`. `None` when the principal is not a session runner module:
+    /// such a conversation keeps the process-configured routes.
+    pub fn for_principal(
+        principal: Option<&subc_protocol::Principal>,
+        parent_session: &str,
+    ) -> Option<Self> {
+        let Some(subc_protocol::Principal::Reserved { module_id }) = principal else {
+            return None;
+        };
+        (SESSION_RUNNER_MODULE_IDS.contains(&module_id.as_str()) && !parent_session.is_empty())
+            .then(|| Self {
+                module_id: module_id.clone(),
+                parent_session: parent_session.to_string(),
+            })
+    }
+
+    /// The route a background model call (historian firing, dream child, classify)
+    /// for this conversation takes, or `None` when it keeps the process-configured
+    /// runner: the conversation is not on a runner lane, or the user explicitly chose
+    /// `broca` (`resolved` is the role's runner, e.g.
+    /// `McModuleConfig::historian_runner_for(harness)`). Depends only on the
+    /// conversation's daemon-stamped principal and session, never on how the
+    /// conversation reports its progress.
+    pub fn for_background_call(
+        principal: Option<&subc_protocol::Principal>,
+        parent_session: &str,
+        resolved: crate::historian_runner::ResolvedRunner,
+    ) -> Option<Self> {
+        crate::historian_runner::uses_session_runner(resolved)
+            .then(|| Self::for_principal(principal, parent_session))
+            .flatten()
+    }
+
+    pub fn module_id(&self) -> &str {
+        &self.module_id
+    }
+
+    pub fn parent_session(&self) -> &str {
+        &self.parent_session
+    }
+
+    pub(crate) fn target(&self) -> RouteTarget {
+        RouteTarget::ManagementSurface {
+            module_id: self.module_id.clone(),
+        }
     }
 }
 
@@ -112,15 +192,23 @@ pub(crate) enum RegisteredRoute {
     SessionResolve,
     HistorianRunner,
     ProviderRunner,
+    FusiformCatalog,
+    CompactionBus,
+    EntorhinalResolve,
+    SynapseRerank,
 }
 
 impl RegisteredRoute {
-    const ALL: [Self; 5] = [
+    const ALL: [Self; 9] = [
         Self::SessionResolve,
         Self::HistorianRunner,
         Self::ProviderRunner,
+        Self::FusiformCatalog,
+        Self::CompactionBus,
         Self::EngramDoor,
         Self::EntorhinalSessionRef,
+        Self::EntorhinalResolve,
+        Self::SynapseRerank,
     ];
 
     fn module_id(self, config: &RouteTargetConfig) -> Option<&str> {
@@ -130,6 +218,10 @@ impl RegisteredRoute {
             Self::SessionResolve => Some(DEFAULT_THALAMUS_MODULE_ID),
             Self::HistorianRunner => config.runner_module_id(),
             Self::ProviderRunner => Some(config.provider_runner_module_id()),
+            Self::FusiformCatalog => Some("fusiform"),
+            Self::CompactionBus => Some("ckbus"),
+            Self::EntorhinalResolve => Some("entorhinal"),
+            Self::SynapseRerank => Some("synapse"),
         }
     }
 
@@ -141,9 +233,17 @@ impl RegisteredRoute {
             Self::EngramDoor | Self::EntorhinalSessionRef => Vec::new(),
             // A lookup on the session registry: it spends nothing and shapes no surface.
             Self::SessionResolve => Vec::new(),
+            // Project lookup is read-only and optional, not a startup dependency.
+            Self::EntorhinalResolve => Vec::new(),
             // Callbacks and transcript reads spend no provider quota. Declaring this target
             // does not open a connection or require the runner to be registered at startup.
             Self::ProviderRunner => Vec::new(),
+            // Model limits are a read-only catalog lookup and spend no provider quota.
+            Self::FusiformCatalog => Vec::new(),
+            Self::CompactionBus => Vec::new(),
+            // Explicit mc.retrieval searches may call Synapse. Declaring this target
+            // neither connects to Synapse nor starts automatic retrieval work.
+            Self::SynapseRerank => Vec::new(),
             // The background runner route carries every model call this module makes, so both
             // callers of it spend the user's provider quota.
             Self::HistorianRunner => vec![
@@ -225,9 +325,24 @@ pub(crate) fn catalog_provider_target_for_test() -> RouteTarget {
 #[cfg(test)]
 pub(crate) fn expected_routes_for_tests(runner: &str) -> Vec<String> {
     #[cfg(feature = "agent-data")]
-    let routes = vec!["thalamus", runner, "engram", "entorhinal"];
+    let routes = vec![
+        "thalamus",
+        runner,
+        "fusiform",
+        "ckbus",
+        "engram",
+        "entorhinal",
+        "synapse",
+    ];
     #[cfg(not(feature = "agent-data"))]
-    let routes = vec!["thalamus", runner];
+    let routes = vec![
+        "thalamus",
+        runner,
+        "fusiform",
+        "ckbus",
+        "entorhinal",
+        "synapse",
+    ];
     routes.into_iter().map(str::to_owned).collect()
 }
 
@@ -238,6 +353,28 @@ mod tests {
 
     use super::executable_staging;
     use super::*;
+
+    #[test]
+    fn every_session_runner_module_gets_its_own_route() {
+        for module in ["thalamus-harness", "broca", "thalamus"] {
+            let principal = subc_protocol::Principal::Reserved {
+                module_id: module.into(),
+            };
+            let route = SessionRunnerRoute::for_principal(Some(&principal), "s")
+                .unwrap_or_else(|| panic!("{module} is a session runner"));
+            assert_eq!(route.module_id(), module);
+            assert_eq!(
+                route.target(),
+                RouteTarget::ManagementSurface {
+                    module_id: module.into()
+                }
+            );
+        }
+        let other = subc_protocol::Principal::Reserved {
+            module_id: "fusiform".into(),
+        };
+        assert!(SessionRunnerRoute::for_principal(Some(&other), "s").is_none());
+    }
 
     #[test]
     fn route_targets_follow_the_resolved_runner() {
@@ -285,6 +422,48 @@ mod tests {
         );
         assert!(host.target(RegisteredRoute::HistorianRunner).is_none());
         assert!(self_signals(&host).is_empty());
+    }
+
+    #[test]
+    fn fusiform_catalog_is_a_static_read_only_tool_provider_route() {
+        let config = RouteTargetConfig::host_runner();
+        assert_eq!(
+            config.target(RegisteredRoute::FusiformCatalog),
+            Some(RouteTarget::ToolProvider {
+                module_id: "fusiform".to_string()
+            })
+        );
+        assert!(RegisteredRoute::FusiformCatalog.self_signals().is_empty());
+        assert!(route_targets(&config).contains(&"fusiform".to_string()));
+    }
+
+    #[test]
+    fn entorhinal_lookup_is_a_read_only_management_route() {
+        let config = RouteTargetConfig::host_runner();
+        assert_eq!(
+            config.target(RegisteredRoute::EntorhinalResolve),
+            Some(RouteTarget::ManagementSurface {
+                module_id: "entorhinal".to_string()
+            })
+        );
+        assert!(RegisteredRoute::EntorhinalResolve.self_signals().is_empty());
+        let manifest = crate::manifest_with_route_targets(crate::DEFAULT_MODULE_ID, &config);
+        let capabilities = manifest
+            .capabilities
+            .expect("provider roles remain declared");
+        assert_eq!(
+            capabilities.provides,
+            vec![
+                cortexkit_role_compaction_provider::PROVIDES.to_string(),
+                crate::MCP_CONVERSATION_BINDING_V1.to_string(),
+                subc_protocol::scope::FLOW_SCOPES_CAPABILITY.to_string(),
+            ]
+        );
+        assert!(capabilities.requires.is_empty());
+        assert!(capabilities.must_never_reach.is_empty());
+        assert!(manifest.consumes.iter().any(|role| matches!(role,
+            subc_protocol::manifest::ConsumerRole::ServiceClient { of } if of.iter().any(|module| module == "entorhinal")
+        )));
     }
 
     #[test]
@@ -437,6 +616,10 @@ mod tests {
                 };
                 let module_id = match target {
                     RouteTarget::ManagementSurface { module_id } => module_id,
+                    RouteTarget::ToolProvider { module_id } => {
+                        assert_eq!(route, RegisteredRoute::FusiformCatalog);
+                        module_id
+                    }
                     RouteTarget::InternalService {
                         module_id,
                         service_id,
@@ -445,7 +628,6 @@ mod tests {
                         assert_eq!(service_id, "session-door");
                         module_id
                     }
-                    _ => panic!("registered route has an unexpected target kind"),
                 };
                 assert!(
                     consumed.contains(&module_id),
@@ -458,7 +640,7 @@ mod tests {
     /// Run after building ck-mc and ck-subc from the workspace and Cargo.lock's subc revision
     /// into the workspace's debug target directory. No installed daemon or runner is used.
     /// ServiceClient declares possible route targets; unlike required capabilities, it
-    /// must not make startup, health, tools, or host completions depend on Broca.
+    /// must not make startup, health, tools, or host completions depend on Broca or Entorhinal.
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     #[ignore = "requires the workspace's ck-mc and ck-subc debug binaries"]
     async fn a_host_runner_starts_and_serves_without_broca_through_real_subc() {
@@ -571,8 +753,14 @@ mod tests {
             .env("HOME", root.join("config"))
             .env("XDG_CONFIG_HOME", root.join("config"))
             .env("XDG_DATA_HOME", root.join("data"))
+            .env("XDG_STATE_HOME", root.join("state"))
+            .env("XDG_RUNTIME_DIR", root.join("runtime"))
+            .env("OPENCODE_DB", root.join("opencode.db"))
             .env_remove("MAGIC_CONTEXT_TEST_DATA_DIR")
-            .env_remove("MAGIC_CONTEXT_STORAGE_DIR")
+            .env(
+                "MAGIC_CONTEXT_STORAGE_DIR",
+                root.join("data/cortexkit/magic-context"),
+            )
             .output()
             .unwrap();
         assert!(
@@ -587,10 +775,15 @@ mod tests {
                 .current_dir(workspace)
                 .env("XDG_CONFIG_HOME", root.join("config"))
                 .env("XDG_DATA_HOME", root.join("data"))
+                .env("XDG_STATE_HOME", root.join("state"))
                 .env("XDG_RUNTIME_DIR", root.join("runtime"))
+                .env("OPENCODE_DB", root.join("opencode.db"))
                 .env("HOME", root.join("config"))
                 .env_remove("MAGIC_CONTEXT_TEST_DATA_DIR")
-                .env_remove("MAGIC_CONTEXT_STORAGE_DIR")
+                .env(
+                    "MAGIC_CONTEXT_STORAGE_DIR",
+                    root.join("data/cortexkit/magic-context"),
+                )
                 .env_remove(subc_protocol::SUBC_MODULE_ID_ENV)
                 .env_remove(subc_protocol::SUBC_LAUNCH_NONCE_ENV)
                 .env_remove(subc_os::LAUNCH_NONCE_FD_ENV)
@@ -636,7 +829,7 @@ mod tests {
                 assert_eq!(
                     catalog.modules.len(),
                     1,
-                    "no runner or gateway may be registered"
+                    "no runner, gateway, or Entorhinal may be registered"
                 );
                 break module.clone();
             }
@@ -653,6 +846,13 @@ mod tests {
         assert!(registered.ready, "{registered:?}");
         assert!(registered.not_ready.is_none(), "{registered:?}");
         assert_eq!(registered.self_signals, Some(vec![]));
+        let declared = crate::manifest_with_route_targets(
+            crate::DEFAULT_MODULE_ID,
+            &RouteTargetConfig::host_runner(),
+        );
+        assert!(declared.consumes.iter().any(|role| matches!(role,
+            subc_protocol::manifest::ConsumerRole::ServiceClient { of } if of.iter().any(|module| module == "entorhinal")
+        )), "Entorhinal must be declared even while unavailable");
         assert!(
             registered.capabilities.is_none(),
             "no required runner capability"
@@ -766,8 +966,29 @@ mod tests {
         assert_eq!(consumer.catalog_list().await.unwrap().modules.len(), 1);
         assert!(
             module.0.try_wait().unwrap().is_none(),
-            "ck-mc must keep serving without Broca"
+            "ck-mc must keep serving without Broca or Entorhinal"
         );
+        let open_files = Command::new("lsof")
+            .args(["-p", &module.0.id().to_string()])
+            .output()
+            .expect("lsof is required to verify the isolated store paths");
+        assert!(open_files.status.success());
+        let listing = String::from_utf8(open_files.stdout).unwrap();
+        let databases: Vec<_> = listing
+            .lines()
+            .filter(|line| line.contains(".db"))
+            .collect();
+        assert!(
+            !databases.is_empty(),
+            "the module must have opened its fixture store"
+        );
+        for line in databases {
+            println!("isolated database: {line}");
+            assert!(
+                line.contains(root.to_str().unwrap()),
+                "database outside fixture: {line}"
+            );
+        }
         consumer.close().await;
     }
 

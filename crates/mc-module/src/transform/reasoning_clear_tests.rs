@@ -1167,3 +1167,45 @@ fn aged_inline_thinking_strip_keeps_the_frozen_caveman_payload() {
         Some(inline_thinking_replacement(&payload).as_str())
     );
 }
+
+
+#[test]
+fn reasoning_age_prefix_gate_holds_while_a_tail_image_is_admitted() {
+    use crate::edit_admission::{EditAdmission, Message, Part};
+    let mut request = opencode_openai_removal_request(8, "google-vertex-anthropic", "claude-opus-5-5");
+    let native = request.native_messages.as_mut().unwrap();
+    native.last_mut().unwrap()["parts"].as_array_mut().unwrap().push(json!({
+        "type":"file", "mime":"image/png", "url":format!("data:image/png;base64,{}", "x".repeat(300))
+    }));
+    native.push(json!({"info":{"id":"reply","role":"assistant"},"parts":[{"type":"text","text":"image processed"}]}));
+    request.messages = crate::codec::decode_opencode(native).messages;
+    let tags = request.messages.iter().enumerate().map(|(index, message)| {
+        (message.mid.clone(), index as u64 + 1)
+    }).collect::<BTreeMap<_, _>>();
+    // Give the removal planner an explicit kept signed block. The release control
+    // uses identical old messages and budget, proving that the missing units are
+    // withheld by the boundary rather than an empty selection of old reasoning.
+    let frame = |held| EditAdmission::new(&[
+        Message { id: Some("current".into()), real_user: false, parts: vec![
+            Part { retained: held, anchor: Some("current-signature".into()) }
+        ] },
+        Message { id: Some("user-last".into()), real_user: false, parts: vec![] },
+    ], true);
+    let mint = |core: &CoreState, held| new_frozen_strip_units(
+        core, &request, &tags, Some(6), true,
+        StripSelectionScope {
+            reasoning: ReasoningBudgetScope::default(), image_watermark: u64::MAX,
+            image_protected_cutoff: None, image_emergency: false,
+        }, &HashSet::new(), &frame(held),
+    );
+    let mut core = CoreState::default();
+    let held = mint(&core, true);
+    assert!(held.iter().any(|unit| unit.key == "strip:processed_image:user-last"));
+    assert!(!held.iter().any(|unit| unit.key.starts_with("strip:reasoning_age:")));
+    core.frozen_units.extend(held);
+    assert!(mint(&core, true).is_empty(), "a repeat must not leak a held omission");
+    let release = mint(&core, false);
+    assert!(release.iter().any(|unit| unit.key.starts_with("strip:reasoning_age:")));
+    core.frozen_units.extend(release);
+    assert!(mint(&core, true).is_empty(), "frozen omissions replay without reselection");
+}

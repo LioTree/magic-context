@@ -23,6 +23,7 @@ import {
 import { isUsableProjectIdentity } from "@magic-context/core/features/magic-context/memory/project-identity";
 import type { ContextDatabase } from "@magic-context/core/features/magic-context/storage";
 import { startDreamScheduleTimer as defaultStartDreamScheduleTimer } from "@magic-context/core/plugin/dream-timer";
+import { extractLatestAssistantText } from "@magic-context/core/shared/assistant-message-extractor";
 import { log } from "@magic-context/core/shared/logger";
 import type { ModelHarness } from "@magic-context/core/shared/model-resolution";
 import { isRecord } from "@magic-context/core/shared/record-type-guard";
@@ -30,6 +31,7 @@ import type { CompletedSubagentToolCall } from "@magic-context/core/shared/subag
 import { HiddenAgentStepLimit } from "@magic-context/core/v2/hooks/hidden-child";
 import { ensureProjectRegisteredFromPiDirectory } from "../embedding-bootstrap";
 import { isPiModelRegistered } from "../model-chain-health";
+import { ZEN_FREE_TIER_FAILURE } from "../pi-zen-free-tier";
 import { PiSubagentRunner } from "../subagent-runner";
 import { createPiPrimerRawProviderFactory } from "./primer-raw-provider-pi";
 import { PiRetrospectiveRawProvider } from "./retrospective-raw-provider-pi";
@@ -100,6 +102,7 @@ interface SessionMessagesArgs {
 }
 
 interface SessionPromptArgs extends SessionMessagesArgs {
+	tokenBudget?: number;
 	body?: unknown;
 	signal?: AbortSignal | null;
 }
@@ -241,7 +244,6 @@ let startDreamScheduleTimerFn: typeof defaultStartDreamScheduleTimer =
 export function registerPiDreamerProject(opts: PiDreamerOptions): void {
 	const directory = resolve(opts.projectDir);
 	if (
-		opts.config.disable === true ||
 		// A directory the identity resolver refuses (home, or a folder inside a
 		// dotfiles repository rooted at home) arrives with an empty identity.
 		// It is not a project, so nothing may be scheduled under that key.
@@ -368,6 +370,11 @@ export function registerPiDreamerProject(opts: PiDreamerOptions): void {
 		}
 		const sampled = manualOpts.sampleDreamRun?.();
 		const dreamerConfig = sampled?.dreamerConfig ?? manualOpts.config;
+		if (dreamerConfig.disable === true) {
+			throw new Error(
+				`Pi dreamer is disabled for project ${opts.projectIdentity}`,
+			);
+		}
 		const mural = sampled?.mural ?? manualOpts.mural;
 		const manualClient = createPiDreamerClient(
 			manualOpts,
@@ -381,6 +388,8 @@ export function registerPiDreamerProject(opts: PiDreamerOptions): void {
 		const manualRun = runManualDream({
 			db: manualOpts.db,
 			projectIdentity: manualOpts.projectIdentity,
+			projectMemoryEnabled: manualOpts.memoryEnabled,
+			smartNotesEnabled: manualOpts.smartNotesEnabled,
 			tasks: manualOpts.modelRegistry
 				? validatePiDreamerModels(
 						buildDreamTaskRuntimeConfigs(
@@ -617,6 +626,7 @@ function createPiDreamerClient(
 				accountingSubagent: "dreamer",
 				accountingTask: accountingTaskFromTitle(dreamSession.title),
 				tokenBudget: (() => {
+					if (args.tokenBudget !== undefined) return args.tokenBudget;
 					const task = accountingTaskFromTitle(dreamSession.title);
 					if (!task) return undefined;
 					return buildDreamTaskRuntimeConfigs(
@@ -631,7 +641,16 @@ function createPiDreamerClient(
 				const budget = result.meta?.tokenBudget as
 					| DreamTokenBudgetState
 					| undefined;
-				if (budget) childBudgetStates.set(sessionId, budget);
+				if (budget) {
+					const prior = childBudgetStates.get(sessionId);
+					childBudgetStates.set(sessionId, {
+						...budget,
+						budget: prior?.budget ?? budget.budget,
+						spent: (prior?.spent ?? 0) + budget.spent,
+						finalizeFired:
+							(prior?.finalizeFired ?? false) || budget.finalizeFired,
+					});
+				}
 				const budgetTask = accountingTaskFromTitle(dreamSession.title);
 				if (budgetTask && budget && typeof budget.spent === "number") {
 					const prior = budgetStates.get(budgetTask);
@@ -643,9 +662,15 @@ function createPiDreamerClient(
 				}
 				assertRegistrationOwnerActive();
 				const mappingMessages = result.meta?.mappingMessages;
-				if (budgetTask === "map-memories" && Array.isArray(mappingMessages)) {
+				const isVerification =
+					budgetTask === "verify" || budgetTask === "verify-broad";
+				const hasMemoryDecisions =
+					(budgetTask === "map-memories" || isVerification) &&
+					result.meta?.failureClass !== ZEN_FREE_TIER_FAILURE &&
+					Array.isArray(mappingMessages);
+				if (hasMemoryDecisions) {
 					// Retain decisions before raising a step/timeout error; the shared
-					// mapper reads this session to bank closed memory elements.
+					// mapper/verifier reads this session to bank closed decisions.
 					dreamSession.messages = mappingMessages
 						.filter(isRecord)
 						.filter((message) => message.role === "assistant")
@@ -665,6 +690,20 @@ function createPiDreamerClient(
 									: [],
 							),
 						);
+					// Pi may retain only tool turns while its runner keeps the final text separately.
+					if (
+						result.ok &&
+						result.assistantText?.trim() &&
+						!dreamSession.messages.some((message) =>
+							extractLatestAssistantText([message])?.trim(),
+						)
+					) {
+						dreamSession.messages.push(
+							makeMessage("assistant", [
+								{ type: "text", text: result.assistantText },
+							]),
+						);
+					}
 				}
 				if (!result.ok) {
 					if (result.reason === "token_budget") {
@@ -690,7 +729,7 @@ function createPiDreamerClient(
 					}
 					throw error;
 				}
-				if (!(budgetTask === "map-memories" && Array.isArray(mappingMessages)))
+				if (!hasMemoryDecisions)
 					dreamSession.messages = [
 						makeMessage("user", [{ type: "text", text: userMessage }]),
 						makeMessage("assistant", [

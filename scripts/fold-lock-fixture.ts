@@ -9,6 +9,7 @@ import { appendCompartments } from "../packages/plugin/src/features/magic-contex
 import { insertMemory } from "../packages/plugin/src/features/magic-context/memory/storage-memory";
 import { getOrCreateSessionMeta } from "../packages/plugin/src/features/magic-context/storage";
 import { initializeDatabase } from "../packages/plugin/src/features/magic-context/storage-db";
+import { sessionRenderCacheSelect } from "../packages/plugin/src/features/magic-context/storage-session-cache";
 import { prepareLegacyToolSkeletonConversions } from "../packages/plugin/src/hooks/magic-context/apply-operations";
 import {
 	injectM0M1,
@@ -181,7 +182,9 @@ for (const host of ["opencode", "pi"] as const) {
 					})
 				: injectM0M1Pi(piState, db, piMessages, undefined, phase !== "defer");
 		const row = db
-			.prepare("SELECT * FROM session_meta WHERE session_id = ?")
+			.prepare(
+				`SELECT *, ${sessionRenderCacheSelect("cached_m0_bytes")}, ${sessionRenderCacheSelect("cached_m1_bytes")}, ${sessionRenderCacheSelect("cached_m0_mural_data_url")} FROM session_meta WHERE session_id = ?`,
+			)
 			.get(session);
 		const served =
 			("preparedMessages" in output ? output.preparedMessages : piMessages) ??

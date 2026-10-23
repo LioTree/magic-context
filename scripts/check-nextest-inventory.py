@@ -46,10 +46,12 @@ def assert_executed(expected, ignored, executed):
 
 def check_junit(directory, label, path):
     expected = (directory / (label + "-names.txt")).read_text().splitlines()
-    ignored = libtest_names((directory / "cargo-ignored.txt").read_text())
+    # The parity job runs with --run-ignored: its long differential is
+    # #[ignore]d only so local `cargo test` stays fast, and CI must execute it.
+    ignored = [] if label == "parity" else libtest_names((directory / "cargo-ignored.txt").read_text())
     executed = [case.attrib["name"] for case in ET.parse(path).iter("testcase")]
     count = assert_executed(expected, ignored, executed)
-    print(f"PASS: {label} JUnit contains exactly {count} executed non-ignored tests")
+    print(f"PASS: {label} JUnit contains exactly {count} executed tests")
 
 
 def check(directory):

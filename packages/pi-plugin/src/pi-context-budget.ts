@@ -45,6 +45,13 @@ export class PiContextBudget {
 	completed = false;
 	failureReason?: string;
 	signal?: AbortSignal;
+	/**
+	 * Set by the context handler when this pass saved its request for replay with
+	 * the certificate deferred. The dispatch wrapper confirms it once the request
+	 * is handed on for sending, or refuses it when the pass is refused instead.
+	 * Both are idempotent and never throw.
+	 */
+	dispatchCertificate?: { confirm(): void; refuse(): void };
 	private cancelled = false;
 	isCancelled(error?: unknown): boolean {
 		// Older hosts do not expose the run signal. Their AbortError is the only
@@ -73,9 +80,9 @@ export class PiContextBudget {
 	elapsed(): number {
 		return this.now() - this.startedAt;
 	}
-	remainingWork(): number {
+	remainingWork = (): number => {
 		return Math.max(0, PI_CONTEXT_BUDGET.workMs - this.elapsed());
-	}
+	};
 	remainingOutcome = (): number =>
 		Math.max(0, PI_CONTEXT_BUDGET.outcomeMs - this.elapsed());
 	writerAllowance(): number {

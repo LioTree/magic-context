@@ -342,7 +342,7 @@ test("history restore clears derived data and never resurrects historical sharin
     }
 });
 
-test("history authority refusal does not become a local SQL fallback after module failure", async () => {
+test("history authority refusal does not become a local SQL fallback", async () => {
     const f = fixture();
     try {
         const row = f.add();
@@ -362,25 +362,13 @@ test("history authority refusal does not become a local SQL fallback after modul
             }).reason,
         ).toBe("authority_unavailable");
         await expect(
-            memoryHistoryRpc(
-                {
-                    db: f.db,
-                    directory: f.projectPath,
-                    moduleClient: {
-                        call: async () => {
-                            throw new Error("module unavailable");
-                        },
-                    },
-                },
-                "memory.restore",
-                {
-                    projectPath: f.projectPath,
-                    decisionKey: change.decisionKey!,
-                    operationId: "module",
-                    expectedRevisions: [{ memoryId: row.id, revision: 2 }],
-                },
-            ),
-        ).rejects.toThrow("module unavailable");
+            memoryHistoryRpc({ db: f.db }, "memory.restore", {
+                projectPath: f.projectPath,
+                decisionKey: change.decisionKey!,
+                operationId: "module",
+                expectedRevisions: [{ memoryId: row.id, revision: 2 }],
+            }),
+        ).rejects.toThrow("authority_unavailable");
         expect(memoryHistorySnapshot(f.db, row.id)).toEqual(before);
     } finally {
         f.close();
@@ -540,55 +528,6 @@ test("history merge link guard rejects relationships changed by another decision
                 .reason,
         ).toBe("successor_changed");
         expect(memoryHistorySnapshot(f.db, first.id)?.status).toBe("archived");
-    } finally {
-        f.close();
-    }
-});
-
-test("history module parser refuses incomplete applied receipts without local fallback", async () => {
-    const f = fixture();
-    try {
-        const row = f.add();
-        f.db
-            .prepare(
-                "INSERT INTO authority_managed(project_path,context_store_uuid,marked_at) VALUES(?,'history-test',0)",
-            )
-            .run(f.projectPath);
-        let calls = 0;
-        await expect(
-            memoryHistoryRpc(
-                {
-                    db: f.db,
-                    directory: f.projectPath,
-                    moduleClient: {
-                        call: async () => {
-                            calls++;
-                            return {
-                                structuredContent: {
-                                    version: 1,
-                                    state: "applied",
-                                    projectPath: f.projectPath,
-                                    operationId: "phantom",
-                                    reason: null,
-                                    revisions: [{ memoryId: row.id, revision: 2 }],
-                                    conflicts: [],
-                                },
-                            };
-                        },
-                    },
-                },
-                "memory.edit",
-                {
-                    projectPath: f.projectPath,
-                    operationId: "phantom",
-                    expectedRevisions: [{ memoryId: row.id, revision: 1 }],
-                    changes: [{ memoryId: row.id, content: "not applied" }],
-                },
-            ),
-        ).rejects.toThrow("invalid_module_receipt");
-        expect(calls).toBe(1);
-        expect(memoryHistorySnapshot(f.db, row.id)?.content).toBe(row.content);
-        expect(memoryHistorySnapshot(f.db, row.id)?.revision).toBe(1);
     } finally {
         f.close();
     }

@@ -911,15 +911,77 @@ fn persist_historian_state_inner(
     }
 }
 
+/// What a fence's [`HistorianPublicationFence::admit`] hands to its own
+/// [`HistorianPublicationFence::publish_admitted`]: for example a lock guard taken
+/// while waiting asynchronously. Only the fence that produced it reads it.
+pub type PublicationAdmission = Box<dyn std::any::Any + Send + Sync>;
+
 pub trait HistorianPublicationFence: Send + Sync {
     fn publish(
         &self,
         store: &McStore,
         request: HistorianPublishRequest<'_>,
     ) -> Result<HistorianPublishResult, HistorianPublishError>;
+
+    /// Wait for whatever publication must hold, before the synchronous publish
+    /// path starts. `publish` runs on a runtime thread and cannot wait for a lock
+    /// that another task on the same thread holds, so a fence that needs one waits
+    /// for it here. The default fence needs nothing.
+    fn admit(
+        &self,
+    ) -> std::pin::Pin<
+        Box<dyn std::future::Future<Output = Option<PublicationAdmission>> + Send + '_>,
+    > {
+        Box::pin(std::future::ready(None))
+    }
+
+    /// Publish with what [`Self::admit`] returned. The default ignores it.
+    fn publish_admitted(
+        &self,
+        store: &McStore,
+        request: HistorianPublishRequest<'_>,
+        _admission: Option<&PublicationAdmission>,
+    ) -> Result<HistorianPublishResult, HistorianPublishError> {
+        self.publish(store, request)
+    }
+}
+
+/// A fence together with what its `admit` returned, presented to the synchronous
+/// publish path as an ordinary fence. Dropping it releases what admission took, so
+/// keep it only for the duration of one publication.
+struct AdmittedFence<'a> {
+    fence: &'a dyn HistorianPublicationFence,
+    admission: Option<PublicationAdmission>,
+}
+
+impl<'a> AdmittedFence<'a> {
+    async fn admit(fence: Option<&'a dyn HistorianPublicationFence>) -> Option<Self> {
+        let fence = fence?;
+        Some(Self {
+            fence,
+            admission: fence.admit().await,
+        })
+    }
+
+    fn as_fence(this: &Option<Self>) -> Option<&dyn HistorianPublicationFence> {
+        this.as_ref()
+            .map(|admitted| admitted as &dyn HistorianPublicationFence)
+    }
+}
+
+impl HistorianPublicationFence for AdmittedFence<'_> {
+    fn publish(
+        &self,
+        store: &McStore,
+        request: HistorianPublishRequest<'_>,
+    ) -> Result<HistorianPublishResult, HistorianPublishError> {
+        self.fence
+            .publish_admitted(store, request, self.admission.as_ref())
+    }
 }
 
 pub struct ValidatedPublishRequest<'a> {
+    pub rust_background_enabled: bool,
     pub session_id: &'a str,
     pub project_path: &'a str,
     /// The harness label the host stamps on this session's rows (`opencode`, `opencode2`,
@@ -1047,6 +1109,7 @@ pub fn publish_validated_chunk(
         request.expected_revert_epoch,
     );
     let publish_request = HistorianPublishRequest {
+        rust_background_enabled: request.rust_background_enabled,
         lifecycle_publication_id: Some(&publication_id),
         harness: Some(request.harness),
         session_id: request.session_id,
@@ -1144,6 +1207,7 @@ pub fn publish_validated_chunk(
                 },
             ))
         }
+        Err(err @ HistorianPublishError::Deferred { .. }) => Err(err.into()),
         Err(err) => {
             // The publish error occurs after the producer has completed its work, so
             // leave the producer run available for the normal recovery path instead of
@@ -1340,6 +1404,14 @@ impl From<McStoreError> for HistorianDriveError {
 
 #[subc_client_rs::async_trait]
 pub trait HistorianProducerDriver: Send {
+    /// Host/configured transports keep their existing sizing and send behavior.
+    /// Session-runner transports return limits from the same discovery as sends.
+    async fn session_runner_limits(
+        &mut self,
+        _child: &str,
+    ) -> Result<Option<crate::runner_limits::RunnerLimits>, HistorianProducerError> {
+        Ok(None)
+    }
     async fn bind_session(&mut self, session_id: &str) -> Result<(), HistorianProducerError>;
     async fn start(
         &mut self,
@@ -1429,6 +1501,12 @@ pub trait HistorianProducerDriver: Send {
 
 #[subc_client_rs::async_trait]
 impl HistorianProducerDriver for HistorianProducer {
+    async fn session_runner_limits(
+        &mut self,
+        child: &str,
+    ) -> Result<Option<crate::runner_limits::RunnerLimits>, HistorianProducerError> {
+        HistorianProducer::session_runner_limits(self, child).await
+    }
     async fn bind_session(&mut self, session_id: &str) -> Result<(), HistorianProducerError> {
         HistorianProducer::bind_session(self, session_id.to_string());
         Ok(())
@@ -1570,6 +1648,7 @@ pub struct HistorianModelLimits {
 }
 
 pub struct HistorianFireRequest<'a> {
+    pub rust_background_enabled: bool,
     pub store: &'a McStore,
     pub session_id: &'a str,
     pub project_path: &'a str,
@@ -1618,6 +1697,7 @@ pub struct HistorianFireRequest<'a> {
 }
 
 pub struct HistorianReattachRequest<'a> {
+    pub rust_background_enabled: bool,
     pub store: &'a McStore,
     pub session_id: &'a str,
     pub project_path: &'a str,
@@ -1670,6 +1750,301 @@ pub fn completion_wait_budget(timeout: Duration) -> Duration {
 pub fn firing_completion_wait_budget(timeout: Duration, chain_len: usize) -> Duration {
     let attempts = u32::try_from(chain_len.max(1)).unwrap_or(u32::MAX);
     completion_wait_budget(timeout).saturating_mul(attempts)
+}
+
+/// A configured attempt keeps its qualifier separate from its model identity.
+/// The qualifier is an OpenCode variant or a Pi/OMP thinking level.
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+pub struct HistorianFixtureModel {
+    pub model: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub qualifier: Option<String>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize)]
+pub struct HistorianFixtureProfile {
+    pub primary: Option<HistorianFixtureModel>,
+    pub fallbacks: Vec<HistorianFixtureModel>,
+}
+
+/// Select attempts from the trusted resolver's complete settings (including any
+/// named profile overlay). This entry is not used by the served historian.
+pub fn historian_fixture_profile(
+    settings: &serde_json::Value,
+    harness: &str,
+    session_model: Option<&str>,
+) -> HistorianFixtureProfile {
+    use serde_json::Value;
+    fn text(value: Option<&Value>) -> Option<String> {
+        value?
+            .as_str()
+            .map(str::trim)
+            .filter(|s| !s.is_empty())
+            .map(str::to_owned)
+    }
+    fn entry(value: &Value, qualifier_key: &str) -> Option<HistorianFixtureModel> {
+        Some(HistorianFixtureModel {
+            model: text(Some(if value.is_string() {
+                value
+            } else {
+                value.get("model")?
+            }))?,
+            qualifier: text(value.get(qualifier_key)),
+        })
+    }
+    fn valid_model(model: &str) -> bool {
+        model
+            .split_once('/')
+            .is_some_and(|(provider, id)| !provider.is_empty() && !id.is_empty())
+    }
+    let historian = &settings["historian"];
+    let block = if harness == "omp" {
+        historian
+            .get("omp")
+            .filter(|v| !v.is_null())
+            .unwrap_or(&historian["pi"])
+    } else {
+        &historian[harness]
+    };
+    let qualifier_key = if harness == "opencode" {
+        "variant"
+    } else {
+        "thinking_level"
+    };
+    let primary = block
+        .get("model")
+        .and_then(|v| entry(v, qualifier_key))
+        .map(|mut model| {
+            model.qualifier = model.qualifier.or_else(|| text(block.get(qualifier_key)));
+            model
+        });
+    let mut fallbacks = Vec::new();
+    if let Some(value) = block.get("fallback_models") {
+        let values = value
+            .as_array()
+            .map(Vec::as_slice)
+            .unwrap_or(std::slice::from_ref(value));
+        for value in values {
+            if let Some(model) = entry(value, qualifier_key) {
+                if valid_model(&model.model)
+                    && !fallbacks.contains(&model)
+                    && primary.as_ref() != Some(&model)
+                {
+                    fallbacks.push(model);
+                }
+            }
+        }
+    }
+    if let Some(model) = session_model.filter(|s| valid_model(s)) {
+        let model = HistorianFixtureModel {
+            model: model.to_owned(),
+            qualifier: None,
+        };
+        if primary.as_ref() != Some(&model) && !fallbacks.contains(&model) {
+            fallbacks.push(model);
+        }
+    }
+    HistorianFixtureProfile { primary, fallbacks }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum HistorianFixtureRole {
+    Historian,
+    Editor,
+    Recomp,
+    Dreamer,
+    Rescore,
+}
+
+/// Recorded host metadata and the matching models.dev capability are supplied
+/// by fixtures; resolving sampling never opens a catalog or performs network I/O.
+pub struct HistorianFixtureSampling<'a> {
+    pub role: HistorianFixtureRole,
+    pub harness: &'a str,
+    pub host_catalog: &'a serde_json::Value,
+    pub catalog_temperature: &'a BTreeMap<String, bool>,
+    pub configured_temperature: Option<f64>,
+    pub request_temperature: Option<f64>,
+}
+
+fn historian_fixture_generation(
+    model: &HistorianFixtureModel,
+    sampling: &HistorianFixtureSampling<'_>,
+) -> (Option<String>, Option<f64>) {
+    use serde_json::Value;
+    let rows = sampling
+        .host_catalog
+        .as_array()
+        .or_else(|| sampling.host_catalog.get("data").and_then(Value::as_array));
+    let (provider, id) = model.model.split_once('/').unwrap_or(("", ""));
+    let matches = |row: &&Value| row["providerID"].as_str() == Some(provider);
+    let variant_entry = rows.and_then(|rows| {
+        rows.iter()
+            .filter(matches)
+            .find(|row| row["id"].as_str() == Some(id))
+    });
+    let qualifier = model.qualifier.clone().filter(|variant| {
+        sampling.harness != "opencode"
+            || variant_entry.is_none_or(|row| {
+                row["variants"]
+                    .as_object()
+                    .is_some_and(|variants| variants.contains_key(variant))
+            })
+    });
+    let metadata = rows.and_then(|rows| {
+        rows.iter()
+            .filter(matches)
+            .find(|row| row["id"].as_str() == Some(id) || row["modelID"].as_str() == Some(id))
+    });
+    // Nullish precedence matters: a non-boolean at an earlier key is unknown,
+    // not permission to use a lower-priority host capability.
+    let host = metadata.and_then(|row| {
+        [
+            row.pointer("/capabilities/temperature"),
+            row.get("temperature"),
+            row.pointer("/compat/supportsTemperature"),
+            row.pointer("/compat/supportsSamplingParams"),
+        ]
+        .into_iter()
+        .flatten()
+        .find(|v| !v.is_null())
+        .and_then(Value::as_bool)
+    });
+    let supported = host.or_else(|| sampling.catalog_temperature.get(&model.model).copied());
+    let temperature = sampling.request_temperature.or_else(|| {
+        (!matches!(
+            sampling.role,
+            HistorianFixtureRole::Dreamer | HistorianFixtureRole::Rescore
+        ))
+        .then_some(sampling.configured_temperature.filter(|v| v.is_finite()))
+        .flatten()
+    });
+    (qualifier, temperature.filter(|_| supported == Some(true)))
+}
+
+/// All inputs are recorded, and no store or publication handle is available.
+/// Only explicit fixture callers can reach these editor/fallback operations.
+pub struct HistorianPassFixtureRequest<'a> {
+    pub session_id: &'a str,
+    pub system: &'a str,
+    pub chunk: &'a HistorianChunk,
+    pub prior_compartments: &'a [StoredCompartmentRange],
+    pub validate_options: ValidateOptions,
+    pub timeout: Duration,
+    pub sampling: HistorianFixtureSampling<'a>,
+}
+
+#[derive(Debug, Clone, PartialEq)]
+pub struct HistorianPassFixtureResult {
+    pub output: ProducerOutput,
+    pub validated: ValidatedChunk,
+    pub run_id: Option<String>,
+}
+
+async fn historian_fixture_attempt<P: HistorianProducerDriver>(
+    producer: &mut P,
+    request: &HistorianPassFixtureRequest<'_>,
+    session_id: &str,
+    stage: &str,
+    prompt: &str,
+    model: &HistorianFixtureModel,
+) -> Result<HistorianPassFixtureResult, String> {
+    let (variant, temperature) = historian_fixture_generation(model, &request.sampling);
+    let result = async {
+        producer
+            .bind_session(session_id)
+            .await
+            .map_err(|e| e.to_string())?;
+        let run = producer
+            .start_stage_with_temperature(
+                session_id,
+                stage,
+                request.system,
+                prompt,
+                &model.model,
+                variant.as_deref(),
+                temperature,
+            )
+            .await
+            .map_err(|e| e.to_string())?;
+        let output = producer
+            .await_output_with_timeout(&run.run_id, request.timeout)
+            .await
+            .map_err(|e| e.to_string())?;
+        if output.length_capped {
+            return Err("Historian output reached its length limit".into());
+        }
+        let validated = validate_historian_output(
+            &output.text,
+            request.chunk,
+            request.prior_compartments,
+            request.validate_options,
+        )
+        .map_err(|e| e.to_string())?;
+        Ok(HistorianPassFixtureResult {
+            output,
+            validated,
+            run_id: Some(run.run_id),
+        })
+    }
+    .await;
+    producer.close().await;
+    result
+}
+
+/// Validate the draft, then ask the editor model to polish it once. The editor
+/// never tries historian fallback models. A failed call or invalid reply returns
+/// the original draft, including its token usage and run identity.
+pub async fn run_historian_editor_fixture<P: HistorianProducerDriver>(
+    producer: &mut P,
+    request: &HistorianPassFixtureRequest<'_>,
+    draft: ProducerOutput,
+    draft_run_id: Option<String>,
+    editor: &HistorianFixtureModel,
+) -> Result<HistorianPassFixtureResult, HistorianValidationError> {
+    let validated = validate_historian_output(
+        &draft.text,
+        request.chunk,
+        request.prior_compartments,
+        request.validate_options,
+    )?;
+    let prompt = format!("This is a historian draft. Clean it up following the rules in your system prompt.\n\n<draft>\n{}\n</draft>\n\nReturn the cleaned draft as valid XML matching the original structure.", draft.text);
+    let result = historian_fixture_attempt(
+        producer,
+        request,
+        request.session_id,
+        "editor",
+        &prompt,
+        editor,
+    )
+    .await;
+    Ok(result.unwrap_or(HistorianPassFixtureResult {
+        output: draft,
+        validated,
+        run_id: draft_run_id,
+    }))
+}
+
+/// Try the historian's fallback models after its primary and repair attempts
+/// have failed. Each model gets a separate producer session. A failed call,
+/// empty reply or invalid output tries the next model in the configured order.
+pub async fn run_historian_fallback_fixture<P: HistorianProducerDriver>(
+    producer: &mut P,
+    request: &HistorianPassFixtureRequest<'_>,
+    prompt: &str,
+    profile: &HistorianFixtureProfile,
+    incoming_error: &str,
+) -> Result<HistorianPassFixtureResult, String> {
+    let mut last_error = incoming_error.to_owned();
+    for (index, model) in profile.fallbacks.iter().enumerate() {
+        let stage = format!("fallback-{}", index + 1);
+        let session = format!("{}/{stage}", request.session_id);
+        match historian_fixture_attempt(producer, request, &session, &stage, prompt, model).await {
+            Ok(result) => return Ok(result),
+            Err(error) => last_error = error,
+        }
+    }
+    Err(last_error)
 }
 
 /// The per-attempt deadline a consumer sets, VERBATIM, for `session.wrapup` calls —
@@ -2138,6 +2513,44 @@ pub(crate) fn producer_input_token_limit_with_input(
     (limit > 0).then_some(limit)
 }
 
+/// The input limit the per-attempt admission check measures a historian prompt
+/// against before sending it to `model`, or None when no positive limit can be
+/// derived (an unknown window, or one the output reserve fills) and the prompt
+/// goes out unguarded.
+///
+/// `legacy_window` is the older single-window setting for this chain entry: the
+/// configured historian context limit for the primary, a supplied fallback limit
+/// otherwise. The chunk assembler sizes the chunk with this same function, so a
+/// prompt it builds passes the check for every model it was sized for.
+pub(crate) fn attempt_producer_input_limit(
+    model: &str,
+    model_limits: &std::collections::BTreeMap<String, HistorianModelLimits>,
+    legacy_window: Option<usize>,
+    historian_context_limit_tokens: Option<usize>,
+    max_output_tokens: u32,
+) -> Option<usize> {
+    let resolved = model_limits.get(model);
+    let current_window = resolved
+        .and_then(|limit| limit.context)
+        .or(legacy_window)
+        .or(historian_context_limit_tokens)
+        .map(|window| {
+            if resolved.and_then(|limit| limit.input).is_some() {
+                window
+            } else {
+                historian_context_limit_tokens.map_or(window, |cap| window.min(cap))
+            }
+        });
+    let output = resolved
+        .and_then(|limit| limit.output)
+        .unwrap_or(max_output_tokens);
+    producer_input_token_limit_with_input(
+        current_window,
+        resolved.and_then(|limit| limit.input),
+        output,
+    )
+}
+
 pub(crate) fn producer_window_failure_reason_with_input(
     producer_source_tokens: usize,
     context_limit_tokens: Option<usize>,
@@ -2382,6 +2795,27 @@ where
             request.chunk_fingerprint,
             request.observed_chunk_fingerprint,
         )?;
+        let next = request.store.load_meta(request.session_id)?;
+        let child = historian_producer_session_id(
+            request.project_slug,
+            request.session_id,
+            next.meta.historian.firing_seq.saturating_add(1),
+        );
+        let mut attempt_limits = request.model_limits.clone();
+        if let Some(limits) = producer.session_runner_limits(&child).await? {
+            let admitted = limits.require_historian().and_then(|()| {
+                limits.fit_limits(
+                    std::slice::from_ref(model),
+                    &mut attempt_limits,
+                    request.historian_context_limit_tokens,
+                    request.max_output_tokens,
+                )
+            });
+            if let Err(error) = admitted {
+                record_admission_refusal(&request, &error.to_string())?;
+                return Err(HistorianDriveError::Producer(error));
+            }
+        }
         let seed = crate::decision_calibration::DecisionCalibration::for_model(Some(model));
         let full_tokens = seed.provider_mass(
             crate::decision_calibration::LocalMass {
@@ -2391,32 +2825,17 @@ where
             },
             true,
         );
-        let resolved = request.model_limits.get(model);
         let legacy_window = if index == 0 {
             request.historian_context_limit_tokens
         } else {
             request.fallback_context_limits.get(model).copied()
         };
-        let current_window = resolved
-            .and_then(|limit| limit.context)
-            .or(legacy_window)
-            .or(request.historian_context_limit_tokens)
-            .map(|window| {
-                if resolved.and_then(|limit| limit.input).is_some() {
-                    window
-                } else {
-                    request
-                        .historian_context_limit_tokens
-                        .map_or(window, |cap| window.min(cap))
-                }
-            });
-        let output = resolved
-            .and_then(|limit| limit.output)
-            .unwrap_or(request.max_output_tokens);
-        let fit_limit = producer_input_token_limit_with_input(
-            current_window,
-            resolved.and_then(|limit| limit.input),
-            output,
+        let fit_limit = attempt_producer_input_limit(
+            model,
+            &attempt_limits,
+            legacy_window,
+            request.historian_context_limit_tokens,
+            request.max_output_tokens,
         );
         if fit_limit.is_none() {
             static UNKNOWN_WINDOWS: std::sync::OnceLock<
@@ -2919,7 +3338,9 @@ where
             None,
             &mut parent_invocation_id,
         );
+        let admitted = AdmittedFence::admit(request.publication_fence).await;
         let publish_result = publish_output_from_awaiting(PublishOutputRequest {
+            rust_background_enabled: request.rust_background_enabled,
             store: request.store,
             session_id: request.session_id,
             project_path: request.project_path,
@@ -2938,8 +3359,9 @@ where
             failure_started_at_ms: request.now_ms,
             failure_backoff_at_ms: request.failure_backoff_at_ms,
             completion_now_ms: request.completion_now_ms,
-            publication_fence: request.publication_fence,
+            publication_fence: AdmittedFence::as_fence(&admitted),
         });
+        drop(admitted);
         producer.close().await;
         let row_version = match publish_result {
             Ok(row_version) => row_version,
@@ -3170,7 +3592,9 @@ async fn drive_historian_on_host(
     }
 
     let report = registration.wait(await_budget).await;
-    let _ = request.store.finish_historian_pending_run(&run_id);
+    if !request.rust_background_enabled {
+        let _ = request.store.finish_historian_pending_run(&run_id);
+    }
 
     let completed_at_ms = (request.completion_now_ms)();
     let failure_backoff_at_ms = completion_failure_backoff_at_ms(
@@ -3184,6 +3608,7 @@ async fn drive_historian_on_host(
     let output = match report {
         Some(crate::historian_host::HostRunReport::Output(output)) => output,
         Some(crate::historian_host::HostRunReport::Failed { code, message }) => {
+            let _ = request.store.finish_historian_pending_run(&run_id);
             abandon_current_state_with_detail(
                 request.store,
                 request.session_id,
@@ -3196,6 +3621,7 @@ async fn drive_historian_on_host(
         }
         Some(crate::historian_host::HostRunReport::WithInvocations { .. }) => unreachable!(),
         None => {
+            let _ = request.store.finish_historian_pending_run(&run_id);
             abandon_current_state_with_detail(
                 request.store,
                 request.session_id,
@@ -3217,6 +3643,7 @@ async fn drive_historian_on_host(
     if claimed.state != HistorianPhase::AwaitingProducer
         || claimed.producer_run_id.as_deref() != Some(run_id.as_str())
     {
+        let _ = request.store.finish_historian_pending_run(&run_id);
         return Err(HistorianDriveError::State(
             HistorianStateError::InvalidTransition {
                 from: claimed.state.clone(),
@@ -3225,7 +3652,13 @@ async fn drive_historian_on_host(
         ));
     }
 
-    let row_version = publish_output_from_awaiting(PublishOutputRequest {
+    let durable_output = mc_store::HistorianRunReport::Output {
+        text: output.text.clone(),
+        length_capped: output.length_capped,
+    };
+    let admitted = AdmittedFence::admit(request.publication_fence).await;
+    let publish_result = publish_output_from_awaiting(PublishOutputRequest {
+        rust_background_enabled: request.rust_background_enabled,
         store: request.store,
         session_id: request.session_id,
         project_path: request.project_path,
@@ -3244,8 +3677,33 @@ async fn drive_historian_on_host(
         failure_started_at_ms: request.now_ms,
         failure_backoff_at_ms: request.failure_backoff_at_ms,
         completion_now_ms: request.completion_now_ms,
-        publication_fence: request.publication_fence,
-    })?;
+        publication_fence: AdmittedFence::as_fence(&admitted),
+    });
+    drop(admitted);
+    if matches!(
+        &publish_result,
+        Err(HistorianDriveError::State(HistorianStateError::Publish(
+            HistorianPublishError::Deferred { .. }
+        )))
+    ) {
+        if let Some(token) = claimed.coordinator_token.as_deref().filter(|_| {
+            request
+                .store
+                .historian_state(request.session_id)
+                .is_ok_and(|state| state.state == HistorianPhase::AwaitingProducer)
+        }) {
+            request.store.record_historian_report(
+                request.project_path,
+                &run_id,
+                token,
+                &durable_output,
+                completed_at_ms,
+            )?;
+        }
+    } else {
+        let _ = request.store.finish_historian_pending_run(&run_id);
+    }
+    let row_version = publish_result?;
 
     Ok(HistorianDriveOutcome::Completed(HistorianRunSuccess {
         row_version,
@@ -3385,6 +3843,7 @@ pub fn adopt_historian_run_on_host(
 
     let predicate = publish_predicate(&awaiting)?;
     let publish_result = publish_output_from_awaiting(PublishOutputRequest {
+        rust_background_enabled: request.rust_background_enabled,
         store: request.store,
         session_id: request.session_id,
         project_path: request.project_path,
@@ -3405,9 +3864,20 @@ pub fn adopt_historian_run_on_host(
         completion_now_ms: request.completion_now_ms,
         publication_fence: request.publication_fence,
     });
-    // The queue row goes whether the publish landed or was refused: the report it
-    // carried has been spent either way, and leaving it would offer the same
-    // rejected document to the next pass forever.
+    if matches!(
+        &publish_result,
+        Err(HistorianDriveError::State(HistorianStateError::Publish(
+            HistorianPublishError::Deferred { .. }
+        )))
+    ) {
+        return Ok(HostRunAdoption::StillOut {
+            run_id,
+            deadline_ms: parked.deadline_ms,
+            republished: false,
+        });
+    }
+    // Remove rejected stale reports so later passes cannot retry the same document.
+    // Lease contention above instead preserves the queue row and its output for retry.
     let _ = request.store.finish_historian_pending_run(&run_id);
     if let Err(error) = &publish_result {
         record_failed_run(
@@ -3776,7 +4246,9 @@ where
 
     // Always release both routes, whether publish succeeds or errors — an early `?`
     // return would leak the command + subscribe routes for this reattached firing.
+    let admitted = AdmittedFence::admit(request.publication_fence).await;
     let publish_result = publish_output_from_awaiting(PublishOutputRequest {
+        rust_background_enabled: request.rust_background_enabled,
         store: request.store,
         session_id: request.session_id,
         project_path: request.project_path,
@@ -3795,8 +4267,9 @@ where
         failure_started_at_ms: request.now_ms,
         failure_backoff_at_ms: request.failure_backoff_at_ms,
         completion_now_ms: request.completion_now_ms,
-        publication_fence: request.publication_fence,
+        publication_fence: AdmittedFence::as_fence(&admitted),
     });
+    drop(admitted);
     producer.close().await;
     let row_version = publish_result?;
     Ok(HistorianReattachOutcome::Published(HistorianRunSuccess {
@@ -3808,6 +4281,7 @@ where
 }
 
 struct PublishOutputRequest<'a> {
+    rust_background_enabled: bool,
     store: &'a McStore,
     session_id: &'a str,
     project_path: &'a str,
@@ -3833,6 +4307,7 @@ fn publish_output_from_awaiting(
     request: PublishOutputRequest<'_>,
 ) -> Result<u64, HistorianDriveError> {
     let PublishOutputRequest {
+        rust_background_enabled,
         store,
         session_id,
         project_path,
@@ -3939,6 +4414,7 @@ fn publish_output_from_awaiting(
     let published = publish_validated_chunk(
         store,
         ValidatedPublishRequest {
+            rust_background_enabled,
             session_id,
             project_path,
             harness,
@@ -3959,7 +4435,19 @@ fn publish_output_from_awaiting(
             failure_backoff_at_ms,
             publication_fence,
         },
-    )?;
+    );
+    let published = match published {
+        Err(error @ HistorianStateError::Publish(HistorianPublishError::Deferred { .. })) => {
+            // Before store.db records the publication intent, contention leaves
+            // the report reusable. After that commit, recovery replays the saved
+            // compartment payload from mc_single_store_pending_publish instead.
+            if store.load_meta(session_id)?.meta.historian.state == HistorianPhase::Publishing {
+                persist_historian_report_state(store, session_id, &publishing, awaiting.clone())?;
+            }
+            return Err(error.into());
+        }
+        result => result?,
+    };
     let importance: Vec<i64> = validated
         .compartments
         .iter()
@@ -4358,6 +4846,9 @@ mod tests {
     fn req(messages: Vec<CkIngressMessage>) -> TransformRequest {
         TransformRequest {
             native_tail_section: false,
+            runner_owned_reminders: false,
+            logical_prefix: None,
+            native_reminder_strip_pending: false,
             native_fold_prefix: None,
             native_fold_sidecar: None,
             native_compartment_source_revision: None,
@@ -4777,6 +5268,491 @@ mod tests {
         }
     }
 
+    fn pass_fixture_request<'a>(
+        chunk: &'a HistorianChunk,
+        prior: &'a [StoredCompartmentRange],
+        host_catalog: &'a serde_json::Value,
+        catalog_temperature: &'a BTreeMap<String, bool>,
+    ) -> HistorianPassFixtureRequest<'a> {
+        HistorianPassFixtureRequest {
+            session_id: "fixture",
+            system: "editor role guidance",
+            chunk,
+            prior_compartments: prior,
+            validate_options: validate_options(),
+            timeout: Duration::from_secs(7),
+            sampling: HistorianFixtureSampling {
+                role: HistorianFixtureRole::Editor,
+                harness: "opencode",
+                host_catalog,
+                catalog_temperature,
+                configured_temperature: Some(0.0),
+                request_temperature: None,
+            },
+        }
+    }
+
+    fn fixture_model() -> HistorianFixtureModel {
+        HistorianFixtureModel {
+            model: "prov/main".into(),
+            qualifier: Some("high".into()),
+        }
+    }
+
+    // Model attempts captured from TypeScript at 282d9c08bce4: the selector in
+    // packages/plugin/src/shared/model-resolution.ts, then runFallbackHistorianPass
+    // in packages/plugin/src/hooks/magic-context/compartment-runner-historian.ts.
+    // Every prompt call was made to fail so the complete attempted order could
+    // be recorded. Rust must match those values, not generate its own expectations.
+    const FALLBACK_PROFILE_VECTORS: &str = r#"[
+{"harness":"opencode","settings":{"historian":{"opencode":{"model":{"model":"prov/main","variant":"high"},"variant":"low","fallback_models":["prov/main",{"model":"prov/main","variant":"high"},{"model":"prov/main","variant":"low"},"prov/fallback","prov/fallback","invalid"," "]}}},"session":"prov/live","expected":{"primary":{"model":"prov/main","qualifier":"high"},"fallbacks":[{"model":"prov/main"},{"model":"prov/main","qualifier":"low"},{"model":"prov/fallback"},{"model":"prov/live"}]}},
+{"harness":"pi","settings":{"historian":{"pi":{"model":"prov/main","thinking_level":"high","fallback_models":[{"model":"prov/backup","thinking_level":"low","variant":"ignored"},"prov/main"]}}},"session":"prov/main","expected":{"primary":{"model":"prov/main","qualifier":"high"},"fallbacks":[{"model":"prov/backup","qualifier":"low"},{"model":"prov/main"}]}},
+{"harness":"omp","settings":{"historian":{"pi":{"model":"prov/pi","thinking_level":"medium","fallback_models":["prov/fallback"]}}},"session":"prov/live","expected":{"primary":{"model":"prov/pi","qualifier":"medium"},"fallbacks":[{"model":"prov/fallback"},{"model":"prov/live"}]}},
+{"harness":"omp","settings":{"historian":{"omp":{"model":"prov/omp","thinking_level":"low"},"pi":{"model":"prov/pi"}}},"session":"prov/omp","expected":{"primary":{"model":"prov/omp","qualifier":"low"},"fallbacks":[{"model":"prov/omp"}]}},
+{"harness":"opencode","settings":{"historian":{"opencode":{"model":"prov/main","variant":"high","fallback_models":"prov/backup"}}},"session":"prov/backup","expected":{"primary":{"model":"prov/main","qualifier":"high"},"fallbacks":[{"model":"prov/backup"}]}},
+{"harness":"opencode","settings":{},"session":"invalid","expected":{"primary":null,"fallbacks":[]}}
+]"#;
+
+    #[tokio::test]
+    async fn historian_4b_fallback_profiles_match_typescript_requests() {
+        let vectors: serde_json::Value = serde_json::from_str(FALLBACK_PROFILE_VECTORS).unwrap();
+        let chunk = historian_chunk();
+        let prior = prior_ranges();
+        let catalog = serde_json::json!([]);
+        let temperatures = BTreeMap::new();
+        for vector in vectors.as_array().unwrap() {
+            let harness = vector["harness"].as_str().unwrap();
+            let profile =
+                historian_fixture_profile(&vector["settings"], harness, vector["session"].as_str());
+            assert_eq!(serde_json::to_value(&profile).unwrap(), vector["expected"]);
+            let mut request = pass_fixture_request(&chunk, &prior, &catalog, &temperatures);
+            request.sampling.harness = harness;
+            let mut producer = ScriptedProducer::default();
+            for _ in &profile.fallbacks {
+                producer = producer.with_start(Err(HistorianProducerError::TimedOut));
+            }
+            let result = run_historian_fallback_fixture(
+                &mut producer,
+                &request,
+                "repaired prompt",
+                &profile,
+                "incoming",
+            )
+            .await;
+            assert!(result.is_err());
+            let expected: Vec<_> = vector["expected"]["fallbacks"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .map(|v| v["model"].as_str().unwrap())
+                .collect();
+            assert_eq!(
+                producer
+                    .observed_starts
+                    .iter()
+                    .map(|s| s.1.as_str())
+                    .collect::<Vec<_>>(),
+                expected
+            );
+            assert!(producer
+                .observed_prompts
+                .iter()
+                .all(|p| p == "repaired prompt"));
+            assert_eq!(
+                producer.observed_variants,
+                profile
+                    .fallbacks
+                    .iter()
+                    .map(|m| m.qualifier.clone())
+                    .collect::<Vec<_>>()
+            );
+        }
+    }
+
+    // Variant and temperature decisions captured from TypeScript at 282d9c08bce4:
+    // packages/plugin/src/v2/hidden-completion.ts's validateVariant and sampling
+    // block, with packages/plugin/src/shared/subagent-temperature.ts. Recorded
+    // host/catalog inputs make unsupported and unknown sampling reproducible.
+    const GENERATION_VECTORS: &str = r#"[
+{"name":"zero supported","metadata":{"providerID":"prov","id":"main","capabilities":{"temperature":true},"variants":{"high":{}}},"configured":0,"expected":{"qualifier":"high","temperature":0}},
+{"name":"host veto beats catalog","metadata":{"providerID":"prov","id":"main","temperature":false,"variants":{}},"configured":0.6,"catalog":true,"expected":{"qualifier":null,"temperature":null}},
+{"name":"catalog positive unknown host","metadata":{"providerID":"prov","id":"main","variants":{"high":{}}},"configured":0.6,"catalog":true,"expected":{"qualifier":"high","temperature":0.6}},
+{"name":"unknown drops temperature","metadata":{"providerID":"prov","id":"main","variants":{"high":{}}},"configured":0.6,"expected":{"qualifier":"high","temperature":null}},
+{"name":"capability precedence","metadata":{"providerID":"prov","id":"main","capabilities":{"temperature":false},"temperature":true,"variants":{"high":{}}},"configured":0.6,"expected":{"qualifier":"high","temperature":null}},
+{"name":"compat sampling support","metadata":{"providerID":"prov","id":"main","compat":{"supportsSamplingParams":true},"variants":{}},"configured":0.6,"expected":{"qualifier":null,"temperature":0.6}},
+{"name":"nonboolean shadows host key","metadata":{"providerID":"prov","id":"main","capabilities":{"temperature":"yes"},"temperature":true},"configured":0.6,"expected":{"qualifier":null,"temperature":null}},
+{"name":"explicit overrides configured","metadata":{"providerID":"prov","id":"main","temperature":true,"variants":{"high":{}}},"configured":0.6,"request":0.2,"expected":{"qualifier":"high","temperature":0.2}},
+{"name":"dreamer no inheritance","metadata":{"providerID":"prov","id":"main","temperature":true},"configured":0.6,"kind":"dreamer-task","expected":{"qualifier":null,"temperature":null}},
+{"name":"rescore no inheritance","metadata":{"providerID":"prov","id":"main","temperature":true},"configured":0.6,"kind":"rescore","qualifier":null,"expected":{"qualifier":null,"temperature":null}},
+{"name":"dreamer explicit zero","metadata":{"providerID":"prov","id":"main","temperature":true},"configured":0.6,"request":0,"kind":"dreamer-task","expected":{"qualifier":null,"temperature":0}},
+{"name":"no matching model preserves variant","metadata":{"providerID":"prov","id":"other","temperature":true},"configured":0.6,"expected":{"qualifier":"high","temperature":null}},
+{"name":"modelID temperature match not variant match","metadata":{"providerID":"prov","modelID":"main","temperature":true},"configured":0.6,"expected":{"qualifier":"high","temperature":0.6}}
+]"#;
+
+    #[tokio::test]
+    async fn historian_4b_generation_matches_typescript_requests() {
+        let vectors: serde_json::Value = serde_json::from_str(GENERATION_VECTORS).unwrap();
+        let chunk = historian_chunk();
+        let prior = prior_ranges();
+        for vector in vectors.as_array().unwrap() {
+            let catalog = serde_json::json!({"data":[vector["metadata"]]});
+            let temperatures = vector["catalog"]
+                .as_bool()
+                .map(|v| BTreeMap::from([("prov/main".into(), v)]))
+                .unwrap_or_default();
+            let mut request = pass_fixture_request(&chunk, &prior, &catalog, &temperatures);
+            request.sampling.configured_temperature = vector["configured"].as_f64();
+            request.sampling.request_temperature = vector["request"].as_f64();
+            request.sampling.role = match vector["kind"].as_str() {
+                Some("dreamer-task") => HistorianFixtureRole::Dreamer,
+                Some("rescore") => HistorianFixtureRole::Rescore,
+                _ => HistorianFixtureRole::Editor,
+            };
+            let mut model = fixture_model();
+            if vector
+                .get("qualifier")
+                .is_some_and(serde_json::Value::is_null)
+            {
+                model.qualifier = None;
+            }
+            let mut producer = ScriptedProducer::default()
+                .with_start(Ok(run_handle("editor")))
+                .with_output(Ok(producer_output(historian_xml("edited"))));
+            run_historian_editor_fixture(
+                &mut producer,
+                &request,
+                producer_output(historian_xml("draft")),
+                None,
+                &model,
+            )
+            .await
+            .unwrap();
+            assert_eq!(
+                producer.observed_variants[0].as_deref(),
+                vector["expected"]["qualifier"].as_str(),
+                "{}",
+                vector["name"]
+            );
+            assert_eq!(
+                producer.observed_temperatures[0],
+                vector["expected"]["temperature"].as_f64(),
+                "{}",
+                vector["name"]
+            );
+        }
+    }
+
+    fn resolve_fixture_config(
+        user: serde_json::Value,
+        project: serde_json::Value,
+    ) -> crate::config_parity::CoreConfig {
+        use crate::config_parity::{
+            ConfigResolveRequest, CoreConfigResolver, TrustedConfigResolver,
+        };
+        use crate::parity_contract::{CapabilityResult, Generation};
+        let dir = tempfile::tempdir().unwrap();
+        let home = dir.path().join("home");
+        let project_root = dir.path().join("project");
+        let user_path = dir.path().join("xdg/cortexkit/magic-context.jsonc");
+        std::fs::create_dir_all(user_path.parent().unwrap()).unwrap();
+        std::fs::create_dir_all(project_root.join(".cortexkit")).unwrap();
+        std::fs::write(&user_path, user.to_string()).unwrap();
+        std::fs::write(
+            project_root.join(".cortexkit/magic-context.jsonc"),
+            project.to_string(),
+        )
+        .unwrap();
+        let resolver = TrustedConfigResolver::new(
+            home.clone(),
+            BTreeMap::from([
+                ("HOME".into(), home.to_string_lossy().into_owned()),
+                (
+                    "XDG_CONFIG_HOME".into(),
+                    dir.path().join("xdg").to_string_lossy().into_owned(),
+                ),
+            ]),
+        );
+        match resolver.resolve(&ConfigResolveRequest {
+            user_config_path: String::new(),
+            project_root: project_root.to_string_lossy().into_owned(),
+            generation: Generation(1),
+        }) {
+            CapabilityResult::Available { value } | CapabilityResult::Degraded { value, .. } => {
+                value
+            }
+            CapabilityResult::Unavailable { reason } => {
+                panic!("fixture config unavailable: {reason:?}")
+            }
+        }
+    }
+
+    #[test]
+    fn historian_4b_named_profile_uses_trusted_overlay() {
+        // Expected attempts were captured at 282d9c08bce4 by TypeScript's
+        // resolveConfigProfile (config/profiles.ts) then resolveHistorianModel
+        // (shared/model-resolution.ts), both under packages/plugin/src. A project
+        // may select a named profile, but only the user config may define it.
+        let config = resolve_fixture_config(
+            serde_json::json!({
+                "profile":"base", "historian":{"opencode":{"model":"prov/base"}},
+                "profiles":{"polish":{"historian":{
+                    "opencode":{"model":{"model":"prov/main","variant":"high"},"fallback_models":[{"model":"prov/main","variant":"low"},"prov/backup"]},
+                    "pi":{"model":"prov/pi","thinking_level":"medium"}
+                }}}
+            }),
+            serde_json::json!({"profile":"polish", "profiles":{"polish":{"historian":{"opencode":{"model":"evil/model"}}}}}),
+        );
+        let profile = historian_fixture_profile(&config.settings, "opencode", None);
+        assert_eq!(
+            serde_json::to_value(profile).unwrap(),
+            serde_json::json!({
+                "primary":{"model":"prov/main","qualifier":"high"},
+                "fallbacks":[{"model":"prov/main","qualifier":"low"},{"model":"prov/backup"}]
+            })
+        );
+    }
+
+    #[tokio::test]
+    async fn historian_4b_served_firing_does_not_run_editor_even_with_two_pass() {
+        for two_pass in [false, true] {
+            let config = resolve_fixture_config(
+                serde_json::json!({"historian":{"two_pass":two_pass,"temperature":0.3,"opencode":{"model":"prov/main"}}}),
+                serde_json::json!({}),
+            );
+            assert_eq!(config.settings["historian"]["two_pass"], two_pass);
+            let dir = tempfile::tempdir().unwrap();
+            let main_store = store(dir.path());
+            seed_prior_compartment(&main_store);
+            let chunk = historian_chunk();
+            let prior = prior_ranges();
+            let models = vec!["prov/main".into()];
+            let mut producer = ScriptedProducer::default()
+                .with_start(Ok(run_handle("served")))
+                .with_output(Ok(producer_output(historian_xml("served draft"))));
+            let mut request = fire_request(&main_store, "prompt", &models, &chunk, &prior);
+            request.temperature = config.effective.historian_temperature;
+            assert!(matches!(
+                run_historian_firing(&mut producer, request).await.unwrap(),
+                HistorianDriveOutcome::Completed(_)
+            ));
+            assert_eq!(producer.observed_starts.len(), 1);
+            assert!(producer
+                .observed_prompts
+                .iter()
+                .all(|prompt| !prompt.contains("<draft>")));
+            assert_eq!(
+                main_store
+                    .load_compartments("ses")
+                    .unwrap()
+                    .last()
+                    .unwrap()
+                    .p1
+                    .as_deref(),
+                Some("served draft")
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn historian_4b_editor_accepts_one_valid_polish() {
+        // runEditorPassOrFallback at 282d9c08bce4 returned one call, this prompt,
+        // "edited exact" and invocation 22 for the accepted reply; the call-failure,
+        // empty and invalid replies returned "draft exact" and invocation 11.
+        // Run identities below are decimal strings because the Rust producer
+        // identifies runs with strings rather than TypeScript's numeric row ids.
+        let chunk = historian_chunk();
+        let prior = prior_ranges();
+        let catalog = serde_json::json!([]);
+        let temperatures = BTreeMap::new();
+        let request = pass_fixture_request(&chunk, &prior, &catalog, &temperatures);
+        let draft = producer_output(historian_xml("draft exact"));
+        let edited = producer_output(historian_xml("edited exact"));
+        let mut producer = ScriptedProducer::default()
+            .with_start(Ok(run_handle("22")))
+            .with_output(Ok(edited.clone()));
+        let result = run_historian_editor_fixture(
+            &mut producer,
+            &request,
+            draft.clone(),
+            Some("11".into()),
+            &fixture_model(),
+        )
+        .await
+        .unwrap();
+        assert_eq!(result.output, edited);
+        assert_eq!(result.run_id.as_deref(), Some("22"));
+        assert_eq!(
+            result.validated.compartments[0].p1.as_deref(),
+            Some("edited exact")
+        );
+        assert_eq!(producer.observed_starts.len(), 1);
+        assert_eq!(producer.observed_systems, ["editor role guidance"]);
+        assert_eq!(producer.observed_prompts, [format!("This is a historian draft. Clean it up following the rules in your system prompt.\n\n<draft>\n{}\n</draft>\n\nReturn the cleaned draft as valid XML matching the original structure.", draft.text)]);
+        assert_eq!(producer.observed_await_timeouts, [Duration::from_secs(7)]);
+        assert_eq!(producer.closes, 1);
+    }
+
+    #[tokio::test]
+    async fn historian_4b_editor_failures_preserve_draft_unchanged() {
+        let chunk = historian_chunk();
+        let prior = prior_ranges();
+        let catalog = serde_json::json!([]);
+        let temperatures = BTreeMap::new();
+        let request = pass_fixture_request(&chunk, &prior, &catalog, &temperatures);
+        let mut draft = producer_output(historian_xml("draft exact"));
+        draft.usage = Some(crate::historian_producer::ProducerUsage {
+            input: 7,
+            output: 9,
+            cache_read: 11,
+            cache_write: 13,
+        });
+        let expected = HistorianPassFixtureResult {
+            validated: validate_historian_output(&draft.text, &chunk, &prior, validate_options())
+                .unwrap(),
+            output: draft.clone(),
+            run_id: Some("11".into()),
+        };
+        for reply in [
+            Err(HistorianProducerError::TimedOut),
+            Ok(producer_output(String::new())),
+            Ok(producer_output("not XML".into())),
+            Ok(ProducerOutput {
+                length_capped: true,
+                ..producer_output(historian_xml("capped"))
+            }),
+            Ok(producer_output(
+                historian_xml("outside range").replace("start=\"2\"", "start=\"1\""),
+            )),
+        ] {
+            let mut producer = ScriptedProducer::default()
+                .with_start(Ok(run_handle("editor")))
+                .with_output(reply);
+            let result = run_historian_editor_fixture(
+                &mut producer,
+                &request,
+                draft.clone(),
+                Some("11".into()),
+                &fixture_model(),
+            )
+            .await
+            .unwrap();
+            assert_eq!(result, expected);
+            assert_eq!(producer.observed_starts.len(), 1);
+            assert_eq!(producer.closes, 1);
+        }
+        let mut producer =
+            ScriptedProducer::default().with_start(Err(HistorianProducerError::TimedOut));
+        assert_eq!(
+            run_historian_editor_fixture(
+                &mut producer,
+                &request,
+                draft,
+                Some("11".into()),
+                &fixture_model()
+            )
+            .await
+            .unwrap(),
+            expected
+        );
+        assert_eq!(producer.observed_starts.len(), 1);
+    }
+
+    #[tokio::test]
+    async fn historian_4b_invalid_draft_never_calls_editor() {
+        let chunk = historian_chunk();
+        let prior = prior_ranges();
+        let catalog = serde_json::json!([]);
+        let temperatures = BTreeMap::new();
+        let request = pass_fixture_request(&chunk, &prior, &catalog, &temperatures);
+        let mut producer = ScriptedProducer::default();
+        assert!(run_historian_editor_fixture(
+            &mut producer,
+            &request,
+            producer_output("not XML".into()),
+            None,
+            &fixture_model()
+        )
+        .await
+        .is_err());
+        assert!(producer.observed_starts.is_empty());
+        assert!(producer.observed_sessions.is_empty());
+    }
+
+    #[tokio::test]
+    async fn historian_4b_fallback_validates_each_attempt_and_keeps_last_error() {
+        let chunk = historian_chunk();
+        let prior = prior_ranges();
+        let catalog = serde_json::json!([]);
+        let temperatures = BTreeMap::new();
+        let request = pass_fixture_request(&chunk, &prior, &catalog, &temperatures);
+        let profile = historian_fixture_profile(
+            &serde_json::json!({"historian":{"opencode":{"fallback_models":["prov/a","prov/b","prov/c","prov/d","prov/e"]}}}),
+            "opencode",
+            None,
+        );
+        let valid = producer_output(historian_xml("fallback accepted"));
+        let mut producer = ScriptedProducer::default()
+            .with_start(Err(HistorianProducerError::TimedOut))
+            .with_start(Ok(run_handle("fallback-2")))
+            .with_start(Ok(run_handle("fallback-3")))
+            .with_start(Ok(run_handle("fallback-4")))
+            .with_output(Ok(producer_output(String::new())))
+            .with_output(Ok(producer_output("invalid".into())))
+            .with_output(Ok(valid.clone()));
+        let result =
+            run_historian_fallback_fixture(&mut producer, &request, "repair", &profile, "incoming")
+                .await
+                .unwrap();
+        assert_eq!(result.output, valid);
+        assert_eq!(
+            producer
+                .observed_starts
+                .iter()
+                .map(|s| s.1.as_str())
+                .collect::<Vec<_>>(),
+            ["prov/a", "prov/b", "prov/c", "prov/d"]
+        );
+        assert_eq!(
+            producer
+                .observed_starts
+                .iter()
+                .map(|s| s.0.as_str())
+                .collect::<Vec<_>>(),
+            [
+                "fixture/fallback-1",
+                "fixture/fallback-2",
+                "fixture/fallback-3",
+                "fixture/fallback-4"
+            ]
+        );
+        let mut producer = ScriptedProducer::default();
+        let empty = HistorianFixtureProfile {
+            primary: None,
+            fallbacks: vec![],
+        };
+        assert_eq!(
+            run_historian_fallback_fixture(&mut producer, &request, "repair", &empty, "incoming")
+                .await
+                .unwrap_err(),
+            "incoming"
+        );
+        let profile = HistorianFixtureProfile {
+            primary: None,
+            fallbacks: vec![fixture_model()],
+        };
+        producer = producer
+            .with_start(Ok(run_handle("invalid")))
+            .with_output(Ok(producer_output(
+                "<output><compartments></compartments></output>".into(),
+            )));
+        assert_eq!(
+            run_historian_fallback_fixture(&mut producer, &request, "repair", &profile, "incoming")
+                .await
+                .unwrap_err(),
+            "Historian returned no usable compartments."
+        );
+    }
+
     #[test]
     fn full_lineage_hash_separates_keys_that_collided_at_32_bits() {
         let first = historian_producer_session_id("proj", "lineage-ZiDxmBSjhQbv", 2);
@@ -4832,6 +5808,7 @@ mod tests {
             .unwrap()
             .compartment_set_generation;
         HistorianFireRequest {
+            rust_background_enabled: false,
             store,
             session_id: "ses",
             project_path: FIRE_PROJECT,
@@ -4879,6 +5856,7 @@ mod tests {
         prior: &'a [StoredCompartmentRange],
     ) -> HistorianReattachRequest<'a> {
         HistorianReattachRequest {
+            rust_background_enabled: false,
             store,
             session_id: "ses",
             project_path: "git:proj",
@@ -5208,6 +6186,7 @@ mod tests {
         let before = main_store.load_meta("ses").unwrap();
         let rows = main_store.load_compartments("ses").unwrap();
         let late = publish_output_from_awaiting(PublishOutputRequest {
+            rust_background_enabled: false,
             store: &main_store,
             session_id: "ses",
             project_path: FIRE_PROJECT,
@@ -6554,6 +7533,7 @@ mod tests {
             .with_status(Ok(RunState::Terminal))
             .with_output(Ok(producer_output(historian_xml("right summary"))));
         let left_request = HistorianReattachRequest {
+            rust_background_enabled: false,
             store: &store,
             session_id: left_lineage,
             project_path: "git:proj",
@@ -6573,6 +7553,7 @@ mod tests {
             publication_fence: None,
         };
         let right_request = HistorianReattachRequest {
+            rust_background_enabled: false,
             store: &store,
             session_id: right_lineage,
             project_path: "git:proj",
@@ -7425,6 +8406,7 @@ mod tests {
 
         // observed fingerprint diverges from the stored "fp" — a tail change since firing.
         let request = HistorianReattachRequest {
+            rust_background_enabled: false,
             store: &store,
             session_id: "ses",
             project_path: "git:proj",
@@ -7786,6 +8768,7 @@ mod tests {
         publish_validated_chunk(
             &store,
             ValidatedPublishRequest {
+                rust_background_enabled: false,
                 session_id: "ses",
                 project_path: "git:proj",
                 harness: "opencode",
@@ -7878,6 +8861,7 @@ mod tests {
             publish_validated_chunk(
                 &store,
                 ValidatedPublishRequest {
+                    rust_background_enabled: false,
                     session_id,
                     project_path: "git:proj",
                     harness: "opencode",
@@ -8035,6 +9019,7 @@ mod tests {
         let err = publish_validated_chunk(
             &store,
             ValidatedPublishRequest {
+                rust_background_enabled: false,
                 session_id: "ses",
                 project_path: "git:proj",
                 harness: "opencode",
@@ -8126,6 +9111,7 @@ mod tests {
         let err = publish_validated_chunk(
             &store,
             ValidatedPublishRequest {
+                rust_background_enabled: false,
                 session_id: "ses",
                 project_path: "git:proj",
                 harness: "opencode",
@@ -8210,6 +9196,7 @@ mod tests {
         let error = publish_validated_chunk(
             &store,
             ValidatedPublishRequest {
+                rust_background_enabled: false,
                 session_id: "ses",
                 project_path: "git:proj",
                 harness: "opencode",
@@ -8364,6 +9351,7 @@ mod tests {
         let predicate = publish_predicate(&loaded.meta.historian).unwrap();
         store
             .publish_historian_chunk(HistorianPublishRequest {
+                rust_background_enabled: false,
                 lifecycle_publication_id: None,
                 harness: None,
                 session_id: "ses",
@@ -8489,6 +9477,7 @@ mod tests {
         };
         store
             .publish_historian_chunk(HistorianPublishRequest {
+                rust_background_enabled: false,
                 lifecycle_publication_id: None,
                 harness: None,
                 session_id: "ses",
@@ -8860,6 +9849,42 @@ mod tests {
         assert_eq!(linked, invocations[0].id);
     }
 
+    #[tokio::test]
+    async fn open_control_runner_and_broca_publish_identical_historian_bytes_from_run_result() {
+        let output = historian_xml("one authoritative result, two event schemas");
+        let chunk = historian_chunk();
+        let prior = prior_ranges();
+        let models = vec!["prov/model-a".to_string()];
+        let mut published = Vec::new();
+        for open_controls in [false, true] {
+            let dir = tempfile::tempdir().unwrap();
+            let store = store(dir.path());
+            seed_prior_compartment(&store);
+            let (mut producer, server) =
+                crate::historian_producer::tests::publication_follower(&output, open_controls)
+                    .await;
+            let mut request = fire_request(&store, "prompt", &models, &chunk, &prior);
+            request.model_limits.insert(
+                "prov/model-a".into(),
+                HistorianModelLimits {
+                    context: Some(200_000),
+                    input: None,
+                    output: Some(128_000),
+                },
+            );
+            request.await_timeout = Duration::from_secs(2);
+            let outcome = run_historian_firing(&mut producer, request).await.unwrap();
+            assert!(matches!(outcome, HistorianDriveOutcome::Completed(_)));
+            assert_eq!(
+                server.follow_counts().await,
+                (2, 1),
+                "one initial status, one control wake, then one result"
+            );
+            published.push(serde_json::to_vec(&store.load_compartments("ses").unwrap()).unwrap());
+        }
+        assert_eq!(published[0], published[1]);
+    }
+
     #[tokio::test(flavor = "current_thread")]
     async fn a_queued_run_nobody_claims_is_released_rather_than_left_in_flight() {
         let host_dir = tempfile::tempdir().unwrap();
@@ -9213,6 +10238,147 @@ mod tests {
                 .is_empty(),
             "a published run leaves the queue"
         );
+    }
+
+    fn i4_store_report(store: &McStore) {
+        let (run_id, token) = claim_a_run_with_no_firing_task(store);
+        store
+            .record_historian_report(
+                FIRE_PROJECT,
+                &run_id,
+                &token,
+                &mc_store::HistorianRunReport::Output {
+                    text: historian_xml("stored output"),
+                    length_capped: false,
+                },
+                123,
+            )
+            .unwrap();
+    }
+
+    fn i4_hold_ts_lease(dir: &std::path::Path, holder: &str) {
+        let conn = rusqlite::Connection::open(dir.join("context.db")).unwrap();
+        conn.execute("INSERT INTO compartment_state_lease (session_id, holder_id, owner_pid, acquired_at, expires_at) VALUES ('ses', ?1, ?2, ?3, ?4)", rusqlite::params![holder, std::process::id(), crate::now_ms(), crate::now_ms() + 300_000]).unwrap();
+    }
+
+    #[test]
+    fn i4_stored_report_holder_matrix_retains_then_publishes_once() {
+        for restart in [false, true] {
+            for holder in ["ts-wrapup", "ts-recomp", "ts-incremental"] {
+                let dir = tempfile::tempdir().unwrap();
+                let mut host_store = store(dir.path());
+                seed_prior_compartment(&host_store);
+                i4_store_report(&host_store);
+                i4_hold_ts_lease(dir.path(), holder);
+                if restart {
+                    drop(host_store);
+                    host_store = store(dir.path());
+                }
+                let chunk = historian_chunk();
+                let prior = prior_ranges();
+                let mut request = reattach_request(&host_store, &chunk, &prior);
+                request.rust_background_enabled = true;
+                assert!(matches!(
+                    adopt_historian_run_on_host(request).unwrap(),
+                    HostRunAdoption::StillOut { .. }
+                ));
+                assert_eq!(host_store.load_compartments("ses").unwrap().len(), 1);
+                assert!(host_store
+                    .load_parked_historian_run("ses")
+                    .unwrap()
+                    .unwrap()
+                    .report
+                    .is_some());
+                assert_eq!(
+                    host_store.historian_state("ses").unwrap().state,
+                    HistorianPhase::AwaitingProducer
+                );
+                rusqlite::Connection::open(dir.path().join("context.db"))
+                    .unwrap()
+                    .execute(
+                        "DELETE FROM compartment_state_lease WHERE session_id='ses'",
+                        [],
+                    )
+                    .unwrap();
+                let mut request = reattach_request(&host_store, &chunk, &prior);
+                request.rust_background_enabled = true;
+                assert!(matches!(
+                    adopt_historian_run_on_host(request).unwrap(),
+                    HostRunAdoption::Published(_)
+                ));
+                assert!(host_store
+                    .load_parked_historian_run("ses")
+                    .unwrap()
+                    .is_none());
+                assert_eq!(host_store.load_compartments("ses").unwrap().len(), 2);
+            }
+        }
+    }
+
+    #[test]
+    fn i4_stored_report_uses_fire_time_snapshot_with_and_without_restart() {
+        for restart in [false, true] {
+            let dir = tempfile::tempdir().unwrap();
+            let mut host_store = store(dir.path());
+            seed_prior_compartment(&host_store);
+            i4_store_report(&host_store);
+            let conn = rusqlite::Connection::open(dir.path().join("context.db")).unwrap();
+            conn.execute("INSERT INTO compartments (session_id, sequence, start_message, end_message, start_message_id, end_message_id, title, content, created_at) VALUES ('ses', 2, 50, 60, 'm50', 'm60', 'TS append', 'new TS history', 1)", []).unwrap();
+            drop(conn);
+            if restart {
+                drop(host_store);
+                host_store = store(dir.path());
+            }
+            let chunk = historian_chunk();
+            let prior = prior_ranges();
+            let mut request = reattach_request(&host_store, &chunk, &prior);
+            request.rust_background_enabled = true;
+            let error = adopt_historian_run_on_host(request).unwrap_err();
+            assert!(
+                matches!(error, HistorianDriveError::State(HistorianStateError::Publish(HistorianPublishError::FenceRejected { reason })) if reason.contains("compartment set"))
+            );
+            assert_eq!(host_store.load_compartments("ses").unwrap().len(), 2);
+            assert!(host_store
+                .load_parked_historian_run("ses")
+                .unwrap()
+                .is_none());
+        }
+    }
+
+    #[tokio::test]
+    async fn i4_firing_carries_captured_activation_to_store_after_toggle() {
+        let dir = tempfile::tempdir().unwrap();
+        let host_store = store(dir.path());
+        seed_prior_compartment(&host_store);
+        i4_hold_ts_lease(dir.path(), "ts-wrapup");
+        let config = std::sync::Arc::new(std::sync::Mutex::new(crate::config::McModuleConfig {
+            rust_background_enabled: true,
+            ..Default::default()
+        }));
+        let captured = config.lock().unwrap().rust_background_enabled();
+        let config_for_hook = config.clone();
+        let mut producer = ScriptedProducer::default()
+            .with_start(Ok(run_handle("run-1")))
+            .with_output(Ok(producer_output(historian_xml("captured on"))))
+            .with_await_output_hook(move || {
+                config_for_hook.lock().unwrap().rust_background_enabled = false
+            });
+        let models = vec!["prov/model-a".into()];
+        let chunk = historian_chunk();
+        let prior = prior_ranges();
+        let mut request = fire_request(&host_store, "prompt", &models, &chunk, &prior);
+        request.rust_background_enabled = captured;
+        let error = run_historian_firing(&mut producer, request)
+            .await
+            .unwrap_err();
+        assert!(matches!(
+            error,
+            HistorianDriveError::State(HistorianStateError::Publish(
+                HistorianPublishError::Deferred { .. }
+            ))
+        ));
+        assert!(!config.lock().unwrap().rust_background_enabled());
+        assert_eq!(host_store.load_compartments("ses").unwrap().len(), 1);
     }
 
     #[test]

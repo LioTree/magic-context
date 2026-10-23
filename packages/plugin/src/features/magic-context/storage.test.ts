@@ -10,6 +10,7 @@ import {
 import { Database } from "../../shared/sqlite";
 import { closeQuietly } from "../../shared/sqlite-helpers";
 import { createTestTempDirFromPath } from "../../shared/test-temp-dir";
+import { patchSessionMeta, seedSessionMeta } from "./__tests__/session-meta-fixture";
 import { acquireCompartmentLease, isCompartmentLeaseHeld } from "./compartment-lease";
 import {
     getCompartments,
@@ -53,6 +54,7 @@ import {
     updateTagStatus,
 } from "./storage";
 import { ensureColumn, initializeDatabase } from "./storage-db";
+import { sessionMetaCollectionSelect } from "./storage-session-collections";
 
 const tempDirs: string[] = [];
 const originalXdgDataHome = process.env.XDG_DATA_HOME;
@@ -214,9 +216,11 @@ describe("magic-context storage", () => {
         const db = makeMemoryDatabase();
         const sessionId = "ses-recomp-cache";
         getOrCreateSessionMeta(db, sessionId);
-        db.prepare(
-            "UPDATE session_meta SET memory_block_cache = ?, memory_block_ids = ?, memory_block_count = ? WHERE session_id = ?",
-        ).run("<memory>stale</memory>", "mem-1,mem-2", 2, sessionId);
+        patchSessionMeta(db, sessionId, {
+            memory_block_cache: "<memory>stale</memory>",
+            memory_block_ids: "mem-1,mem-2",
+            memory_block_count: 2,
+        });
         saveRecompStagingPass(
             db,
             sessionId,
@@ -242,7 +246,10 @@ describe("magic-context storage", () => {
         expect(promoted?.compartments).toHaveLength(1);
         const row = db
             .prepare(
-                "SELECT memory_block_cache AS cache, memory_block_ids AS ids, memory_block_count AS count FROM session_meta WHERE session_id = ?",
+                `SELECT COALESCE((SELECT value FROM session_render_cache WHERE session_id = session_meta.session_id AND cache_key = 'memory_block_cache'), '') AS cache,
+                    ${sessionMetaCollectionSelect("memory_block_ids", "ids", db)},
+                    memory_block_count AS count
+                FROM session_meta WHERE session_id = ?`,
             )
             .get(sessionId) as { cache: string; ids: string; count: number };
         expect(row).toEqual({ cache: "", ids: "", count: 0 });
@@ -351,9 +358,11 @@ describe("magic-context storage", () => {
     it("recovers from malformed sticky-injection JSON", () => {
         //#given
         const db = makeMemoryDatabase();
-        db.prepare(
-            "INSERT INTO session_meta (session_id, note_nudge_anchors, auto_search_hint_decisions) VALUES (?, ?, ?)",
-        ).run("ses-bad-json", "not-json", "{}");
+        seedSessionMeta(db, {
+            session_id: "ses-bad-json",
+            note_nudge_anchors: "not-json",
+            auto_search_hint_decisions: "{}",
+        });
 
         //#then
         expect(getNoteNudgeAnchors(db, "ses-bad-json")).toEqual([]);

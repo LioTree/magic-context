@@ -30,7 +30,7 @@ it("Pi upgrade preserves every previously served marker on the first defer", asy
 		expect(getTemporalDecisions(db, sessionId).size).toBe(0);
 		const prefix = db
 			.prepare(
-				"SELECT cached_m0_bytes, cached_m1_bytes FROM session_meta WHERE session_id=?",
+				"SELECT (SELECT value FROM session_render_cache WHERE session_id = session_meta.session_id AND cache_key = 'cached_m0_bytes') AS cached_m0_bytes, (SELECT value FROM session_render_cache WHERE session_id = session_meta.session_id AND cache_key = 'cached_m1_bytes') AS cached_m1_bytes FROM session_meta WHERE session_id=?",
 			)
 			.get(sessionId);
 		db.close();
@@ -60,7 +60,7 @@ it("Pi upgrade preserves every previously served marker on the first defer", asy
 		expect(
 			db
 				.prepare(
-					"SELECT cached_m0_bytes, cached_m1_bytes FROM session_meta WHERE session_id=?",
+					"SELECT (SELECT value FROM session_render_cache WHERE session_id = session_meta.session_id AND cache_key = 'cached_m0_bytes') AS cached_m0_bytes, (SELECT value FROM session_render_cache WHERE session_id = session_meta.session_id AND cache_key = 'cached_m1_bytes') AS cached_m1_bytes FROM session_meta WHERE session_id=?",
 				)
 				.get(sessionId),
 		).toEqual(prefix);
@@ -94,7 +94,7 @@ async function legacyPiCut(keepLkg: boolean): Promise<void> {
 		}
 		const cache = db
 			.prepare(
-				"SELECT cached_m0_bytes,cached_m1_bytes FROM session_meta WHERE session_id=?",
+				"SELECT (SELECT value FROM session_render_cache WHERE session_id = session_meta.session_id AND cache_key = 'cached_m0_bytes') AS cached_m0_bytes, (SELECT value FROM session_render_cache WHERE session_id = session_meta.session_id AND cache_key = 'cached_m1_bytes') AS cached_m1_bytes FROM session_meta WHERE session_id=?",
 			)
 			.get(id);
 		db.close();
@@ -118,7 +118,7 @@ async function legacyPiCut(keepLkg: boolean): Promise<void> {
 		expect(
 			db
 				.prepare(
-					"SELECT cached_m0_bytes,cached_m1_bytes FROM session_meta WHERE session_id=?",
+					"SELECT (SELECT value FROM session_render_cache WHERE session_id = session_meta.session_id AND cache_key = 'cached_m0_bytes') AS cached_m0_bytes, (SELECT value FROM session_render_cache WHERE session_id = session_meta.session_id AND cache_key = 'cached_m1_bytes') AS cached_m1_bytes FROM session_meta WHERE session_id=?",
 				)
 				.get(id),
 		).toEqual(cache);

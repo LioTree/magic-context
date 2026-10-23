@@ -1,6 +1,7 @@
 import { describe, expect, spyOn, test } from "bun:test";
 import * as logger from "../../shared/logger";
 import { Database } from "../../shared/sqlite";
+import { sessionMetaFixtureRows } from "./__tests__/session-meta-fixture";
 import { enforceProjectCap, upsertCommits } from "./git-commits/storage-git-commits";
 import {
     GIT_FTS_MAP_DISAGREEMENT_SQL,
@@ -9,14 +10,20 @@ import {
     V95_REDUNDANT_INDEXES,
 } from "./migration-v95-perf-indexes";
 import { MIGRATIONS, runMigrations } from "./migrations";
+import { restorePreV103SessionMetaLayout } from "./session-meta-pre-v103-test-support";
 import { initializeDatabase, LATEST_SUPPORTED_VERSION } from "./storage-db";
 import { getOrCreateSessionMeta, updateSessionMeta } from "./storage-meta-session";
+import {
+    sessionMetaCollectionSelect,
+    updateSessionMetaCollection,
+} from "./storage-session-collections";
 import { insertTag, markTagsCompactedByMessageIds, updateTagStatus } from "./storage-tags";
 import { getTemporalDecisions } from "./temporal-decisions";
 
 function v94(): Database {
     const db = new Database(":memory:");
     initializeDatabase(db);
+    restorePreV103SessionMetaLayout(db);
     db.exec("DROP TABLE IF EXISTS temporal_decisions");
     for (const name of [
         "idx_message_fts_rowid_map_session_rowid",
@@ -76,7 +83,9 @@ describe("migration 95", () => {
             MIGRATIONS.find((migration) => migration.version === 95)!.up(db);
             expect(
                 db
-                    .prepare("SELECT session_id,merged_reasoning_stripped_ids FROM session_meta")
+                    .prepare(
+                        `SELECT session_id, ${sessionMetaCollectionSelect("merged_reasoning_stripped_ids", "merged_reasoning_stripped_ids", db)} FROM session_meta`,
+                    )
                     .all(),
             ).toEqual([{ session_id: "legacy", merged_reasoning_stripped_ids: "" }]);
             expect(getTemporalDecisions(db, "legacy").size).toBe(0);
@@ -92,9 +101,7 @@ describe("migration 95", () => {
         const diagnostic = spyOn(logger, "sessionLog").mockImplementation(() => {});
         try {
             getOrCreateSessionMeta(db, "legacy");
-            db.prepare(
-                "UPDATE session_meta SET merged_reasoning_stripped_ids=? WHERE session_id='legacy'",
-            ).run(blob);
+            updateSessionMetaCollection(db, "legacy", "merged_reasoning_stripped_ids", blob);
             expect(() => runMigrations(db)).not.toThrow();
             expect(db.prepare("SELECT MAX(version) AS v FROM schema_migrations").get()).toEqual({
                 v: LATEST_SUPPORTED_VERSION,
@@ -102,7 +109,7 @@ describe("migration 95", () => {
             expect(
                 db
                     .prepare(
-                        "SELECT merged_reasoning_stripped_ids AS entries FROM session_meta WHERE session_id='legacy'",
+                        `SELECT ${sessionMetaCollectionSelect("merged_reasoning_stripped_ids", "entries", db)} FROM session_meta WHERE session_id='legacy'`,
                     )
                     .get(),
             ).toEqual({ entries: blob });
@@ -139,9 +146,12 @@ describe("migration 95", () => {
                 'temporal-message-v1:["",""]',
             ];
             const entries = [...kept, 'temporal-message-v1:["user","<!-- +5m -->\\n"]'];
-            db.prepare(
-                "UPDATE session_meta SET merged_reasoning_stripped_ids=? WHERE session_id='legacy'",
-            ).run(JSON.stringify(entries));
+            updateSessionMetaCollection(
+                db,
+                "legacy",
+                "merged_reasoning_stripped_ids",
+                JSON.stringify(entries),
+            );
             runMigrations(db);
             expect(getTemporalDecisions(db, "legacy")).toEqual(
                 new Map([["user", "<!-- +5m -->\n"]]),
@@ -149,7 +159,7 @@ describe("migration 95", () => {
             expect(
                 db
                     .prepare(
-                        "SELECT merged_reasoning_stripped_ids AS entries FROM session_meta WHERE session_id='legacy'",
+                        `SELECT ${sessionMetaCollectionSelect("merged_reasoning_stripped_ids", "entries", db)} FROM session_meta WHERE session_id='legacy'`,
                     )
                     .get(),
             ).toEqual({ entries: JSON.stringify(kept) });
@@ -166,9 +176,12 @@ describe("migration 95", () => {
                 'temporal-message-v1:["user","<!-- +5m -->\\n"]',
                 'temporal-message-v1:["none",""]',
             ];
-            db.prepare(
-                "UPDATE session_meta SET merged_reasoning_stripped_ids=? WHERE session_id=?",
-            ).run(JSON.stringify(entries), "temporal");
+            updateSessionMetaCollection(
+                db,
+                "temporal",
+                "merged_reasoning_stripped_ids",
+                JSON.stringify(entries),
+            );
             runMigrations(db);
             expect(
                 db
@@ -183,7 +196,7 @@ describe("migration 95", () => {
             expect(
                 db
                     .prepare(
-                        "SELECT merged_reasoning_stripped_ids AS entries FROM session_meta WHERE session_id=?",
+                        `SELECT ${sessionMetaCollectionSelect("merged_reasoning_stripped_ids", "entries", db)} FROM session_meta WHERE session_id=?`,
                     )
                     .get("temporal"),
             ).toEqual({ entries: JSON.stringify(["assistant-reasoning"]) });
@@ -216,13 +229,16 @@ describe("migration 95", () => {
                 'temporal-message-v1:["m1","<!-- +5m -->\\n"]',
                 'temporal-message-v1:["m2",""]',
             ];
-            db.prepare(
-                "UPDATE session_meta SET merged_reasoning_stripped_ids=? WHERE session_id=?",
-            ).run(JSON.stringify(legacyEntries), "session");
+            updateSessionMetaCollection(
+                db,
+                "session",
+                "merged_reasoning_stripped_ids",
+                JSON.stringify(legacyEntries),
+            );
             insertTag(db, "session", "m1:p0", "message", 30, 1);
             updateTagStatus(db, "session", 1, "dropped");
             upsertCommits(db, "project", [commit, { ...commit, sha: "sha-b", shortSha: "b" }]);
-            const meta = db.prepare("SELECT * FROM session_meta").all();
+            const meta = sessionMetaFixtureRows(db);
             const expectedMeta = meta.map((row) => ({
                 ...(row as Record<string, unknown>),
                 merged_reasoning_stripped_ids: JSON.stringify(["assistant-reasoning"]),
@@ -242,7 +258,7 @@ describe("migration 95", () => {
             expect(db.prepare("SELECT MAX(version) AS v FROM schema_migrations").get()).toEqual({
                 v: LATEST_SUPPORTED_VERSION,
             });
-            expect(db.prepare("SELECT * FROM session_meta").all()).toEqual(expectedMeta);
+            expect(sessionMetaFixtureRows(db)).toEqual(expectedMeta);
             expect(db.prepare("SELECT * FROM tags").all()).toEqual(tags);
             expect(fts(db)).toEqual(before);
             expect(ranked()).toEqual(ranks);
@@ -266,7 +282,7 @@ describe("migration 95", () => {
                 ).not.toBeNull();
             runMigrations(db);
             initializeDatabase(db);
-            expect(db.prepare("SELECT * FROM session_meta").all()).toEqual(expectedMeta);
+            expect(sessionMetaFixtureRows(db)).toEqual(expectedMeta);
             expect(
                 db.prepare("SELECT COUNT(*) AS n FROM schema_migrations WHERE version=95").get(),
             ).toEqual({ n: 1 });

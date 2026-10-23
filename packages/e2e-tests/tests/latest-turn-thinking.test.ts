@@ -3,9 +3,13 @@ import { expect, test } from "bun:test";
 import { spawnSync } from "node:child_process";
 import { mkdirSync, readFileSync, realpathSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
-import { dirname, join } from "node:path";
+import { dirname, join, resolve } from "node:path";
 import { TestHarness } from "../src/harness";
 import { MockProvider } from "../src/mock-provider/server";
+import { sessionMetaFieldSelect } from "../src/session-meta-fields";
+
+// The seed script runs inside the host's bash tool, outside this test process.
+const SESSION_META_FIELDS_MODULE = resolve(import.meta.dir, "../src/session-meta-fields.ts");
 
 const bytes = (v: unknown) =>
 	JSON.stringify(v, (k, x) => (k === "cache_control" ? undefined : x));
@@ -85,7 +89,7 @@ test("mock rejects edited, missing and reordered latest-turn thinking across too
 });
 
 for (const { band, mode } of [{ band: 76, mode: "drops" }, { band: 85, mode: "drops" }, { band: 76, mode: "primary" }, { band: 85, mode: "primary" }, { band: 76, mode: "legacy-accepted" }, { band: 76, mode: "legacy-rejected" }]) {
-	test(mode === "primary" ? `Anthropic primary long tool loop defers thinking-changing queued drops at ${band}%` : mode === "drops" ? `Anthropic task preserves latest-turn thinking and queues ctx_reduce at ${band}%` : `Anthropic task ${mode} thinking replay`, async () => {
+	test(mode === "primary" ? band === 76 ? "Anthropic primary long tool loop holds queued drops on a plain real-user pass until ctx-flush at 76%" : `Anthropic primary long tool loop defers thinking-changing queued drops at ${band}%` : mode === "drops" ? `Anthropic task preserves latest-turn thinking and queues ctx_reduce at ${band}%` : `Anthropic task ${mode} thinking replay`, async () => {
         let enforceLegacy = mode !== "legacy-accepted";
         const modelID = mode.startsWith("legacy-") ? "mock-sonnet" : "claude-sonnet-5-5";
 		const oldTmp = process.env.TMPDIR;
@@ -239,7 +243,7 @@ for (const { band, mode } of [{ band: 76, mode: "drops" }, { band: 85, mode: "dr
 					tag = tags[1]!.tag_number;
                     if (mode.startsWith("legacy-")) {
                         const owners = h.contextDb().query("SELECT tool_owner_message_id AS id FROM tags WHERE session_id = ? AND type = 'tool' ORDER BY tag_number").all(childId) as Array<{ id: string }>;
-                        writeFileSync(join(h.workdir, "seed-legacy.ts"), `import {Database} from "bun:sqlite"; import {join} from "node:path"; const db = new Database(join(process.env.MAGIC_CONTEXT_STORAGE_DIR!, "context.db")); db.exec("PRAGMA busy_timeout = 10000"); db.query("UPDATE session_meta SET merged_reasoning_stripped_ids = ? WHERE session_id = ?").run(${JSON.stringify(JSON.stringify([`binding_mismatch:${owners[1]!.id}`, `binding_mismatch:${owners[2]!.id}`]))}, ${JSON.stringify(childId)}); db.close(); console.log("Legacy seed installed");`);
+                        writeFileSync(join(h.workdir, "seed-legacy.ts"), `import {Database} from "bun:sqlite"; import {join} from "node:path"; import {writeSessionMetaField} from ${JSON.stringify(SESSION_META_FIELDS_MODULE)}; const db = new Database(join(process.env.MAGIC_CONTEXT_STORAGE_DIR!, "context.db")); db.exec("PRAGMA busy_timeout = 10000"); writeSessionMetaField(db, ${JSON.stringify(childId)}, "merged_reasoning_stripped_ids", ${JSON.stringify(JSON.stringify([`binding_mismatch:${owners[1]!.id}`, `binding_mismatch:${owners[2]!.id}`]))}); db.close(); console.log("Legacy seed installed");`);
                         return { ...tool("bash", { command: "bun seed-legacy.ts", description: "Seed recorded legacy thinking decision" }), usage: { ...usage, cache_read_input_tokens: Math.ceil(band * (100_000 - 8192) / 100) } };
                     }
 
@@ -329,11 +333,44 @@ for (const { band, mode } of [{ band: 76, mode: "drops" }, { band: 85, mode: "dr
 					.query("SELECT tag_id FROM pending_ops WHERE session_id = ?")
 					.all(childId),
 			).toContainEqual({ tag_id: tag });
-			// A real user turn releases the queued drop, even in a former child.
+			const previousRequest = wire.at(-1)!;
+			const workerRequest = () => h.mock.requests().filter(request =>
+				bytes(request.body.system).includes("ISSUE-630-WORKER"),
+			).at(-1)!.body;
+			const previousBody = workerRequest();
+			const logPath = join(h.dataDir, "cortexkit", "magic-context-e2e.log");
+			const beforeUserLog = readFileSync(logPath, "utf8").length;
+			// Ending a signed tool loop is not itself permission to rewrite its prefix.
 			await h.sendPrompt(childId, "Next real user turn; finish.", {
 				timeoutMs: 30_000,
 				agent: "thinking-worker",
 			});
+			if (mode === "primary" && band === 76) {
+				const held = wire.at(-1)!;
+				expect(bytes(held.slice(0, previousRequest.length))).toBe(bytes(previousRequest));
+				expect(bytes(workerRequest().system)).toBe(bytes(previousBody.system));
+				expect(bytes(workerRequest().tools)).toBe(bytes(previousBody.tools));
+				expect(bytes(held)).toContain("SPENT-b");
+				const signedBlocks = held.flatMap(message =>
+					(message as { content: Array<{ type: string }> }).content,
+				).filter(part => part.type === "thinking");
+				expect(signedBlocks).toEqual(Array.from({ length: lastPass - 1 }, (_, index) => thinking(index + 1)));
+				expect(h.contextDb().query("SELECT tag_id FROM pending_ops WHERE session_id = ?").all(childId)).toContainEqual({ tag_id: tag });
+				expect(readFileSync(logPath, "utf8").slice(beforeUserLog)).toContain(
+					"pending ops held — reason=no originating cache-bust opportunity; scheduler=execute, historianRunning=false",
+				);
+				// An explicit flush supplies the shared rebuild permission and releases the queue.
+				const response = await fetch(`${h.serverUrl}/session/${childId}/command?directory=${encodeURIComponent(h.workdir)}`, {
+					method: "POST",
+					headers: { "content-type": "application/json" },
+					body: JSON.stringify({ command: "ctx-flush", arguments: "" }),
+				});
+				expect(response.ok).toBe(true);
+				await h.sendPrompt(childId, "Apply the explicitly requested rebuild; finish.", {
+					timeoutMs: 30_000,
+					agent: "thinking-worker",
+				});
+			}
 			expect(bytes(wire.at(-1))).not.toContain("SPENT-b");
 			expect(
 				h
@@ -344,7 +381,7 @@ for (const { band, mode } of [{ band: 76, mode: "drops" }, { band: 85, mode: "dr
         } finally {
             const hostProofDb = new Database(join(h.dataDir, "opencode", "opencode.db"), { readonly: true });
             try { writeFileSync(join(proof, "original-thinking-parts.json"), JSON.stringify(hostProofDb.query("SELECT message_id, data FROM part WHERE session_id = ? AND json_extract(data, '$.type') = 'reasoning'").all(childId), null, 2)); } finally { hostProofDb.close(); }
-            writeFileSync(join(proof, "recovery-state.json"), JSON.stringify(h.contextDb().query("SELECT thinking_binding_recovery_target, merged_reasoning_stripped_ids FROM session_meta WHERE session_id = ?").get(childId), null, 2));
+            writeFileSync(join(proof, "recovery-state.json"), JSON.stringify(h.contextDb().query(`SELECT thinking_binding_recovery_target, ${sessionMetaFieldSelect("merged_reasoning_stripped_ids")} FROM session_meta WHERE session_id = ?`).get(childId), null, 2));
 			writeFileSync(
 				join(proof, "requests.json"),
 				JSON.stringify(h.mock.requests(), null, 2),

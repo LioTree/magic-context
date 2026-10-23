@@ -69,7 +69,7 @@ try {
     }
     const memoryVectors = [...memory.loadAllEmbeddings(db, project, model)].map(([id, row]: any) => ({ id, values: [...row.embedding] }));
     const commitVectors = [...commits.loadProjectCommitEmbeddings(db, project, model)].map(([id, vector]: any) => ({ id, values: [...vector] }));
-    const chunkVectors = chunks.loadCompartmentChunkEmbeddingsForSearch(db, "session-a", project, chunkModel)
+    const chunkVectors = (await chunks.loadCompartmentChunkEmbeddingsForSearch(db, "session-a", project, chunkModel))
         .map((row: any) => ({ id: row.windowIndex, values: [...row.vector] }));
     const rank = (rows: {id: number | string; values: number[]}[]) => rows.map(row => ({
         id: row.id, score: cosineSimilarity(query, new Float32Array(row.values)),
@@ -80,18 +80,22 @@ try {
         chunk: db.prepare(`SELECT compartment_id,session_id,project_path,harness,window_index,start_ordinal,end_ordinal,
             chunk_hash,model_id,dims,created_at,lower(hex(vector)) AS blob FROM compartment_chunk_embeddings ORDER BY compartment_id,model_id,window_index`).all(),
     };
+    const datedChunks = [];
+    for (const [from, to] of [[100, 100], [150, 150], [200, 200], [201, 300], [0, 99]]) {
+        const dated = await chunks.loadCompartmentChunkEmbeddingsForSearch(db, "session-a", project, chunkModel, { from, to });
+        datedChunks.push({
+            from, to, rows: dated.map((row: any) => ({ compartmentId: row.compartmentId, title: row.title,
+                startOrdinal: row.startOrdinal, endOrdinal: row.endOrdinal, windowIndex: row.windowIndex,
+                windowStartOrdinal: row.windowStartOrdinal, windowEndOrdinal: row.windowEndOrdinal,
+                values: [...row.vector] })),
+        });
+    }
     writeFileSync(output, JSON.stringify({ project, model, chunkModel, query: [...query], texts, windows,
         vectors: vectors.map(v => [...new Float32Array(v)]), rows,
         decoded: { memory: memoryVectors, commit: commitVectors, chunk: chunkVectors },
         rankings: { memory: rank(memoryVectors), commit: rank(commitVectors), chunk: rank(chunkVectors) },
         coverage: memory.getMemoryEmbedCoverage(db, project, model),
-        datedChunks: [[100, 100], [150, 150], [200, 200], [201, 300], [0, 99]].map(([from, to]) => ({
-            from, to, rows: chunks.loadCompartmentChunkEmbeddingsForSearch(db, "session-a", project, chunkModel, { from, to })
-                .map((row: any) => ({ compartmentId: row.compartmentId, title: row.title,
-                    startOrdinal: row.startOrdinal, endOrdinal: row.endOrdinal, windowIndex: row.windowIndex,
-                    windowStartOrdinal: row.windowStartOrdinal, windowEndOrdinal: row.windowEndOrdinal,
-                    values: [...row.vector] })),
-        })),
+        datedChunks,
         cosineEdges: [cosineSimilarity(new Float32Array(0), new Float32Array(0)),
             cosineSimilarity(query, new Float32Array(2)), cosineSimilarity(query, new Float32Array(4))],
     }, null, 2));

@@ -9,6 +9,10 @@ test("v1_untouched and captured fixture bytes remain sha256 pinned", () => {
 	// The server entry's version marker is part of host detection and stays pinned.
 	// The v1 entry also registers background-only Zen agents. Native primary-request
 	// tests verify that those registrations do not affect ordinary prompts or tools.
+	// The entry also samples the default-off Rust background switch for the dreamer;
+	// it does not select a different primary-request transform. It also passes
+	// the moved-session check to the shared hook gate and the RPC guard, which
+	// refuse only sessions moved to mode 3; every other session is unchanged.
 	for (const [path, expected] of Object.entries(pins)) {
 		let bytes = readFileSync(resolve(root, path), "utf8");
 		if (path === "packages/plugin/src/index.ts") {

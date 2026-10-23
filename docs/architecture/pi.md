@@ -30,7 +30,7 @@ Pi and OMP share the extension API, so the plugin decides which host it is in at
 
 The deciding rung is logged at boot. The result sets the harness id, which selects the per-harness model blocks in config (`historian.omp`, `dreamer.omp`, profile `omp` overlays alongside `opencode` and `pi`), the scratch and log directory (`${tmpdir}/pi/magic-context/` or `${tmpdir}/omp/magic-context/`), the agent config directory, and which `bin` entry subagents launch. Model references are translated between OpenCode's canonical provider prefixes and Pi's at the config read and write edges (`harness-provider-map.ts`), so one config works on every host.
 
-Pi runs only the TypeScript transform; `transform_mode: "rust"` is accepted by the shared config but has no effect here.
+Pi runs the TypeScript transform. Rust transform mode is retired: the Pi config loader still accepts `transform_mode`, but Pi does not use it. A Pi session that the CortexKit harness bridges to ck-mc is served by ck-mc instead; see [host-runner.md](../integrations/host-runner.md).
 
 ## Every pass rebuilds from JSONL
 

@@ -39,6 +39,7 @@
  */
 
 import { createHash } from "node:crypto";
+import type { MarkerToolDefinition } from "../../hooks/magic-context/marker-envelope";
 import { estimateTokens } from "../../hooks/magic-context/read-session-formatting";
 import type { Database, Statement } from "../../shared/sqlite";
 import { stableStringify } from "../../shared/stable-json";
@@ -52,6 +53,7 @@ const measurements = new Map<string, Map<string, number>>();
 // repeated identical fires; the actual measurement still lives in the
 // `measurements` map above. Cleared together with `measurements` on reset.
 const fingerprints = new Map<string, Map<string, string>>();
+const material = new Map<string, Map<string, MarkerToolDefinition>>();
 
 // Database reference for persistence. Set by setDatabase() once
 // openDatabase() has finished migrations. Until then, recordToolDefinition
@@ -201,6 +203,20 @@ export function recordToolDefinition(
     let innerFp = fingerprints.get(key);
     if (innerFp && innerFp.get(toolID) === fp) return;
 
+    // Raw definitions are process-local evidence only; persisted token totals
+    // cannot reconstruct schemas or prove provider serialization overhead.
+    let definitions = material.get(key);
+    if (!definitions) material.set(key, (definitions = new Map()));
+    try {
+        definitions.set(toolID, {
+            name: toolID,
+            description: description ?? "",
+            inputSchema: structuredClone(parameters) as Record<string, unknown>,
+        });
+    } catch {
+        definitions.delete(toolID);
+    }
+
     // Serialize parameters to match what the provider actually sees on the
     // wire. `JSON.stringify(undefined)` returns undefined, so guard that.
     let paramsText = "";
@@ -294,8 +310,32 @@ export function getMeasuredToolDefinitionTokens(
 export function __resetToolDefinitionMeasurements(): void {
     measurements.clear();
     fingerprints.clear();
+    material.clear();
     persistenceDb = null;
     cachedInsertStmt = null;
+}
+
+export function getMarkerToolDefinitions(
+    providerID: string,
+    modelID: string,
+    agentName: string | undefined,
+): MarkerToolDefinition[] | undefined {
+    const definitions = material.get(keyFor(providerID, modelID, agentName));
+    const measured = measurements.get(keyFor(providerID, modelID, agentName));
+    if (!definitions || !measured || [...measured.keys()].some((id) => !definitions.has(id)))
+        return undefined;
+    return [...definitions.values()];
+}
+
+/** Sorted names of the tools the `tool.definition` hook reported for this route.
+ * OpenCode does not run that hook for MCP tools, so they are never listed. */
+export function getHookToolNames(
+    providerID: string,
+    modelID: string,
+    agentName: string | undefined,
+): string[] | undefined {
+    const measured = measurements.get(keyFor(providerID, modelID, agentName));
+    return measured && measured.size > 0 ? [...measured.keys()].sort() : undefined;
 }
 
 /** Inspection helper: snapshot the current store (for debug logging/tests). */

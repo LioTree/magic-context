@@ -14,19 +14,31 @@
 #![forbid(unsafe_code)]
 
 pub mod cache_codec;
+pub mod command_ledger;
 pub use cache_codec::{
     DiscardReason, FrozenBase, HashBase, SectionState, SectionsBase, FROZEN_CHUNK_UNITS,
 };
 pub mod context_boundaries;
 pub use context_boundaries::ResolvedContextBoundary;
 pub mod archive_index;
+pub mod background_state;
 pub mod context_schema;
 pub mod context_writes;
+pub mod dream_curate;
+pub mod dream_domain;
+pub mod dream_memory;
+pub mod dream_primer;
+pub mod dream_retrospective;
+pub mod dream_schedule_bridge;
 pub mod dream_scheduler;
+pub mod dream_verify;
 pub mod git_archive;
 mod historian_claim;
+#[cfg(feature = "test-support")]
+pub use historian_claim::with_historian_claim_fixture_entropy;
 mod historian_telemetry;
 pub use historian_telemetry::{HistorianInvocation, HistorianRunTelemetry};
+mod async_compaction;
 pub mod memory_history;
 pub mod memory_lifecycle;
 pub mod memory_projection;
@@ -36,6 +48,9 @@ pub mod move_snapshot;
 pub mod move_store;
 pub mod parity_schema_manifest;
 pub mod private_permissions;
+#[cfg(test)]
+mod provider_delete_tests;
+#[cfg(test)]
 mod provider_legacy;
 mod provider_log;
 mod provider_policy_overlay;
@@ -44,8 +59,8 @@ mod provider_v2_tests;
 mod provider_view_recipe;
 mod provider_wal;
 pub use provider_view_recipe::{
-    ProviderResolvedView, ProviderViewRecipe, ProviderViewSegment, ProviderViewTreatment,
-    MAX_VIEW_ANCESTOR_BYTES, MAX_VIEW_BASE_DEPTH,
+    record_lineage_answered_view, ProviderResolvedView, ProviderViewRecipe, ProviderViewSegment,
+    ProviderViewTreatment, LINEAGE_ANSWERED_VIEWS, MAX_VIEW_ANCESTOR_BYTES, MAX_VIEW_BASE_DEPTH,
 };
 pub mod provider_meters;
 mod provider_preparation;
@@ -57,10 +72,27 @@ pub use provider_resident_read::CompartmentSourceRevision;
 #[cfg(any(test, feature = "test-support"))]
 pub use provider_resident_read::ProviderResidentAuthority;
 pub mod provider_records;
+pub mod recomp_staging;
 pub mod retrieval_vectors;
 #[cfg(test)]
 #[path = "../tests/support/upgrade_rehearsal.rs"]
 mod upgrade_rehearsal;
+
+/// Reserved embedding-effect queue API for transactional memory writers and
+/// off-thread drains. This names the shared interface; it does not implement a
+/// queue or change storage. The retrieval-vector backfill lease is not a durable
+/// mutation-effect queue and cannot replace enqueueing in the memory transaction.
+///
+/// The queue implementation belongs in `mc_store::embedding_queue`:
+/// - `enqueue_tx`: insert/invalidate an effect in the source mutation's transaction;
+/// - `claim_batch`: claim a bounded batch after activation is captured by the caller;
+/// - `complete_batch`: acknowledge only the claimed effects after guarded vector publication;
+/// - `release_batch`: retain failed effects for a later retry.
+///
+/// Writers do no embedding RPC inside their transaction. Drains reuse
+/// `retrieval_vectors` for generation/hash-guarded publication, do network work
+/// outside the store lock, and never read module configuration.
+pub const EMBEDDING_QUEUE_API: &str = "mc_store::embedding_queue";
 pub use provider_records::ProviderSessionKey;
 pub mod score_projection;
 pub mod single_store_domain;
@@ -596,6 +628,23 @@ fn current_time_ms() -> i64 {
         .duration_since(std::time::UNIX_EPOCH)
         .map(|duration| i64::try_from(duration.as_millis()).unwrap_or(i64::MAX))
         .unwrap_or(0)
+}
+
+/// The smallest string greater than every string that starts with `prefix`, for a
+/// primary-key range read: the prefix with its last character advanced, dropping
+/// trailing characters that cannot advance. SQLite compares text by its UTF-8 bytes,
+/// which order the same way as code points. `None` when no such bound exists (an
+/// empty prefix, or one made only of `char::MAX`); the caller then filters without
+/// an upper bound.
+fn session_prefix_upper_bound(prefix: &str) -> Option<String> {
+    let mut chars: Vec<char> = prefix.chars().collect();
+    while let Some(last) = chars.pop() {
+        if let Some(next) = (u32::from(last) + 1..=u32::from(char::MAX)).find_map(char::from_u32) {
+            chars.push(next);
+            return Some(chars.into_iter().collect());
+        }
+    }
+    None
 }
 
 const MIGRATIONS: &[Migration] = &[
@@ -3312,6 +3361,15 @@ const MIGRATIONS: &[Migration] = &[
         version: 72,
         statements: include_str!("migrations/store_072_provider_policy_baselines_views.sql"),
     },
+    Migration {
+        version: 73,
+        // Retire whole-copy provider views; every lane now stores v2 recipes.
+        statements: include_str!("migrations/store_073_provider_views_v1_retired.sql"),
+    },
+    Migration {
+        version: 74,
+        statements: include_str!("migrations/store_074_async_compaction.sql"),
+    },
 ];
 
 /// The highest `mc_cache` schema migration this binary ships.
@@ -4254,6 +4312,9 @@ pub struct TruncateOutcome {
 }
 
 pub struct HistorianPublishRequest<'a> {
+    /// The historian task or stored-report publisher captures this at its start;
+    /// the store never reads configuration or changes it during publication.
+    pub rust_background_enabled: bool,
     /// Optional durable publication identity for the historian lifecycle lane. With
     /// no identity, publication preserves the legacy writes exactly.
     pub lifecycle_publication_id: Option<&'a str>,
@@ -4278,11 +4339,124 @@ pub struct HistorianPublishRequest<'a> {
     pub raw_chunk_messages: Option<&'a str>,
 }
 
+const HISTORIAN_LEASE_TTL_MS: i64 = 5 * 60 * 1000;
+
+#[cfg(test)]
+type HistorianFoldTestHook = Box<dyn FnOnce(&McStore)>;
+
+#[cfg(test)]
+thread_local! {
+    static HISTORIAN_FOLD_TEST_HOOK: std::cell::RefCell<Option<HistorianFoldTestHook>> = const { std::cell::RefCell::new(None) };
+}
+
+struct HistorianLease<'a> {
+    store: &'a McStore,
+    session_id: String,
+    holder_id: String,
+}
+
+impl Drop for HistorianLease<'_> {
+    fn drop(&mut self) {
+        // A failed release is bounded by the TypeScript publishers' five-minute TTL.
+        let _ = self
+            .store
+            .context_write(&["compartment_state_lease"], |tx| {
+                tx.execute(
+                    "DELETE FROM compartment_state_lease WHERE session_id = ?1 AND holder_id = ?2",
+                    params![self.session_id, self.holder_id],
+                )?;
+                Ok(())
+            });
+    }
+}
+
+fn historian_owner_dead(pid: i64) -> bool {
+    #[cfg(unix)]
+    {
+        let Ok(pid) = i32::try_from(pid) else {
+            return false;
+        };
+        if pid <= 0 {
+            return false;
+        }
+        // Signal zero probes existence without signalling the process. Only ESRCH
+        // proves death; permission failures must not steal a live owner's lease.
+        std::process::Command::new("/bin/kill")
+            .args(["-0", &pid.to_string()])
+            .env("LC_ALL", "C")
+            .output()
+            .is_ok_and(|output| {
+                !output.status.success()
+                    && String::from_utf8_lossy(&output.stderr).contains("No such process")
+            })
+    }
+    #[cfg(not(unix))]
+    {
+        let _ = pid;
+        false
+    }
+}
+
+fn historian_lease_held(
+    conn: &rusqlite::Connection,
+    session_id: &str,
+    holder_id: &str,
+) -> rusqlite::Result<bool> {
+    conn.query_row("SELECT EXISTS(SELECT 1 FROM compartment_state_lease WHERE session_id = ?1 AND holder_id = ?2 AND expires_at > ?3)", params![session_id, holder_id, current_time_ms()], |row| row.get(0))
+}
+
+fn historian_wrapup_active(
+    conn: &rusqlite::Connection,
+    session_id: &str,
+) -> rusqlite::Result<bool> {
+    let raw: Option<String> = conn
+        .query_row(
+            "SELECT wrapup_in_progress_state FROM session_meta WHERE session_id = ?1",
+            params![session_id],
+            |row| row.get(0),
+        )
+        .optional()?
+        .flatten();
+    let Some(state) = raw.and_then(|raw| serde_json::from_str::<serde_json::Value>(&raw).ok())
+    else {
+        return Ok(false);
+    };
+    let holder_valid = state
+        .get("holderId")
+        .and_then(|v| v.as_str())
+        .is_some_and(|s| !s.is_empty());
+    let numbers_valid = [
+        "acquiredAt",
+        "expiresAt",
+        "messagesToKeep",
+        "anchorRawMessageCount",
+        "targetEligibleEndOrdinal",
+        "lastCompartmentEnd",
+        "chunkIndex",
+        "expectedChunks",
+        "updatedAt",
+    ]
+    .iter()
+    .all(|field| {
+        state
+            .get(field)
+            .and_then(|v| v.as_f64())
+            .is_some_and(f64::is_finite)
+    });
+    Ok(holder_valid
+        && numbers_valid
+        && state["expiresAt"].as_f64().unwrap_or(0.0) > current_time_ms() as f64)
+}
+
 /// Typed publish failures. CAS and state mismatches are deliberately separate so a
 /// caller can tell "another writer already committed" from "this producer is stale."
 #[derive(Debug)]
 pub enum HistorianPublishError {
     Store(McStoreError),
+    /// Shared TS publication ownership is busy; keep a stored report for retry.
+    Deferred {
+        reason: String,
+    },
     CasConflict {
         expected: Option<u64>,
         found: u64,
@@ -4317,6 +4491,7 @@ impl std::fmt::Display for HistorianPublishError {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
             HistorianPublishError::Store(e) => write!(f, "store: {e}"),
+            HistorianPublishError::Deferred { reason } => write!(f, "publication deferred: {reason}"),
             HistorianPublishError::FenceRejected { reason } => {
                 write!(f, "publication fence rejected: {reason}")
             }
@@ -5346,6 +5521,11 @@ pub struct McTagRow {
     pub source_bytes: std::sync::Arc<[u8]>,
 }
 
+const NEWEST_TOOL_TAGS_SQL: &str = "SELECT tag_number, block_id, kind, token_count, created_at_ms
+     FROM mc_tags WHERE session_id=?1 AND tag_number<=?2
+       AND kind IN ('tool', 'tool_call', 'tool_result')
+     ORDER BY tag_number DESC LIMIT ?3";
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct TagNumberRow {
     pub block_id: String,
@@ -6175,6 +6355,7 @@ pub enum ModuleStateSyncError {
 #[derive(Debug)]
 pub enum McStoreError {
     Store(StoreError),
+    NativeSnapshotUnavailable(cache_codec::NativeSnapshotRejection),
     /// A durable move fence or staged import owns this session.
     SessionMoving,
     /// The on-disk row_version moved under us (a concurrent writer committed first).
@@ -6294,6 +6475,12 @@ pub enum McStoreError {
         base_row_version: u64,
         meta_only_steps: u64,
     },
+    /// [`McStore::commit_block_identities`] was given a vector for a message id whose stored
+    /// vector differs. Stored identities are never replaced by that writer; nothing was written.
+    BlockIdentityConflict {
+        session_id: String,
+        mid: String,
+    },
 }
 
 impl std::fmt::Display for McStoreError {
@@ -6301,6 +6488,7 @@ impl std::fmt::Display for McStoreError {
         match self {
             McStoreError::SessionMoving => write!(f, "session_moving"),
             McStoreError::Store(e) => write!(f, "store: {e}"),
+            McStoreError::NativeSnapshotUnavailable(reason) => f.write_str(reason.reason()),
             McStoreError::CasConflict { expected, found } => {
                 write!(f, "cas conflict: expected {expected:?}, found {found}")
             }
@@ -6400,6 +6588,10 @@ impl std::fmt::Display for McStoreError {
                 f,
                 "commit expects row_version {expected:?} over a base loaded at \
                  {base_row_version} plus {meta_only_steps} meta-only steps"
+            ),
+            McStoreError::BlockIdentityConflict { session_id, mid } => write!(
+                f,
+                "session {session_id} already holds different block identities for {mid}"
             ),
         }
     }
@@ -7696,7 +7888,7 @@ impl<'a> FacadeMutationTxn<'a> {
 pub struct McStore {
     inner: Arc<SqliteStore>,
     move_path: Option<std::path::PathBuf>,
-    provider_wal: Mutex<Option<provider_wal::ProviderWal>>,
+    native_snapshot_fallbacks: Mutex<HashMap<String, cache_codec::NativeSnapshotRejection>>,
     // Distinguishes independent stores in the process-local tag baseline cache. Production
     // opens one store for the module lifetime; tests and embedded callers may open several.
     tag_cache_namespace: Arc<std::sync::atomic::AtomicU64>,
@@ -8023,6 +8215,26 @@ impl McStore {
         })
     }
 
+    /// Whether this identity still awaits the single-store migration. Older layouts
+    /// without the authority table have no managed identities.
+    pub fn is_authority_managed(&self, project_identity: &str) -> Result<bool, McStoreError> {
+        self.context_read(|conn| {
+            let has_table: bool = conn.query_row(
+                "SELECT EXISTS(SELECT 1 FROM sqlite_master WHERE type = 'table' AND name = 'authority_managed')",
+                [],
+                |row| row.get(0),
+            )?;
+            if !has_table {
+                return Ok(false);
+            }
+            conn.query_row(
+                "SELECT EXISTS(SELECT 1 FROM authority_managed WHERE project_path = ?1)",
+                [project_identity],
+                |row| row.get(0),
+            )
+        })
+    }
+
     /// The installed `context.db` domain's status block, or null when none is installed.
     pub fn context_domain_status(&self) -> Value {
         self.context
@@ -8051,6 +8263,36 @@ impl McStore {
                     "no context.db is attached to this store",
                 )
             })
+    }
+
+    /// Run a snapshot callback with SQLite's query-only enforcement enabled.
+    /// Callers must not change connection settings or re-enter the serialized read domain.
+    /// Retrieval uses this boundary without opening another database connection.
+    pub fn with_context_read<T>(
+        &self,
+        read: impl FnOnce(&rusqlite::Connection) -> rusqlite::Result<T>,
+    ) -> Result<T, McStoreError> {
+        self.context_read(|conn| {
+            struct RestoreQueryOnly<'a> {
+                conn: &'a rusqlite::Connection,
+                previous: i64,
+            }
+            impl Drop for RestoreQueryOnly<'_> {
+                fn drop(&mut self) {
+                    let _ = self.conn.pragma_update(None, "query_only", self.previous);
+                }
+            }
+            let previous = conn.pragma_query_value(None, "query_only", |row| row.get(0))?;
+            let _restore = RestoreQueryOnly { conn, previous };
+            conn.pragma_update(None, "query_only", true)?;
+            read(conn)
+        })
+    }
+
+    /// The directory holding this store's `store.db`, which is the module's data
+    /// root; `None` for a store not backed by a SQLite file.
+    pub fn data_dir(&self) -> Option<&std::path::Path> {
+        self.move_path.as_deref().and_then(std::path::Path::parent)
     }
 
     /// Run `read` against `context.db` in one read snapshot.
@@ -8360,7 +8602,7 @@ impl McStore {
                 }
                 _ => None,
             },
-            provider_wal: Mutex::new(None),
+            native_snapshot_fallbacks: Mutex::new(HashMap::new()),
             tag_cache_namespace: Arc::new(std::sync::atomic::AtomicU64::new(
                 NEXT_TAG_CACHE_NAMESPACE.fetch_add(1, Ordering::Relaxed),
             )),
@@ -9078,6 +9320,98 @@ impl McStore {
         }
     }
 
+    /// [`McStore::load_meta`] plus, from the same small row, an identity of
+    /// the tail hygiene baseline a full [`McStore::load`] would decode: the
+    /// sections version, the tail section's index entry (its digest) and the
+    /// native-tail reference kept in the small meta. Two equal identities mean
+    /// the same baseline, so a caller can keep a decoded baseline (one
+    /// measurement per tail part) and skip the full load while it holds.
+    /// `None` identity when the session has no row.
+    pub fn load_meta_with_tail_identity(
+        &self,
+        session_id: &str,
+    ) -> Result<(MetaSnapshot, Option<String>), McStoreError> {
+        let row = self
+            .inner
+            .with_conn(|conn| cache_codec::read_small_row(conn, session_id))?;
+        let identity = row.as_ref().and_then(cache_codec::tail_baseline_identity);
+        let user_profile_version = if self.has_context_domain() {
+            self.user_profile_version()?
+        } else {
+            0
+        };
+        let snapshot = match row {
+            None => MetaSnapshot {
+                row_version: None,
+                meta: ModuleMeta {
+                    user_profile_version,
+                    ..ModuleMeta::default()
+                },
+            },
+            Some(row) => {
+                let mut meta = cache_codec::decode_small_meta(&row.meta)
+                    .map_err(|error| McStoreError::Serde(error.to_string()))?;
+                meta.user_profile_version = user_profile_version;
+                MetaSnapshot {
+                    row_version: Some(row.row_version),
+                    meta,
+                }
+            }
+        };
+        Ok((snapshot, identity))
+    }
+
+    /// Read hint policy and the stored frozen-section content identity from one
+    /// small row. Bookkeeping-only writes do not change this identity. Legacy
+    /// unhashed sections have no reusable identity and must be loaded in full.
+    pub fn load_meta_with_frozen_identity(
+        &self,
+        session_id: &str,
+    ) -> Result<(MetaSnapshot, Option<String>), McStoreError> {
+        let row = self
+            .inner
+            .with_conn(|conn| cache_codec::read_small_row(conn, session_id))?;
+        let Some(row) = row else {
+            return Ok((
+                MetaSnapshot {
+                    row_version: None,
+                    meta: ModuleMeta::default(),
+                },
+                None,
+            ));
+        };
+        let identity = cache_codec::SectionIndex::parse(&row.section_index)
+            .filter(|index| index.sv > 0 && index.f.as_ref().is_some_and(|f| f.h.is_some()))
+            .map(|index| serde_json::json!([index.sv, index.f]).to_string());
+        let mut meta = cache_codec::decode_small_meta(&row.meta)
+            .map_err(|error| McStoreError::Serde(error.to_string()))?;
+        if self.has_context_domain() {
+            meta.user_profile_version = self.user_profile_version()?;
+        }
+        Ok((
+            MetaSnapshot {
+                row_version: Some(row.row_version),
+                meta,
+            },
+            identity,
+        ))
+    }
+
+    /// Read the committed boundary from the small cache header without hydrating
+    /// frozen units or covered-message policy. Native endpoint validation needs
+    /// only this coordinate, not the history represented by the boundary.
+    pub fn load_boundary_id(&self, session_id: &str) -> Result<String, McStoreError> {
+        Ok(self.inner.with_conn(|conn| {
+            cache_codec::read_small_row(conn, session_id)?
+                .map(|row| {
+                    cache_codec::decode_small_core(&row.core_state).map(|core| core.boundary_id)
+                })
+                .transpose()
+                .map(|boundary| boundary.unwrap_or_default())
+                .map_err(|error| rusqlite::Error::ToSqlConversionFailure(Box::new(error)))
+        })?)
+    }
+
     /// Read the cache header and bounded shape summary, never chunk payloads.
     /// Missing summaries are deliberately unknown, not an empty frozen set.
     pub fn load_compaction_trigger_core(
@@ -9181,6 +9515,90 @@ impl McStore {
         })
     }
 
+    /// Add block identities a session does not have yet, under the `row_version` CAS.
+    ///
+    /// Block identities live as rows in `mc_block_identities`, outside the meta blob, so
+    /// [`McStore::commit_meta`] cannot store them; this writes those rows and nothing else:
+    /// never `core_state`, `meta`, `section_index`, or a chunk or section row. A message id
+    /// that already has a row must hold exactly the given vector; any difference refuses the
+    /// whole batch with [`McStoreError::BlockIdentityConflict`] before a row is written.
+    ///
+    /// When rows are added, `row_version` is bumped. A full commit that loaded the session
+    /// before this write replaces the stored identities with its own (older) map, which would
+    /// delete the new rows; the bump makes that commit fail its CAS instead. The row-state
+    /// digest is dropped because it described the identity rows as they were. Nothing to add
+    /// keeps the current `row_version`.
+    ///
+    /// `expected` is required: there is no session row to version before the first full
+    /// commit, and creating one is a full codec write this narrow writer does not do.
+    pub fn commit_block_identities(
+        &self,
+        session_id: &str,
+        expected: u64,
+        identities: &BTreeMap<String, Vec<BlockIdentity>>,
+    ) -> Result<u64, McStoreError> {
+        self.inner.with_conn_fenced(|tx| {
+            move_store::check_writer(tx, session_id)?;
+            let current: Option<i64> = tx
+                .query_row(
+                    "SELECT row_version FROM mc_cache_state WHERE session_id = ?1",
+                    [session_id],
+                    |row| row.get(0),
+                )
+                .optional()?;
+            let Some(current) = current else {
+                return Ok(Err(McStoreError::CasConflict {
+                    expected: Some(expected),
+                    found: 0,
+                }));
+            };
+            if current != expected as i64 {
+                return Ok(Err(McStoreError::CasConflict {
+                    expected: Some(expected),
+                    found: current.max(0) as u64,
+                }));
+            }
+            // Check the whole batch before writing, so a conflict leaves no row behind.
+            let mut missing = Vec::new();
+            for (mid, vector) in identities {
+                match block_identities_for_mid_tx(tx, session_id, mid)? {
+                    Some(held) if &held != vector => {
+                        return Ok(Err(McStoreError::BlockIdentityConflict {
+                            session_id: session_id.to_string(),
+                            mid: mid.clone(),
+                        }));
+                    }
+                    Some(_) => {}
+                    None => missing.push((
+                        mid,
+                        serde_json::to_string(vector).map_err(serde_to_sql_error)?,
+                    )),
+                }
+            }
+            if missing.is_empty() {
+                return Ok(Ok(expected));
+            }
+            for (mid, vector) in &missing {
+                tx.execute(
+                    "INSERT INTO mc_block_identities (session_id, mid, identities)
+                     VALUES (?1, ?2, ?3)",
+                    params![session_id, mid, vector],
+                )?;
+            }
+            let next = expected + 1;
+            tx.execute(
+                "UPDATE mc_cache_state SET row_version = ?2, last_activity_at = ?3
+                  WHERE session_id = ?1 AND row_version = ?4",
+                params![session_id, next as i64, current_time_ms(), expected as i64],
+            )?;
+            tx.execute(
+                "DELETE FROM mc_cache_state_digest WHERE session_id = ?1",
+                [session_id],
+            )?;
+            Ok(Ok(next))
+        })?
+    }
+
     /// Read bootstrap cursors without hydrating frozen units or compartment summary bodies.
     pub fn load_state_sync_inventory(
         &self,
@@ -9243,6 +9661,17 @@ impl McStore {
         self.load_transform_snapshot_with_hook(session_id, || {})
     }
 
+    /// Read identities only for the supplied live context. The caller must hold
+    /// a validated logical-prefix certificate; omitted identities remain in rows
+    /// and are not deleted by a transform commit using this scoped snapshot.
+    pub fn load_logical_transform_snapshot(
+        &self,
+        session_id: &str,
+        mids: &[&str],
+    ) -> Result<TransformSnapshot, McStoreError> {
+        self.load_transform_snapshot_scoped(session_id, None, Some(mids), || {})
+    }
+
     /// Internal native execution reads only identities in its validated live
     /// tail. Public full loads continue to reconstruct the entire baseline.
     pub fn load_native_transform_snapshot(
@@ -9251,7 +9680,35 @@ impl McStore {
         prefix: &provider_log::ProviderNativePrefix,
         mids: &[&str],
     ) -> Result<TransformSnapshot, McStoreError> {
-        self.load_transform_snapshot_scoped(session_id, Some((prefix, mids)), || {})
+        let result =
+            self.load_transform_snapshot_scoped(session_id, Some((prefix, mids)), None, || {});
+        if let Err(McStoreError::NativeSnapshotUnavailable(reason)) = &result {
+            let mut logged = self
+                .native_snapshot_fallbacks
+                .lock()
+                .unwrap_or_else(|e| e.into_inner());
+            if !logged.contains_key(session_id) {
+                logged.insert(session_id.to_owned(), *reason);
+                tracing::warn!(
+                    session_id,
+                    reason = reason.reason(),
+                    "native fold cache inadmissible; using the full rebuild"
+                );
+            }
+        }
+        result
+    }
+
+    #[cfg(any(test, feature = "test-support"))]
+    pub fn native_snapshot_fallback_for_test(
+        &self,
+        session_id: &str,
+    ) -> Option<cache_codec::NativeSnapshotRejection> {
+        self.native_snapshot_fallbacks
+            .lock()
+            .unwrap()
+            .get(session_id)
+            .copied()
     }
 
     fn load_transform_snapshot_with_hook(
@@ -9259,20 +9716,25 @@ impl McStore {
         session_id: &str,
         after_state_read: impl FnOnce(),
     ) -> Result<TransformSnapshot, McStoreError> {
-        self.load_transform_snapshot_scoped(session_id, None, after_state_read)
+        self.load_transform_snapshot_scoped(session_id, None, None, after_state_read)
     }
 
     fn load_transform_snapshot_scoped(
         &self,
         session_id: &str,
         native: Option<(&provider_log::ProviderNativePrefix, &[&str])>,
+        logical_mids: Option<&[&str]>,
         after_state_read: impl FnOnce(),
     ) -> Result<TransformSnapshot, McStoreError> {
         let snapshot = self.inner.with_conn(|conn| {
             let transaction = conn.unchecked_transaction()?;
             let cache_state_started_at = Instant::now();
             let decoded = match native {
-                Some((prefix, _)) => cache_codec::read_native_decoded(&transaction, session_id, prefix)?,
+                Some((prefix, _)) => match cache_codec::read_native_decoded(&transaction, session_id, prefix) {
+                    Ok(decoded) => decoded,
+                    Err(cache_codec::NativeSnapshotError::Unavailable(reason)) => return Ok(Err(reason)),
+                    Err(cache_codec::NativeSnapshotError::Sqlite(error)) => return Err(error),
+                },
                 None => cache_codec::read_decoded(&transaction, session_id)?,
             };
             let loaded = match decoded {
@@ -9284,7 +9746,7 @@ impl McStore {
                         sections,
                     } = decoded;
                     log_discarded_sections(session_id, &sections);
-                    if let Some((_, mids)) = native {
+                    if let Some(mids) = native.map(|(_, mids)| mids).or(logical_mids) {
                         let mids=serde_json::to_string(mids).map_err(serde_to_sql_error)?;
                         let mut query=transaction.prepare_cached("SELECT mid,identities FROM mc_block_identities WHERE session_id=?1 AND mid IN (SELECT value FROM json_each(?2))")?;
                         for row in query.query_map(params![session_id,mids],|row|Ok((row.get::<_,String>(0)?,row.get::<_,String>(1)?)))? {
@@ -9377,7 +9839,7 @@ impl McStore {
                 .map(|ordinal| ordinal.max(0) as u64);
             let overlay_frontier_ms = overlay_frontier_started_at.elapsed().as_secs_f64() * 1_000.0;
             transaction.commit()?;
-            Ok(TransformSnapshot {
+            Ok(Ok(TransformSnapshot {
                 loaded,
                 temporal_marks,
                 user_hints,
@@ -9390,9 +9852,9 @@ impl McStore {
                     channel1_ms,
                     overlay_frontier_ms,
                 },
-            })
+            }))
         })?;
-        Ok(snapshot)
+        snapshot.map_err(McStoreError::NativeSnapshotUnavailable)
     }
 
     /// Load the durable fields used by session.status: the cache fields from one `store.db`
@@ -10104,6 +10566,38 @@ impl McStore {
         })?)
     }
 
+    /// Read up to `limit` persisted tool rows newest-first, at or below `through`,
+    /// using the existing `(session_id, tag_number)` primary key. The reminder's
+    /// protection window needs token counts, so source payloads are omitted.
+    pub fn load_newest_tool_tags(
+        &self,
+        session_id: &str,
+        through: i64,
+        limit: usize,
+    ) -> Result<Vec<McTagRow>, McStoreError> {
+        Ok(self.inner.with_conn(|conn| {
+            let mut statement = conn.prepare_cached(NEWEST_TOOL_TAGS_SQL)?;
+            let rows = statement.query_map(
+                params![
+                    session_id,
+                    through,
+                    i64::try_from(limit).unwrap_or(i64::MAX)
+                ],
+                |row| {
+                    Ok(McTagRow {
+                        tag_number: row.get(0)?,
+                        block_id: row.get(1)?,
+                        kind: row.get(2)?,
+                        token_count: row.get(3)?,
+                        created_at_ms: row.get(4)?,
+                        source_bytes: Default::default(),
+                    })
+                },
+            )?;
+            rows.collect()
+        })?)
+    }
+
     /// A native intact cut renders only these blocks. Resolve their immutable
     /// tags by the block index instead of walking tags for covered history.
     pub fn load_tags_for_blocks(
@@ -10165,6 +10659,41 @@ impl McStore {
             )
             .optional()
             .map(|summary| summary.unwrap_or_default())
+        })?)
+    }
+
+    /// The highest tag number stored under each session id that equals `exact` or
+    /// starts with `prefix`, in session-id order; sessions with no tag rows are absent.
+    ///
+    /// The full-array allocator numbers a session's next tag one above its highest
+    /// stored row (see `mint_or_get_tags`), so while a session's rows are kept each
+    /// value is its allocation high-water. A session whose rows were deleted
+    /// (`delete_session`, or a lineage descent replacing them with its source's rows)
+    /// may have allocated numbers above what is stored now. The prefix is matched as a
+    /// primary-key range, so the read never scans other sessions' rows.
+    pub fn tag_high_water_by_session_prefix(
+        &self,
+        exact: &str,
+        prefix: &str,
+    ) -> Result<Vec<(String, i64)>, McStoreError> {
+        let upper = session_prefix_upper_bound(prefix);
+        Ok(self.inner.with_conn(|conn| {
+            let mut stmt = conn.prepare(
+                "SELECT session_id, MAX(tag_number) FROM mc_tags
+                  WHERE session_id = ?1
+                  GROUP BY session_id
+                 UNION
+                 SELECT session_id, MAX(tag_number) FROM mc_tags
+                  WHERE session_id >= ?2
+                    AND (?3 IS NULL OR session_id < ?3)
+                    AND substr(session_id, 1, length(?2)) = ?2
+                  GROUP BY session_id
+                 ORDER BY 1",
+            )?;
+            let rows = stmt.query_map(params![exact, prefix, upper], |row| {
+                Ok((row.get::<_, String>(0)?, row.get::<_, i64>(1)?))
+            })?;
+            rows.collect::<Result<Vec<_>, _>>()
         })?)
     }
 
@@ -10991,11 +11520,11 @@ impl McStore {
                 .optional()?;
             let (found_row_version, found_revert_epoch) = match current {
                 Some((row_version, meta_json)) => {
-                    let meta = serde_json::from_str::<ModuleMeta>(&meta_json).map_err(|error| {
+                    let meta = cache_codec::decode_small_meta(&meta_json).map_err(|error| {
                         rusqlite::Error::FromSqlConversionFailure(
                             1,
                             rusqlite::types::Type::Text,
-                            Box::new(error),
+                            Box::new(std::io::Error::other(error.to_string())),
                         )
                     })?;
                     (Some(row_version), meta.revert_epoch)
@@ -11270,6 +11799,27 @@ impl McStore {
         request: TransformCommit<'_>,
         provider_policy: Option<&provider_records::ProviderEnginePolicy>,
     ) -> Result<u64, McStoreError> {
+        self.commit_transform_scoped(session_id, request, provider_policy, false)
+    }
+
+    /// A certified logical-prefix pass read only its live identities. Preserve
+    /// the covered identity rows it omitted instead of treating them as deleted.
+    pub fn commit_logical_transform_with_provider_policy(
+        &self,
+        session_id: &str,
+        request: TransformCommit<'_>,
+        provider_policy: Option<&provider_records::ProviderEnginePolicy>,
+    ) -> Result<u64, McStoreError> {
+        self.commit_transform_scoped(session_id, request, provider_policy, true)
+    }
+
+    fn commit_transform_scoped(
+        &self,
+        session_id: &str,
+        request: TransformCommit<'_>,
+        provider_policy: Option<&provider_records::ProviderEnginePolicy>,
+        partial_identities: bool,
+    ) -> Result<u64, McStoreError> {
         let TransformCommit {
             expected,
             core,
@@ -11416,16 +11966,20 @@ impl McStore {
             // snapshot shows up as a changed head on the next pass.
 
             // Refuse before the diff runs rather than treating an unhydrated meta as a
-            // request to delete the session's identity history.
+            // request to delete the session's identity history. Scoped identity
+            // commits only upsert, so an empty scoped map cannot delete history.
             if let Some(prefix) = native_prefix {
-                let decoded = cache_codec::read_native_decoded(tx, session_id, prefix)?
+                let decoded = cache_codec::read_native_decoded(tx, session_id, prefix)
+                    .map_err(|error| rusqlite::Error::ToSqlConversionFailure(Box::new(error)))?
                     .ok_or(rusqlite::Error::InvalidQuery)?;
                 if !native_requested || meta.coverage_ordinal.is_none_or(|through| through < prefix.through)
                     || decoded.sections.any_discarded() {
                     return Err(rusqlite::Error::InvalidQuery);
                 }
-            } else if let Some(stored) = refuse_unhydrated_block_identities_tx(tx, session_id, meta)? {
-                return Ok(CommitOutcome::UnhydratedBlockIdentities(stored));
+            } else if !partial_identities {
+                if let Some(stored) = refuse_unhydrated_block_identities_tx(tx, session_id, meta)? {
+                    return Ok(CommitOutcome::UnhydratedBlockIdentities(stored));
+                }
             }
             let stored_units = stored_index
                 .as_ref()
@@ -11438,17 +11992,19 @@ impl McStore {
                 return Ok(CommitOutcome::FrozenClearRefused(stored_units));
             }
 
+            let flush_progress = command_ledger::prepare_flush_progress_tx(tx, session_id)?;
+
             // The grow-mostly parts of the meta are rows, so a pass writes only the entries
             // that differ instead of re-serializing the whole history to append one. Finding
             // WHICH entries differ means reading every stored row, so a pass that changed
             // none of them proves that from its fingerprint and skips the comparison
             // entirely; that is the common case and it must not cost a walk of the session.
-            let row_state_unchanged = native_prefix.is_none()
+            let row_state_unchanged = native_prefix.is_none() && !partial_identities
                 && row_state_digest_matches_tx(tx, session_id, current, &fingerprint)?;
             let row_state_writes = if row_state_unchanged {
                 0
             } else {
-                (if native_prefix.is_some() {
+                (if native_prefix.is_some() || partial_identities {
                     sync_native_block_identities_tx(tx, session_id, &meta.block_identity_by_mid)?
                 } else {
                     sync_block_identities_tx(tx, session_id, &meta.block_identity_by_mid)?
@@ -11765,6 +12321,10 @@ impl McStore {
                     params![session_id, drop_id],
                 )?;
             }
+
+            command_ledger::finish_flush_progress_tx(
+                tx, session_id, flush_progress, meta.soft_refresh_pending, divergence_at_ms,
+            )?;
 
             Ok(CommitOutcome::Committed(accepted_version))
         })?;
@@ -12516,7 +13076,7 @@ impl McStore {
         self.apply_compartment_dates(session_id, &mut compartments)?;
         let revert_epoch = match meta_json {
             Some(json) => {
-                serde_json::from_str::<ModuleMeta>(&json)
+                cache_codec::decode_small_meta(&json)
                     .map_err(|e| McStoreError::Serde(e.to_string()))?
                     .revert_epoch
             }
@@ -12733,7 +13293,7 @@ impl McStore {
                 let Some(candidate_meta) = candidate_meta else {
                     continue;
                 };
-                let candidate_meta: ModuleMeta = match serde_json::from_str(&candidate_meta) {
+                let candidate_meta = match cache_codec::decode_small_meta(&candidate_meta) {
                     Ok(meta) => meta,
                     Err(error) => {
                         return Ok(LineageDescentTxnOutcome::Serde(error.to_string()))
@@ -12940,7 +13500,7 @@ impl McStore {
                     "root prior lineage has no cache state for the publish fence".to_string(),
                 ));
             };
-            let mut prior_meta: ModuleMeta = match serde_json::from_str(&prior_meta_json) {
+            let mut prior_meta = match cache_codec::decode_small_meta(&prior_meta_json) {
                 Ok(meta) => meta,
                 Err(error) => return Ok(LineageDescentTxnOutcome::Serde(error.to_string())),
             };
@@ -12949,7 +13509,7 @@ impl McStore {
                 "lineage descent edge {} fenced prior key at epoch {}",
                 request.edge_id, prior_meta.revert_epoch
             ));
-            let prior_meta_json = match serde_json::to_string(&prior_meta) {
+            let prior_meta_json = match reencode_small_meta(&prior_meta, &prior_meta_json) {
                 Ok(json) => json,
                 Err(error) => return Ok(LineageDescentTxnOutcome::Serde(error.to_string())),
             };
@@ -13473,7 +14033,7 @@ impl McStore {
                 return Ok(TruncateTxnOutcome::CasConflict(current.max(0) as u64));
             }
 
-            let mut meta: ModuleMeta = match serde_json::from_str(&meta_json) {
+            let mut meta = match cache_codec::decode_small_meta(&meta_json) {
                 Ok(meta) => meta,
                 Err(e) => return Ok(TruncateTxnOutcome::Serde(e.to_string())),
             };
@@ -13506,9 +14066,9 @@ impl McStore {
             ));
             meta.revert_epoch = next_epoch;
             meta.last_recut = last_recut.clone();
-            let meta_json = match serde_json::to_string(&meta) {
+            let meta_json = match reencode_small_meta(&meta, &meta_json) {
                 Ok(json) => json,
-                Err(e) => return Ok(TruncateTxnOutcome::Serde(e.to_string())),
+                Err(e) => return Ok(TruncateTxnOutcome::Serde(e)),
             };
 
             tx.execute(
@@ -14111,7 +14671,7 @@ impl McStore {
             let Some((current, meta_json)) = row else {
                 return Ok(AbandonHistorianTxnOutcome::Unchanged);
             };
-            let mut meta: ModuleMeta = match serde_json::from_str(&meta_json) {
+            let mut meta = match cache_codec::decode_small_meta(&meta_json) {
                 Ok(meta) => meta,
                 Err(error) => return Ok(AbandonHistorianTxnOutcome::Serde(error.to_string())),
             };
@@ -14153,9 +14713,9 @@ impl McStore {
                 ..HistorianDurableState::default()
             };
             let next = current.max(0) as u64 + 1;
-            let meta_json = match serde_json::to_string(&meta) {
+            let meta_json = match reencode_small_meta(&meta, &meta_json) {
                 Ok(json) => json,
-                Err(error) => return Ok(AbandonHistorianTxnOutcome::Serde(error.to_string())),
+                Err(error) => return Ok(AbandonHistorianTxnOutcome::Serde(error)),
             };
             tx.execute(
                 "UPDATE mc_cache_state SET row_version = ?2, meta = ?3
@@ -14192,7 +14752,7 @@ impl McStore {
             let Some((current, meta_json)) = row else {
                 return Ok(AbandonHistorianTxnOutcome::Unchanged);
             };
-            let mut meta: ModuleMeta = match serde_json::from_str(&meta_json) {
+            let mut meta = match cache_codec::decode_small_meta(&meta_json) {
                 Ok(meta) => meta,
                 Err(error) => return Ok(AbandonHistorianTxnOutcome::Serde(error.to_string())),
             };
@@ -14211,9 +14771,9 @@ impl McStore {
                 .consecutive_publish_failures
                 .saturating_add(1);
             let next = current.max(0) as u64 + 1;
-            let meta_json = match serde_json::to_string(&meta) {
+            let meta_json = match reencode_small_meta(&meta, &meta_json) {
                 Ok(json) => json,
-                Err(error) => return Ok(AbandonHistorianTxnOutcome::Serde(error.to_string())),
+                Err(error) => return Ok(AbandonHistorianTxnOutcome::Serde(error)),
             };
             tx.execute(
                 "UPDATE mc_cache_state SET row_version = ?2, meta = ?3 WHERE session_id = ?1 AND row_version = ?4",
@@ -14242,13 +14802,37 @@ impl McStore {
         let session_id = request.session_id;
         let expected_row_version = request.expected_row_version;
         let predicate = request.predicate;
-        // A fold whose context.db half an earlier publish left pending lands first, so the
-        // compartment set this publish is checked against is the complete one.
+        if request.rust_background_enabled && request.compartments.is_empty() {
+            return Err(HistorianPublishError::FenceRejected {
+                reason: "activated historian fold has no compartments".into(),
+            });
+        }
         self.resume_pending_context_write(session_id)?;
-        // The compartment set lives in context.db. It is read before the store.db
-        // transaction (never inside a write lock on the other file); the module is the only
-        // writer of a session's compartments, and every such write goes through here or
-        // resumes before it, so the set cannot move between this read and the commit.
+        static NEXT_HOLDER: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+        let holder_id = format!(
+            "rust-historian:{}:{}:{}",
+            std::process::id(),
+            current_time_ms(),
+            NEXT_HOLDER.fetch_add(1, std::sync::atomic::Ordering::Relaxed)
+        );
+        let _lease = if request.rust_background_enabled {
+            let lease = self
+                .acquire_historian_lease(session_id, &holder_id)?
+                .ok_or_else(|| HistorianPublishError::Deferred {
+                    reason: "compartment lease busy".into(),
+                })?;
+            if self.context_read(|conn| historian_wrapup_active(conn, session_id))? {
+                return Err(HistorianPublishError::Deferred {
+                    reason: "wrapup in progress".into(),
+                });
+            }
+            Some(lease)
+        } else {
+            None
+        };
+        // Legacy publication reads compartment-set generation before the store.db
+        // transaction. With rust_background_enabled, the context.db append transaction
+        // checks it again under the shared publication lease.
         let (current_compartment_set_generation, existing_ranges) = self.context_read(|conn| {
             let generation = conn.query_row(
                 "SELECT COALESCE(MAX(sequence), 0), COUNT(*)
@@ -14292,7 +14876,22 @@ impl McStore {
             .unwrap_or_else(current_time_ms);
         // Side channels are best effort: a test can make one fail, and the fold's
         // compartments must still land.
+        let prior_publication_floor_ordinal = if request.rust_background_enabled {
+            self.load_meta(session_id)?.meta.publication_floor_ordinal
+        } else {
+            None
+        };
         let fold = context_writes::FoldWrite {
+            fence: request
+                .rust_background_enabled
+                .then(|| context_writes::HistorianFoldFence {
+                    firing_seq: predicate.firing_seq,
+                    prior_publication_floor_ordinal,
+                    producer_run_id: predicate.producer_run_id.clone(),
+                    holder_id: holder_id.clone(),
+                    generation: predicate.compartment_set_generation,
+                    revert_epoch: request.expected_revert_epoch,
+                }),
             lifecycle_publication_id: request.lifecycle_publication_id.map(str::to_owned),
             project_path: request.project_path.to_string(),
             harness: request.harness.map(str::to_string),
@@ -14351,7 +14950,7 @@ impl McStore {
                 });
             }
 
-            let mut meta: ModuleMeta = match serde_json::from_str(&meta_json) {
+            let mut meta = match cache_codec::decode_small_meta(&meta_json) {
                 Ok(meta) => meta,
                 Err(e) => return Ok(PublishTxnOutcome::Serde(e.to_string())),
             };
@@ -14372,7 +14971,8 @@ impl McStore {
                 && meta.historian.chunk_fingerprint == predicate.chunk_fingerprint
                 && meta.historian.selected_range_identities == predicate.selected_range_identities
                 && meta.historian.compartment_set_generation
-                    == predicate.compartment_set_generation;
+                    == predicate.compartment_set_generation
+                && (!request.rust_background_enabled || meta.historian.expected_revert_epoch == request.expected_revert_epoch);
             if !predicate_matches {
                 return Ok(PublishTxnOutcome::StateMismatch(Box::new(meta.historian)));
             }
@@ -14448,7 +15048,10 @@ impl McStore {
             let next = current as u64 + 1;
             meta.historian = idle_historian_after_success(&meta.historian);
             meta.historian.complete_latest_fire(current_time_ms(), next);
-            let meta_json = match encode_published_meta(&meta) {
+            let meta_json = match encode_published_meta(&meta).and_then(|json| {
+                cache_codec::preserve_native_marker(json, &meta_json)
+                    .map_err(|error| error.to_string())
+            }) {
                 Ok(json) => json,
                 Err(e) => return Ok(PublishTxnOutcome::Serde(e)),
             };
@@ -14478,7 +15081,25 @@ impl McStore {
 
         match outcome {
             PublishTxnOutcome::Committed(mut result) => {
-                result.promoted_refs = self.finish_context_write(session_id, &write);
+                if request.rust_background_enabled {
+                    let context_writes::PendingContextWrite::Fold(fold) = &write else {
+                        unreachable!()
+                    };
+                    let recorded = serde_json::to_string(&write)
+                        .map_err(|e| HistorianPublishError::Serde(e.to_string()))?;
+                    result.promoted_refs =
+                        match self.complete_activated_fold(session_id, fold, &recorded)? {
+                            context_writes::ActivatedFoldOutcome::Applied(promoted) => promoted,
+                            context_writes::ActivatedFoldOutcome::Deferred(reason) => {
+                                return Err(HistorianPublishError::Deferred { reason })
+                            }
+                            context_writes::ActivatedFoldOutcome::Discarded(reason) => {
+                                return Err(HistorianPublishError::FenceRejected { reason })
+                            }
+                        };
+                } else {
+                    result.promoted_refs = self.finish_context_write(session_id, &write);
+                }
                 Ok(result)
             }
             PublishTxnOutcome::CasConflict { found, reason } => {
@@ -14509,6 +15130,31 @@ impl McStore {
             }
             PublishTxnOutcome::Serde(e) => Err(HistorianPublishError::Serde(e)),
         }
+    }
+
+    fn acquire_historian_lease<'a>(
+        &'a self,
+        session_id: &str,
+        holder_id: &str,
+    ) -> Result<Option<HistorianLease<'a>>, McStoreError> {
+        // As in compartment-lease.ts, reclaim a dead owner's row only while its
+        // session, holder, PID, acquisition time and expiry still match. The upsert
+        // admits only the same holder or an expired row.
+        let acquired = self.context_write(&["compartment_state_lease"], |tx| {
+            let now = current_time_ms();
+            let blocker = tx.query_row("SELECT holder_id, owner_pid, acquired_at, expires_at FROM compartment_state_lease WHERE session_id = ?1 AND expires_at > ?2", params![session_id, now], |row| Ok((row.get::<_, String>(0)?, row.get::<_, Option<i64>>(1)?, row.get::<_, i64>(2)?, row.get::<_, i64>(3)?))).optional()?;
+            if let Some((holder, Some(pid), acquired, expires)) = blocker {
+                if historian_owner_dead(pid) {
+                    tx.execute("DELETE FROM compartment_state_lease WHERE session_id = ?1 AND holder_id = ?2 AND owner_pid = ?3 AND acquired_at = ?4 AND expires_at = ?5", params![session_id, holder, pid, acquired, expires])?;
+                }
+            }
+            Ok(tx.execute("INSERT INTO compartment_state_lease (session_id, holder_id, owner_pid, acquired_at, expires_at) VALUES (?1, ?2, ?3, ?4, ?5) ON CONFLICT(session_id) DO UPDATE SET holder_id=excluded.holder_id, owner_pid=excluded.owner_pid, acquired_at=excluded.acquired_at, expires_at=excluded.expires_at WHERE compartment_state_lease.holder_id=excluded.holder_id OR compartment_state_lease.expires_at <= ?4", params![session_id, holder_id, std::process::id() as i64, now, now + HISTORIAN_LEASE_TTL_MS])? == 1)
+        })?;
+        Ok(acquired.then(|| HistorianLease {
+            store: self,
+            session_id: session_id.into(),
+            holder_id: holder_id.into(),
+        }))
     }
 
     fn take_historian_side_channel_fault_for_test(&self, kind: &str) -> bool {
@@ -17750,6 +18396,15 @@ thread_local! {
 }
 
 /// The small-row meta JSON a historian publish stores.
+/// Serialize a meta-only write over the row's previous small `meta` blob. A fold
+/// served by the resident step engine replaces the hashed tail section's key in
+/// that blob with a native-tail reference; dropping it would make the tail
+/// section unreadable, so the reference is carried over unchanged.
+fn reencode_small_meta(meta: &ModuleMeta, old_meta_json: &str) -> Result<String, String> {
+    let json = serde_json::to_string(meta).map_err(|error| error.to_string())?;
+    cache_codec::preserve_native_marker(json, old_meta_json).map_err(|error| error.to_string())
+}
+
 fn encode_published_meta(meta: &ModuleMeta) -> Result<String, String> {
     #[cfg(test)]
     if FAIL_PUBLISH_META_ENCODE.with(|flag| flag.replace(false)) {
@@ -18552,6 +19207,109 @@ fn capped_trace_error(error: &str) -> String {
 #[cfg(test)]
 mod tests {
     #[test]
+    fn context_read_guard_rejects_insert_and_temp_schema_writes() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = McStore::open_for_test(&descriptor(dir.path())).unwrap();
+        store
+            .context_read(|conn| {
+                conn.execute_batch("CREATE TEMP TABLE read_guard_probe(value INTEGER)")
+            })
+            .unwrap();
+        for sql in [
+            "INSERT INTO read_guard_probe VALUES (1)",
+            "CREATE TEMP TABLE forbidden_read_guard(value INTEGER)",
+        ] {
+            store
+                .with_context_read(|conn| {
+                    let error = conn
+                        .execute_batch(sql)
+                        .expect_err("the snapshot must reject writes");
+                    assert_eq!(
+                        error.sqlite_error_code(),
+                        Some(rusqlite::ErrorCode::ReadOnly)
+                    );
+                    Ok(())
+                })
+                .unwrap();
+        }
+        let (rows, tables) = store
+            .context_read(|conn| {
+                Ok((
+                    conn.query_row("SELECT COUNT(*) FROM read_guard_probe", [], |r| {
+                        r.get::<_, i64>(0)
+                    })?,
+                    conn.query_row(
+                        "SELECT COUNT(*) FROM sqlite_temp_master WHERE name='forbidden_read_guard'",
+                        [],
+                        |r| r.get::<_, i64>(0),
+                    )?,
+                ))
+            })
+            .unwrap();
+        assert_eq!((rows, tables), (0, 0));
+    }
+
+    #[test]
+    fn context_read_guard_restores_query_only_after_success_error_and_panic() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = McStore::open_for_test(&descriptor(dir.path())).unwrap();
+        store
+            .context_read(|conn| {
+                conn.execute_batch("CREATE TEMP TABLE read_guard_probe(value INTEGER)")
+            })
+            .unwrap();
+        store.with_context_read(|_| Ok(())).unwrap();
+        let write = || {
+            store
+                .context_read(|conn| {
+                    assert_eq!(
+                        conn.pragma_query_value(None, "query_only", |r| r.get::<_, i64>(0))?,
+                        0
+                    );
+                    conn.execute("INSERT INTO read_guard_probe VALUES (1)", [])
+                })
+                .unwrap()
+        };
+        assert_eq!(write(), 1);
+        assert!(store
+            .with_context_read::<()>(|_| Err(rusqlite::Error::InvalidQuery))
+            .is_err());
+        assert_eq!(write(), 1);
+        let panic = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            store.with_context_read::<()>(|_| panic!("read callback panic"))
+        }));
+        assert!(panic.is_err());
+        assert_eq!(write(), 1);
+    }
+
+    #[test]
+    fn context_read_guard_preserves_preexisting_query_only() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = McStore::open_for_test(&descriptor(dir.path())).unwrap();
+        store
+            .context_read(|conn| conn.pragma_update(None, "query_only", true))
+            .unwrap();
+        store
+            .with_context_read(|conn| {
+                assert_eq!(
+                    conn.pragma_query_value(None, "query_only", |r| r.get::<_, i64>(0))?,
+                    1
+                );
+                Ok(())
+            })
+            .unwrap();
+        store
+            .context_read(|conn| {
+                assert_eq!(
+                    conn.pragma_query_value(None, "query_only", |r| r.get::<_, i64>(0))?,
+                    1
+                );
+                conn.pragma_update(None, "query_only", false)
+            })
+            .unwrap();
+    }
+
+    #[test]
     fn projection_replay_constructor_matches_serde_for_validated_shells() {
         let cases = [
             (
@@ -18708,6 +19466,61 @@ mod tests {
         assert_eq!(enabled, 1);
     }
 
+    #[test]
+    fn newest_tool_tag_pages_are_exact_and_use_the_existing_primary_key() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = McStore::open_for_test(&descriptor(dir.path())).unwrap();
+        store
+            .execute_tag_sql_for_test(
+                "INSERT INTO mc_tags(session_id,tag_number,block_id,kind,token_count) VALUES
+             ('s',90,'stale','tool_result',0),
+             ('s',10,'newer-message','tool_result',300),
+             ('s',80,'prose','message',1000),
+             ('s',30,'old-call','tool_call',-10),
+             ('other',100,'other','tool_result',9000);",
+            )
+            .unwrap();
+        let first = store.load_newest_tool_tags("s", i64::MAX, 2).unwrap();
+        assert_eq!(
+            first.iter().map(|row| row.tag_number).collect::<Vec<_>>(),
+            [90, 30]
+        );
+        assert_eq!(first[0].token_count, 0);
+        assert_eq!(first[1].token_count, -10);
+        assert!(first.iter().all(|row| row.source_bytes.is_empty()));
+        let second = store.load_newest_tool_tags("s", 29, 2).unwrap();
+        assert_eq!(
+            second.iter().map(|row| row.tag_number).collect::<Vec<_>>(),
+            [10]
+        );
+        assert!(store.load_newest_tool_tags("s", 9, 2).unwrap().is_empty());
+        assert!(store
+            .load_newest_tool_tags("s", i64::MAX, 0)
+            .unwrap()
+            .is_empty());
+        let plan = store
+            .inner
+            .with_conn(|conn| {
+                conn.prepare(&format!("EXPLAIN QUERY PLAN {NEWEST_TOOL_TAGS_SQL}"))?
+                    .query_map(params!["s", i64::MAX, 32], |row| row.get::<_, String>(3))?
+                    .collect::<rusqlite::Result<Vec<_>>>()
+            })
+            .unwrap();
+        eprintln!("newest-tool-tags query plan: {plan:?}");
+        assert!(
+            plan.iter().any(|detail| detail
+                .contains("SEARCH mc_tags USING INDEX sqlite_autoindex_mc_tags_1")
+                && detail.contains("session_id=? AND tag_number<?")),
+            "{plan:?}"
+        );
+        assert!(
+            !plan
+                .iter()
+                .any(|detail| detail.contains("SCAN") || detail.contains("TEMP B-TREE")),
+            "{plan:?}"
+        );
+    }
+
     fn descriptor(dir: &std::path::Path) -> StorageDescriptor {
         StorageDescriptor {
             module_id: "magic-context-test".to_string(),
@@ -18717,6 +19530,41 @@ mod tests {
                 path: dir.join("store.db").to_string_lossy().to_string(),
             },
         }
+    }
+
+    #[test]
+    fn authority_managed_reads_the_context_domain_and_tracks_row_removal() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = McStore::open_for_test(&descriptor(dir.path())).unwrap();
+        store.with_context_conn_for_test(|conn| {
+            conn.execute_batch("CREATE TABLE IF NOT EXISTS authority_managed (project_path TEXT PRIMARY KEY, context_store_uuid TEXT NOT NULL, marked_at INTEGER NOT NULL);
+                INSERT INTO authority_managed VALUES ('git:managed', 'fixture', 1);")
+        }).unwrap();
+        assert!(store.is_authority_managed("git:managed").unwrap());
+        assert!(!store.is_authority_managed("git:other").unwrap());
+        store
+            .with_context_conn_for_test(|conn| conn.execute_batch("DELETE FROM authority_managed"))
+            .unwrap();
+        assert!(!store.is_authority_managed("git:managed").unwrap());
+        store
+            .with_context_conn_for_test(|conn| conn.execute_batch("DROP TABLE authority_managed"))
+            .unwrap();
+        assert!(!store.is_authority_managed("git:managed").unwrap());
+    }
+
+    #[test]
+    fn authority_managed_propagates_context_query_errors() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = McStore::open_for_test(&descriptor(dir.path())).unwrap();
+        store
+            .with_context_conn_for_test(|conn| {
+                conn.execute_batch(
+                    "DROP TABLE IF EXISTS authority_managed;
+                CREATE TABLE authority_managed (wrong_column TEXT);",
+                )
+            })
+            .unwrap();
+        assert!(store.is_authority_managed("git:managed").is_err());
     }
 
     fn commit_scheduler_observation(
@@ -19075,6 +19923,175 @@ mod tests {
         assert_eq!(reloaded.meta, meta);
         assert_eq!(reloaded.core, core);
         assert_eq!(reloaded.row_version, Some(version));
+    }
+
+    fn cache_row_columns(store: &McStore, session: &str) -> (i64, String, String, String) {
+        store
+            .inner
+            .with_conn(|conn| {
+                conn.query_row(
+                    "SELECT row_version, core_state, meta, section_index FROM mc_cache_state
+                      WHERE session_id = ?1",
+                    [session],
+                    |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?)),
+                )
+            })
+            .unwrap()
+    }
+
+    fn digest_rows(store: &McStore, session: &str) -> i64 {
+        store
+            .inner
+            .with_conn(|conn| {
+                conn.query_row(
+                    "SELECT COUNT(*) FROM mc_cache_state_digest WHERE session_id = ?1",
+                    [session],
+                    |row| row.get(0),
+                )
+            })
+            .unwrap()
+    }
+
+    /// A session with three identities, a frozen unit and a meta scalar, so a writer that
+    /// touched anything besides the identity rows would show up in the cache row.
+    fn seeded_identity_session(store: &McStore) -> u64 {
+        let core = CoreState {
+            boundary_id: "b1".to_string(),
+            frozen_units: vec![FrozenUnit {
+                key: "m000000".to_string(),
+                kind: "synth-region".to_string(),
+                frozen_payload: "frozen".to_string(),
+                durability_class: DurabilityClass::Lineage,
+                reset_rule: String::new(),
+            }],
+            ..CoreState::default()
+        };
+        let meta = ModuleMeta {
+            initialized: true,
+            block_identity_by_mid: identity_map(3),
+            ..ModuleMeta::default()
+        };
+        store.commit("ses", None, &core, &meta).unwrap()
+    }
+
+    #[test]
+    fn commit_block_identities_adds_only_missing_rows_and_bumps_the_row_version() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = McStore::open_for_test(&descriptor(dir.path())).unwrap();
+        let version = seeded_identity_session(&store);
+        let (_, core_before, meta_before, index_before) = cache_row_columns(&store, "ses");
+        assert_eq!(digest_rows(&store, "ses"), 1);
+
+        // The first three match what is stored; the last two are new.
+        let wanted = identity_map(5);
+        let next = store
+            .commit_block_identities("ses", version, &wanted)
+            .unwrap();
+        assert_eq!(next, version + 1);
+        let (row_version, core_after, meta_after, index_after) = cache_row_columns(&store, "ses");
+        assert_eq!(row_version, next as i64);
+        assert_eq!(
+            (core_after, meta_after, index_after),
+            (core_before, meta_before, index_before),
+            "an identity-only write must not rewrite the cache row's state"
+        );
+        assert_eq!(
+            digest_rows(&store, "ses"),
+            0,
+            "the digest described the identity rows before the insert"
+        );
+        let loaded = store.load("ses").unwrap();
+        assert_eq!(loaded.meta.block_identity_by_mid, wanted);
+        assert_eq!(loaded.core.frozen_units[0].frozen_payload, "frozen");
+
+        // Nothing left to add: no write, no bump.
+        assert_eq!(
+            store.commit_block_identities("ses", next, &wanted).unwrap(),
+            next
+        );
+        assert_eq!(cache_row_columns(&store, "ses").0, next as i64);
+    }
+
+    #[test]
+    fn commit_block_identities_refuses_a_stale_row_version_without_writing() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = McStore::open_for_test(&descriptor(dir.path())).unwrap();
+        let version = seeded_identity_session(&store);
+        let error = store
+            .commit_block_identities("ses", version + 7, &identity_map(5))
+            .unwrap_err();
+        assert!(
+            matches!(error, McStoreError::CasConflict { expected: Some(e), found } if e == version + 7 && found == version),
+            "{error}"
+        );
+        assert_eq!(
+            store.load("ses").unwrap().meta.block_identity_by_mid,
+            identity_map(3)
+        );
+        assert_eq!(cache_row_columns(&store, "ses").0, version as i64);
+        assert_eq!(digest_rows(&store, "ses"), 1);
+
+        // A session with no cache row has no version to match; nothing is created.
+        let error = store
+            .commit_block_identities("absent", 1, &identity_map(1))
+            .unwrap_err();
+        assert!(
+            matches!(error, McStoreError::CasConflict { found: 0, .. }),
+            "{error}"
+        );
+        assert!(store.load("absent").unwrap().row_version.is_none());
+        assert!(store
+            .load("absent")
+            .unwrap()
+            .meta
+            .block_identity_by_mid
+            .is_empty());
+    }
+
+    #[test]
+    fn commit_block_identities_refuses_a_differing_vector_and_writes_nothing() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = McStore::open_for_test(&descriptor(dir.path())).unwrap();
+        let version = seeded_identity_session(&store);
+        // One new message id sorts before the conflicting one, so a writer that inserted
+        // as it validated would leave it behind.
+        let mut wanted = identity_map(5);
+        wanted.get_mut("m000002").unwrap()[0].byte_fingerprint = "changed".to_string();
+        let copied = wanted["m000004"].clone();
+        wanted.insert("m000001a".to_string(), copied);
+        let error = store
+            .commit_block_identities("ses", version, &wanted)
+            .unwrap_err();
+        assert!(
+            matches!(&error, McStoreError::BlockIdentityConflict { session_id, mid } if session_id == "ses" && mid == "m000002"),
+            "{error}"
+        );
+        assert_eq!(
+            store.load("ses").unwrap().meta.block_identity_by_mid,
+            identity_map(3)
+        );
+        assert_eq!(cache_row_columns(&store, "ses").0, version as i64);
+        assert_eq!(digest_rows(&store, "ses"), 1);
+    }
+
+    #[test]
+    fn a_full_commit_loaded_before_commit_block_identities_cannot_delete_its_rows() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = McStore::open_for_test(&descriptor(dir.path())).unwrap();
+        let version = seeded_identity_session(&store);
+        let stale = store.load("ses").unwrap();
+        store
+            .commit_block_identities("ses", version, &identity_map(5))
+            .unwrap();
+        // The stale map lacks the two new rows; committing it would delete them.
+        let error = store
+            .commit("ses", stale.row_version, &stale.core, &stale.meta)
+            .unwrap_err();
+        assert!(matches!(error, McStoreError::CasConflict { .. }), "{error}");
+        assert_eq!(
+            store.load("ses").unwrap().meta.block_identity_by_mid,
+            identity_map(5)
+        );
     }
 
     #[test]
@@ -20782,6 +21799,58 @@ mod tests {
             plan.contains("INDEX") && plan.contains("block_id"),
             "{plan}"
         );
+    }
+
+    #[test]
+    fn tag_high_water_by_session_prefix_reads_each_matching_session_and_nothing_else() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = McStore::open_for_test(&descriptor(dir.path())).unwrap();
+        let mint = |session: &str, blocks: usize| {
+            let inputs = (0..blocks)
+                .map(|n| TagMintInput {
+                    block_id: format!("m{n}#0"),
+                    kind: "message".to_string(),
+                    token_count: 1,
+                    source_bytes: Vec::new(),
+                })
+                .collect::<Vec<_>>();
+            store.mint_or_get_tags(session, &inputs, 1).unwrap();
+        };
+        mint("s", 3);
+        mint("s\u{241f}1", 5);
+        mint("s\u{241f}a\u{241f}0", 2);
+        // Neighbours on either side of the prefix range, and a longer id that
+        // merely starts with the exact id.
+        mint("s\u{241e}1", 9);
+        mint("s\u{2420}1", 9);
+        mint("sx", 9);
+        assert_eq!(
+            store
+                .tag_high_water_by_session_prefix("s", "s\u{241f}")
+                .unwrap(),
+            vec![
+                ("s".to_string(), 3),
+                ("s\u{241f}1".to_string(), 5),
+                ("s\u{241f}a\u{241f}0".to_string(), 2),
+            ]
+        );
+        assert!(store
+            .tag_high_water_by_session_prefix("none", "none\u{241f}")
+            .unwrap()
+            .is_empty());
+        assert_eq!(
+            session_prefix_upper_bound("a\u{241f}").as_deref(),
+            Some("a\u{2420}")
+        );
+        assert_eq!(
+            session_prefix_upper_bound("a\u{d7ff}").as_deref(),
+            Some("a\u{e000}")
+        );
+        assert_eq!(
+            session_prefix_upper_bound("a\u{10ffff}").as_deref(),
+            Some("b")
+        );
+        assert_eq!(session_prefix_upper_bound(""), None);
     }
 
     #[test]
@@ -25267,6 +26336,7 @@ mod tests {
 
         let first = store
             .publish_historian_chunk(HistorianPublishRequest {
+                rust_background_enabled: false,
                 lifecycle_publication_id: None,
                 harness: None,
                 session_id: "ses",
@@ -25301,6 +26371,7 @@ mod tests {
 
         let err = store
             .publish_historian_chunk(HistorianPublishRequest {
+                rust_background_enabled: false,
                 lifecycle_publication_id: None,
                 harness: None,
                 session_id: "ses",
@@ -25358,6 +26429,7 @@ mod tests {
 
         let error = store
             .publish_historian_chunk(HistorianPublishRequest {
+                rust_background_enabled: false,
                 lifecycle_publication_id: None,
                 harness: None,
                 session_id: "ses",
@@ -25427,6 +26499,7 @@ mod tests {
 
             store
                 .publish_historian_chunk(HistorianPublishRequest {
+                    rust_background_enabled: false,
                     lifecycle_publication_id: None,
                     harness: None,
                     session_id: "ses",
@@ -25507,6 +26580,7 @@ mod tests {
         let expected = store.load("ses").unwrap().row_version;
         store
             .publish_historian_chunk(HistorianPublishRequest {
+                rust_background_enabled: false,
                 lifecycle_publication_id: None,
                 harness: None,
                 session_id: "ses",
@@ -25556,6 +26630,7 @@ mod tests {
         let expected = store.load("ses").unwrap().row_version;
         store
             .publish_historian_chunk(HistorianPublishRequest {
+                rust_background_enabled: false,
                 lifecycle_publication_id: None,
                 harness: None,
                 session_id: "ses",
@@ -25597,6 +26672,7 @@ mod tests {
         };
         let err = store
             .publish_historian_chunk(HistorianPublishRequest {
+                rust_background_enabled: false,
                 lifecycle_publication_id: None,
                 harness: None,
                 session_id: "ses",
@@ -25647,6 +26723,7 @@ mod tests {
         let expected = store.load("ses").unwrap().row_version;
         store
             .publish_historian_chunk(HistorianPublishRequest {
+                rust_background_enabled: false,
                 lifecycle_publication_id: None,
                 harness: None,
                 session_id: "ses",
@@ -25691,6 +26768,7 @@ mod tests {
         let expected = store.load("ses").unwrap().row_version;
         store
             .publish_historian_chunk(HistorianPublishRequest {
+                rust_background_enabled: false,
                 lifecycle_publication_id: None,
                 harness: None,
                 session_id: "ses",
@@ -25746,6 +26824,7 @@ mod tests {
         };
         store
             .publish_historian_chunk(HistorianPublishRequest {
+                rust_background_enabled: false,
                 lifecycle_publication_id: None,
                 harness: None,
                 session_id: "ses",
@@ -26085,6 +27164,7 @@ mod tests {
 
         let error = store
             .publish_historian_chunk(HistorianPublishRequest {
+                rust_background_enabled: false,
                 lifecycle_publication_id: None,
                 harness: None,
                 session_id: "ses",
@@ -26138,6 +27218,7 @@ mod tests {
 
         let err = store
             .publish_historian_chunk(HistorianPublishRequest {
+                rust_background_enabled: false,
                 lifecycle_publication_id: None,
                 harness: None,
                 session_id: "ses",
@@ -26180,6 +27261,7 @@ mod tests {
 
         let err = store
             .publish_historian_chunk(HistorianPublishRequest {
+                rust_background_enabled: false,
                 lifecycle_publication_id: None,
                 harness: None,
                 session_id: "ses",
@@ -26301,6 +27383,7 @@ mod tests {
 
         let err = store
             .publish_historian_chunk(HistorianPublishRequest {
+                rust_background_enabled: false,
                 lifecycle_publication_id: None,
                 harness: None,
                 session_id: "ses",
@@ -26351,8 +27434,17 @@ mod tests {
         store: &McStore,
         session_id: &str,
     ) -> Result<HistorianPublishResult, HistorianPublishError> {
+        publish_with_activation(store, session_id, false)
+    }
+
+    fn publish_with_activation(
+        store: &McStore,
+        session_id: &str,
+        enabled: bool,
+    ) -> Result<HistorianPublishResult, HistorianPublishError> {
         let expected = store.load(session_id).unwrap().row_version;
         store.publish_historian_chunk(HistorianPublishRequest {
+            rust_background_enabled: enabled,
             lifecycle_publication_id: None,
             harness: None,
             session_id,
@@ -26370,6 +27462,332 @@ mod tests {
             chunk_transcript: None,
             raw_chunk_messages: None,
         })
+    }
+
+    fn i4_seed(store: &McStore) {
+        store
+            .commit("ses", None, &CoreState::default(), &publishing_meta())
+            .unwrap();
+    }
+
+    fn i4_ts_lease(store: &McStore, holder: &str, pid: Option<i64>, expires: i64) {
+        store.context_write(&["compartment_state_lease"], |tx| {
+            tx.execute("INSERT OR REPLACE INTO compartment_state_lease (session_id, holder_id, owner_pid, acquired_at, expires_at) VALUES ('ses', ?1, ?2, ?3, ?4)", params![holder, pid, current_time_ms(), expires])?;
+            Ok(())
+        }).unwrap();
+    }
+
+    fn i4_marker(store: &McStore, expires: i64) {
+        let marker = serde_json::json!({"holderId":"wrapup", "acquiredAt":1, "expiresAt":expires, "messagesToKeep":1, "anchorRawMessageCount":30, "targetEligibleEndOrdinal":20, "lastCompartmentEnd":0, "chunkIndex":0, "expectedChunks":1, "updatedAt":1}).to_string();
+        store.context_write(&["session_meta"], |tx| {
+            tx.execute("INSERT INTO session_meta(session_id, wrapup_in_progress_state) VALUES ('ses', ?1) ON CONFLICT(session_id) DO UPDATE SET wrapup_in_progress_state=excluded.wrapup_in_progress_state", params![marker])?;
+            Ok(())
+        }).unwrap();
+    }
+
+    fn i4_ts_append(store: &McStore, compartment: &StoredCompartment) {
+        store
+            .context_write(context_writes::HISTORY_TABLES, |tx| {
+                insert_compartment_tx(tx, "ses", compartment.sequence, compartment, "opencode")?;
+                Ok(())
+            })
+            .unwrap();
+    }
+
+    #[test]
+    fn i4_publish_holder_matrix_defers_without_writes() {
+        for holder in ["ts-wrapup", "ts-recomp", "ts-incremental"] {
+            let dir = tempfile::tempdir().unwrap();
+            let store = McStore::open_for_test(&descriptor(dir.path())).unwrap();
+            i4_seed(&store);
+            let before = store.load_meta("ses").unwrap().row_version;
+            i4_ts_lease(
+                &store,
+                holder,
+                Some(std::process::id() as i64),
+                current_time_ms() + HISTORIAN_LEASE_TTL_MS,
+            );
+            assert!(
+                matches!(
+                    publish_with_activation(&store, "ses", true),
+                    Err(HistorianPublishError::Deferred { .. })
+                ),
+                "{holder}"
+            );
+            assert!(store.load_compartments("ses").unwrap().is_empty());
+            assert_eq!(store.load_meta("ses").unwrap().row_version, before);
+            assert!(!store.has_pending_context_write("ses").unwrap());
+        }
+    }
+
+    #[test]
+    fn i4_publish_off_takes_no_lease_and_ignores_marker() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = McStore::open_for_test(&descriptor(dir.path())).unwrap();
+        i4_seed(&store);
+        i4_ts_lease(
+            &store,
+            "ts-wrapup",
+            Some(std::process::id() as i64),
+            current_time_ms() + HISTORIAN_LEASE_TTL_MS,
+        );
+        i4_marker(&store, current_time_ms() + HISTORIAN_LEASE_TTL_MS);
+        publish_with_activation(&store, "ses", false).unwrap();
+        assert!(store
+            .context_read(|conn| historian_lease_held(conn, "ses", "ts-wrapup"))
+            .unwrap());
+        assert_eq!(store.load_compartments("ses").unwrap().len(), 1);
+    }
+
+    #[test]
+    fn i4_publish_reclaims_expired_and_dead_pid_but_not_unknown_owner() {
+        for (pid, expires, expected) in [
+            (Some(std::process::id() as i64), 1, true),
+            (
+                Some(i32::MAX as i64),
+                current_time_ms() + HISTORIAN_LEASE_TTL_MS,
+                true,
+            ),
+            (None, current_time_ms() + HISTORIAN_LEASE_TTL_MS, false),
+        ] {
+            let dir = tempfile::tempdir().unwrap();
+            let store = McStore::open_for_test(&descriptor(dir.path())).unwrap();
+            i4_seed(&store);
+            i4_ts_lease(&store, "old", pid, expires);
+            assert_eq!(
+                publish_with_activation(&store, "ses", true).is_ok(),
+                expected
+            );
+        }
+    }
+
+    #[test]
+    fn i4_publish_marker_respects_ts_expiry() {
+        for active in [true, false] {
+            let dir = tempfile::tempdir().unwrap();
+            let store = McStore::open_for_test(&descriptor(dir.path())).unwrap();
+            i4_seed(&store);
+            let before = store.load_meta("ses").unwrap().row_version;
+            i4_marker(
+                &store,
+                if active {
+                    current_time_ms() + HISTORIAN_LEASE_TTL_MS
+                } else {
+                    1
+                },
+            );
+            assert_eq!(
+                publish_with_activation(&store, "ses", true).is_ok(),
+                !active
+            );
+            if active {
+                assert_eq!(store.load_meta("ses").unwrap().row_version, before);
+                assert!(!store.has_pending_context_write("ses").unwrap());
+            }
+        }
+    }
+
+    #[test]
+    fn i4_publish_rechecks_ownership_inside_append_transaction() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = McStore::open_for_test(&descriptor(dir.path())).unwrap();
+        i4_seed(&store);
+        HISTORIAN_FOLD_TEST_HOOK.with(|hook| {
+            *hook.borrow_mut() = Some(Box::new(|store| {
+                i4_ts_lease(
+                    store,
+                    "ts-recomp",
+                    Some(std::process::id() as i64),
+                    current_time_ms() + HISTORIAN_LEASE_TTL_MS,
+                )
+            }))
+        });
+        assert!(
+            matches!(publish_with_activation(&store, "ses", true), Err(HistorianPublishError::Deferred { reason }) if reason.contains("ownership"))
+        );
+        assert!(store.load_compartments("ses").unwrap().is_empty());
+        assert!(store.has_pending_context_write("ses").unwrap());
+    }
+
+    #[test]
+    fn i4_publish_rechecks_marker_inside_append_transaction() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = McStore::open_for_test(&descriptor(dir.path())).unwrap();
+        i4_seed(&store);
+        HISTORIAN_FOLD_TEST_HOOK.with(|hook| {
+            *hook.borrow_mut() = Some(Box::new(|store| {
+                i4_marker(store, current_time_ms() + HISTORIAN_LEASE_TTL_MS)
+            }))
+        });
+        assert!(
+            matches!(publish_with_activation(&store, "ses", true), Err(HistorianPublishError::Deferred { reason }) if reason.contains("wrapup"))
+        );
+        assert!(store.load_compartments("ses").unwrap().is_empty());
+    }
+
+    #[test]
+    fn i4_publish_rechecks_generation_inside_append_transaction() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = McStore::open_for_test(&descriptor(dir.path())).unwrap();
+        i4_seed(&store);
+        HISTORIAN_FOLD_TEST_HOOK.with(|hook| {
+            *hook.borrow_mut() = Some(Box::new(|store| {
+                let mut ts = publish_compartment();
+                ts.sequence = 1;
+                ts.start_message = 50;
+                ts.end_message = 60;
+                ts.title = "TS append".into();
+                i4_ts_append(store, &ts);
+            }))
+        });
+        assert!(
+            matches!(publish_with_activation(&store, "ses", true), Err(HistorianPublishError::FenceRejected { reason }) if reason.contains("compartment set"))
+        );
+        assert_eq!(
+            store.load_compartments("ses").unwrap()[0].title,
+            "TS append"
+        );
+        assert_eq!(
+            store
+                .load_meta("ses")
+                .unwrap()
+                .meta
+                .publication_floor_ordinal,
+            None
+        );
+        assert!(!store.has_pending_context_write("ses").unwrap());
+    }
+
+    #[test]
+    fn i4_publish_rechecks_epoch_inside_append_transaction() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = McStore::open_for_test(&descriptor(dir.path())).unwrap();
+        i4_seed(&store);
+        HISTORIAN_FOLD_TEST_HOOK.with(|hook| {
+            *hook.borrow_mut() = Some(Box::new(|store| {
+                let mut loaded = store.load_meta("ses").unwrap();
+                loaded.meta.revert_epoch += 1;
+                store
+                    .commit_meta("ses", loaded.row_version, &loaded.meta)
+                    .unwrap();
+            }))
+        });
+        assert!(
+            matches!(publish_with_activation(&store, "ses", true), Err(HistorianPublishError::FenceRejected { reason }) if reason.contains("epoch"))
+        );
+        assert!(store.load_compartments("ses").unwrap().is_empty());
+    }
+
+    #[test]
+    fn i4_crash_replay_discards_after_ts_publish_and_applies_once_otherwise() {
+        for ts_publish in [true, false] {
+            let dir = tempfile::tempdir().unwrap();
+            let store = McStore::open_for_test(&descriptor(dir.path())).unwrap();
+            i4_seed(&store);
+            HISTORIAN_FOLD_TEST_HOOK.with(|hook| {
+                *hook.borrow_mut() = Some(Box::new(|_| {
+                    panic!("simulated crash before context commit")
+                }))
+            });
+            assert!(std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                publish_with_activation(&store, "ses", true)
+            }))
+            .is_err());
+            assert!(store.has_pending_context_write("ses").unwrap());
+            assert!(store.load_compartments("ses").unwrap().is_empty());
+            if ts_publish {
+                let mut ts = publish_compartment();
+                ts.sequence = 1;
+                ts.title = "TS won".into();
+                i4_ts_append(&store, &ts);
+            }
+            drop(store);
+            let store = McStore::open_for_test(&descriptor(dir.path())).unwrap();
+            store.resume_pending_context_write("ses").unwrap();
+            assert!(!store.resume_pending_context_write("ses").unwrap());
+            let rows = store.load_compartments("ses").unwrap();
+            assert_eq!(rows.len(), 1);
+            assert_eq!(rows[0].title == "TS won", ts_publish);
+            assert_eq!(
+                store
+                    .load_meta("ses")
+                    .unwrap()
+                    .meta
+                    .publication_floor_ordinal,
+                if ts_publish { None } else { Some(21) }
+            );
+        }
+    }
+
+    fn i4_run_ts_probe(context_path: &std::path::Path, blocked: bool) {
+        let output = std::process::Command::new("bun")
+            .arg(concat!(
+                env!("CARGO_MANIFEST_DIR"),
+                "/testdata/i4-ts-lease-probe.ts"
+            ))
+            .arg(context_path)
+            .arg(if blocked { "blocked" } else { "free" })
+            .output()
+            .expect("i4_rust_hold_refuses_frozen_ts_recomp_and_bounded_wrapup requires Bun");
+        assert!(
+            output.status.success(),
+            "frozen TS refusal probe: {}{}",
+            String::from_utf8_lossy(&output.stdout),
+            String::from_utf8_lossy(&output.stderr)
+        );
+    }
+
+    #[test]
+    fn i4_rust_hold_refuses_frozen_ts_recomp_and_bounded_wrapup() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = McStore::open_for_test(&descriptor(dir.path())).unwrap();
+        i4_seed(&store);
+        let context_path = dir.path().join("context.db");
+        let held_path = context_path.clone();
+        HISTORIAN_FOLD_TEST_HOOK.with(|hook| *hook.borrow_mut() = Some(Box::new(move |store| {
+            i4_run_ts_probe(&held_path, true);
+            let (holder, pid, ttl): (String, i64, i64) = store.context_read(|conn| conn.query_row("SELECT holder_id, owner_pid, expires_at - acquired_at FROM compartment_state_lease WHERE session_id='ses'", [], |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)))).unwrap();
+            assert!(holder.starts_with("rust-historian:"));
+            assert_eq!(pid, std::process::id() as i64);
+            assert_eq!(ttl, 300_000);
+        })));
+        publish_with_activation(&store, "ses", true).unwrap();
+        i4_run_ts_probe(&context_path, false);
+        assert_eq!(store.load_compartments("ses").unwrap().len(), 1);
+    }
+
+    #[test]
+    fn i4_startup_defers_busy_pending_fold_then_replays_idempotently() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = McStore::open_for_test(&descriptor(dir.path())).unwrap();
+        i4_seed(&store);
+        HISTORIAN_FOLD_TEST_HOOK
+            .with(|hook| *hook.borrow_mut() = Some(Box::new(|_| panic!("simulated crash"))));
+        assert!(std::panic::catch_unwind(std::panic::AssertUnwindSafe(
+            || publish_with_activation(&store, "ses", true)
+        ))
+        .is_err());
+        let recorded: String = store.inner.with_conn(|conn| conn.query_row("SELECT publish_json FROM mc_single_store_pending_publish WHERE session_id='ses'", [], |row| row.get(0))).unwrap();
+        i4_ts_lease(
+            &store,
+            "ts-wrapup",
+            Some(std::process::id() as i64),
+            current_time_ms() + HISTORIAN_LEASE_TTL_MS,
+        );
+        drop(store);
+        let store = McStore::open_for_test(&descriptor(dir.path())).unwrap();
+        assert_eq!(store.resume_all_pending_context_writes().unwrap(), 0);
+        assert!(store.has_pending_context_write("ses").unwrap());
+        assert!(store.load_compartments("ses").unwrap().is_empty());
+        i4_ts_lease(&store, "ts-wrapup", None, 1);
+        assert_eq!(store.resume_all_pending_context_writes().unwrap(), 1);
+        store.inner.with_conn_fenced(|tx| {
+            tx.execute("INSERT INTO mc_single_store_pending_publish (session_id, publish_json, created_at) VALUES ('ses', ?1, 1)", params![recorded])?;
+            Ok(())
+        }).unwrap();
+        assert_eq!(store.resume_all_pending_context_writes().unwrap(), 1);
+        assert_eq!(store.load_compartments("ses").unwrap().len(), 1);
+        assert!(!store.has_pending_context_write("ses").unwrap());
     }
 
     #[test]

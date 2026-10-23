@@ -29,7 +29,6 @@ import {
     projectNeedsSingleStoreMigration,
     renderSingleStoreMigrationRequiredRefusal,
 } from "../../hooks/magic-context/single-store-refusal";
-import type { RustToolBackends } from "../../plugin/rust-tool-backends";
 import type { Database } from "../../shared/sqlite";
 import { unwrapImitatedReducedArgs } from "../unwrap-imitated-reduced-args";
 import {
@@ -60,7 +59,6 @@ export interface CtxNoteToolDeps {
      * explanatory error.
      */
     resolveProjectPath?: (directory: string) => string | undefined;
-    rustToolBackends?: RustToolBackends;
 }
 
 /** Capture the live-tail message ordinal so a note can be traced back to the
@@ -235,18 +233,20 @@ function parseNoteIds(action: string, value: unknown): number[] | string {
 
 function createCtxNoteTool(deps: CtxNoteToolDeps): ToolDefinition {
     const { surface_condition: _condition, ...plainArgs } = ctxNoteArgsShape;
+    // Smart notes are evaluated by the dreamer, so a disabled dreamer hides the
+    // smart-note argument and text just as smart_notes.enabled=false does. An
+    // omitted dreamerEnabled is treated as not disabled, keeping the full surface.
+    const smartNoteSurface = deps.smartNotesEnabled !== false && deps.dreamerEnabled !== false;
     return tool({
-        description:
-            deps.smartNotesEnabled === false
-                ? withoutSmartNoteText(CTX_NOTE_DESCRIPTION)
-                : CTX_NOTE_DESCRIPTION,
-        args:
-            deps.smartNotesEnabled === false
-                ? {
-                      ...plainArgs,
-                      filter: ctxNoteArgsShape.filter.describe(NOTES_FILTER_DESCRIPTION),
-                  }
-                : ctxNoteArgsShape,
+        description: smartNoteSurface
+            ? CTX_NOTE_DESCRIPTION
+            : withoutSmartNoteText(CTX_NOTE_DESCRIPTION),
+        args: smartNoteSurface
+            ? ctxNoteArgsShape
+            : {
+                  ...plainArgs,
+                  filter: ctxNoteArgsShape.filter.describe(NOTES_FILTER_DESCRIPTION),
+              },
         async execute(rawArgs: CtxNoteArgs, toolContext) {
             const parsedArgs = ctxNoteArgsSchema.safeParse(rawArgs);
             let args = (parsedArgs.success ? parsedArgs.data : rawArgs) as CtxNoteArgs;

@@ -2,6 +2,7 @@ import { afterEach, beforeEach, describe, expect, it, spyOn } from "bun:test";
 import { rmSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
+import { seedSessionMeta } from "../../features/magic-context/__tests__/session-meta-fixture";
 import { replaceAllCompartments } from "../../features/magic-context/compartment-storage";
 import { insertMemory } from "../../features/magic-context/memory";
 import { applyAgentMemoryMutation } from "../../features/magic-context/memory/lifecycle-applier";
@@ -103,10 +104,10 @@ describe("createCtxSearchTools", () => {
             expect(memory.id).toBe(id);
         }
         const visibleIds = [3, 4, 54, 5, 7, 49, 53, 6, 50, 51, 52, 55];
-        db.prepare("INSERT INTO session_meta (session_id, memory_block_ids) VALUES (?, ?)").run(
-            "ses-reporter",
-            JSON.stringify(visibleIds),
-        );
+        seedSessionMeta(db, {
+            session_id: "ses-reporter",
+            memory_block_ids: JSON.stringify(visibleIds),
+        });
         const tools = createCtxSearchTools({
             db,
             resolveProjectPath: () => "git:reporter",
@@ -133,10 +134,10 @@ describe("createCtxSearchTools", () => {
                 content: `Aurora ${label}`,
             }),
         );
-        db.prepare("INSERT INTO session_meta (session_id, memory_block_ids) VALUES (?, ?)").run(
-            "ses-mixed",
-            JSON.stringify([memories[0]?.id, memories[1]?.id]),
-        );
+        seedSessionMeta(db, {
+            session_id: "ses-mixed",
+            memory_block_ids: JSON.stringify([memories[0]?.id, memories[1]?.id]),
+        });
         const tools = createCtxSearchTools({
             db,
             resolveProjectPath: () => "git:mixed",

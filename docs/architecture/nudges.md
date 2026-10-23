@@ -65,6 +65,6 @@ Delivery per host:
 
 Synthetic nudges are recognised everywhere real user input matters (turn counting, unanswered-prompt checks), so they never count as the user speaking.
 
-## Rust mode
+## The Rust module
 
-When the Rust module runs the transform, `tail_hygiene.rs` classifies the same bands (quiet, gentle, firm, urgent, Channel 2). Channel 1 reminders are fixed before replay, so a defer pass never lands one on an output that was already served.
+When ck-mc serves a session (for example Claude Code through the Thalamus gateway, or an OpenCode or Pi session that the CortexKit harness bridges to ck-mc), `tail_hygiene.rs` classifies the same bands (quiet, gentle, firm, urgent, Channel 2). Channel 1 reminders are fixed before replay, so a defer pass never lands one on an output that was already served.

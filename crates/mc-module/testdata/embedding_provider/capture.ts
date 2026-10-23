@@ -67,7 +67,10 @@ try {
             maxInputTokens: config.max_input_tokens,
         });
         const vectors = await provider.embedBatch(test.texts, undefined, test.kind);
-        results.push({ endpoint: caseEndpoint, modelId: provider.modelId, vectors: vectors.map((v) => v && Array.from(v)), failure: provider.getLastFailureReason()?.class ?? null, retryable: provider.getLastFailureReason()?.retryable ?? null });
+        // An HTTP 429 is back-pressure, not a failure: it leaves no failure class,
+        // only a cooldown on this endpoint. Report it so Rust can be held to it.
+        const rateLimited = provider._getRateLimitedUntil() > Date.now();
+        results.push({ endpoint: caseEndpoint, modelId: provider.modelId, vectors: vectors.map((v) => v && Array.from(v)), failure: provider.getLastFailureReason()?.class ?? null, retryable: provider.getLastFailureReason()?.retryable ?? null, rateLimited });
     }
     console.log(JSON.stringify({ endpoint, results, requests }));
     // Keep the same server alive until Rust finishes its half of the experiment.

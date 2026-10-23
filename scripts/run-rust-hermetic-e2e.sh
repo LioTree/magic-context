@@ -110,7 +110,12 @@ else
     RUST_E2E_FILES=$(bun "$MANIFEST_VALIDATOR" --mode rust --harness all | tr '\n' ' ')
 fi
 if [[ -z "$RUST_E2E_FILES" ]]; then
-    echo "Error: Rust e2e manifest selected zero test files" >&2
+    # An empty selection passes only when the manifest marks the Rust lane
+    # retired (rust_lane: "retired"); the validator prints why and exits 0.
+    # Without that marker an empty selection is still an error.
+    if bun "$MANIFEST_VALIDATOR" --allow-empty-rust-selection; then
+        exit 0
+    fi
     exit 1
 fi
 

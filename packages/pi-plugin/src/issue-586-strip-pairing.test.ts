@@ -18,11 +18,13 @@ import {
 	updateTagDropMode,
 	updateTagStatus,
 } from "@magic-context/core/features/magic-context/storage";
+import { updateSessionMetaCollection } from "../../plugin/src/features/magic-context/storage-session-collections";
 import {
 	clearContextHandlerSession,
 	recordPiLiveModel,
 	registerPiContextHandler,
 	signalPiHistoryRefresh,
+	signalPiPendingMaterialization,
 } from "./context-handler";
 import {
 	assistantMessage,
@@ -154,8 +156,12 @@ function fixture(session: string) {
 		input: { messages: unknown[] },
 		ctx: unknown,
 	) => Promise<{ messages: unknown[] }>;
-	const pass = async (percent: number, opts: { refresh?: boolean } = {}) => {
-		if (opts.refresh) signalPiHistoryRefresh(session);
+	const pass = async (
+		percent: number,
+		opts: { refresh?: boolean; historyOnly?: boolean } = {},
+	) => {
+		if (opts.refresh || opts.historyOnly) signalPiHistoryRefresh(session);
+		if (opts.refresh) signalPiPendingMaterialization(session);
 		updateSessionMeta(db, session, {
 			lastResponseTime: Date.now(),
 			cacheTtl: "59m",
@@ -181,15 +187,15 @@ function fixture(session: string) {
 	};
 	recordPiLiveModel(session, `${RELAY.provider}/${RELAY.id}`);
 	/** Tag, drop every tool arc but the newest few as `full`, remove them, then discover placeholders. */
-	const dropAndDiscover = async () => {
+	const dropAndDiscover = async (discover = true) => {
 		await pass(0);
 		for (const tag of getTagsBySession(db, session))
 			if (tag.type === "tool" && tag.tagNumber < count - 2) {
 				updateTagStatus(db, session, tag.tagNumber, "dropped");
 				updateTagDropMode(db, session, tag.tagNumber, "full");
 			}
-		await pass(90);
-		return pass(0, { refresh: true });
+		const dropped = await pass(90);
+		return discover ? pass(0, { refresh: true }) : dropped;
 	};
 	const toolModes = () =>
 		getTagsBySession(db, session)
@@ -210,6 +216,22 @@ function fixture(session: string) {
 }
 
 describe("issue 586: placeholder strip keeps tool calls and results together", () => {
+	it("a no-op history refresh at 0% neither creates nor strips placeholders", async () => {
+		const f = fixture("issue-586-noop-refresh");
+		try {
+			const dropped = await f.dropAndDiscover(false);
+			const frozen = getStrippedPlaceholderIds(f.db, f.session);
+			expect(frozen.size).toBe(0);
+			expect(JSON.stringify(await f.pass(0))).toBe(JSON.stringify(dropped));
+			expect(JSON.stringify(await f.pass(0, { historyOnly: true }))).toBe(
+				JSON.stringify(dropped),
+			);
+			expect(getStrippedPlaceholderIds(f.db, f.session)).toEqual(frozen);
+		} finally {
+			f.close();
+		}
+	}, 60_000);
+
 	it("a model round trip through a pair-keeping API never strands a result", async () => {
 		const f = fixture("issue-586-round-trip");
 		try {
@@ -260,14 +282,12 @@ describe("issue 586: placeholder strip keeps tool calls and results together", (
 		const f = fixture("issue-586-unreadable");
 		try {
 			await f.dropAndDiscover();
-			f.db
-				.prepare(
-					"UPDATE session_meta SET trailing_blank_decisions = ? WHERE session_id = ?",
-				)
-				.run(
-					'{"version":2,"trailingBlank":{},"piNative":{"toolInputs":"{","reasoningIds":[]}}',
-					f.session,
-				);
+			updateSessionMetaCollection(
+				f.db,
+				f.session,
+				"trailing_blank_decisions",
+				'{"version":2,"trailingBlank":{},"piNative":{"toolInputs":"{","reasoningIds":[]}}',
+			);
 			const first = await f.pass(0);
 			expect(orphanToolResults(first)).toEqual([]);
 			const second = await f.pass(0);

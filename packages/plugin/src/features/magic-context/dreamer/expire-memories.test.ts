@@ -73,68 +73,68 @@ describe("archiveExpiredMemories", () => {
         }
     });
 
-    for (const transformMode of ["ts", "rust"] as const) {
-        test(`scheduled expiry runs with curate and all model tasks disabled (${transformMode})`, async () => {
-            db = new Database(":memory:");
-            initializeDatabase(db);
-            runMigrations(db);
-            const project = "/repo/disabled-curate-expiry";
-            const expired = insertMemory(db, {
-                projectPath: project,
-                category: "PROJECT_RULES",
-                content: "Expired rule.",
-                expiresAt: Date.now() - 1,
-            });
-            const future = insertMemory(db, {
-                projectPath: project,
-                category: "PROJECT_RULES",
-                content: "Future rule.",
-                expiresAt: Date.now() + 60_000,
-            });
-            const call = mock(async (request: { method: string; body?: unknown }) => {
-                expect(request.method).toBe("memory.expire");
-                expect(request.body).toMatchObject({
-                    name: "memory.expire",
-                    arguments: { memory_project: project, ids: [expired.id] },
-                });
-                db!.prepare("UPDATE memories SET status='archived' WHERE id=?").run(expired.id);
-                return { result: { ok: true } };
-            });
-            const executor = createDreamTaskExecutor({
-                sessionDirectory: project,
-                openOpenCodeDb: () => null,
-                transformMode,
-                moduleClient: { call },
-            });
-            const run = () =>
-                runDueTasksForProject({
-                    db: db!,
-                    projectIdentity: project,
-                    tasks: [{ task: "curate", schedule: "", timeoutMinutes: 1 }],
-                    executor,
-                });
-            const leaseKey = leaseKeyFor("curate", project);
-            const lease = acquireLeaseWithAcquisition(db, "other-worker", leaseKey);
-            expect(lease).not.toBeNull();
-            await run();
-            expect(getMemoryById(db, expired.id)?.status).toBe("active");
-            releaseLease(db, "other-worker", leaseKey);
-
-            expect(await run()).toBe(0);
-            expect(getMemoryById(db, expired.id)?.status).toBe("archived");
-            expect(getMemoryById(db, future.id)?.status).toBe("active");
-            expect(call).toHaveBeenCalledTimes(transformMode === "rust" ? 1 : 0);
-            await run();
-            expect(call).toHaveBeenCalledTimes(transformMode === "rust" ? 1 : 0);
-            expect(db.prepare("SELECT COUNT(*) AS count FROM dream_runs").get()).toEqual({
-                count: 0,
-            });
-            expect(db.prepare("SELECT COUNT(*) AS count FROM memory_mutation_log").get()).toEqual({
-                count: 0,
-            });
+    test("scheduled expiry runs with curate and all model tasks disabled", async () => {
+        db = new Database(":memory:");
+        initializeDatabase(db);
+        runMigrations(db);
+        const project = "/repo/disabled-curate-expiry";
+        const expired = insertMemory(db, {
+            projectPath: project,
+            category: "PROJECT_RULES",
+            content: "Expired rule.",
+            expiresAt: Date.now() - 1,
         });
-    }
+        const future = insertMemory(db, {
+            projectPath: project,
+            category: "PROJECT_RULES",
+            content: "Future rule.",
+            expiresAt: Date.now() + 60_000,
+        });
+        const call = mock(async () => {
+            throw new Error("Expiry must not open a model child");
+        });
+        const executor = createDreamTaskExecutor({
+            sessionDirectory: project,
+            openOpenCodeDb: () => null,
+            hiddenCompletionExecutor: {
+                capabilities: { tools: false, harness: "opencode2" },
+                open: call,
+                attempt: async () => {
+                    throw new Error("Unexpected model attempt");
+                },
+                collect: async () => {
+                    throw new Error("Unexpected model collection");
+                },
+                close: async () => {},
+            },
+        });
+        const run = () =>
+            runDueTasksForProject({
+                db: db!,
+                projectIdentity: project,
+                tasks: [{ task: "curate", schedule: "", timeoutMinutes: 1 }],
+                executor,
+            });
+        const leaseKey = leaseKeyFor("curate", project);
+        const lease = acquireLeaseWithAcquisition(db, "other-worker", leaseKey);
+        expect(lease).not.toBeNull();
+        await run();
+        expect(getMemoryById(db, expired.id)?.status).toBe("active");
+        releaseLease(db, "other-worker", leaseKey);
 
+        expect(await run()).toBe(0);
+        expect(getMemoryById(db, expired.id)?.status).toBe("archived");
+        expect(getMemoryById(db, future.id)?.status).toBe("active");
+        expect(call).not.toHaveBeenCalled();
+        await run();
+        expect(call).not.toHaveBeenCalled();
+        expect(db.prepare("SELECT COUNT(*) AS count FROM dream_runs").get()).toEqual({
+            count: 0,
+        });
+        expect(db.prepare("SELECT COUNT(*) AS count FROM memory_mutation_log").get()).toEqual({
+            count: 0,
+        });
+    });
     test("routes expiry using shared context ids without a mirror pull", async () => {
         db = new Database(":memory:");
         initializeDatabase(db);

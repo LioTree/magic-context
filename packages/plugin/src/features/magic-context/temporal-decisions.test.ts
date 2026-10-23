@@ -7,6 +7,7 @@ import { runMigrations } from "./migrations";
 import { getOrCreateSessionMeta, insertTag } from "./storage";
 import { initializeDatabase } from "./storage-db";
 import { addMergedReasoningStrippedIds } from "./storage-meta-persisted";
+import { sessionMetaCollectionSelect } from "./storage-session-collections";
 import { deleteSessionScopedRows } from "./storage-session-tables";
 import { replaceSourceContent } from "./storage-source";
 import { createTagger } from "./tagger";
@@ -56,7 +57,7 @@ it("temporal choices freeze absence as well as marker bytes and preserve other r
         ).toBe("<!-- +5m -->\n");
         const row = db
             .prepare(
-                "SELECT merged_reasoning_stripped_ids AS entries FROM session_meta WHERE session_id = 'session'",
+                `SELECT ${sessionMetaCollectionSelect("merged_reasoning_stripped_ids", "entries", db)} FROM session_meta WHERE session_id = 'session'`,
             )
             .get() as { entries: string };
         expect(JSON.parse(row.entries)).toContain("assistant");

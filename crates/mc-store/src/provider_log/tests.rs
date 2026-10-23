@@ -106,9 +106,11 @@ fn hook(
 }
 
 #[test]
-fn v65_blob_round_trips_messages_answers_views_pending_drops_and_empty_lineages() {
+fn v65_blob_round_trips_messages_answers_pending_drops_and_empty_lineages() {
     // The undeployed OpenCode projection is reset at the recipe cutover; generic
     // runner observations must still migrate losslessly through every version.
+    // A runner record that stored whole views in mc_provider_views_v1 (an
+    // unreleased development table) is reset when migration 73 retires it.
     let native_key = key();
     let key = || ProviderSessionKey {
         harness: "broca".into(),
@@ -132,6 +134,21 @@ fn v65_blob_round_trips_messages_answers_views_pending_drops_and_empty_lineages(
         "messages":{"L":{"4000":{"ordinal":4000,"mid":"m4000","message":{"role":"user","content":[{"type":"text","text":"résumé"}]}}},"empty":{}},
         "pending_drops":[10,12],"last_answer":{"request_id":"r","answer":"noop"},"wait_request":"wait","wait_view":view(7),"future_field":{"keep":true}
     });
+    let viewed_key = ProviderSessionKey {
+        session: "viewed".into(),
+        ..key()
+    };
+    let viewed = record.clone();
+    let mut record = record;
+    record["setup"]["state"]
+        .as_object_mut()
+        .unwrap()
+        .remove("last_produced");
+    record["setup"]["state"]
+        .as_object_mut()
+        .unwrap()
+        .remove("last_applied");
+    record.as_object_mut().unwrap().remove("wait_view");
     inner
         .with_conn(|conn| {
             conn.execute(
@@ -141,6 +158,15 @@ fn v65_blob_round_trips_messages_answers_views_pending_drops_and_empty_lineages(
                     key().session,
                     key().harness,
                     record.to_string()
+                ],
+            )?;
+            conn.execute(
+                "INSERT INTO mc_provider_sessions_v1 VALUES (?1,?2,?3,?4)",
+                params![
+                    viewed_key.project_root,
+                    viewed_key.session,
+                    viewed_key.harness,
+                    viewed.to_string()
                 ],
             )?;
             conn.execute(
@@ -160,6 +186,11 @@ fn v65_blob_round_trips_messages_answers_views_pending_drops_and_empty_lineages(
     assert!(store.load_provider_record(&native_key).unwrap().is_none());
     assert!(store
         .load_provider_conversation(&native_key)
+        .unwrap()
+        .is_none());
+    assert!(store.load_provider_record(&viewed_key).unwrap().is_none());
+    assert!(store
+        .load_provider_conversation(&viewed_key)
         .unwrap()
         .is_none());
     assert_eq!(
@@ -183,7 +214,7 @@ fn v65_blob_round_trips_messages_answers_views_pending_drops_and_empty_lineages(
         .unwrap();
     assert_eq!(store.provider_frontier(&key(), "L").unwrap(), 4001);
     store
-        .save_provider_record(&key(), &record.to_string(), &c.engine_namespace, &[])
+        .save_provider_record(&key(), &record.to_string(), &c.engine_namespace, &[], &[])
         .unwrap();
     assert_eq!(
         serde_json::from_str::<Value>(&store.load_provider_record(&key()).unwrap().unwrap())
@@ -201,10 +232,11 @@ fn v65_blob_round_trips_messages_answers_views_pending_drops_and_empty_lineages(
         .inner
         .with_conn(|conn| {
             assert_eq!(
-                conn.query_row("SELECT record FROM mc_provider_sessions_v1", [], |r| r
-                    .get::<_, String>(
-                    0
-                ))?,
+                conn.query_row(
+                    "SELECT record FROM mc_provider_sessions_v1 WHERE session='session'",
+                    [],
+                    |r| r.get::<_, String>(0)
+                )?,
                 record.to_string()
             );
             Ok(())
@@ -477,24 +509,55 @@ fn acknowledgement_decreases_only_in_the_transaction_creating_a_descent() {
     ));
 }
 
+/// A synthetic-only recipe: the immutable content is its metadata and head slot.
+fn frozen_recipe(version: u64, text: &str) -> crate::ProviderViewRecipe {
+    crate::ProviderViewRecipe {
+        version,
+        lineage_id: "L".into(),
+        range_from: 4000,
+        range_to: 4001,
+        base_version: None,
+        policy_cut_id: None,
+        metadata: serde_json::json!({"text": text}),
+        segments: vec![crate::ProviderViewSegment::Synthetic {
+            slot: "head".into(),
+        }],
+        synthetic: BTreeMap::from([("head".into(), serde_json::json!({"text": text}))]),
+        treatments: vec![],
+        serializer_profile: "owned-broca".into(),
+        render_key: "fixture-render".into(),
+        tokenizer_key: "fixture-tokenizer".into(),
+        state: "produced".into(),
+    }
+}
+
+fn recipe_state(store: &McStore, version: u64) -> (String, String) {
+    store
+        .inner
+        .with_conn(|conn| {
+            conn.query_row(
+                "SELECT state,view_meta_json FROM mc_provider_views_v2 WHERE conv_key=?1 AND version=?2",
+                params![key().conversation_key(), version],
+                |r| Ok((r.get(0)?, r.get(1)?)),
+            )
+        })
+        .unwrap()
+}
+
 #[test]
 fn view_state_changes_only_state_and_refuses_missing_or_illegal_transitions() {
     let dir = tempfile::tempdir().unwrap();
     let store = store(dir.path());
-    let original = ProviderView {
-        version: 7,
-        lineage_id: "L".into(),
-        range_from: 4000,
-        range_to: 4001,
-        replacement_json: "[ { \"text\" : \"résumé \\u0061\" } ]".into(),
-        state: "produced".into(),
-    };
-    store.save_provider_view(&key(), &original).unwrap();
+    store
+        .save_provider_view_recipe(&key(), &frozen_recipe(7, "résumé \\u0061"))
+        .unwrap();
+    let (_, metadata) = recipe_state(&store, 7);
     for state in ["applied", "applied", "not_applied", "not_applied"] {
         store.set_provider_view_state(&key(), 7, state).unwrap();
-        let mut expected = original.clone();
-        expected.state = state.into();
-        assert_eq!(store.load_provider_views(&key()).unwrap(), vec![expected]);
+        assert_eq!(
+            recipe_state(&store, 7),
+            (state.to_string(), metadata.clone())
+        );
     }
     assert!(store
         .set_provider_view_state(&key(), 7, "produced")
@@ -511,10 +574,7 @@ fn view_state_changes_only_state_and_refuses_missing_or_illegal_transitions() {
         .unwrap_err()
         .to_string()
         .contains("version"));
-    assert_eq!(
-        store.load_provider_views(&key()).unwrap()[0].replacement_json,
-        original.replacement_json
-    );
+    assert_eq!(recipe_state(&store, 7).1, metadata);
 }
 
 #[test]
@@ -652,26 +712,25 @@ fn hook_path_writes_one_transaction_without_blob_rewrite() {
 fn views_are_frozen_at_a_version_and_only_application_state_changes() {
     let dir = tempfile::tempdir().unwrap();
     let store = store(dir.path());
-    let mut view = ProviderView {
-        version: 1,
-        lineage_id: "L".into(),
-        range_from: 4000,
-        range_to: 4001,
-        replacement_json: r#"[ {"frozen":true} ]"#.into(),
-        state: "produced".into(),
-    };
-    store.save_provider_view(&key(), &view).unwrap();
-    view.state = "applied".into();
-    store.save_provider_view(&key(), &view).unwrap();
+    store
+        .save_provider_view_recipe(&key(), &frozen_recipe(1, "frozen"))
+        .unwrap();
+    store.set_provider_view_state(&key(), 1, "applied").unwrap();
+    let held = recipe_state(&store, 1);
+    assert_eq!(held.0, "applied");
+    // A second recipe at the same version is refused rather than replacing it.
+    assert!(store
+        .save_provider_view_recipe(&key(), &frozen_recipe(1, "replaced"))
+        .is_err());
+    assert_eq!(recipe_state(&store, 1), held);
     assert_eq!(
-        store.load_provider_views(&key()).unwrap(),
-        vec![view.clone()]
-    );
-    view.replacement_json = "[]".into();
-    assert!(store.save_provider_view(&key(), &view).is_err());
-    assert_eq!(
-        store.load_provider_views(&key()).unwrap()[0].replacement_json,
-        r#"[ {"frozen":true} ]"#
+        store
+            .resolve_provider_view(&key(), 1)
+            .unwrap()
+            .unwrap()
+            .recipe
+            .synthetic["head"],
+        serde_json::json!({"text":"frozen"})
     );
 }
 

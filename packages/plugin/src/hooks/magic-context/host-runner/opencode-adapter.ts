@@ -27,12 +27,16 @@ import type { SessionMeta } from "../../../features/magic-context/types";
 import { sessionLog } from "../../../shared/logger";
 import { EmergencyFailClosedError } from "../emergency-fail-closed";
 import { createHistorianHostRunner } from "../historian-host-runner";
-import { type ModuleStateSyncState, syncModuleState } from "../module-state-sync";
+import type { createModuleSessionKernel, HistorianHostRunnerSeam } from "../module-session-kernel";
+import {
+    type ModuleStateSyncState,
+    readAuthoritySeqMismatch,
+    syncModuleState,
+} from "../module-state-sync";
 import { resolveOrdinalsForModule } from "../module-wire";
 import { providerNativeMessage } from "../provider-visible-parts";
 import { hasRawSessionMessageById } from "../read-session-chunk";
 import { isRawCompactionSummaryInfo } from "../read-session-raw";
-import type { createRustModeTransform, HistorianHostRunnerSeam } from "../rust-mode-transform";
 import { storeAheadOfBinaryFailure } from "../store-ahead-refusal";
 import type { TransformDeps } from "../transform";
 import type { MessageLike } from "../transform-operations";
@@ -57,6 +61,7 @@ import {
     type ProviderResult,
     type StepInputs,
 } from "./provider-client";
+import type { ProviderCodec } from "./provider-codec";
 import {
     type Admission,
     acknowledgeStatus,
@@ -91,7 +96,17 @@ export type {
 } from "./fallback-admissibility";
 export { isFallbackAdmissible, recordProviderUsage } from "./fallback-admissibility";
 
-type Legacy = ReturnType<typeof createRustModeTransform>;
+type SessionKernel = ReturnType<typeof createModuleSessionKernel>;
+export class TransformRouteRetiredError extends EmergencyFailClosedError {
+    readonly code = "transform_route_retired";
+
+    constructor() {
+        super(
+            "transform_route_retired: the full-request transform is retired; use the step contract",
+        );
+        this.name = "TransformRouteRetiredError";
+    }
+}
 type RecordState = RunnerRecord<MessageLike, FrozenProviderPlan>;
 type Admitted = Extract<Admission<MessageLike>, { entry: unknown }>;
 class StepOrdinalConflict extends Error {}
@@ -221,7 +236,14 @@ export function providerIncoming(message: MessageLike): Incoming<MessageLike> {
             // LSP diagnostics are host UI data, not model input. Reuse replay's
             // model projection, plus the answer markers needed to prevent removal
             // of user answers, before the context module stores rows or views.
-            const visible = providerNativeMessage(message);
+            let visible = providerNativeMessage(message);
+            if (visible.info.role === "user" && "summary" in visible.info) {
+                // OpenCode fills user diff statistics asynchronously, even after
+                // a refused send. They are UI data, not a change to model input;
+                // retaining them makes a module-ahead retry conflict with itself.
+                const { summary: _summary, ...info } = visible.info;
+                visible = { ...visible, info };
+            }
             // Persist the projected identity in ingest as well as the hook. The
             // module can address the same part after a rebuild changes part order.
             let changed = false;
@@ -322,6 +344,50 @@ export const providerOpFunctions: OpFunctions<MessageLike> = {
     versions: new Map([[1, applyProviderOps]]),
 };
 
+/** OpenCode embeds results in assistant rows; Pi returns separate tool-role messages. */
+export function providerReplacementValid(
+    message: MessageLike,
+    harness: "opencode" | "opencode2" | "pi",
+    incoming: typeof providerIncoming = providerIncoming,
+): boolean {
+    const role = message?.info?.role;
+    return (
+        (role === "user" || role === "assistant" || (harness === "pi" && role === "tool")) &&
+        Array.isArray(message?.parts) &&
+        incoming(message).classify() !== "non_terminal"
+    );
+}
+
+/** The model-visible text of each part: message text, or a tool's output or error.
+ * Hook answers (tags, notes) change exactly these strings. */
+function visibleText(message: MessageLike): string {
+    return JSON.stringify(
+        (Array.isArray(message?.parts) ? message.parts : []).map((value) => {
+            const p = part(value);
+            if (p.type === "text") return ["text", p.text ?? ""];
+            if (p.type !== "tool") return [String(p.type)];
+            const state = part(p.state);
+            return ["tool", state[toolTextField(state)] ?? ""];
+        }),
+    );
+}
+
+/**
+ * Whether `next` puts a message back to the host's raw text after Magic Context had
+ * served it with its own changes (`served`): a tag or other hook edit was removed and
+ * nothing replaced it. A drop or a different edit renders other text and is not a
+ * reversion. `raw` is the host's own copy of the same message.
+ */
+export function providerRevertsToRaw(
+    served: MessageLike,
+    next: MessageLike,
+    raw: MessageLike,
+): boolean {
+    const host = visibleText(raw);
+    const before = visibleText(served);
+    return before !== host && visibleText(next) === host;
+}
+
 /** Same strict TTL clock and self-consuming baseline as the full-request renderer. */
 export function providerCold(
     meta: Pick<SessionMeta, "cacheTtl" | "lastResponseTime" | "cachedM0MaterializedAt">,
@@ -394,9 +460,22 @@ export const OPENCODE_PROVIDER_BOOTSTRAP_BUDGET_MS = 30_000;
 /** All provider state is session-scoped; a failed write never installs staged bytes. */
 export function createOpenCodeProviderTransform(
     deps: TransformDeps,
-    legacy: Legacy,
+    kernel: SessionKernel,
     options: OpenCodeProviderOptions = {},
 ) {
+    return createProviderTransform(deps, kernel, options);
+}
+
+/** Share request-deadline checks, saved hook answers and database commits across host message formats. */
+export function createProviderTransform(
+    deps: TransformDeps,
+    kernel: SessionKernel,
+    options: OpenCodeProviderOptions = {},
+    codec?: ProviderCodec,
+) {
+    const incoming = codec?.incoming ?? providerIncoming;
+    const subjectsFor = codec?.subjects ?? providerSubjects;
+    const ops = codec?.ops ?? providerOpFunctions;
     const sessions = new Map<string, Session>();
     const projectionOwner = {};
     const projectionTokens = new Map<string, { generation: number; token: object }>();
@@ -407,7 +486,7 @@ export function createOpenCodeProviderTransform(
         commitEntries(record, admissions);
         if (options.deferServed) record.served_through_ordinal = served;
     };
-    const harness = deps.storeGeneration === "v2" ? "opencode2" : "opencode";
+    const harness = codec?.harness ?? (deps.storeGeneration === "v2" ? "opencode2" : "opencode");
     const projectRoot = deps.rustModeProjectRoot ?? deps.directory ?? process.cwd();
     const configuredModule = deps.rustModeModuleClient;
     if (!configuredModule) throw new Error("Provider pipeline requires a module client");
@@ -554,6 +633,7 @@ export function createOpenCodeProviderTransform(
             sessionId: s.metadata.fullRequestNamespace ?? id,
             projectRoot,
             harness,
+            wire: codec?.wire,
             now,
             bootstrapBudgetMs: OPENCODE_PROVIDER_BOOTSTRAP_BUDGET_MS,
             consumePreparedPolicy: () => deps.rustProviderPreparation === true,
@@ -626,7 +706,7 @@ export function createOpenCodeProviderTransform(
                     ingested: e.ingested === 1,
                     race: e.race === 1,
                 },
-                providerOpFunctions,
+                ops,
             );
             if (result.event) {
                 record.counters.prefix_events++;
@@ -638,7 +718,7 @@ export function createOpenCodeProviderTransform(
             record,
             state: stored.state,
             metadata,
-            sync: legacy.getState(id),
+            sync: kernel.getState(id),
             client: undefined as unknown as ProviderClient,
         } as Session;
         s.client = client(id, s);
@@ -646,7 +726,12 @@ export function createOpenCodeProviderTransform(
         registerProjection(id);
         return s;
     }
-    async function sync(id: string, s: Session, passComplete: boolean): Promise<void> {
+    async function sync(
+        id: string,
+        s: Session,
+        passComplete: boolean,
+        force = false,
+    ): Promise<void> {
         checkpoint();
         if (options.sync) return stage(options.sync(id, s.sync, passComplete));
         const chain = deps.resolveHistorianRun?.();
@@ -690,7 +775,7 @@ export function createOpenCodeProviderTransform(
                     nowMs: now(),
                 },
                 projectRoot,
-                force: !s.metadata.active,
+                force: force || !s.metadata.active,
                 options: {
                     authority: true,
                     knownWatermarksUnchanged:
@@ -703,19 +788,27 @@ export function createOpenCodeProviderTransform(
             throw new EmergencyFailClosedError("Provider state sync is still applying");
         s.syncSignature = signature;
         if (syncResult.status === "no_change" && passComplete) {
-            await moduleClient.call({
-                sessionId: id,
-                projectRoot,
-                method: "state_sync",
-                body: {
+            try {
+                await moduleClient.call({
+                    sessionId: id,
+                    projectRoot,
                     method: "state_sync",
-                    session_id: id,
-                    shadow_generation: s.sync.moduleGeneration,
-                    expected_shadow_seq: s.sync.lastAckedSeq,
-                    pass_complete: true,
-                    historian_model_chain: [...new Set(models)],
-                },
-            });
+                    body: {
+                        method: "state_sync",
+                        session_id: id,
+                        shadow_generation: s.sync.moduleGeneration,
+                        expected_shadow_seq: s.sync.lastAckedSeq,
+                        pass_complete: true,
+                        historian_model_chain: [...new Set(models)],
+                    },
+                });
+            } catch (error) {
+                // Tools can increment Rust's durable state sequence between passes.
+                // Resynchronize with the module's returned sequence before retrying pass_complete.
+                if (!force && readAuthoritySeqMismatch(error) !== null)
+                    return sync(id, s, passComplete, true);
+                throw error;
+            }
         }
         checkpoint();
         // Rebuilding search embeddings can change data for other sessions. Keep that
@@ -805,39 +898,8 @@ export function createOpenCodeProviderTransform(
                 s?.record.pipeline_exit?.reason ??
                     (deps.rustPipeline !== "provider" ? "provider_disabled" : "bootstrap_declined"),
             );
-        if (!namespace) return legacy.run(id, messages, output, meta);
-        // A race's runner ordinals cannot enter the canonical full-request namespace.
-        // Re-route all module calls, not host storage or the real OpenCode session id.
-        let fresh = reseeded.get(id);
-        if (!fresh) {
-            const { createRustModeTransform } = await import("../rust-mode-transform");
-            fresh = createRustModeTransform(deps, {
-                moduleClient: {
-                    ...moduleClient,
-                    call: (args) => {
-                        let body = args.body;
-                        if (!(body instanceof Uint8Array))
-                            body = {
-                                ...part(body),
-                                params: { ...part(part(body).params), session_id: namespace },
-                            };
-                        else {
-                            const wire = JSON.parse(new TextDecoder().decode(body));
-                            wire.params.session_id = namespace;
-                            body = new TextEncoder().encode(JSON.stringify(wire));
-                        }
-                        return moduleClient.call({ ...args, sessionId: namespace, body });
-                    },
-                },
-                projectRoot,
-                hostClient: deps.client,
-                onEngineReconnectRefusal: deps.onRustEngineReconnectRefusal,
-            });
-            reseeded.set(id, fresh);
-        }
-        await fresh.run(id, messages, output, meta);
+        throw new TransformRouteRetiredError();
     }
-    const reseeded = new Map<string, Legacy>();
     function recover(id: string, messages: MessageLike[]): void {
         const meters = currentProviderMeters();
         if (meters) meters.recovery_count++;
@@ -907,14 +969,7 @@ export function createOpenCodeProviderTransform(
                     compaction: a.compaction as unknown as RecordState["view"],
                     coverage: a.coverage,
                 },
-                (all) =>
-                    all.every(
-                        (m) =>
-                            m &&
-                            (m.info?.role === "user" || m.info?.role === "assistant") &&
-                            Array.isArray(m.parts) &&
-                            providerIncoming(m).classify() !== "non_terminal",
-                    ),
+                (all) => all.every((m) => providerReplacementValid(m, harness, incoming)),
             );
             applied = appliedResult.applied;
             if (appliedResult.applied) coverage = appliedResult.coverage;
@@ -957,7 +1012,7 @@ export function createOpenCodeProviderTransform(
                     initial: { ...s.metadata.setup.initial, replacement: [] },
                 };
             s.metadata.model = inputs.model;
-            s.metadata.manifest = manifest(messages);
+            s.metadata.manifest = manifest(messages, id);
             s.metadata.flush = flush(id);
         }
         const state = stateFor(s);
@@ -1034,8 +1089,9 @@ export function createOpenCodeProviderTransform(
         const value = part(m ?? {});
         return `${value.providerID ?? "unknown"}/${value.modelID ?? "unknown"}`;
     }
-    function manifest(messages: MessageLike[]): string {
-        const id = messages.at(-1)?.info.sessionID ?? "";
+    function manifest(messages: MessageLike[], sessionId = ""): string {
+        const id = sessionId || messages.at(-1)?.info.sessionID || "";
+        if (codec) return codec.manifest(id);
         const row = deps.db
             .prepare("SELECT system_prompt_hash FROM session_meta WHERE session_id=?")
             .get(id) as { system_prompt_hash: string | null } | null;
@@ -1076,7 +1132,7 @@ export function createOpenCodeProviderTransform(
             ? "revert"
             : model(id, messages) !== s.metadata.model
               ? "model_switch"
-              : manifest(messages) !== s.metadata.manifest
+              : manifest(messages, id) !== s.metadata.manifest
                 ? "manifest_change"
                 : deps.historyRefreshSessions.has(id) ||
                     deps.rustMemorySyncRequestedSessions?.has(id) ||
@@ -1092,7 +1148,7 @@ export function createOpenCodeProviderTransform(
             return "bootstrap";
         const scan = scanWindow(
             s.record,
-            messages.filter((m) => !isMagicContextHead(m)).map(providerIncoming),
+            messages.filter((m) => !isMagicContextHead(m)).map(incoming),
         );
         return rebuildReason(id, s, messages, meta, scan.revert_through !== undefined)
             ? "rebuild"
@@ -1107,24 +1163,31 @@ export function createOpenCodeProviderTransform(
     ): Promise<Session | undefined> {
         checkpoint();
         const visible = messages.filter(
-            (m) => !isMagicContextHead(m) && providerIncoming(m).classify() !== "marker",
+            (m) => !isMagicContextHead(m) && incoming(m).classify() !== "marker",
         );
         if (!s || reentry) {
-            const memo = legacy.getState(id);
-            const resolved = await stage(
-                (options.resolveOrdinals ?? resolveOrdinalsForModule)({
-                    sessionId: id,
-                    messages: visible,
-                    generation: memo.moduleGeneration,
-                    memoGeneration: memo.idOrdinalMemoGeneration,
-                    memo: memo.idOrdinalMemo,
-                    memoAnchor: memo.ordinalMemoAnchor,
-                    memoStoredCount: memo.ordinalMemoStoredCount,
-                    memoCanonicalCount: memo.ordinalMemoCanonicalCount,
-                    memoCheckpoints: memo.ordinalMemoCheckpoints,
-                    provisionalBase: memo.ordinalContinuationBase ?? undefined,
-                }),
-            );
+            const memo = kernel.getState(id);
+            const resolved = codec
+                ? {
+                      ok: true as const,
+                      annotatedInput: codec
+                          .ordinals(id, visible)
+                          .map((absolute_ordinal) => ({ absolute_ordinal })),
+                  }
+                : await stage(
+                      (options.resolveOrdinals ?? resolveOrdinalsForModule)({
+                          sessionId: id,
+                          messages: visible,
+                          generation: memo.moduleGeneration,
+                          memoGeneration: memo.idOrdinalMemoGeneration,
+                          memo: memo.idOrdinalMemo,
+                          memoAnchor: memo.ordinalMemoAnchor,
+                          memoStoredCount: memo.ordinalMemoStoredCount,
+                          memoCanonicalCount: memo.ordinalMemoCanonicalCount,
+                          memoCheckpoints: memo.ordinalMemoCheckpoints,
+                          provisionalBase: memo.ordinalContinuationBase ?? undefined,
+                      }),
+                  );
             // The full-request resolver deliberately lends ordinals to wire-only
             // synthetics. Bootstrap admits only distinct, persisted identities.
             const persisted = options.persisted ?? hasRawSessionMessageById;
@@ -1137,7 +1200,7 @@ export function createOpenCodeProviderTransform(
                     (m) =>
                         !mid(m) ||
                         !persisted(id, mid(m) ?? "") ||
-                        providerIncoming(m).classify() !== "terminal",
+                        incoming(m).classify() !== "terminal",
                 ) ||
                 ordinals.some(
                     (o, i) =>
@@ -1168,7 +1231,10 @@ export function createOpenCodeProviderTransform(
                     { subscriptions: [] },
                     {
                         preset: meta.isSubagent ? "worker" : "head",
-                        params: { serializer_profile: "opencode-aisdk", observation: "answer" },
+                        params: {
+                            serializer_profile: codec?.serializerProfile ?? "opencode-aisdk",
+                            observation: "answer",
+                        },
                     },
                 ),
                 initial,
@@ -1194,7 +1260,7 @@ export function createOpenCodeProviderTransform(
                     initial,
                     active: false,
                     model: model(id, messages),
-                    manifest: manifest(messages),
+                    manifest: manifest(messages, id),
                     flush: flush(id),
                     materializedAt: meta.cachedM0MaterializedAt ?? 0,
                     switchGeneration: reentry
@@ -1227,7 +1293,7 @@ export function createOpenCodeProviderTransform(
                 params: { ...r.plan.params },
             });
             s.state.plan_json = JSON.stringify(r.plan);
-            const appends = scanWindow(r, visible.map(providerIncoming)).appends;
+            const appends = scanWindow(r, visible.map(incoming)).appends;
             const admissions: Admitted[] = [];
             for (const candidate of appends) {
                 const admitted = admit(r, candidate, {
@@ -1246,9 +1312,7 @@ export function createOpenCodeProviderTransform(
                     registerProjection(id);
                     return s;
                 }
-                admissions.push(
-                    finishEntry(candidate, admitted, [], providerOpFunctions) as Admitted,
-                );
+                admissions.push(finishEntry(candidate, admitted, [], ops) as Admitted);
             }
             commitProviderEntries(r, admissions);
             save(id, s, admissions);
@@ -1258,7 +1322,7 @@ export function createOpenCodeProviderTransform(
             // Bootstrap can span host passes while the current pipeline still serves.
             // Admit new persisted tail rows before completing, rather than dropping
             // appends that arrived after a timed-out page.
-            const scan = scanWindow(s.record, visible.map(providerIncoming));
+            const scan = scanWindow(s.record, visible.map(incoming));
             if (
                 scan.exit ||
                 scan.revert_through !== undefined ||
@@ -1288,9 +1352,7 @@ export function createOpenCodeProviderTransform(
                         exit(id, s, admitted.exit);
                         return s;
                     }
-                    staged.push(
-                        finishEntry(candidate, admitted, [], providerOpFunctions) as Admitted,
-                    );
+                    staged.push(finishEntry(candidate, admitted, [], ops) as Admitted);
                 }
                 commitProviderEntries(s.record, staged);
                 save(id, s, staged);
@@ -1376,7 +1438,7 @@ export function createOpenCodeProviderTransform(
     ): Promise<void> {
         return withProviderMeters(
             id,
-            harness === "opencode" ? "OpenCode1" : "OpenCode2",
+            harness === "pi" ? "Pi" : harness === "opencode" ? "OpenCode1" : "OpenCode2",
             null,
             () => runPass(id, messages, output, meta, conflictRetry),
             (meters) => {
@@ -1396,8 +1458,6 @@ export function createOpenCodeProviderTransform(
         conflictRetry = 0,
     ): Promise<void> {
         checkpoint();
-        // A legacy handoff preserves its original exception type. In particular,
-        // BUSY must still be eligible for the legacy wrapper's LKG recovery.
         const existing = hydrate(id);
         if (
             deps.rustPipeline !== "provider" ||
@@ -1453,9 +1513,9 @@ export function createOpenCodeProviderTransform(
                 });
                 return;
             }
-            const incoming = messages.filter((m) => !isMagicContextHead(m)).map(providerIncoming);
+            const incomingWindow = messages.filter((m) => !isMagicContextHead(m)).map(incoming);
             const previousViewVersion = s.record.view.version;
-            let scan = scanWindow(s.record, incoming);
+            let scan = scanWindow(s.record, incomingWindow);
             if (scan.exit) {
                 exit(id, s, scan.exit);
                 return fallback(id, s, messages, output, meta);
@@ -1497,7 +1557,7 @@ export function createOpenCodeProviderTransform(
                         await fallback(id, s, messages, output, meta);
                         return;
                     }
-                    const subjects = providerSubjects(admitted.message).filter((subject) =>
+                    const subjects = subjectsFor(admitted.message).filter((subject) =>
                         s?.record.plan.subscriptions.some(
                             (sub) =>
                                 sub.hook === subject.hook &&
@@ -1520,7 +1580,12 @@ export function createOpenCodeProviderTransform(
                         );
                         checkpoint();
                         completedHook ||= complete;
-                        checkFailure(result);
+                        if (
+                            !codec?.freezeUnavailableHooks ||
+                            result.status !== "unavailable" ||
+                            !["timeout", "late", "aborted"].includes(result.reason)
+                        )
+                            checkFailure(result);
                         if (result.status === "unavailable") {
                             const error = part(result.error ?? {});
                             if (
@@ -1536,6 +1601,7 @@ export function createOpenCodeProviderTransform(
                         // serving the raw append would lose that tag on this turn.
                         if (
                             result.status === "unavailable" &&
+                            !codec?.freezeUnavailableHooks &&
                             ["timeout", "late", "aborted"].includes(result.reason)
                         ) {
                             throw new EmergencyFailClosedError(
@@ -1562,12 +1628,7 @@ export function createOpenCodeProviderTransform(
                         } else outcomes.push({ subject, unavailable: true });
                     }
                     if (conflict) break;
-                    const finished = finishEntry(
-                        candidate,
-                        admitted,
-                        outcomes,
-                        providerOpFunctions,
-                    ) as Admitted;
+                    const finished = finishEntry(candidate, admitted, outcomes, ops) as Admitted;
                     admissions.push(finished);
                     // The next message's hook must burn these answers before deciding
                     // cadence, even though the append transaction is later.
@@ -1748,11 +1809,14 @@ export function createOpenCodeProviderTransform(
             output: { messages: unknown[] },
             meta: SessionMeta,
             pass: BridgeStep,
+            /** Runs after the pass and before its writes commit; a throw discards them. */
+            verify?: () => void,
         ): Promise<void> {
             await passContext.run(pass, async () => {
                 try {
                     await run(id, messages, output, meta);
                     pass.check();
+                    verify?.();
                     pass.commit(deps.db);
                 } catch (error) {
                     sessions.delete(id);
@@ -1818,6 +1882,16 @@ export function createOpenCodeProviderTransform(
                 throw error;
             }
         },
+        /** Latest provider usage attributed to this session's served request, if any. */
+        measuredUsage(id: string): RecordState["measured_usage"] {
+            const s = hydrate(id);
+            return s?.record.measured_usage && structuredClone(s.record.measured_usage);
+        },
+        /** Give native-history writers the saved request and coverage record, not caller-supplied summary coordinates alone. */
+        record(id: string): RecordState | undefined {
+            const s = hydrate(id);
+            return s?.metadata.active && !s.record.pipeline_exit ? s.record : undefined;
+        },
         bootstrapDeclines: () => declines,
         hasRecord: (id: string) => hydrate(id) !== undefined,
         dispose() {
@@ -1825,7 +1899,6 @@ export function createOpenCodeProviderTransform(
                 if (projection.owner === projectionOwner) providerProjections.delete(id);
             }
             const stopped = historian?.stop();
-            for (const fresh of reseeded.values()) fresh.dispose();
             sessions.clear();
             projectionTokens.clear();
             return stopped ?? Promise.resolve();

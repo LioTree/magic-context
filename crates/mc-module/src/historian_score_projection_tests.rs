@@ -47,6 +47,7 @@ fn historian_effective_scores_change_diverse_picks_not_recent_or_base_rows() {
             boundary_reason: "test".into(),
         },
         memory_enabled: false,
+        user_observations_requested: false,
         auto_promote: true,
         user_memory_collection_enabled: false,
         extraction_free: false,

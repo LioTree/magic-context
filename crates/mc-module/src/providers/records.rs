@@ -1,4 +1,4 @@
-//! Typed provider records and once-per-lineage transcript observation.
+//! Conversation identity and durable tool catalogs shared by provider engines.
 use super::*;
 use serde::Deserialize;
 
@@ -7,8 +7,6 @@ pub struct Key {
     pub project: PathBuf,
     pub session: String,
     pub harness: String,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub generation: Option<mc_store::provider_records::ProviderGeneration>,
 }
 
 impl Key {
@@ -23,22 +21,10 @@ impl Key {
         if harness.trim().is_empty() {
             return Err(invalid("harness must be non-empty"));
         }
-        if attested_claude_code(binding) && binding.native_generation.is_none() {
-            return Err(HandlerOutcome::ErrorWithDetail {
-                code: "invalid_params".into(),
-                message: "native route has no frozen generation".into(),
-                detail: json!({"field":"claude_code"}),
-            });
-        }
         Ok(Self {
             project: binding.project_root.clone(),
             session: session.trim().into(),
             harness: harness.into(),
-            generation: if attested_claude_code(binding) {
-                binding.native_generation.clone()
-            } else {
-                None
-            },
         })
     }
 
@@ -58,59 +44,6 @@ pub struct Catalog {
     pub tools: BTreeSet<String>,
 }
 
-#[derive(Clone, Debug, Serialize, Deserialize)]
-pub struct Setup {
-    pub request: compact::setup::SetupRequest,
-    pub state: transform::compaction::State,
-    pub stability: Vec<compact::setup::StabilityRank>,
-    pub call_when: compact::setup::CallWhen,
-}
-
-#[derive(Clone, Debug, Serialize, Deserialize)]
-pub struct LiveTag {
-    pub lineage: String,
-    pub ordinal: u64,
-    pub block_id: String,
-    pub kind: String,
-    pub source: String,
-}
-
-#[derive(Clone, Debug, Serialize, Deserialize)]
-pub struct HookRecord {
-    pub subject: String,
-    pub lineage: Option<String>,
-    pub answer: hooks::answer::HookAnswer,
-    pub rendered: Vec<String>,
-    pub tags: Vec<u64>,
-    pub cadence: bool,
-    pub observed: bool,
-    pub tool_call_id: Option<String>,
-}
-
-#[derive(Clone, Debug, Default, Serialize, Deserialize)]
-pub struct HookState {
-    pub high_water: u64,
-    pub answers: Vec<HookRecord>,
-    pub live: BTreeMap<u64, LiveTag>,
-    pub burned: BTreeSet<u64>,
-    pub observed_tools: u64,
-    pub last_reminder_at: Option<u64>,
-    pub observed_users: u64,
-    pub last_nudge_at: Option<u64>,
-}
-
-#[derive(Clone, Debug, Default, Serialize, Deserialize)]
-pub struct Record {
-    pub catalog: Option<Catalog>,
-    pub setup: Option<Setup>,
-    pub hook: Option<HookState>,
-    pub messages: BTreeMap<String, BTreeMap<u64, compact::status::StatusMessage>>,
-    pub pending_drops: BTreeSet<u64>,
-    pub last_answer: Option<Value>,
-    pub wait_request: Option<String>,
-    pub wait_view: Option<transform::compaction::View>,
-}
-
 /// A typed adapter over the handler's main store slot. It owns no connection,
 /// policy or schema: store open and migrations finish before the slot is filled.
 pub struct Storage {
@@ -118,6 +51,7 @@ pub struct Storage {
     /// If storage cannot record admission, the process remembers that fact until
     /// a full successful refetch. Discovery still serves its unchanged bytes.
     catalog_failures: Mutex<BTreeMap<(PathBuf, String), String>>,
+    pub(crate) async_runtime: super::async_provider::Runtime,
 }
 
 impl Storage {
@@ -125,6 +59,7 @@ impl Storage {
         Self {
             store,
             catalog_failures: Mutex::new(BTreeMap::new()),
+            async_runtime: Default::default(),
         }
     }
 
@@ -173,96 +108,21 @@ impl Storage {
             .ok_or_else(|| transient("provider store is not open"))
     }
 
-    pub fn load(&self, key: &Key) -> Result<Record, HandlerOutcome> {
-        self.store()?
-            .load_provider_record(&key.store_key())
-            .map_err(transient)?
-            .map_or(Ok(Record::default()), |raw| {
-                serde_json::from_str(&raw).map_err(transient)
-            })
-    }
-
-    /// The host lane decides cadence after burns and promotion, inside the store
-    /// transaction. It never hydrates the legacy whole-record compatibility view.
-    #[allow(dead_code)] // The host request handlers opt into this adapter separately.
-    pub fn commit_hook<T>(
-        &self,
-        key: &Key,
-        request: mc_store::provider_records::ProviderHookRequest<'_>,
-        decide: impl FnOnce(
-            &mc_store::provider_records::ProviderHookContext,
-        ) -> Result<
-            (mc_store::provider_records::ProviderHookWrite, T),
-            mc_store::provider_records::ProviderError,
-        >,
-    ) -> Result<T, HandlerOutcome> {
-        self.store()?
-            .commit_provider_hook(&key.store_key(), request, decide)
-            .map_err(provider_error)
-    }
-
-    pub fn save(&self, key: &Key, record: &Record) -> Result<(), HandlerOutcome> {
-        // A host switch adopts the full-request engine namespace. Compatibility
-        // saves must not silently move its tags and frozen state to a new one.
-        let namespace = self
-            .store()?
-            .load_provider_conversation(&key.store_key())
-            .map_err(transient)?
-            .map_or_else(
-                || key.engine_key(),
-                |conversation| conversation.engine_namespace,
-            );
-        let tags = record
-            .hook
-            .as_ref()
-            .map(|hook| {
-                hook.live
-                    .iter()
-                    .map(|(number, tag)| McTagRow {
-                        tag_number: *number as i64,
-                        block_id: tag.block_id.clone(),
-                        kind: tag.kind.clone(),
-                        token_count: mc_tokenizer::estimate_tokens(&tag.source) as i64,
-                        created_at_ms: now_ms(),
-                        source_bytes: tag.source.as_bytes().into(),
-                    })
-                    .collect::<Vec<_>>()
-            })
-            .unwrap_or_default();
-        self.store()?
-            .save_provider_record(
-                &key.store_key(),
-                &serde_json::to_string(record).map_err(transient)?,
-                &namespace,
-                &tags,
-            )
-            .map_err(transient)
-    }
-
     pub fn tool_key(&self, binding: &SessionBinding) -> Result<Key, HandlerOutcome> {
         if let Some(refusal) = self.catalog_refusal(binding, &binding.session) {
             return Err(refusal);
         }
-        let rows = self
+        let keys = self
             .store()?
-            .provider_records_for_session(
+            .provider_session_keys(
                 &binding.project_root.to_string_lossy(),
                 binding.session.trim(),
             )
             .map_err(transient)?;
-        let mut found = Vec::new();
-        for (harness, raw) in rows {
-            let record: Record = serde_json::from_str(&raw).map_err(transient)?;
-            if record.setup.is_some() || record.hook.is_some() {
-                found.push(harness);
-            }
-        }
-        // A tool call has no caller-harness field. Do not guess among several
-        // conversations that happen to share the same project and handle.
-        if found.len() != 1 {
+        let [key] = keys.as_slice() else {
             return Err(session_unresolved_error());
-        }
-        Key::new(binding, &binding.session, &found[0])
+        };
+        Key::new(binding, &binding.session, &key.harness)
     }
 
     pub fn save_catalog(
@@ -297,339 +157,7 @@ impl Key {
             project_root: self.project.to_string_lossy().into_owned(),
             session: self.session.clone(),
             harness: self.harness.clone(),
-            generation: self.generation.clone(),
-        }
-    }
-}
-
-fn provider_error(error: mc_store::provider_records::ProviderError) -> HandlerOutcome {
-    match error {
-        mc_store::provider_records::ProviderError::InvalidParams { field } => {
-            HandlerOutcome::ErrorWithDetail {
-                code: "invalid_params".into(),
-                message: format!("conflicting provider {field}"),
-                detail: json!({"field": field}),
-            }
-        }
-        error => transient(error),
-    }
-}
-
-fn text_targets(message: &ck_wire::CkIngressMessage) -> Vec<(String, String, String)> {
-    let mut targets = Vec::new();
-    for (index, block) in message.ck.content.iter().enumerate() {
-        let id = format!("{}#{index}", message.mid);
-        match &block.kind {
-            ck_wire::CkKind::Text { text } => targets.push((id, "text".into(), text.clone())),
-            ck_wire::CkKind::ToolResult { output, .. } => {
-                let text = match &output.kind {
-                    ck_wire::CkOutputKind::Text { text }
-                    | ck_wire::CkOutputKind::ErrorText { text } => text.clone(),
-                    _ => String::new(),
-                };
-                targets.push((id, "tool_result".into(), text));
-            }
-            _ => {}
-        }
-    }
-    targets
-}
-
-pub fn ingest(
-    record: &mut Record,
-    lineage: &str,
-    messages: &[compact::status::StatusMessage],
-) -> Result<(), HandlerOutcome> {
-    for entry in messages {
-        let held = record.messages.entry(lineage.into()).or_default();
-        if let Some(previous) = held.get(&entry.ordinal) {
-            if previous.mid != entry.mid {
-                return Err(provider_error(
-                    mc_store::provider_records::ProviderError::InvalidParams {
-                        field: "subject_ordinal",
-                    },
-                ));
-            }
-            if previous != entry {
-                return Err(transient("an ingested ordinal changed"));
-            }
-            continue;
-        }
-        if held.values().any(|previous| previous.mid == entry.mid) {
-            return Err(provider_error(
-                mc_store::provider_records::ProviderError::InvalidParams {
-                    field: "subject_mid",
-                },
-            ));
-        }
-        let message = decode_message(entry)?;
-        if let Some(hook) = &mut record.hook {
-            let targets = text_targets(&message);
-            if message.ck.role == "user"
-                && !targets.iter().any(|(_, kind, _)| kind == "tool_result")
-            {
-                hook.observed_users += 1;
-            }
-            if targets.iter().any(|(_, kind, _)| kind == "tool_result") {
-                hook.observed_tools += 1;
-            }
-            for answer in &mut hook.answers {
-                if answer.observed || answer.lineage.as_deref().is_some_and(|l| l != lineage) {
-                    continue;
-                }
-                if answer.tool_call_id.as_ref().is_some_and(|id|!message.ck.content.iter().any(|b|matches!(&b.kind,ck_wire::CkKind::ToolResult {id:actual,..} if id==actual))) {continue;}
-                let all_seen = !answer.rendered.is_empty()
-                    && answer
-                        .rendered
-                        .iter()
-                        .all(|text| targets.iter().any(|(_, _, actual)| actual.contains(text)));
-                if !all_seen {
-                    continue;
-                }
-                answer.observed = true;
-                for number in &answer.tags {
-                    if hook.burned.contains(number) {
-                        continue;
-                    }
-                    let prefix = format!("§{number}§ ");
-                    if let Some((id, kind, text)) =
-                        targets.iter().find(|(_, _, text)| text.contains(&prefix))
-                    {
-                        hook.live.insert(
-                            *number,
-                            LiveTag {
-                                lineage: lineage.into(),
-                                ordinal: entry.ordinal,
-                                block_id: id.clone(),
-                                kind: kind.clone(),
-                                source: text.strip_prefix(&prefix).unwrap_or(text).into(),
-                            },
-                        );
-                    }
-                }
-                if answer.cadence {
-                    if targets.iter().any(|(_, kind, _)| kind == "tool_result") {
-                        hook.last_reminder_at = Some(hook.observed_tools);
-                    } else {
-                        hook.last_nudge_at = Some(hook.observed_users);
-                    }
-                }
-            }
-        }
-        held.insert(entry.ordinal, entry.clone());
-    }
-    Ok(())
-}
-
-pub fn frontier(record: &Record, lineage: &str) -> u64 {
-    let Some(messages) = record.messages.get(lineage) else {
-        return 0;
-    };
-    let mut next = messages.keys().next().copied().unwrap_or(0);
-    for ordinal in messages.keys() {
-        if *ordinal != next {
-            break;
-        }
-        next += 1;
-    }
-    next
-}
-
-/// Reads are bounded by one absolute call deadline, including every page and
-/// commit. The in-flight hook subject is never awaited here: reads show only
-/// records already durable in the runner.
-pub async fn scan(
-    storage: &Storage,
-    runner: &dyn session_resolver::ProviderRunner,
-    key: &Key,
-    record: &mut Record,
-    lineage: Option<&str>,
-    sought: &[u64],
-    deadline: Instant,
-) -> Result<(), HandlerOutcome> {
-    let mut lineage = lineage.map(str::to_string);
-    let mut from = lineage.as_deref().map_or(0, |l| frontier(record, l));
-    loop {
-        let budget = deadline
-            .checked_duration_since(Instant::now())
-            .filter(|b| !b.is_zero())
-            .ok_or_else(|| transient("transcript scan budget exhausted"))?;
-        let mut params = json!({"from_ordinal":from,"max_bytes":4*1024*1024});
-        if let Some(lineage) = &lineage {
-            params["lineage_id"] = json!(lineage);
-        }
-        let page = tokio::time::timeout(
-            budget,
-            runner.call(&key.project, &key.session, "session.read", params, budget),
-        )
-        .await
-        .map_err(|_| transient("transcript scan timed out"))?
-        .map_err(transient)?;
-        let page_lineage = page
-            .get("lineage_id")
-            .and_then(Value::as_str)
-            .ok_or_else(|| transient("transcript page omitted lineage_id"))?;
-        if lineage.as_deref().is_some_and(|l| l != page_lineage) {
-            return Err(transient("transcript lineage changed"));
-        }
-        lineage = Some(page_lineage.into());
-        let messages: Vec<compact::status::StatusMessage> = decode(
-            page.get("messages")
-                .ok_or_else(|| transient("transcript page omitted messages"))?,
-        )?;
-        ingest(record, page_lineage, &messages)?;
-        storage.save(key, record)?;
-        if Instant::now() >= deadline {
-            return Err(transient(
-                "transcript scan budget exhausted before its answer",
-            ));
-        }
-        if !sought.is_empty()
-            && record.hook.as_ref().is_some_and(|h| {
-                sought
-                    .iter()
-                    .all(|n| h.live.contains_key(n) || h.burned.contains(n))
-            })
-        {
-            return Ok(());
-        }
-        let next = page.get("next_from_ordinal").and_then(Value::as_u64);
-        if let Some(next) = next {
-            if next <= from || next > frontier(record, page_lineage) {
-                return Err(transient(
-                    "transcript scan cursor did not advance contiguously",
-                ));
-            }
-            from = next;
-            continue;
-        }
-        let head = page.get("head").filter(|v| !v.is_null());
-        if let Some(head) = head {
-            let ordinal = head
-                .get("ordinal")
-                .and_then(Value::as_u64)
-                .ok_or_else(|| transient("transcript head omitted ordinal"))?;
-            if frontier(record, page_lineage) <= ordinal {
-                return Err(transient("transcript scan did not reach head"));
-            }
-        } else if !messages.is_empty() {
-            return Err(transient("transcript page omitted head"));
-        }
-        // An allocation absent at the durable head cannot yet be used. Mark
-        // it burned so subsequent requests do not repeatedly read for it.
-        if let Some(hook) = &mut record.hook {
-            for answer in &hook.answers {
-                if !answer.observed {
-                    hook.burned.extend(answer.tags.iter().copied());
-                }
-            }
-        }
-        storage.save(key, record)?;
-        return Ok(());
-    }
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    #[test]
-    fn held_ordinal_with_another_mid_refuses_by_field() {
-        let mut record = Record::default();
-        let entry: compact::status::StatusMessage =
-            decode(&json!({"ordinal":4000,"mid":"held","message":{"role":"user","content":[]}}))
-                .unwrap();
-        record
-            .messages
-            .entry("L".into())
-            .or_default()
-            .insert(4000, entry.clone());
-        let mut conflict = entry;
-        conflict.mid = "different".into();
-        match ingest(&mut record, "L", &[conflict]) {
-            Err(HandlerOutcome::ErrorWithDetail { code, detail, .. }) => {
-                assert_eq!(code, "invalid_params");
-                assert_eq!(detail, json!({"field":"subject_ordinal"}));
-            }
-            _ => panic!("held ordinal conflict was ignored or refused without its field"),
-        }
-        assert_eq!(record.messages["L"][&4000].mid, "held");
-    }
-
-    #[test]
-    fn frontier_starts_at_the_absolute_bootstrap_ordinal() {
-        let mut record = Record::default();
-        for ordinal in 4000..=4010 {
-            let entry=decode(&json!({"ordinal":ordinal,"mid":format!("m{ordinal}"),"message":{"role":"user","content":[]}})).unwrap();
-            record
-                .messages
-                .entry("L".into())
-                .or_default()
-                .insert(ordinal, entry);
-        }
-        assert_eq!(frontier(&record, "L"), 4011);
-        record.messages.get_mut("L").unwrap().remove(&4005);
-        assert_eq!(frontier(&record, "L"), 4005);
-    }
-}
-
-#[cfg(test)]
-mod namespace_tests {
-    use super::*;
-    #[test]
-    fn compatibility_save_preserves_host_namespace_and_creates_broca_hash_namespace() {
-        let dir = tempfile::tempdir().unwrap();
-        let store = Arc::new(
-            McStore::open_for_test(&StorageDescriptor {
-                module_id: DEFAULT_MODULE_ID.into(),
-                storage_namespace: "mc_cache".into(),
-                isolation: Isolation::Module,
-                backend: StorageBackend::Sqlite {
-                    path: dir.path().join("store.db").to_string_lossy().into(),
-                },
-            })
-            .unwrap(),
-        );
-        let slot = Arc::new(OnceLock::new());
-        slot.set(Arc::clone(&store)).ok().unwrap();
-        let storage = Storage::new(slot);
-        let host = Key {
             generation: None,
-            project: dir.path().into(),
-            session: "host-session".into(),
-            harness: "opencode".into(),
-        };
-        store
-            .save_provider_conversation(
-                &host.store_key(),
-                &mc_store::provider_records::ProviderConversation {
-                    engine_namespace: host.session.clone(),
-                    ..Default::default()
-                },
-            )
-            .unwrap();
-        storage.save(&host, &Record::default()).unwrap();
-        assert_eq!(
-            store
-                .load_provider_conversation(&host.store_key())
-                .unwrap()
-                .unwrap()
-                .engine_namespace,
-            host.session
-        );
-        let broca = Key {
-            harness: "broca".into(),
-            ..host
-        };
-        storage.save(&broca, &Record::default()).unwrap();
-        assert_eq!(
-            store
-                .load_provider_conversation(&broca.store_key())
-                .unwrap()
-                .unwrap()
-                .engine_namespace,
-            broca.engine_key()
-        );
-        assert!(broca.engine_key().starts_with("mc-provider:"));
+        }
     }
 }

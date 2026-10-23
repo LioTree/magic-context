@@ -1,7 +1,11 @@
 import { expect, spyOn, test } from "bun:test";
 import { resolveProjectIdentityForSession } from "@magic-context/core/features/magic-context/memory/project-identity";
 import { insertMemory } from "@magic-context/core/features/magic-context/memory/storage-memory";
-import { createProjectionFixture } from "@magic-context/core/shared/memory-projection-fixtures.test";
+import {
+	createProjectionFixture,
+	isDashboardPayloadRead,
+} from "@magic-context/core/shared/memory-projection-fixtures.test";
+import { sessionRenderCacheSelect } from "../../plugin/src/features/magic-context/storage-session-cache";
 import * as autoSearchPi from "./auto-search-pi";
 import {
 	clearContextHandlerSession,
@@ -15,10 +19,10 @@ import {
 } from "./test-utils.test";
 
 /**
- * Automatic search is one of the two named memory readers outside the memory pair
- * (with explicit ctx_search). On Pi too it reads current memory only while computing a
- * new hint for a new user message: a pass that replays an already-decided message
- * reads neither memories nor the mutation log, and no hint ever changes m[0]/m[1].
+ * Automatic search reads canonical memory only to compute a new hint for a user
+ * message. Replaying a previously decided hint reads no canonical rows or log
+ * heads. A separately authorized delta refresh may read immutable dashboard
+ * payloads, but search hints never rewrite the cached baseline or delta blocks.
  */
 for (const busting of [false, true])
 	test(`a Pi ${busting ? "busting" : "defer"} context pass reads memory only when automatic search computes a new hint`, async () => {
@@ -100,7 +104,7 @@ for (const busting of [false, true])
 			const m0 = () =>
 				f.db
 					.prepare(
-						"SELECT cached_m0_bytes FROM session_meta WHERE session_id=?",
+						`SELECT ${sessionRenderCacheSelect("cached_m0_bytes", "cached_m0_bytes", f.db)} FROM session_meta WHERE session_id=?`,
 					)
 					.get(a);
 			const before = m0();
@@ -110,14 +114,19 @@ for (const busting of [false, true])
 			observing = false;
 			expect(m0()).toEqual(before);
 			expect(search).toHaveBeenCalledTimes(1);
-			expect(seen).toEqual([]);
+			expect(seen.filter((sql) => !isDashboardPayloadRead(sql))).toEqual([]);
 
 			computeNewHint = true;
 			observing = true;
 			await invoke(busting ? 80 : 20);
 			observing = false;
 			expect(seen.length).toBeGreaterThan(0);
-			expect(seen.every((sql) => /FROM memories/i.test(sql))).toBe(true);
+			expect(seen.some((sql) => /FROM memories/i.test(sql))).toBe(true);
+			expect(
+				seen.every(
+					(sql) => /FROM memories/i.test(sql) || isDashboardPayloadRead(sql),
+				),
+			).toBe(true);
 			expect(m0()).toEqual(before);
 		} finally {
 			search.mockRestore();

@@ -207,6 +207,11 @@ describe("stripUnsafeProjectConfigFields", () => {
                     fallback_models: ["pi/repo-fallback"],
                     thinking_level: "medium",
                 },
+                broca: {
+                    model: "broca/repo-model",
+                    fallback_models: ["broca/repo-fallback"],
+                    variant: "high",
+                },
                 temperature: 0.2,
             },
         };
@@ -215,6 +220,7 @@ describe("stripUnsafeProjectConfigFields", () => {
         expect(raw.historian).toEqual({
             opencode: {},
             pi: {},
+            broca: {},
             temperature: 0.2,
         });
         const warning = warnings.join("\n");
@@ -223,6 +229,9 @@ describe("stripUnsafeProjectConfigFields", () => {
         expect(warning).toContain("historian.opencode.variant");
         expect(warning).toContain("historian.pi.model");
         expect(warning).toContain("historian.pi.thinking_level");
+        expect(warning).toContain("historian.broca.model");
+        expect(warning).toContain("historian.broca.fallback_models");
+        expect(warning).toContain("historian.broca.variant");
     });
 
     it("strips the historian runner from project config so a repo cannot redirect the completion", () => {
@@ -476,6 +485,15 @@ it("signed_thinking_hold is off by default and cannot be changed by a project", 
                 .signed_thinking_hold,
         ).toBe("on");
     }
+});
+
+it("a project cannot hand dream tasks to the Rust module", () => {
+    const raw: Record<string, unknown> = { rust_background_enabled: true, transform_mode: "rust" };
+    const warnings = stripUnsafeProjectConfigFields(raw);
+    expect(raw).toEqual({ transform_mode: "rust" });
+    expect(warnings).toEqual([
+        "Ignoring rust_background_enabled from project config (security: only user-level config may hand dream tasks to the Rust module).",
+    ]);
 });
 
 it("a project cannot enable prepared provider policy consumption", () => {

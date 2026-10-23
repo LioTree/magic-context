@@ -173,7 +173,6 @@ function busyHandler(onRefusal?: () => void) {
                 throw Object.assign(new Error("lock after acquisition"), { code: "SQLITE_BUSY" });
             },
         },
-        rustReplayParticipant: () => null,
     });
 }
 
@@ -259,7 +258,6 @@ describe("issue 653 independent upgrade review", () => {
                     ).toBe(true);
                 },
             },
-            rustReplayParticipant: () => null,
         });
         await handler({}, output as never);
         // The healthy pass wrote the slot in the current format.

@@ -5,6 +5,7 @@ use super::{merge, remove_path, schema, schema_parse, set_path, value_at, Warnin
 use serde_json::{json, Map, Value};
 
 const HARNESSES: [&str; 3] = ["opencode", "pi", "omp"];
+const HISTORIAN_HARNESSES: [&str; 4] = ["opencode", "pi", "omp", "broca"];
 const HISTORIAN: [&str; 6] = [
     "model",
     "fallback_models",
@@ -108,7 +109,7 @@ pub(crate) fn sanitize(project: &mut Value, warnings: &mut Vec<Warning>) {
         }
         if key == "historian" {
             strip(agent, &HISTORIAN, warnings);
-            for harness in HARNESSES {
+            for harness in HISTORIAN_HARNESSES {
                 if let Some(value) = agent.get_mut(harness) {
                     strip(value, &HISTORIAN, warnings);
                 }

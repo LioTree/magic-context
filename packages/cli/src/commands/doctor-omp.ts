@@ -7,7 +7,10 @@ import {
     getDreamerTickFailure,
 } from "@magic-context/core/features/magic-context/dreamer/tick-failure";
 import type { ContextDatabase } from "@magic-context/core/features/magic-context/storage";
-import { getMagicContextStorageResolution } from "@magic-context/core/shared/data-path";
+import {
+    getMagicContextStorageResolution,
+    isMagicContextStorageOutsideEngram,
+} from "@magic-context/core/shared/data-path";
 import { loadPiConfig } from "@magic-context/pi-core/config";
 import { parse as parseJsonc, stringify as stringifyJsonc } from "comment-json";
 import { OmpAdapter } from "../adapters/omp";
@@ -23,12 +26,7 @@ import {
     type GhCommandResult,
     submitGithubIssue,
 } from "../lib/github-issue";
-import {
-    capBodyToGithubLimit,
-    extractRecentErrors,
-    filterLogLinesBySession,
-    getLogSessionIds,
-} from "../lib/issue-body";
+import { capBodyToGithubLimit, getLogSessionIds, prepareIssueReport } from "../lib/issue-body";
 import { formatLogFileInspection, inspectMagicContextLogs, readLogLines } from "../lib/log-lines";
 import {
     detectOmpBinary,
@@ -39,6 +37,7 @@ import {
     type OmpBinaryInfo,
     runOmpCommand,
 } from "../lib/omp-helpers";
+import { checkOmpHideSecrets, collectHideSecretsSources } from "../lib/omp-hide-secrets";
 import {
     getOmpAgentDir,
     getOmpConfigPath,
@@ -49,13 +48,14 @@ import {
     getOmpUserConfigPath,
 } from "../lib/paths";
 import { type PromptIO, promptIO } from "../lib/prompts";
-import { sanitizeDiagnosticText } from "../lib/redaction";
 
 const MIN_OMP_VERSION = "17.1.7";
 type Status = "pass" | "warn" | "fail" | "info";
 interface CheckResult {
     status: Status;
     message: string;
+    /** Fixed text with no paths or values, used verbatim by the issue report. */
+    issueMessage?: string;
 }
 interface RepairPlan {
     installPlugin: boolean;
@@ -257,6 +257,9 @@ async function runHealthChecks(options: {
                     repairPlan.disableMemory = true;
                 } else add(results, "fail", "Could not read OMP memory.backend");
 
+                for (const check of checkOmpHideSecrets(collectHideSecretsSources(options.cwd)))
+                    results.push(check);
+
                 const nonGlobalSources = getOmpNonGlobalConfigSources(options.cwd);
                 if (
                     nonGlobalSources.length > 0 &&
@@ -310,6 +313,13 @@ async function runHealthChecks(options: {
 
     const storage = getMagicContextStorageResolution();
     const dbPath = join(storage.path, "context.db");
+    if (isMagicContextStorageOutsideEngram(storage.path)) {
+        add(
+            results,
+            "warn",
+            `Magic Context storage is at ${storage.path}, outside the folder Engram backs up (~/.local/share/cortexkit/magic-context). It is not included in CortexKit backups.`,
+        );
+    }
     add(results, "info", `Shared storage: ${storage.path} (source: ${storage.source})`);
     if (!existsSync(dbPath)) add(results, "info", `Shared context DB will be created at ${dbPath}`);
     else {
@@ -441,22 +451,25 @@ function ompIssueBody(
     report: HealthReport,
     logLines: string[],
     sessionFilter: string | null,
+    cwd: string,
 ): string {
     const LOG_TAIL_LINES = 400;
-    const filteredLogLines = filterLogLinesBySession(logLines, sessionFilter);
-    const recentLog = sanitizeDiagnosticText(
-        filteredLogLines.slice(-LOG_TAIL_LINES).join("\n"),
-    ).trim();
-    const errorScanWindow = sanitizeDiagnosticText(filteredLogLines.slice(-4000).join("\n"));
-    const recentErrorLines = extractRecentErrors(errorScanWindow, 20);
+    const { privacy, recentLog, recentErrorLines } = prepareIssueReport(
+        report,
+        logLines,
+        sessionFilter,
+        [cwd],
+    );
 
     return [
         "## Description",
-        sanitizeDiagnosticText(description),
+        privacy.userText(description),
+        "",
+        privacy.notice,
         "",
         "## Environment",
-        `- Magic Context plugin: ${report.pluginVersion ? `v${sanitizeDiagnosticText(report.pluginVersion)}` : "not installed"}`,
-        `- Oh My Pi: ${report.ompVersion ? sanitizeDiagnosticText(report.ompVersion) : "not detected"}`,
+        `- Magic Context plugin: ${report.pluginVersion ? `v${privacy.report(report.pluginVersion, "pluginVersion")}` : "not installed"}`,
+        `- Oh My Pi: ${report.ompVersion ? privacy.report(report.ompVersion, "ompVersion") : "not detected"}`,
         `- OS: ${process.platform} ${process.arch}`,
         `- Runtime: Node.js ${process.version}`,
         "",
@@ -464,7 +477,7 @@ function ompIssueBody(
         `- Magic Context CLI: v${selfVersion()}`,
         ...report.results.map(
             (result) =>
-                `- ${result.status.toUpperCase()}: ${sanitizeDiagnosticText(result.message)}`,
+                `- ${result.status.toUpperCase()}: ${result.issueMessage ?? privacy.healthMessage(result.message)}`,
         ),
         "",
         "## Recent errors (last 20, sanitized)",
@@ -546,6 +559,7 @@ async function runIssueFlow(options: {
                 report,
                 readLogLines(report.logFiles),
                 null,
+                options.cwd,
             ),
         );
         options.prompts.log.success(
@@ -585,7 +599,7 @@ async function runIssueFlow(options: {
     const path = join(options.cwd, `magic-context-omp-issue-${timestamp(options.deps.now())}.md`);
     const bundle = writeOmpIssueReport(
         path,
-        ompIssueBody(description, report, logLines, sessionFilter),
+        ompIssueBody(description, report, logLines, sessionFilter, options.cwd),
     );
     options.prompts.log.success(
         bundle.fullPath

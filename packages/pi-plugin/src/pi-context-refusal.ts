@@ -657,13 +657,17 @@ export function registerPiGuardedContext(
 				}
 				if (!active.dispatched) active.dispatchFields = fields;
 				active.dispatched = true;
+				// The provider request is going out with this pass's bytes.
+				budget.dispatchCertificate?.confirm();
 			} catch (error) {
 				if (signal ? signal.aborted : budget.isCancelled(error)) {
 					budget.cancel();
 					active.ready = false;
+					budget.dispatchCertificate?.refuse();
 					return;
 				}
 				active.refused = true;
+				budget.dispatchCertificate?.refuse();
 				// Report what invalidated the prepared result and the last preparation
 				// stage it reached, rather than blaming a writer lock during dispatch.
 				budget.stage = refusalOrigin
@@ -766,12 +770,19 @@ export function registerPiGuardedContext(
 				active.preparedStructure = prepared.structure;
 				budget.completed = true;
 				active.ready = true;
+				// Without Oh My Pi's provider-dispatch fence (plain Pi, or a side turn),
+				// returning the prepared request is the hand-off for sending. With the
+				// fence, the provider-dispatch hook confirms or refuses it.
+				if (!fenceEnabled || budget.sideTurn)
+					budget.dispatchCertificate?.confirm();
 				// Oh My Pi persists the new prompt concurrently with preparation; its
 				// message entry may not exist when the context hook first enters.
 				if (inputs) active.inputBranch = inputBranch(ctx, inputs);
 			}
 			return result;
 		} catch (error) {
+			// This pass's request is not handed on for sending.
+			budget.dispatchCertificate?.refuse();
 			if (budget.isCancelled(error)) {
 				budget.cancel();
 				if (isOwned()) active.ready = false;

@@ -64,16 +64,9 @@ describe("createCtxNoteTools", () => {
     });
 
     it("refuses unmigrated note writes with MC-C14 and otherwise writes the shared store", async () => {
-        let moduleCalls = 0;
         const localTools = createCtxNoteTools({
             db,
             resolveProjectPath: () => "git:project-a",
-            rustToolBackends: {
-                note: async () => {
-                    moduleCalls++;
-                    throw new Error("module note route must not be called");
-                },
-            },
         });
         db.prepare("INSERT INTO authority_managed VALUES (?, 'old-store', 1)").run("git:project-a");
         const reply = await localTools.ctx_note.execute(
@@ -81,7 +74,7 @@ describe("createCtxNoteTools", () => {
             toolContext(),
         );
         expect(reply).toBe(
-            "Magic Context's Rust mode needs a one-time migration of its store. Quit OpenCode and every ck-mc process, then run `magic-context doctor single-store migrate`. (MC-C14)",
+            "Magic Context needs a one-time migration of its store. Quit OpenCode and every ck-mc process, then run `magic-context doctor single-store migrate`. (MC-C14)",
         );
         expect(db.prepare("SELECT COUNT(*) AS count FROM notes").get()).toEqual({ count: 0 });
         db.exec("DELETE FROM authority_managed");
@@ -92,7 +85,6 @@ describe("createCtxNoteTools", () => {
             ),
         ).toContain("Saved session note");
         expect(db.prepare("SELECT content FROM notes").get()).toEqual({ content: "shared" });
-        expect(moduleCalls).toBe(0);
     });
 
     it("writes and reads session notes", async () => {
