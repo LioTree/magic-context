@@ -3,6 +3,7 @@ import { realpathSync, statSync, openSync, readSync, closeSync } from "node:fs";
 import { homedir } from "node:os";
 import { join, resolve } from "node:path";
 import { movedPayloadDifference, type PayloadProof } from "./upgrade-payloads";
+import { rootExpiryDifference, type OpenInterval, type RootExpiryProof } from "./upgrade-roots";
 
 export const quote = (name: string): string =>
 	`"${name.replaceAll('"', '""')}"`;
@@ -102,7 +103,8 @@ export function firstDifference(
 	before: string,
 	after: string,
 	onlyTables?: readonly string[],
-	proofs?: { payloads: PayloadProof[]; tables: { name: string; rows: number; sha256: string }[] },
+	proofs?: { payloads: PayloadProof[]; tables: { name: string; rows: number; sha256: string }[]; rootExpiry?: RootExpiryProof },
+	opener?: OpenInterval,
 ): string | null {
 	const db = new Database(after, { readonly: true });
 	try {
@@ -150,12 +152,20 @@ export function firstDifference(
 			}
 			const columns = oldColumns.filter((c) => newColumns.has(c.name)).map((c) => quote(c.name)).join(",");
 			// Ledger advancement is expected, but old context migration identities must survive.
-			const filter =
+			let filter =
 				name === "schema_migrations"
 					? " WHERE version IN (SELECT version FROM baseline.schema_migrations)"
 					: name === "cortexkit_schema_version"
 						? " WHERE namespace <> 'mc_cache'"
 						: "";
+			if (name === "mc_transform_session_roots" && opener) {
+				const { difference, proof } = rootExpiryDifference(db, opener);
+				if (proofs) proofs.rootExpiry = proof;
+				if (difference) return difference;
+				// Compare every byte and rowid of retained roots; policy-approved deletions
+				// are the only rows excluded from the ordinary bidirectional content check.
+				filter = " WHERE rowid IN (SELECT rowid FROM main.mc_transform_session_roots)";
+			}
 			const fields =
 				table.wr || table.type === "virtual"
 					? columns

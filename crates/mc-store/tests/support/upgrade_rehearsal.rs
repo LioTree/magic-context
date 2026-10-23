@@ -1,5 +1,75 @@
-//! Process-only crash helper using the same store migrator and SQL chain as McStore::open.
+//! Synthetic rehearsal probes using the same store migrator and SQL chain as McStore::open.
 use super::*;
+
+#[test]
+fn root_expiry_is_an_opener_effect_not_a_migration_effect() {
+    let dir = tempfile::tempdir().unwrap();
+    let descriptor = cortexkit_store_types::StorageDescriptor {
+        module_id: "magic-context".into(),
+        storage_namespace: "mc_cache".into(),
+        isolation: cortexkit_store_types::Isolation::Module,
+        backend: cortexkit_store_types::StorageBackend::Sqlite {
+            path: dir.path().join("store.db").to_string_lossy().into_owned(),
+        },
+    };
+    let inner = open_sqlite(&descriptor).unwrap();
+    inner
+        .with_conn(|db| {
+            register_legacy_trigger_functions(db)?;
+            Ok(())
+        })
+        .unwrap();
+    let released = MIGRATIONS.iter().take_while(|m| m.version <= 63).count();
+    inner.migrate(NS, &MIGRATIONS[..released]).unwrap();
+    let now = current_time_ms();
+    inner.with_conn(|db| {
+        for (id, observed) in [("expired", 1), ("recent", now + 86_400_000), ("active", 1), ("fenced", 1)] {
+            db.execute("INSERT INTO mc_transform_session_roots VALUES(?1,'/synthetic',?2)", params![id, observed])?;
+        }
+        db.execute("INSERT INTO mc_cache_state(session_id,row_version,core_state,meta,last_activity_at) VALUES('active',1,'{}','{}',?1)", [now + 86_400_000])?;
+        Ok(())
+    }).unwrap();
+    inner.migrate(NS, MIGRATIONS).unwrap();
+    inner
+        .with_conn(|db| {
+            assert_eq!(
+                db.query_row("SELECT COUNT(*) FROM mc_transform_session_roots", [], |r| r
+                    .get::<_, i64>(0))?,
+                4
+            );
+            db.execute(
+                "INSERT INTO mc_move_fences VALUES('fenced','synthetic-cut','frozen')",
+                [],
+            )?;
+            Ok(())
+        })
+        .unwrap();
+    let roots = |db: &rusqlite::Connection| -> rusqlite::Result<Vec<(i64, String, String, i64)>> {
+        db.prepare("SELECT rowid,session_id,project_root,observed_at FROM mc_transform_session_roots ORDER BY rowid")?
+            .query_map([], |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?)))?.collect()
+    };
+    let before = inner.with_conn(|db| roots(db).map_err(Into::into)).unwrap();
+    drop(inner);
+    let started = current_time_ms();
+    let opened = McStore::open(&descriptor).unwrap();
+    let finished = current_time_ms();
+    assert!(started <= finished);
+    let after = opened
+        .inner
+        .with_conn(|db| roots(db).map_err(Into::into))
+        .unwrap();
+    assert_eq!(
+        after,
+        before
+            .into_iter()
+            .filter(|r| r.1 != "expired")
+            .collect::<Vec<_>>()
+    );
+    println!(
+        "REHEARSAL_OPEN {}",
+        serde_json::json!({"startedAtMs": started, "finishedAtMs": finished})
+    );
+}
 
 #[test]
 #[ignore = "invoked by scripts/rehearse-upgrade.ts with a throwaway store root"]

@@ -10,7 +10,12 @@ use mc_store::parity_schema_manifest::{
 };
 use rusqlite::{types::ValueRef, Connection};
 use serde_json::{json, Value};
-use std::{error::Error, fs, path::PathBuf, time::Duration};
+use std::{
+    error::Error,
+    fs,
+    path::PathBuf,
+    time::{Duration, SystemTime, UNIX_EPOCH},
+};
 
 fn rows(db: &Connection, sql: &str) -> rusqlite::Result<Vec<Vec<Value>>> {
     let mut statement = db.prepare(sql)?;
@@ -111,7 +116,13 @@ fn main() -> Result<(), Box<dyn Error>> {
                     path: root.join("store.db").to_string_lossy().into_owned(),
                 },
             };
+            let started = SystemTime::now().duration_since(UNIX_EPOCH)?.as_millis();
             drop(mc_store::McStore::open(&descriptor)?);
+            let finished = SystemTime::now().duration_since(UNIX_EPOCH)?.as_millis();
+            println!(
+                "REHEARSAL_OPEN {}",
+                json!({"startedAtMs": started, "finishedAtMs": finished})
+            );
         }
         "fingerprint" => {
             let db = Connection::open(&context)?;

@@ -1,6 +1,6 @@
 import { expect, test } from "bun:test";
 import { Database } from "bun:sqlite";
-import { mkdirSync, mkdtempSync, copyFileSync, writeFileSync, existsSync, statSync } from "node:fs";
+import { mkdirSync, mkdtempSync, copyFileSync, writeFileSync, readFileSync, existsSync, statSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { compareServedBodies, firstDifference, snapshotRoot, hashFile, version, versionAfterCrash } from "./lib/upgrade-audit";
@@ -14,6 +14,8 @@ import { runMigrations } from "../packages/plugin/src/features/magic-context/mig
 import { HOSTS, sampleSessions, assertHostCoverage, assertRendered, assertTagContinuity } from "./lib/upgrade-seats";
 import { runSessionPass } from "./lib/upgrade-session-pass";
 import { databaseDoctor } from "./lib/upgrade-doctor";
+import { assertApplicationSchema } from "./lib/upgrade-schema";
+import { openInterval, type RootExpiryProof } from "./lib/upgrade-roots";
 
 function pair(): [string, string] {
 	const parent = join(tmpdir(), "magic-context", "upgrade-audit-test");
@@ -36,6 +38,194 @@ test("upgrade audit accepts additive columns without changing old session_meta k
 	db.exec("ALTER TABLE session_meta ADD COLUMN held_release TEXT");
 	db.close();
 	expect(firstDifference(before, after)).toBeNull();
+});
+
+function schemaPair(): [string, string] {
+	const [before, after] = pair();
+	for (const path of [before, after]) {
+		const db = new Database(path);
+		db.exec("DROP TABLE session_meta; CREATE TABLE session_meta(session_id TEXT PRIMARY KEY, system_prompt_hash TEXT DEFAULT '', thinking_binding_recovery_target TEXT NOT NULL DEFAULT ''); CREATE INDEX idx_memory_content ON memories(content)");
+		db.close();
+	}
+	return [before, after];
+}
+
+test("application schema rejects an unknown extra table", () => {
+	const [before, after] = schemaPair();
+	const db = new Database(after);
+	db.exec("CREATE TABLE unreviewed_runtime_state(value TEXT)"); db.close();
+	expect(() => assertApplicationSchema(before, after)).toThrow("unknown extra table unreviewed_runtime_state");
+});
+
+test("application schema rejects a missing fresh column", () => {
+	const [before, after] = schemaPair();
+	const db = new Database(after);
+	db.exec("ALTER TABLE memories DROP COLUMN embedding"); db.close();
+	expect(() => assertApplicationSchema(before, after)).toThrow("missing fresh column memories.embedding");
+});
+
+test("application schema rejects an incompatible declared type", () => {
+	const [before, after] = schemaPair();
+	const db = new Database(after);
+	db.exec("DROP TABLE memories; CREATE TABLE memories(id INTEGER PRIMARY KEY, content INTEGER, embedding BLOB); CREATE INDEX idx_memory_content ON memories(content)"); db.close();
+	expect(() => assertApplicationSchema(before, after)).toThrow("incompatible column memories.content");
+});
+
+test("application schema accepts only the reviewed legacy object and metadata profiles", () => {
+	const [before, after] = schemaPair();
+	for (const path of [before, after]) {
+		const db = new Database(path); db.exec("CREATE TABLE sequence_owner(id INTEGER PRIMARY KEY AUTOINCREMENT)"); db.close();
+	}
+	const db = new Database(after);
+	db.exec(`DROP TABLE session_meta;
+		CREATE TABLE session_meta(session_id TEXT PRIMARY KEY, system_prompt_hash INTEGER DEFAULT 0, thinking_binding_recovery_target TEXT DEFAULT '',
+			nudge_45 INTEGER DEFAULT 0, nudge_55 INTEGER DEFAULT 0, nudge_65 INTEGER DEFAULT 0, times_65_reached INTEGER DEFAULT 0,
+			todo_sticky_text TEXT DEFAULT '', todo_sticky_message_id TEXT DEFAULT '', last_emergency_drop_through_tag INTEGER DEFAULT 0);
+		CREATE TABLE recalls(tag_id INTEGER,session_id TEXT,original_content TEXT,created_at INTEGER,PRIMARY KEY(session_id,tag_id));
+		CREATE INDEX idx_recalls_session ON recalls(session_id);
+		CREATE TABLE session_notes(id INTEGER PRIMARY KEY AUTOINCREMENT,session_id TEXT NOT NULL,content TEXT NOT NULL,created_at INTEGER NOT NULL);
+		CREATE INDEX idx_session_notes_session ON session_notes(session_id);
+		CREATE TABLE session_project_backfill_state(harness TEXT PRIMARY KEY,status TEXT NOT NULL CHECK(status IN ('running','completed')),started_at INTEGER,lease_expires_at INTEGER,completed_at INTEGER,holder_id TEXT);
+		CREATE TABLE mirror_memory_repair_state(id INTEGER PRIMARY KEY CHECK(id=1),dirty INTEGER NOT NULL DEFAULT 0 CHECK(dirty IN (0,1)),updated_at INTEGER NOT NULL DEFAULT 0);
+		CREATE INDEX idx_session_meta_session ON session_meta(session_id);`);
+	const allowances = assertApplicationSchema(before, after);
+	expect(allowances).toHaveLength(16);
+	expect(allowances.every((entry) => entry.reason.length > 10 && Object.keys(entry.columns).length > 0)).toBe(true);
+	expect(() => assertApplicationSchema(before, after, false)).toThrow("unknown extra table");
+	db.exec("ALTER TABLE recalls ADD COLUMN unreviewed TEXT");
+	expect(() => assertApplicationSchema(before, after)).toThrow("legacy table recalls");
+	db.close();
+});
+
+test("application schema admits exact SQLite statistics names and untyped profiles only", () => {
+	for (const variant of ["reviewed", "typed", "unknown"]) {
+		const [before, after] = schemaPair();
+		const db = new Database(after);
+		db.exec(`CREATE TABLE fixturestat1(tbl,idx,stat); CREATE TABLE fixturestat2(tbl,idx,sampleno,sample);
+			CREATE TABLE fixturestat3(tbl,idx,neq,nlt,ndlt,sample);
+			CREATE TABLE fixturestat4(tbl ${variant === "typed" ? "TEXT" : ""},idx,nEq,nLt,nDLt,sample);`);
+		if (variant === "unknown") db.exec("CREATE TABLE fixturestat5(tbl,idx,stat)");
+		db.close();
+		// Bun's defensive SQLite forbids creating reserved names and may lack STAT4.
+		// The synthetic statistics tables are empty. Rename their equal-length names
+		// in the closed fixture file and verify the occurrence count; cell lengths and
+		// page layout stay intact, and the checker reads real PRAGMAs.
+		const bytes = readFileSync(after);
+		for (let n = 1; n <= (variant === "unknown" ? 5 : 4); n++) {
+			const from = `fixturestat${n}`, to = `sqlite_stat${n}`;
+			let count = 0, offset = bytes.indexOf(from);
+			while (offset >= 0) { bytes.write(to, offset); count++; offset = bytes.indexOf(from, offset + to.length); }
+			expect(count).toBe(3);
+		}
+		writeFileSync(after, bytes);
+		if (variant === "reviewed") expect(assertApplicationSchema(before, after, false).map((entry) => entry.object)).toEqual(["sqlite_stat1", "sqlite_stat2", "sqlite_stat3", "sqlite_stat4"]);
+		else expect(() => assertApplicationSchema(before, after)).toThrow(variant === "typed" ? "unreviewed column/type pairs" : "unknown extra table sqlite_stat5");
+	}
+});
+
+test("application schema checks a populated historical metadata layout after migration 103", () => {
+	const [before, after] = pair();
+	for (const path of [before, after]) {
+		const db = new ProductionDatabase(path);
+		db.exec("DROP TABLE memories; DROP TABLE session_meta"); initializeDatabase(db); runMigrations(db); db.close();
+	}
+	let db = new ProductionDatabase(after);
+	restorePreV103SessionMetaLayout(db);
+	db.exec("DROP TABLE session_render_cache; DROP TABLE session_meta_chunks; DROP TABLE session_meta_collection_revisions; DELETE FROM schema_migrations WHERE version >= 103");
+	for (const [column, declaration] of [["nudge_45", "INTEGER DEFAULT 0"], ["nudge_55", "INTEGER DEFAULT 0"], ["nudge_65", "INTEGER DEFAULT 0"], ["times_65_reached", "INTEGER DEFAULT 0"], ["todo_sticky_text", "TEXT DEFAULT ''"], ["todo_sticky_message_id", "TEXT DEFAULT ''"], ["last_emergency_drop_through_tag", "INTEGER DEFAULT 0"]])
+		db.exec(`ALTER TABLE session_meta ADD COLUMN ${column} ${declaration}`);
+	const sql = (db.prepare("SELECT sql FROM sqlite_master WHERE name='session_meta'").get() as { sql: string }).sql;
+	const historical = sql.replace(/system_prompt_hash TEXT DEFAULT ''/i, "system_prompt_hash INTEGER DEFAULT 0").replace(/thinking_binding_recovery_target TEXT NOT NULL DEFAULT ''/i, "thinking_binding_recovery_target TEXT DEFAULT ''");
+	expect(historical).not.toBe(sql);
+	// Recreate the empty synthetic table with its historical declaration before
+	// writing payloads, so fixture setup cannot convert the values being audited.
+	expect(db.prepare("SELECT COUNT(*) AS n FROM session_meta").get()).toEqual({ n: 0 });
+	const dependents = db.prepare("SELECT sql FROM sqlite_master WHERE tbl_name='session_meta' AND type <> 'table' AND sql IS NOT NULL").all() as { sql: string }[];
+	db.exec("PRAGMA foreign_keys=OFF; DROP TABLE session_meta"); db.exec(historical);
+	for (const dependent of dependents) db.exec(dependent.sql);
+	db.exec("INSERT INTO session_meta(session_id,cached_m0_bytes,system_prompt_hash,thinking_binding_recovery_target) VALUES('historical','opaque cache',0,NULL)");
+	runMigrations(db); db.close();
+	expect(assertApplicationSchema(before, after)).toHaveLength(9);
+	db = new ProductionDatabase(after);
+	expect(db.prepare("SELECT system_prompt_hash,thinking_binding_recovery_target FROM session_meta WHERE session_id='historical'").get()).toEqual({ system_prompt_hash: 0, thinking_binding_recovery_target: null });
+	db.close();
+});
+
+test("application schema normalizes cosmetic DDL but preserves literals and index definitions", () => {
+	const [before, after] = schemaPair();
+	const db = new Database(after);
+	db.exec(`DROP TABLE memories; CREATE TABLE "memories" ("id" integer PRIMARY KEY, /* format */ "content" text, "embedding" blob); CREATE INDEX "idx_memory_content" ON "memories" ("content")`);
+	expect(assertApplicationSchema(before, after)).toEqual([]);
+	db.exec("DROP INDEX idx_memory_content; CREATE INDEX idx_memory_content ON memories(content DESC)");
+	expect(() => assertApplicationSchema(before, after)).toThrow("index");
+	db.close();
+});
+
+test("application schema refuses unknown columns, indexes, triggers and non-cosmetic defaults", () => {
+	for (const ddl of [
+		"ALTER TABLE session_meta ADD COLUMN unknown TEXT",
+		"CREATE INDEX unknown ON memories(id)",
+		"CREATE TRIGGER unknown AFTER INSERT ON memories BEGIN SELECT 1; END",
+		"DROP TABLE session_meta; CREATE TABLE session_meta(session_id TEXT PRIMARY KEY, system_prompt_hash TEXT DEFAULT 'different', thinking_binding_recovery_target TEXT NOT NULL DEFAULT '')",
+	]) {
+		const [before, after] = schemaPair();
+		const db = new Database(after); db.exec(ddl); db.close();
+		expect(() => assertApplicationSchema(before, after)).toThrow("Application schema");
+	}
+});
+
+const ROOT_NOW = 1_800_000_000_000;
+const ROOT_CUTOFF = ROOT_NOW - 30 * 24 * 60 * 60 * 1000;
+function rootPair(): [string, string] {
+	const [before, after] = pair();
+	const db = new Database(before);
+	db.exec("CREATE TABLE mc_transform_session_roots(session_id TEXT, project_root TEXT, observed_at INTEGER, PRIMARY KEY(session_id,project_root)); CREATE TABLE mc_move_fences(session_id TEXT PRIMARY KEY); CREATE TABLE mc_cache_state(session_id TEXT PRIMARY KEY,last_activity_at INTEGER)");
+	for (const [id, observed] of [["expired", ROOT_CUTOFF - 1], ["recent", ROOT_CUTOFF + 1], ["exact", ROOT_CUTOFF], ["fenced", 1], ["active", 1], ["null-activity", 1], ["boundary", ROOT_CUTOFF + 5]] as const)
+		db.query("INSERT INTO mc_transform_session_roots VALUES(?,'/project',?)").run(id, observed);
+	db.exec(`INSERT INTO mc_move_fences VALUES('fenced'); INSERT INTO mc_cache_state VALUES('active',${ROOT_CUTOFF}),('null-activity',NULL)`);
+	db.close(); copyFileSync(before, after);
+	return [before, after];
+}
+
+test("root expiry rejects deletion of a non-expired root", () => {
+	const [before, after] = rootPair();
+	const db = new Database(after); db.exec("DELETE FROM mc_transform_session_roots WHERE session_id IN ('expired','null-activity','recent')"); db.close();
+	expect(firstDifference(before, after, undefined, undefined, { startedAtMs: ROOT_NOW, finishedAtMs: ROOT_NOW })).toContain("deleted non-expired root");
+});
+
+test("root expiry checks strict cutoff, fences, activity and unchanged retained rows", () => {
+	const [before, after] = rootPair();
+	const db = new Database(after); db.exec("DELETE FROM mc_transform_session_roots WHERE session_id IN ('expired','null-activity')");
+	const proof: { payloads: PayloadProof[]; tables: { name: string; rows: number; sha256: string }[]; rootExpiry?: RootExpiryProof } = { payloads: [], tables: [] };
+	expect(firstDifference(before, after, undefined, proof, { startedAtMs: ROOT_NOW, finishedAtMs: ROOT_NOW })).toBeNull();
+	expect(proof.rootExpiry).toEqual({ startedAtMs: ROOT_NOW, finishedAtMs: ROOT_NOW, deleted: 2, retained: 5, boundary: 0, compatibleAtMs: ROOT_NOW });
+	expect(proof.tables.find((table) => table.name === "mc_transform_session_roots")?.rows).toBe(5);
+	db.exec("UPDATE mc_transform_session_roots SET project_root='/changed' WHERE session_id='active'");
+	expect(firstDifference(before, after, undefined, undefined, { startedAtMs: ROOT_NOW, finishedAtMs: ROOT_NOW })).toContain("mc_transform_session_roots: lost/changed row");
+	db.close();
+});
+
+test("root expiry rejects eligible survivors and protected-root deletion", () => {
+	const [before, after] = rootPair();
+	const interval = { startedAtMs: ROOT_NOW, finishedAtMs: ROOT_NOW };
+	expect(firstDifference(before, after, undefined, undefined, interval)).toContain("eligible root survived");
+	const db = new Database(after);
+	db.exec("DELETE FROM mc_transform_session_roots WHERE session_id IN ('expired','null-activity','fenced')");
+	expect(firstDifference(before, after, undefined, undefined, interval)).toContain("deleted non-expired root"); db.close();
+});
+
+test("root expiry accounts for threshold crossings inside the actual opener interval", () => {
+	const [before, after] = rootPair();
+	const db = new Database(after); db.exec("DELETE FROM mc_transform_session_roots WHERE session_id IN ('expired','null-activity')");
+	const interval = { startedAtMs: ROOT_NOW, finishedAtMs: ROOT_NOW + 10 };
+	expect(firstDifference(before, after, undefined, undefined, interval)).toBeNull();
+	db.exec("DELETE FROM mc_transform_session_roots WHERE session_id IN ('boundary','exact')");
+	expect(firstDifference(before, after, undefined, undefined, interval)).toContain("no single opener clock");
+	db.exec("DELETE FROM mc_transform_session_roots WHERE session_id IN ('recent','active')");
+	expect(firstDifference(before, after, undefined, undefined, interval)).toBeNull(); db.close();
+	expect(openInterval(`REHEARSAL_OPEN ${JSON.stringify(interval)}\n`)).toEqual(interval);
+	for (const output of ["", 'REHEARSAL_OPEN {"startedAtMs":2,"finishedAtMs":1}', `REHEARSAL_OPEN ${JSON.stringify(interval)}\nREHEARSAL_OPEN ${JSON.stringify(interval)}`])
+		expect(() => openInterval(output)).toThrow();
 });
 test("database hashing reads every buffer and the short final block", () => {
     const [path] = pair();

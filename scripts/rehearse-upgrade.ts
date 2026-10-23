@@ -29,6 +29,8 @@ import {
 import { EFFECTS, CONTEXT_CRASH_VERSIONS, STORE_CRASH_VERSIONS, assertEffects, assertCrashCoverage, assertBundles, assertDoctor, assertFullDoctorTarget, assertMigrationMetrics, assertArtifactIdentity, type MigrationMetric } from "./lib/upgrade-contract";
 import type { PayloadProof } from "./lib/upgrade-payloads";
 import { HOSTS, assertHostCoverage } from "./lib/upgrade-seats";
+import { openInterval, type OpenInterval } from "./lib/upgrade-roots";
+import { assertApplicationSchema, LEGACY_TABLES, LEGACY_COLUMNS, LEGACY_INDEXES } from "./lib/upgrade-schema";
 
 const repo = resolve(import.meta.dir, "..");
 const args = process.argv.slice(2);
@@ -91,6 +93,8 @@ const evidence: Record<string, unknown> = {
 	prompts: [],
 	refusals: [],
 	preservation: [],
+	storeOpens: [],
+	schemaCompatibility: [],
 	doctor: [],
 };
 const env: NodeJS.ProcessEnv = {
@@ -197,10 +201,11 @@ function fileHashes(dir: string): Record<string, string> {
 			.map((f) => [f, hash(join(dir, f))]),
 	);
 }
-function assertPreserved(before: string, after: string): void {
+function assertPreserved(before: string, after: string, storeBefore = before): void {
+	if (!storeOpens.has(after)) throw new Error(`Missing McStore opener clock interval: ${after}`);
 	for (const name of ["context.db", "store.db"]) {
 		const proof = { payloads: [] as PayloadProof[], tables: [] as {name: string; rows: number; sha256: string}[] };
-		const difference = firstDifference(join(before, name), join(after, name), undefined, proof);
+		const difference = firstDifference(join(name === "store.db" ? storeBefore : before, name), join(after, name), undefined, proof, name === "store.db" ? storeOpens.get(after) : undefined);
 		(evidence.preservation as unknown[]).push({ route: after.split("/").at(-1), database: name, ...proof });
 		if (difference)
 			throw new Error(
@@ -218,6 +223,12 @@ type Fingerprints = {
 	store_schema: unknown;
 };
 let helper = "";
+const storeOpens = new Map<string, OpenInterval>();
+function openStore(step: string, dir: string): void {
+	const interval = openInterval(run(step, [helper, "store", dir]));
+	storeOpens.set(dir, interval);
+	(evidence.storeOpens as unknown[]).push({ step, route: dir.split("/").at(-1), ...interval });
+}
 function fingerprints(dir: string): Fingerprints {
 	return JSON.parse(
 		run(`fingerprint-${dir.split("/").at(-1)}`, [helper, "fingerprint", dir]),
@@ -379,7 +390,10 @@ function writeReport(): void {
 		"",
 		"TypeScript owns context.db migration on first host open; Rust McStore owns store.db on both paired routes. The other route uses Rust context_schema::migrations_legacy::upgrade. Fresh context bootstraps are independently produced by TypeScript and Rust. Context fingerprints use parity-1A's exact Rust snapshot/digest. Store fingerprints use the same digest and equivalent structural metadata with the mc_cache namespace ledger.",
 		"",
-		"Every retained original column is compared in both directions, with row counts and row-level SHA-256 streams. Removed session_meta payloads must match their original bytes, SQLite storage class and NULL/empty distinction through production accessors; every chunk is reconstructed. Unknown removed columns fail. Ordinary tables include rowid to preserve identity and duplicates. FTS shadow counts are reported but their physical bytes are not content contracts. All original context ledger rows must be unchanged; mc_cache version advancement and SQLite bookkeeping are excluded from content equality. New columns are checked structurally by fingerprint, not treated as original content.",
+		"Every retained original column is compared in both directions, with row counts and row-level SHA-256 streams. Removed session_meta payloads must match their original bytes, SQLite storage class and NULL/empty distinction through production accessors; every chunk is reconstructed. Unknown removed columns fail. Ordinary tables include rowid to preserve identity and duplicates. FTS shadow counts are reported but their physical bytes are not content contracts. All original context ledger rows must be unchanged; mc_cache version advancement and SQLite bookkeeping are excluded from content equality.",
+		"Fresh-to-upgraded application compatibility requires every fresh table, column and index, including declared types, defaults, nullability, keys, constraints, triggers and views. SQL whitespace, comments, keyword case, identifier quotation, outer table-declaration order and index column ordinals are cosmetic. Types must match after case/whitespace normalization except session_meta.system_prompt_hash TEXT DEFAULT '' may remain INTEGER DEFAULT 0; thinking_binding_recovery_target may remain nullable. Only exact reviewed legacy table/column/index names and column-type profiles are admitted; unknown objects or other declaration changes fail. Fingerprints remain diagnostic evidence and same-route parity checks, not a fresh-to-upgraded compatibility requirement.",
+		`Reviewed legacy tables: ${JSON.stringify(LEGACY_TABLES)}. Reviewed session_meta columns: ${JSON.stringify(LEGACY_COLUMNS)}. Reviewed legacy indexes: ${JSON.stringify(LEGACY_INDEXES)}. Actual allowances are recorded under schemaCompatibility.`,
+		"McStore opener wall-clock intervals bracket its strict 30-day lineage-root expiry. A deleted root must be expired by the interval's end, with no move fence and no cache activity at or after the cutoff; a root already eligible at the interval's start must not survive. Boundary-crossing roots are counted explicitly, and a single clock inside the interval must explain every deletion and survivor. Every retained row and rowid is unchanged; all existing fence/cache dependency rows remain in the ordinary preservation audit. Migration 64 introduces the fence table, so released-63 inputs use the newly migrated fence table. Crash store audits compare against the original baseline using their own opener interval, never against an earlier pruned reference.",
 		"",
 		"Five ordered sessions use the real old/candidate materializeM0 renderer, both m[0] and m[1], defaults, frozen clock and an empty project-docs directory. This is the prefix renderer, not a live provider request. Rendering runs on separate copies so cache/render side effects cannot conceal migration loss.",
 		"",
@@ -608,7 +622,7 @@ try {
 	const fresh = join(root, "fresh-rust");
 	mkdirSync(fresh);
 	run("fresh-rust-context", [helper, "fresh-context", fresh]);
-	run("fresh-rust-store", [helper, "store", fresh]);
+	openStore("fresh-rust-store", fresh);
 	const freshFp = fingerprints(fresh);
 	(evidence.fingerprints as Record<string, unknown>).freshRust = freshFp;
 	const freshHost = pairCopy(fresh, "fresh-host");
@@ -636,7 +650,7 @@ try {
 				? [process.execPath, host, "migrate", repo, dir]
 				: [helper, "context", dir],
 		);
-		run(`${route}-store-migrate`, [helper, "store", dir]);
+		openStore(`${route}-store-migrate`, dir);
 		for (const name of ["context.db", "store.db"]) {
 			(evidence.tables as Record<string, unknown>)[`${route}/${name}`] =
 				inventory(join(dir, name));
@@ -661,9 +675,10 @@ try {
 		});
 		const fp = fingerprints(dir);
 		(evidence.fingerprints as Record<string, unknown>)[route] = fp;
-		check(`${route} fresh schema fingerprint`, () =>
-			assertFingerprint(freshFp, fp),
-		);
+		check(`${route} application schema compatibility`, () => {
+			for (const name of ["context.db", "store.db"])
+				(evidence.schemaCompatibility as unknown[]).push({ route, database: name, allowances: assertApplicationSchema(join(fresh, name), join(dir, name), name === "context.db") });
+		});
 		const renderDir = pairCopy(dir, `${route}-render`);
 		const output = join(root, `prompts-${route}`);
 		run(`render-${route}`, [
@@ -864,9 +879,9 @@ try {
 			try {
 				await crash(route, command, dir, migration);
 				run(`reopen-${route}-${migration}`, command);
-				run(`reopen-store-${route}-${migration}`, [helper, "store", dir]);
+				openStore(`reopen-store-${route}-${migration}`, dir);
 				const preserved = check(`crash ${route} v${migration} preservation`, () =>
-					assertPreserved(join(root, route), dir),
+					assertPreserved(join(root, route), dir, baseline),
 				);
 				const schema = check(`crash ${route} v${migration} schema`, () =>
 					assertFingerprint(
@@ -899,10 +914,10 @@ try {
 				migration,
 				"store.db",
 			);
-			run(`reopen-store-${migration}`, [helper, "store", dir]);
+			openStore(`reopen-store-${migration}`, dir);
 			run(`reopen-context-store-${migration}`, [helper, "context", dir]);
 			const preserved = check(`crash store v${migration} preservation`, () =>
-				assertPreserved(join(root, "rust"), dir),
+				assertPreserved(join(root, "rust"), dir, baseline),
 			);
 			const schema = check(`crash store v${migration} schema`, () =>
 				assertFingerprint(

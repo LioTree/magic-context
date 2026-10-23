@@ -8,6 +8,8 @@
 		"rehearse-upgrade.ts",
 		"rehearse-upgrade.test.ts",
 		"lib/upgrade-audit.ts",
+		"lib/upgrade-schema.ts",
+		"lib/upgrade-roots.ts",
 		"lib/upgrade-contract.ts",
 		"lib/upgrade-payloads.ts",
 		"lib/upgrade-metrics.ts",
