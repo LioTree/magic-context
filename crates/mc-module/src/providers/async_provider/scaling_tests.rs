@@ -182,27 +182,6 @@ async fn first_certified_notice_renders_only_the_view_sources() {
     }
 }
 
-fn legacy_covered_hygiene_row(rig: &Rig) {
-    // Older baselines retained zero-weight covered rows. Insert one so trimming
-    // still exercises the version-checked metadata update and conflict retry;
-    // new measurements already omit these rows.
-    let namespace = rig.state().namespace();
-    let mut loaded = rig.store().load(&namespace).unwrap();
-    loaded
-        .meta
-        .tail_hygiene_baseline
-        .as_mut()
-        .unwrap()
-        .baseline_parts
-        .insert(
-            0,
-            crate::tail_hygiene::excluded_part("m0#0\0text".into(), "covered"),
-        );
-    rig.store()
-        .commit_meta(&namespace, loaded.row_version, &loaded.meta)
-        .unwrap();
-}
-
 #[tokio::test]
 async fn covered_ride_keeps_prefix_during_historian_meta_write() {
     // One conflict exercises the fresh-snapshot retry; two exhaust the retry
@@ -218,7 +197,6 @@ async fn covered_ride_keeps_prefix_during_historian_meta_write() {
         rig.settle().await;
         view_work::take(&rig.reference);
         rig.history(788, "new completed prefix for the ride");
-        legacy_covered_hygiene_row(&rig);
         let hooks = (0..writes)
             .map(|write| {
                 let h = rig.h.clone();
@@ -315,7 +293,6 @@ async fn covered_ride_rejects_prefix_when_hygiene_conflict_changes_certificate()
     rig.settle().await;
     view_work::take(&rig.reference);
     rig.history(68, "new completed prefix for the ride");
-    legacy_covered_hygiene_row(&rig);
     let store = rig.h.store.get().unwrap().clone();
     let namespace = rig.state().namespace();
     let interleaving = hygiene_interleaving::install(
@@ -1306,7 +1283,26 @@ impl Rig {
         let wall = Instant::now();
         let thread = cpu_time::ThreadTime::now();
         let process = cpu_time::ProcessTime::now();
-        let outcome = self.h.advance_compaction("fixture", &message).await;
+        let mut previous_progress = None;
+        let outcome = loop {
+            let outcome = self.h.advance_compaction("fixture", &message).await;
+            let incomplete = matches!(&outcome, Err(HandlerOutcome::Error { code, message })
+                if code == "transient" && message.starts_with("async read incomplete;"));
+            if !incomplete {
+                break outcome;
+            }
+            // The bus retries the same claim after a valid partial read. Do
+            // the same during fixture preparation instead of starting a new
+            // notice or treating documented progress as a failed benchmark.
+            let head = load_head(self.store(), &self.reference).unwrap().unwrap();
+            assert_eq!(head.partial_read_seq, Some(seq));
+            let progress = self.scalar("SELECT COALESCE(MAX(ordinal),0) FROM mc_async_compaction_entries WHERE session_ref=?1");
+            assert!(
+                previous_progress.is_none_or(|previous| progress > previous),
+                "a resumable read must advance"
+            );
+            previous_progress = Some(progress);
+        };
         let sample = (
             wall.elapsed().as_secs_f64() * 1e3,
             thread.elapsed().as_secs_f64() * 1e3,
@@ -2015,4 +2011,25 @@ fn cost_rule_150k_vs_1k() {
             failures.join(", ")
         );
     }
+}
+
+#[tokio::test]
+async fn benchmark_preparation_resumes_the_same_notice_until_the_read_finishes() {
+    let dir = tempfile::tempdir().unwrap();
+    let mut rig = Rig::new(dir.path()).await;
+    rig.append(1_000);
+    *rig.h
+        .provider_store
+        .async_runtime
+        .notice_read_budget
+        .lock()
+        .unwrap() = Some(Duration::from_micros(1));
+    let (_, _, outcome) = rig.try_timed_notice(0, None, 1_000).await;
+    outcome.unwrap();
+    let state = rig.state();
+    assert_eq!(state.seq, 1);
+    assert_eq!(state.completed_seq, 1);
+    assert_eq!(state.partial_read_seq, None);
+    assert_eq!(state.entries.len(), 1_000);
+    assert!(rig.runner.calls.load(std::sync::atomic::Ordering::Relaxed) > 2);
 }

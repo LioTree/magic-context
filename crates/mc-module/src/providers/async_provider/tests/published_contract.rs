@@ -469,3 +469,76 @@ async fn stage_crash_worker() {
     rig.notice(1, 90_000, None).await;
     panic!("stage crash point did not execute");
 }
+
+#[tokio::test]
+async fn descending_setup_carries_tags_appended_after_the_cut_was_staged() {
+    let dir = tempfile::tempdir().unwrap();
+    let rig = Rig::new(dir.path()).await;
+    rig.fill(180);
+    rig.history(130, "published head");
+    rig.notice(1, 90_000, None).await;
+    let staged = rig.state();
+    let first = *staged.published_cuts.keys().next_back().unwrap();
+    rig.fill(200);
+    rig.notice(2, 1_000, None).await;
+    let parent = rig.state();
+    let store = rig.h.store.get().unwrap();
+    let expected = store
+        .load_tags_for_session(&parent.namespace())
+        .unwrap()
+        .into_iter()
+        .filter(|row| {
+            ck_wire::split_block_id(&row.block_id)
+                .and_then(|(mid, _)| parent.mid_index.get(mid))
+                .is_some_and(|ordinal| *ordinal >= first)
+        })
+        .map(|row| (row.tag_number, row.block_id, row.kind, row.token_count))
+        .collect::<Vec<_>>();
+    assert!(expected.iter().any(|row| row.1.starts_with("m199#")));
+    descend_at(&rig, first, "late-child").await;
+    let child = rig.state();
+    let actual = store
+        .load_tags_for_session(&child.namespace())
+        .unwrap()
+        .into_iter()
+        .map(|row| (row.tag_number, row.block_id, row.kind, row.token_count))
+        .collect::<Vec<_>>();
+    assert_eq!(
+        actual, expected,
+        "retained entries and their staged tag namespace must have the same frontier"
+    );
+}
+
+#[tokio::test]
+async fn reset_binds_a_split_history_head_to_every_replaced_source() {
+    let dir = tempfile::tempdir().unwrap();
+    let rig = Rig::new(dir.path()).await;
+    rig.fill(180);
+    rig.history(130, "history spanning the restart cut");
+    rig.notice(1, 90_000, None).await;
+    let version = rig.newest().unwrap();
+    rig.notice(2, 1_000, Some(version)).await;
+    let view = rig.get(version).await;
+    let end = view
+        .ranges
+        .iter()
+        .take_while(|range| matches!(range, view::ViewRange::Replace { .. }))
+        .last()
+        .unwrap()
+        .to();
+    assert!(
+        view.ranges[0].to() < end,
+        "fixture must split the head's source span at the restart point"
+    );
+    let mut state = rig.state();
+    state.reset(rig.h.store.get().unwrap()).unwrap();
+    let source = state
+        .resync_sources
+        .as_ref()
+        .unwrap()
+        .head
+        .as_ref()
+        .unwrap();
+    assert_eq!(source.messages.len(), end as usize);
+    assert_eq!(source.messages.last().unwrap().mid, format!("m{}", end - 1));
+}

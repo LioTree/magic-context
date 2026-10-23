@@ -11,6 +11,7 @@ pub(super) struct PublishedCut {
     parent_namespace: String,
     #[serde(default)]
     parent_revision: Option<mc_store::CompartmentSourceRevision>,
+    tag_high_water: i64,
 }
 
 #[derive(Serialize, Deserialize)]
@@ -241,6 +242,10 @@ impl AsyncRecord {
                 parent_revision: store
                     .compartment_source_revision(&self.namespace())
                     .map_err(transient)?,
+                tag_high_water: store
+                    .tag_cache_summary(&self.namespace())
+                    .map_err(transient)?
+                    .max_tag_number,
             },
         );
         self.pending_cut_seeds.insert(first, seed);
@@ -301,6 +306,13 @@ impl McHandler {
             return unknown();
         };
         let seed: cut_seed::CutSeed = serde_json::from_str(&raw).map_err(transient)?;
+        // A cut may be prepared before the parent appends more messages. Those
+        // rows are already held by the provider, but were not in the staged
+        // tag namespace. Copy only tags allocated after the staged high-water
+        // mark; never reread transcript history.
+        let inherited_tags = store
+            .load_tags_after(&cut.parent_namespace, cut.tag_high_water)
+            .map_err(transient)?;
         if request.lineage_id.is_none() {
             return Err(invalid_field(
                 "lineage_id",
@@ -354,7 +366,7 @@ impl McHandler {
         }
         state.initial = serde_json::to_value(answer).map_err(transient)?;
         state.initial["serializer_profile"] = json!(codec.wire_id());
-        state.save(store, &[])?;
+        state.save(store, &inherited_tags)?;
         self.provider_store
             .async_runtime
             .resident

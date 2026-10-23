@@ -1282,11 +1282,14 @@ async fn stack25_delayed_acknowledgements_keep_publication_source_identities() {
         (Profile::OpenCode, 7341),
         (Profile::Pi, 7362),
     ] {
-        let (violations, _, _) = review_session(profile, seed, 32, true).await;
+        let (violations, _, log) = review_session(profile, seed, 32, true).await;
         let restored = violations
             .iter()
             .filter(|row| row.starts_with("RESTORED"))
             .collect::<Vec<_>>();
-        assert!(restored.is_empty(), "seed {seed} {profile:?}: {restored:?}");
+        assert!(
+            restored.is_empty(),
+            "seed {seed} {profile:?}: {restored:?}; steps={log:?}"
+        );
     }
 }

@@ -1391,20 +1391,39 @@ impl State {
             if let Some(version) = self.applied {
                 self.capture_frozen_version(store, version)?;
             }
-            let head = applied.and_then(|view| match view.ranges.first()? {
-                view::ViewRange::Replace { from: 0, to, bytes }
-                    if *to == 0 || self.entries.contains_key(&(to - 1)) =>
-                {
-                    Some(HistoryHeadSource {
-                        bytes: bytes.clone(),
-                        messages: self
-                            .entries
-                            .range(..*to)
-                            .map(|(ordinal, entry)| source(ordinal, entry))
-                            .collect(),
-                    })
+            // A restart-point cut may split one history head into several
+            // leading replacements. The history head's source proof covers the whole
+            // replaced span, not only the first range fragment.
+            let head = applied.and_then(|view| {
+                let view::ViewRange::Replace { from, .. } = view.ranges.first()? else {
+                    return None;
+                };
+                if *from != self.lineage_first_ordinal {
+                    return None;
                 }
-                _ => None,
+                let leading = view
+                    .ranges
+                    .iter()
+                    .take_while(|range| matches!(range, view::ViewRange::Replace { .. }))
+                    .collect::<Vec<_>>();
+                let to = leading.last()?.to();
+                if to > *from && !self.entries.contains_key(&(to - 1)) {
+                    return None;
+                }
+                let mut messages = Vec::<Value>::new();
+                for range in leading {
+                    if let view::ViewRange::Replace { bytes, .. } = range {
+                        messages.extend(serde_json::from_str::<Vec<Value>>(bytes).ok()?);
+                    }
+                }
+                Some(HistoryHeadSource {
+                    bytes: serde_json::to_string(&messages).ok()?,
+                    messages: self
+                        .entries
+                        .range(..to)
+                        .map(|(ordinal, entry)| source(ordinal, entry))
+                        .collect(),
+                })
             });
             self.resync_sources = Some(ResyncSources {
                 namespace,
@@ -2564,7 +2583,6 @@ fn compact_prefix_hygiene_once(
     let Some(baseline) = &mut loaded.meta.tail_hygiene_baseline else {
         return Ok(());
     };
-    let before = baseline.baseline_parts.len();
     // Covered excluded parts contribute no token mass. Their source membership
     // is certified by the prefix, so keep only context and uncovered parts,
     // without changing the frozen totals, generation, or reminder cadence.
@@ -2583,9 +2601,9 @@ fn compact_prefix_hygiene_once(
             *ordinal >= prefix.tail_from || prefix.context_ordinals.contains(ordinal)
         })
     });
-    if baseline.baseline_parts.len() == before {
-        return Ok(());
-    }
+    // The version check also validates the certificate's metadata snapshot.
+    // Keep it when the baseline is already canonical: concurrent historian
+    // metadata may be rebased, but a concurrent revert must invalidate reuse.
     #[cfg(test)]
     scaling_tests::hygiene_interleaving::run(&state.reference());
     store.commit_logical_transform_with_provider_policy(
@@ -4293,11 +4311,24 @@ impl McHandler {
         }
         let restored_head = state.restored_head.take();
         if let Some(head) = &restored_head {
-            if let Some(view::ViewRange::Replace { from: 0, to, bytes }) =
-                ranges.first_mut().filter(|range| range.to() == head.to)
+            let head_end = ranges
+                .iter()
+                .take_while(|range| matches!(range, view::ViewRange::Replace { .. }))
+                .last()
+                .map(view::ViewRange::to);
+            if let Some(view::ViewRange::Replace { bytes, .. }) =
+                ranges.first_mut().filter(|_| head_end == Some(head.to))
             {
-                let _ = to;
                 *bytes = head.bytes.clone();
+                for range in ranges
+                    .iter_mut()
+                    .skip(1)
+                    .take_while(|range| matches!(range, view::ViewRange::Replace { .. }))
+                {
+                    if let view::ViewRange::Replace { bytes, .. } = range {
+                        *bytes = "[]".into();
+                    }
+                }
                 let messages: Vec<Value> = serde_json::from_str(&head.bytes).map_err(transient)?;
                 let mut decoded = Vec::new();
                 for (index, mut message) in messages.into_iter().enumerate() {

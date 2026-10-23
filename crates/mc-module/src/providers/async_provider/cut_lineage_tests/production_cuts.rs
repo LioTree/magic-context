@@ -9,8 +9,9 @@ async fn descend_pair(pair: &mut Pair, first: u64, child: &str) {
     request["lineage_id"] = json!(child);
     request["descends_from"] = json!({"lineage_id":full.lineage,"through_ordinal":first - 1});
     request["request_id"] = json!(format!("setup-{child}"));
+    let label = format!("production cut Setup at {first}");
     let answer = pair
-        .both("production cut Setup", |side| {
+        .both(&label, |side| {
             let request = request.clone();
             Box::pin(async move {
                 side.dispatch(json!({"method":"compaction.setup","params":request}))
@@ -141,17 +142,22 @@ async fn session(profile: Profile, number: u64, steps: u64) {
         .is_empty());
     assert!(
         pair.engine_mismatches.borrow().is_empty(),
-        "{:?}",
-        pair.engine_mismatches.borrow()
+        "{profile:?} seed {number}: {:?}; steps={:?}",
+        pair.engine_mismatches.borrow(),
+        pair.log
     );
 }
 
 async fn differential(sessions: u64, steps: u64) {
+    let first_seed = std::env::var("MC_PRODUCTION_CUT_FIRST_SEED")
+        .ok()
+        .and_then(|value| value.parse::<u64>().ok())
+        .unwrap_or(70_000);
     let mut tasks = Vec::new();
     for index in 0..sessions {
         tasks.push(tokio::spawn(session(
-            PROFILES[(index % 4) as usize],
-            70_000 + index,
+            PROFILES[((first_seed + index) % 4) as usize],
+            first_seed + index,
             steps,
         )));
         if tasks.len() == 4 || index + 1 == sessions {
