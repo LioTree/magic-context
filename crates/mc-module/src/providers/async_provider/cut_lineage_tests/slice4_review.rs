@@ -1,9 +1,9 @@
-//! An independent adversarial review of lineage-from-cut (slice 4), with
-//! its own seeds, step mix and content checks.
+//! An independent adversarial test suite for conversations whose lineage
+//! begins at a published cut, with its own seeds, step mix and content checks.
 //!
 //! It reuses the differential fixtures (`Pair`, the fake runner, the
-//! production descent `descend_pair`) but not the slice's own session
-//! generator. Every check that matters here is independent of the
+//! production descent `descend_pair`) but uses a separate session generator
+//! from the production cut tests (`production_cuts::session`). Every check that matters here is independent of the
 //! full-processing side agreeing: the served model input of the newest view
 //! is assembled from the transcript and inspected for
 //!
@@ -20,8 +20,9 @@
 use super::*;
 use std::sync::atomic::Ordering::Relaxed;
 
-/// Turn on the full-input reference and the decision traces, as the slice's
-/// own differential does, so `compare_decisions`/`verify_passes` can run.
+/// Turn on the full-input reference and the decision traces, as
+/// `production_cuts::session` does, so `verify_passes` and the decision
+/// comparison can run.
 fn review_enable(pair: &Pair) {
     pair.oracle
         .h
@@ -776,8 +777,9 @@ fn decisions_agree(pair: &Pair, seed: u64) -> usize {
 }
 
 /// One step of the review's own mix inside a lineage that begins at
-/// `first`. Unlike the slice's generator it forks and rewrites at or after
-/// the cut and rewinds the summary inside the window.
+/// `first`. Unlike `Pair::cut_step` (the production cut tests' generator),
+/// it forks and rewrites at or after the cut and rewinds the summary inside
+/// the window.
 async fn review_step(
     pair: &mut Pair,
     rng: &mut Rng,
@@ -1049,7 +1051,7 @@ fn failure_kind(message: &str) -> String {
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-#[ignore = "independent slice-4 campaign; long, run explicitly"]
+#[ignore = "independent cut-lineage campaign; long, run explicitly"]
 async fn s4_independent_campaign() {
     let count = std::env::var("MC_S4_SESSIONS")
         .ok()
@@ -1201,7 +1203,12 @@ async fn s4_05_resync_in_a_cut_lineage_keeps_publishing() {
                 *pair.resident.runner.floor.lock().unwrap() = Some(newest_ordinal(&pair) + 100);
                 let ride = json!({"method":"compaction.ride","params":{"session_ref":pair.reference,"cause":"ceiling","deadline_ms":10_000}});
                 pair.resident.dispatch(ride).await;
-                pair.resident.runner.reads_below_floor.lock().unwrap().clear();
+                pair.resident
+                    .runner
+                    .reads_below_floor
+                    .lock()
+                    .unwrap()
+                    .clear();
                 *pair.resident.runner.floor.lock().unwrap() = Some(first);
             }
             let before = newest_version(&pair);
