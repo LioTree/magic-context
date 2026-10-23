@@ -48,16 +48,13 @@ fn root_expiry_is_an_opener_effect_not_a_migration_effect() {
         db.prepare("SELECT rowid,session_id,project_root,observed_at FROM mc_transform_session_roots ORDER BY rowid")?
             .query_map([], |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?)))?.collect()
     };
-    let before = inner.with_conn(|db| roots(db).map_err(Into::into)).unwrap();
+    let before = inner.with_conn(roots).unwrap();
     drop(inner);
     let started = current_time_ms();
     let opened = McStore::open(&descriptor).unwrap();
     let finished = current_time_ms();
     assert!(started <= finished);
-    let after = opened
-        .inner
-        .with_conn(|db| roots(db).map_err(Into::into))
-        .unwrap();
+    let after = opened.inner.with_conn(roots).unwrap();
     assert_eq!(
         after,
         before
