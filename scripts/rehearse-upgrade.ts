@@ -22,6 +22,7 @@ import {
 	inventory,
 	snapshotRoot,
 	version,
+	versionAfterCrash,
 	hashFile,
 } from "./lib/upgrade-audit";
 
@@ -318,7 +319,7 @@ async function crash(
 		);
 	const barrier = readFileSync(marker, "utf8");
 	if (!barrier.includes(`${dbName} migration ${migration}`)) throw new Error(`Wrong crash barrier: ${barrier}`);
-	const recorded = version(join(dir, dbName));
+	const recorded = versionAfterCrash(join(dir, dbName));
 	if (recorded !== migration - 1)
 		throw new Error(
 			`${name}: barrier transaction unexpectedly committed v${recorded}`,

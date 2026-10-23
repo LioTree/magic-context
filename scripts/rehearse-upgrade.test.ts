@@ -1,9 +1,9 @@
 import { expect, test } from "bun:test";
 import { Database } from "bun:sqlite";
-import { mkdirSync, mkdtempSync, copyFileSync, writeFileSync } from "node:fs";
+import { mkdirSync, mkdtempSync, copyFileSync, writeFileSync, existsSync, statSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
-import { compareServedBodies, firstDifference, snapshotRoot, hashFile } from "./lib/upgrade-audit";
+import { compareServedBodies, firstDifference, snapshotRoot, hashFile, version, versionAfterCrash } from "./lib/upgrade-audit";
 import { assertEffects, assertCrashCoverage, assertBundles, assertDoctor, assertFullDoctorTarget, assertMigrationMetrics, assertArtifactIdentity, CONTEXT_CRASH_VERSIONS, STORE_CRASH_VERSIONS } from "./lib/upgrade-contract";
 import { MOVED_COLUMNS, type PayloadProof } from "./lib/upgrade-payloads";
 import { Database as ProductionDatabase } from "../packages/plugin/src/shared/sqlite";
@@ -48,6 +48,33 @@ test("database hashing reads every buffer and the short final block", () => {
     writeFileSync(path, bytes);
     expect(hashFile(path)).toBe(new Bun.CryptoHasher("sha256").update(bytes).digest("hex"));
 });
+
+test("crash audit recovers a hot rollback journal before reading the ledger", async () => {
+    const [file] = pair();
+    const path = join(file, "..", "context.db");
+    const ready = join(file, "..", "writer-ready");
+    const db = new Database(path);
+    db.exec("PRAGMA journal_mode=DELETE; CREATE TABLE schema_migrations(version INTEGER PRIMARY KEY); INSERT INTO schema_migrations VALUES(102); CREATE TABLE durable_data(id INTEGER PRIMARY KEY,body BLOB)");
+    const insert = db.query("INSERT INTO durable_data VALUES(?,zeroblob(32768))");
+    for (let i=0;i<64;i++) insert.run(i);
+    db.close();
+    const before = hashFile(path);
+    const code = `import {Database} from 'bun:sqlite'; import {writeFileSync} from 'node:fs'; const db=new Database(${JSON.stringify(path)}); db.exec('PRAGMA cache_size=8; PRAGMA cache_spill=ON; BEGIN IMMEDIATE; UPDATE durable_data SET body=zeroblob(32769); INSERT INTO schema_migrations VALUES(103)'); writeFileSync(${JSON.stringify(ready)},'ready'); Atomics.wait(new Int32Array(new SharedArrayBuffer(4)),0,0);`;
+    const child = Bun.spawn([process.execPath,"-e",code],{stdout:"ignore",stderr:"pipe"});
+    try {
+        const deadline = performance.now()+10000;
+        while (!existsSync(ready) && child.exitCode===null && performance.now()<deadline) await Bun.sleep(10);
+        expect(existsSync(ready)).toBe(true);
+        child.kill("SIGKILL"); await child.exited;
+        expect(statSync(`${path}-journal`).size).toBeGreaterThan(512);
+        expect(() => version(path)).toThrow("readonly");
+        expect(versionAfterCrash(path)).toBe(102);
+        expect(hashFile(path)).toBe(before);
+        const recovered = new Database(path,{readonly:true});
+        expect(recovered.query("SELECT COUNT(*) AS n,SUM(length(body)) AS bytes FROM durable_data").get()).toEqual({n:64,bytes:64*32768});
+        recovered.close();
+    } finally { if (child.exitCode===null) child.kill("SIGKILL"); await child.exited; }
+},30000);
 
 test("upgrade audit names the exact changed memory row including blobs", () => {
 	const [before, after] = pair();

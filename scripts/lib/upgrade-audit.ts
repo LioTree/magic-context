@@ -63,6 +63,18 @@ export function version(path: string): number {
 	}
 }
 
+export function versionAfterCrash(path: string): number {
+	// A killed DELETE-journal writer may have spilled pages. Let SQLite roll
+	// those pages back before asking a read-only connection for the ledger.
+	const db = new Database(path, { create: false, readwrite: true });
+	try {
+		db.query("PRAGMA schema_version").get();
+	} finally {
+		db.close();
+	}
+	return version(path);
+}
+
 export function inventory(path: string): Record<string, number> {
 	const db = new Database(path, { readonly: true });
 	try {
