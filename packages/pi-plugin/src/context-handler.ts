@@ -9190,9 +9190,16 @@ const UNPAIRED_PREFIX_REWRITE_SITE = "pi-unpaired-prefix-rewrite";
  * anchor, and, with the hold off, a first render without a cached pair or the 95% wall.
  */
 function piPassMayRewritePrefix(args: RunPipelineArgs): boolean {
+	const policy = resolveSignedThinkingHoldPolicy(
+		args.signedThinkingHoldPolicy ??
+			(typeof args.signedThinkingHold === "string"
+				? args.signedThinkingHold
+				: undefined),
+	);
 	if (args.recoveryRebuildReason || args.forceSignedRebuildForFit) return true;
 	if (readPiIdentityRebuilds(args.db, args.sessionId).length > 0) return true;
 	if (
+		policy.strict &&
 		args.injection &&
 		args.reasoningClearing?.prefixBound === true &&
 		!hasActiveAnthropicThinkingTurn(
@@ -9233,16 +9240,11 @@ function piPassMayRewritePrefix(args: RunPipelineArgs): boolean {
 			if (!plan || plan.entryIds.length > 0) return true;
 		}
 	}
-	if (
-		resolveSignedThinkingHoldPolicy(
-			args.signedThinkingHoldPolicy ??
-				(typeof args.signedThinkingHold === "string"
-					? args.signedThinkingHold
-					: undefined),
-		).strict ||
-		args.signedThinkingHold === true
-	)
-		return false;
+	if (policy.strict || args.signedThinkingHold === true) return false;
+	// An unheld signed turn can rewrite on a fold or any admitted lane edit.
+	// Choose the whole-pass pair before preflight can publish a new head; the
+	// old strict-only shortcut assumed every active signed turn was held.
+	if ((args.messages as unknown[]).some(piMessageHasThinking)) return true;
 	if (args.contextUsage.percentage >= 95) return true;
 	const meta = getOrCreateSessionMeta(args.db, args.sessionId);
 	return !meta.cachedM0Bytes || !meta.cachedM1Bytes;
@@ -9251,13 +9253,23 @@ function piPassMayRewritePrefix(args: RunPipelineArgs): boolean {
 /** A cheap guess, confirmed inside the pipeline, that this pass needs no companion strip. */
 function piPassMayNeedNoCompanion(args: RunPipelineArgs): boolean {
 	if (!(args.messages as unknown[]).some(piMessageHasThinking)) return true;
+	const policy = resolveSignedThinkingHoldPolicy(
+		args.signedThinkingHoldPolicy ??
+			(typeof args.signedThinkingHold === "string"
+				? args.signedThinkingHold
+				: undefined),
+	);
 	return (
 		args.reasoningClearing?.prefixBound === true &&
 		!args.recoveryRebuildReason &&
-		hasActiveAnthropicThinkingTurn(
-			args.messages,
-			args.resolvedProviderID,
-			args.resolvedModelID,
+		policy.holdsPrefix(
+			hasActiveAnthropicThinkingTurn(
+				args.messages,
+				args.resolvedProviderID,
+				args.resolvedModelID,
+			),
+			false,
+			args.signedThinkingHold === true,
 		)
 	);
 }
@@ -9569,7 +9581,9 @@ function runSynchronousPipeline(
 		passFallbackIds[index] ??
 		resolvePiStableId(msg, index);
 	const prefixPass =
-		args.injection && args.reasoningClearing?.prefixBound === true
+		signedThinkingPolicy.strict &&
+		args.injection &&
+		args.reasoningClearing?.prefixBound === true
 			? new PiPrefixPass(
 					args.db,
 					args.sessionId,

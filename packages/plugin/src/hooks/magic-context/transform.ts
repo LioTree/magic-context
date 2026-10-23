@@ -3552,6 +3552,16 @@ export function createTransform(deps: TransformDeps) {
         // of it) must not change the system prompt in front of it either. The
         // last argument carries the same fact to an idle-expired request, whose
         // date would otherwise advance without asking for permission.
+        let signedThinkingKeptForDate: boolean | undefined =
+            postTransformResult.openTurnSignedThinkingKept === true;
+        if (signedThinkingPolicy.strict) {
+            signedThinkingKeptForDate = isPrefixBoundThinkingModel(
+                resolvedProviderID,
+                modelForBudget?.modelID,
+            )
+                ? hasKeptSignedThinking(output.messages)
+                : undefined;
+        }
         finishSystemDateRefresh(
             deps.historyRefreshSessions,
             dateRequest,
@@ -3559,7 +3569,7 @@ export function createTransform(deps: TransformDeps) {
                 !activeThinkingPrefixHold &&
                 postTransformResult.openTurnSignedThinkingKept !== true) ||
                 postTransformResult.thinkingReleasedForFit === true,
-            postTransformResult.openTurnSignedThinkingKept === true,
+            signedThinkingKeptForDate,
         );
         if (
             activeThinkingPrefixHold &&
@@ -3985,6 +3995,7 @@ import {
     beginSystemDateRequest,
     bindSystemDateRequest,
     finishSystemDateRefresh,
+    hasKeptSignedThinking,
     registerSystemDateRefresh,
     systemDateRequestForOutput,
     systemDateRequestIdentity,

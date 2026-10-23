@@ -44,6 +44,7 @@ import { queueM0Mutation } from "../../features/magic-context/storage-m0-mutatio
 import { setPersistedCompactionMarkerState } from "../../features/magic-context/storage-meta-persisted";
 import { getReasoningRemovalState } from "../../features/magic-context/storage-reasoning-removal";
 import { createTagger } from "../../features/magic-context/tagger";
+import { clearModelsDevCache, refreshModelLimitsFromApi } from "../../shared/models-dev-cache";
 import { Database } from "../../shared/sqlite";
 import { closeQuietly } from "../../shared/sqlite-helpers";
 import { createTestTempDir } from "../../shared/test-temp-dir";
@@ -252,12 +253,14 @@ function readPart(callID: string, filePath: string, output: string) {
 }
 
 /** A current-turn step: read one more source file. */
-function defaultStepParts(n: number): unknown[] {
+function defaultStepParts(n: number, reachableEmergencyFloor = false): unknown[] {
     return [
         readPart(
             `call-${n}`,
             `/project/src/file-${n}.ts`,
-            `export const v${n} = ${n};\n`.repeat(400),
+            reachableEmergencyFloor
+                ? `step ${n}\n${"word ".repeat(8000)}`
+                : `export const v${n} = ${n};\n`.repeat(400),
         ),
     ];
 }
@@ -302,6 +305,8 @@ async function fixture(
     dir: string,
     scenario: string,
 ): Promise<Fixture> {
+    const reachableEmergencyFloor =
+        lane === "emergency 95% wall" && (scenario === "mid-loop" || scenario === "control");
     const db = new Database(":memory:");
     initializeDatabase(db);
     runMigrations(db);
@@ -417,7 +422,7 @@ async function fixture(
                           },
                       ]
                     : []),
-                ...(parts ? parts(step) : defaultStepParts(step)),
+                ...(parts ? parts(step) : defaultStepParts(step, reachableEmergencyFloor)),
             ],
         });
     };
@@ -755,12 +760,46 @@ function withFixture(
 ) {
     return async () => {
         const { dir, cleanup } = createTestTempDir("signed-prefix-audit-");
+        const pinEmergencyLimit =
+            lane === "emergency 95% wall" && (scenario === "mid-loop" || scenario === "control");
+        const priorDataHome = process.env.XDG_DATA_HOME;
+        const priorTestData = process.env.MAGIC_CONTEXT_TEST_DATA_DIR;
         let f: Fixture | undefined;
         try {
+            if (pinEmergencyLimit) {
+                // The pressure witness needs enough real tail mass to reclaim,
+                // with a fixed window rather than a machine's catalog cache.
+                process.env.XDG_DATA_HOME = dir;
+                process.env.MAGIC_CONTEXT_TEST_DATA_DIR = dir;
+                clearModelsDevCache();
+                await refreshModelLimitsFromApi({
+                    config: {
+                        providers: async () => ({
+                            data: {
+                                providers: [
+                                    {
+                                        id: MODEL.providerID,
+                                        models: {
+                                            [MODEL.modelID]: { limit: { context: 100_000 } },
+                                        },
+                                    },
+                                ],
+                            },
+                        }),
+                    },
+                });
+            }
             f = await fixture(generation, subagent, lane, dir, scenario);
             await body(f);
         } finally {
             if (f) closeQuietly(f.db);
+            if (pinEmergencyLimit) {
+                if (priorDataHome === undefined) delete process.env.XDG_DATA_HOME;
+                else process.env.XDG_DATA_HOME = priorDataHome;
+                if (priorTestData === undefined) delete process.env.MAGIC_CONTEXT_TEST_DATA_DIR;
+                else process.env.MAGIC_CONTEXT_TEST_DATA_DIR = priorTestData;
+                clearModelsDevCache();
+            }
             cleanup();
         }
     };

@@ -23,10 +23,9 @@ import {
 import { createTestTempDirFromPath } from "../shared/test-temp-dir";
 import {
     SESSION_ID,
-    seedTsEraTagsThenRustHistory,
-    TS_ERA_TEXT,
-} from "../tools/ctx-expand/rust-mode-tag.test-support";
-import { CTX_EXPAND_RUST_TAG_REFUSAL } from "../tools/ctx-expand/tools";
+    seedTypeScriptTagHistory,
+    TS_TAG_TEXT,
+} from "../tools/ctx-expand/tag-history.test-support";
 import {
     FULL_PARAMETER_DESCRIPTIONS,
     LIGHT_PARAMETER_DESCRIPTIONS,
@@ -441,11 +440,8 @@ describe("createToolRegistry — user-owned registration default", () => {
     });
 });
 
-describe("createToolRegistry — ctx_expand tag lookup and the transform mode", () => {
-    // The registry must hand the resolved transform mode to ctx_expand: in Rust mode
-    // the visible tag numbers come from the module, and context.db's leftover rows
-    // from the TypeScript era reuse them.
-    async function expandTag(transformMode: "ts" | "rust"): Promise<unknown> {
+describe("createToolRegistry — ctx_expand tag lookup", () => {
+    async function expandTag(): Promise<unknown> {
         const root = join(tmpdir(), "magic-context", "expand-tag");
         mkdirSync(root, { recursive: true });
         const dir = createTestTempDirFromPath(join(root, "registry-"));
@@ -453,9 +449,9 @@ describe("createToolRegistry — ctx_expand tag lookup and the transform mode", 
         process.env.XDG_DATA_HOME = dir;
         const db = openDatabase();
         if (!db) throw new Error("test database unavailable");
-        const cleanup = seedTsEraTagsThenRustHistory(db);
+        const cleanup = seedTypeScriptTagHistory(db);
         try {
-            const tools = buildRegistry({ transform_mode: transformMode });
+            const tools = buildRegistry({});
             return await tools.ctx_expand!.execute({ tag: 75386 }, {
                 sessionID: SESSION_ID,
             } as never);
@@ -464,11 +460,7 @@ describe("createToolRegistry — ctx_expand tag lookup and the transform mode", 
         }
     }
 
-    it("refuses tag lookup when the process runs the Rust transform", async () => {
-        expect(await expandTag("rust")).toBe(CTX_EXPAND_RUST_TAG_REFUSAL);
-    });
-
     it("keeps tag lookup for the TypeScript transform", async () => {
-        expect(await expandTag("ts")).toContain(TS_ERA_TEXT);
+        expect(await expandTag()).toContain(TS_TAG_TEXT);
     });
 });

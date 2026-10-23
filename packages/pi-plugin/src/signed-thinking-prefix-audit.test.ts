@@ -240,6 +240,7 @@ const FIRST_TURN_COMPARTMENT = {
 };
 
 interface Fixture {
+	reachableEmergencyFloor: boolean;
 	db: ReturnType<typeof createTestDb>;
 	sessionId: string;
 	mock: StrictBindingMock;
@@ -419,6 +420,9 @@ async function fixture(
 			(t) => t.messageId === callId || t.messageId.endsWith(callId),
 		);
 	const f: Fixture = {
+		reachableEmergencyFloor:
+			lane === "emergency 95% wall" &&
+			(scenario === "mid-loop" || scenario === "control"),
 		db,
 		sessionId,
 		mock,
@@ -530,7 +534,9 @@ async function toolLoop(
 					stale ? `loop-reduce-${n}` : `call-${n}`,
 					stale
 						? "Queued: drop §1§"
-						: `export const v${n} = ${n};\n`.repeat(400),
+						: f.reachableEmergencyFloor
+							? `step ${n}\n${"word ".repeat(8000)}`
+							: `export const v${n} = ${n};\n`.repeat(400),
 				],
 			],
 		);

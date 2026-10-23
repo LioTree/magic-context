@@ -2418,7 +2418,9 @@ export async function runPostTransformPhase(
     );
     const recordTurn = prefixTurn(args.messages, (message) => message.info.id);
     const prefixRecordEnabled =
-        m0M1EnabledForFold && args.thinkingBindingRecoveryEnabledForModel === true;
+        signedThinkingPolicy.strict &&
+        m0M1EnabledForFold &&
+        args.thinkingBindingRecoveryEnabledForModel === true;
     let prefixRecord: ServedPrefix<MessageLike> | null = null;
     if (prefixRecordEnabled) {
         try {

@@ -177,7 +177,8 @@ test("Pi compaction-off replays a first render's thinking strip on later passes 
 			expect.arrayContaining([
 				"binding_mismatch:step-1",
 				"binding_mismatch:step-3",
-				"binding_mismatch_order:end",
+				"binding_mismatch_entry_order:end:step-1",
+				"binding_mismatch_entry_order:end:step-3",
 			]),
 		);
 		s.step(4);

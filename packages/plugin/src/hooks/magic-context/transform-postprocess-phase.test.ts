@@ -14300,6 +14300,7 @@ it("compaction-off late digest failure serves the complete cached head, not raw 
     const base = () =>
         basePostTransformArgs(db!, sessionId, [structuredClone(first)], {
             compactionOff: true,
+            signedThinkingHold: "on",
             m0M1: injection,
             resolvedProviderID: "anthropic",
             resolvedModelID: "claude-opus-5-5",
