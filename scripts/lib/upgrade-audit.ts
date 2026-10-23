@@ -1,11 +1,24 @@
 import { Database } from "bun:sqlite";
-import { realpathSync, statSync } from "node:fs";
+import { realpathSync, statSync, openSync, readSync, closeSync } from "node:fs";
 import { homedir } from "node:os";
 import { join, resolve } from "node:path";
+import { movedPayloadDifference, type PayloadProof } from "./upgrade-payloads";
 
 export const quote = (name: string): string =>
 	`"${name.replaceAll('"', '""')}"`;
 export const NOW = 1_800_000_000_000;
+
+export function hashFile(path: string): string {
+    const fd = openSync(path, "r");
+    const buffer = Buffer.allocUnsafe(1024 * 1024);
+    const digest = new Bun.CryptoHasher("sha256");
+    try {
+        let count: number;
+        while ((count = readSync(fd, buffer, 0, buffer.length, null)) > 0)
+            digest.update(buffer.subarray(0, count));
+        return digest.digest("hex");
+    } finally { closeSync(fd); }
+}
 
 export function snapshotRoot(path: string): string {
 	const requested = resolve(path);
@@ -77,6 +90,7 @@ export function firstDifference(
 	before: string,
 	after: string,
 	onlyTables?: readonly string[],
+	proofs?: { payloads: PayloadProof[]; tables: { name: string; rows: number; sha256: string }[] },
 ): string | null {
 	const db = new Database(after, { readonly: true });
 	try {
@@ -116,9 +130,13 @@ export function firstDifference(
 					}[]
 				).map((c) => c.name),
 			);
-			for (const c of oldColumns)
-				if (!newColumns.has(c.name)) return `${name}: removed column ${c.name}`;
-			const columns = oldColumns.map((c) => quote(c.name)).join(",");
+			const removed = oldColumns.filter((c) => !newColumns.has(c.name));
+			if (removed.length) {
+				if (name !== "session_meta") return `${name}: removed column ${removed[0].name}`;
+				const difference = movedPayloadDifference(db, removed.map((c) => c.name), proofs?.payloads ?? []);
+				if (difference) return difference;
+			}
+			const columns = oldColumns.filter((c) => newColumns.has(c.name)).map((c) => quote(c.name)).join(",");
 			// Ledger advancement is expected, but old context migration identities must survive.
 			const filter =
 				name === "schema_migrations"
@@ -152,6 +170,16 @@ export function firstDifference(
 				.get() as { old: number; next: number };
 			if (counts.old !== counts.next)
 				return `${name}: row count ${counts.old} -> ${counts.next}`;
+			if (proofs) {
+				const hashes = [old, next].map((sql) => {
+					const digest = new Bun.CryptoHasher("sha256");
+					for (const row of db.query(`${sql} ORDER BY ${table.wr ? columns : "rowid"}`).iterate())
+						digest.update(JSON.stringify(row, (_key, value) => value instanceof Uint8Array ? { blob: Buffer.from(value).toString("hex") } : typeof value === "bigint" ? value.toString() : value) + "\n");
+					return digest.digest("hex");
+				});
+				if (hashes[0] !== hashes[1]) return `${name}: row checksum differs`;
+				proofs.tables.push({ name, rows: counts.old, sha256: hashes[0] });
+			}
 		}
 		return null;
 	} finally {

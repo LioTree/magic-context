@@ -8,6 +8,12 @@
 		"rehearse-upgrade.ts",
 		"rehearse-upgrade.test.ts",
 		"lib/upgrade-audit.ts",
+		"lib/upgrade-contract.ts",
+		"lib/upgrade-payloads.ts",
+		"lib/upgrade-metrics.ts",
+		"lib/upgrade-seats.ts",
+		"lib/upgrade-session-pass.ts",
+		"lib/upgrade-doctor.ts",
 		"lib/upgrade-host.ts",
 		"lib/upgrade-live-hosts.ts"
 	],
