@@ -1,17 +1,308 @@
-//! Adversarial gate over the host-runner claim lane: the arrangement where a
-//! transform pass queues a historian run and a separate host process claims it,
-//! runs the completion, and reports back.
+//! Historian execution-path gates, including the host-runner claim lane: a transform
+//! pass queues a run and a separate host claims it, completes it and reports back.
 //!
-//! Every test drives the real dispatcher, the real store and the real restart
-//! path. Each one settles one question about what survives a dead claimant, a
-//! module restart, or a second project sharing this machine's store. Where a test
-//! records behaviour nobody promised, its name says what it observed rather than
-//! what it approves of.
+//! Tests drive the real dispatcher or provider firing preparation and the real
+//! store. Recovery cases also exercise a module restart, a dead claimant, or a
+//! second project sharing the store. Where a test records behaviour nobody
+//! promised, its name says what it observed rather than what it approves of.
 
 use super::*;
 use rusqlite::Connection;
 
 const A2_AWAIT_BUDGET_MS: i64 = 660_000;
+
+/// Keep stage sends observable: the general test producer's default stage method
+/// discards the stage key before recording the ordinary send.
+struct DormantProducer(Box<dyn HistorianProducerDriver + Send>);
+
+#[async_trait]
+impl HistorianProducerDriver for DormantProducer {
+    async fn session_runner_limits(
+        &mut self,
+        child: &str,
+    ) -> Result<Option<runner_limits::RunnerLimits>, HistorianProducerError> {
+        self.0.session_runner_limits(child).await
+    }
+
+    async fn bind_session(&mut self, session: &str) -> Result<(), HistorianProducerError> {
+        self.0.bind_session(session).await
+    }
+
+    async fn start(
+        &mut self,
+        session: &str,
+        system: &str,
+        prompt: &str,
+        model: &str,
+    ) -> Result<RunHandle, HistorianProducerError> {
+        self.0.start(session, system, prompt, model).await
+    }
+
+    async fn start_stage_with_temperature(
+        &mut self,
+        _session: &str,
+        stage_key: &str,
+        _system: &str,
+        _prompt: &str,
+        _model: &str,
+        _variant: Option<&str>,
+        _temperature: Option<f64>,
+    ) -> Result<RunHandle, HistorianProducerError> {
+        panic!("a dormant carrier sent a stage key: {stage_key}");
+    }
+
+    async fn await_output(&mut self, run: &str) -> Result<ProducerOutput, HistorianProducerError> {
+        self.0.await_output(run).await
+    }
+
+    async fn status(&mut self, run: &str) -> Result<RunState, HistorianProducerError> {
+        self.0.status(run).await
+    }
+
+    async fn cancel(&mut self, run: &str) -> Result<(), HistorianProducerError> {
+        self.0.cancel(run).await
+    }
+
+    async fn close(&mut self) {
+        self.0.close().await;
+    }
+}
+
+struct DormantCarrierFactory {
+    producer: Arc<ProducerState>,
+    runner_binds: Mutex<Vec<(String, String, String)>>,
+}
+
+#[async_trait]
+impl HistorianProducerFactory for DormantCarrierFactory {
+    async fn connect(
+        &self,
+        project: &Path,
+    ) -> Result<Box<dyn HistorianProducerDriver + Send>, HistorianProducerError> {
+        let inner = TestProducerFactory {
+            state: Arc::clone(&self.producer),
+        }
+        .connect(project)
+        .await?;
+        Ok(Box::new(DormantProducer(inner)))
+    }
+
+    async fn connect_session_runner(
+        &self,
+        identity: &session_resolver::RunnerBindIdentity,
+        route: &SessionRunnerRoute,
+    ) -> Result<Box<dyn HistorianProducerDriver + Send>, HistorianProducerError> {
+        self.runner_binds.lock().unwrap().push((
+            route.module_id().into(),
+            route.parent_session().into(),
+            identity.harness.clone(),
+        ));
+        self.connect(&identity.project_root).await
+    }
+}
+
+fn dormant_context(store: &McStore, dir: &Path) -> PathBuf {
+    let context = PathBuf::from(sqlite_store_path(
+        dir.join("data").to_str().unwrap(),
+        DEFAULT_MODULE_ID,
+    ))
+    .parent()
+    .unwrap()
+    .join("context.db");
+    store.install_context_domain(Arc::new(
+        single_store_reads::ModuleContextDomain::open(&context).unwrap(),
+    ));
+    context
+}
+
+fn assert_no_dormant_stages(context: &Path) {
+    // An installed context domain makes this a real write fence, rather than the
+    // stage writer's no-adapter early return.
+    let conn = Connection::open(context).unwrap();
+    let stages: i64 = conn
+        .query_row("SELECT COUNT(*) FROM memory_stage_attempts", [], |row| {
+            row.get(0)
+        })
+        .unwrap();
+    assert_eq!(stages, 0, "dormant carriers must not persist stage keys");
+}
+
+async fn dormant_producer_firing(module: Option<&str>, harness: &str) {
+    let producer = Arc::new(ProducerState::default());
+    *producer.runner_limits.lock().unwrap() = Some(runner_limits::RunnerLimits {
+        max_steps: true,
+        max_output_tokens: true,
+        no_tools: true,
+    });
+    let mut config = default_test_config();
+    if module.is_none() {
+        config.historian_runner = Some(HistorianRunnerKind::Broca);
+    }
+    let (mut handler, store, dir, project) = handler_with_store(Arc::clone(&producer), config);
+    let context = dormant_context(&store, dir.path());
+    let factory = Arc::new(DormantCarrierFactory {
+        producer: Arc::clone(&producer),
+        runner_binds: Mutex::new(Vec::new()),
+    });
+    handler.producer_factory = factory.clone();
+    let mut binding = handler.facade_binding(7).unwrap();
+    binding.harness = harness.into();
+    binding.principal = module.map(|module_id| subc_protocol::Principal::Reserved {
+        module_id: module_id.into(),
+    });
+    handler.bind_route(7, binding.clone());
+
+    // Persist the actual transcript before preparing the provider's runner-lane
+    // firing; successful publication checks its selected message identities.
+    let mut seed = request(big_messages());
+    seed["historian_model_chain"] = json!([]);
+    let seeded = call_transform_request(&handler, seed).await;
+    assert_eq!(seeded["historian"]["fired"], false, "{seeded}");
+    let parsed: TransformRequest = serde_json::from_value(request(big_messages())).unwrap();
+    let projection = crate::ck_wire::project_messages(&parsed.messages).unwrap();
+    let mut timings = HistorianTriggerTimings::default();
+    let prepared = handler.prepare_historian_fire(
+        Arc::clone(&store),
+        &parsed,
+        &binding,
+        project.to_str().unwrap(),
+        &projection,
+        HistorianPrepareContext {
+            rust_background_enabled: Some(true),
+            now: now_ms(),
+            snapshot_generation: None,
+            publication_fence: None,
+            tag_snapshot: None,
+            async_coverage: None,
+            reclaim_ride_available: false,
+            runner_lane: true,
+            timings: &mut timings,
+        },
+    );
+    let PreparedHistorianAction::FireReady(prepared) = prepared else {
+        panic!("the carrier must prepare a real firing");
+    };
+    assert_eq!(prepared.task.session_runner.is_some(), module.is_some());
+    let outcome = McHandler::execute_historian_firing_task(factory.clone(), prepared.task)
+        .await
+        .unwrap();
+    assert!(
+        matches!(outcome, historian::HistorianDriveOutcome::Completed(_)),
+        "{outcome:?}"
+    );
+    assert_eq!(store.load_compartments("ses").unwrap().len(), 1);
+    assert_eq!(
+        producer.starts.load(Ordering::SeqCst),
+        1,
+        "no turn-two send"
+    );
+    assert_eq!(
+        producer.systems.lock().unwrap().as_slice(),
+        &[historian_prompt::HISTORIAN_SYSTEM_PROMPT]
+    );
+    let sessions = producer.sessions.lock().unwrap();
+    assert_eq!(sessions.len(), 1);
+    assert!(
+        sessions[0].starts_with("mc-historian:"),
+        "ordinary child identity: {sessions:?}"
+    );
+    let expected_binds: Vec<_> = module
+        .map(|module| (module.into(), "ses".into(), harness.into()))
+        .into_iter()
+        .collect();
+    assert_eq!(*factory.runner_binds.lock().unwrap(), expected_binds);
+    assert!(gate_queue_rows(&dir.path().join("data")).is_empty());
+    assert_no_dormant_stages(&context);
+    assert!(!historian_stage::lifecycle_enabled());
+    assert!(!std::hint::black_box(
+        historian_stage::RUST_LIFECYCLE_ENABLED
+    ));
+}
+
+#[tokio::test(flavor = "current_thread")]
+async fn gate_dormant_thalamus_harness_opencode_is_one_pass() {
+    dormant_producer_firing(Some("thalamus-harness"), "opencode").await;
+}
+
+#[tokio::test(flavor = "current_thread")]
+async fn gate_dormant_thalamus_harness_opencode2_is_one_pass() {
+    dormant_producer_firing(Some("thalamus-harness"), "opencode2").await;
+}
+
+#[tokio::test(flavor = "current_thread")]
+async fn gate_dormant_thalamus_harness_pi_is_one_pass() {
+    dormant_producer_firing(Some("thalamus-harness"), "pi").await;
+}
+
+#[tokio::test(flavor = "current_thread")]
+async fn gate_dormant_thalamus_harness_omp_is_one_pass() {
+    dormant_producer_firing(Some("thalamus-harness"), "omp").await;
+}
+
+#[tokio::test(flavor = "current_thread")]
+async fn gate_dormant_broca_session_runner_is_one_pass() {
+    dormant_producer_firing(Some("broca"), "broca").await;
+}
+
+#[tokio::test(flavor = "current_thread")]
+async fn gate_dormant_thalamus_session_runner_is_one_pass() {
+    dormant_producer_firing(Some("thalamus"), "claude-code").await;
+}
+
+#[tokio::test(flavor = "current_thread")]
+async fn gate_dormant_configured_broca_is_one_pass() {
+    dormant_producer_firing(None, "opencode").await;
+}
+
+#[tokio::test(flavor = "current_thread")]
+async fn gate_dormant_host_queue_is_one_pass() {
+    let producer = Arc::new(ProducerState::default());
+    let (handler, store, dir, _) = handler_with_store(Arc::clone(&producer), host_runner_config());
+    let context = dormant_context(&store, dir.path());
+    assert_eq!(
+        call_transform(&handler, big_messages()).await["historian"]["fired"],
+        true
+    );
+    let queued = a2_await_queued_run(&handler).await;
+    let claim = call_dispatch_request(
+        &handler,
+        json!({"method":"historian.claim","v":1,
+            "run_id":queued["run_id"],"claimant_instance_id":"dormant-host"}),
+    )
+    .await;
+    assert_eq!(claim["ok"], true, "{claim}");
+    assert_eq!(
+        claim["prompt"]["system"],
+        historian_prompt::HISTORIAN_SYSTEM_PROMPT
+    );
+    assert!(
+        claim.get("lifecycle").is_none(),
+        "no stage key or turn-two retention: {claim}"
+    );
+    assert_no_dormant_stages(&context);
+    let completed = call_dispatch_request(
+        &handler,
+        json!({"method":"historian.complete","v":1,
+            "run_id":queued["run_id"],"token":claim["token"],
+            "output":{"text":historian_output_for_prompt(claim["prompt"]["user"].as_str().unwrap()),
+                "length_capped":false}}),
+    )
+    .await;
+    assert_eq!(completed["ok"], true, "{completed}");
+    wait_for_idle(&store).await;
+    assert_eq!(store.load_compartments("ses").unwrap().len(), 1);
+    let pending =
+        call_dispatch_request(&handler, json!({"method":"historian.pending","v":1})).await;
+    assert!(
+        pending["runs"].as_array().unwrap().is_empty(),
+        "no second host send: {pending}"
+    );
+    assert!(gate_queue_rows(&dir.path().join("data")).is_empty());
+    assert_eq!(producer.connects.load(Ordering::SeqCst), 0);
+    assert_eq!(producer.starts.load(Ordering::SeqCst), 0);
+    assert_no_dormant_stages(&context);
+    assert!(!historian_stage::lifecycle_enabled());
+}
 
 /// One claim queue row, in the columns a gate reads.
 struct GateQueueRow {
