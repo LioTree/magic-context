@@ -605,12 +605,11 @@ export async function runCompartmentAgent(deps: HiddenCompartmentRunnerDeps): Pr
         // reconcile step compares the fact with existing memory instead.
         const turnOneLane = resolveTurnOneLane(deps.memoryLifecycleLane);
         const anchoredFacts = turnOneLane === "enabled" && deps.memoryEnabled !== false;
-        // Every attempt in the chain (configured fallbacks, then the session
-        // model as the last resort) sends this same prompt, so size it for each
+        // Every configured attempt sends this same prompt, so size it for each
         // of their windows too, resolved as their pre-send check resolves them.
         const fallbackWindows = [
             ...(deps.fallbackModels ?? []).map((entry) => toModelEntry(entry)?.model),
-            deps.fallbackModelId,
+            ...(toModelEntry(deps.model) ? [] : [deps.fallbackModelId]),
         ]
             .filter((key): key is string => typeof key === "string" && key !== producerModel)
             .map((key) => resolveHistorianProducerWindow(key, deps.historianMaxOutputTokens));

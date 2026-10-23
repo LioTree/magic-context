@@ -60,6 +60,10 @@ async function runTrials(first: number, last: number, seed: number) {
 		rmSync(path, { force: true });
 		const db = createTestDb(path);
 		const locker = new Database(path);
+		// Message indexing can finish on a worker after a context pass returns.
+		// Let only the locker wait for that writer; the handler still uses zero
+		// busy timeout below and must serve its LKG replay while this lock is held.
+		locker.exec("PRAGMA busy_timeout=5000");
 		const sessionId = `pi-independent-${trial}`;
 		const fake = createFakePi();
 		Object.assign(fake.pi, { getAllTools: () => [] });
@@ -159,6 +163,7 @@ async function runTrials(first: number, last: number, seed: number) {
 			if (busy) {
 				db.exec("PRAGMA busy_timeout=0");
 				locker.exec("BEGIN IMMEDIATE");
+				expect(locker.inTransaction).toBe(true);
 			}
 			try {
 				const result = await handler(

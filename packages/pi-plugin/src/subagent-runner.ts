@@ -53,6 +53,12 @@ import type {
 } from "@magic-context/core/shared/subagent-runner";
 import { logTemperatureDecision } from "@magic-context/core/shared/subagent-temperature";
 import { summarizeChildStderr } from "@magic-context/core/shared/summarize-child-stderr";
+import { OPENCODE_OUTPUT_CAP } from "@magic-context/core/shared/window-geometry";
+import {
+	HISTORIAN_CACHE_TAIL_ENV,
+	HISTORIAN_MAX_OUTPUT_TOKENS_ENV,
+	SUBAGENT_OUTPUT_CEILING_ENV,
+} from "./historian-calibration-extension";
 import { type PiHarnessKind, resolvePiHarnessKind } from "./pi-harness-kind";
 import {
 	classifyZenFreeTierFailure,
@@ -64,6 +70,12 @@ import {
 import { SubagentTelemetry, subagentStepCap } from "./subagent-telemetry";
 
 const PI_CODING_AGENT_MODULE = "@earendil-works/pi-coding-agent";
+/**
+ * Output cap for a hidden child with no configured maxTokens. OpenCode sends
+ * min(model output limit, 32k) for every hidden child, so Pi children use the
+ * same ceiling. The child extension only lowers Pi's request to this value.
+ */
+export const HIDDEN_CHILD_OUTPUT_CEILING = OPENCODE_OUTPUT_CAP;
 const PI_CODING_AGENT_PACKAGE_NAMES = new Set([
 	PI_CODING_AGENT_MODULE,
 	"@oh-my-pi/pi-coding-agent",
@@ -1694,8 +1706,12 @@ export class PiSubagentRunner implements PiRpcHistorianRunner {
 
 			let child: ReturnType<typeof childProcess.spawn>;
 			const parentEnv = { ...process.env };
-			// Calibration belongs to this invocation, not to a spawning historian child.
+			// Calibration and output caps belong to this invocation, not to a
+			// spawning historian child.
 			delete parentEnv.MAGIC_CONTEXT_HISTORIAN_TEMPERATURE;
+			delete parentEnv[HISTORIAN_MAX_OUTPUT_TOKENS_ENV];
+			delete parentEnv[SUBAGENT_OUTPUT_CEILING_ENV];
+			delete parentEnv[HISTORIAN_CACHE_TAIL_ENV];
 			try {
 				child = inRootAsyncContext(() =>
 					this.spawnImpl(
@@ -1711,6 +1727,12 @@ export class PiSubagentRunner implements PiRpcHistorianRunner {
 								...parentEnv,
 								[MAGIC_CONTEXT_PI_SUBAGENT_ENV]: "1",
 								MAGIC_CONTEXT_SUBAGENT_PROMPT_FILE: systemPromptPath,
+								[HISTORIAN_CACHE_TAIL_ENV]:
+									/^(magic-context-)?historian(?:-recomp)?$/.test(
+										options.agent,
+									) && options.accountingSubagent !== "historian_editor"
+										? options.cacheTail
+										: undefined,
 								MAGIC_CONTEXT_SUBAGENT_BUDGET_GUARD_FILE: budgetGuardFile,
 								MAGIC_CONTEXT_SUBAGENT_PROVENANCE_ONLY:
 									options.agent === "rescore" ||
@@ -1728,11 +1750,18 @@ export class PiSubagentRunner implements PiRpcHistorianRunner {
 									: {}),
 								...(options.maxOutputTokens !== undefined
 									? {
-											MAGIC_CONTEXT_HISTORIAN_MAX_OUTPUT_TOKENS: String(
+											[HISTORIAN_MAX_OUTPUT_TOKENS_ENV]: String(
 												options.maxOutputTokens,
 											),
 										}
-									: {}),
+									: {
+											// With no configured cap, Pi would request the
+											// model's whole output limit. Match OpenCode, which
+											// caps every hidden child at min(model limit, 32k).
+											[SUBAGENT_OUTPUT_CEILING_ENV]: String(
+												HIDDEN_CHILD_OUTPUT_CEILING,
+											),
+										}),
 							},
 							// stdout = JSON events; stderr = diagnostics. stdin is a pipe
 							// when we deliver the user message there (always on Windows, or

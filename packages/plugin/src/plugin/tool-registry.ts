@@ -157,7 +157,10 @@ export function createToolRegistry(args: {
                           getObservedEpochFloor(db, sessionId),
                       ),
               })),
-        ...createCtxExpandTools({ db, expandTools: pluginConfig.historian?.expand_tools }),
+        ...createCtxExpandTools({
+            db,
+            expandTools: pluginConfig.historian?.expand_tools,
+        }),
         ...createCtxNoteTools({
             db,
             dreamerEnabled: isDreamerRunnable(pluginConfig),

@@ -10,7 +10,7 @@ import { unwrapImitatedReducedArgs } from "../unwrap-imitated-reduced-args";
 import { CTX_EXPAND_DESCRIPTION, CTX_EXPAND_TOKEN_BUDGET } from "./constants";
 import { resolveCtxExpandMode } from "./mode";
 import { renderItemByTag, renderMessageByOrdinal, renderVerboseRange } from "./render";
-import { renderSearchArchive } from "./search-archive";
+import { renderSearchArchiveOffThread } from "./search-archive";
 import type { CtxExpandArgs } from "./types";
 
 export { CTX_EXPAND_LIGHT_DESCRIPTION } from "../light-descriptions";
@@ -69,9 +69,9 @@ function createCtxExpandTool(deps: CtxExpandToolDeps): ToolDefinition {
                 message: "number",
             });
             const sessionId = toolContext.sessionID;
+            const mode = resolveCtxExpandMode(args, "positive");
             if (!(await prepareRawSessionOrdinals(sessionId)))
                 return "Session ordinals are warming in the background. Retry ctx_expand shortly; no approximate ordinal was served.";
-            const mode = resolveCtxExpandMode(args, "positive");
             if (mode.kind === "error") {
                 return mode.message;
             }
@@ -80,13 +80,13 @@ function createCtxExpandTool(deps: CtxExpandToolDeps): ToolDefinition {
             }
             if (mode.kind === "message") {
                 return (
-                    renderSearchArchive(
+                    (await renderSearchArchiveOffThread(
                         deps.db,
                         sessionId,
                         mode.message,
                         mode.message,
                         CTX_EXPAND_TOKEN_BUDGET,
-                    ) ?? renderMessageByOrdinal(sessionId, mode.message)
+                    )) ?? renderMessageByOrdinal(sessionId, mode.message)
                 );
             }
             const { start, end, verbose } = mode;
@@ -101,7 +101,7 @@ function createCtxExpandTool(deps: CtxExpandToolDeps): ToolDefinition {
                 return `Range ${start}-${end} is entirely within the live tail (after the last compacted message ${lastCompartmentEnd}); those messages are already visible in context.`;
             }
             const effectiveEnd = lastCompartmentEnd >= 0 ? Math.min(end, lastCompartmentEnd) : end;
-            const archived = renderSearchArchive(
+            const archived = await renderSearchArchiveOffThread(
                 deps.db,
                 sessionId,
                 start,

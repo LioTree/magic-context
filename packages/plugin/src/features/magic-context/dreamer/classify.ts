@@ -34,6 +34,7 @@ import {
     validateClassifyManifest,
 } from "./classify-prompt";
 import { readFailedChildMessages } from "./failed-invocation-evidence";
+import { DREAMER_FIRST_OUTPUT_TIMEOUT_MS } from "./hidden-single-shot";
 import { type LeaseAcquisition, runLeaseGuardedWrite, startLeaseHeartbeat } from "./lease";
 import { assertManifestCoversExactly } from "./manifest-parser";
 import {
@@ -79,6 +80,9 @@ export interface ClassifyArgs {
     leaseAcquisition?: LeaseAcquisition;
     model?: ModelInput;
     fallbackModels?: readonly ModelInput[];
+    /** How long a model may stay silent before the chain moves to the next model.
+     *  Defaults to DREAMER_FIRST_OUTPUT_TIMEOUT_MS. */
+    firstOutputTimeoutMs?: number;
     language?: string;
     onProgress?: (processed: number) => void;
 }
@@ -317,6 +321,8 @@ async function classifyOneChunk(
                         { childSessionId: opened.childSessionId },
                     ),
                     timeoutMs: sliceMs,
+                    firstOutputTimeoutMs:
+                        args.firstOutputTimeoutMs ?? DREAMER_FIRST_OUTPUT_TIMEOUT_MS,
                     signal,
                     fallbackModels: args.fallbackModels,
                     callContext: "dreamer:classify-memories",

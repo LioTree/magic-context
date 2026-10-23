@@ -343,6 +343,7 @@ export function tryMessagesTransformLkgReplay(args: {
                             entry,
                             messages: replay.messages,
                             ...keys,
+                            db,
                         })
                     )
                         return false;

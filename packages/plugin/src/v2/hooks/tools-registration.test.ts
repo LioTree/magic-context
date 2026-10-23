@@ -11,6 +11,12 @@ import {
     openDatabase,
 } from "../../features/magic-context/storage";
 import { createTestTempDirFromPath } from "../../shared/test-temp-dir";
+import {
+    SESSION_ID,
+    seedTsEraTagsThenRustHistory,
+    TS_ERA_TEXT,
+} from "../../tools/ctx-expand/rust-mode-tag.test-support";
+import { CTX_EXPAND_RUST_TAG_REFUSAL } from "../../tools/ctx-expand/tools";
 import { registerTools } from "./tools";
 import type { V2Context } from "./types";
 
@@ -65,4 +71,35 @@ test("the registered ctx_note tool reads the host store", async () => {
         { sessionID: "ses-1", messageID: "msg-1", agent: "build", progress: () => {} },
     );
     expect(typeof result.content).toBe("string");
+});
+
+/**
+ * OpenCode 2 runs the Rust transform too, and registers its own tool map, so it
+ * must also pass the resolved transform mode to ctx_expand.
+ */
+async function expandTagOnV2(transformMode: "ts" | "rust"): Promise<string> {
+    const cleanup = seedTsEraTagsThenRustHistory(db);
+    try {
+        const config = parsePluginConfig({ memory: { enabled: true } });
+        config.transform_mode = transformMode;
+        const registered: RegisteredTool[] = [];
+        await registerTools(hostContext(registered), db, config, undefined);
+        const expand = registered.find((tool) => tool.name === "ctx_expand");
+        expect(expand).toBeDefined();
+        const result = await expand!.execute(
+            { tag: "[dropped §75386§]" },
+            { sessionID: SESSION_ID, messageID: "msg-1", agent: "build", progress: () => {} },
+        );
+        return result.content;
+    } finally {
+        cleanup();
+    }
+}
+
+test("Rust-mode ctx_expand refuses tag lookup instead of serving a TypeScript-era row", async () => {
+    expect(await expandTagOnV2("rust")).toBe(CTX_EXPAND_RUST_TAG_REFUSAL);
+});
+
+test("TypeScript-mode ctx_expand keeps resolving tags from the host", async () => {
+    expect(await expandTagOnV2("ts")).toContain(TS_ERA_TEXT);
 });

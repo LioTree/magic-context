@@ -47,7 +47,10 @@ export async function registerTools(
                       ),
               })
             : {}),
-        ...createCtxExpandTools({ db, expandTools: config.historian?.expand_tools }),
+        ...createCtxExpandTools({
+            db,
+            expandTools: config.historian?.expand_tools,
+        }),
         ...createCtxNoteTools({
             ...project,
             dreamerEnabled: isDreamerRunnable(config),
