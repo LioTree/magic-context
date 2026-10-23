@@ -7,6 +7,30 @@ pub(super) struct PublishedCut {
     pub(super) version: u64,
     generation: u64,
     head: String,
+    #[serde(default)]
+    parent_namespace: String,
+    #[serde(default)]
+    parent_revision: Option<mc_store::CompartmentSourceRevision>,
+}
+
+#[derive(Serialize, Deserialize)]
+pub(super) struct ParentHistory {
+    namespace: String,
+    revision: Option<mc_store::CompartmentSourceRevision>,
+}
+
+#[derive(Serialize, Deserialize)]
+struct PendingStage {
+    namespace: String,
+    version: u64,
+}
+
+#[cfg(test)]
+thread_local! { static CRASH_AFTER_STAGE: std::cell::Cell<bool> = const { std::cell::Cell::new(false) }; }
+
+#[cfg(test)]
+pub(super) fn crash_after_stage_for_test() {
+    CRASH_AFTER_STAGE.with(|flag| flag.set(true));
 }
 
 pub(super) fn split_head_at(ranges: &mut Vec<view::ViewRange>, first: u64) {
@@ -23,6 +47,91 @@ pub(super) fn split_head_at(ranges: &mut Vec<view::ViewRange>, first: u64) {
 }
 
 impl AsyncRecord {
+    fn stage_slot() -> &'static str {
+        "pending-cut-stage"
+    }
+
+    pub(super) fn cleanup_pending_cut_stage(&self, store: &McStore) -> Result<(), HandlerOutcome> {
+        let Some(raw) = store
+            .load_async_compaction_baseline(&self.reference(), Self::stage_slot())
+            .map_err(transient)?
+        else {
+            return Ok(());
+        };
+        let pending: PendingStage = serde_json::from_str(&raw).map_err(transient)?;
+        let namespace = pending.namespace;
+        let prefix = format!("{}:async:", self.key.engine_key());
+        if !namespace.starts_with(&prefix) {
+            return Err(invalid("staged namespace belongs to another conversation"));
+        }
+        let referenced = namespace == self.namespace()
+            || self
+                .published_cuts
+                .values()
+                .any(|cut| namespace == format!("{prefix}{}", cut.generation));
+        if !referenced {
+            store
+                .discard_staged_namespace(&namespace, &self.key.project.to_string_lossy())
+                .map_err(transient)?;
+            store
+                .retire_unannounced_async_view(&self.reference(), pending.version)
+                .map_err(transient)?;
+        }
+        self.save_stage_intent(store, None)
+    }
+
+    fn save_stage_intent(
+        &self,
+        store: &McStore,
+        stage: Option<(&str, u64)>,
+    ) -> Result<(), HandlerOutcome> {
+        let record = serde_json::to_string(self).map_err(transient)?;
+        let reference = self.reference();
+        let key = self.key.store_key().conversation_key();
+        let mut save = store.async_compaction_save(&reference, &key, &self.key.session, &record);
+        save.baseline(
+            Self::stage_slot(),
+            stage
+                .map(|(namespace, version)| PendingStage {
+                    namespace: namespace.into(),
+                    version,
+                })
+                .map(|intent| serde_json::to_string(&intent))
+                .transpose()
+                .map_err(transient)?,
+        );
+        save.commit().map_err(transient)
+    }
+
+    pub(super) fn forward_parent_history(&mut self, store: &McStore) -> Result<(), HandlerOutcome> {
+        let Some(parent) = self.pending_parent_history.as_ref() else {
+            return Ok(());
+        };
+        let namespace = self.namespace();
+        if store
+            .compartment_source_revision(&parent.namespace)
+            .map_err(transient)?
+            != parent.revision
+            && store
+                .compartment_source_revision(&namespace)
+                .map_err(transient)?
+                == parent.revision
+        {
+            let compartments = store
+                .load_compartments(&parent.namespace)
+                .map_err(transient)?;
+            store
+                .replace_compartments(&namespace, &compartments)
+                .map_err(transient)?;
+            store
+                .adopt_compartment_history_identity(&parent.namespace, &namespace)
+                .map_err(transient)?;
+            store.arm_soft_refresh(&namespace).map_err(transient)?;
+        }
+        self.pending_parent_history = None;
+        Ok(())
+    }
+
     pub(super) fn keep_published_cut(
         &mut self,
         store: &McStore,
@@ -30,7 +139,7 @@ impl AsyncRecord {
         first: u64,
         view: &view::CompactionView,
     ) -> Result<(), HandlerOutcome> {
-        let seed = match self.capture_cut_seed(store, codec, first)? {
+        let mut seed = match self.capture_cut_seed(store, codec, first)? {
             Ok(seed) => seed,
             Err(reason) => {
                 tracing::debug!(
@@ -41,22 +150,40 @@ impl AsyncRecord {
                 return Ok(());
             }
         };
-        // Guard pruning before advertising that a cut is adoptable. Every retained
-        // engine view must be renderable without the rows the cut removes.
-        if self
-            .produced_view
-            .iter()
-            .chain(&self.applied_view)
-            .chain(self.published_engine.values())
-            .any(|held| {
-                held.view().map_or(true, |v| {
-                    v.replacement
-                        .iter()
-                        .any(|m| !m.meta.synthetic && m.meta.ordinal.is_some_and(|n| n < first))
-                })
+        // The new lineage adopts this published view, not a parent's older
+        // applied view. Its candidate must satisfy the same pruning guard;
+        // parent views remain available only on the parent until descent.
+        if self.produced_view.iter().any(|held| {
+            held.view().map_or(true, |v| {
+                v.replacement
+                    .iter()
+                    .any(|m| !m.meta.synthetic && m.meta.ordinal.is_some_and(|n| n < first))
             })
-        {
+        }) {
             return Ok(());
+        }
+        let candidate = self
+            .published_engine
+            .get(&view.view_version)
+            .ok_or_else(|| transient("published cut engine view missing"))?;
+        seed.window.produced_view = Some(candidate.json.to_string());
+        seed.window.applied_view = seed.window.produced_view.clone();
+        seed.window
+            .views
+            .retain(|(version, _, _, _)| *version >= view.view_version);
+        if let Some(record) = &mut seed.window.record {
+            record.insert("applied".into(), json!(view.view_version));
+            record.insert("frozen_edits_version".into(), json!(view.view_version));
+        }
+        if let Some(edits) = &candidate.frozen_edits {
+            let mut frozen = self.frozen_edits.clone();
+            frozen.merge(edits);
+            let mids = self
+                .entries
+                .range(first..)
+                .map(|(_, entry)| entry.mid.clone())
+                .collect();
+            seed.window.frozen_edits = Some(frozen.only_mids(&mids).json()?);
         }
         let mut head = Vec::<Value>::new();
         for range in view
@@ -74,6 +201,10 @@ impl AsyncRecord {
             .and_then(|v| v.checked_add(1))
             .ok_or_else(|| transient("async generation exhausted"))?;
         let namespace = format!("{}:async:{generation}", self.key.engine_key());
+        // Persist one intent before any namespace writes. A crash can leave at
+        // most this one unreferenced stage; the next publication removes it.
+        self.cleanup_pending_cut_stage(store)?;
+        self.save_stage_intent(store, Some((&namespace, view.view_version)))?;
         if let Some(head) = &seed.window.head {
             store
                 .adopt_namespace_head(&namespace, head)
@@ -95,6 +226,10 @@ impl AsyncRecord {
         let mut save = store.async_compaction_save(&reference, &key, &self.key.session, &record);
         save.tags(&namespace, &tags);
         save.commit().map_err(transient)?;
+        #[cfg(test)]
+        if CRASH_AFTER_STAGE.with(|flag| flag.get()) {
+            std::process::abort();
+        }
         self.published_cuts.insert(
             first,
             PublishedCut {
@@ -102,6 +237,10 @@ impl AsyncRecord {
                 version: view.view_version,
                 generation,
                 head: serde_json::to_string(&head).map_err(transient)?,
+                parent_namespace: self.namespace(),
+                parent_revision: store
+                    .compartment_source_revision(&self.namespace())
+                    .map_err(transient)?,
             },
         );
         self.pending_cut_seeds.insert(first, seed);
@@ -190,6 +329,13 @@ impl McHandler {
         state.resync = false;
         state.setup.lineage_id = request.lineage_id.clone();
         state.setup.descends_from = request.descends_from.clone();
+        // The initial answer is the published cut's exact head. A historian
+        // completion on the parent after staging is folded only by a later view.
+        state.pending_parent_history =
+            (!cut.parent_namespace.is_empty()).then_some(ParentHistory {
+                namespace: cut.parent_namespace.clone(),
+                revision: cut.parent_revision.clone(),
+            });
         let old: compact::setup::SetupAnswer = decode(&state.initial)?;
         let codec = codec::Codec::from_params(&Value::Object(request.params.clone()))?;
         let initial = compact::message::CompactionMessage::new(

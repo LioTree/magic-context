@@ -208,6 +208,19 @@ impl McStore {
     pub fn retire_unannounced_async_views(&self, session_ref: &str) -> Result<(), McStoreError> {
         metered!(session_ref, self.inner.with_conn_fenced(held(|conn|conn.execute("UPDATE mc_async_compaction_views SET announced=-1 WHERE session_ref=?1 AND announced=0",[session_ref]).map(|rows|((),rows as u64,0)))).map_err(McStoreError::from))
     }
+
+    /// A failed cut stage must not announce a view with no saved adoption seed.
+    pub fn retire_unannounced_async_view(
+        &self,
+        reference: &str,
+        version: u64,
+    ) -> Result<(), McStoreError> {
+        self.inner.with_conn_fenced(|tx| {
+            tx.execute("UPDATE mc_async_compaction_views SET announced=-1 WHERE session_ref=?1 AND version=?2 AND announced=0", params![reference, version])?;
+            Ok(())
+        })?;
+        Ok(())
+    }
     pub fn async_compaction_for_session(
         &self,
         project: &str,

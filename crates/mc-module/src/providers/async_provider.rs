@@ -348,6 +348,8 @@ pub(crate) struct AsyncRecord {
     published_cuts: BTreeMap<u64, cut_runtime::PublishedCut>,
     #[serde(skip)]
     pending_cut_seeds: BTreeMap<u64, cut_seed::CutSeed>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pending_parent_history: Option<cut_runtime::ParentHistory>,
 }
 
 fn deserialize_logical_prefix<'de, D: serde::Deserializer<'de>>(
@@ -908,6 +910,9 @@ impl State {
                 format!("published-cut:{first}"),
                 Some(serde_json::to_string(seed).map_err(transient)?),
             );
+        }
+        if !self.pending_cut_seeds.is_empty() {
+            save.baseline("pending-cut-stage", None);
         }
         for (ordinal, entry, index) in appended {
             save.append_entry(ordinal, entry, index);
@@ -2082,6 +2087,7 @@ impl McHandler {
             lineage_first_ordinal: 0,
             published_cuts: BTreeMap::new(),
             pending_cut_seeds: BTreeMap::new(),
+            pending_parent_history: None,
         };
         let route = state.runner()?;
         state.runner_route =
@@ -3306,6 +3312,12 @@ impl McHandler {
                 state.resync
                     || state.offline_first_pass.is_some()
                     || state.lineage.as_deref() != Some(&view.lineage_id)
+                    || view.cut.as_ref().is_some_and(|cut| {
+                        state
+                            .published_cuts
+                            .get(&(cut.through_ordinal + 1))
+                            .is_none_or(|held| held.version != version)
+                    })
             }) {
                 continue;
             }
@@ -4117,6 +4129,8 @@ impl McHandler {
             .store
             .get()
             .ok_or_else(|| transient("store unavailable"))?;
+        state.cleanup_pending_cut_stage(store)?;
+        state.forward_parent_history(store)?;
         let headers = state
             .conditions
             .as_ref()
@@ -5175,6 +5189,9 @@ impl McHandler {
         }
         if state.resync || state.entries.is_empty() {
             return Ok(true);
+        }
+        if state.pending_parent_history.is_some() {
+            return Ok(false);
         }
         let store = self
             .store

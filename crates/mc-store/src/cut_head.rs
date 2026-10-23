@@ -58,6 +58,29 @@ impl NamespaceHead {
 }
 
 impl McStore {
+    /// Delete an unreferenced window stage. The caller keeps its durable intent
+    /// until both stores have been cleaned, so interrupted deletion is retryable.
+    pub fn discard_staged_namespace(
+        &self,
+        namespace: &str,
+        project: &str,
+    ) -> Result<(), McStoreError> {
+        self.delete_session(namespace, project)?;
+        self.context_write(
+            &["compartment_history_versions", "compartment_state_lease"],
+            |tx| {
+                for table in ["compartment_history_versions", "compartment_state_lease"] {
+                    tx.execute(
+                        &format!("DELETE FROM {table} WHERE session_id=?1"),
+                        [namespace],
+                    )?;
+                }
+                Ok(())
+            },
+        )?;
+        Ok(())
+    }
+
     /// A staged cut has exactly its parent's compartments. Preserve their
     /// identity so adopting the stage does not look like a history rewrite.
     pub fn adopt_compartment_history_identity(

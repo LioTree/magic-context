@@ -232,3 +232,240 @@ fn cache_policy_uses_mc_resolution_and_session_frozen_defaults() {
         );
     }
 }
+
+async fn descend_at(rig: &Rig, first: u64, child: &str) -> Value {
+    let state = rig.state();
+    let mut request = serde_json::to_value(&state.setup).unwrap();
+    request["lineage_id"] = json!(child);
+    request["descends_from"] = json!({"lineage_id":state.lineage,"through_ordinal":first - 1});
+    request["request_id"] = json!(format!("setup-{child}"));
+    let answer = rig.op("compaction.setup", request).await;
+    assert_eq!(answer["answer"], "ready", "{answer}");
+    *rig.runner.lineage.lock().unwrap() = child.into();
+    answer
+}
+
+#[tokio::test]
+async fn parent_summary_after_staging_reaches_child_only_in_a_later_view() {
+    let dir = tempfile::tempdir().unwrap();
+    let rig = Rig::new(dir.path()).await;
+    rig.fill(180);
+    rig.history(130, "head at the published cut");
+    rig.notice(1, 90_000, None).await;
+    let before = rig.state();
+    let first = *before.published_cuts.keys().next_back().unwrap();
+    let cut_version = before.published_cuts[&first].version;
+    let cut_view = rig.get(cut_version).await;
+    let mut exact_head = Vec::<Value>::new();
+    for range in cut_view
+        .ranges
+        .iter()
+        .take_while(|range| matches!(range, view::ViewRange::Replace { .. }))
+    {
+        if let view::ViewRange::Replace { bytes, .. } = range {
+            exact_head.extend(serde_json::from_str::<Vec<Value>>(bytes).unwrap());
+        }
+    }
+    rig.history(145, "a later parent summarizer completion");
+    let answer = descend_at(&rig, first, "L2").await;
+    assert_eq!(answer["initial"]["replacement"], json!(exact_head));
+    assert!(!answer
+        .to_string()
+        .contains("a later parent summarizer completion"));
+    let child = rig.state();
+    assert_eq!(
+        rig.h
+            .store
+            .get()
+            .unwrap()
+            .load_compartments(&child.namespace())
+            .unwrap()[0]
+            .content,
+        "head at the published cut"
+    );
+    let next = rig
+        .ride("ceiling")
+        .await
+        .expect("the normal next view folds the parent completion");
+    assert!(next.view_version > cut_version);
+    assert!(rig
+        .render(&next)
+        .windows(b"a later parent summarizer completion".len())
+        .any(|bytes| bytes == b"a later parent summarizer completion"));
+    assert_eq!(
+        rig.state().initial["initial"],
+        answer["initial"],
+        "a later view must not rewrite the frozen Setup answer"
+    );
+}
+
+#[tokio::test]
+async fn successive_production_cuts_keep_only_the_window() {
+    let dir = tempfile::tempdir().unwrap();
+    let rig = Rig::new(dir.path()).await;
+    rig.fill(180);
+    rig.notice(1, 1_000, None).await;
+    let mut previous = 0;
+    for (index, end) in [130, 145, 160].into_iter().enumerate() {
+        rig.history(end, &format!("summary {index}"));
+        let view = rig
+            .ride("ceiling")
+            .await
+            .expect("a summary publishes a new cut view");
+        let first = view.cut.as_ref().unwrap().through_ordinal + 1;
+        assert!(first > previous);
+        let answer = descend_at(&rig, first, &format!("child-{index}")).await;
+        let state = rig.state();
+        assert_eq!(state.lineage_first_ordinal, first);
+        assert_eq!(state.cut_seed.as_ref().unwrap().first_ordinal, first);
+        assert!(state.entries.keys().all(|ordinal| *ordinal >= first));
+        assert!(state
+            .produced_view
+            .as_ref()
+            .unwrap()
+            .view()
+            .unwrap()
+            .replacement
+            .iter()
+            .all(|message| message.meta.synthetic
+                || message.meta.ordinal.is_none_or(|ordinal| ordinal >= first)));
+        assert_eq!(answer["initial"]["range"], json!({"from":first,"to":first}));
+        previous = first;
+    }
+}
+
+#[tokio::test]
+async fn next_publication_cleans_an_unsaved_stage_without_accumulating_namespaces() {
+    let dir = tempfile::tempdir().unwrap();
+    let rig = Rig::new(dir.path()).await;
+    rig.fill(180);
+    rig.history(130, "history");
+    rig.notice(1, 90_000, None).await;
+    let store = rig.h.store.get().unwrap();
+    let original = rig.state();
+    let first = *original.published_cuts.keys().next_back().unwrap();
+    let committed_version = original.published_cuts[&first].version;
+    let codec = codec::Codec::from_params(&Value::Object(original.setup.params.clone())).unwrap();
+    let mut last_orphan = None::<String>;
+    for _ in 0..3 {
+        let mut unsaved = load(store, &rig.reference).unwrap().unwrap();
+        let version = store
+            .reserve_async_compaction_version(&rig.reference, committed_version)
+            .unwrap();
+        let mut view = rig.get(committed_version).await;
+        view.view_version = version;
+        view.digest = view.compute_digest();
+        let candidate = unsaved.produced_view.clone().unwrap();
+        store
+            .save_async_compaction_view(
+                &rig.reference,
+                version,
+                &serde_json::to_string(&view).unwrap(),
+                &candidate.json,
+            )
+            .unwrap();
+        unsaved.published_engine.insert(version, candidate);
+        unsaved
+            .keep_published_cut(store, codec, first, &view)
+            .unwrap();
+        let pending: Value = serde_json::from_str(
+            &store
+                .load_async_compaction_baseline(&rig.reference, "pending-cut-stage")
+                .unwrap()
+                .unwrap(),
+        )
+        .unwrap();
+        let namespace = pending["namespace"].as_str().unwrap().to_owned();
+        assert!(store.load_namespace_head(&namespace).unwrap().is_some());
+        if let Some(previous) = last_orphan {
+            assert!(
+                store.load_namespace_head(&previous).unwrap().is_none(),
+                "a retry cleans the previous crash's stage before creating another"
+            );
+        }
+        last_orphan = Some(namespace);
+        // Discard the unsaved record, as a crash before the seed save does.
+        drop(unsaved);
+        rig.h
+            .provider_store
+            .async_runtime
+            .resident
+            .lock()
+            .unwrap()
+            .forget(&rig.reference);
+        assert_eq!(
+            load_head(store, &rig.reference)
+                .unwrap()
+                .unwrap()
+                .published_cuts[&first]
+                .version,
+            committed_version
+        );
+    }
+    rig.history(145, "next successful summary");
+    rig.ride("ceiling").await.expect("next publication");
+    assert!(store
+        .load_namespace_head(&last_orphan.unwrap())
+        .unwrap()
+        .is_none());
+    assert!(store
+        .load_async_compaction_baseline(&rig.reference, "pending-cut-stage")
+        .unwrap()
+        .is_none());
+}
+
+#[cfg(unix)]
+#[tokio::test]
+async fn stage_crash_before_seed_save_is_cleaned_on_next_publication() {
+    use std::os::unix::process::ExitStatusExt;
+    let dir = tempfile::tempdir().unwrap();
+    let child = std::process::Command::new(std::env::current_exe().unwrap())
+        .args([
+            "--exact",
+            "providers::async_provider::tests::published_contract::stage_crash_worker",
+            "--ignored",
+            "--nocapture",
+        ])
+        .env("MC_TEST_STAGE_ROOT", dir.path())
+        .output()
+        .unwrap();
+    assert_eq!(
+        child.status.signal(),
+        Some(6),
+        "child must abort after staging, not fail a test: {}",
+        String::from_utf8_lossy(&child.stderr)
+    );
+    let rig = Rig::new(dir.path()).await;
+    let store = rig.h.store.get().unwrap();
+    let pending: Value = serde_json::from_str(
+        &store
+            .load_async_compaction_baseline(&rig.reference, "pending-cut-stage")
+            .unwrap()
+            .unwrap(),
+    )
+    .unwrap();
+    let orphan = pending["namespace"].as_str().unwrap();
+    assert!(store.load_namespace_head(orphan).unwrap().is_some());
+    rig.fill(180);
+    rig.notice(2, 90_000, None).await;
+    assert!(store.load_namespace_head(orphan).unwrap().is_none());
+    assert!(store.load_tags_for_session(orphan).unwrap().is_empty());
+    assert!(store.load_compartments(orphan).unwrap().is_empty());
+    assert!(store.compartment_source_revision(orphan).unwrap().is_none());
+    assert!(store
+        .load_async_compaction_baseline(&rig.reference, "pending-cut-stage")
+        .unwrap()
+        .is_none());
+}
+
+#[tokio::test]
+#[ignore = "subprocess abort helper, invoked by stage_crash_before_seed_save_is_cleaned_on_next_publication"]
+async fn stage_crash_worker() {
+    let root = std::env::var_os("MC_TEST_STAGE_ROOT").expect("parent supplies a private store");
+    let rig = Rig::new(std::path::Path::new(&root)).await;
+    rig.fill(180);
+    rig.history(130, "history at the staged cut");
+    cut_runtime::crash_after_stage_for_test();
+    rig.notice(1, 90_000, None).await;
+    panic!("stage crash point did not execute");
+}

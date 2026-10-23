@@ -26,6 +26,8 @@
 //! in the history summary
 //! (`ctx_reduce_naming_a_tag_below_the_cut_answers_it_is_already_summarized`).
 use super::*;
+#[path = "cut_lineage_tests/production_cuts.rs"]
+mod production_cuts;
 use subc_protocol::scope::{ScopeKind, ScopeStamp};
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
