@@ -97,7 +97,11 @@ beforeAll(async () => {
     const load = spyOn(configLoader, "loadPluginConfigDetailed").mockReturnValue({
         config,
     } as ReturnType<typeof configLoader.loadPluginConfigDetailed>);
-    const probe = spyOn(storageGate, "probeV2StorageAtBoot").mockResolvedValue(db);
+    // Boot and deferred admission must use the same throwaway store.
+    const createGate = storageGate.createV2StorageGate;
+    const probe = spyOn(storageGate, "createV2StorageGate").mockImplementation((options) =>
+        createGate({ ...options, open: async () => db }),
+    );
     const contextLimit = spyOn(budgets, "resolveKnownHistorianContextLimit").mockReturnValue(
         123456,
     );
@@ -136,7 +140,7 @@ beforeAll(async () => {
         session: {
             remove: async () => {},
             compact: async () => {},
-            interrupt: async () => ({}),
+            interrupt: async () => ({ interrupted: true }),
             hook: async (name: string, callback: typeof hook) => {
                 if (name === "context") hook = callback;
             },

@@ -8,6 +8,7 @@ import { appendCompartments } from "../../features/magic-context/compartment-sto
 import { closeDatabase, openDatabase } from "../../features/magic-context/storage";
 import * as retention from "../../features/magic-context/storage-host-instruction-retention";
 import { setHostInstructionRetentionEnabledForTests } from "../../features/magic-context/storage-host-instruction-retention";
+import { writeSessionRenderCache } from "../../features/magic-context/storage-session-cache";
 import * as incremental from "../../hooks/magic-context/compartment-runner-incremental";
 import { resetCtxReduceRegisteredGloballyForTest } from "../../hooks/magic-context/ctx-reduce-availability";
 import { resetLkgSlotsForTest } from "../../hooks/magic-context/lkg-slot";
@@ -655,16 +656,19 @@ test("issue 750: a historian join at 97% and the defer pass after it serve the s
         await f.pass();
         f.respond();
         await f.pass();
-        // A compaction-mode switch clears the cached m[0]/m[1] bytes (the same
-        // statement as clearCachedM0Baseline in compaction-off-transition.ts),
+        // A compaction-mode switch clears the cached m[0]/m[1] payloads, as
+        // clearCachedM0Baseline does through the storage accessors,
         // so the next trim follows the newest compartment. That pass arrives at
         // 97% of the window: it blocks on the historian, which publishes a
         // compartment across "day 2".
-        f.db
-            .prepare(
-                "UPDATE session_meta SET cached_m0_bytes = NULL, cached_m1_bytes = NULL, cached_m0_mural_data_url = NULL WHERE session_id = ?",
-            )
-            .run(f.session);
+        f.db.transaction(() => {
+            for (const column of [
+                "cached_m0_bytes",
+                "cached_m1_bytes",
+                "cached_m0_mural_data_url",
+            ] as const)
+                writeSessionRenderCache(f.db, f.session, column, null);
+        })();
         f.respond(1, 970_000);
         const joined = await f.pass();
         const joinedLog = joined.logs.join("\n");

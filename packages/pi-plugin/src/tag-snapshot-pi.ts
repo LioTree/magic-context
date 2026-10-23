@@ -227,7 +227,11 @@ export function createPiTagSnapshotReader(db: Database) {
 				// already failed as stale is not: returning its rejected result would
 				// make the readiness retry fail with the same stale error without ever
 				// reading again. Wait for its worker to exit, then start a new one.
-				if (current.sessionId === sessionId && !current.stale)
+				if (
+					current.sessionId === sessionId &&
+					!current.stale &&
+					!current.cancelled
+				)
 					return current.result;
 				current.cancel();
 				await current.released;
@@ -272,7 +276,13 @@ export function createPiTagSnapshotReader(db: Database) {
 				sessionId,
 				result: Promise.resolve(),
 				released: worker.released,
-				cancel: worker.cancel,
+				cancel: () => {
+					if (destination.cancelled) return;
+					// Preemption is not a failed read. Mark it before the worker
+					// rejects so a returning session cannot join or cache it.
+					destination.cancelled = true;
+					worker.cancel();
+				},
 			};
 			current = destination;
 			let jobs = activeJobs.get(sessionId);
@@ -290,6 +300,8 @@ export function createPiTagSnapshotReader(db: Database) {
 			jobs.add(lifetime);
 			destination.result = worker.result
 				.then(({ candidate, generation }) => {
+					if (destination.cancelled)
+						throw new PiTagHydrationError("owner hydration cancelled", "stale");
 					// No await is allowed from this owner validation through publication.
 					const live = stamps(sessionId, token.jobId);
 					if (
@@ -349,6 +361,7 @@ export function createPiTagSnapshotReader(db: Database) {
 					// Cancelling an old session is not a connection failure. Do not
 					// replay its cancellation as the next session's startup error.
 					if (
+						!destination.cancelled &&
 						current === destination &&
 						desiredSession === sessionId &&
 						token.sessionEpoch === (sessionEpochs.get(sessionId) ?? 0)
@@ -974,6 +987,7 @@ interface OwnerJob {
 	result: Promise<void>;
 	released: Promise<void>;
 	cancel: () => void;
+	cancelled?: boolean;
 	/** Set when this job's result rejected because the database changed while it
 	 * read. Such a result must not be shared with a later load of the same
 	 * session: that load is a retry and needs a fresh read. */

@@ -157,6 +157,9 @@ async function openCode(host: "oc1" | "oc2", signed: boolean, seed: number, acti
     const project = "/nonexistent-system-delivery-review-project";
     const deps: TransformDeps = {
         db,
+        // The stored signed-wire baseline describes strict admission. Active
+        // rounds below exercise the bounded default without that baseline.
+        signedThinkingHold: signed && !active ? "on" : undefined,
         tagger: createTagger(),
         scheduler: createScheduler({ executeThresholdPercentage: 65 }),
         contextUsageMap: new Map(),
@@ -438,6 +441,7 @@ async function pi(signed: boolean, seed: number, active = false) {
     });
     piContext.registerPiContextHandler(fake.pi as never, {
         db,
+        signedThinkingHold: signed && !active ? "on" : undefined,
         protectedTokens: 1000,
         injection: { injectionBudgetTokens: 1000, memoryEnabled: false, injectDocs: false },
         protectedTools: { read: 0 },

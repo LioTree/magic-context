@@ -267,6 +267,8 @@ export async function runPiHoldDriver(options: {
 		typeof registerPiContextHandler
 	>[1] => ({
 		db,
+		signedThinkingHold:
+			process.env.R2_SERVED_EVIDENCE === "1" ? "on" : undefined,
 		tagger: createTagger(),
 		protectedTokens: 2000,
 		injection: {
@@ -1073,7 +1075,11 @@ test("Pi held drivers: m[0]/m[1] is never re-rendered while signed thinking is k
 // and optionally a carried tag-identity repair) before the held passes, then
 // checks the cached pair and the served head. The release pass at the end is
 // the positive control: once the turn ends the same inputs do rebuild the pair.
-async function piRulingFixture(withCarriedRepair: boolean, heldSteps = 1) {
+async function piRulingFixture(
+	withCarriedRepair: boolean,
+	heldSteps = 1,
+	signedThinkingHold?: "off" | "on",
+) {
 	const sessionId = `r2-pi-ruling-${withCarriedRepair ? "carried" : "plain"}`;
 	const db = createTestDb();
 	getOrCreateSessionMeta(db, sessionId);
@@ -1098,6 +1104,7 @@ async function piRulingFixture(withCarriedRepair: boolean, heldSteps = 1) {
 	});
 	registerPiContextHandler(fake.pi as never, {
 		db,
+		signedThinkingHold,
 		tagger: createTagger(),
 		protectedTokens: 2000,
 		injection: {
@@ -1399,7 +1406,7 @@ test("Pi carried identity repair: a failing declared rebuild refuses at most one
 
 test("Pi held replay over a shrunken window rebuilds or refuses before dispatch", async () => {
 	setHarness("pi");
-	const f = await piRulingFixture(true, 16);
+	const f = await piRulingFixture(true, 16, "on");
 	const window = 16000;
 	const record = f.db
 		.prepare("SELECT served_prefix FROM session_meta WHERE session_id = ?")

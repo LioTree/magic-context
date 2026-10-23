@@ -20,6 +20,7 @@ import {
 } from "./tag-snapshot-codec-pi";
 import {
 	__setPiTagSnapshotWorkerForTests,
+	cancelPiTagSnapshotSession,
 	createPiTagSnapshotCandidate,
 	drainPiTagSnapshotSession,
 	ensurePiTagSnapshotReady,
@@ -29,6 +30,7 @@ import {
 	PI_FALLBACK_ROW_PREDICATE,
 	type PiFallbackTagRow,
 	type PiTagSnapshotToken,
+	prewarmPiTagSnapshot,
 	readPiTagSnapshotRevision,
 	samePiTagSnapshotToken,
 } from "./tag-snapshot-pi";
@@ -36,6 +38,7 @@ import {
 	createPiHydrationPacketConsumer,
 	type PiHydrationMessage,
 	type PiHydrationRequest,
+	PiTagHydrationError,
 	startPiTagSnapshotWorker,
 } from "./tag-snapshot-worker-client-pi";
 
@@ -872,6 +875,136 @@ it("paired tag views admit own first allocation but refuse an unhydrated foreign
 		expect(getPiTagSnapshotView(db, "s")[0]?.byteSize).toBe(42);
 	} finally {
 		await drainPiTagSnapshotSession("s");
+		close();
+	}
+});
+
+function controlledHydration(db: Database) {
+	type WorkerResult = Awaited<
+		ReturnType<typeof startPiTagSnapshotWorker>["result"]
+	>;
+	const jobs: Array<{
+		sessionId: string;
+		cancellations: () => number;
+		publish: () => void;
+		release: () => void;
+		finish: () => void;
+	}> = [];
+	let changed = Promise.withResolvers<void>();
+	__setPiTagSnapshotWorkerForTests(db, (request) => {
+		const result = Promise.withResolvers<WorkerResult>();
+		const release = Promise.withResolvers<void>();
+		let cancellations = 0;
+		const publish = () => {
+			const candidate = createPiTagSnapshotCandidate();
+			candidate.end("tags");
+			candidate.end("fallback");
+			result.resolve({
+				candidate: candidate.finish(),
+				generation: { revision: "0", durable: 0 },
+			});
+		};
+		jobs.push({
+			sessionId: request.sessionId,
+			cancellations: () => cancellations,
+			publish,
+			release: () => release.resolve(),
+			finish: () => {
+				publish();
+				release.resolve();
+			},
+		});
+		const notification = changed;
+		changed = Promise.withResolvers<void>();
+		notification.resolve();
+		return {
+			result: result.promise,
+			released: release.promise,
+			cancel: () => {
+				cancellations++;
+				result.reject(new PiTagHydrationError("cancelled"));
+			},
+		};
+	});
+	const next = async (index: number): Promise<(typeof jobs)[number]> => {
+		while (jobs.length <= index) await changed.promise;
+		return jobs[index]!;
+	};
+	return { jobs, next };
+}
+
+it("returning to a preempted hydration waits for release and does not poison the next session", async () => {
+	for (const resolveBeforeCancel of [false, true]) {
+		const { db, close } = fixture();
+		const controlled = controlledHydration(db);
+		try {
+			prewarmPiTagSnapshot(db, "a");
+			const first = await controlled.next(0);
+			if (resolveBeforeCancel) first.publish();
+			prewarmPiTagSnapshot(db, "b");
+			prewarmPiTagSnapshot(db, "a");
+			const ready = Promise.resolve(
+				ensurePiTagSnapshotReady(db, "a", new PiContextBudget()),
+			).then(
+				() => "ready",
+				(error: unknown) => error,
+			);
+			expect(first.cancellations()).toBe(1);
+			expect(controlled.jobs).toHaveLength(1);
+			first.release();
+			const outcome = await Promise.race([
+				controlled.next(1).then(() => "started"),
+				ready,
+			]);
+			expect(outcome).toBe("started");
+			const second = await controlled.next(1);
+			expect(second.sessionId).toBe("a");
+			second.finish();
+			expect(await ready).toBe("ready");
+			const nextReady = Promise.resolve(
+				ensurePiTagSnapshotReady(db, "b", new PiContextBudget()),
+			);
+			const third = await controlled.next(2);
+			expect(third.sessionId).toBe("b");
+			third.finish();
+			await nextReady;
+			expect(getPiTagSnapshotView(db, "b")).toEqual([]);
+		} finally {
+			for (const job of controlled.jobs) job.finish();
+			await drainPiTagSnapshotSession("a");
+			await drainPiTagSnapshotSession("b");
+			close();
+		}
+	}
+});
+
+it("cancelled prewarm is never shared by readiness before its worker releases", async () => {
+	const { db, close } = fixture();
+	const controlled = controlledHydration(db);
+	try {
+		prewarmPiTagSnapshot(db, "a");
+		const first = await controlled.next(0);
+		cancelPiTagSnapshotSession("a");
+		const ready = Promise.resolve(
+			ensurePiTagSnapshotReady(db, "a", new PiContextBudget()),
+		).then(
+			() => "ready",
+			(error: unknown) => error,
+		);
+		expect(first.cancellations()).toBe(1);
+		expect(controlled.jobs).toHaveLength(1);
+		first.release();
+		expect(
+			await Promise.race([controlled.next(1).then(() => "started"), ready]),
+		).toBe("started");
+		const second = await controlled.next(1);
+		expect(second.sessionId).toBe("a");
+		second.finish();
+		expect(await ready).toBe("ready");
+		expect(getPiTagSnapshotView(db, "a")).toEqual([]);
+	} finally {
+		for (const job of controlled.jobs) job.finish();
+		await drainPiTagSnapshotSession("a");
 		close();
 	}
 });

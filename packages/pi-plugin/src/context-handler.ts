@@ -7047,7 +7047,16 @@ export function registerPiContextHandler(
 				// replay a last-known-good array whose branch identity is also unproven.
 				// Optional post-commit mirror failures are handled at publication.
 				if (sessionIdForError) clearPiLkgSessionState(sessionIdForError);
-				throw piFallbackRefusal("served-identity-unavailable", err);
+				throw piFallbackRefusal(
+					"served-identity-unavailable",
+					err instanceof PiServedIdentityError ||
+						err instanceof PiPendingUserRefusalError
+						? err
+						: new PiPendingUserRefusalError(
+								"pending-user recovery cannot prove final message identity",
+								sessionIdForError ?? "unknown",
+							),
+				);
 			}
 			if (err instanceof PiLkgAdmissionReplay && sessionIdForError) {
 				budget.assertOutcome();
@@ -9240,13 +9249,18 @@ function piPassMayRewritePrefix(args: RunPipelineArgs): boolean {
 			if (!plan || plan.entryIds.length > 0) return true;
 		}
 	}
-	if (policy.strict || args.signedThinkingHold === true) return false;
+	if (policy.strict) return false;
+	const meta = getOrCreateSessionMeta(args.db, args.sessionId);
+	if (args.signedThinkingHold === true)
+		return args.injection
+			? !meta.cachedM0Bytes || !meta.cachedM1Bytes
+			: args.stableIdSchemeCutover === true &&
+					args.readLastServedMessages?.() === null;
 	// An unheld signed turn can rewrite on a fold or any admitted lane edit.
 	// Choose the whole-pass pair before preflight can publish a new head; the
 	// old strict-only shortcut assumed every active signed turn was held.
 	if ((args.messages as unknown[]).some(piMessageHasThinking)) return true;
 	if (args.contextUsage.percentage >= 95) return true;
-	const meta = getOrCreateSessionMeta(args.db, args.sessionId);
 	return !meta.cachedM0Bytes || !meta.cachedM1Bytes;
 }
 
@@ -9488,7 +9502,7 @@ function runSynchronousPipeline(
 				});
 			requirePairing?.();
 		}
-		const result = applyPiProactiveThinkingStrip({
+		applyPiProactiveThinkingStrip({
 			db: args.db,
 			sessionId: args.sessionId,
 			messages: messages as unknown[],
@@ -9509,10 +9523,8 @@ function runSynchronousPipeline(
 			persistOnly: true,
 			requirePersistence: true,
 		});
-		if (activeThinkingTurn && isCacheBustingPass && !result)
-			throw new Error(
-				"Cannot persist signed thinking omission before prefix rewrite",
-			);
+		// Required persistence throws on an unresolved ID or failed write. The
+		// helper can return null when no new omissions are needed.
 		rewritingSignedPrefix = true;
 		activeThinkingTurn = false;
 		protectedSignedPrefix = false;

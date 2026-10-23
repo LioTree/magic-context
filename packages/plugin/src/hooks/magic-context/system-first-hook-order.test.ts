@@ -46,7 +46,7 @@ afterEach(() => {
     for (const cleanup of cleanups.splice(0).reverse()) cleanup();
 });
 
-function fixture(order: "private" | "stock" = "private") {
+function fixture(order: "private" | "stock" = "private", signedThinkingHold?: "off" | "on") {
     Date.now = () => now;
     now = Date.UTC(2026, 9, 14, 23, 59);
     const sessionId = `system-first-${++sequence}`;
@@ -137,6 +137,7 @@ function fixture(order: "private" | "stock" = "private") {
         scheduler: { shouldExecute: () => (execute ? "execute" : "defer") },
         compactionHandler: { onCompacted: () => {} } as never,
         config: {
+            signed_thinking_hold: signedThinkingHold,
             cache_ttl: "never",
             protected_tokens: 0,
             memory: { enabled: false, injection_budget_tokens: 1000 },
@@ -319,7 +320,7 @@ describe("standalone real hooks under private system-first dispatch", () => {
 
     it("an explicit history refresh consumes published history and advances the date only without a signed hold", async () => {
         for (const held of [false, true]) {
-            const f = fixture();
+            const f = fixture("private", held ? "on" : undefined);
             f.appendDelta();
             await f.serve();
             if (held) f.appendThinking();
