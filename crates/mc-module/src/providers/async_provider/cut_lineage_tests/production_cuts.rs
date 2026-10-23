@@ -1,6 +1,46 @@
 //! Two real Setup descents per seeded session, against a full-input engine oracle.
 use super::*;
 
+fn compare_decisions(pair: &Pair, after: u64, seed: u64) -> usize {
+    let resident = cut_seed::notice_trace::take(pair.resident.store() as *const McStore as usize);
+    let oracle = cut_seed::notice_trace::take(pair.oracle.store() as *const McStore as usize);
+    assert_eq!(
+        resident, oracle,
+        "{:?} seed {seed}: independent skip/run decisions; steps={:?}",
+        pair.profile, pair.log
+    );
+    for sequence in after + 1..=pair.seq {
+        assert!(
+            oracle.iter().any(|(seen, _)| *seen == sequence),
+            "{:?} seed {seed}: notice {sequence} has no decision trace",
+            pair.profile
+        );
+    }
+    oracle.len()
+}
+
+fn verify_passes(pair: &Pair, seed: u64) -> usize {
+    let resident = cut_seed::pass_trace::take(pair.resident.store() as *const McStore as usize);
+    let oracle = cut_seed::pass_trace::take(pair.oracle.store() as *const McStore as usize);
+    let actions = |lines: &[String]| {
+        lines
+            .iter()
+            .filter(|line| line.starts_with("action="))
+            .count()
+    };
+    assert_eq!(actions(&resident), actions(&oracle), "{:?} seed {seed}: both providers must run the same engine passes; resident={resident:?} full={oracle:?}", pair.profile);
+    assert_eq!(
+        oracle
+            .iter()
+            .filter(|line| line.starts_with("full_input "))
+            .count(),
+        actions(&oracle),
+        "{:?} seed {seed}: each full-input pass needs an exact source-identity proof: {oracle:?}",
+        pair.profile
+    );
+    actions(&oracle)
+}
+
 async fn descend_pair(pair: &mut Pair, first: u64, child: &str) {
     let full = load(pair.oracle.store(), &pair.reference).unwrap().unwrap();
     let codec = codec::Codec::from_params(&Value::Object(full.setup.params.clone())).unwrap();
@@ -61,13 +101,27 @@ async fn descend_pair(pair: &mut Pair, first: u64, child: &str) {
         .contains_key(&0));
 }
 
-async fn session(profile: Profile, number: u64, steps: u64) {
+async fn session(profile: Profile, number: u64, steps: u64) -> (usize, usize) {
     let mut rng = Rng(number.wrapping_mul(0x9E37_79B9_7F4A_7C15) | 1);
-    let mut pair = Pair::open_with(profile, false, Some("L"), false, true).await;
+    let mut pair = Pair::open_with(profile, false, Some("L"), false, false).await;
+    pair.oracle
+        .h
+        .provider_store
+        .async_runtime
+        .full_input_only
+        .store(true, std::sync::atomic::Ordering::Relaxed);
+    for side in [&pair.resident, &pair.oracle] {
+        side.h
+            .provider_store
+            .async_runtime
+            .record_notice_decisions
+            .store(true, std::sync::atomic::Ordering::Relaxed);
+    }
     attest(&pair.resident);
     attest(&pair.oracle);
     pair.append(208 + rng.below(5) * 4);
     let mut previous = 0;
+    let (mut decisions, mut passes) = (0, 0);
     for cut in 0..2 {
         if cut > 0 {
             pair.append(32);
@@ -87,7 +141,10 @@ async fn session(profile: Profile, number: u64, steps: u64) {
             Box::pin(async move { publish_history(side, &reference, history_end) })
         })
         .await;
+        let sequence = pair.seq;
         pair.notice(&mut rng, None).await;
+        decisions += compare_decisions(&pair, sequence, number);
+        passes += verify_passes(&pair, number);
         let held = load(pair.resident.store(), &pair.reference)
             .unwrap()
             .unwrap();
@@ -101,35 +158,16 @@ async fn session(profile: Profile, number: u64, steps: u64) {
             "each session must descend at two advancing cuts"
         );
         descend_pair(&mut pair, first, &format!("child-{cut}")).await;
-        let mut telemetry_stale = false;
         for _ in 0..steps {
             for side in [&pair.resident, &pair.oracle] {
                 cut_seed::pass_trace::take(side.store() as *const McStore as usize);
+                cut_seed::notice_trace::take(side.store() as *const McStore as usize);
             }
-            let earlier = pair.engine_mismatches.borrow().clone();
+            let sequence = pair.seq;
             pair.cut_step(&mut rng, first, &mut history_end).await;
+            decisions += compare_decisions(&pair, sequence, number);
+            passes += verify_passes(&pair, number);
             pair.check_cut(first);
-            let resident_passes =
-                cut_seed::pass_trace::take(pair.resident.store() as *const McStore as usize);
-            let oracle_passes =
-                cut_seed::pass_trace::take(pair.oracle.store() as *const McStore as usize);
-            if oracle_passes.len() > resident_passes.len() {
-                telemetry_stale = true;
-            } else if !resident_passes.is_empty() {
-                telemetry_stale = false;
-            }
-            if telemetry_stale {
-                // These fields describe the last engine pass, not the latest
-                // runner notice. A deliberately skipped pass leaves them stale;
-                // current usage policy, hygiene signatures and every decision
-                // field still have to match the full-input oracle.
-                let mut mismatches = pair.engine_mismatches.borrow_mut();
-                for field in ["last_usage", "newest_live_block_id", "newest_live_ordinal"] {
-                    if !earlier.contains_key(field) {
-                        mismatches.remove(field);
-                    }
-                }
-            }
         }
         previous = first;
     }
@@ -146,6 +184,7 @@ async fn session(profile: Profile, number: u64, steps: u64) {
         pair.engine_mismatches.borrow(),
         pair.log
     );
+    (decisions, passes)
 }
 
 async fn differential(sessions: u64, steps: u64) {
@@ -154,6 +193,7 @@ async fn differential(sessions: u64, steps: u64) {
         .and_then(|value| value.parse::<u64>().ok())
         .unwrap_or(70_000);
     let mut tasks = Vec::new();
+    let (mut decisions, mut passes) = (0, 0);
     for index in 0..sessions {
         tasks.push(tokio::spawn(session(
             PROFILES[((first_seed + index) % 4) as usize],
@@ -162,11 +202,13 @@ async fn differential(sessions: u64, steps: u64) {
         )));
         if tasks.len() == 4 || index + 1 == sessions {
             for task in std::mem::take(&mut tasks) {
-                task.await.unwrap();
+                let (seen, verified) = task.await.unwrap();
+                decisions += seen;
+                passes += verified;
             }
         }
     }
-    eprintln!("production differential: {sessions} sessions x 2 advancing cuts x {steps} steps over 4 formats; 0 divergences");
+    eprintln!("production differential: {sessions} sessions x 2 advancing cuts x {steps} steps over 4 formats; {decisions} independent notice decisions matched; {passes} full-input passes proved every source identity; strict engine-state comparison; 0 divergences");
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]

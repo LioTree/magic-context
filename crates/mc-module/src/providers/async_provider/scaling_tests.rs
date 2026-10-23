@@ -442,6 +442,9 @@ struct PagedRunner {
     /// Every call the provider made, for checks that an operation calls no
     /// runner method.
     calls: std::sync::atomic::AtomicU64,
+    read_requests: Mutex<Vec<u64>>,
+    read_rows: std::sync::atomic::AtomicU64,
+    read_bytes: std::sync::atomic::AtomicU64,
 }
 
 #[async_trait]
@@ -493,6 +496,7 @@ impl session_resolver::ProviderRunner for PagedRunner {
         }
         assert_eq!(method, "session.read");
         let from = params["from_ordinal"].as_u64().unwrap();
+        self.read_requests.lock().unwrap().push(from);
         if let Some((_, first)) = &cut {
             assert!(from >= *first, "before_lineage_start: {from} < {first}");
         }
@@ -508,6 +512,10 @@ impl session_resolver::ProviderRunner for PagedRunner {
             used += size;
             messages.push(entry.clone());
         }
+        self.read_rows
+            .fetch_add(messages.len() as u64, std::sync::atomic::Ordering::Relaxed);
+        self.read_bytes
+            .fetch_add(used as u64, std::sync::atomic::Ordering::Relaxed);
         let mut page = json!({"lineage_id":cut.map_or_else(|| "L".into(), |(lineage,_)| lineage),"messages":messages});
         if start + messages.len() < entries.len() {
             page["next_from_ordinal"] = json!(messages.last().unwrap().ordinal + 1);
@@ -1590,7 +1598,51 @@ async fn covered_tail_latency_benchmark() {
         let rss_before = current;
         eprintln!("BENCH before_bootstrap total={size} RSS_bytes={current} peak_RSS_bytes={peak}");
         let boot_phases = phase_stats(&rig.reference);
+        view_work::take(&rig.reference);
+        let read_calls_before = rig.runner.read_requests.lock().unwrap().len();
+        let read_rows_before = rig
+            .runner
+            .read_rows
+            .load(std::sync::atomic::Ordering::Relaxed);
+        let read_bytes_before = rig
+            .runner
+            .read_bytes
+            .load(std::sync::atomic::Ordering::Relaxed);
         let bootstrap = rig.try_timed_notice(0, None, est_tokens).await;
+        let first_work = view_work::take(&rig.reference);
+        let first_head = load_head(rig.store(), &rig.reference).unwrap().unwrap();
+        let first_from = first_head.lineage_first_ordinal;
+        let first_reads = rig.runner.read_requests.lock().unwrap()[read_calls_before..].to_vec();
+        assert!(first_reads.iter().all(|from| *from >= first_from));
+        let below_cut = rig.scalar(&format!("SELECT count(*) FROM mc_async_compaction_entries WHERE session_ref=?1 AND ordinal<{first_from}"));
+        assert_eq!(
+            below_cut, 0,
+            "first notice must hold no per-message rows below the cut"
+        );
+        let first_compartments = rig
+            .store()
+            .load_compartments(&first_head.namespace())
+            .unwrap();
+        let first_summary_bytes = first_compartments
+            .iter()
+            .map(|row| row.title.len() + row.content.len() + row.p1.as_ref().map_or(0, String::len))
+            .sum::<usize>();
+        let first_pending = rig
+            .store()
+            .load_pending_agent_drops(&first_head.namespace())
+            .unwrap()
+            .len();
+        let first_phases = phases(&rig.reference, &boot_phases);
+        let first_read_rows = rig
+            .runner
+            .read_rows
+            .load(std::sync::atomic::Ordering::Relaxed)
+            - read_rows_before;
+        let first_read_bytes = rig
+            .runner
+            .read_bytes
+            .load(std::sync::atomic::Ordering::Relaxed)
+            - read_bytes_before;
         let (peak, current) = rss();
         eprintln!("BENCH bootstrap total={size} wall_ms={:.1} RSS_bytes={current} peak_RSS_bytes={peak} phases: {}", bootstrap.0.0, phases(&rig.reference, &boot_phases));
         eprintln!("shape total={size} uncovered={tail} serialized_tail_tokens={tokens} compartment_end={covered} bootstrap={:?} elapsed_ms={:.1}", bootstrap.2, bootstrap.0.0);
@@ -1841,6 +1893,19 @@ async fn covered_tail_latency_benchmark() {
             descending_setup_p50_ms: median_wall(&setups),
             cut_seed_bytes,
             descending_setup_runner_calls: setup_runner_calls,
+            first_notice_thread_cpu_ms: bootstrap.0 .1,
+            first_notice_process_cpu_ms: bootstrap.0 .2,
+            first_notice_engine_input: first_work.engine_input,
+            first_notice_decoded_entries: first_work.decoded_entries,
+            first_notice_read_rows: first_read_rows,
+            first_notice_read_bytes: first_read_bytes,
+            first_notice_from_ordinal: first_from,
+            first_notice_read_requests: first_reads,
+            first_notice_below_cut_rows: below_cut,
+            first_notice_compartments: first_compartments.len(),
+            first_notice_summary_bytes: first_summary_bytes,
+            first_notice_pending_drops: first_pending,
+            first_notice_phases: first_phases,
         };
         eprintln!("{COST_LINE}{}", serde_json::to_string(&cost).unwrap());
     }
@@ -1874,6 +1939,19 @@ struct CostSample {
     descending_setup_p50_ms: f64,
     cut_seed_bytes: u64,
     descending_setup_runner_calls: u64,
+    first_notice_thread_cpu_ms: f64,
+    first_notice_process_cpu_ms: f64,
+    first_notice_engine_input: usize,
+    first_notice_decoded_entries: usize,
+    first_notice_read_rows: u64,
+    first_notice_read_bytes: u64,
+    first_notice_from_ordinal: u64,
+    first_notice_read_requests: Vec<u64>,
+    first_notice_below_cut_rows: u64,
+    first_notice_compartments: usize,
+    first_notice_summary_bytes: usize,
+    first_notice_pending_drops: usize,
+    first_notice_phases: String,
 }
 
 fn median_wall(samples: &[(f64, f64, f64)]) -> f64 {

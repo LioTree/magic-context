@@ -1379,3 +1379,23 @@ pub(super) mod pass_trace {
         taken.into_iter().map(|(_, line)| line).collect()
     }
 }
+
+#[cfg(test)]
+pub(super) mod notice_trace {
+    use std::sync::Mutex;
+    static DECISIONS: Mutex<Vec<(usize, u64, bool)>> = Mutex::new(Vec::new());
+    pub fn record(provider: usize, sequence: u64, run: bool) {
+        DECISIONS.lock().unwrap().push((provider, sequence, run));
+    }
+    pub fn take(provider: usize) -> Vec<(u64, bool)> {
+        let mut decisions = DECISIONS.lock().unwrap();
+        let (taken, kept) = std::mem::take(&mut *decisions)
+            .into_iter()
+            .partition::<Vec<_>, _>(|(owner, _, _)| *owner == provider);
+        *decisions = kept;
+        taken
+            .into_iter()
+            .map(|(_, sequence, run)| (sequence, run))
+            .collect()
+    }
+}

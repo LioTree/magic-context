@@ -182,6 +182,12 @@ pub(crate) struct Runtime {
     /// A test's notice read budget instead of the production one.
     #[cfg(test)]
     pub(crate) notice_read_budget: Mutex<Option<Duration>>,
+    /// Test reference that projects every held transcript row whenever normal
+    /// notice policy runs the engine; it still computes skip eligibility itself.
+    #[cfg(test)]
+    pub(crate) full_input_only: std::sync::atomic::AtomicBool,
+    #[cfg(test)]
+    pub(crate) record_notice_decisions: std::sync::atomic::AtomicBool,
 }
 
 #[derive(Serialize, Deserialize)]
@@ -2147,7 +2153,7 @@ impl McHandler {
             codec,
             initial,
             &state,
-            self.async_oracle() || state.logical_prefix.is_none(),
+            self.async_input_oracle() || state.logical_prefix.is_none(),
         )?;
         state.adopt_engine(engine)?;
         // `serializer_profile` is a ck-mc extension member: the profile this
@@ -2242,7 +2248,7 @@ impl McHandler {
         #[cfg(test)]
         resident::counters::engine_pass();
         // The oracle deliberately never consults prefix selection or its proof.
-        let mut prefix = if self.async_oracle() {
+        let mut prefix = if self.async_input_oracle() {
             None
         } else if let Some(prefix) = &state.logical_prefix {
             let loaded = store
@@ -2381,6 +2387,44 @@ impl McHandler {
                     .pending(&cadence.ledger, now_ms().max(0) as u64)
             });
         template.native_tail_section = true;
+        #[cfg(test)]
+        if self
+            .provider_store
+            .async_runtime
+            .full_input_only
+            .load(std::sync::atomic::Ordering::Relaxed)
+        {
+            let expected = state
+                .entries
+                .iter()
+                .map(|(ordinal, entry)| (*ordinal, entry.mid.clone()))
+                .collect::<Vec<_>>();
+            let actual = template
+                .messages
+                .iter()
+                .map(|message| (message.ordinal, message.mid.clone()))
+                .collect::<Vec<_>>();
+            assert!(
+                expected.is_empty()
+                    || (expected[0].0 == 0
+                        && expected.windows(2).all(|pair| pair[0].0 + 1 == pair[1].0)),
+                "the full-input fixture must retain the original contiguous transcript"
+            );
+            assert_eq!(
+                actual, expected,
+                "full-input oracle must project every original source identity in order"
+            );
+            cut_seed::pass_trace::record(
+                Arc::as_ptr(store) as usize,
+                format!(
+                    "full_input rows={} first={:?} last={:?} identities_digest={}",
+                    expected.len(),
+                    expected.first(),
+                    expected.last(),
+                    crate::sha256_hex(&serde_json::to_vec(&actual).unwrap())
+                ),
+            );
+        }
         if let Some(policy) = &state.usage_policy {
             template.emergency_recovery_armed = policy.emergency_recovery_armed;
             if let Some(limit) = policy.limit_for(model) {
@@ -3678,6 +3722,15 @@ impl McHandler {
         let run_engine = (state.completed_seq < notice.seq || resynced)
             && (resynced || !self.async_engine_can_skip(&state, &notice)?);
         #[cfg(test)]
+        if self
+            .provider_store
+            .async_runtime
+            .record_notice_decisions
+            .load(std::sync::atomic::Ordering::Relaxed)
+        {
+            cut_seed::notice_trace::record(Arc::as_ptr(store) as usize, notice.seq, run_engine);
+        }
+        #[cfg(test)]
         drop(skip_phase);
         if run_engine {
             if let Err(error) = self.publish_async(0, &mut state, codec, resynced) {
@@ -4268,7 +4321,7 @@ impl McHandler {
         drop(meter);
         #[cfg(test)]
         let meter = scaling_tests::save_meter::start_kind(&state.reference(), "pub:render");
-        let wire = if self.async_oracle() || state.logical_prefix.is_none() {
+        let wire = if self.async_input_oracle() || state.logical_prefix.is_none() {
             rendered_view(codec, &candidate, state, true)?
         } else if template.logical_prefix.is_none() {
             // This pass read every held message, but `certify` above has just
@@ -5183,6 +5236,19 @@ impl McHandler {
     #[cfg(not(test))]
     fn async_oracle(&self) -> bool {
         false
+    }
+
+    fn async_input_oracle(&self) -> bool {
+        #[cfg(test)]
+        if self
+            .provider_store
+            .async_runtime
+            .full_input_only
+            .load(std::sync::atomic::Ordering::Relaxed)
+        {
+            return true;
+        }
+        self.async_oracle()
     }
 
     /// Take a conversation for one operation. Call only under its provider

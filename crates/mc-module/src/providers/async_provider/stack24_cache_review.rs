@@ -900,7 +900,8 @@ async fn stack24_trace_part() {
     let profile = PROFILES[var("MC_STACK24_TRACE_PROFILE", 1) as usize];
     let ordinal = var("MC_STACK24_TRACE_ORDINAL", 32);
     let steps = var("MC_STACK24_TRACE_STEPS", 24);
-    let (mut pair, mut rng) = session_start(profile, seed, false).await;
+    let (mut pair, mut rng) =
+        session_start(profile, seed, var("MC_STACK24_TRACE_ECHOES", 0) != 0).await;
     let needle = format!("m{ordinal}#");
     for step in 0..=steps {
         if step > 0 {
@@ -911,6 +912,32 @@ async fn stack24_trace_part() {
             continue;
         };
         let loaded = side.store().load(&head.namespace()).unwrap();
+        let state = load(side.store(), &pair.reference).unwrap().unwrap();
+        let current_digest = state
+            .mid_index
+            .get(&format!("m{ordinal}"))
+            .and_then(|at| state.entries.get(at))
+            .and_then(|entry| entry.read().ok())
+            .and_then(|entry| served_part_digest(&entry, "0").ok());
+        let frozen_native: Vec<Value> =
+            serde_json::from_str::<Vec<Value>>(&state.frozen_edits.json().unwrap())
+                .unwrap()
+                .into_iter()
+                .filter(|part| part["mid"] == format!("m{ordinal}"))
+                .collect();
+        let retired_native = state
+            .retired_frozen
+            .views
+            .iter()
+            .filter_map(|(version, edits)| {
+                let parts = serde_json::from_str::<Vec<Value>>(&edits.json().unwrap())
+                    .unwrap()
+                    .into_iter()
+                    .filter(|part| part["mid"] == format!("m{ordinal}"))
+                    .collect::<Vec<_>>();
+                (!parts.is_empty()).then_some((*version, parts))
+            })
+            .collect::<Vec<_>>();
         let frozen: Vec<_> = loaded
             .core
             .frozen_units
@@ -1000,6 +1027,7 @@ async fn stack24_trace_part() {
             loaded.meta.coverage_ordinal,
             pair.review.borrow().acks.iter().rev().take(2).collect::<Vec<_>>()
         );
+        eprintln!("native trace step={step} applied={:?} frozen_version={:?} current_digest={current_digest:?} frozen={frozen_native:?} retired={retired_native:?} conditions={:?}", state.applied, state.frozen_edits_version, state.conditions);
     }
 }
 
