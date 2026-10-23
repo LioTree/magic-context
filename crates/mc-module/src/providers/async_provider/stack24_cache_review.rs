@@ -210,16 +210,18 @@ impl Review {
             .join(" <- ");
         let mut parts = BTreeMap::new();
         self.check_served_history(profile, version, &context, entries, model);
-        // A replace range of one message by no messages removes that message
-        // (`emptied_messages::shape`); for these observations it is a drop of
-        // each of the message's parts, as it was before such messages were
-        // removed.
+        // Outside this view's historian coverage, a one-message empty
+        // replacement is a whole-message cleanup drop. Inside its coverage,
+        // the same shape can be a summary segment split at a restart point;
+        // shorter later summaries may uncover those source bytes again.
         let removed: Vec<view::ViewRange> = view
             .ranges
             .iter()
             .filter_map(|range| match range {
                 view::ViewRange::Replace { from, to, bytes }
-                    if *to == from + 1 && bytes == "[]" =>
+                    if *to == from + 1
+                        && bytes == "[]"
+                        && coverage.is_none_or(|covered| *from > covered) =>
                 {
                     let entry = entries.iter().find(|entry| entry.ordinal == *from)?;
                     let drops = entry
@@ -900,7 +902,8 @@ async fn stack24_trace_part() {
     let profile = PROFILES[var("MC_STACK24_TRACE_PROFILE", 1) as usize];
     let ordinal = var("MC_STACK24_TRACE_ORDINAL", 32);
     let steps = var("MC_STACK24_TRACE_STEPS", 24);
-    let (mut pair, mut rng) = session_start(profile, seed, false).await;
+    let (mut pair, mut rng) =
+        session_start(profile, seed, var("MC_STACK24_TRACE_ECHOES", 0) != 0).await;
     let needle = format!("m{ordinal}#");
     for step in 0..=steps {
         if step > 0 {
@@ -911,6 +914,32 @@ async fn stack24_trace_part() {
             continue;
         };
         let loaded = side.store().load(&head.namespace()).unwrap();
+        let state = load(side.store(), &pair.reference).unwrap().unwrap();
+        let current_digest = state
+            .mid_index
+            .get(&format!("m{ordinal}"))
+            .and_then(|at| state.entries.get(at))
+            .and_then(|entry| entry.read().ok())
+            .and_then(|entry| served_part_digest(&entry, "0").ok());
+        let frozen_native: Vec<Value> =
+            serde_json::from_str::<Vec<Value>>(&state.frozen_edits.json().unwrap())
+                .unwrap()
+                .into_iter()
+                .filter(|part| part["mid"] == format!("m{ordinal}"))
+                .collect();
+        let retired_native = state
+            .retired_frozen
+            .views
+            .iter()
+            .filter_map(|(version, edits)| {
+                let parts = serde_json::from_str::<Vec<Value>>(&edits.json().unwrap())
+                    .unwrap()
+                    .into_iter()
+                    .filter(|part| part["mid"] == format!("m{ordinal}"))
+                    .collect::<Vec<_>>();
+                (!parts.is_empty()).then_some((*version, parts))
+            })
+            .collect::<Vec<_>>();
         let frozen: Vec<_> = loaded
             .core
             .frozen_units
@@ -1000,6 +1029,7 @@ async fn stack24_trace_part() {
             loaded.meta.coverage_ordinal,
             pair.review.borrow().acks.iter().rev().take(2).collect::<Vec<_>>()
         );
+        eprintln!("native trace step={step} applied={:?} frozen_version={:?} current_digest={current_digest:?} frozen={frozen_native:?} retired={retired_native:?} conditions={:?}", state.applied, state.frozen_edits_version, state.conditions);
     }
 }
 
@@ -1294,11 +1324,187 @@ async fn stack25_delayed_acknowledgements_keep_publication_source_identities() {
         (Profile::OpenCode, 7341),
         (Profile::Pi, 7362),
     ] {
-        let (violations, _, _) = review_session(profile, seed, 32, true).await;
+        let (violations, _, log) = review_session(profile, seed, 32, true).await;
         let restored = violations
             .iter()
             .filter(|row| row.starts_with("RESTORED"))
             .collect::<Vec<_>>();
-        assert!(restored.is_empty(), "seed {seed} {profile:?}: {restored:?}");
+        assert!(
+            restored.is_empty(),
+            "seed {seed} {profile:?}: {restored:?}; steps={log:?}"
+        );
     }
+}
+
+#[test]
+fn covered_empty_history_segment_is_not_a_frozen_cleanup_edit() {
+    let entry = message(Profile::Broca, 0, 0);
+    let mut review = Review::default();
+    let published = view::CompactionView::new(
+        "fixture",
+        1,
+        "L",
+        contract::lineage::MessageRef {
+            ordinal: 0,
+            mid: entry.mid.clone(),
+        },
+        vec![view::ViewRange::replace(0, 1, "[]")],
+    );
+    review.record_view(
+        Profile::Broca,
+        1,
+        &published,
+        std::slice::from_ref(&entry),
+        &["summarized".into()],
+        Some(0),
+        0,
+        "[]",
+    );
+    review.acknowledge(1, 1);
+    let uncovered = view::CompactionView::new(
+        "fixture",
+        2,
+        "L",
+        contract::lineage::MessageRef {
+            ordinal: 0,
+            mid: entry.mid.clone(),
+        },
+        vec![view::ViewRange::keep(0, 1)],
+    );
+    review.record_view(
+        Profile::Broca,
+        2,
+        &uncovered,
+        std::slice::from_ref(&entry),
+        &["acknowledged".into(), "shorter summary".into()],
+        None,
+        0,
+        &json!([entry.message]).to_string(),
+    );
+    review.check_served_edits();
+    assert!(
+        review.snapshots[0].parts.is_empty(),
+        "covered summary rows must not be recorded as cleanup edits"
+    );
+    assert!(
+        review
+            .violations
+            .iter()
+            .all(|row| !row.starts_with("RESTORED")),
+        "coverage is fixed by the publishing view, not by the later uncovered boundary"
+    );
+}
+
+#[test]
+fn uncovered_empty_replacement_still_detects_a_restored_cleanup_drop() {
+    let entry = message(Profile::Broca, 0, 0);
+    let mut review = Review::default();
+    let published = view::CompactionView::new(
+        "fixture",
+        1,
+        "L",
+        contract::lineage::MessageRef {
+            ordinal: 0,
+            mid: entry.mid.clone(),
+        },
+        vec![view::ViewRange::replace(0, 1, "[]")],
+    );
+    review.record_view(
+        Profile::Broca,
+        1,
+        &published,
+        std::slice::from_ref(&entry),
+        &["cleanup".into()],
+        None,
+        0,
+        "[]",
+    );
+    review.acknowledge(1, 1);
+    let restored = view::CompactionView::new(
+        "fixture",
+        2,
+        "L",
+        contract::lineage::MessageRef {
+            ordinal: 0,
+            mid: entry.mid.clone(),
+        },
+        vec![view::ViewRange::keep(0, 1)],
+    );
+    review.record_view(
+        Profile::Broca,
+        2,
+        &restored,
+        std::slice::from_ref(&entry),
+        &["acknowledged".into(), "restored".into()],
+        None,
+        0,
+        &json!([entry.message]).to_string(),
+    );
+    review.check_served_edits();
+    assert!(
+        review
+            .violations
+            .iter()
+            .any(|row| row.starts_with("RESTORED")),
+        "uncovered cleanup removals remain frozen edits"
+    );
+}
+
+#[test]
+fn explicit_part_drop_remains_an_edit_even_inside_published_history_coverage() {
+    let entry = message(Profile::Broca, 0, 0);
+    let mut review = Review::default();
+    let published = view::CompactionView::new(
+        "fixture",
+        1,
+        "L",
+        contract::lineage::MessageRef {
+            ordinal: 0,
+            mid: entry.mid.clone(),
+        },
+        vec![view::ViewRange::keep_with_edits(
+            0,
+            1,
+            vec![view::PartEdit::drop(0, &entry.mid, "0")],
+        )],
+    );
+    review.record_view(
+        Profile::Broca,
+        1,
+        &published,
+        std::slice::from_ref(&entry),
+        &["explicit drop".into()],
+        Some(0),
+        0,
+        "[]",
+    );
+    review.acknowledge(1, 1);
+    let restored = view::CompactionView::new(
+        "fixture",
+        2,
+        "L",
+        contract::lineage::MessageRef {
+            ordinal: 0,
+            mid: entry.mid.clone(),
+        },
+        vec![view::ViewRange::keep(0, 1)],
+    );
+    review.record_view(
+        Profile::Broca,
+        2,
+        &restored,
+        std::slice::from_ref(&entry),
+        &["acknowledged".into(), "uncovered".into()],
+        None,
+        0,
+        &json!([entry.message]).to_string(),
+    );
+    review.check_served_edits();
+    assert!(
+        review
+            .violations
+            .iter()
+            .any(|row| row.starts_with("RESTORED")),
+        "explicit edits are independent of summary coverage"
+    );
 }

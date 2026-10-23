@@ -5,6 +5,9 @@ use compact::{self as contract, ceiling::CeilingPolicy, notice, ride, view};
 use cortexkit_bus_trait::{ContentDigest, DurableOwner, Stream, StreamCursor};
 use cortexkit_role_llm_runner::{read::ReadMessage, session_ref, tags};
 use serde::Deserialize;
+mod contract_policy;
+mod cut_runtime;
+mod cut_seed;
 #[cfg(test)]
 mod differential_tests;
 mod emptied_messages;
@@ -12,6 +15,7 @@ mod frozen_edits;
 mod full_array_floor;
 mod held_entries;
 mod historian_tail;
+mod history_expand;
 mod moved_session;
 pub(crate) mod offline_first_pass;
 pub(crate) mod reminder_echoes;
@@ -178,6 +182,12 @@ pub(crate) struct Runtime {
     /// A test's notice read budget instead of the production one.
     #[cfg(test)]
     pub(crate) notice_read_budget: Mutex<Option<Duration>>,
+    /// Test reference that projects every held transcript row whenever normal
+    /// notice policy runs the engine; it still computes skip eligibility itself.
+    #[cfg(test)]
+    pub(crate) full_input_only: std::sync::atomic::AtomicBool,
+    #[cfg(test)]
+    pub(crate) record_notice_decisions: std::sync::atomic::AtomicBool,
 }
 
 #[derive(Serialize, Deserialize)]
@@ -265,6 +275,8 @@ pub(crate) struct AsyncRecord {
     runner_module: String,
     setup: compact::setup::SetupRequest,
     initial: Value,
+    #[serde(default)]
+    cache_policy: contract_policy::CachePolicy,
     /// Only the engine's fixed-size counters are in this record; its produced
     /// and applied baselines are named by `engine_baselines`.
     #[serde(with = "engine_header")]
@@ -324,6 +336,28 @@ pub(crate) struct AsyncRecord {
     /// live notice adopts or discards it; see `offline_first_pass`.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     offline_first_pass: Option<offline_first_pass::OfflineFirstPass>,
+    /// The record format; see `cut_seed::RECORD_VERSION`. Absent on records
+    /// written before cut seeds existed.
+    #[serde(default)]
+    record_version: u32,
+    /// The first ordinal of a lineage that begins at a cut: the slot
+    /// (`cut:<F>`) its seed is stored in. The seed itself is a baseline row,
+    /// so quiet notices never rewrite it.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    cut_first_ordinal: Option<u64>,
+    /// What the conversation keeps of the transcript below its cut.
+    #[serde(skip)]
+    cut_seed: Option<Arc<cut_seed::CutSeed>>,
+    #[serde(default)]
+    lineage_first_ordinal: u64,
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+    published_cuts: BTreeMap<u64, cut_runtime::PublishedCut>,
+    #[serde(skip)]
+    pending_cut_seeds: BTreeMap<u64, cut_seed::CutSeed>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pending_parent_history: Option<cut_runtime::ParentHistory>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    cut_signature: Option<crate::tail_hygiene::signature::SignaturePrefix>,
 }
 
 fn deserialize_logical_prefix<'de, D: serde::Deserializer<'de>>(
@@ -441,6 +475,10 @@ struct Journal {
     /// on the next save, because the next lineage may show their numbers on
     /// other parts.
     forget_tags_of: Vec<String>,
+    /// Stored entries below this ordinal go on the next save (a cut).
+    truncate_below: Option<u64>,
+    /// The cut seed changed and is written on the next save.
+    cut_seed_dirty: bool,
     /// Identities of the baselines as last stored.
     produced: Option<ViewIdentity>,
     applied: Option<ViewIdentity>,
@@ -846,6 +884,7 @@ impl State {
         });
         if let Some(floor) = retain_from {
             self.retired_frozen.retain_from(floor);
+            self.published_cuts.retain(|_, cut| cut.version >= floor);
         }
         let mut appended = Vec::new();
         for (ordinal, entry) in self.unsaved_entries() {
@@ -864,6 +903,24 @@ impl State {
         save.forget_tags_of(self.journal.forget_tags_of.clone());
         if let Some(through) = self.journal.truncate {
             save.truncate_entries(through);
+        }
+        if let Some(first) = self.journal.truncate_below {
+            save.truncate_below(first);
+        }
+        if let (true, Some(seed)) = (self.journal.cut_seed_dirty, &self.cut_seed) {
+            save.baseline(
+                cut_seed::CutSeed::slot(seed.first_ordinal),
+                Some(serde_json::to_string(seed.as_ref()).map_err(transient)?),
+            );
+        }
+        for (first, seed) in &self.pending_cut_seeds {
+            save.baseline(
+                format!("published-cut:{first}"),
+                Some(serde_json::to_string(seed).map_err(transient)?),
+            );
+        }
+        if !self.pending_cut_seeds.is_empty() {
+            save.baseline("pending-cut-stage", None);
         }
         for (ordinal, entry, index) in appended {
             save.append_entry(ordinal, entry, index);
@@ -890,6 +947,9 @@ impl State {
             return Err(transient(error));
         }
         self.journal.truncate = None;
+        self.journal.truncate_below = None;
+        self.journal.cut_seed_dirty = false;
+        self.pending_cut_seeds.clear();
         self.journal.forget_tags_of.clear();
         self.frozen_edits.dirty = false;
         self.retired_frozen.dirty = false;
@@ -1080,6 +1140,7 @@ impl State {
     /// Drop held entries after `through`, or all of them for `None`, with
     /// their tag addresses; the next save deletes the stored rows.
     fn truncate_entries(&mut self, through: Option<u64>) {
+        self.cut_signature = None;
         self.logical_prefix = None;
         self.mid_index
             .retain(|_, ordinal| through.is_some_and(|end| *ordinal <= end));
@@ -1104,8 +1165,9 @@ impl State {
             }
         }
         // A cut is rare (a fork descent or a resync): the next notice folds
-        // the remaining entries again from the first.
-        self.aggregates = resident::Aggregates::default();
+        // the remaining entries again from the first, on top of what a cut
+        // seed stands for.
+        self.aggregates = self.base_aggregates();
         self.entry_bytes = (None, 0);
         let journal = &mut self.journal;
         journal.truncate = Some(match (journal.truncate, through) {
@@ -1228,6 +1290,10 @@ impl State {
                 .map_or(0, |json| json.len())
             + self.aggregates.historian_input.retained_bytes()
             + self
+                .cut_seed
+                .as_ref()
+                .map_or(0, |seed| seed.retained_bytes())
+            + self
                 .reminder_hint_state
                 .as_ref()
                 .map_or(0, |cached| cached.bytes)
@@ -1331,20 +1397,39 @@ impl State {
             if let Some(version) = self.applied {
                 self.capture_frozen_version(store, version)?;
             }
-            let head = applied.and_then(|view| match view.ranges.first()? {
-                view::ViewRange::Replace { from: 0, to, bytes }
-                    if *to == 0 || self.entries.contains_key(&(to - 1)) =>
-                {
-                    Some(HistoryHeadSource {
-                        bytes: bytes.clone(),
-                        messages: self
-                            .entries
-                            .range(..*to)
-                            .map(|(ordinal, entry)| source(ordinal, entry))
-                            .collect(),
-                    })
+            // A restart-point cut may split one history head into several
+            // leading replacements. The history head's source proof covers the whole
+            // replaced span, not only the first range fragment.
+            let head = applied.and_then(|view| {
+                let view::ViewRange::Replace { from, .. } = view.ranges.first()? else {
+                    return None;
+                };
+                if *from != self.lineage_first_ordinal {
+                    return None;
                 }
-                _ => None,
+                let leading = view
+                    .ranges
+                    .iter()
+                    .take_while(|range| matches!(range, view::ViewRange::Replace { .. }))
+                    .collect::<Vec<_>>();
+                let to = leading.last()?.to();
+                if to > *from && !self.entries.contains_key(&(to - 1)) {
+                    return None;
+                }
+                let mut messages = Vec::<Value>::new();
+                for range in leading {
+                    if let view::ViewRange::Replace { bytes, .. } = range {
+                        messages.extend(serde_json::from_str::<Vec<Value>>(bytes).ok()?);
+                    }
+                }
+                Some(HistoryHeadSource {
+                    bytes: serde_json::to_string(&messages).ok()?,
+                    messages: self
+                        .entries
+                        .range(..to)
+                        .map(|(ordinal, entry)| source(ordinal, entry))
+                        .collect(),
+                })
             });
             self.resync_sources = Some(ResyncSources {
                 namespace,
@@ -1402,26 +1487,30 @@ impl State {
 /// on none for a session that was never moved. Records stored before the
 /// checkpoint had its own member kept it as two top-level members; those are
 /// not part of the published answer and are dropped.
-fn with_checkpoint(
-    mut answer: Value,
-    checkpoint: Option<contract::setup::SetupCheckpoint>,
-) -> Value {
-    if let Some(answer) = answer.as_object_mut() {
-        answer.remove("tag_checkpoint");
-        answer.remove("cut");
-        match checkpoint {
-            Some(checkpoint) => {
-                answer.insert(
-                    "checkpoint".into(),
-                    serde_json::to_value(checkpoint).expect("checkpoint serializes"),
-                );
-            }
-            None => {
-                answer.remove("checkpoint");
-            }
-        }
+fn with_checkpoint(answer: Value, checkpoint: Option<contract::setup::SetupCheckpoint>) -> Value {
+    let decoded: compact::setup::SetupAnswer =
+        serde_json::from_value(answer.clone()).expect("stored Setup answer decodes");
+    let mut built = compact::setup::SetupAnswer::ready(
+        decoded.request_id(),
+        decoded.initial().expect("ready answer").clone(),
+    );
+    if let Some(ceiling) = decoded.ceiling() {
+        built = built.with_ceiling(ceiling.clone());
     }
-    answer
+    if let Some(ttl) = decoded.cache_ttl() {
+        built = built.with_cache_ttl(ttl.clone());
+    }
+    if let Some(wait) = decoded.ride_wait_ms() {
+        built = built.with_ride_wait_ms(wait);
+    }
+    if let Some(checkpoint) = checkpoint {
+        built = built.with_checkpoint(checkpoint);
+    }
+    let mut result = serde_json::to_value(built).expect("Setup answer serializes");
+    if let Some(profile) = answer.get("serializer_profile") {
+        result["serializer_profile"] = profile.clone();
+    }
+    result
 }
 
 /// Load a conversation with its held transcript, tag index and engine
@@ -1487,6 +1576,13 @@ fn load(store: &McStore, reference: &str) -> Result<Option<State>, HandlerOutcom
     if let Some(json) = stored.remove("retired_native_edits") {
         state.retired_frozen = frozen_edits::RetiredViews::from_json(&json)?;
     }
+    if let Some(first) = state.cut_first_ordinal {
+        let json = stored
+            .remove(&cut_seed::CutSeed::slot(first))
+            .ok_or_else(|| transient("async cut seed row missing"))?;
+        state.cut_seed = Some(Arc::new(serde_json::from_str(&json).map_err(transient)?));
+        state.aggregates = state.base_aggregates();
+    }
     state.produced_view = produced;
     state.applied_view = applied;
     if let Some(prefix) = &state.logical_prefix {
@@ -1498,6 +1594,8 @@ fn load(store: &McStore, reference: &str) -> Result<Option<State>, HandlerOutcom
         persisted_through: through,
         indexed_through: through,
         truncate: None,
+        truncate_below: None,
+        cut_seed_dirty: false,
         clear_published: false,
         forget_tags_of: Vec::new(),
         produced: state
@@ -1704,7 +1802,12 @@ impl McHandler {
                 self.provider_store.async_runtime.bus_link.describe()
             );
             return bytes(
-                &json!({"answer":"refuse","request_id":request.request_id,"code":"provider_busy","provider_code":"bus_not_ready","reason":reason}),
+                &compact::setup::SetupAnswer::refuse(
+                    &request.request_id,
+                    compact::errors::RefuseCode::from_code("provider_busy"),
+                    reason,
+                )
+                .with_provider_code("bus_not_ready"),
             );
         }
         // Checked before an existing record is answered: a session the standalone
@@ -1721,6 +1824,42 @@ impl McHandler {
         };
         let reference = session_ref(&key.harness, &key.project.to_string_lossy(), &key.session);
         let existing = load_head(store, &reference)?;
+        if request.descends_from.is_some() {
+            return self
+                .setup_cut_descent(binding, &request, existing, store)
+                .await;
+        }
+        if let Some(old) = existing
+            .as_ref()
+            .filter(|old| old.lineage != request.lineage_id)
+        {
+            self.authorize_async(binding, old)?;
+            let generation = old
+                .generation
+                .checked_add(old.engine.version_high_water)
+                .and_then(|v| v.checked_add(2))
+                .ok_or_else(|| transient("async generation exhausted"))?;
+            let history = store
+                .load_compartments(&old.namespace())
+                .map_err(transient)?;
+            let mut state =
+                self.new_async_record(channel, binding, &request, key, None, generation)?;
+            state.cache_policy = old.cache_policy.clone();
+            store
+                .replace_compartments(&state.namespace(), &history)
+                .map_err(transient)?;
+            self.ensure_lineage_window(&mut state, Duration::from_secs(10))
+                .await?;
+            state.journal.truncate = Some(None);
+            state.save(store, &[])?;
+            self.provider_store
+                .async_runtime
+                .resident
+                .lock()
+                .expect("async resident cache")
+                .forget(&reference);
+            return bytes(&state.initial);
+        }
         // A record the offline first pass prepared is kept only for the exact
         // Setup it was prepared under; any other Setup discards it and sets the
         // conversation up fresh in the next generation.
@@ -1948,6 +2087,9 @@ impl McHandler {
             },
             setup: request.clone(),
             initial: Value::Null,
+            cache_policy: contract_policy::CachePolicy::freeze(
+                &self.effective_config(&binding.project_root),
+            ),
             engine: engine.clone(),
             published_engine: BTreeMap::new(),
             produced_view: None,
@@ -1967,6 +2109,14 @@ impl McHandler {
             resync: false,
             generation,
             offline_first_pass: None,
+            record_version: cut_seed::RECORD_VERSION,
+            cut_first_ordinal: None,
+            cut_seed: None,
+            lineage_first_ordinal: 0,
+            published_cuts: BTreeMap::new(),
+            pending_cut_seeds: BTreeMap::new(),
+            pending_parent_history: None,
+            cut_signature: None,
         };
         let route = state.runner()?;
         state.runner_route =
@@ -2003,12 +2153,25 @@ impl McHandler {
             codec,
             initial,
             &state,
-            self.async_oracle() || state.logical_prefix.is_none(),
+            self.async_input_oracle() || state.logical_prefix.is_none(),
         )?;
         state.adopt_engine(engine)?;
         // `serializer_profile` is a ck-mc extension member: the profile this
         // Setup accepted, so the runner can confirm ck-mc reads its schema.
-        state.initial = json!({"answer":"ready","request_id":request.request_id,"initial":wire, "ceiling":CeilingPolicy::new(0.95,300_000).with_on_overflow(),"serializer_profile":codec.wire_id()});
+        let mut answer = compact::setup::SetupAnswer::ready(
+            &request.request_id,
+            decode(&serde_json::to_value(wire).map_err(transient)?)?,
+        )
+        .with_ceiling(CeilingPolicy::new(0.95, 300_000).with_on_overflow())
+        .with_cache_ttl(state.cache_policy.resolve(&request.model));
+        if let Some(cap) = request.ride_wait_max_ms {
+            if cap == 0 {
+                return Err(invalid_field("ride_wait_max_ms", "must be positive"));
+            }
+            answer = answer.with_ride_wait_ms(10_000.min(cap));
+        }
+        state.initial = serde_json::to_value(answer).map_err(transient)?;
+        state.initial["serializer_profile"] = json!(codec.wire_id());
         Ok(state)
     }
 
@@ -2085,7 +2248,7 @@ impl McHandler {
         #[cfg(test)]
         resident::counters::engine_pass();
         // The oracle deliberately never consults prefix selection or its proof.
-        let mut prefix = if self.async_oracle() {
+        let mut prefix = if self.async_input_oracle() {
             None
         } else if let Some(prefix) = &state.logical_prefix {
             let loaded = store
@@ -2103,21 +2266,70 @@ impl McHandler {
                         .entries
                         .matches(state.prefix_input_proof.as_ref(), prefix.tail_from)
                 })
-                .filter(|_| {
-                    state.entries.first_key_value().map(|(ordinal, _)| *ordinal)
-                        == Some(prefix.from)
-                })
+                .filter(|_| state.lineage_from() == prefix.from)
                 .filter(|_| {
                     prefix.context_sources.iter().all(|(ordinal, source)| {
-                        state.entries.get(ordinal).is_some_and(|entry| {
-                            entry.mid == source.mid && source.ordinal == *ordinal
-                        })
+                        source.ordinal == *ordinal
+                            && (state
+                                .entries
+                                .get(ordinal)
+                                .is_some_and(|entry| entry.mid == source.mid)
+                                || state.cut_seed.as_ref().is_some_and(|seed| {
+                                    seed.context_sources
+                                        .get(ordinal)
+                                        .is_some_and(|held| held.mid == source.mid)
+                                }))
                     })
                 })
                 .map(|_| prefix.clone())
         } else {
             None
         };
+        #[cfg(test)]
+        if std::env::var_os("MC_CUT_TRACE").is_some() && prefix.is_none() {
+            if let Some(held) = &state.logical_prefix {
+                let loaded = store
+                    .load_logical_transform_snapshot(&state.namespace(), &[])
+                    .map_err(transient)?
+                    .loaded;
+                let compartments = store
+                    .load_compartments(&state.namespace())
+                    .map_err(transient)?;
+                eprintln!(
+                    "TRACE certificate refused: matches={} proof={} (held {:?} expected {:?}) from={}/{}",
+                    held.matches(&status.lineage_id, state.generation, &loaded, &compartments),
+                    state.entries.matches(state.prefix_input_proof.as_ref(), held.tail_from),
+                    state.entries.proof_before_peek(),
+                    state.prefix_input_proof,
+                    state.lineage_from(),
+                    held.from
+                );
+            }
+        }
+        // A conversation that begins at a cut has no rows below it to fall
+        // back on: without a matching certificate, its cut seed stands for
+        // them.
+        let seeded_prefix = |state: &State| -> Result<_, HandlerOutcome> {
+            state
+                .cut_seed
+                .as_ref()
+                .map(|seed| {
+                    let epoch = store
+                        .load_meta(&state.namespace())
+                        .map_err(transient)?
+                        .meta
+                        .revert_epoch;
+                    Ok(Arc::new(seed.prefix(
+                        &status.lineage_id,
+                        state.generation,
+                        epoch,
+                    )))
+                })
+                .transpose()
+        };
+        if prefix.is_none() {
+            prefix = seeded_prefix(state)?;
+        }
         let mut membership_unavailable = false;
         if let Some(prefix) = &mut prefix {
             let prefix = Arc::make_mut(prefix);
@@ -2140,7 +2352,7 @@ impl McHandler {
             }
         }
         if membership_unavailable {
-            prefix = None;
+            prefix = seeded_prefix(state)?;
         }
         let messages = if let Some(prefix) = &prefix {
             let mut messages = prefix.context_sources.values().cloned().collect::<Vec<_>>();
@@ -2156,10 +2368,9 @@ impl McHandler {
         };
         #[cfg(test)]
         scaling_tests::view_work::engine(&state.reference(), messages.len());
-        let source_from = state
-            .entries
-            .first_key_value()
-            .map_or(0, |(ordinal, _)| *ordinal);
+        // Positions count from the lineage's first ordinal, also in a
+        // lineage that begins at a cut (Pi derives fallback tool ids from them).
+        let source_from = state.lineage_from();
         state.reminder_echoes.prepare_with(
             codec,
             &mut template,
@@ -2176,6 +2387,44 @@ impl McHandler {
                     .pending(&cadence.ledger, now_ms().max(0) as u64)
             });
         template.native_tail_section = true;
+        #[cfg(test)]
+        if self
+            .provider_store
+            .async_runtime
+            .full_input_only
+            .load(std::sync::atomic::Ordering::Relaxed)
+        {
+            let expected = state
+                .entries
+                .iter()
+                .map(|(ordinal, entry)| (*ordinal, entry.mid.clone()))
+                .collect::<Vec<_>>();
+            let actual = template
+                .messages
+                .iter()
+                .map(|message| (message.ordinal, message.mid.clone()))
+                .collect::<Vec<_>>();
+            assert!(
+                expected.is_empty()
+                    || (expected[0].0 == 0
+                        && expected.windows(2).all(|pair| pair[0].0 + 1 == pair[1].0)),
+                "the full-input fixture must retain the original contiguous transcript"
+            );
+            assert_eq!(
+                actual, expected,
+                "full-input oracle must project every original source identity in order"
+            );
+            cut_seed::pass_trace::record(
+                Arc::as_ptr(store) as usize,
+                format!(
+                    "full_input rows={} first={:?} last={:?} identities_digest={}",
+                    expected.len(),
+                    expected.first(),
+                    expected.last(),
+                    crate::sha256_hex(&serde_json::to_vec(&actual).unwrap())
+                ),
+            );
+        }
         if let Some(policy) = &state.usage_policy {
             template.emergency_recovery_armed = policy.emergency_recovery_armed;
             if let Some(limit) = policy.limit_for(model) {
@@ -2195,6 +2444,18 @@ impl McHandler {
         // views never remove the signed reasoning they invalidate.
         let signed = transform::compaction::SignedReasoning::RunnerCompanion;
         let previous_engine = engine.clone();
+        #[cfg(test)]
+        if self
+            .provider_store
+            .async_runtime
+            .record_notice_decisions
+            .load(std::sync::atomic::Ordering::Relaxed)
+        {
+            cut_seed::pass_trace::record(
+                Arc::as_ptr(store) as usize,
+                format!("engine_input rows={}", template.messages.len()),
+            );
+        }
         let output = if engine.last_applied.is_none() {
             transform::compaction::setup_with(store, &template, &context, status, engine, signed)
         } else {
@@ -2202,11 +2463,22 @@ impl McHandler {
         };
         let output = match output {
             Ok(output) => output,
-            Err(_) if template.logical_prefix.is_some() => {
+            Err(_)
+                if template
+                    .logical_prefix
+                    .as_ref()
+                    .is_some_and(|prefix| !prefix.is_cut()) =>
+            {
                 // If a prefix-based pass fails, retry with every held inbound
-                // message; do not guess at the omitted source bytes.
+                // message (behind the cut seed, for a conversation that
+                // begins at a cut); do not guess at the omitted source bytes.
                 *engine = previous_engine;
-                let messages = inbound_messages(state.entries.values())?;
+                let fallback = seeded_prefix(state)?;
+                let mut messages = fallback
+                    .as_ref()
+                    .map(|prefix| prefix.context_sources.values().cloned().collect::<Vec<_>>())
+                    .unwrap_or_default();
+                messages.extend(inbound_messages(state.entries.values())?);
                 #[cfg(test)]
                 scaling_tests::view_work::engine(&state.reference(), messages.len());
                 state.reminder_echoes.prepare_with(
@@ -2216,7 +2488,7 @@ impl McHandler {
                     false,
                     |request, entries| codec.prepare_request_from(request, entries, source_from),
                 )?;
-                template.logical_prefix = None;
+                template.logical_prefix = fallback;
                 if engine.last_applied.is_none() {
                     transform::compaction::setup_with(
                         store, &template, &context, status, engine, signed,
@@ -2367,7 +2639,6 @@ fn compact_prefix_hygiene_once(
     let Some(baseline) = &mut loaded.meta.tail_hygiene_baseline else {
         return Ok(());
     };
-    let before = baseline.baseline_parts.len();
     // Covered excluded parts contribute no token mass. Their source membership
     // is certified by the prefix, so keep only context and uncovered parts,
     // without changing the frozen totals, generation, or reminder cadence.
@@ -2386,9 +2657,9 @@ fn compact_prefix_hygiene_once(
             *ordinal >= prefix.tail_from || prefix.context_ordinals.contains(ordinal)
         })
     });
-    if baseline.baseline_parts.len() == before {
-        return Ok(());
-    }
+    // The version check also validates the certificate's metadata snapshot.
+    // Keep it when the baseline is already canonical: concurrent historian
+    // metadata may be rebased, but a concurrent revert must invalidate reuse.
     #[cfg(test)]
     scaling_tests::hygiene_interleaving::run(&state.reference());
     store.commit_logical_transform_with_provider_policy(
@@ -2421,6 +2692,17 @@ fn compact_prefix_hygiene_once(
         None,
     )?;
     Ok(())
+}
+
+/// The `ctx_reduce` detail for tags from below the conversation's cut.
+fn ctx_reduce_summarized_details(summarized: &[u64]) -> String {
+    if summarized.is_empty() {
+        return String::new();
+    }
+    format!(
+        "tags {} already in the history summary, nothing to drop",
+        format_plain_tag_numbers(summarized)
+    )
 }
 
 /// The part as the runner renders it to the model under `render_tags`: a
@@ -2588,7 +2870,7 @@ fn ranges(
     let mut ranges = Vec::new();
     let mut kept = tool_arcs::KeptMessages::new();
     let mut synthetic = Vec::new();
-    let mut next = 0;
+    let mut next = state.lineage_first_ordinal;
     let history_end = history_through
         .map_or(0, |through| through.saturating_add(1))
         .max(
@@ -3108,6 +3390,12 @@ impl McHandler {
                 state.resync
                     || state.offline_first_pass.is_some()
                     || state.lineage.as_deref() != Some(&view.lineage_id)
+                    || view.cut.as_ref().is_some_and(|cut| {
+                        state
+                            .published_cuts
+                            .get(&(cut.through_ordinal + 1))
+                            .is_none_or(|held| held.version != version)
+                    })
             }) {
                 continue;
             }
@@ -3217,8 +3505,46 @@ impl McHandler {
         state = self
             .checkout(store, &notice.session_ref)?
             .ok_or_else(|| transient("async session disappeared"))?;
+        if notice
+            .first_ordinal
+            .is_some_and(|first| first > state.lineage_first_ordinal)
+        {
+            let Some(descent) = &notice.descends_from else {
+                return Err(error(
+                    "unknown_cut",
+                    "a cut notice must name its published parent",
+                ));
+            };
+            let mut request = state.setup.clone();
+            request.lineage_id = Some(notice.lineage_id.clone());
+            request.descends_from = Some(compact::lineage::DescendsFrom::new(
+                &descent.lineage_id,
+                descent.through_ordinal,
+            ));
+            let binding = self.async_binding(&state);
+            self.checkin(state);
+            let answer: Value = serde_json::from_slice(
+                &self
+                    .setup_cut_descent(
+                        &binding,
+                        &request,
+                        load_head(store, &notice.session_ref)?,
+                        store,
+                    )
+                    .await?,
+            )
+            .map_err(transient)?;
+            if answer["answer"] != "ready" {
+                return Err(error("unknown_cut", "the notice names an unknown cut"));
+            }
+            state = self
+                .checkout(store, &notice.session_ref)?
+                .ok_or_else(|| transient("async session disappeared"))?;
+        }
         #[cfg(test)]
         drop(phase);
+        // A record from before cut seeds existed is rebuilt, not migrated.
+        cut_seed::discard_older_record(&mut state, store)?;
         // A record the offline first pass prepared is checked against what the
         // runner serves now, once, before anything else: it is either adopted
         // whole or discarded for a fresh record.
@@ -3332,7 +3658,7 @@ impl McHandler {
         #[cfg(test)]
         let phase = scaling_tests::save_meter::start_kind(&notice.session_ref, "phase:read");
         for attempt in 0..2 {
-            let from = state.entries.last_key_value().map_or(0, |(n, _)| *n);
+            let from = state.read_from();
             let read = self
                 .read_async_resumable(&mut state, from, self.notice_read_budget())
                 .await;
@@ -3407,6 +3733,15 @@ impl McHandler {
         let skip_phase = scaling_tests::save_meter::start_kind(&notice.session_ref, "phase:skip");
         let run_engine = (state.completed_seq < notice.seq || resynced)
             && (resynced || !self.async_engine_can_skip(&state, &notice)?);
+        #[cfg(test)]
+        if self
+            .provider_store
+            .async_runtime
+            .record_notice_decisions
+            .load(std::sync::atomic::Ordering::Relaxed)
+        {
+            cut_seed::notice_trace::record(Arc::as_ptr(store) as usize, notice.seq, run_engine);
+        }
         #[cfg(test)]
         drop(skip_phase);
         if run_engine {
@@ -3499,6 +3834,8 @@ impl McHandler {
     ) -> Result<ReadProgress, HandlerOutcome> {
         let started = Instant::now();
         let deadline = started + budget;
+        self.ensure_lineage_window(state, budget).await?;
+        from = from.max(state.cut_first_ordinal.unwrap_or(0));
         // Stop before a page that the remaining budget could cut short: a page
         // call cut by its timeout is a failed read, not a resumable one.
         let mut slowest_page = Duration::ZERO;
@@ -3879,6 +4216,8 @@ impl McHandler {
             .store
             .get()
             .ok_or_else(|| transient("store unavailable"))?;
+        state.cleanup_pending_cut_stage(store)?;
+        state.forward_parent_history(store)?;
         let headers = state
             .conditions
             .as_ref()
@@ -3908,6 +4247,24 @@ impl McHandler {
         let (template, output) =
             self.async_engine(channel, &binding, state, codec, &status, &mut engine)?;
         #[cfg(test)]
+        cut_seed::pass_trace::record(
+            Arc::as_ptr(store) as usize,
+            format!(
+                "action={} prefix={:?} cut_prefix={} messages={} first={:?}",
+                output.engine.response.action,
+                template
+                    .logical_prefix
+                    .as_ref()
+                    .map(|prefix| prefix.tail_from),
+                template
+                    .logical_prefix
+                    .as_ref()
+                    .is_some_and(|prefix| prefix.is_cut()),
+                template.messages.len(),
+                template.messages.first().map(|message| message.ordinal)
+            ),
+        );
+        #[cfg(test)]
         drop(meter);
         #[cfg(test)]
         let meter = scaling_tests::save_meter::start_kind(&state.reference(), "pub:certify");
@@ -3931,7 +4288,7 @@ impl McHandler {
                 state.generation,
             );
             if let Some(prefix) = &mut prefix {
-                prefix.context_sources = inbound_messages(
+                let mut sources: BTreeMap<u64, InboundMessage> = inbound_messages(
                     prefix
                         .context_ordinals
                         .iter()
@@ -3940,6 +4297,15 @@ impl McHandler {
                 .into_iter()
                 .map(|source| (source.ordinal, source))
                 .collect();
+                // Context sources below a cut are kept by its seed.
+                if let Some(seed) = &state.cut_seed {
+                    for ordinal in &prefix.context_ordinals {
+                        if let Some(source) = seed.context_sources.get(ordinal) {
+                            sources.entry(*ordinal).or_insert_with(|| source.clone());
+                        }
+                    }
+                }
+                prefix.context_sources = sources;
             }
             if let Some(candidate) = &prefix {
                 if let Err(error) =
@@ -3967,7 +4333,7 @@ impl McHandler {
         drop(meter);
         #[cfg(test)]
         let meter = scaling_tests::save_meter::start_kind(&state.reference(), "pub:render");
-        let wire = if self.async_oracle() || state.logical_prefix.is_none() {
+        let wire = if self.async_input_oracle() || state.logical_prefix.is_none() {
             rendered_view(codec, &candidate, state, true)?
         } else if template.logical_prefix.is_none() {
             // This pass read every held message, but `certify` above has just
@@ -4010,11 +4376,24 @@ impl McHandler {
         }
         let restored_head = state.restored_head.take();
         if let Some(head) = &restored_head {
-            if let Some(view::ViewRange::Replace { from: 0, to, bytes }) =
-                ranges.first_mut().filter(|range| range.to() == head.to)
+            let head_end = ranges
+                .iter()
+                .take_while(|range| matches!(range, view::ViewRange::Replace { .. }))
+                .last()
+                .map(view::ViewRange::to);
+            if let Some(view::ViewRange::Replace { bytes, .. }) =
+                ranges.first_mut().filter(|_| head_end == Some(head.to))
             {
-                let _ = to;
                 *bytes = head.bytes.clone();
+                for range in ranges
+                    .iter_mut()
+                    .skip(1)
+                    .take_while(|range| matches!(range, view::ViewRange::Replace { .. }))
+                {
+                    if let view::ViewRange::Replace { bytes, .. } = range {
+                        *bytes = "[]".into();
+                    }
+                }
                 let messages: Vec<Value> = serde_json::from_str(&head.bytes).map_err(transient)?;
                 let mut decoded = Vec::new();
                 for (index, mut message) in messages.into_iter().enumerate() {
@@ -4061,11 +4440,28 @@ impl McHandler {
         }
         // The cut covers the leading replace ranges the history head made, not
         // a removed message that may follow them.
-        let cut_through = ranges
-            .iter()
-            .take_while(|range| matches!(range, view::ViewRange::Replace { .. }))
-            .last()
-            .and_then(|range| range.to().checked_sub(1));
+        state.fold_entries(codec, None)?;
+        let cut_first = coverage
+            .and_then(|through| {
+                state
+                    .aggregates
+                    .historian_input
+                    .restart_at_or_below(through)
+            })
+            .filter(|first| *first > state.lineage_first_ordinal);
+        if let Some(first) = cut_first {
+            if let Some(signature) = crate::tail_hygiene::signature::SignaturePrefix::capture(
+                first,
+                template
+                    .logical_prefix
+                    .as_ref()
+                    .and_then(|prefix| prefix.signature_prefix.as_ref()),
+                &output.engine.projection,
+            ) {
+                state.cut_signature = Some(signature);
+            }
+            cut_runtime::split_head_at(&mut ranges, first);
+        }
         let shaped = emptied_messages::shape(codec, &kept, &state.frozen_edits, ranges);
         let ranges = shaped.ranges;
         let version = store
@@ -4081,9 +4477,10 @@ impl McHandler {
                 mid: last.mid.clone(),
             },
             ranges,
-        );
-        if let Some(through) = cut_through {
-            view = view.with_cut(view::ViewCut::new(format!("v{version}"), through));
+        )
+        .with_cache_ttl(state.cache_ttl());
+        if let Some(first) = cut_first {
+            view = view.with_cut(view::ViewCut::new(format!("v{version}"), first - 1));
         }
         let view = match checked_async_view(view, codec, &kept)? {
             Ok(view) => view,
@@ -4109,10 +4506,12 @@ impl McHandler {
             #[serde(flatten)]
             view: &'a transform::compaction::View,
             native_frozen_edits: &'a frozen_edits::FrozenEdits,
+            history_through: Option<u64>,
         }
         let engine_json: Arc<str> = serde_json::to_string(&PublishedEngine {
             view: &candidate,
             native_frozen_edits: &frozen_edits,
+            history_through: coverage,
         })
         .map_err(transient)?
         .into();
@@ -4131,6 +4530,9 @@ impl McHandler {
         // The produced baseline is this published view; adopting after the
         // insert shares its serialized form instead of serializing it again.
         state.adopt_engine(engine)?;
+        if let Some(first) = cut_first {
+            state.keep_published_cut(store, codec, first, &view)?;
+        }
         Ok(Some(view))
     }
 
@@ -4194,6 +4596,13 @@ impl McHandler {
         }
         let started = Instant::now();
         let budget = Duration::from_millis(request.deadline_ms);
+        let fallback_ttl = self
+            .store
+            .get()
+            .map(|store| load_head(store, &request.session_ref))
+            .transpose()?
+            .flatten()
+            .map(|state| state.cache_ttl());
         let work = async {
             let store = self
                 .store
@@ -4210,21 +4619,30 @@ impl McHandler {
                     detail: serde_json::to_value(failure).map_err(transient)?,
                 });
             }
-            let _serial = self.provider_serial.lock_for(&state.key).await;
+            let _serial = if matches!(request.cause, ride::RideCause::Ceiling) {
+                self.provider_serial.lock_for(&state.key).await
+            } else {
+                let Ok(guard) = self.provider_serial.try_lock_for(&state.key) else {
+                    return bytes(&ride::RideAnswer::nothing().with_cache_ttl(state.cache_ttl()));
+                };
+                guard
+            };
             state = self
                 .checkout(store, &request.session_ref)?
                 .ok_or_else(|| transient("async session disappeared"))?;
             // An offline-prepared record serves nothing until a notice has
             // checked it against the runner's transcript.
             if state.resync || state.offline_first_pass.is_some() {
+                let answer = ride::RideAnswer::nothing().with_cache_ttl(state.cache_ttl());
                 self.checkin(state);
-                return bytes(&ride::RideAnswer::nothing());
+                return bytes(&answer);
             }
-            let from = state.entries.last_key_value().map_or(0, |(n, _)| *n);
-            if self
-                .read_async(&mut state, from, budget.saturating_sub(started.elapsed()))
-                .await
-                .is_err()
+            let from = state.read_from();
+            if matches!(request.cause, ride::RideCause::Ceiling)
+                && self
+                    .read_async(&mut state, from, budget.saturating_sub(started.elapsed()))
+                    .await
+                    .is_err()
             {
                 state.reset(store)?;
                 state.save(store, &[])?;
@@ -4240,6 +4658,7 @@ impl McHandler {
             let rows = state.unsaved_tag_rows(codec)?;
             state.save(store, &rows)?;
             let worker = self.provider_historian_worker();
+            let cache_ttl = state.cache_ttl();
             let store = Arc::clone(store);
             let reference = request.session_ref.clone();
             let view = tokio::task::spawn_blocking(move || {
@@ -4261,13 +4680,18 @@ impl McHandler {
             .map_err(transient)??;
             self.announce_async_views().await?;
             match view {
-                Some(view) => bytes(&ride::RideAnswer::view(view)),
-                None => bytes(&ride::RideAnswer::nothing()),
+                Some(view) => bytes(&ride::RideAnswer::view(view).with_cache_ttl(cache_ttl)),
+                None => bytes(&ride::RideAnswer::nothing().with_cache_ttl(cache_ttl)),
             }
         };
         tokio::time::timeout(budget, work)
             .await
-            .unwrap_or_else(|_| bytes(&ride::RideAnswer::nothing()))
+            .unwrap_or_else(|_| {
+                bytes(&match fallback_ttl {
+                    Some(ttl) => ride::RideAnswer::nothing().with_cache_ttl(ttl),
+                    None => ride::RideAnswer::nothing(),
+                })
+            })
     }
 }
 
@@ -4315,12 +4739,23 @@ impl McHandler {
             Ok((targets, unknown))
         };
         let (mut targets, mut unknown) = resolve(&state)?;
+        // A tag from below the conversation's cut is already in the history
+        // summary: its content is out of the model's context, so there is
+        // nothing to drop and nothing is queued.
+        let summarized = state.cut_seed.as_ref().map_or_else(Vec::new, |seed| {
+            unknown
+                .iter()
+                .copied()
+                .filter(|number| seed.tagged_below(*number))
+                .collect::<Vec<_>>()
+        });
+        unknown.retain(|number| !summarized.contains(number));
         let mut catch_up_failed = false;
         if !unknown.is_empty() {
             // A tag can reach the model before its change notice reaches us.
             // Re-read the inclusive tail under the same serial as notices so
             // the cursor, lineage checks and persisted indexes move together.
-            let from = state.entries.last_key_value().map_or(0, |(n, _)| *n);
+            let from = state.read_from();
             let budget = Duration::from_secs(2);
             catch_up_failed = state.resync
                 || !matches!(
@@ -4330,6 +4765,7 @@ impl McHandler {
                 || state.ingest_read(store, codec).is_err();
             if !catch_up_failed {
                 (targets, unknown) = resolve(&state)?;
+                unknown.retain(|number| !summarized.contains(number));
             }
         }
         let namespace = state.namespace();
@@ -4344,8 +4780,24 @@ impl McHandler {
                 format_plain_tag_numbers(&unknown)
             )
         } else {
-            ctx_reduce_ack_details(&unknown)
+            [
+                ctx_reduce_ack_details(&unknown),
+                ctx_reduce_summarized_details(&summarized),
+            ]
+            .into_iter()
+            .filter(|detail| !detail.is_empty())
+            .collect::<Vec<_>>()
+            .join("; ")
         };
+        if targets.is_empty() && unknown.is_empty() && !summarized.is_empty() && !catch_up_failed {
+            return Ok(mcp_text_result(
+                format!(
+                    "Nothing to drop: tags {} are already in the history summary.",
+                    format_plain_tag_numbers(&summarized)
+                ),
+                false,
+            ));
+        }
         if targets.is_empty() {
             return Ok(tool_error_result(if catch_up_failed {
                 details
@@ -4800,6 +5252,19 @@ impl McHandler {
         false
     }
 
+    fn async_input_oracle(&self) -> bool {
+        #[cfg(test)]
+        if self
+            .provider_store
+            .async_runtime
+            .full_input_only
+            .load(std::sync::atomic::Ordering::Relaxed)
+        {
+            return true;
+        }
+        self.async_oracle()
+    }
+
     /// Take a conversation for one operation. Call only under its provider
     /// lock. The resident copy is used when the store still holds exactly the
     /// record it was saved or loaded with; otherwise it is rebuilt from rows.
@@ -4849,6 +5314,9 @@ impl McHandler {
         }
         if state.resync || state.entries.is_empty() {
             return Ok(true);
+        }
+        if state.pending_parent_history.is_some() {
+            return Ok(false);
         }
         let store = self
             .store

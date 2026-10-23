@@ -43,13 +43,14 @@ async fn a_moved_session_answers_setup_with_its_checkpoint_and_the_runner_anchor
             cut: cut.into()
         }
     );
-    let numbers = tags::number_parts(
+    let numbers = tags::try_number_parts(
         20,
         &[
             tags::RenderedPart::new(tags::PartKind::UserText, 0),
             tags::RenderedPart::new(tags::PartKind::AssistantText, 1),
         ],
-    );
+    )
+    .unwrap();
     assert_eq!(numbers, vec![Some(21), Some(22)]);
 }
 

@@ -11,6 +11,7 @@ use mc_store::{
 use sha2::{Digest, Sha256};
 
 use crate::ck_wire::{FlatBlock, FlatProjection};
+pub(crate) mod signature;
 #[cfg(test)]
 use crate::protection_window::CoordinateSpace;
 use crate::protection_window::{TagNumber, TagNumberProjection};
@@ -92,6 +93,22 @@ pub(crate) struct TailHygieneMeasurement {
     pub(crate) parts: Vec<TailHygienePartMeasurement>,
     /// First index in `parts` that belongs to the newest message; the frozen prefix stops here.
     pub(crate) newest_message_part_start: usize,
+}
+
+impl TailHygieneMeasurement {
+    /// Excluded parts have no token, tag or protection contribution. Their
+    /// bytes still belong to the content signature, but retaining them in the
+    /// positional metric baseline makes a covered-prefix trim look like an edit.
+    pub(crate) fn omit_excluded_baseline_parts(&mut self) {
+        self.newest_message_part_start = self
+            .parts
+            .iter()
+            .take(self.newest_message_part_start)
+            .filter(|part| part.kind != TailHygienePartKind::Excluded)
+            .count();
+        self.parts
+            .retain(|part| part.kind != TailHygienePartKind::Excluded);
+    }
 }
 
 /// First point where a defer pass stopped matching the frozen prefix.

@@ -19,6 +19,9 @@ mod stack26_cache_review;
 #[path = "card_cache_review.rs"]
 mod card_cache_review;
 
+#[path = "cut_lineage_tests.rs"]
+mod cut_lineage_tests;
+
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum Profile {
     Broca,
@@ -99,7 +102,7 @@ fn renumber(entries: &mut [ReadMessage]) {
     let parts = (0..counted as u64)
         .map(|at| tags::RenderedPart::new(tags::PartKind::ToolResultText, at))
         .collect::<Vec<_>>();
-    let mut numbers = tags::number_parts(0, &parts).into_iter();
+    let mut numbers = tags::try_number_parts(0, &parts).unwrap().into_iter();
     for row in entries
         .iter_mut()
         .flat_map(|entry| entry.tags.iter_mut())
@@ -315,12 +318,72 @@ fn timeless(mut value: Value) -> Value {
     value
 }
 
+/// A cancelled Tokio blocking task reports a process-local id. Preserve the
+/// exact provider code and cancellation message, ignoring only that id.
+fn comparable_answer(answer: String) -> String {
+    let prefix = "Error { code: \"transient\", message: \"task ";
+    let suffix = " was cancelled\" }";
+    if let Some(id) = answer
+        .strip_prefix(prefix)
+        .and_then(|tail| tail.strip_suffix(suffix))
+    {
+        if !id.is_empty() && id.bytes().all(|byte| byte.is_ascii_digit()) {
+            return format!("{prefix}<id>{suffix}");
+        }
+    }
+    answer
+}
+
+#[test]
+fn cancelled_blocking_tasks_differ_only_in_their_runtime_task_id() {
+    let cancel_queued = || {
+        let runtime = tokio::runtime::Builder::new_multi_thread()
+            .worker_threads(1)
+            .max_blocking_threads(1)
+            .enable_all()
+            .build()
+            .unwrap();
+        let (started, entered) = std::sync::mpsc::channel();
+        let (release, blocked) = std::sync::mpsc::channel();
+        let occupied = runtime.spawn_blocking(move || {
+            started.send(()).unwrap();
+            blocked.recv().unwrap();
+        });
+        entered.recv().unwrap();
+        let queued = runtime.spawn_blocking(|| 4);
+        queued.abort();
+        runtime.shutdown_background();
+        release.send(()).unwrap();
+        let observer = tokio::runtime::Runtime::new().unwrap();
+        observer.block_on(occupied).unwrap();
+        let error = observer.block_on(queued).unwrap_err();
+        assert!(error.is_cancelled());
+        format!("{:?}", transient(error))
+    };
+    let first = cancel_queued();
+    let second = cancel_queued();
+    assert_ne!(first, second, "real runtime task identities must differ");
+    assert_eq!(comparable_answer(first), comparable_answer(second));
+    for answer in [
+        "Error { code: \"fatal\", message: \"task 61 was cancelled\" }",
+        "Error { code: \"transient\", message: \"task 61 panicked\" }",
+        "Error { code: \"transient\", message: \"task -61 was cancelled\" }",
+        "Error { code: \"transient\", message: \"task 61 was cancelled: partial work\" }",
+    ] {
+        assert_eq!(comparable_answer(answer.into()), answer);
+    }
+}
+
 struct Runner {
     transcript: Arc<Transcript>,
     sends: Mutex<Vec<String>>,
     /// The same sends with their clock-dependent members, for rendering the
     /// reminder text a runner would deliver.
     raw_sends: Mutex<Vec<Value>>,
+    /// The first ordinal of a lineage that begins at a cut: a read from
+    /// below it is refused (`before_lineage_start`) and recorded.
+    floor: Mutex<Option<u64>>,
+    reads_below_floor: Mutex<Vec<u64>>,
 }
 
 #[async_trait]
@@ -363,6 +426,9 @@ impl session_resolver::ProviderRunner for Runner {
                 json!({"majors":[{"version":"llm-runner/v1","ops":["role.describe","session.baseline","session.send"]}],"implementation_version":"fake","session_capabilities_from":"baseline","capabilities":["delivery_order"]}),
             );
         }
+        if method == "session.head" {
+            return Ok(json!({"first_ordinal":0}));
+        }
         assert_eq!(method, "session.read");
         let lineage = self.transcript.lineage.lock().unwrap().clone();
         if params["lineage_id"]
@@ -374,6 +440,12 @@ impl session_resolver::ProviderRunner for Runner {
             ));
         }
         let from = params["from_ordinal"].as_u64().unwrap();
+        if self.floor.lock().unwrap().is_some_and(|floor| from < floor) {
+            self.reads_below_floor.lock().unwrap().push(from);
+            return Err(SessionResolveError::InvalidResponse(
+                "before_lineage_start".into(),
+            ));
+        }
         let mut entries = self.transcript.entries.lock().unwrap();
         renumber(&mut entries);
         let messages = entries
@@ -430,6 +502,8 @@ impl Side {
             transcript: Arc::clone(transcript),
             sends: Mutex::new(Vec::new()),
             raw_sends: Mutex::new(Vec::new()),
+            floor: Mutex::new(None),
+            reads_below_floor: Mutex::new(Vec::new()),
         });
         let mut h = McHandler::new();
         h.store.set(store).ok().unwrap();
@@ -572,6 +646,9 @@ struct Pair {
     /// Independent served-edit and reminder-echo observations; see
     /// `stack24_cache_review::Review`.
     review: std::cell::RefCell<stack24_cache_review::Review>,
+    /// Engine state fields that differed between the two sides, by field,
+    /// with the first difference; see `cut_lineage_tests`.
+    engine_mismatches: std::cell::RefCell<BTreeMap<String, String>>,
     _project: tempfile::TempDir,
 }
 
@@ -588,6 +665,18 @@ impl Pair {
         setup_lineage: Option<&str>,
         inject_docs: bool,
     ) -> Self {
+        Self::open_with(profile, tiny_budget, setup_lineage, inject_docs, true).await
+    }
+
+    /// `open`, with the second side the full-recompute oracle or, when
+    /// `oracle` is false, a second resident provider.
+    async fn open_with(
+        profile: Profile,
+        tiny_budget: bool,
+        setup_lineage: Option<&str>,
+        inject_docs: bool,
+        oracle: bool,
+    ) -> Self {
         let project = tempfile::tempdir().unwrap();
         let transcript = Arc::new(Transcript {
             lineage: Mutex::new("L".into()),
@@ -601,7 +690,7 @@ impl Pair {
             .unwrap();
         }
         let resident = Side::new(project.path(), &transcript, false, inject_docs).await;
-        let oracle = Side::new(project.path(), &transcript, true, inject_docs).await;
+        let oracle = Side::new(project.path(), &transcript, oracle, inject_docs).await;
         if tiny_budget {
             resident
                 .h
@@ -627,6 +716,7 @@ impl Pair {
             mismatches: Vec::new(),
             immutable_views: Default::default(),
             review: Default::default(),
+            engine_mismatches: Default::default(),
             _project: project,
         };
         let mut setup = json!({"method":"compaction.setup","params":{"session":"s","harness":profile.harness(),"request_id":"setup","model":"fixture","context_window":100_000,"composition":{"render_tags":true},"params":{"serializer_profile":profile.wire()},"now":1}});
@@ -665,11 +755,11 @@ impl Pair {
             eprintln!("review trace: running {label} after {:?}", self.log.last());
         }
         let timer = Instant::now();
-        let resident = op(&self.resident).await;
+        let resident = comparable_answer(op(&self.resident).await);
         let resident_ms = timer.elapsed().as_millis();
         self.resident.settle().await;
         let timer = Instant::now();
-        let oracle = op(&self.oracle).await;
+        let oracle = comparable_answer(op(&self.oracle).await);
         let oracle_ms = timer.elapsed().as_millis();
         self.oracle.settle().await;
         // Rides answer nothing once their deadline passes, so a slow side can
@@ -748,10 +838,12 @@ impl Pair {
             .collect::<BTreeSet<_>>();
         (!differing.is_empty()).then(|| {
             format!(
-                "after step {} ({}): {:?}",
+                "after step {} ({}): {:?}; historian full={:?} resident={:?}",
                 self.log.len(),
                 self.log.last().map_or("", String::as_str),
-                differing
+                differing,
+                oracle.get("historian"),
+                resident.get("historian")
             )
         })
     }
@@ -775,14 +867,21 @@ impl Pair {
             {
                 let head = load_head(self.resident.store(), &self.reference).unwrap();
                 let generation = head.as_ref().map_or(0, |head| head.generation);
-                let coverage = head.and_then(|head| {
-                    self.resident
-                        .store()
-                        .load_meta(&head.namespace())
-                        .ok()?
-                        .meta
-                        .coverage_ordinal
-                });
+                // Coverage is the publication's own snapshot. A later summary
+                // may have a different boundary by the time a view is observed.
+                let coverage = self
+                    .resident
+                    .store()
+                    .load_async_compaction_views(&self.reference)
+                    .unwrap()
+                    .0
+                    .into_iter()
+                    .find(|(published, _, _, _)| published == version)
+                    .and_then(|(_, _, engine, _)| engine)
+                    .map(|engine| {
+                        serde_json::from_str::<Value>(&engine).unwrap()["history_through"].as_u64()
+                    })
+                    .expect("each new view records its publication coverage");
                 // Assemble before locking the transcript: assembly locks it too.
                 let model = String::from_utf8(self.model_bytes(&left_view)).unwrap();
                 self.review.borrow_mut().record_view(
@@ -1096,7 +1195,13 @@ impl Pair {
     }
 
     async fn step(&mut self, rng: &mut Rng) {
-        match rng.below(100) {
+        let roll = rng.below(100);
+        self.step_roll(rng, roll).await;
+    }
+
+    /// One randomized step of kind `roll` (0 to 99).
+    async fn step_roll(&mut self, rng: &mut Rng, roll: u64) {
+        match roll {
             0..=44 => {
                 let count = 1 + rng.below(5);
                 self.append(count);

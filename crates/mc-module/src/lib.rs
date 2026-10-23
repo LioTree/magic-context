@@ -16129,6 +16129,29 @@ impl McHandler {
             Ok(transcripts) => transcripts,
             Err(error) => return tool_error_result(format!("Error: {error}")),
         };
+        if let Ok(binding) = self.facade_binding(channel) {
+            match self
+                .async_history_expand(&binding, session_id, &compartments, start, bounded_end)
+                .await
+            {
+                Ok(Some(messages)) => {
+                    return mcp_text_result(
+                        if verbose {
+                            render_verbose_expand_result(
+                                start,
+                                bounded_end,
+                                render_verbose_range_expand(&messages, start, bounded_end),
+                            )
+                        } else {
+                            render_durable_range_expand(start, bounded_end, &messages)
+                        },
+                        false,
+                    );
+                }
+                Ok(None) => {}
+                Err(outcome) => return outcome,
+            }
+        }
         if verbose {
             let durable_messages = durable_expand_messages(&transcripts);
             let rendered = self

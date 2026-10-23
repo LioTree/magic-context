@@ -2,7 +2,7 @@
 use super::*;
 use std::ops::Deref;
 
-#[derive(Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
 pub(super) struct InputProof {
     before: u64,
     count: usize,
@@ -101,6 +101,11 @@ impl HeldEntries {
             }
         }
         self.proof.before = before;
+        self.proof.clone()
+    }
+
+    #[cfg(test)]
+    pub(super) fn proof_before_peek(&self) -> InputProof {
         self.proof.clone()
     }
 

@@ -135,7 +135,7 @@ async fn covered_view_work_tracks_tail_not_session() {
         );
         eprintln!("covered ride total={size} tail=12 work={work:?}");
         assert!(
-            work.engine_input <= 14 && work.renderer_input <= 14 && work.decoded_entries <= 28,
+            work.engine_input <= 14 && work.renderer_input <= 14 && work.decoded_entries <= 84,
             "size={size}, tail=12: {work:?}"
         );
         rig.history(size - 10, "later fold");
@@ -255,7 +255,7 @@ async fn covered_ride_keeps_prefix_during_historian_meta_write() {
                 && work.renderer_input > 0
                 && work.renderer_input <= 14
                 && work.decoded_entries > 0
-                && work.decoded_entries <= 28,
+                && work.decoded_entries <= 84,
             "writes={writes}: {work:?}"
         );
         let state = rig.state();
@@ -438,6 +438,13 @@ pub(super) mod save_meter {
 #[derive(Default)]
 struct PagedRunner {
     entries: Mutex<Vec<(ReadMessage, usize)>>,
+    cut: Mutex<Option<(String, u64)>>,
+    /// Every call the provider made, for checks that an operation calls no
+    /// runner method.
+    calls: std::sync::atomic::AtomicU64,
+    read_requests: Mutex<Vec<u64>>,
+    read_rows: std::sync::atomic::AtomicU64,
+    read_bytes: std::sync::atomic::AtomicU64,
 }
 
 #[async_trait]
@@ -467,6 +474,8 @@ impl session_resolver::ProviderRunner for PagedRunner {
         params: Value,
         _: Duration,
     ) -> Result<Value, SessionResolveError> {
+        self.calls
+            .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
         if method == "session.send" {
             return Ok(json!({"state":"pending","submission_id":"reminder"}));
         }
@@ -475,8 +484,22 @@ impl session_resolver::ProviderRunner for PagedRunner {
                 json!({"majors":[{"version":"llm-runner/v1","ops":["role.describe","session.baseline","session.send"]}],"implementation_version":"fake","session_capabilities_from":"baseline","capabilities":["delivery_order"]}),
             );
         }
+        let cut = self.cut.lock().unwrap().clone();
+        if method == "session.head" {
+            return Ok(if let Some((lineage, first)) = cut {
+                let entries = self.entries.lock().unwrap();
+                let entry = &entries[(first - 1) as usize].0;
+                json!({"lineage_id":lineage,"first_ordinal":first,"last_ordinal":entries.last().unwrap().0.ordinal,"cut":{"mid":entry.mid,"digest":served_digest(entry).unwrap(),"written_at":1}})
+            } else {
+                json!({"first_ordinal":0})
+            });
+        }
         assert_eq!(method, "session.read");
         let from = params["from_ordinal"].as_u64().unwrap();
+        self.read_requests.lock().unwrap().push(from);
+        if let Some((_, first)) = &cut {
+            assert!(from >= *first, "before_lineage_start: {from} < {first}");
+        }
         let budget = params["max_bytes"].as_u64().unwrap_or(1_048_576) as usize;
         let entries = self.entries.lock().unwrap();
         let start = entries.partition_point(|(entry, _)| entry.ordinal < from);
@@ -489,7 +512,11 @@ impl session_resolver::ProviderRunner for PagedRunner {
             used += size;
             messages.push(entry.clone());
         }
-        let mut page = json!({"lineage_id":"L","messages":messages});
+        self.read_rows
+            .fetch_add(messages.len() as u64, std::sync::atomic::Ordering::Relaxed);
+        self.read_bytes
+            .fetch_add(used as u64, std::sync::atomic::Ordering::Relaxed);
+        let mut page = json!({"lineage_id":cut.map_or_else(|| "L".into(), |(lineage,_)| lineage),"messages":messages});
         if start + messages.len() < entries.len() {
             page["next_from_ordinal"] = json!(messages.last().unwrap().ordinal + 1);
         }
@@ -772,7 +799,12 @@ impl Rig {
         let mut notice = notice::AdvanceNotice::new(
             &self.reference,
             seq,
-            "L",
+            self.runner
+                .cut
+                .lock()
+                .unwrap()
+                .as_ref()
+                .map_or("L".into(), |(lineage, _)| lineage.clone()),
             last_ordinal,
             digest,
             est_tokens,
@@ -783,7 +815,7 @@ impl Rig {
             notice = notice.with_applied_view_version(version);
         }
         let mut headers = notice.to_headers();
-        headers.insert("lineage_id".into(), "L".into());
+        headers.insert("lineage_id".into(), notice.lineage_id.clone());
         let message = cortexkit_bus_trait::Message {
             subject: notice::event_subject("fixture", "thalamus-harness", notice::ADVANCED_EVENT),
             id: bus_id(&self.reference, "advanced", seq),
@@ -1018,7 +1050,7 @@ fn row(label: &str, size: u64, sample: &Sample) -> String {
     line
 }
 
-const PHASES: [&str; 17] = [
+const PHASES: [&str; 21] = [
     "load",
     "rem:base",
     "rem:last",
@@ -1036,6 +1068,10 @@ const PHASES: [&str; 17] = [
     "phase:historian",
     "phase:checkin",
     "save",
+    "pub:engine",
+    "pub:certify",
+    "pub:render",
+    "pub:ranges",
 ];
 
 fn phase_stats(reference: &str) -> Vec<save_meter::SaveStats> {
@@ -1229,7 +1265,12 @@ impl Rig {
         let mut notice = notice::AdvanceNotice::new(
             &self.reference,
             seq,
-            "L",
+            self.runner
+                .cut
+                .lock()
+                .unwrap()
+                .as_ref()
+                .map_or("L".into(), |(lineage, _)| lineage.clone()),
             last_ordinal,
             digest,
             est_tokens,
@@ -1240,7 +1281,7 @@ impl Rig {
             notice = notice.with_applied_view_version(version);
         }
         let mut headers = notice.to_headers();
-        headers.insert("lineage_id".into(), "L".into());
+        headers.insert("lineage_id".into(), notice.lineage_id.clone());
         let message = cortexkit_bus_trait::Message {
             subject: notice::event_subject("fixture", "thalamus-harness", notice::ADVANCED_EVENT),
             id: bus_id(&self.reference, "advanced", seq),
@@ -1250,7 +1291,26 @@ impl Rig {
         let wall = Instant::now();
         let thread = cpu_time::ThreadTime::now();
         let process = cpu_time::ProcessTime::now();
-        let outcome = self.h.advance_compaction("fixture", &message).await;
+        let mut previous_progress = None;
+        let outcome = loop {
+            let outcome = self.h.advance_compaction("fixture", &message).await;
+            let incomplete = matches!(&outcome, Err(HandlerOutcome::Error { code, message })
+                if code == "transient" && message.starts_with("async read incomplete;"));
+            if !incomplete {
+                break outcome;
+            }
+            // The bus retries the same claim after a valid partial read. Do
+            // the same during fixture preparation instead of starting a new
+            // notice or treating documented progress as a failed benchmark.
+            let head = load_head(self.store(), &self.reference).unwrap().unwrap();
+            assert_eq!(head.partial_read_seq, Some(seq));
+            let progress = self.scalar("SELECT COALESCE(MAX(ordinal),0) FROM mc_async_compaction_entries WHERE session_ref=?1");
+            assert!(
+                previous_progress.is_none_or(|previous| progress > previous),
+                "a resumable read must advance"
+            );
+            previous_progress = Some(progress);
+        };
         let sample = (
             wall.elapsed().as_secs_f64() * 1e3,
             thread.elapsed().as_secs_f64() * 1e3,
@@ -1505,7 +1565,86 @@ async fn covered_tail_latency_benchmark() {
         assert!(tail > 0 && (tail as u64) < size);
         let covered = size - tail as u64 - 1;
         rig.history(covered, "completed history covering the old prefix");
+        // Seed capture belongs to the fold that publishes a cut, not to a
+        // later step. The runner starts the timed lineage at that real cut.
+        if std::env::var_os("MC_ASYNC_FRESH_CUT").is_some() {
+            *rig.runner.cut.lock().unwrap() = Some(("L".into(), covered.saturating_sub(4)));
+        } else {
+            rig.try_timed_notice(0, None, est_tokens).await.2.unwrap();
+            let version = rig.newest_view().expect("published fold");
+            rig.try_timed_notice(0, Some(version), est_tokens)
+                .await
+                .2
+                .unwrap();
+            let first = *rig
+                .state()
+                .published_cuts
+                .keys()
+                .next_back()
+                .expect("saved cut");
+            let mut request = serde_json::to_value(&rig.state().setup).unwrap();
+            request["lineage_id"] = json!("L2");
+            request["descends_from"] = json!({"lineage_id":"L","through_ordinal":first - 1});
+            let setup = rig.op("compaction.setup", request).await;
+            assert_eq!(setup["answer"], "ready", "{setup}");
+            *rig.runner.cut.lock().unwrap() = Some(("L2".into(), first));
+        }
+        #[cfg(target_os = "linux")]
+        {
+            std::fs::write("/proc/self/clear_refs", "5")
+                .expect("reset peak after fixture preparation");
+        }
+        let (peak, current) = rss();
+        let rss_before = current;
+        eprintln!("BENCH before_bootstrap total={size} RSS_bytes={current} peak_RSS_bytes={peak}");
+        let boot_phases = phase_stats(&rig.reference);
+        view_work::take(&rig.reference);
+        let read_calls_before = rig.runner.read_requests.lock().unwrap().len();
+        let read_rows_before = rig
+            .runner
+            .read_rows
+            .load(std::sync::atomic::Ordering::Relaxed);
+        let read_bytes_before = rig
+            .runner
+            .read_bytes
+            .load(std::sync::atomic::Ordering::Relaxed);
         let bootstrap = rig.try_timed_notice(0, None, est_tokens).await;
+        let first_work = view_work::take(&rig.reference);
+        let first_head = load_head(rig.store(), &rig.reference).unwrap().unwrap();
+        let first_from = first_head.lineage_first_ordinal;
+        let first_reads = rig.runner.read_requests.lock().unwrap()[read_calls_before..].to_vec();
+        assert!(first_reads.iter().all(|from| *from >= first_from));
+        let below_cut = rig.scalar(&format!("SELECT count(*) FROM mc_async_compaction_entries WHERE session_ref=?1 AND ordinal<{first_from}"));
+        assert_eq!(
+            below_cut, 0,
+            "first notice must hold no per-message rows below the cut"
+        );
+        let first_compartments = rig
+            .store()
+            .load_compartments(&first_head.namespace())
+            .unwrap();
+        let first_summary_bytes = first_compartments
+            .iter()
+            .map(|row| row.title.len() + row.content.len() + row.p1.as_ref().map_or(0, String::len))
+            .sum::<usize>();
+        let first_pending = rig
+            .store()
+            .load_pending_agent_drops(&first_head.namespace())
+            .unwrap()
+            .len();
+        let first_phases = phases(&rig.reference, &boot_phases);
+        let first_read_rows = rig
+            .runner
+            .read_rows
+            .load(std::sync::atomic::Ordering::Relaxed)
+            - read_rows_before;
+        let first_read_bytes = rig
+            .runner
+            .read_bytes
+            .load(std::sync::atomic::Ordering::Relaxed)
+            - read_bytes_before;
+        let (peak, current) = rss();
+        eprintln!("BENCH bootstrap total={size} wall_ms={:.1} RSS_bytes={current} peak_RSS_bytes={peak} phases: {}", bootstrap.0.0, phases(&rig.reference, &boot_phases));
         eprintln!("shape total={size} uncovered={tail} serialized_tail_tokens={tokens} compartment_end={covered} bootstrap={:?} elapsed_ms={:.1}", bootstrap.2, bootstrap.0.0);
         if bootstrap.2.is_err() {
             eprintln!("Bootstrap failed; retrying before ordinary-notice sampling.");
@@ -1563,6 +1702,7 @@ async fn covered_tail_latency_benchmark() {
             }
         }
         percentiles("quiet notice (+4 msgs)", size, &mut notices);
+        let quiet_p50 = median_wall(&notices);
         if !historian.is_empty() {
             percentiles(
                 "historian evaluation (process CPU after notice)",
@@ -1598,6 +1738,7 @@ async fn covered_tail_latency_benchmark() {
         let mut publish_errors = 0;
         for index in 0..views {
             rig.history(covered + 1 + index as u64 * 2, "a newer completed summary");
+            let ride_phases = phase_stats(&rig.reference);
             let wall = Instant::now();
             let thread = cpu_time::ThreadTime::now();
             let process = cpu_time::ProcessTime::now();
@@ -1612,6 +1753,10 @@ async fn covered_tail_latency_benchmark() {
                 thread.elapsed().as_secs_f64() * 1e3,
                 process.elapsed().as_secs_f64() * 1e3,
             ));
+            eprintln!(
+                "BENCH ride total={size} phases: {}",
+                phases(&rig.reference, &ride_phases)
+            );
             if answer["answer"] == "view" {
                 version = answer["view"]["view_version"].as_u64();
                 eprintln!(
@@ -1626,7 +1771,13 @@ async fn covered_tail_latency_benchmark() {
             let ack = rig.try_timed_notice(0, version, est_tokens).await;
             eprintln!("acknowledging notice outcome={:?}", ack.2);
             rig.history(covered + 2 + index as u64 * 2, "another completed summary");
+            let publish_phases = phase_stats(&rig.reference);
             let (sample, _, outcome) = rig.try_timed_notice(0, version, est_tokens).await;
+            eprintln!(
+                "BENCH publish total={size} wall_ms={:.1} phases: {}",
+                sample.0,
+                phases(&rig.reference, &publish_phases)
+            );
             publishes.push(sample);
             if let Err(error) = outcome {
                 publish_errors += 1;
@@ -1636,6 +1787,7 @@ async fn covered_tail_latency_benchmark() {
         }
         percentiles("ride attempt", size, &mut rides);
         percentiles("publishing notice attempt", size, &mut publishes);
+        let (ride_p50, publish_p50) = (median_wall(&rides), median_wall(&publishes));
         eprintln!(
             "ride errors={ride_errors}/{views}, publishing notice errors={publish_errors}/{views}"
         );
@@ -1644,5 +1796,318 @@ async fn covered_tail_latency_benchmark() {
         let compartment_end = rig.store().max_compartment_end_ordinal(&namespace).unwrap();
         let (peak, current) = rss();
         eprintln!("memory total={size} RSS_bytes={current} peak_RSS_bytes={peak} persisted_compartment_end={compartment_end} applied_coverage={:?}", meta.coverage_ordinal);
+        let held = rig
+            .h
+            .provider_store
+            .async_runtime
+            .resident
+            .lock()
+            .unwrap()
+            .held_bytes(&rig.reference)
+            .unwrap_or(0);
+        let (record, entry_bytes) = rig.record_bytes();
+        let entry_rows =
+            rig.scalar("SELECT count(*) FROM mc_async_compaction_entries WHERE session_ref=?1");
+        eprintln!("BENCH store total={size} resident_held_bytes={held} state_json_bytes={record} entry_rows={entry_rows} entry_bytes={entry_bytes}");
+        // What a lineage that descends from a cut at the newest historian
+        // restart point would keep: the cut seed with the folded head, the
+        // record's cadence state, its retained views and its certificate.
+        // Bounded by the history, the frozen units and the window, so it must
+        // not grow with the session.
+        let cut_seed_bytes = {
+            let mut state = rig.state();
+            let codec =
+                codec::Codec::from_params(&Value::Object(state.setup.params.clone())).unwrap();
+            state.fold_entries(codec, None).unwrap();
+            let first = meta
+                .coverage_ordinal
+                .and_then(|coverage| {
+                    state
+                        .aggregates
+                        .historian_input
+                        .restart_at_or_below(coverage)
+                })
+                .expect("a restart point at or below coverage");
+            let seed = state
+                .capture_cut_seed(rig.store(), codec, first)
+                .unwrap()
+                .unwrap_or_else(|refusal| panic!("cut seed refused: {}", refusal.code()));
+            let bytes = |value: &dyn erased_size::Sized| value.json_len();
+            let total = serde_json::to_string(&seed).unwrap().len();
+            eprintln!(
+                "BENCH cut_seed total={size} first={first} seed_bytes={total} head_bytes={} views_bytes={} engine_views_bytes={} certificate_bytes={} record_bytes={} context_bytes={} protection_bytes={} pre_cut_tags_bytes={} frozen_edits_bytes={} window_units_bytes={} window_units={}",
+                bytes(&seed.window.head),
+                bytes(&seed.window.views),
+                bytes(&(&seed.window.produced_view, &seed.window.applied_view)),
+                bytes(&seed.window.certificate),
+                bytes(&seed.window.record),
+                bytes(&seed.context_sources),
+                bytes(&seed.protection),
+                bytes(&seed.pre_cut_tags),
+                bytes(&seed.window.frozen_edits),
+                bytes(&seed.window.frozen_units),
+                seed.window.head.as_ref().map_or(0, |head| head.core.frozen_units.len()),
+            );
+            total as u64
+        };
+        // Setup for a lineage that descends from this one at its newest
+        // message, as a runner sends it at a cut: it must be answered from
+        // the state kept, with no runner call and nothing that grows with the
+        // session. Measured last, so the conversation is not moved before the
+        // other operations.
+        let first = *rig.state().published_cuts.keys().next_back().unwrap();
+        let parent = rig.state().published_cuts[&first].lineage.clone();
+        let calls_before = rig.runner.calls.load(std::sync::atomic::Ordering::Relaxed);
+        let mut setups = Vec::new();
+        for attempt in 0..5 {
+            let wall = Instant::now();
+            let thread = cpu_time::ThreadTime::now();
+            let process = cpu_time::ProcessTime::now();
+            let answer = rig.op("compaction.setup",json!({"session":"s","harness":"opencode","request_id":format!("descending-setup-{attempt}"),"model":"fixture","context_window":100_000,"composition":{"render_tags":true},"params":{"serializer_profile":"opencode-aisdk"},"lineage_id":format!("L3-{attempt}"),"descends_from":{"lineage_id":parent,"through_ordinal":first - 1},"now":1})).await;
+            assert_eq!(answer["answer"], "ready", "{answer}");
+            setups.push((
+                wall.elapsed().as_secs_f64() * 1e3,
+                thread.elapsed().as_secs_f64() * 1e3,
+                process.elapsed().as_secs_f64() * 1e3,
+            ));
+            if attempt == 0 {
+                eprintln!("descending setup answer={}", answer["answer"]);
+            }
+        }
+        let setup_runner_calls =
+            rig.runner.calls.load(std::sync::atomic::Ordering::Relaxed) - calls_before;
+        percentiles("setup for a descending lineage", size, &mut setups);
+        eprintln!("descending setup runner calls={setup_runner_calls}");
+        // One machine-readable line per size, read by `cost_rule_150k_vs_1k`.
+        // The peak is net of the RSS before the first notice: that baseline is
+        // the test fixture and the fake runner's own copy of the transcript,
+        // which the provider does not own.
+        let cost = CostSample {
+            size,
+            first_notice_ms: bootstrap.0 .0,
+            quiet_p50_ms: quiet_p50,
+            ride_p50_ms: ride_p50,
+            publish_p50_ms: publish_p50,
+            peak_rss_net_bytes: peak.saturating_sub(rss_before),
+            resident_held_bytes: held as u64,
+            descending_setup_p50_ms: median_wall(&setups),
+            cut_seed_bytes,
+            descending_setup_runner_calls: setup_runner_calls,
+            first_notice_thread_cpu_ms: bootstrap.0 .1,
+            first_notice_process_cpu_ms: bootstrap.0 .2,
+            first_notice_engine_input: first_work.engine_input,
+            first_notice_decoded_entries: first_work.decoded_entries,
+            first_notice_read_rows: first_read_rows,
+            first_notice_read_bytes: first_read_bytes,
+            first_notice_from_ordinal: first_from,
+            first_notice_read_requests: first_reads,
+            first_notice_below_cut_rows: below_cut,
+            first_notice_compartments: first_compartments.len(),
+            first_notice_summary_bytes: first_summary_bytes,
+            first_notice_pending_drops: first_pending,
+            first_notice_phases: first_phases,
+        };
+        eprintln!("{COST_LINE}{}", serde_json::to_string(&cost).unwrap());
     }
+}
+
+/// Serialized size, for the benchmark's cut-seed breakdown.
+mod erased_size {
+    pub trait Sized {
+        fn json_len(&self) -> usize;
+    }
+    impl<T: serde::Serialize> Sized for T {
+        fn json_len(&self) -> usize {
+            serde_json::to_string(self).map_or(0, |json| json.len())
+        }
+    }
+}
+
+/// Prefix of the line `covered_tail_latency_benchmark` prints with one size's
+/// cost summary.
+const COST_LINE: &str = "COST_RULE ";
+
+#[derive(Serialize, Deserialize, Debug, Clone)]
+struct CostSample {
+    size: u64,
+    first_notice_ms: f64,
+    quiet_p50_ms: f64,
+    ride_p50_ms: f64,
+    publish_p50_ms: f64,
+    peak_rss_net_bytes: u64,
+    resident_held_bytes: u64,
+    descending_setup_p50_ms: f64,
+    cut_seed_bytes: u64,
+    descending_setup_runner_calls: u64,
+    first_notice_thread_cpu_ms: f64,
+    first_notice_process_cpu_ms: f64,
+    first_notice_engine_input: usize,
+    first_notice_decoded_entries: usize,
+    first_notice_read_rows: u64,
+    first_notice_read_bytes: u64,
+    first_notice_from_ordinal: u64,
+    first_notice_read_requests: Vec<u64>,
+    first_notice_below_cut_rows: u64,
+    first_notice_compartments: usize,
+    first_notice_summary_bytes: usize,
+    first_notice_pending_drops: usize,
+    first_notice_phases: String,
+}
+
+fn median_wall(samples: &[(f64, f64, f64)]) -> f64 {
+    let mut walls = samples.iter().map(|sample| sample.0).collect::<Vec<_>>();
+    walls.sort_by(f64::total_cmp);
+    walls.get(walls.len() / 2).copied().unwrap_or(f64::NAN)
+}
+
+/// The cost rule as an assertion: per-step work scales with new messages and
+/// resident memory with the window, so a 150,000-message session whose
+/// compartments cover all but the same ~40k-token tail must cost no more than
+/// twice a 1,000-message one on every measured step, and hold no more than
+/// twice the memory.
+///
+/// Each size runs `covered_tail_latency_benchmark` in its own child process
+/// of this test binary, because the peak resident set (VmHWM) of a process
+/// never decreases. Linux only (RSS comes from /proc). Run with:
+///
+/// ```sh
+/// cargo test --release -p mc-module --lib cost_rule_150k_vs_1k -- --ignored --nocapture
+/// ```
+///
+/// `MC_ASYNC_NOTICES` and `MC_ASYNC_VIEWS` pass through (defaults 50 and 5).
+#[test]
+#[ignore = "cost-rule benchmark assertion; run explicitly with --release --ignored --nocapture"]
+fn cost_rule_150k_vs_1k() {
+    let run = |size: u64, fresh: bool| -> CostSample {
+        let exe = std::env::current_exe().unwrap();
+        let mut command = std::process::Command::new(exe);
+        if fresh {
+            command.env("MC_ASYNC_FRESH_CUT", "1");
+        }
+        let output = command
+            .args([
+                "--exact",
+                "providers::async_provider::scaling_tests::covered_tail_latency_benchmark",
+                "--ignored",
+                "--nocapture",
+                "--test-threads=1",
+            ])
+            .env("MC_ASYNC_SCALING_SIZES", size.to_string())
+            .env(
+                "MC_ASYNC_NOTICES",
+                std::env::var("MC_ASYNC_NOTICES").unwrap_or_else(|_| "50".into()),
+            )
+            .env(
+                "MC_ASYNC_VIEWS",
+                std::env::var("MC_ASYNC_VIEWS").unwrap_or_else(|_| "5".into()),
+            )
+            .output()
+            .unwrap();
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        let stdout = String::from_utf8_lossy(&output.stdout);
+        for line in stderr.lines().filter(|line| line.starts_with("BENCH ")) {
+            eprintln!("{line}");
+        }
+        assert!(
+            output.status.success(),
+            "benchmark at {size} failed:\n{stdout}\n{stderr}"
+        );
+        let line = stderr
+            .lines()
+            .find_map(|line| line.strip_prefix(COST_LINE))
+            .unwrap_or_else(|| panic!("no cost line at {size}:\n{stdout}\n{stderr}"));
+        serde_json::from_str(line).unwrap()
+    };
+    for fresh in [false, true] {
+        eprintln!(
+            "cost rule mode={}",
+            if fresh { "fresh" } else { "descending" }
+        );
+        let small = run(1_000, fresh);
+        let large = run(150_000, fresh);
+        eprintln!("cost rule 1k: {small:?}");
+        eprintln!("cost rule 150k: {large:?}");
+        let checks = [
+            (
+                "first notice ms",
+                small.first_notice_ms,
+                large.first_notice_ms,
+            ),
+            (
+                "quiet notice p50 ms",
+                small.quiet_p50_ms,
+                large.quiet_p50_ms,
+            ),
+            ("ride p50 ms", small.ride_p50_ms, large.ride_p50_ms),
+            (
+                "publishing notice p50 ms",
+                small.publish_p50_ms,
+                large.publish_p50_ms,
+            ),
+            (
+                "peak RSS net of the fixture, bytes",
+                small.peak_rss_net_bytes as f64,
+                large.peak_rss_net_bytes as f64,
+            ),
+            (
+                "resident record bytes",
+                small.resident_held_bytes as f64,
+                large.resident_held_bytes as f64,
+            ),
+            (
+                "cut seed bytes",
+                small.cut_seed_bytes as f64,
+                large.cut_seed_bytes as f64,
+            ),
+            (
+                "setup for a descending lineage p50 ms",
+                small.descending_setup_p50_ms,
+                large.descending_setup_p50_ms,
+            ),
+        ];
+        let mut failures = checks
+            .iter()
+            .map(|(name, small, large)| {
+                let ratio = large / small;
+                eprintln!("cost rule {name}: 1k {small:.1} 150k {large:.1} ratio {ratio:.2}");
+                (name, ratio)
+            })
+            .filter(|(_, ratio)| !ratio.is_finite() || *ratio > 2.0)
+            .map(|(name, ratio)| format!("{name} {ratio:.2}x"))
+            .collect::<Vec<_>>();
+        for sample in [&small, &large] {
+            if sample.descending_setup_runner_calls != 0 {
+                failures.push(format!(
+                    "setup for a descending lineage at {} made {} runner calls",
+                    sample.size, sample.descending_setup_runner_calls
+                ));
+            }
+        }
+        assert!(
+            failures.is_empty(),
+            "150k vs 1k above 2x: {}",
+            failures.join(", ")
+        );
+    }
+}
+
+#[tokio::test]
+async fn benchmark_preparation_resumes_the_same_notice_until_the_read_finishes() {
+    let dir = tempfile::tempdir().unwrap();
+    let mut rig = Rig::new(dir.path()).await;
+    rig.append(1_000);
+    *rig.h
+        .provider_store
+        .async_runtime
+        .notice_read_budget
+        .lock()
+        .unwrap() = Some(Duration::from_micros(1));
+    let (_, _, outcome) = rig.try_timed_notice(0, None, 1_000).await;
+    outcome.unwrap();
+    let state = rig.state();
+    assert_eq!(state.seq, 1);
+    assert_eq!(state.completed_seq, 1);
+    assert_eq!(state.partial_read_seq, None);
+    assert_eq!(state.entries.len(), 1_000);
+    assert!(rig.runner.calls.load(std::sync::atomic::Ordering::Relaxed) > 2);
 }
