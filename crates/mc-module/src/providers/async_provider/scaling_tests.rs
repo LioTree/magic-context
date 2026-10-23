@@ -1927,7 +1927,7 @@ mod erased_size {
 /// cost summary.
 const COST_LINE: &str = "COST_RULE ";
 
-#[derive(Serialize, Deserialize, Debug, Clone, Copy)]
+#[derive(Serialize, Deserialize, Debug, Clone)]
 struct CostSample {
     size: u64,
     first_notice_ms: f64,
