@@ -1792,7 +1792,7 @@ async fn covered_tail_latency_benchmark() {
             let wall = Instant::now();
             let thread = cpu_time::ThreadTime::now();
             let process = cpu_time::ProcessTime::now();
-            let answer = rig.op("compaction.setup",json!({"session":"s","harness":"opencode","request_id":format!("descending-setup-{attempt}"),"model":"fixture","context_window":100_000,"composition":{"render_tags":true},"params":{"serializer_profile":"opencode-aisdk"},"lineage_id":"L3","descends_from":{"lineage_id":parent,"through_ordinal":first - 1},"now":1})).await;
+            let answer = rig.op("compaction.setup",json!({"session":"s","harness":"opencode","request_id":format!("descending-setup-{attempt}"),"model":"fixture","context_window":100_000,"composition":{"render_tags":true},"params":{"serializer_profile":"opencode-aisdk"},"lineage_id":format!("L3-{attempt}"),"descends_from":{"lineage_id":parent,"through_ordinal":first - 1},"now":1})).await;
             assert_eq!(answer["answer"], "ready", "{answer}");
             setups.push((
                 wall.elapsed().as_secs_f64() * 1e3,
