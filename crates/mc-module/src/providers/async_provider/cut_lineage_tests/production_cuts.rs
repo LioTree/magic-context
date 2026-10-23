@@ -28,17 +28,24 @@ fn verify_passes(pair: &Pair, seed: u64) -> usize {
             .filter(|line| line.starts_with("action="))
             .count()
     };
+    let attempts = |lines: &[String]| {
+        lines
+            .iter()
+            .filter(|line| line.starts_with("engine_input "))
+            .count()
+    };
+    assert_eq!(attempts(&resident), attempts(&oracle), "{:?} seed {seed}: both providers must attempt the same engine passes; resident={resident:?} full={oracle:?}", pair.profile);
     assert_eq!(actions(&resident), actions(&oracle), "{:?} seed {seed}: both providers must run the same engine passes; resident={resident:?} full={oracle:?}", pair.profile);
     assert_eq!(
         oracle
             .iter()
             .filter(|line| line.starts_with("full_input "))
             .count(),
-        actions(&oracle),
-        "{:?} seed {seed}: each full-input pass needs an exact source-identity proof: {oracle:?}",
-        pair.profile
+        attempts(&oracle),
+        "{:?} seed {seed}: each full-input pass needs an exact source-identity proof: resident={resident:?} full={oracle:?}; steps={:?}",
+        pair.profile, pair.log
     );
-    actions(&oracle)
+    attempts(&oracle)
 }
 
 async fn descend_pair(pair: &mut Pair, first: u64, child: &str) {
@@ -116,6 +123,8 @@ async fn session(profile: Profile, number: u64, steps: u64) -> (usize, usize) {
             .async_runtime
             .record_notice_decisions
             .store(true, std::sync::atomic::Ordering::Relaxed);
+        cut_seed::pass_trace::take(side.store() as *const McStore as usize);
+        cut_seed::notice_trace::take(side.store() as *const McStore as usize);
     }
     attest(&pair.resident);
     attest(&pair.oracle);
@@ -125,6 +134,21 @@ async fn session(profile: Profile, number: u64, steps: u64) -> (usize, usize) {
     for cut in 0..2 {
         if cut > 0 {
             pair.append(32);
+        }
+        if profile != Profile::OpenCode {
+            while pair
+                .transcript
+                .entries
+                .lock()
+                .unwrap()
+                .last()
+                .unwrap()
+                .ordinal
+                % 4
+                != 3
+            {
+                pair.append(1);
+            }
         }
         let last = pair
             .transcript
@@ -143,16 +167,48 @@ async fn session(profile: Profile, number: u64, steps: u64) -> (usize, usize) {
         .await;
         let sequence = pair.seq;
         pair.notice(&mut rng, None).await;
+        {
+            let historian = |side: &Side| {
+                let head = load_head(side.store(), &pair.reference).unwrap().unwrap();
+                serde_json::to_value(
+                    side.store()
+                        .load_meta(&head.namespace())
+                        .unwrap()
+                        .meta
+                        .historian,
+                )
+                .unwrap()
+            };
+            let (full, cut) = (historian(&pair.oracle), historian(&pair.resident));
+            assert_eq!(without_rows_below(full.clone(), 0), without_rows_below(cut.clone(), 0), "{profile:?} seed {number}: historian non-clock state diverged before descent: full={full} cut={cut}");
+        }
         decisions += compare_decisions(&pair, sequence, number);
         passes += verify_passes(&pair, number);
-        let held = load(pair.resident.store(), &pair.reference)
-            .unwrap()
-            .unwrap();
-        let first = *held
-            .published_cuts
-            .keys()
-            .next_back()
-            .expect("an adoptable published cut");
+        let mut first = None;
+        for attempt in 0..12 {
+            let held = load(pair.resident.store(), &pair.reference)
+                .unwrap()
+                .unwrap();
+            first = held
+                .published_cuts
+                .keys()
+                .next_back()
+                .copied()
+                .filter(|first| *first > previous);
+            if first.is_some() {
+                break;
+            }
+            // A signed/in-flight turn may defer a fold. Complete another turn
+            // and offer the ordinary rewrite opportunity; never fabricate a seed.
+            pair.append(if profile == Profile::OpenCode { 1 } else { 4 });
+            let request = json!({"method":"compaction.ride","params":{"session_ref":pair.reference,"cause":"surface_change","deadline_ms":10_000}});
+            pair.both(&format!("cut preparation ride {attempt}"), |side| {
+                Box::pin(side.dispatch(request.clone()))
+            })
+            .await;
+            passes += verify_passes(&pair, number);
+        }
+        let first = first.unwrap_or_else(|| panic!("{profile:?} seed {number}: no advancing adoptable cut after completing turns; previous={previous}; steps={:?}", pair.log));
         assert!(
             first > previous,
             "each session must descend at two advancing cuts"
@@ -193,21 +249,36 @@ async fn differential(sessions: u64, steps: u64) {
         .and_then(|value| value.parse::<u64>().ok())
         .unwrap_or(70_000);
     let mut tasks = Vec::new();
+    let mut failures = Vec::new();
     let (mut decisions, mut passes) = (0, 0);
     for index in 0..sessions {
-        tasks.push(tokio::spawn(session(
-            PROFILES[((first_seed + index) % 4) as usize],
+        tasks.push((
             first_seed + index,
-            steps,
-        )));
+            tokio::spawn(session(
+                PROFILES[((first_seed + index) % 4) as usize],
+                first_seed + index,
+                steps,
+            )),
+        ));
         if tasks.len() == 4 || index + 1 == sessions {
-            for task in std::mem::take(&mut tasks) {
-                let (seen, verified) = task.await.unwrap();
-                decisions += seen;
-                passes += verified;
+            for (seed, task) in std::mem::take(&mut tasks) {
+                match task.await {
+                    Ok((seen, verified)) => {
+                        decisions += seen;
+                        passes += verified;
+                    }
+                    Err(error) => failures.push(format!("seed {seed}: {error}")),
+                }
+            }
+            if !failures.is_empty() {
+                break;
             }
         }
     }
+    assert!(
+        failures.is_empty(),
+        "two-cut failures after all session tasks settled: {failures:?}"
+    );
     eprintln!("production differential: {sessions} sessions x 2 advancing cuts x {steps} steps over 4 formats; {decisions} independent notice decisions matched; {passes} full-input passes proved every source identity; strict engine-state comparison; 0 divergences");
 }
 

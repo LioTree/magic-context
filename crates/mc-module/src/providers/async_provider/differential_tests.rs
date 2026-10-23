@@ -318,6 +318,62 @@ fn timeless(mut value: Value) -> Value {
     value
 }
 
+/// A cancelled Tokio blocking task reports a process-local id. Preserve the
+/// exact provider code and cancellation message, ignoring only that id.
+fn comparable_answer(answer: String) -> String {
+    let prefix = "Error { code: \"transient\", message: \"task ";
+    let suffix = " was cancelled\" }";
+    if let Some(id) = answer
+        .strip_prefix(prefix)
+        .and_then(|tail| tail.strip_suffix(suffix))
+    {
+        if !id.is_empty() && id.bytes().all(|byte| byte.is_ascii_digit()) {
+            return format!("{prefix}<id>{suffix}");
+        }
+    }
+    answer
+}
+
+#[test]
+fn cancelled_blocking_tasks_differ_only_in_their_runtime_task_id() {
+    let cancel_queued = || {
+        let runtime = tokio::runtime::Builder::new_multi_thread()
+            .worker_threads(1)
+            .max_blocking_threads(1)
+            .enable_all()
+            .build()
+            .unwrap();
+        let (started, entered) = std::sync::mpsc::channel();
+        let (release, blocked) = std::sync::mpsc::channel();
+        let occupied = runtime.spawn_blocking(move || {
+            started.send(()).unwrap();
+            blocked.recv().unwrap();
+        });
+        entered.recv().unwrap();
+        let queued = runtime.spawn_blocking(|| 4);
+        queued.abort();
+        runtime.shutdown_background();
+        release.send(()).unwrap();
+        let observer = tokio::runtime::Runtime::new().unwrap();
+        observer.block_on(occupied).unwrap();
+        let error = observer.block_on(queued).unwrap_err();
+        assert!(error.is_cancelled());
+        format!("{:?}", transient(error))
+    };
+    let first = cancel_queued();
+    let second = cancel_queued();
+    assert_ne!(first, second, "real runtime task identities must differ");
+    assert_eq!(comparable_answer(first), comparable_answer(second));
+    for answer in [
+        "Error { code: \"fatal\", message: \"task 61 was cancelled\" }",
+        "Error { code: \"transient\", message: \"task 61 panicked\" }",
+        "Error { code: \"transient\", message: \"task -61 was cancelled\" }",
+        "Error { code: \"transient\", message: \"task 61 was cancelled: partial work\" }",
+    ] {
+        assert_eq!(comparable_answer(answer.into()), answer);
+    }
+}
+
 struct Runner {
     transcript: Arc<Transcript>,
     sends: Mutex<Vec<String>>,
@@ -699,11 +755,11 @@ impl Pair {
             eprintln!("review trace: running {label} after {:?}", self.log.last());
         }
         let timer = Instant::now();
-        let resident = op(&self.resident).await;
+        let resident = comparable_answer(op(&self.resident).await);
         let resident_ms = timer.elapsed().as_millis();
         self.resident.settle().await;
         let timer = Instant::now();
-        let oracle = op(&self.oracle).await;
+        let oracle = comparable_answer(op(&self.oracle).await);
         let oracle_ms = timer.elapsed().as_millis();
         self.oracle.settle().await;
         // Rides answer nothing once their deadline passes, so a slow side can
@@ -782,10 +838,12 @@ impl Pair {
             .collect::<BTreeSet<_>>();
         (!differing.is_empty()).then(|| {
             format!(
-                "after step {} ({}): {:?}",
+                "after step {} ({}): {:?}; historian full={:?} resident={:?}",
                 self.log.len(),
                 self.log.last().map_or("", String::as_str),
-                differing
+                differing,
+                oracle.get("historian"),
+                resident.get("historian")
             )
         })
     }

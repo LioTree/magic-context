@@ -2444,6 +2444,11 @@ impl McHandler {
         // views never remove the signed reasoning they invalidate.
         let signed = transform::compaction::SignedReasoning::RunnerCompanion;
         let previous_engine = engine.clone();
+        #[cfg(test)]
+        cut_seed::pass_trace::record(
+            Arc::as_ptr(store) as usize,
+            format!("engine_input rows={}", template.messages.len()),
+        );
         let output = if engine.last_applied.is_none() {
             transform::compaction::setup_with(store, &template, &context, status, engine, signed)
         } else {
