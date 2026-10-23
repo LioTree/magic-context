@@ -84,6 +84,9 @@ function transform(
         },
         protectedTokens: 1,
         keepReasoningTokens: 100_000,
+        // No hidden executor is installed and the historian is disabled, so
+        // mirror the production OpenCode 2 historian admission gate.
+        historianRunnable: false,
         ...extra,
     });
 }
