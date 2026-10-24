@@ -672,6 +672,96 @@ impl McHandler {
 }
 
 impl McHandler {
+    /// Prove a fork whose declared endpoint was appended after the last read.
+    /// Probe from the last held row first, then verify the rest of the held
+    /// window. Neither read may cross below the retained cut. The declared
+    /// endpoint must exist and match even though no engine state used it yet.
+    pub(super) async fn verify_unseen_descent(
+        &self,
+        state: &State,
+        lineage: &str,
+        header: &str,
+        budget: Duration,
+    ) -> Result<Option<u64>, HandlerOutcome> {
+        let mut fields = header.rsplitn(3, ':');
+        let Some(digest) = fields.next() else {
+            return Ok(None);
+        };
+        let Some(through) = fields.next().and_then(|n| n.parse::<u64>().ok()) else {
+            return Ok(None);
+        };
+        let Some(parent) = fields.next() else {
+            return Ok(None);
+        };
+        let first = state
+            .cut_first_ordinal
+            .unwrap_or(state.lineage_first_ordinal);
+        let Some(last) = state.entries.last_key_value().map(|(n, _)| *n) else {
+            return Ok(None);
+        };
+        if first == 0 || last < first || through <= last || state.lineage.as_deref() != Some(parent)
+        {
+            return Ok(None);
+        }
+        let deadline = Instant::now() + budget;
+        let ranges = [(last, through), (first, last.saturating_sub(1))];
+        for (low, high) in ranges {
+            if low > high {
+                continue;
+            }
+            let mut from = low;
+            loop {
+                let page = self.provider_runner.call_for_identity(
+                    &state.runner()?, &state.runner_identity(), "session.read",
+                    json!({"lineage_id":lineage,"from_ordinal":from,"max_bytes":1_048_576,"media":"descriptors"}),
+                    deadline.saturating_duration_since(Instant::now()),
+                ).await.map_err(runner_error)?;
+                if page["lineage_id"].as_str() != Some(lineage) {
+                    return Ok(None);
+                }
+                let entries: Vec<ReadMessage> = decode(&page["messages"])?;
+                let mut expected = from;
+                let mut complete = false;
+                for entry in entries {
+                    if entry.ordinal != expected {
+                        return Ok(None);
+                    }
+                    if entry.ordinal <= last {
+                        let Some(held) = state.entries.get(&entry.ordinal) else {
+                            return Ok(None);
+                        };
+                        let held = held.read()?;
+                        if held.mid != entry.mid || served_digest(&held)? != served_digest(&entry)?
+                        {
+                            return Ok(None);
+                        }
+                    }
+                    if entry.ordinal == through && served_digest(&entry)? != digest {
+                        return Ok(None);
+                    }
+                    if entry.ordinal == high {
+                        complete = true;
+                        break;
+                    }
+                    expected = expected
+                        .checked_add(1)
+                        .ok_or_else(|| invalid("ordinal exhausted"))?;
+                }
+                if complete {
+                    break;
+                }
+                let Some(next) = page["next_from_ordinal"].as_u64() else {
+                    return Ok(None);
+                };
+                if next != expected || next <= from {
+                    return Ok(None);
+                }
+                from = next;
+            }
+        }
+        Ok(Some(through))
+    }
+
     pub(super) async fn ensure_lineage_window(
         &self,
         state: &mut State,

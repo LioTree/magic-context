@@ -34,6 +34,7 @@ struct ArcSide {
 /// its id, role and part keys in order, and the tool-arc sides it carries.
 #[derive(Clone, Debug)]
 pub(super) struct KeptMessage {
+    codec: codec::Codec,
     pub(super) mid: String,
     pub(super) parts: Vec<String>,
     /// The message's role in the runner's schema (`role`, OpenCode's
@@ -71,6 +72,7 @@ impl KeptMessage {
         let native = super::parts(message)?;
         let (sides, tool_result_message) = sides(codec, message, &native);
         Ok(Self {
+            codec,
             mid: mid.to_owned(),
             parts,
             role: role(message).map(str::to_owned),
@@ -274,6 +276,82 @@ pub(super) fn complete_dropped_arcs(kept: &KeptMessages, ranges: &mut [view::Vie
     }
 }
 
+/// Keep an acknowledged native replacement and the source sides it still
+/// depends on. Dropping its companion would otherwise force arc completion to
+/// replace the acknowledged bytes with a drop or a different message shell.
+pub(super) fn preserve_acknowledged_arcs(
+    kept: &KeptMessages,
+    acknowledged: &BTreeMap<u64, Vec<view::PartEdit>>,
+    ranges: &mut [view::ViewRange],
+) {
+    let mut protected: BTreeMap<u64, BTreeSet<&str>> = BTreeMap::new();
+    let edits = edits_by_part(ranges);
+    for arc in arcs(kept) {
+        let sides = arc.calls.iter().chain(&arc.results);
+        if !sides.clone().any(|side| side_dropped(kept, *side, &edits)) {
+            continue;
+        }
+        let has_frozen_side = sides.clone().any(|(ordinal, index)| {
+            let message = &kept[ordinal];
+            let side = &message.sides[*index];
+            acknowledged.get(ordinal).is_some_and(|edits| {
+                edits.iter().any(|edit| {
+                    !edit.drop
+                        && side.parts.iter().any(|index| {
+                            message
+                                .parts
+                                .get(*index)
+                                .is_some_and(|part| part == &edit.part)
+                        })
+                        && (message.tool_result_message
+                            || replacement_keeps_side(message.codec, edit, side))
+                })
+            })
+        });
+        if !has_frozen_side {
+            continue;
+        }
+        for (ordinal, index) in sides {
+            let message = &kept[ordinal];
+            for part in &message.sides[*index].parts {
+                if let Some(part) = message.parts.get(*part) {
+                    protected.entry(*ordinal).or_default().insert(part);
+                }
+            }
+        }
+    }
+    for range in ranges {
+        let view::ViewRange::Keep { from, to, edits } = range else {
+            continue;
+        };
+        for (ordinal, parts) in protected.range(*from..*to) {
+            edits.retain(|edit| edit.ordinal != *ordinal || !parts.contains(edit.part.as_str()));
+            if let Some(saved) = acknowledged.get(ordinal) {
+                edits.extend(
+                    saved
+                        .iter()
+                        .filter(|edit| parts.contains(edit.part.as_str()))
+                        .cloned(),
+                );
+            }
+        }
+    }
+}
+
+fn replacement_keeps_side(codec: codec::Codec, edit: &view::PartEdit, side: &ArcSide) -> bool {
+    let Some(bytes) = &edit.bytes else {
+        return false;
+    };
+    let Ok(part) = serde_json::from_str::<Value>(bytes) else {
+        return false;
+    };
+    let shell = json!({ "content": [part] });
+    sides(codec, &shell, std::slice::from_ref(&shell["content"][0]))
+        .0
+        .iter()
+        .any(|after| after.id == side.id && after.side == side.side)
+}
+
 /// Sort one keep range's edits as the contract requires: by ordinal, then by
 /// the part's position in its message (the order of the message's part keys).
 /// Part keys are opaque strings, so their string order is not the part order:
@@ -386,17 +464,7 @@ pub(super) fn split_pairs(
                 Some(edit) => {
                     // A replacement still serves this side only if it still
                     // names the same call id on the same side.
-                    let Some(bytes) = &edit.bytes else {
-                        return false;
-                    };
-                    let Ok(part) = serde_json::from_str::<Value>(bytes) else {
-                        return false;
-                    };
-                    let shell = json!({ "content": [part] });
-                    sides(codec, &shell, std::slice::from_ref(&shell["content"][0]))
-                        .0
-                        .iter()
-                        .any(|after| after.id == side.id && after.side == side.side)
+                    replacement_keeps_side(codec, edit, side)
                 }
             }
         })
@@ -616,6 +684,61 @@ mod tests {
         let mut ranges = vec![keep(0, vec![]), keep(1, vec![placeholder.clone()])];
         complete_dropped_arcs(&kept, &mut ranges);
         assert_eq!(ranges, vec![keep(0, vec![]), keep(1, vec![placeholder])]);
+    }
+
+    #[test]
+    fn an_acknowledged_native_result_prevents_a_new_partial_arc_drop() {
+        let kept = kept_of(codec::Codec::AnthropicMessages, &anthropic());
+        let placeholder = view::PartEdit::replace(
+            1,
+            "m1",
+            "0",
+            r#"{"content":"[dropped]","tool_use_id":"call1","type":"tool_result"}"#,
+        );
+        let acknowledged = BTreeMap::from([(1, vec![placeholder.clone()])]);
+        let mut ranges = vec![
+            keep(0, vec![drop(0, 1)]),
+            keep(1, vec![placeholder.clone()]),
+        ];
+        preserve_acknowledged_arcs(&kept, &acknowledged, &mut ranges);
+        complete_dropped_arcs(&kept, &mut ranges);
+        assert_eq!(ranges, vec![keep(0, vec![]), keep(1, vec![placeholder])]);
+        assert!(split_pairs(codec::Codec::AnthropicMessages, &kept, &ranges).is_empty());
+    }
+
+    #[test]
+    fn an_acknowledged_text_shell_does_not_preserve_its_old_tool_call() {
+        let kept = kept_of(codec::Codec::AnthropicMessages, &anthropic());
+        let shell = view::PartEdit::replace(1, "m1", "0", r#"{"type":"text","text":"[dropped]"}"#);
+        let acknowledged = BTreeMap::from([(1, vec![shell.clone()])]);
+        let mut ranges = vec![keep(0, vec![drop(0, 1)]), keep(1, vec![shell.clone()])];
+        preserve_acknowledged_arcs(&kept, &acknowledged, &mut ranges);
+        assert_eq!(
+            ranges,
+            vec![keep(0, vec![drop(0, 1)]), keep(1, vec![shell])]
+        );
+    }
+
+    #[test]
+    fn a_new_native_call_redaction_can_coexist_with_an_acknowledged_result() {
+        let kept = kept_of(codec::Codec::AnthropicMessages, &anthropic());
+        let result = view::PartEdit::replace(
+            1,
+            "m1",
+            "0",
+            r#"{"content":"[dropped]","tool_use_id":"call1","type":"tool_result"}"#,
+        );
+        let call = view::PartEdit::replace(
+            0,
+            "m0",
+            "1",
+            r#"{"type":"tool_use","id":"call1","name":"read","input":{"path":"[dropped]"}}"#,
+        );
+        let acknowledged = BTreeMap::from([(1, vec![result.clone()])]);
+        let expected = vec![keep(0, vec![call]), keep(1, vec![result])];
+        let mut ranges = expected.clone();
+        preserve_acknowledged_arcs(&kept, &acknowledged, &mut ranges);
+        assert_eq!(ranges, expected);
     }
 
     #[test]

@@ -337,6 +337,104 @@ async fn full_revert_does_not_revalidate_an_opaque_cut_head() {
     .await;
 }
 
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn resync_keeps_an_acknowledged_native_result_in_its_original_shape() {
+    review_session_inner(Profile::Anthropic, 3_144_134_328, 12, false, None, true).await;
+}
+
+async fn unseen_fork_proof(extra: u64, fault: &str) {
+    let mut pair = Pair::open_with(Profile::Broca, false, Some("L"), false, false).await;
+    pair.append(120);
+    let mut rng = Rng(0xF021);
+    review_history(&mut pair, 99).await;
+    pair.notice(&mut rng, None).await;
+    descend_pair(&mut pair, 100, "child").await;
+    let state = load(pair.resident.store(), &pair.reference)
+        .unwrap()
+        .unwrap();
+    let first = state.lineage_first_ordinal;
+    let last = *state.entries.last_key_value().unwrap().0;
+    let through = if fault == "below_cut" {
+        first - 1
+    } else {
+        last + extra
+    };
+    if fault != "missing" {
+        pair.append(extra);
+    }
+    let digest = {
+        let mut entries = pair.transcript.entries.lock().unwrap();
+        if fault == "overlap" {
+            entries[(first + 1) as usize] = message(pair.profile, first + 1, 90_001);
+        }
+        entries
+            .get(through as usize)
+            .map(|entry| contract::digest::content_digest(&entry.message))
+            .unwrap_or_else(|| "0".repeat(64))
+    };
+    let digest = if fault == "digest" {
+        "f".repeat(64)
+    } else {
+        digest
+    };
+    let header = format!("child:{through}:{digest}");
+    *pair.transcript.lineage.lock().unwrap() = "unseen-fork".into();
+    let proof = pair
+        .resident
+        .h
+        .verify_unseen_descent(&state, "unseen-fork", &header, Duration::from_secs(30))
+        .await
+        .unwrap();
+    assert!(pair
+        .resident
+        .runner
+        .reads_below_floor
+        .lock()
+        .unwrap()
+        .is_empty());
+    if fault.is_empty() {
+        assert_eq!(proof, Some(through));
+    } else {
+        assert_eq!(proof, None, "invalid {fault} proof must start fresh");
+        let _ = resident_notice(&mut pair, &mut rng, Some(header)).await;
+        let reset = load(pair.resident.store(), &pair.reference)
+            .unwrap()
+            .unwrap();
+        assert!(reset.cut_seed.is_none() && reset.cut_first_ordinal.is_none());
+        assert_eq!(reset.lineage_first_ordinal, 0);
+    }
+}
+
+#[tokio::test]
+async fn unseen_fork_two_rows_after_held_proves_the_whole_window() {
+    unseen_fork_proof(2, "").await;
+}
+
+#[tokio::test]
+async fn unseen_fork_three_rows_after_held_never_reads_below_the_cut() {
+    unseen_fork_proof(3, "").await;
+}
+
+#[tokio::test]
+async fn unseen_fork_with_a_wrong_through_digest_starts_fresh() {
+    unseen_fork_proof(2, "digest").await;
+}
+
+#[tokio::test]
+async fn unseen_fork_with_a_changed_interior_overlap_row_starts_fresh() {
+    unseen_fork_proof(3, "overlap").await;
+}
+
+#[tokio::test]
+async fn unseen_fork_below_the_cut_starts_fresh() {
+    unseen_fork_proof(2, "below_cut").await;
+}
+
+#[tokio::test]
+async fn unseen_fork_with_a_missing_through_row_starts_fresh() {
+    unseen_fork_proof(2, "missing").await;
+}
+
 #[tokio::test]
 async fn legacy_seed_crossing_its_wire_cut_is_refused_then_restarts_fresh() {
     let mut pair = Pair::open_with(Profile::OpenCode, false, Some("L"), false, false).await;

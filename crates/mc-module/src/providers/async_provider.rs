@@ -3697,11 +3697,22 @@ impl McHandler {
             .filter(|_| !resuming)
             .filter(|new| state.lineage.as_ref().is_some_and(|old| old != *new))
         {
-            if let Some(through) = message
-                .headers
-                .get("descends_from")
-                .and_then(|header| verified_descent(&state, header))
-            {
+            let through = if let Some(header) = message.headers.get("descends_from") {
+                if let Some(through) = verified_descent(&state, header) {
+                    Some(through)
+                } else {
+                    Box::pin(self.verify_unseen_descent(
+                        &state,
+                        lineage,
+                        header,
+                        self.notice_read_budget(),
+                    ))
+                    .await?
+                }
+            } else {
+                None
+            };
+            if let Some(through) = through {
                 let parent = state.lineage.clone().expect("held lineage");
                 // A fork can cut away source identities needed by a later restore.
                 // Capture acknowledged edits before dropping those held entries.

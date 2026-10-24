@@ -224,9 +224,10 @@ impl FrozenEdits {
 
     /// Re-anchor by source identity, never by an ordinal retained from another lineage.
     ///
-    /// Parts are filled one at a time, then each tool arc is made whole
-    /// (`tool_arcs::complete_dropped_arcs`): a re-anchored drop of a call must
-    /// not leave its result served, nor the other way round. Last, each keep
+    /// Parts are filled one at a time. A saved native replacement keeps its
+    /// companion source side, so a new drop cannot rewrite the saved bytes.
+    /// Remaining dropped arcs are made whole (`tool_arcs::complete_dropped_arcs`):
+    /// a re-anchored drop must not leave its other side served. Last, each keep
     /// range's edits are put in the order the contract requires: by ordinal,
     /// then by the part's position in its message (`tool_arcs::sort_edits`).
     pub(super) fn apply(
@@ -277,6 +278,7 @@ impl FrozenEdits {
                 }
             }
         }
+        tool_arcs::preserve_acknowledged_arcs(kept, &anchored, ranges);
         tool_arcs::complete_dropped_arcs(kept, ranges);
         for range in ranges.iter_mut() {
             if let view::ViewRange::Keep { edits, .. } = range {
