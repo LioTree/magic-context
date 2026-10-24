@@ -15,6 +15,7 @@ use cortexkit_role_routing_conformance::{
 use serde::de::DeserializeOwned;
 use serde_json::{json, Value};
 use sha2::{Digest, Sha256};
+use tracing::instrument::WithSubscriber;
 
 use super::*;
 use kit_fake::{Defects, FakeRoute, FakeSubject};
@@ -63,8 +64,10 @@ impl std::io::Write for LogWriter {
 struct TestRoute {
     route: FakeRoute,
     project: String,
+    scope_key: String,
     trace: Arc<Mutex<Trace>>,
     report_failure: Mutex<Option<Refusal>>,
+    report_hangs: bool,
     answer_auth: Option<RunnerAuth>,
     after_select: Option<(TestClock, u64)>,
 }
@@ -79,6 +82,10 @@ fn decode<T: DeserializeOwned>(reply: Reply) -> Result<T, Refusal> {
 }
 
 impl ScopeRoute for TestRoute {
+    fn scope_key(&self) -> &str {
+        &self.scope_key
+    }
+
     fn project_key(&self) -> &str {
         &self.project
     }
@@ -119,6 +126,9 @@ impl ScopeRoute for TestRoute {
         }
         if let Some(error) = self.report_failure.lock().unwrap().take() {
             return Err(error);
+        }
+        if self.report_hangs {
+            return std::future::pending().await;
         }
         decode(
             self.route
@@ -206,8 +216,10 @@ impl Rig {
             route: TestRoute {
                 route,
                 project: PROJECT.into(),
+                scope_key: "daemon-scope-a".into(),
                 trace: Arc::new(Mutex::new(Trace::default())),
                 report_failure: Mutex::new(None),
+                report_hangs: false,
                 answer_auth: None,
                 after_select: None,
             },
@@ -734,7 +746,7 @@ async fn completed_output_survives_report_refusal_and_report_retries_next_run() 
     let pending = engine.pending_reports.front().unwrap();
     assert_eq!(pending.provider, PROVIDER);
     assert_eq!(pending.report, done.attempts[0].report);
-    assert_eq!(pending.source, source);
+    assert_eq!(pending.source, ReportFailure::Refused(source));
     assert_eq!(
         rig.route.trace.lock().unwrap().events,
         ["select", "send", "report"]
@@ -825,6 +837,108 @@ async fn pending_reports_retry_only_with_the_original_provider() {
 }
 
 #[tokio::test]
+async fn pending_reports_retry_only_on_the_original_scope() {
+    let rig = Rig::new().await;
+    *rig.route.report_failure.lock().unwrap() = Some(Refusal::unknown_decision());
+    let mut engine = Engine::new(rig.clock.clone());
+    engine
+        .run(&catalog(), &rig.order(), &rig.runner(vec![completed()]))
+        .await
+        .unwrap();
+    assert_eq!(engine.pending_reports[0].scope_key, rig.route.scope_key());
+    let other_scope = TestRoute {
+        route: rig
+            .subject
+            .route(&RouteStamp::project("ck-mc-scope-b", PROJECT))
+            .await
+            .unwrap(),
+        project: PROJECT.into(),
+        scope_key: "daemon-scope-b".into(),
+        trace: Arc::new(Mutex::new(Trace::default())),
+        report_failure: Mutex::new(None),
+        report_hangs: false,
+        answer_auth: None,
+        after_select: None,
+    };
+    assert_eq!(other_scope.project_key(), rig.route.project_key());
+    assert_ne!(other_scope.scope_key(), rig.route.scope_key());
+    let mut order = rig.order();
+    order.scope_route = &other_scope;
+    order.max_decisions = 0;
+    let error = engine
+        .run(&catalog(), &order, &rig.runner(vec![]))
+        .await
+        .unwrap_err();
+    assert_eq!(error.code, "mc_route_exhausted");
+    assert!(other_scope.trace.lock().unwrap().reports.is_empty());
+    assert_eq!(engine.pending_reports.len(), 1);
+    engine
+        .run(&catalog(), &rig.order(), &rig.runner(vec![completed()]))
+        .await
+        .unwrap();
+    assert!(engine.pending_reports.is_empty());
+    let trace = rig.route.trace.lock().unwrap();
+    assert_eq!(trace.reports.len(), 3);
+    assert_eq!(trace.reports[0], trace.reports[1]);
+}
+
+#[tokio::test(start_paused = true)]
+async fn hung_report_preserves_completed_output_without_exceeding_work_deadline() {
+    let mut rig = Rig::new().await;
+    rig.route.report_hangs = true;
+    let mut order = rig.order();
+    let budget = Duration::from_millis(20);
+    order.deadline_ms = rig.clock.now_ms() + budget.as_millis() as u64;
+    let mut engine = Engine::new(rig.clock.clone());
+    let runner = rig.runner(vec![completed()]);
+    let start = tokio::time::Instant::now();
+    let done = tokio::time::timeout(budget * 2, engine.run(&catalog(), &order, &runner))
+        .await
+        .expect("a hung report must not hold completed work")
+        .unwrap();
+    assert_eq!(done.output, "validated result");
+    assert!(start.elapsed() <= budget);
+    assert_eq!(engine.pending_reports.len(), 1);
+    assert_eq!(engine.pending_reports[0].source, ReportFailure::TimedOut);
+    assert_eq!(engine.pending_reports[0].report, done.attempts[0].report);
+}
+
+#[tokio::test(start_paused = true)]
+async fn pending_report_replay_limits_calls_and_bounds_each_timeout() {
+    let mut rig = Rig::new().await;
+    rig.route.report_hangs = true;
+    let mut engine = Engine::new(rig.clock.clone());
+    for n in 0..PENDING_REPORT_CAP {
+        engine.queue_report(
+            PROVIDER,
+            rig.route.scope_key(),
+            ReportRequest::new(format!("pending-{n}"), Outcome::Completed),
+            ReportFailure::TimedOut,
+        );
+    }
+    let mut order = rig.order();
+    order.max_decisions = 0;
+    let runner = rig.runner(vec![]);
+    let bound =
+        Duration::from_millis(REPORT_TIMEOUT_MS * MAX_PENDING_REPORT_RETRIES_PER_RUN as u64);
+    let start = tokio::time::Instant::now();
+    let error = tokio::time::timeout(
+        bound + Duration::from_millis(REPORT_TIMEOUT_MS),
+        engine.run(&catalog(), &order, &runner),
+    )
+    .await
+    .expect("pending reports must not monopolize a run")
+    .unwrap_err();
+    assert_eq!(error.code, "mc_route_exhausted");
+    assert!(start.elapsed() <= bound);
+    assert_eq!(
+        rig.route.trace.lock().unwrap().reports.len(),
+        MAX_PENDING_REPORT_RETRIES_PER_RUN
+    );
+    assert_eq!(engine.pending_reports.len(), PENDING_REPORT_CAP);
+}
+
+#[tokio::test]
 async fn pending_report_failures_log_once_and_queue_evicts_oldest_at_capacity() {
     let logs = Arc::new(Mutex::new(Vec::new()));
     let writer = logs.clone();
@@ -833,67 +947,80 @@ async fn pending_report_failures_log_once_and_queue_evicts_oldest_at_capacity() 
         .with_ansi(false)
         .without_time()
         .finish();
-    let _guard = tracing::subscriber::set_default(subscriber);
-    let rig = Rig::new().await;
-    let source = Refusal::unknown_decision();
-    *rig.route.report_failure.lock().unwrap() = Some(source.clone());
-    let mut engine = Engine::new(rig.clock.clone());
-    let done = engine
-        .run(&catalog(), &rig.order(), &rig.runner(vec![completed()]))
-        .await
-        .unwrap();
-    let mut order = rig.order();
-    order.max_decisions = 0;
-    for _ in 0..2 {
+    async {
+        // Re-evaluate which log messages are enabled with this collector active;
+        // parallel tests may have first logged without a collector.
+        tracing::callsite::rebuild_interest_cache();
+        let rig = Rig::new().await;
+        let source = Refusal::unknown_decision();
         *rig.route.report_failure.lock().unwrap() = Some(source.clone());
-        let error = engine
-            .run(&catalog(), &order, &rig.runner(vec![]))
+        let mut engine = Engine::new(rig.clock.clone());
+        let done = engine
+            .run(&catalog(), &rig.order(), &rig.runner(vec![completed()]))
             .await
-            .unwrap_err();
-        assert_eq!(error.code, "mc_route_exhausted");
-    }
-    engine.queue_report(PROVIDER, done.attempts[0].report.clone(), source.clone());
-    assert_eq!(engine.pending_reports.len(), 1);
-    let trace = rig.route.trace.lock().unwrap();
-    assert_eq!(trace.reports.len(), 3);
-    assert!(trace
-        .reports
-        .iter()
-        .all(|report| report == &done.attempts[0].report));
-    drop(trace);
-    let text = String::from_utf8(logs.lock().unwrap().clone()).unwrap();
-    assert_eq!(
-        text.matches("model work report refused; queued for retry")
-            .count(),
-        1
-    );
-    for n in 1..=PENDING_REPORT_CAP {
+            .unwrap();
+        let mut order = rig.order();
+        order.max_decisions = 0;
+        for _ in 0..2 {
+            *rig.route.report_failure.lock().unwrap() = Some(source.clone());
+            let error = engine
+                .run(&catalog(), &order, &rig.runner(vec![]))
+                .await
+                .unwrap_err();
+            assert_eq!(error.code, "mc_route_exhausted");
+        }
         engine.queue_report(
             PROVIDER,
-            ReportRequest::new(format!("queued-{n}"), Outcome::Completed),
-            source.clone(),
+            rig.route.scope_key(),
+            done.attempts[0].report.clone(),
+            ReportFailure::Refused(source.clone()),
+        );
+        assert_eq!(engine.pending_reports.len(), 1);
+        let trace = rig.route.trace.lock().unwrap();
+        assert_eq!(trace.reports.len(), 3);
+        assert!(trace
+            .reports
+            .iter()
+            .all(|report| report == &done.attempts[0].report));
+        drop(trace);
+        let text = String::from_utf8(logs.lock().unwrap().clone()).unwrap();
+        assert_eq!(
+            text.matches("model work report unacknowledged; queued for retry")
+                .count(),
+            1,
+            "captured logs: {text:?}"
+        );
+        for n in 1..=PENDING_REPORT_CAP {
+            engine.queue_report(
+                PROVIDER,
+                rig.route.scope_key(),
+                ReportRequest::new(format!("queued-{n}"), Outcome::Completed),
+                ReportFailure::Refused(source.clone()),
+            );
+        }
+        assert_eq!(engine.pending_reports.len(), PENDING_REPORT_CAP);
+        assert_eq!(
+            engine.pending_reports.front().unwrap().report.decision_id,
+            "queued-1"
+        );
+        assert_eq!(
+            engine.pending_reports.back().unwrap().report.decision_id,
+            format!("queued-{PENDING_REPORT_CAP}")
+        );
+        let text = String::from_utf8(logs.lock().unwrap().clone()).unwrap();
+        assert_eq!(
+            text.matches("model work report unacknowledged; queued for retry")
+                .count(),
+            PENDING_REPORT_CAP + 1
+        );
+        assert_eq!(
+            text.matches("model work pending-report queue full; dropped oldest report")
+                .count(),
+            1
         );
     }
-    assert_eq!(engine.pending_reports.len(), PENDING_REPORT_CAP);
-    assert_eq!(
-        engine.pending_reports.front().unwrap().report.decision_id,
-        "queued-1"
-    );
-    assert_eq!(
-        engine.pending_reports.back().unwrap().report.decision_id,
-        format!("queued-{PENDING_REPORT_CAP}")
-    );
-    let text = String::from_utf8(logs.lock().unwrap().clone()).unwrap();
-    assert_eq!(
-        text.matches("model work report refused; queued for retry")
-            .count(),
-        PENDING_REPORT_CAP + 1
-    );
-    assert_eq!(
-        text.matches("model work pending-report queue full; dropped oldest report")
-            .count(),
-        1
-    );
+    .with_subscriber(subscriber)
+    .await;
 }
 
 #[tokio::test]

@@ -20,6 +20,9 @@ use crate::runner_choices::RoutedChoice;
 /// A route already bound to the work's daemon scope stamp. Implementations must
 /// use this same stamp for routing and runner calls, never a scope in a body.
 pub trait ScopeRoute: Sync {
+    /// Stable identity of the daemon scope stamp, including its caller/session/run
+    /// binding. Equal keys must authorize reports for the same scoped decisions.
+    fn scope_key(&self) -> &str;
     /// Stable project identity for parking work across sessions of that project.
     fn project_key(&self) -> &str;
     fn select(
@@ -145,10 +148,24 @@ impl Clock for WallClock {
 /// no model output; the oldest accounting entry is sacrificed before paid work.
 pub const PENDING_REPORT_CAP: usize = 64;
 
+/// Accounting must not hold paid output hostage to an unresponsive provider.
+/// Every report gets at most this budget, or the remaining work deadline if less.
+pub const REPORT_TIMEOUT_MS: u64 = 250;
+/// An outage must not make each run drain the entire queue before placing work.
+/// Three retries cost at most 750 ms, further capped by the work deadline.
+pub const MAX_PENDING_REPORT_RETRIES_PER_RUN: usize = 3;
+
+#[derive(Clone, Debug, PartialEq)]
+enum ReportFailure {
+    Refused(Refusal),
+    TimedOut,
+}
+
 struct PendingReport {
     provider: String,
+    scope_key: String,
     report: ReportRequest,
-    source: Refusal,
+    source: ReportFailure,
 }
 
 pub struct Engine<C = WallClock> {
@@ -189,17 +206,30 @@ impl<C: Clock> Engine<C> {
         result
     }
 
-    fn queue_report(&mut self, provider: &str, report: ReportRequest, source: Refusal) {
+    fn queue_report(
+        &mut self,
+        provider: &str,
+        scope_key: &str,
+        report: ReportRequest,
+        source: ReportFailure,
+    ) {
         if self.pending_reports.iter().any(|pending| {
-            pending.provider == provider && pending.report.decision_id == report.decision_id
+            pending.provider == provider
+                && pending.scope_key == scope_key
+                && pending.report.decision_id == report.decision_id
         }) {
             return;
         }
+        let code = match &source {
+            ReportFailure::Refused(refusal) => refusal.code.to_string(),
+            ReportFailure::TimedOut => "mc_route_report_timed_out".to_owned(),
+        };
         tracing::warn!(
             decision_id = %report.decision_id,
             routing_provider = provider,
-            code = %source.code,
-            "model work report refused; queued for retry"
+            scope_key,
+            code,
+            "model work report unacknowledged; queued for retry"
         );
         if self.pending_reports.len() == PENDING_REPORT_CAP {
             let oldest = self
@@ -209,23 +239,65 @@ impl<C: Clock> Engine<C> {
             tracing::warn!(
                 decision_id = %oldest.report.decision_id,
                 routing_provider = %oldest.provider,
+                scope_key = %oldest.scope_key,
                 "model work pending-report queue full; dropped oldest report"
             );
         }
         self.pending_reports.push_back(PendingReport {
             provider: provider.to_owned(),
+            scope_key: scope_key.to_owned(),
             report,
             source,
         });
     }
 
-    async fn retry_pending_reports<S: ScopeRoute>(&mut self, provider: &str, scope: &S) {
+    fn remaining_budget(&self, deadline_ms: u64, deadline: tokio::time::Instant) -> Duration {
+        Duration::from_millis(deadline_ms.saturating_sub(self.clock.now_ms()))
+            .min(deadline.saturating_duration_since(tokio::time::Instant::now()))
+    }
+
+    async fn send_report<S: ScopeRoute>(
+        &self,
+        provider: &str,
+        scope: &S,
+        report: &ReportRequest,
+        deadline_ms: u64,
+        deadline: tokio::time::Instant,
+    ) -> Result<ReportAnswer, ReportFailure> {
+        let budget = self
+            .remaining_budget(deadline_ms, deadline)
+            .min(Duration::from_millis(REPORT_TIMEOUT_MS));
+        match tokio::time::timeout(budget, scope.report(provider, report)).await {
+            Ok(result) => result.map_err(ReportFailure::Refused),
+            Err(_) => Err(ReportFailure::TimedOut),
+        }
+    }
+
+    async fn retry_pending_reports<S: ScopeRoute>(
+        &mut self,
+        provider: &str,
+        scope: &S,
+        deadline_ms: u64,
+        deadline: tokio::time::Instant,
+    ) {
         let mut index = 0;
-        while index < self.pending_reports.len() {
+        let mut retried = 0;
+        while index < self.pending_reports.len() && retried < MAX_PENDING_REPORT_RETRIES_PER_RUN {
+            if self.remaining_budget(deadline_ms, deadline).is_zero() {
+                break;
+            }
             let pending = &self.pending_reports[index];
             // Reports are idempotent by decision id. Leave an unacknowledged
-            // entry in place across awaits, and log only its initial refusal.
-            if pending.provider == provider && scope.report(provider, &pending.report).await.is_ok()
+            // entry in place across awaits, and log only its initial failure.
+            if pending.provider != provider || pending.scope_key != scope.scope_key() {
+                index += 1;
+                continue;
+            }
+            retried += 1;
+            if self
+                .send_report(provider, scope, &pending.report, deadline_ms, deadline)
+                .await
+                .is_ok()
             {
                 self.pending_reports.remove(index);
             } else {
@@ -241,7 +313,11 @@ impl<C: Clock> Engine<C> {
         runner: &R,
     ) -> Result<WorkDone<R::Output>, WorkError> {
         let provider = self.provider(catalog)?;
-        self.retry_pending_reports(&provider, order.scope_route)
+        // Keep a monotonic deadline too, so elapsed report retries consume the
+        // same work budget even if the wall clock moves backwards.
+        let deadline = tokio::time::Instant::now()
+            + Duration::from_millis(order.deadline_ms.saturating_sub(self.clock.now_ms()));
+        self.retry_pending_reports(&provider, order.scope_route, order.deadline_ms, deadline)
             .await;
         let key = (
             order.scope_route.project_key().to_owned(),
@@ -264,8 +340,8 @@ impl<C: Clock> Engine<C> {
         let mut exclude = Vec::new();
         let mut timeouts = 0;
         loop {
-            let remaining = order.deadline_ms.saturating_sub(self.clock.now_ms());
-            if remaining == 0 {
+            let remaining = self.remaining_budget(order.deadline_ms, deadline);
+            if remaining.is_zero() {
                 let mut error = WorkError::new("mc_run_timed_out");
                 error.attempts = attempts;
                 return Err(error);
@@ -281,11 +357,9 @@ impl<C: Clock> Engine<C> {
             request.correlation_id = Some(order.work_id.clone());
             request.concurrency_slots = order.concurrency_slots.clone();
             request.exclude = (!exclude.is_empty()).then(|| exclude.clone());
-            let selected = tokio::time::timeout(
-                Duration::from_millis(remaining),
-                order.scope_route.select(&provider, &request),
-            )
-            .await;
+            let selected =
+                tokio::time::timeout(remaining, order.scope_route.select(&provider, &request))
+                    .await;
             let choice = match selected {
                 Ok(Ok(choice)) => choice,
                 Ok(Err(source)) => {
@@ -317,12 +391,12 @@ impl<C: Clock> Engine<C> {
                 }
             };
 
-            let remaining = order.deadline_ms.saturating_sub(self.clock.now_ms());
-            let mut result = if remaining == 0 {
+            let remaining = self.remaining_budget(order.deadline_ms, deadline);
+            let mut result = if remaining.is_zero() {
                 RunResult::new(Outcome::TimedOut, None)
             } else {
                 match tokio::time::timeout(
-                    Duration::from_millis(remaining),
+                    remaining,
                     runner.send(order.scope_route, &choice, order.deadline_ms),
                 )
                 .await
@@ -332,7 +406,7 @@ impl<C: Clock> Engine<C> {
                 }
             };
             if result.outcome == Outcome::TimedOut {
-                if remaining > 0 {
+                if !remaining.is_zero() {
                     runner.cancel(order.scope_route, &choice).await;
                 }
                 timeouts += 1;
@@ -351,8 +425,17 @@ impl<C: Clock> Engine<C> {
                 choice: choice.clone(),
                 report: report.clone(),
             });
-            if let Err(source) = order.scope_route.report(&provider, &report).await {
-                self.queue_report(&provider, report, source);
+            if let Err(source) = self
+                .send_report(
+                    &provider,
+                    order.scope_route,
+                    &report,
+                    order.deadline_ms,
+                    deadline,
+                )
+                .await
+            {
+                self.queue_report(&provider, order.scope_route.scope_key(), report, source);
             }
             if result.outcome == Outcome::Completed {
                 return Ok(WorkDone {
