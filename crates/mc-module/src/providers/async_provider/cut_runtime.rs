@@ -5,7 +5,7 @@ use super::*;
 pub(super) struct PublishedCut {
     pub(super) lineage: String,
     pub(super) version: u64,
-    generation: u64,
+    pub(super) generation: u64,
     head: String,
     #[serde(default)]
     parent_namespace: String,
@@ -48,6 +48,90 @@ pub(super) fn split_head_at(ranges: &mut Vec<view::ViewRange>, first: u64) {
 }
 
 impl AsyncRecord {
+    pub(super) fn cleanup_retired_cut_stages(
+        &mut self,
+        store: &McStore,
+    ) -> Result<(), HandlerOutcome> {
+        let mut pending = Vec::new();
+        for namespace in &self.retired_cut_stages {
+            let referenced = namespace == &self.namespace()
+                || self.published_cuts.values().any(|cut| {
+                    namespace == &format!("{}:async:{}", self.key.engine_key(), cut.generation)
+                        || namespace == &cut.parent_namespace
+                })
+                || self
+                    .pending_parent_history
+                    .as_ref()
+                    .is_some_and(|parent| &parent.namespace == namespace);
+            if referenced {
+                pending.push(namespace.clone());
+            } else {
+                store
+                    .discard_staged_namespace(namespace, &self.key.project.to_string_lossy())
+                    .map_err(transient)?;
+            }
+        }
+        self.retired_cut_stages = pending;
+        Ok(())
+    }
+
+    pub(super) fn recovery_seed(
+        &self,
+        store: &McStore,
+    ) -> Result<Option<Arc<cut_seed::CutSeed>>, HandlerOutcome> {
+        if let Some(seed) = &self.cut_seed {
+            return Ok(Some(Arc::clone(seed)));
+        }
+        if self.lineage_first_ordinal == 0 {
+            return Ok(None);
+        }
+        store
+            .load_async_compaction_baseline(
+                &self.reference(),
+                &format!("published-cut:{}", self.lineage_first_ordinal),
+            )
+            .map_err(transient)?
+            .map(|raw| {
+                serde_json::from_str::<cut_seed::CutSeed>(&raw)
+                    .map(Arc::new)
+                    .map_err(transient)
+            })
+            .transpose()
+    }
+
+    pub(super) fn repair_cut_history(
+        &self,
+        store: &McStore,
+        history: &mut Vec<mc_store::StoredCompartment>,
+        through: Option<u64>,
+    ) -> Result<(), HandlerOutcome> {
+        let Some(seed) = self.recovery_seed(store)? else {
+            return Ok(());
+        };
+        let mut next = seed.lineage_from as i64;
+        for c in history.iter() {
+            if c.start_message <= next && c.end_message >= next {
+                next = c.end_message.saturating_add(1);
+            }
+        }
+        if next >= seed.first_ordinal as i64 {
+            return Ok(());
+        }
+        // A replacement summary can straddle the cut and then be removed by
+        // a fork. The staged history is the last independent source for the
+        // unreadable prefix; window messages are replayed from held rows.
+        let mut restored = seed
+            .recovery_history
+            .iter()
+            .filter(|c| through.is_none_or(|end| c.end_message <= end as i64))
+            .cloned()
+            .collect::<Vec<_>>();
+        let end = restored.iter().map(|c| c.end_message).max().unwrap_or(-1);
+        restored.extend(history.iter().filter(|c| c.start_message > end).cloned());
+        *history = restored;
+        Ok(())
+    }
+
     fn stage_slot() -> &'static str {
         "pending-cut-stage"
     }
@@ -231,7 +315,7 @@ impl AsyncRecord {
         if CRASH_AFTER_STAGE.with(|flag| flag.get()) {
             std::process::abort();
         }
-        self.published_cuts.insert(
+        let superseded = self.published_cuts.insert(
             first,
             PublishedCut {
                 lineage: view.lineage_id.clone(),
@@ -248,6 +332,13 @@ impl AsyncRecord {
                     .max_tag_number,
             },
         );
+        if let Some(old) = superseded {
+            self.retired_cut_stages.push(format!(
+                "{}:async:{}",
+                self.key.engine_key(),
+                old.generation
+            ));
+        }
         self.pending_cut_seeds.insert(first, seed);
         Ok(())
     }
@@ -439,6 +530,21 @@ impl McHandler {
         let compartments = store
             .load_compartments(&state.namespace())
             .map_err(transient)?;
+        let mut next = 0i64;
+        let mut ordered = compartments.iter().collect::<Vec<_>>();
+        ordered.sort_by_key(|c| c.start_message);
+        for c in ordered {
+            if c.start_message <= next && c.end_message >= next {
+                next = c.end_message.saturating_add(1);
+            }
+        }
+        if next < first as i64 {
+            return Err(error(
+                "unknown_cut",
+                "history does not cover the runner's cut",
+            ));
+        }
+        seed.recovery_history = compartments.clone();
         if let Some(last) = compartments
             .iter()
             .filter(|c| c.end_message < first as i64)

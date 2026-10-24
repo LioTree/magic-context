@@ -352,6 +352,8 @@ pub(crate) struct AsyncRecord {
     lineage_first_ordinal: u64,
     #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
     published_cuts: BTreeMap<u64, cut_runtime::PublishedCut>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    retired_cut_stages: Vec<String>,
     #[serde(skip)]
     pending_cut_seeds: BTreeMap<u64, cut_seed::CutSeed>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -884,7 +886,6 @@ impl State {
         });
         if let Some(floor) = retain_from {
             self.retired_frozen.retain_from(floor);
-            self.published_cuts.retain(|_, cut| cut.version >= floor);
         }
         let mut appended = Vec::new();
         for (ordinal, entry) in self.unsaved_entries() {
@@ -946,6 +947,7 @@ impl State {
             self.journal.complete = false;
             return Err(transient(error));
         }
+        self.cleanup_retired_cut_stages(store)?;
         self.journal.truncate = None;
         self.journal.truncate_below = None;
         self.journal.cut_seed_dirty = false;
@@ -1324,6 +1326,11 @@ impl State {
     }
 
     fn reset(&mut self, store: &McStore) -> Result<(), HandlerOutcome> {
+        self.capture_resync_sources(store)?;
+        self.finish_reset(store)
+    }
+
+    fn capture_resync_sources(&mut self, store: &McStore) -> Result<(), HandlerOutcome> {
         if self.resync_sources.is_none() {
             let namespace = self.namespace();
             // A resync is rare; it reads every held message once for its digest.
@@ -1444,6 +1451,10 @@ impl State {
                     .collect(),
             });
         }
+        Ok(())
+    }
+
+    fn finish_reset(&mut self, store: &McStore) -> Result<(), HandlerOutcome> {
         self.resync = true;
         self.partial_read_seq = None;
         // The held entries an offline proof described are gone with the reset.
@@ -1458,7 +1469,10 @@ impl State {
         self.todo_scan = None;
         self.lineage = None;
         self.generation = self
-            .generation
+            .published_cuts
+            .values()
+            .map(|cut| cut.generation)
+            .fold(self.generation, u64::max)
             .checked_add(1)
             .ok_or_else(|| transient("async generation exhausted"))?;
         self.engine = transform::compaction::State::new(self.reference(), self.engine.preset);
@@ -1850,6 +1864,17 @@ impl McHandler {
                 .map_err(transient)?;
             self.ensure_lineage_window(&mut state, Duration::from_secs(10))
                 .await?;
+            if state.cut_seed.is_none() {
+                // A lineage starting at zero can undo summarized messages. Keep
+                // only history whose original sources survive the next read.
+                let mut prior = load(store, &reference)?
+                    .ok_or_else(|| transient("async session disappeared"))?;
+                prior.capture_resync_sources(store)?;
+                state.resync_sources = prior.resync_sources.take();
+                store
+                    .replace_compartments(&state.namespace(), &[])
+                    .map_err(transient)?;
+            }
             state.journal.truncate = Some(None);
             state.save(store, &[])?;
             self.provider_store
@@ -2114,6 +2139,7 @@ impl McHandler {
             cut_seed: None,
             lineage_first_ordinal: 0,
             published_cuts: BTreeMap::new(),
+            retired_cut_stages: Vec::new(),
             pending_cut_seeds: BTreeMap::new(),
             pending_parent_history: None,
             cut_signature: None,
@@ -3612,18 +3638,27 @@ impl McHandler {
                 state.adopt_engine(engine)?;
                 state.lineage = Some(lineage.clone());
                 state.failure = None;
-                let retained = store
+                let mut retained = store
                     .load_compartments(&state.namespace())
                     .map_err(transient)?
                     .into_iter()
                     .filter(|row| row.end_message <= through as i64)
                     .collect::<Vec<_>>();
+                state.repair_cut_history(store, &mut retained, Some(through))?;
                 store
                     .replace_compartments(&state.namespace(), &retained)
                     .map_err(transient)?;
+                // Forked rows can reuse message ids with different block
+                // identities. Revalidate the surviving sources in a fresh
+                // namespace rather than carrying the parent's row cache.
+                state.reset(store)?;
                 descended = true;
             } else {
                 state.reset(store)?;
+                // An unverifiable lineage change cannot inherit the old cut.
+                state.cut_seed = None;
+                state.cut_first_ordinal = None;
+                state.lineage_first_ordinal = 0;
                 state.save(store, &[])?;
             }
         }
@@ -5149,6 +5184,22 @@ impl McHandler {
         let todo_through = if scan.lineage == lineage {
             scan.through
         } else {
+            // Replaying a fork must not keep a todo owned by a removed row.
+            // Start with the immutable pre-cut snapshot, then scan the window.
+            let store = self
+                .store
+                .get()
+                .ok_or_else(|| transient("store unavailable"))?;
+            let loaded = store.load_meta(&state.namespace()).map_err(transient)?;
+            let mut meta = loaded.meta;
+            let seed = state.recovery_seed(store)?;
+            let todo = seed.as_ref().and_then(|seed| seed.todo.as_ref());
+            meta.last_todo_state = todo.map(|todo| todo.state_json.clone());
+            meta.last_todo_state_owner_message_id = todo.map(|todo| todo.owner_message_id.clone());
+            meta.last_todo_state_hash = todo.map(|todo| todo.state_hash.clone());
+            store
+                .commit_meta(&state.namespace(), loaded.row_version, &meta)
+                .map_err(transient)?;
             None
         };
         let messages = state.fold_entries(codec, Some(todo_through))?;
@@ -5587,6 +5638,14 @@ impl AsyncRecord {
         let mut retained = Vec::new();
         let mut sequences = Vec::new();
         for history in &source.history {
+            if self
+                .cut_first_ordinal
+                .is_some_and(|first| history.compartment.end_message < first as i64)
+            {
+                retained.push(history.compartment.clone());
+                sequences.push((history.compartment.sequence, history.compartment.sequence));
+                continue;
+            }
             let mapped = history
                 .messages
                 .iter()
@@ -5624,7 +5683,11 @@ impl AsyncRecord {
             {
                 break;
             }
-            compartment.start_message = first.ordinal as i64;
+            compartment.start_message = if self.cut_seed.is_some() {
+                compartment.start_message.min(first.ordinal as i64)
+            } else {
+                first.ordinal as i64
+            };
             compartment.end_message = last.ordinal as i64;
             let start_part = compartment
                 .start_message_id
@@ -5638,15 +5701,29 @@ impl AsyncRecord {
                 .map(|(_, part)| part)
                 .unwrap_or("0")
                 .to_owned();
-            compartment.start_message_id = format!("{}#{start_part}", first.mid);
+            if compartment.start_message == first.ordinal as i64 {
+                compartment.start_message_id = format!("{}#{start_part}", first.mid);
+            }
             compartment.end_message_id = format!("{}#{end_part}", last.mid);
             sequences.push((history.compartment.sequence, compartment.sequence));
             retained.push(compartment);
         }
+        self.repair_cut_history(store, &mut retained, None)?;
         let namespace = self.namespace();
         store
             .replace_compartments(&namespace, &retained)
             .map_err(transient)?;
+        if let Some(seed) = self.recovery_seed(store)? {
+            // Keep the covered boundary available even when an incomplete
+            // tool arc makes the first engine pass wait for another message.
+            let mut bootstrap = seed.as_ref().clone();
+            bootstrap.window = Default::default();
+            if let Some(last) = retained.last() {
+                bootstrap.boundary_id = last.end_message_id.clone();
+                bootstrap.compartment_seq = last.sequence;
+            }
+            self.initialize_cut_namespace(store, &bootstrap)?;
+        }
         let copied = store
             .copy_async_history_artifacts(&source.namespace, &namespace, &sequences)
             .map_err(transient)?;

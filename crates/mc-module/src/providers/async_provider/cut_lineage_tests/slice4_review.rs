@@ -18,6 +18,9 @@
 //! with the finding's id; the campaign (`s4_independent_campaign`) is ignored
 //! because it is long. Run them with `--ignored`.
 use super::*;
+
+#[path = "slice4_guards.rs"]
+mod slice4_guards;
 use std::sync::atomic::Ordering::Relaxed;
 
 /// Turn on the full-input reference and the decision traces, as
@@ -466,7 +469,6 @@ async fn cut_pair(profile: Profile, seed: u64) -> (Pair, Rng, u64) {
 /// message, and Setup runs for it without `descends_from` (compaction-provider
 /// 0.5.1 §5.1). The summaries of the reverted messages must not be served.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-#[ignore = "S4-01: a Setup for a lineage reverted below every cut copies every summary of the old lineage"]
 async fn s4_01_revert_below_every_cut_serves_no_summary_of_reverted_messages() {
     let mut problems = Vec::new();
     for (index, profile) in PROFILES.into_iter().enumerate() {
@@ -526,7 +528,6 @@ async fn s4_01_revert_below_every_cut_serves_no_summary_of_reverted_messages() {
 /// seed through the reset, so it reads from the old cut, never the new
 /// lineage's start.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-#[ignore = "S4-02: a reset keeps the cut seed, so a lineage that restarts at 0 is read from the old cut"]
 async fn s4_02_reset_after_revert_below_cut_reads_the_new_lineage_from_its_start() {
     let mut problems = Vec::new();
     for (index, profile) in PROFILES.into_iter().enumerate() {
@@ -567,7 +568,6 @@ async fn s4_02_reset_after_revert_below_cut_reads_the_new_lineage_from_its_start
 /// the earlier cut's, with the window rows after it and nothing that the
 /// revert removed.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-#[ignore = "S4-03: a revert to an earlier cut fails or serves summaries of reverted messages"]
 async fn s4_03_revert_to_an_earlier_cut_serves_that_cut() {
     let mut problems = Vec::new();
     for (index, profile) in PROFILES.into_iter().enumerate() {
@@ -694,7 +694,6 @@ async fn s4_control_restore_at_a_published_cut_keeps_the_history() {
 /// nor the lineage. The Setup must refuse rather than answer from the
 /// summaries it holds.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-#[ignore = "S4-04: a fresh Setup at an unpublished, uncovered cut answers ready and silently loses messages"]
 async fn s4_04_setup_at_an_unpublished_uncovered_cut_refuses() {
     let mut problems = Vec::new();
     for profile in PROFILES {
@@ -1186,7 +1185,6 @@ async fn s4_control_pressure_notices_after_the_summary_moves() {
 /// rows, which start at the cut, so the cut seed's prefix no longer matches,
 /// every later pass fails and the conversation is marked failed.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-#[ignore = "S4-05: after a resync in a cut lineage every pass fails with `logical prefix certificate invalid`"]
 async fn s4_05_resync_in_a_cut_lineage_keeps_publishing() {
     let mut problems = Vec::new();
     for trigger in ["newest message rewritten", "ceiling ride read failed"] {
@@ -1235,7 +1233,6 @@ async fn s4_05_resync_in_a_cut_lineage_keeps_publishing() {
 /// that straddles the cut: the fork drops that summary, nothing covers the
 /// rows below the cut any more, and every later pass fails.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-#[ignore = "S4-06: a fork after the cut that drops a straddling summary leaves the cut lineage unable to pass"]
 async fn s4_06_fork_after_the_cut_keeps_publishing() {
     let mut problems = Vec::new();
     for (index, profile) in PROFILES.into_iter().enumerate() {
@@ -1287,7 +1284,6 @@ async fn s4_06_fork_after_the_cut_keeps_publishing() {
 /// the cut: the cut lineage keeps the todo state of a `todowrite` the fork
 /// removed, where full processing holds the newest one the fork kept.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-#[ignore = "S4-07: after a fork the cut lineage keeps a removed message's todo state"]
 async fn s4_07_fork_replay_keeps_the_todo_state_full_processing_holds() {
     review_session(Profile::Broca, 1_779_033_703, 12, false, Some(vec![8, 2])).await;
 }
@@ -1296,7 +1292,6 @@ async fn s4_07_fork_replay_keeps_the_todo_state_full_processing_holds() {
 /// A later publication replaces the conversation's record of the cut, but
 /// the namespace staged for the earlier one stays in the store.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-#[ignore = "S4-08: staged cut namespaces that no record references stay in the store"]
 async fn s4_08_superseded_cut_stages_are_removed() {
     let mut problems = Vec::new();
     for profile in [Profile::Broca, Profile::OpenCode] {

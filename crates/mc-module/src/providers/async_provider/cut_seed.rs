@@ -110,9 +110,13 @@ pub(crate) struct CutSeed {
     pub pre_cut_tags: Vec<(u64, u64)>,
     /// The highest tag number below the cut (0 when none).
     pub max_tag: u64,
-    /// The newest todo state when the seed was taken. Fallback: none, so no
+    /// The newest todo state below the cut. Fallback: none, so no
     /// synthetic todo pair shows until the next `todowrite` in the window.
     pub todo: Option<SeedTodo>,
+    /// History at the restart boundary, retained independently of later
+    /// historian replacements so a fork can rebuild the cut's covered prefix.
+    #[serde(default)]
+    pub recovery_history: Vec<mc_store::StoredCompartment>,
     /// State of the messages at or after the cut, as the conversation held
     /// it when the cut was taken. It is not derived from rows below the cut,
     /// but a lineage that begins at the cut cannot recompute it either: the
@@ -275,6 +279,7 @@ impl CutSeed {
             pre_cut_tags: Vec::new(),
             max_tag: 0,
             todo: None,
+            recovery_history: Vec::new(),
             window: CutWindow::default(),
         }
     }
@@ -722,18 +727,18 @@ impl AsyncRecord {
             .chain(previous.as_ref().map(|seed| seed.max_tag))
             .max()
             .unwrap_or(0);
-        let todo = match (
-            &loaded.meta.last_todo_state,
-            &loaded.meta.last_todo_state_owner_message_id,
-            &loaded.meta.last_todo_state_hash,
+        let mut todo = previous.as_ref().and_then(|seed| seed.todo.clone());
+        let mut scan = super::super::runner_todo::TodoScan::default();
+        if let Some(latest) = scan.advance(
+            self.lineage.as_deref().unwrap_or_default(),
+            &prepared(self, codec, base..first, lineage_from)?.messages,
         ) {
-            (Some(state_json), Some(owner), Some(hash)) => Some(SeedTodo {
-                state_json: state_json.clone(),
-                owner_message_id: owner.clone(),
-                state_hash: hash.clone(),
-            }),
-            _ => None,
-        };
+            todo = Some(SeedTodo {
+                state_json: latest.state_json,
+                owner_message_id: latest.owner_message_id,
+                state_hash: latest.state_hash,
+            });
+        }
         // The window's state, keyed by the window's messages.
         let window_mids: HashSet<&str> = self
             .entries
@@ -824,6 +829,7 @@ impl AsyncRecord {
         window.views_high_water = high;
         window.engine_versions = (self.engine.version_high_water, self.engine.rebuild_epoch);
         Ok(Ok(CutSeed {
+            recovery_history: compartments.clone(),
             window,
             first_ordinal: first,
             lineage_from,
@@ -933,6 +939,37 @@ impl AsyncRecord {
         if start == CutStart::Descending {
             return self.adopt_folded_head(store, seed);
         }
+        self.initialize_cut_namespace(store, &seed)?;
+        if let Some(json) = &seed.window.frozen_edits {
+            self.frozen_edits = frozen_edits::FrozenEdits::from_json(json)?;
+            self.frozen_edits.dirty = true;
+        }
+        if let Some(todo) = &seed.todo {
+            store
+                .set_todo_state(
+                    &self.namespace(),
+                    &todo.state_json,
+                    &todo.owner_message_id,
+                    &todo.state_hash,
+                )
+                .map_err(transient)?;
+        }
+        self.todo_scan = self
+            .lineage
+            .as_deref()
+            .map(|lineage| seed.todo_scan(lineage));
+        self.cut_first_ordinal = Some(seed.first_ordinal);
+        self.cut_seed = Some(Arc::new(seed));
+        self.aggregates = self.base_aggregates();
+        self.journal.cut_seed_dirty = true;
+        self.save(store, &[])
+    }
+
+    pub(super) fn initialize_cut_namespace(
+        &self,
+        store: &McStore,
+        seed: &CutSeed,
+    ) -> Result<(), HandlerOutcome> {
         // Commit the history's coverage through the cut in the engine
         // namespace first, as the fold that made the cut did: the seeded
         // boundary adopts it from the compartments, and the engine's first
@@ -1016,29 +1053,7 @@ impl AsyncRecord {
                 loaded.meta.shadow_seq = seq_before;
             })?;
         }
-        if let Some(json) = &seed.window.frozen_edits {
-            self.frozen_edits = frozen_edits::FrozenEdits::from_json(json)?;
-            self.frozen_edits.dirty = true;
-        }
-        if let Some(todo) = &seed.todo {
-            store
-                .set_todo_state(
-                    &self.namespace(),
-                    &todo.state_json,
-                    &todo.owner_message_id,
-                    &todo.state_hash,
-                )
-                .map_err(transient)?;
-        }
-        self.todo_scan = self
-            .lineage
-            .as_deref()
-            .map(|lineage| seed.todo_scan(lineage));
-        self.cut_first_ordinal = Some(seed.first_ordinal);
-        self.cut_seed = Some(Arc::new(seed));
-        self.aggregates = self.base_aggregates();
-        self.journal.cut_seed_dirty = true;
-        self.save(store, &[])
+        Ok(())
     }
 
     /// Whether a Setup that names `descends_from` continues from a cut this
