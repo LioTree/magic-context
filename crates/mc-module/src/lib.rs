@@ -5027,7 +5027,8 @@ struct HistorianFiringTask {
     runner_identity: session_resolver::RunnerBindIdentity,
     /// The conversation's daemon scope stamp; routed summaries select and send
     /// under it.
-    scope: Option<subc_protocol::scope::ScopeStamp>,
+    /// Boxed so the absent case keeps the task small.
+    scope: Option<Box<subc_protocol::scope::ScopeStamp>>,
     /// Context pressure drove this firing, so a routed summary must not wait on
     /// a quota reset.
     pressure: bool,
@@ -7978,7 +7979,7 @@ impl McHandler {
                 host_runs: Arc::clone(&self.host_runs),
                 session_runner,
                 runner_identity: runner_bind_identity(binding),
-                scope: binding.scope.clone(),
+                scope: binding.scope.clone().map(Box::new),
                 // The force band is context pressure; an armed emergency recovery
                 // means the provider is refusing turns for size.
                 pressure: trigger_rule == boundary::TriggerReason::ForceBand
@@ -8193,7 +8194,7 @@ impl McHandler {
             // harness, and session when binding child routes.
             session_runner,
             runner_identity: runner_bind_identity(binding),
-            scope: binding.scope.clone(),
+            scope: binding.scope.clone().map(Box::new),
             // A wrapup is requested by the user, not forced by context pressure.
             pressure: false,
             model_chain_generation,
@@ -8281,41 +8282,47 @@ impl McHandler {
         }
     }
 
-    async fn execute_historian_firing_task(
-        factory: Arc<dyn HistorianProducerFactory>,
+    /// Run a firing that routing places. Returned boxed: the routed drive nests
+    /// the whole firing drive inside the routing engine, and kept inline in the
+    /// executor that state would enlarge every firing's poll frame, routed or not.
+    fn execute_routed_firing_task(
+        routing: Arc<dyn historian_routed::SummaryRouting>,
         task: HistorianFiringTask,
-    ) -> Result<historian::HistorianDriveOutcome, historian::HistorianDriveError> {
-        let HistorianFiringTask {
-            rust_background_enabled,
-            store,
-            session_id,
-            harness,
-            language,
-            historian_temperature,
-            historian_await_timeout,
-            project_path,
-            project_slug,
-            project_root,
-            mut firing,
-            runner_refit,
-            runner,
-            host_runs,
-            session_runner,
-            runner_identity,
-            scope,
-            pressure,
-            model_chain_generation,
-            runner_refusal_cache,
-            live_guard,
-            connect_failure_commit_hook,
-            publication_fence,
-            provider_completion,
-        } = task;
-        let _guard = live_guard;
-        if let Some(routing) = factory.summary_routing() {
+    ) -> std::pin::Pin<
+        Box<
+            dyn std::future::Future<
+                    Output = Result<
+                        historian::HistorianDriveOutcome,
+                        historian::HistorianDriveError,
+                    >,
+                > + Send,
+        >,
+    > {
+        Box::pin(async move {
+            let HistorianFiringTask {
+                rust_background_enabled,
+                store,
+                session_id,
+                harness,
+                language,
+                historian_temperature,
+                historian_await_timeout,
+                project_path,
+                project_slug,
+                project_root,
+                firing,
+                runner_identity,
+                scope,
+                pressure,
+                live_guard,
+                publication_fence,
+                provider_completion,
+                ..
+            } = task;
+            let _guard = live_guard;
             let result = historian_routed::run_routed_summary(historian_routed::RoutedSummary {
                 routing: routing.as_ref(),
-                scope: scope.as_ref(),
+                scope: scope.as_deref(),
                 identity: &runner_identity,
                 store: &store,
                 session_id: &session_id,
@@ -8341,8 +8348,44 @@ impl McHandler {
             if let Some(completion) = provider_completion {
                 completion.record(&store, &session_id, &result);
             }
-            return result;
+            result
+        })
+    }
+
+    async fn execute_historian_firing_task(
+        factory: Arc<dyn HistorianProducerFactory>,
+        task: HistorianFiringTask,
+    ) -> Result<historian::HistorianDriveOutcome, historian::HistorianDriveError> {
+        if let Some(routing) = factory.summary_routing() {
+            return Self::execute_routed_firing_task(routing, task).await;
         }
+        let HistorianFiringTask {
+            rust_background_enabled,
+            store,
+            session_id,
+            harness,
+            language,
+            historian_temperature,
+            historian_await_timeout,
+            project_path,
+            project_slug,
+            project_root,
+            mut firing,
+            runner_refit,
+            runner,
+            host_runs,
+            session_runner,
+            runner_identity,
+            scope: _,
+            pressure: _,
+            model_chain_generation,
+            runner_refusal_cache,
+            live_guard,
+            connect_failure_commit_hook,
+            publication_fence,
+            provider_completion,
+        } = task;
+        let _guard = live_guard;
         tracing::info!(
             "mc-module: historian firing for {session_id}: await_timeout_ms={} attempt_budget_ms={} firing_budget_ms={}",
             historian_await_timeout.as_millis(),

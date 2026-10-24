@@ -5476,9 +5476,10 @@ pub struct ModuleMeta {
     /// The summarizer's system prompt, rendered once per conversation and sent
     /// verbatim on every later summary so the provider's cached prefix stays the
     /// same even if a persona file changes. A native recomp resets this meta to its
-    /// default, which re-renders it. Never read by the m0/m1 renderers.
+    /// default, which re-renders it. Never read by the m0/m1 renderers. Boxed so
+    /// the absent common case adds one pointer to every in-memory meta copy.
     #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub summary_persona: Option<FrozenSummaryPersona>,
+    pub summary_persona: Option<Box<FrozenSummaryPersona>>,
 }
 
 /// A rendered summary persona and the generation and routing settings frozen

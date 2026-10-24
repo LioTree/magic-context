@@ -432,11 +432,11 @@ pub(crate) fn freeze_summary_persona(
     loop {
         let loaded = store.load_meta(session_id)?;
         if let Some(frozen) = &loaded.meta.summary_persona {
-            return Ok(frozen.clone());
+            return Ok(frozen.as_ref().clone());
         }
         let frozen = render_frozen(routing, project_root, language, fallback_temperature)?;
         let mut meta = loaded.meta.clone();
-        meta.summary_persona = Some(frozen.clone());
+        meta.summary_persona = Some(Box::new(frozen.clone()));
         match store.commit_meta(session_id, loaded.row_version, &meta) {
             Ok(_) => {
                 tracing::info!(

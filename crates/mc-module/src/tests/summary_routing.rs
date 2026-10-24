@@ -387,7 +387,10 @@ async fn routed_summary_selects_sends_exactly_the_answer_and_reports_on_the_sess
         );
     }
     // Exactly the answered runner and model, under the session's own scope.
-    assert_eq!(trace.runner_modules, [answer.runner.module.clone()]);
+    assert_eq!(
+        trace.runner_modules,
+        std::slice::from_ref(&answer.runner.module)
+    );
     assert_eq!(
         *rig.producer.models.lock().unwrap(),
         [answered_model(answer)]
@@ -658,7 +661,10 @@ async fn routed_output_is_byte_identical_to_the_chain_path_for_the_same_model() 
             })
             .collect()
     };
-    assert_eq!(*chain_producer.models.lock().unwrap(), [model.clone()]);
+    assert_eq!(
+        *chain_producer.models.lock().unwrap(),
+        std::slice::from_ref(&model)
+    );
     assert_eq!(*routed.producer.models.lock().unwrap(), [model]);
     assert_eq!(
         *chain_producer.systems.lock().unwrap(),
