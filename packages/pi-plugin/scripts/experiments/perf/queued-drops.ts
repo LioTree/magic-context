@@ -107,6 +107,10 @@ try {
 					samples,
 				}),
 			);
+			// Shared unit runners enforce the commit budget; controlled benchmarks enforce latency.
+			if (count === 160 && p95("elapsedMs") >= 300) {
+				throw new Error(`${host}: 160-drop p95 must stay below 300ms`);
+			}
 		}
 		db.close();
 	}

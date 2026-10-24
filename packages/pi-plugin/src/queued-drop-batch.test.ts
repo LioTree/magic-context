@@ -21,7 +21,7 @@ import {
 import { createTestDb } from "./test-utils.test";
 
 for (const host of ["pi", "oc1", "oc2"] as const) {
-	test(`queued batch ${host}: 160 drops have three bounded commits and stay below 300ms`, () => {
+	test(`queued batch ${host}: 160 drops have three bounded commits`, () => {
 		const root = createTestTempDirFromPath(join(tmpdir(), "queued-count-"));
 		const db = createTestDb(join(root, "fixture.db"));
 		try {
@@ -41,14 +41,11 @@ for (const host of ["pi", "oc1", "oc2"] as const) {
 				if (sql === "COMMIT") commits++;
 				return result;
 			}) as typeof db.exec;
-			const start = performance.now();
 			expect(
 				applyPendingOperations(session, db, tagged.targets, new Set()),
 			).toBe(true);
 			tagged.commit();
-			const elapsed = performance.now() - start;
 			expect(commits).toBe(3);
-			expect(elapsed).toBeLessThan(300);
 			expect(getPendingOps(db, session)).toEqual([]);
 			expect(
 				getTagsBySession(db, session).filter((t) => t.status === "dropped"),
