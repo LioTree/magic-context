@@ -183,6 +183,7 @@ export interface HiddenChildAttempt {
     budgetExceeded?: Error;
     budget?: ReturnType<typeof createDreamTokenBudget>;
     observedMessages?: SessionContext["messages"];
+    observedToolSurface?: readonly string[];
     marker?: string;
     /**
      * Earlier settled exchanges of the same run, sent before this attempt's prompt
@@ -643,6 +644,7 @@ export class HiddenChildHook {
                     onBudgetUpdate({ ...selected.budget.snapshot(), sessionId: draft.sessionID });
             }
         }
+        selected.observedToolSurface = Object.keys(draft.tools);
         selected.observedMessages = draft.messages;
         selected.shaped = true;
         return true;

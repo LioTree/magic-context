@@ -1,3 +1,4 @@
+import { CHECK_SCHEMA_CONTRACT } from "@magic-context/core/features/magic-context/memory/historian-schema";
 import { hasHistorianToolActivity } from "@magic-context/core/features/magic-context/memory/historian-wire";
 import { resolveFactDecision } from "@magic-context/core/features/magic-context/memory/lifecycle-applier";
 import type { ReportedProfile } from "@magic-context/core/features/magic-context/memory/lifecycle-gates";
@@ -8,6 +9,7 @@ import {
 	type TurnTwoCarrier,
 	type TurnTwoRecoveryResolver,
 } from "@magic-context/core/features/magic-context/memory/turn-two";
+import { lifecycleToolHash } from "@magic-context/core/features/magic-context/memory/turn-two-allowlist";
 import {
 	closeTurnTwoChild,
 	registerTurnTwoChild,
@@ -16,12 +18,14 @@ import {
 import type { TurnTwoExcerptReader } from "@magic-context/core/features/magic-context/memory/turn-two-scoring";
 import { renderCheckInput } from "@magic-context/core/hooks/magic-context/historian-turn-two-carrier";
 import { sessionLog } from "@magic-context/core/shared/logger";
+import { toModelEntry } from "@magic-context/core/shared/resolve-fallbacks";
 import type { Database } from "@magic-context/core/shared/sqlite";
 import type {
 	SubagentRunner,
 	SubagentRunOptions,
 	SubagentRunResult,
 } from "@magic-context/core/shared/subagent-runner";
+import { resolvePiHarnessKind } from "./pi-harness-kind";
 import type {
 	PiRpcHistorianChild,
 	PiRpcHistorianRunner,
@@ -244,16 +248,27 @@ function reportedProfile(
 	result: SubagentRunResult,
 	options: SubagentRunOptions,
 	systemHash: string,
+	formatInstructions?: string,
+	harness = resolvePiHarnessKind(),
 ): ReportedProfile | null {
 	const provider = result.meta?.reportedProvider;
 	const modelId = result.meta?.reportedModel;
 	if (typeof provider !== "string" || typeof modelId !== "string") return null;
 	return {
+		lane: harness,
+		carrier: PI_RPC_CARRIER,
 		provider,
 		modelId,
-		variant: options.thinkingLevel ?? null,
-		temperature: options.temperature ?? null,
+		variant: toModelEntry(options.model)?.qualifier ?? null,
+		// RPC currently observes neither effective sampling nor effective thinking.
+		temperature: null,
+		thinkingLevel: null,
 		systemHash,
+		schemaHash:
+			formatInstructions === undefined
+				? null
+				: lifecycleTextHash(formatInstructions),
+		toolHash: lifecycleToolHash([]),
 	};
 }
 
@@ -265,8 +280,11 @@ export function createPiTurnTwoCarrier(args: {
 	turnOneText: string;
 	enforcedJson?: boolean;
 	onStageKey?: (key: string) => void;
+	/** Persisted format instructions, shared byte-for-byte by both turns. */
+	formatInstructions?: string;
 }): PiTurnTwoCarrier {
 	const systemHash = lifecycleTextHash(args.options.systemPrompt);
+	const harness = resolvePiHarnessKind();
 	const cancellation = new AbortController();
 	const signal = args.options.signal
 		? AbortSignal.any([args.options.signal, cancellation.signal])
@@ -278,11 +296,11 @@ export function createPiTurnTwoCarrier(args: {
 			for (const child of checks) void child.close().catch(() => {});
 		},
 		carrier: PI_RPC_CARRIER,
-		harness: "pi",
+		harness,
 		childSessionId: args.child.id,
 		baseline: lifecycleTextHash(args.turnOneText),
 		historianSystemHash: systemHash,
-		variant: args.options.thinkingLevel ?? null,
+		variant: toModelEntry(args.options.model)?.qualifier ?? null,
 		async send(prompt, key) {
 			signal.throwIfAborted();
 			args.onStageKey?.(key);
@@ -294,7 +312,13 @@ export function createPiTurnTwoCarrier(args: {
 				text: result.assistantText,
 				lengthCapped: result.meta?.lengthCapped === true,
 				toolActivity: hasHistorianToolActivity(result.meta),
-				profile: reportedProfile(result, args.options, systemHash),
+				profile: reportedProfile(
+					result,
+					args.options,
+					systemHash,
+					args.formatInstructions,
+					harness,
+				),
 				usage: result.meta?.usage,
 			};
 		},
@@ -324,7 +348,13 @@ export function createPiTurnTwoCarrier(args: {
 				signal.throwIfAborted();
 				if (!result.ok)
 					throw new Error(`Pi check: ${result.reason}: ${result.error}`);
-				const profile = reportedProfile(result, options, request.systemHash);
+				const profile = reportedProfile(
+					result,
+					options,
+					lifecycleTextHash(request.system),
+					CHECK_SCHEMA_CONTRACT,
+					harness,
+				);
 				let verdicts = [];
 				try {
 					verdicts = JSON.parse(result.assistantText).verdicts;
@@ -338,11 +368,16 @@ export function createPiTurnTwoCarrier(args: {
 							? verdicts
 							: [],
 					profile: profile ?? {
+						lane: harness,
+						carrier: PI_RPC_CARRIER,
 						provider: "",
 						modelId: "",
 						variant: null,
 						temperature: null,
-						systemHash: request.systemHash,
+						thinkingLevel: null,
+						systemHash: lifecycleTextHash(request.system),
+						schemaHash: lifecycleTextHash(CHECK_SCHEMA_CONTRACT),
+						toolHash: lifecycleToolHash([]),
 					},
 					usage: result.meta?.usage,
 				};
@@ -426,6 +461,7 @@ export function schedulePiHistorianTurnTwo(args: {
 	memoryEnabled: boolean;
 	autoPromote: boolean;
 	validatedProfiles: readonly ReportedProfile[];
+	formatInstructions?: string;
 	log: (message: string) => void;
 	readExcerpt?: TurnTwoExcerptReader;
 }): void {
@@ -457,7 +493,7 @@ export function schedulePiHistorianTurnTwo(args: {
 	registerTurnTwoChild({
 		childSessionId: args.child.id,
 		parentSessionId: args.sessionId,
-		harness: "pi",
+		harness: carrier.harness,
 		handle: args.child,
 		active: true,
 		close: async () => {

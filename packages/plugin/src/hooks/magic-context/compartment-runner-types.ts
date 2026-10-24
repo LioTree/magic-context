@@ -115,6 +115,8 @@ export interface HiddenCompletion {
     messages?: unknown[];
     providerId?: string;
     modelId?: string;
+    /** Tool names in the context-hook draft, in sent order; absent when not observed. */
+    observedToolSurface?: readonly string[];
 }
 
 export interface HiddenCompletionExecutor {
