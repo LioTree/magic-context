@@ -1,6 +1,0 @@
-ck motor run: job_id=01a16fce-91e6-746f-bf51-e8d11241dcc5 secret-file=/Users/ufukaltinok/.local/share/cortexkit/ck-motor/direct-secrets/01a16fce-91e6-746f-bf51-e8d11241dcc5
-cargo 1.99.0 (5f94df478 2026-08-27)
-rustc 1.99.0 (b940084d7 2026-09-28)
-   Compiling mc-module v0.49.13 (/Users/ufukaltinok/.local/share/cortexkit/alfonso/worktrees/8f93aad09f2535d0/bg_c644789ea485326b/crates/mc-module)
-    Finished `test` profile [unoptimized + debuginfo] target(s) in 1m 09s
-  Executable unittests src/lib.rs (/run/motor/target/debug/deps/mc_module-a100b82d7b7ce97d)

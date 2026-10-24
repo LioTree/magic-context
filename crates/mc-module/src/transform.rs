@@ -7922,17 +7922,6 @@ fn apply_once(
             ctx.execute_threshold_percentage,
             estimate_tokens,
         );
-        #[cfg(test)]
-        if std::env::var_os("MC_CUT_FLOOR_TRACE").is_some() {
-            eprintln!(
-                "FLOOR value={floor} coverage={:?} prefix={:?} live={:?}",
-                meta.coverage_ordinal,
-                req.logical_prefix.as_ref().map(|p| p.tail_from),
-                live.iter()
-                    .map(|b| (b.ordinal, b.role.clone(), b.id().to_owned(), b.bytes.len()))
-                    .collect::<Vec<_>>()
-            );
-        }
         meta.publication_floor_ordinal = Some(floor);
     }
     // A todo-only SOFT splice changes neither the m0/m1 divider nor the covered tail. Keep

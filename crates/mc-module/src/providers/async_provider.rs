@@ -1891,12 +1891,6 @@ impl McHandler {
         {
             self.authorize_async(binding, old)?;
             let generation = old.next_generation()?;
-            #[cfg(test)]
-            if std::env::var_os("MC_CUT_DIFF_DETAIL").is_some() {
-                let legacy = old.generation + old.engine.version_high_water + 2;
-                let namespace = format!("{}:async:{legacy}", old.key.engine_key());
-                eprintln!("FRESH NAMESPACE old={} engine_high={} legacy={legacy} selected={generation} max_stage={:?} legacy_occupied={}", old.generation, old.engine.version_high_water, old.published_cuts.values().map(|cut|cut.generation).max(), store.load_namespace_head(&namespace).map_err(transient)?.is_some());
-            }
             let history = store
                 .load_compartments(&old.namespace())
                 .map_err(transient)?;
@@ -1914,17 +1908,6 @@ impl McHandler {
                 let mut prior = load(store, &reference)?
                     .ok_or_else(|| transient("async session disappeared"))?;
                 prior.capture_resync_sources(store)?;
-                #[cfg(test)]
-                if std::env::var_os("MC_CUT_DIFF_DETAIL").is_some() {
-                    eprintln!(
-                        "FRESH HEAD PROOF {:?}",
-                        prior
-                            .resync_sources
-                            .as_ref()
-                            .and_then(|source| source.head.as_ref())
-                            .map(|head| (head.messages.len(), &head.required_cut))
-                    );
-                }
                 state.resync_sources = prior.resync_sources.take();
                 state.frozen_edits.merge(&prior.frozen_edits);
                 for archive in store.load_async_undo_edits(&reference).map_err(transient)? {

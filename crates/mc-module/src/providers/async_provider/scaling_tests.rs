@@ -1648,6 +1648,23 @@ async fn covered_tail_latency_benchmark() {
         let (peak, current) = rss();
         eprintln!("BENCH bootstrap total={size} wall_ms={:.1} RSS_bytes={current} peak_RSS_bytes={peak} phases: {}", bootstrap.0.0, phases(&rig.reference, &boot_phases));
         eprintln!("shape total={size} uncovered={tail} serialized_tail_tokens={tokens} compartment_end={covered} bootstrap={:?} elapsed_ms={:.1}", bootstrap.2, bootstrap.0.0);
+        if bootstrap.2.is_ok() {
+            let first_notice = FirstNoticeSample {
+                wall_ms: bootstrap.0 .0,
+                thread_cpu_ms: bootstrap.0 .1,
+                process_cpu_ms: bootstrap.0 .2,
+            };
+            eprintln!(
+                "{FIRST_NOTICE_LINE}{}",
+                serde_json::to_string(&first_notice).unwrap()
+            );
+        }
+        // Extra first-notice samples use a fresh process and the identical cut
+        // preparation, but do not repeat the steady-state or Setup measurements.
+        if std::env::var_os("MC_ASYNC_FIRST_NOTICE_ONLY").is_some() {
+            bootstrap.2.unwrap();
+            continue;
+        }
         if bootstrap.2.is_err() {
             eprintln!("Bootstrap failed; retrying before ordinary-notice sampling.");
         }
@@ -1923,6 +1940,70 @@ mod erased_size {
 /// Prefix of the line `covered_tail_latency_benchmark` prints with one size's
 /// cost summary.
 const COST_LINE: &str = "COST_RULE ";
+const FIRST_NOTICE_LINE: &str = "FIRST_NOTICE_SAMPLE ";
+
+#[derive(Serialize, Deserialize, Debug, Clone, Copy, PartialEq)]
+struct FirstNoticeSample {
+    wall_ms: f64,
+    thread_cpu_ms: f64,
+    process_cpu_ms: f64,
+}
+
+fn first_notice_medians(samples: &[FirstNoticeSample]) -> FirstNoticeSample {
+    assert!(
+        samples.len() >= 5,
+        "first-notice median needs at least five fresh samples"
+    );
+    let median = |get: fn(&FirstNoticeSample) -> f64| {
+        let mut values = samples.iter().map(get).collect::<Vec<_>>();
+        values.sort_by(f64::total_cmp);
+        values[values.len() / 2]
+    };
+    FirstNoticeSample {
+        wall_ms: median(|sample| sample.wall_ms),
+        thread_cpu_ms: median(|sample| sample.thread_cpu_ms),
+        process_cpu_ms: median(|sample| sample.process_cpu_ms),
+    }
+}
+
+#[test]
+fn first_notice_medians_use_all_fresh_samples_and_preserve_cpu_measurements() {
+    let samples = [
+        FirstNoticeSample {
+            wall_ms: 900.0,
+            thread_cpu_ms: 6.0,
+            process_cpu_ms: 5.0,
+        },
+        FirstNoticeSample {
+            wall_ms: 30.0,
+            thread_cpu_ms: 4.0,
+            process_cpu_ms: 8.0,
+        },
+        FirstNoticeSample {
+            wall_ms: 10.0,
+            thread_cpu_ms: 2.0,
+            process_cpu_ms: 4.0,
+        },
+        FirstNoticeSample {
+            wall_ms: 20.0,
+            thread_cpu_ms: 8.0,
+            process_cpu_ms: 3.0,
+        },
+        FirstNoticeSample {
+            wall_ms: 40.0,
+            thread_cpu_ms: 3.0,
+            process_cpu_ms: 6.0,
+        },
+    ];
+    assert_eq!(
+        first_notice_medians(&samples),
+        FirstNoticeSample {
+            wall_ms: 30.0,
+            thread_cpu_ms: 4.0,
+            process_cpu_ms: 5.0,
+        }
+    );
+}
 
 #[derive(Serialize, Deserialize, Debug, Clone)]
 struct CostSample {
@@ -1965,7 +2046,10 @@ fn median_wall(samples: &[(f64, f64, f64)]) -> f64 {
 ///
 /// Each size runs `covered_tail_latency_benchmark` in its own child process
 /// of this test binary, because the peak resident set (VmHWM) of a process
-/// never decreases. Linux only (RSS comes from /proc). Run with:
+/// never decreases. First-notice wall time is the median of five fresh child
+/// processes; all samples include thread and process CPU time for diagnosis.
+/// Other measurements still come from one full benchmark per size and mode.
+/// Linux only (RSS comes from /proc). Run with:
 ///
 /// ```sh
 /// cargo test --release -p mc-module --lib cost_rule_150k_vs_1k -- --ignored --nocapture
@@ -1975,11 +2059,21 @@ fn median_wall(samples: &[(f64, f64, f64)]) -> f64 {
 #[test]
 #[ignore = "cost-rule benchmark assertion; run explicitly with --release --ignored --nocapture"]
 fn cost_rule_150k_vs_1k() {
-    let run = |size: u64, fresh: bool| -> CostSample {
+    let run = |size: u64,
+               fresh: bool,
+               first_only: bool|
+     -> (Option<CostSample>, FirstNoticeSample) {
         let exe = std::env::current_exe().unwrap();
         let mut command = std::process::Command::new(exe);
         if fresh {
             command.env("MC_ASYNC_FRESH_CUT", "1");
+        } else {
+            command.env_remove("MC_ASYNC_FRESH_CUT");
+        }
+        if first_only {
+            command.env("MC_ASYNC_FIRST_NOTICE_ONLY", "1");
+        } else {
+            command.env_remove("MC_ASYNC_FIRST_NOTICE_ONLY");
         }
         let output = command
             .args([
@@ -2011,24 +2105,50 @@ fn cost_rule_150k_vs_1k() {
             output.status.success(),
             "benchmark at {size} failed:\n{stdout}\n{stderr}"
         );
+        let first_notice = stderr
+            .lines()
+            .find_map(|line| line.strip_prefix(FIRST_NOTICE_LINE))
+            .unwrap_or_else(|| panic!("no successful first notice at {size}:\n{stdout}\n{stderr}"));
+        let first_notice = serde_json::from_str(first_notice).unwrap();
+        if first_only {
+            return (None, first_notice);
+        }
         let line = stderr
             .lines()
             .find_map(|line| line.strip_prefix(COST_LINE))
             .unwrap_or_else(|| panic!("no cost line at {size}:\n{stdout}\n{stderr}"));
-        serde_json::from_str(line).unwrap()
+        (Some(serde_json::from_str(line).unwrap()), first_notice)
     };
     for fresh in [false, true] {
         eprintln!(
             "cost rule mode={}",
             if fresh { "fresh" } else { "descending" }
         );
-        let small = run(1_000, fresh);
-        let large = run(150_000, fresh);
+        let sample = |size| {
+            let (cost, first) = run(size, fresh, false);
+            let mut cost = cost.unwrap();
+            let mut samples = vec![first];
+            for _ in 1..5 {
+                samples.push(run(size, fresh, true).1);
+            }
+            eprintln!(
+                "cost rule first-notice samples size={size} mode={}: {}",
+                if fresh { "fresh" } else { "descending" },
+                serde_json::to_string(&samples).unwrap()
+            );
+            let medians = first_notice_medians(&samples);
+            cost.first_notice_ms = medians.wall_ms;
+            cost.first_notice_thread_cpu_ms = medians.thread_cpu_ms;
+            cost.first_notice_process_cpu_ms = medians.process_cpu_ms;
+            cost
+        };
+        let small = sample(1_000);
+        let large = sample(150_000);
         eprintln!("cost rule 1k: {small:?}");
         eprintln!("cost rule 150k: {large:?}");
         let checks = [
             (
-                "first notice ms",
+                "first notice p50 ms (5 fresh samples)",
                 small.first_notice_ms,
                 large.first_notice_ms,
             ),
