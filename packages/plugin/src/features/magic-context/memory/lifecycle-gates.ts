@@ -8,14 +8,20 @@ import {
     scanConcreteTokens,
     splitMemoryClauses,
 } from "./lifecycle-text";
+import { matchesReportedProfile } from "./turn-two-allowlist";
 
 export type CheckKind = "disproof" | "support" | "kept-clause" | "compatibility";
 export interface ReportedProfile {
+    lane?: string | null;
+    carrier?: string | null;
     provider: string;
     modelId: string;
     variant: string | null;
     temperature: number | null;
+    thinkingLevel?: string | null;
     systemHash: string;
+    schemaHash?: string | null;
+    toolHash?: string | null;
 }
 export interface ClauseCitation {
     blockStartOrdinal: number;
@@ -354,14 +360,12 @@ export function sameInferenceTuple(a: ReportedProfile, b: ReportedProfile): bool
         a.provider === b.provider &&
         a.modelId === b.modelId &&
         a.variant === b.variant &&
-        a.temperature === b.temperature
+        a.temperature === b.temperature &&
+        a.thinkingLevel === b.thinkingLevel
     );
 }
 function validated(profile: ReportedProfile, profiles: ReportedProfile[]): boolean {
-    return profiles.some(
-        (candidate) =>
-            sameInferenceTuple(candidate, profile) && candidate.systemHash === profile.systemHash,
-    );
+    return profiles.some((candidate) => matchesReportedProfile(profile, candidate));
 }
 export function makeCheckRequest(
     decisionKey: string,
@@ -418,6 +422,8 @@ export async function runMemoryChecks(
         }
         if (
             !reply?.profile ||
+            reply.profile.lane !== context.historianProfile.lane ||
+            reply.profile.carrier !== context.historianProfile.carrier ||
             !sameInferenceTuple(reply.profile, context.historianProfile) ||
             reply.profile.systemHash !== request.systemHash ||
             !validated(reply.profile, context.validatedProfiles)

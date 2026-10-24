@@ -8,16 +8,22 @@ import {
     type ReportedProfile,
     type RevisionDecision,
     runMemoryChecks,
+    sameInferenceTuple,
 } from "./lifecycle-gates";
 import { lifecycleTextHash } from "./lifecycle-text";
 
 function fixture(): { decision: RevisionDecision; context: GateContext } {
     const profile: ReportedProfile = {
+        lane: "opencode-2",
+        carrier: "hidden-completion",
         provider: "test",
         modelId: "reported",
         variant: null,
         temperature: 0,
-        systemHash: "historian-hash",
+        thinkingLevel: null,
+        systemHash: lifecycleTextHash("historian system"),
+        schemaHash: lifecycleTextHash("schema contract"),
+        toolHash: lifecycleTextHash("[]"),
     };
     const evidence = { blockStartOrdinal: 42, excerpt: "The limit was 32 KiB; it is now 64 KiB." };
     return {
@@ -88,6 +94,72 @@ async function assess(f: ReturnType<typeof fixture>, fail?: (request: CheckReque
 }
 
 describe("memory revision deterministic gates", () => {
+    test("sameInferenceTuple compares thinkingLevel separately from variant", () => {
+        const profile = fixture().context.historianProfile;
+        expect(sameInferenceTuple(profile, { ...profile })).toBe(true);
+        expect(sameInferenceTuple(profile, { ...profile, thinkingLevel: "high" })).toBe(false);
+        expect(sameInferenceTuple(profile, { ...profile, thinkingLevel: undefined })).toBe(false);
+    });
+
+    test("absent thinkingLevel against a null entry refuses before sending checks", async () => {
+        const f = fixture();
+        f.context.historianProfile = { ...f.context.historianProfile };
+        delete f.context.historianProfile.thinkingLevel;
+        expect(await assess(f)).toMatchObject({
+            ok: false,
+            reason: "unvalidated_profile",
+            calls: [],
+        });
+    });
+
+    for (const [field, value] of [
+        ["lane", "opencode-1"],
+        ["carrier", "opencode-session"],
+        ["thinkingLevel", "high"],
+    ] as const) {
+        test(`check completion substituted ${field} refuses even with its own validated row`, async () => {
+            const f = fixture();
+            const lane = field === "lane" ? "opencode-2" : "opencode-1";
+            f.context.historianProfile.lane = lane;
+            for (const row of f.context.validatedProfiles) row.lane = lane;
+            const plan = planMemoryRevision(f.decision, f.context);
+            if (!plan.ok) throw new Error("fixture must plan checks");
+            const otherRows = f.context.validatedProfiles.map((row) => ({
+                ...row,
+                [field]: value,
+            }));
+            f.context.validatedProfiles.push(...otherRows);
+            const result = await runMemoryChecks(
+                f.decision.key,
+                plan,
+                f.context,
+                async (request) => ({
+                    profile: {
+                        ...f.context.historianProfile,
+                        [field]: value,
+                        systemHash: request.systemHash,
+                    },
+                    usage: {},
+                    verdicts: (request.kind === "compatibility"
+                        ? request.pairs
+                        : request.operands
+                    ).map((operand) => ({
+                        id: operand.id,
+                        verdict:
+                            request.kind === "disproof" || request.kind === "support"
+                                ? "yes"
+                                : "no",
+                    })),
+                }),
+            );
+            expect(result).toMatchObject({
+                ok: false,
+                reason: "unvalidated_profile",
+                retryable: true,
+            });
+        });
+    }
+
     test("null check entry is refused as malformed_check without throwing", async () => {
         const f = fixture();
         const plan = planMemoryRevision(f.decision, f.context);
