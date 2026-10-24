@@ -1013,7 +1013,9 @@ async function runHistorianPrompt(args: {
                     `historian: prompt attempt ${retryIndex + 1} failed: ${errorMsg}`,
                 );
                 const shouldRetry =
-                    retryIndex < MAX_HISTORIAN_RETRIES && isTransientHistorianPromptError(errorMsg);
+                    !args.turnTwoEnabled &&
+                    retryIndex < MAX_HISTORIAN_RETRIES &&
+                    isTransientHistorianPromptError(errorMsg);
                 if (!shouldRetry) {
                     throw error;
                 }
@@ -1164,11 +1166,15 @@ async function runHistorianPrompt(args: {
             reportedProfile: profile ?? undefined,
         };
     } catch (modelError: unknown) {
+        // A failed response read does not make an accepted prompt safe to send again.
+        // Keep its child and key until recovery observes a reply or confirms expiry.
         if (
             args.turnOneStageKey &&
             handle &&
-            (!promptSettled || !completion) &&
-            /timed?\s*out|outcome.*unknown/i.test(getErrorMessage(modelError))
+            !completion &&
+            (promptSettled ||
+                args.recoverTurnOne ||
+                /timed?\s*out|outcome.*unknown/i.test(getErrorMessage(modelError)))
         ) {
             childRetained = true;
             executor.detach?.(handle);

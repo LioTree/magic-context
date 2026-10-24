@@ -1,6 +1,6 @@
 /**
  * Runs historian turn two after turn one's publication committed, on the child
- * turn one ran in. Only an `enabled` lane reaches this (see `resolveTurnOneLane`).
+ * turn one ran in. Only a lane enabled by `selectTurnOneExecution` reaches this.
  */
 
 import { HISTORIAN_AGENT } from "../../agents/historian";

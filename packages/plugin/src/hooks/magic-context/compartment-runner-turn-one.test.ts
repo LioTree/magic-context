@@ -17,8 +17,10 @@ import {
     getMemoriesByProject,
     insertMemory,
 } from "../../features/magic-context/memory/storage-memory";
-import { HISTORIAN_FORMAT_INSTRUCTION } from "../../features/magic-context/memory/turn-one-publication";
-import { TurnTwoOutcomeUnknownError } from "../../features/magic-context/memory/turn-two";
+import {
+    HISTORIAN_FORMAT_INSTRUCTION,
+    sweepDormantTurnTwo,
+} from "../../features/magic-context/memory/turn-one-publication";
 import { __turnTwoChildrenTest } from "../../features/magic-context/memory/turn-two-children";
 import { authorizationFixture } from "../../features/magic-context/memory/turn-two-test-fixtures.test";
 import {
@@ -748,6 +750,43 @@ describe("historian turn one when the store is busy before dispatch", () => {
 });
 
 describe("historian turn two on an enabled lane", () => {
+    it("an enabled turn-one timeout retains its stage without retrying the provider send", async () => {
+        useTempDataHome("turn-one-unknown-timeout-");
+        const sessionId = "ses-unknown-timeout";
+        const directory = "/tmp/turn-one-unknown-timeout";
+        createOpenCodeSession(sessionId);
+        const db = openDatabase();
+        seedPriorCompartment(db, sessionId);
+        const { client, events } = twoTurnClient(directory, null);
+        const original = createV1HiddenCompletionExecutor(client, db, directory);
+        let released = 0;
+        const executor = {
+            ...original,
+            close: async (...input: Parameters<typeof original.close>) => {
+                released++;
+                await original.close(...input);
+            },
+            attempt: async (...input: Parameters<typeof original.attempt>) => {
+                await original.attempt(...input);
+                throw new Error("provider timed out");
+            },
+        };
+        await runHistorian(db, sessionId, client, directory, {
+            memoryLifecycleLane: "enabled",
+            hiddenCompletionExecutor: executor,
+        });
+        expect(events).toEqual(["prompt:ses-child-1:1"]);
+        expect(
+            db.prepare("SELECT state FROM memory_stage_attempts WHERE stage='turn_one'").get(),
+        ).toEqual({ state: "sending" });
+        expect(getCompartments(db, sessionId)).toHaveLength(1);
+        expect(pendingFacts(db)).toEqual([]);
+        await sweepDormantTurnTwo(db, resolveProjectIdentity(directory));
+        expect(released).toBe(1);
+        expect(
+            db.prepare("SELECT state FROM memory_stage_attempts WHERE stage='turn_one'").get(),
+        ).toEqual({ state: "revoked" });
+    });
     it("OpenCode turn-one reply revoked in flight publishes nothing and releases once", async () => {
         useTempDataHome("turn-one-revoked-");
         const sessionId = "ses-turn-one-revoked";
@@ -798,7 +837,7 @@ describe("historian turn two on an enabled lane", () => {
                 collect: async (...input: Parameters<typeof original.collect>) => {
                     if (first) {
                         first = false;
-                        throw new TurnTwoOutcomeUnknownError();
+                        throw new Error("historian response read failed");
                     }
                     return original.collect(...input);
                 },
