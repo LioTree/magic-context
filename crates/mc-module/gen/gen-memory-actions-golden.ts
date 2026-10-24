@@ -20,7 +20,7 @@ const oracleSources = [
   ],
   [
     "packages/plugin/src/features/magic-context/memory/lifecycle-applier.ts",
-    "6e1914c50e29a841c475cb51ef6f77e1b5e19026be0b2e6eb28c109180b04a38",
+    "48cd5cca96a35dcbe1750ccf3e291bcca6b33a67f1ccb1c1c7ff148212cefdd5",
   ],
   [
     "packages/plugin/src/features/magic-context/memory/storage-memory.ts",
