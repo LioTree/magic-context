@@ -19,7 +19,12 @@ import { replaceAllCompartments } from "../../features/magic-context/compartment
 import { resolveProjectIdentity } from "../../features/magic-context/memory/project-identity";
 import { selectTurnOneExecution } from "../../features/magic-context/memory/turn-one-publication";
 import { loadTurnTwoAllowlist } from "../../features/magic-context/memory/turn-two-allowlist";
-import { closeDatabase, openDatabase } from "../../features/magic-context/storage";
+import {
+    closeDatabase,
+    openDatabase,
+    updateSessionMeta,
+} from "../../features/magic-context/storage";
+import { createTagger } from "../../features/magic-context/tagger";
 import type { PluginContext } from "../../plugin/types";
 import { Database } from "../../shared/sqlite";
 import { closeQuietly } from "../../shared/sqlite-helpers";
@@ -256,36 +261,62 @@ describe("OpenCode hosts hand turn_two, the allowlist and trial evidence to the 
         expect(deps.memoryLifecycleValidatedProfiles).toBeUndefined();
     });
 
-    it("OpenCode 1 passes a configured historian.turn_two through the hook it builds", async () => {
+    it("OpenCode 1 hook reaches the historian start with the sampled switch", async () => {
         useTempDataHome("turn-two-wiring-hook-");
-        // A configured historian block (with two_pass for contrast) proves the
-        // switch reaches the hook, not merely that the schema accepts the key.
+        createOpenCodeSession(SESSION);
+        const db = openDatabase();
+        seedPriorCompartment(db, SESSION);
+        // The flag is what asks the phase for a start; a firing from the ordinary
+        // trigger path is covered by the phase test above.
+        updateSessionMeta(db, SESSION, { compartmentInProgress: true });
         const config = MagicContextConfigSchema.parse({
             historian: { turn_two: "off", two_pass: true },
         });
-        expect(config.historian?.turn_two).toBe("off");
-        const hook = createMagicContextHook({
-            client: sdkClient(),
-            tagger: {
-                assignTag: () => 1,
-                bindTag: () => {},
-                getTag: () => undefined,
-                getAssignments: () => new Map(),
-                resetCounter: () => {},
-                getCounter: () => 0,
-                initFromDb: () => {},
-                cleanup: () => {},
+        const started: Array<{ turnTwo?: string; twoPass?: boolean }> = [];
+        const start = spyOn(runnerModule, "startCompartmentAgent").mockImplementation(
+            (deps: HiddenCompartmentRunnerDeps) => {
+                started.push({
+                    turnTwo: deps.historianTurnTwo,
+                    twoPass: deps.historianTwoPass,
+                });
             },
-            scheduler: { shouldExecute: () => "defer" },
-            compactionHandler: { onCompacted: () => {} },
-            directory: DIRECTORY,
-            config,
-            liveSessionState: createLiveSessionState(),
-        } as unknown as Parameters<typeof createMagicContextHook>[0]);
-        expect(hook).not.toBeNull();
-        // `historian` is an optional block: with no block there is no schema value,
-        // so each host applies the documented "allowlist" default itself.
-        expect(MagicContextConfigSchema.parse({}).historian).toBeUndefined();
+        );
+        try {
+            const hook = createMagicContextHook({
+                client: sdkClient(),
+                tagger: createTagger(),
+                scheduler: { shouldExecute: () => "defer" },
+                compactionHandler: { onCompacted: () => {} },
+                directory: DIRECTORY,
+                config,
+                contextUsageMap: new Map([
+                    [
+                        SESSION,
+                        {
+                            usage: { percentage: 25, inputTokens: 50_000 },
+                            updatedAt: Date.now(),
+                        },
+                    ],
+                ]),
+                liveSessionState: createLiveSessionState(),
+            } as unknown as Parameters<typeof createMagicContextHook>[0]);
+            expect(hook).not.toBeNull();
+            const messages = RAW_MESSAGES.map((message) => ({
+                info: { id: message.id, role: message.role, sessionID: SESSION },
+                parts: [{ type: "text", text: message.text }],
+            }));
+            await hook!["experimental.chat.messages.transform"]!(
+                {},
+                { messages } as unknown as Parameters<
+                    NonNullable<ReturnType<typeof createMagicContextHook>>["experimental.chat.messages.transform"]
+                >[1],
+            );
+            expect(started.length).toBeGreaterThan(0);
+            // The hook samples config per firing; both switches arrive as configured.
+            expect(started.at(-1)).toEqual({ turnTwo: "off", twoPass: true });
+        } finally {
+            start.mockRestore();
+        }
     });
 });
 
