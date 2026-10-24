@@ -48,6 +48,7 @@ mod dream_claim;
 pub mod dream_dispatch;
 pub mod dream_tasks;
 mod memory_actions;
+pub mod persona_host;
 
 /// Names reserved for scoped, non-tool management requests. These are not facade
 /// tools: adding them to the model-visible catalog would invalidate cached prefixes.

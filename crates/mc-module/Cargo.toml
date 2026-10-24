@@ -24,6 +24,7 @@ cortexkit-store-types = { workspace = true }
 cortexkit-store = { workspace = true }
 cortexkit-lease = { workspace = true }
 cortexkit-log = { workspace = true }
+cortexkit-persona = "=0.1.0"
 tracing = "0.1"
 subc-protocol = { workspace = true }
 subc-control = { workspace = true }
