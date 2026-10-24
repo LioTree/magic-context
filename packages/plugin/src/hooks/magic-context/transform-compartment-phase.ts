@@ -122,6 +122,8 @@ interface RunCompartmentPhaseArgs {
     historianTwoPass?: boolean;
     /** `historian.turn_two`: the memory-lifecycle off switch. Absent means "allowlist". */
     historianTurnTwo?: "allowlist" | "off";
+    /** Re-reads the switch from current config after provider replies. */
+    historianTurnTwoIsEnabled?: () => boolean;
     historianExpandTools?: Record<string, string | false>;
     /** Cross-session memory feature gate (`memory.enabled`). Issue #44. */
     memoryEnabled?: boolean;
@@ -416,6 +418,7 @@ async function runCompartmentPhaseImpl(args: RunCompartmentPhaseArgs): Promise<{
                     userObservationsRequested: args.userObservationsRequested,
                     historianTwoPass: args.historianTwoPass,
                     historianTurnTwo: args.historianTurnTwo,
+                    historianTurnTwoIsEnabled: args.historianTurnTwoIsEnabled,
                     historianExpandTools: args.historianExpandTools,
                     memoryEnabled: args.memoryEnabled,
                     autoPromote: args.autoPromote,
@@ -482,6 +485,7 @@ async function runCompartmentPhaseImpl(args: RunCompartmentPhaseArgs): Promise<{
                 userObservationsRequested: args.userObservationsRequested,
                 historianTwoPass: args.historianTwoPass,
                 historianTurnTwo: args.historianTurnTwo,
+                historianTurnTwoIsEnabled: args.historianTurnTwoIsEnabled,
                 historianExpandTools: args.historianExpandTools,
                 memoryEnabled: args.memoryEnabled,
                 autoPromote: args.autoPromote,

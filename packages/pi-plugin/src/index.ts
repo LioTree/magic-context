@@ -1102,6 +1102,8 @@ export function resolveHistorianFromConfig(
 		// The memory-lifecycle off switch. The historian block is optional, so a
 		// missing key takes "allowlist" here, the value the schema gives a
 		// configured block; the runner then matches only the shipped allowlist.
+		// Pi's context handler additionally re-reads the switch from fresh config
+		// for replies still in flight (see resolveContextOptionsForProject).
 		turnTwo: historian?.turn_two ?? "allowlist",
 		expandTools: historian?.expand_tools,
 		// Pi and OMP: explicit thinking level for historian subagent invocations.
@@ -1833,9 +1835,18 @@ async function startPiMagicContextRuntime(
 			PI_HARNESS_KIND,
 			activeModelRegistry,
 		);
+		// `sampled` came from a poll of this project's live config reader, so
+		// re-polling inside the callback answers with the file as it reads now.
+		// That is what lets a reload to "off" revoke a turn two whose reply is
+		// still pending, instead of applying it on the start-time value.
+		const turnTwoIsEnabled = () =>
+			historianRunConfig(
+				project.config,
+				liveReaderFor(dir, project.config).poll().effective,
+			).historian?.turn_two !== "off";
 		return {
 			...project.contextOptions,
-			historian,
+			historian: historian ? { ...historian, turnTwoIsEnabled } : historian,
 			cacheTtlConfig: sampled.cache_ttl,
 			cacheTtlConfigured: sampled.cacheTtlConfigured,
 		};

@@ -327,6 +327,11 @@ export function createMagicContextHook(deps: MagicContextDeps) {
     };
     const bootHistorian = sampleHistorian();
     const getHistorianChunkTokens = (): number => sampleHistorian().chunkTokens;
+    // `sampleHistorian` reads the live config through `sampleHistorianConfig`,
+    // which production wires to the live config reader polled on each call. So
+    // asking it again late in a run answers with whatever the file says now,
+    // while the start-time value stays the snapshot the run began with.
+    const historianTurnTwoIsEnabled = (): boolean => sampleHistorian().turnTwo !== "off";
 
     // Three independent cache-busting signal sets, sourced from the
     // process-scoped LiveSessionState so RPC handlers (TUI recomp) can
@@ -494,6 +499,7 @@ export function createMagicContextHook(deps: MagicContextDeps) {
             })(),
             historianTwoPass: historianRun.twoPass,
             historianTurnTwo: historianRun.turnTwo,
+            historianTurnTwoIsEnabled,
             historianExpandTools: historianRun.expandTools,
             // Option C privacy gate: behavioral observation candidates are collected
             // during historian runs only when the user has SCHEDULED the
@@ -688,6 +694,7 @@ export function createMagicContextHook(deps: MagicContextDeps) {
         muralEnabled: deps.config.mural?.enabled === true,
         historianTwoPass: deps.config.historian?.two_pass === true,
         historianTurnTwo: deps.config.historian?.turn_two ?? "allowlist",
+        historianTurnTwoIsEnabled,
         historianExpandTools: deps.config.historian?.expand_tools,
         historianRunner: deps.config.historian?.runner,
         historianHostRunnerEnabled: deps.config.historian?.host_runner?.enabled,

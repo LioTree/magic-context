@@ -628,6 +628,9 @@ export interface TransformDeps {
     /** `historian.turn_two`, the memory-lifecycle off switch. Absent means
      *  "allowlist", the value the schema gives a configured historian block. */
     historianTurnTwo?: "allowlist" | "off";
+    /** Reads the switch again from current config; the runner asks after each
+     *  provider reply, so turning turn two off mid-flight revokes it. */
+    historianTurnTwoIsEnabled?: () => boolean;
     historianExpandTools?: Record<string, string | false>;
     liveModelBySession?: LiveModelBySession;
     /**
@@ -1951,6 +1954,7 @@ export function createTransform(deps: TransformDeps) {
                     experimentalTemporalAwareness: deps.experimentalTemporalAwareness,
                     historianTwoPass: historianRun?.twoPass ?? deps.historianTwoPass,
                     historianTurnTwo: deps.historianTurnTwo,
+                    historianTurnTwoIsEnabled: deps.historianTurnTwoIsEnabled,
                     historianExpandTools: historianRun?.expandTools ?? deps.historianExpandTools,
                     // Issue #44: gate historian-driven memory promotion so users
                     // who disable the feature actually see no memories created.
@@ -2643,6 +2647,7 @@ export function createTransform(deps: TransformDeps) {
             experimentalTemporalAwareness: deps.experimentalTemporalAwareness,
             historianTwoPass: historianRun?.twoPass ?? deps.historianTwoPass,
             historianTurnTwo: deps.historianTurnTwo,
+            historianTurnTwoIsEnabled: deps.historianTurnTwoIsEnabled,
             historianExpandTools: historianRun?.expandTools ?? deps.historianExpandTools,
             // Issue #44: forward memory gating so the normal historian path
             // (not just the recovery path above) honors memory.enabled and

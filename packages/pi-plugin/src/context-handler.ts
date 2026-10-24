@@ -1572,6 +1572,9 @@ export interface PiHistorianOptions {
 	twoPass?: boolean;
 	/** The `historian.turn_two` switch. Absent means "allowlist". */
 	turnTwo?: "allowlist" | "off";
+	/** Re-reads the switch from current config; the runner asks after each
+	 *  provider reply, so turning turn two off mid-flight revokes it. */
+	turnTwoIsEnabled?: () => boolean;
 	expandTools?: Record<string, string | false>;
 	/** Pi only: explicit thinking level for historian/compressor subagent
 	 *  invocations (passed as --thinking <level>). When unset, Pi's own
@@ -7632,6 +7635,7 @@ function spawnPiHistorianRun(args: {
 					maxOutputTokens: historian.maxOutputTokens,
 					twoPass: historian.twoPass,
 					turnTwo: historian.turnTwo,
+					turnTwoIsEnabled: historian.turnTwoIsEnabled,
 					allowlist: loadTurnTwoAllowlist(),
 					expandTools: historian.expandTools,
 					thinkingLevel: historian.thinkingLevel,

@@ -10,6 +10,11 @@
  */
 
 import { afterEach, beforeEach, describe, expect, it, spyOn } from "bun:test";
+import { mkdirSync, rmSync, writeFileSync } from "node:fs";
+import { tmpdir } from "node:os";
+import { join } from "node:path";
+import { historianRunConfig } from "@magic-context/core/config/live-run-config";
+import { LiveConfigReader } from "@magic-context/core/config/live-snapshot";
 import { acquireCompartmentLease } from "@magic-context/core/features/magic-context/compartment-lease";
 import { getCompartments } from "@magic-context/core/features/magic-context/compartment-storage";
 import { resolveProjectIdentity } from "@magic-context/core/features/magic-context/memory/project-identity";
@@ -19,6 +24,8 @@ import { closeDatabase } from "@magic-context/core/features/magic-context/storag
 import type { RawMessage } from "@magic-context/core/hooks/magic-context/read-session-raw";
 import { closeQuietly } from "@magic-context/core/shared/sqlite-helpers";
 import type { SubagentRunner } from "@magic-context/core/shared/subagent-runner";
+import { createTestTempDirFromPath } from "@magic-context/core/shared/test-temp-dir";
+import { loadPiConfigDetailed } from "./config";
 import {
 	awaitInFlightHistorians,
 	clearContextHandlerSession,
@@ -206,6 +213,51 @@ describe("a Pi firing selects turn two from the allowlist alone", () => {
 			expect(select([identity], "off")).toBe("dormant");
 		} finally {
 			closeQuietly(db);
+		}
+	});
+});
+
+describe("the Pi host re-reads the switch from its live reader while a reply is pending", () => {
+	it("the callback the handler passes follows a reload of the user config", () => {
+		const root = createTestTempDirFromPath(
+			join(tmpdir(), "mc-pi-live-switch-"),
+		);
+		const previousConfigHome = process.env.XDG_CONFIG_HOME;
+		try {
+			process.env.XDG_CONFIG_HOME = root;
+			const projectDir = join(root, "project");
+			mkdirSync(projectDir, { recursive: true });
+			const userDirectory = join(root, "cortexkit");
+			mkdirSync(userDirectory, { recursive: true });
+			const userFile = join(userDirectory, "magic-context.jsonc");
+			const write = (turnTwo: "allowlist" | "off") =>
+				writeFileSync(
+					userFile,
+					JSON.stringify({ historian: { turn_two: turnTwo } }),
+				);
+			write("allowlist");
+
+			const directory = projectDir;
+			const boot = loadPiConfigDetailed({ cwd: directory }, false).config;
+			const reader = new LiveConfigReader(
+				directory,
+				boot,
+				() => loadPiConfigDetailed({ cwd: directory }, false).config,
+				() => {},
+			);
+			reader.poll();
+			// This is the expression resolveContextOptionsForProject builds: it
+			// re-polls the project's reader and samples the switch again.
+			const turnTwoIsEnabled = () =>
+				historianRunConfig(boot, reader.poll().effective).historian
+					?.turn_two !== "off";
+			expect(turnTwoIsEnabled()).toBe(true);
+			write("off");
+			expect(turnTwoIsEnabled()).toBe(false);
+		} finally {
+			if (previousConfigHome === undefined) delete process.env.XDG_CONFIG_HOME;
+			else process.env.XDG_CONFIG_HOME = previousConfigHome;
+			rmSync(root, { recursive: true, force: true });
 		}
 	});
 });
