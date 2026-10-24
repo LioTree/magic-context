@@ -236,7 +236,12 @@ async function latestAssistantCompletion(sessionId: string): Promise<number | un
         }
     }
     if (h instanceof TestHarness) {
-        const response = await h.client.session.messages({ path: { id: sessionId } });
+        // The harness's SdkClient type lists only the calls it makes itself; the
+        // OpenCode SDK client it wraps also lists a session's messages.
+        const client = h.client as unknown as {
+            session: { messages(opts: { path: { id: string } }): Promise<{ data?: unknown }> };
+        };
+        const response = await client.session.messages({ path: { id: sessionId } });
         const messages = (response.data ?? []) as Array<{
             info: { role: string; time?: { completed?: number } };
         }>;
