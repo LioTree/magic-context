@@ -47,6 +47,19 @@ struct Trace {
     sends: Vec<RoutedChoice>,
 }
 
+struct LogWriter(Arc<Mutex<Vec<u8>>>);
+
+impl std::io::Write for LogWriter {
+    fn write(&mut self, bytes: &[u8]) -> std::io::Result<usize> {
+        self.0.lock().unwrap().extend_from_slice(bytes);
+        Ok(bytes.len())
+    }
+
+    fn flush(&mut self) -> std::io::Result<()> {
+        Ok(())
+    }
+}
+
 struct TestRoute {
     route: FakeRoute,
     project: String,
@@ -704,26 +717,182 @@ async fn pin_refusal_passes_through_without_local_model_fallback() {
 }
 
 #[tokio::test]
-async fn report_refusal_is_preserved_and_prevents_unaccounted_retry() {
+async fn completed_output_survives_report_refusal_and_report_retries_next_run() {
     let rig = Rig::new().await;
     let source = Refusal::new(
         RefusalCode::Other("new_report_refusal".into()),
         "unchanged message",
     );
     *rig.route.report_failure.lock().unwrap() = Some(source.clone());
-    let error = Engine::new(rig.clock.clone())
-        .run(
-            &catalog(),
-            &rig.order(),
-            &rig.runner(vec![failed("send_failed")]),
-        )
+    let mut engine = Engine::new(rig.clock.clone());
+    let done = engine
+        .run(&catalog(), &rig.order(), &rig.runner(vec![completed()]))
         .await
-        .unwrap_err();
-    assert_eq!(error.code, "mc_route_report_failed");
-    assert_eq!(error.source, Some(Box::new(source)));
+        .unwrap();
+    assert_eq!(done.output, "validated result");
+    assert_eq!(engine.pending_reports.len(), 1);
+    let pending = engine.pending_reports.front().unwrap();
+    assert_eq!(pending.provider, PROVIDER);
+    assert_eq!(pending.report, done.attempts[0].report);
+    assert_eq!(pending.source, source);
     assert_eq!(
         rig.route.trace.lock().unwrap().events,
         ["select", "send", "report"]
+    );
+    engine
+        .run(&catalog(), &rig.order(), &rig.runner(vec![completed()]))
+        .await
+        .unwrap();
+    assert!(engine.pending_reports.is_empty());
+    let trace = rig.route.trace.lock().unwrap();
+    assert_eq!(
+        trace.events,
+        ["select", "send", "report", "report", "select", "send", "report"]
+    );
+    assert_eq!(trace.reports[0], trace.reports[1]);
+}
+
+#[tokio::test]
+async fn failed_output_report_refusal_still_reselects_with_exclusion() {
+    let rig = Rig::new().await;
+    *rig.route.report_failure.lock().unwrap() = Some(Refusal::unknown_decision());
+    let mut engine = Engine::new(rig.clock.clone());
+    let done = engine
+        .run(
+            &catalog(),
+            &rig.order(),
+            &rig.runner(vec![failed("send_failed"), completed()]),
+        )
+        .await
+        .unwrap();
+    assert_eq!(done.output, "validated result");
+    assert_eq!(done.attempts.len(), 2);
+    assert_eq!(
+        done.attempts[0].report.runner_code.as_deref(),
+        Some("send_failed")
+    );
+    assert_eq!(engine.pending_reports.len(), 1);
+    assert_eq!(engine.pending_reports[0].report, done.attempts[0].report);
+    let trace = rig.route.trace.lock().unwrap();
+    assert_eq!(
+        trace.events,
+        ["select", "send", "report", "select", "send", "report"]
+    );
+    assert_eq!(
+        trace.selects[1]["exclude"],
+        json!(["example-provider/model-a"])
+    );
+    assert_eq!(trace.sends[1].route.model, "model-b");
+}
+
+#[tokio::test]
+async fn pending_reports_retry_only_with_the_original_provider() {
+    let rig = Rig::new().await;
+    *rig.route.report_failure.lock().unwrap() = Some(Refusal::unknown_decision());
+    let mut engine = Engine::new(rig.clock.clone());
+    engine
+        .run(&catalog(), &rig.order(), &rig.runner(vec![completed()]))
+        .await
+        .unwrap();
+    let mut order = rig.order();
+    order.max_decisions = 0;
+    let other_provider = RoutingCatalog {
+        generation: 2,
+        providers: vec!["another-routing-provider".into()],
+    };
+    let error = engine
+        .run(&other_provider, &order, &rig.runner(vec![]))
+        .await
+        .unwrap_err();
+    assert_eq!(error.code, "mc_route_exhausted");
+    assert_eq!(engine.pending_reports.len(), 1);
+    assert_eq!(rig.route.trace.lock().unwrap().reports.len(), 1);
+    let original_provider = RoutingCatalog {
+        generation: 3,
+        ..catalog()
+    };
+    engine
+        .run(
+            &original_provider,
+            &rig.order(),
+            &rig.runner(vec![completed()]),
+        )
+        .await
+        .unwrap();
+    assert!(engine.pending_reports.is_empty());
+    let trace = rig.route.trace.lock().unwrap();
+    assert_eq!(trace.reports[0], trace.reports[1]);
+}
+
+#[tokio::test]
+async fn pending_report_failures_log_once_and_queue_evicts_oldest_at_capacity() {
+    let logs = Arc::new(Mutex::new(Vec::new()));
+    let writer = logs.clone();
+    let subscriber = tracing_subscriber::fmt()
+        .with_writer(move || LogWriter(writer.clone()))
+        .with_ansi(false)
+        .without_time()
+        .finish();
+    let _guard = tracing::subscriber::set_default(subscriber);
+    let rig = Rig::new().await;
+    let source = Refusal::unknown_decision();
+    *rig.route.report_failure.lock().unwrap() = Some(source.clone());
+    let mut engine = Engine::new(rig.clock.clone());
+    let done = engine
+        .run(&catalog(), &rig.order(), &rig.runner(vec![completed()]))
+        .await
+        .unwrap();
+    let mut order = rig.order();
+    order.max_decisions = 0;
+    for _ in 0..2 {
+        *rig.route.report_failure.lock().unwrap() = Some(source.clone());
+        let error = engine
+            .run(&catalog(), &order, &rig.runner(vec![]))
+            .await
+            .unwrap_err();
+        assert_eq!(error.code, "mc_route_exhausted");
+    }
+    engine.queue_report(PROVIDER, done.attempts[0].report.clone(), source.clone());
+    assert_eq!(engine.pending_reports.len(), 1);
+    let trace = rig.route.trace.lock().unwrap();
+    assert_eq!(trace.reports.len(), 3);
+    assert!(trace
+        .reports
+        .iter()
+        .all(|report| report == &done.attempts[0].report));
+    drop(trace);
+    let text = String::from_utf8(logs.lock().unwrap().clone()).unwrap();
+    assert_eq!(
+        text.matches("model work report refused; queued for retry")
+            .count(),
+        1
+    );
+    for n in 1..=PENDING_REPORT_CAP {
+        engine.queue_report(
+            PROVIDER,
+            ReportRequest::new(format!("queued-{n}"), Outcome::Completed),
+            source.clone(),
+        );
+    }
+    assert_eq!(engine.pending_reports.len(), PENDING_REPORT_CAP);
+    assert_eq!(
+        engine.pending_reports.front().unwrap().report.decision_id,
+        "queued-1"
+    );
+    assert_eq!(
+        engine.pending_reports.back().unwrap().report.decision_id,
+        format!("queued-{PENDING_REPORT_CAP}")
+    );
+    let text = String::from_utf8(logs.lock().unwrap().clone()).unwrap();
+    assert_eq!(
+        text.matches("model work report refused; queued for retry")
+            .count(),
+        PENDING_REPORT_CAP + 1
+    );
+    assert_eq!(
+        text.matches("model work pending-report queue full; dropped oldest report")
+            .count(),
+        1
     );
 }
 

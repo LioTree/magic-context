@@ -2,9 +2,10 @@
 //!
 //! The scoped routing transport and runner lifecycle are injected. No live caller
 //! uses this engine yet; summary and dream adapters will supply those transports.
+// Remove the dead-code allowance when the first summary or dream caller lands.
 #![allow(dead_code)]
 
-use std::collections::HashMap;
+use std::collections::{HashMap, VecDeque};
 use std::future::Future;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
@@ -140,11 +141,22 @@ impl Clock for WallClock {
     }
 }
 
+/// Keep accounting retries small during a prolonged routing outage. Reports hold
+/// no model output; the oldest accounting entry is sacrificed before paid work.
+pub const PENDING_REPORT_CAP: usize = 64;
+
+struct PendingReport {
+    provider: String,
+    report: ReportRequest,
+    source: Refusal,
+}
+
 pub struct Engine<C = WallClock> {
     clock: C,
     provider: Option<(u64, Result<String, WorkError>)>,
     parked: HashMap<(String, String), WorkError>,
     misconfigured: HashMap<(String, String), (u64, WorkError)>,
+    pending_reports: VecDeque<PendingReport>,
 }
 
 impl<C: Clock> Engine<C> {
@@ -154,6 +166,7 @@ impl<C: Clock> Engine<C> {
             provider: None,
             parked: HashMap::new(),
             misconfigured: HashMap::new(),
+            pending_reports: VecDeque::new(),
         }
     }
 
@@ -176,6 +189,51 @@ impl<C: Clock> Engine<C> {
         result
     }
 
+    fn queue_report(&mut self, provider: &str, report: ReportRequest, source: Refusal) {
+        if self.pending_reports.iter().any(|pending| {
+            pending.provider == provider && pending.report.decision_id == report.decision_id
+        }) {
+            return;
+        }
+        tracing::warn!(
+            decision_id = %report.decision_id,
+            routing_provider = provider,
+            code = %source.code,
+            "model work report refused; queued for retry"
+        );
+        if self.pending_reports.len() == PENDING_REPORT_CAP {
+            let oldest = self
+                .pending_reports
+                .pop_front()
+                .expect("report queue is full");
+            tracing::warn!(
+                decision_id = %oldest.report.decision_id,
+                routing_provider = %oldest.provider,
+                "model work pending-report queue full; dropped oldest report"
+            );
+        }
+        self.pending_reports.push_back(PendingReport {
+            provider: provider.to_owned(),
+            report,
+            source,
+        });
+    }
+
+    async fn retry_pending_reports<S: ScopeRoute>(&mut self, provider: &str, scope: &S) {
+        let mut index = 0;
+        while index < self.pending_reports.len() {
+            let pending = &self.pending_reports[index];
+            // Reports are idempotent by decision id. Leave an unacknowledged
+            // entry in place across awaits, and log only its initial refusal.
+            if pending.provider == provider && scope.report(provider, &pending.report).await.is_ok()
+            {
+                self.pending_reports.remove(index);
+            } else {
+                index += 1;
+            }
+        }
+    }
+
     pub async fn run<S: ScopeRoute, R: Runner<S>>(
         &mut self,
         catalog: &RoutingCatalog,
@@ -183,6 +241,8 @@ impl<C: Clock> Engine<C> {
         runner: &R,
     ) -> Result<WorkDone<R::Output>, WorkError> {
         let provider = self.provider(catalog)?;
+        self.retry_pending_reports(&provider, order.scope_route)
+            .await;
         let key = (
             order.scope_route.project_key().to_owned(),
             order.consumer.clone(),
@@ -292,10 +352,7 @@ impl<C: Clock> Engine<C> {
                 report: report.clone(),
             });
             if let Err(source) = order.scope_route.report(&provider, &report).await {
-                let mut error = WorkError::new("mc_route_report_failed");
-                error.source = Some(Box::new(source));
-                error.attempts = attempts;
-                return Err(error);
+                self.queue_report(&provider, report, source);
             }
             if result.outcome == Outcome::Completed {
                 return Ok(WorkDone {
@@ -313,8 +370,8 @@ impl<C: Clock> Engine<C> {
                 error.attempts = attempts;
                 return Err(error);
             }
-            // Unknown outcomes are failures under routing/v1. Reporting them
-            // unchanged ends affinity before another placement is requested.
+            // Routing treats unknown outcomes as failures. Exclude the failed
+            // route even if routing has not acknowledged its report yet.
             exclude.push(choice.route.route_key());
         }
     }
