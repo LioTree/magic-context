@@ -405,6 +405,26 @@ impl McStore {
         )
     }
 
+    /// Remove a deferred cut from its still-private view. Once announced, the
+    /// version is immutable and this update must refuse rather than rewrite it.
+    pub fn revise_unannounced_async_compaction_view(
+        &self,
+        reference: &str,
+        version: u64,
+        view: &str,
+    ) -> Result<(), McStoreError> {
+        let changed = metered!(reference, self.inner.with_conn_fenced(held(|conn| {
+            let rows = conn.execute("UPDATE mc_async_compaction_views SET view_json=?3 WHERE session_ref=?1 AND version=?2 AND announced=0", params![reference, version, view])?;
+            Ok((rows, rows as u64, if rows > 0 { view.len() as u64 } else { 0 }))
+        })).map_err(McStoreError::from))?;
+        if changed != 1 {
+            return Err(McStoreError::Serde(
+                "async view is missing or already announced".into(),
+            ));
+        }
+        Ok(())
+    }
+
     pub fn load_async_compaction_view(
         &self,
         session_ref: &str,
@@ -717,6 +737,48 @@ mod tests {
             vec!["archived"]
         );
         assert!(store.load_async_undo_edits("another").unwrap().is_empty());
+    }
+
+    #[test]
+    fn only_an_unannounced_view_can_drop_a_deferred_cut() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = McStore::open(&StorageDescriptor {
+            module_id: "magic-context".into(),
+            storage_namespace: "mc_cache".into(),
+            isolation: Isolation::Module,
+            backend: StorageBackend::Sqlite {
+                path: dir.path().join("store.db").to_string_lossy().into_owned(),
+            },
+        })
+        .unwrap();
+        store
+            .async_compaction_save("ref", "key", "session", "{}")
+            .commit()
+            .unwrap();
+        store
+            .save_async_compaction_view("ref", 1, "with-cut", "engine")
+            .unwrap();
+        store
+            .revise_unannounced_async_compaction_view("ref", 1, "without-cut")
+            .unwrap();
+        assert_eq!(
+            store
+                .load_async_compaction_view("ref", 1)
+                .unwrap()
+                .as_deref(),
+            Some("without-cut")
+        );
+        store.mark_async_compaction_announced("ref", 1).unwrap();
+        assert!(store
+            .revise_unannounced_async_compaction_view("ref", 1, "rewritten")
+            .is_err());
+        assert_eq!(
+            store
+                .load_async_compaction_view("ref", 1)
+                .unwrap()
+                .as_deref(),
+            Some("without-cut")
+        );
     }
 
     fn entry(n: u64) -> (String, String) {

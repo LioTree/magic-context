@@ -28,6 +28,7 @@ struct Drive {
     window: historian_tail::InputWindow,
     codec: codec::Codec,
     echoes: reminder_echoes::ReminderEchoes,
+    cut_seed: Option<Arc<cut_seed::CutSeed>>,
     keep: usize,
     _guard: WrapupSessionGuard,
     permit: Arc<super::super::historian_budget::Permit>,
@@ -132,6 +133,7 @@ impl McHandler {
                 window: window.through(state.entries.last_key_value().map(|(ordinal, _)| *ordinal)),
                 codec: codec::Codec::from_params(&Value::Object(state.setup.params.clone()))?,
                 echoes: state.reminder_echoes.clone(),
+                cut_seed: state.cut_seed.clone(),
                 keep: keep.max(1),
                 _guard: guard,
                 permit,
@@ -181,6 +183,7 @@ impl McHandler {
         let window = drive.window;
         let codec = drive.codec;
         let echoes = drive.echoes.clone();
+        let cut_seed = drive.cut_seed.clone();
         let prepare = self.provider_historian_worker();
         let input_store = Arc::clone(&store);
         let binding = drive.binding.clone();
@@ -189,13 +192,16 @@ impl McHandler {
         let (parsed, projection, plan, project_path) = tokio::task::spawn_blocking(move || {
             // A blocking decoder can outlive its awaiting task during shutdown.
             let _permit = permit;
-            let projection = historian_tail::prepare_input(
+            let projection = historian_tail::prepare_cut_input(
                 &input_store,
                 &reference,
                 window,
                 codec,
                 &mut parsed,
                 &echoes,
+                cut_seed
+                    .as_ref()
+                    .and_then(|seed| seed.historian_prelude.as_ref()),
             )?;
             let messages = wrapup_boundary_messages(&parsed, &projection, &prepare.boundary_tokens);
             let end = input_store

@@ -19,6 +19,8 @@
 //! because it is long. Run them with `--ignored`.
 use super::*;
 
+#[path = "slice4_boundaries.rs"]
+mod slice4_boundaries;
 #[path = "slice4_guards.rs"]
 mod slice4_guards;
 use std::sync::atomic::Ordering::Relaxed;

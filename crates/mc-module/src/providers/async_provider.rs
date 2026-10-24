@@ -600,6 +600,9 @@ fn verified_descent(state: &State, header: &str) -> Option<u64> {
     let digest = fields.next()?;
     let through = fields.next()?.parse::<u64>().ok()?;
     let lineage = fields.next()?;
+    if through < state.lineage_first_ordinal.saturating_sub(1) {
+        return None;
+    }
     if state.lineage.as_deref() != Some(lineage) {
         return None;
     }
@@ -1849,6 +1852,11 @@ impl McHandler {
         };
         let reference = session_ref(&key.harness, &key.project.to_string_lossy(), &key.session);
         let existing = load_head(store, &reference)?;
+        let unsafe_existing = existing
+            .as_ref()
+            .map(|state| state.active_seed_is_unsafe(store))
+            .transpose()?
+            .unwrap_or(false);
         if request.descends_from.is_some() {
             return self
                 .setup_cut_descent(binding, &request, existing, store)
@@ -1856,7 +1864,7 @@ impl McHandler {
         }
         if let Some(old) = existing
             .as_ref()
-            .filter(|old| old.lineage != request.lineage_id)
+            .filter(|old| old.lineage != request.lineage_id || unsafe_existing)
         {
             self.authorize_async(binding, old)?;
             let generation = old
@@ -2279,6 +2287,12 @@ impl McHandler {
             .store
             .get()
             .ok_or_else(|| transient("store unavailable"))?;
+        if state.active_seed_is_unsafe(store)? {
+            return Err(error(
+                "unsafe_cut_seed",
+                "the stored head requires a fresh full lineage",
+            ));
+        }
         let model = state
             .conditions
             .as_ref()
@@ -2499,6 +2513,10 @@ impl McHandler {
                 format!("engine_input rows={}", template.messages.len()),
             );
         }
+        template.declared_trim = template
+            .logical_prefix
+            .as_ref()
+            .and_then(|prefix| prefix.declared_cut_trim());
         let output = if engine.last_applied.is_none() {
             transform::compaction::setup_with(store, &template, &context, status, engine, signed)
         } else {
@@ -2532,6 +2550,10 @@ impl McHandler {
                     |request, entries| codec.prepare_request_from(request, entries, source_from),
                 )?;
                 template.logical_prefix = fallback;
+                template.declared_trim = template
+                    .logical_prefix
+                    .as_ref()
+                    .and_then(|prefix| prefix.declared_cut_trim());
                 if engine.last_applied.is_none() {
                     transform::compaction::setup_with(
                         store, &template, &context, status, engine, signed,
@@ -3437,7 +3459,12 @@ impl McHandler {
                         state
                             .published_cuts
                             .get(&(cut.through_ordinal + 1))
-                            .is_none_or(|held| held.version != version)
+                            .is_none_or(|held| {
+                                held.version != version
+                                    || held
+                                        .covered_through
+                                        .is_none_or(|end| end > cut.through_ordinal)
+                            })
                     })
             }) {
                 continue;
@@ -3548,6 +3575,12 @@ impl McHandler {
         state = self
             .checkout(store, &notice.session_ref)?
             .ok_or_else(|| transient("async session disappeared"))?;
+        if state.active_seed_is_unsafe(store)? {
+            return Err(error(
+                "unsafe_cut_seed",
+                "the stored head requires a fresh full lineage",
+            ));
+        }
         if notice
             .first_ordinal
             .is_some_and(|first| first > state.lineage_first_ordinal)
@@ -4272,6 +4305,24 @@ impl McHandler {
             .ok_or_else(|| transient("store unavailable"))?;
         state.cleanup_pending_cut_stage(store)?;
         state.forward_parent_history(store)?;
+        let mut history = store
+            .load_compartments(&state.namespace())
+            .map_err(transient)?;
+        let before = history
+            .iter()
+            .map(|c| (c.sequence, c.start_message, c.end_message))
+            .collect::<Vec<_>>();
+        state.repair_cut_history(store, &mut history, None)?;
+        if before
+            != history
+                .iter()
+                .map(|c| (c.sequence, c.start_message, c.end_message))
+                .collect::<Vec<_>>()
+        {
+            store
+                .replace_compartments(&state.namespace(), &history)
+                .map_err(transient)?;
+        }
         let headers = state
             .conditions
             .as_ref()
@@ -4498,12 +4549,7 @@ impl McHandler {
         // a removed message that may follow them.
         state.fold_entries(codec, None)?;
         let cut_first = coverage
-            .and_then(|through| {
-                state
-                    .aggregates
-                    .historian_input
-                    .restart_at_or_below(through)
-            })
+            .and_then(|through| through.checked_add(1))
             .filter(|first| *first > state.lineage_first_ordinal);
         if let Some(first) = cut_first {
             if let Some(signature) = crate::tail_hygiene::signature::SignaturePrefix::capture(
@@ -4538,7 +4584,7 @@ impl McHandler {
         if let Some(first) = cut_first {
             view = view.with_cut(view::ViewCut::new(format!("v{version}"), first - 1));
         }
-        let view = match checked_async_view(view, codec, &kept)? {
+        let mut view = match checked_async_view(view, codec, &kept)? {
             Ok(view) => view,
             Err(splits) => {
                 // Defence in depth: publish nothing on this pass, exactly as
@@ -4581,13 +4627,31 @@ impl McHandler {
             .map_err(transient)?;
         state.published_engine.insert(
             version,
-            EngineView::with_json(&candidate, engine_json).with_frozen_edits(frozen_edits),
+            EngineView::with_json(&candidate, Arc::clone(&engine_json))
+                .with_frozen_edits(frozen_edits),
         );
         // The produced baseline is this published view; adopting after the
         // insert shares its serialized form instead of serializing it again.
         state.adopt_engine(engine)?;
         if let Some(first) = cut_first {
             state.keep_published_cut(store, codec, first, &view)?;
+            if state
+                .published_cuts
+                .get(&first)
+                .is_none_or(|cut| cut.version != version)
+            {
+                // A bounded prelude or another cut guard may defer the marker.
+                // The unannounced view still publishes; only the cut is removed.
+                view.cut = None;
+                view.digest = view.compute_digest();
+                store
+                    .revise_unannounced_async_compaction_view(
+                        &state.reference(),
+                        version,
+                        &serde_json::to_string(&view).map_err(transient)?,
+                    )
+                    .map_err(transient)?;
+            }
         }
         Ok(Some(view))
     }
@@ -4608,6 +4672,11 @@ impl McHandler {
             );
         };
         self.authorize_async(binding, &state)?;
+        if state.active_seed_is_unsafe(store)? {
+            return bytes(
+                &json!({"answer":"refuse","code":"unsafe_cut_seed","reason":"Set up a fresh full lineage before reading views."}),
+            );
+        }
         match store
             .load_async_compaction_view(&request.session_ref, request.view_version)
             .map_err(transient)?
@@ -5023,6 +5092,7 @@ impl McHandler {
         let settings = self.historian_settings_loader()(&state.key.project);
         let harness = state.key.harness.clone();
         let reminder_echoes = state.reminder_echoes.clone();
+        let historian_seed = state.cut_seed.clone();
         #[cfg(test)]
         let inflight = {
             struct Inflight(Arc<std::sync::atomic::AtomicU64>);
@@ -5050,13 +5120,16 @@ impl McHandler {
             parsed.historian_model_limits = configured.model_limits;
             let prepare = worker.clone();
             let result = tokio::task::spawn_blocking(move || {
-                let projection = historian_tail::prepare_input(
+                let projection = historian_tail::prepare_cut_input(
                     &store,
                     &reference_for_rows,
                     from.through(through),
                     codec,
                     &mut parsed,
                     &reminder_echoes,
+                    historian_seed
+                        .as_ref()
+                        .and_then(|seed| seed.historian_prelude.as_ref()),
                 )?;
                 let mut timings = HistorianTriggerTimings::default();
                 Ok::<_, HandlerOutcome>(prepare.prepare_historian_fire(

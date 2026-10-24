@@ -411,6 +411,37 @@ impl LogicalPrefix {
         self.cut_max_tag.is_some()
     }
 
+    pub(crate) fn certifies_omitted_boundary(
+        &self,
+        core: &CoreState,
+        meta: &ModuleMeta,
+        first_window_ordinal: Option<u64>,
+    ) -> bool {
+        self.is_cut()
+            && self.coverage.checked_add(1) == Some(self.tail_from)
+            && meta.coverage_ordinal == Some(self.coverage)
+            && meta.revert_epoch == self.revert_epoch
+            && !self.boundary.is_empty()
+            && core.boundary_id == self.boundary
+            && first_window_ordinal == Some(self.tail_from)
+    }
+
+    pub(crate) fn declared_cut_trim(&self) -> Option<DeclaredTrim> {
+        if !self.is_cut()
+            || self.coverage.checked_add(1) != Some(self.tail_from)
+            || self.boundary.is_empty()
+        {
+            return None;
+        }
+        Some(DeclaredTrim {
+            flat_boundary_id: self.boundary.clone(),
+            boundary_bare_message_id: split_block_id(&self.boundary)
+                .map_or_else(|| self.boundary.clone(), |(mid, _)| mid.to_owned()),
+            boundary_absolute_ordinal: self.coverage,
+            next_absolute_ordinal: self.tail_from,
+        })
+    }
+
     /// The protected tool-tag rows this certificate recorded, with the floor
     /// and calibration ratio they were computed at.
     // Only cut capture and pruning (`cut_seed`) call this; only tests drive them so far.

@@ -1821,13 +1821,8 @@ async fn covered_tail_latency_benchmark() {
             state.fold_entries(codec, None).unwrap();
             let first = meta
                 .coverage_ordinal
-                .and_then(|coverage| {
-                    state
-                        .aggregates
-                        .historian_input
-                        .restart_at_or_below(coverage)
-                })
-                .expect("a restart point at or below coverage");
+                .and_then(|coverage| coverage.checked_add(1))
+                .expect("a boundary after covered history");
             let seed = state
                 .capture_cut_seed(rig.store(), codec, first)
                 .unwrap()

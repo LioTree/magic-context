@@ -106,6 +106,10 @@ async fn m04_pending_parent_history_prevents_skip() {
     let loaded = store.load_meta(&state.namespace()).unwrap();
     let mut meta = loaded.meta;
     meta.reasoning_clear_initialized = true;
+    meta.emergency_drain_active = false;
+    if let Some(policy) = &mut state.usage_policy {
+        policy.emergency_recovery_armed = false;
+    }
     store
         .commit_meta(&state.namespace(), loaded.row_version, &meta)
         .unwrap();
@@ -325,12 +329,17 @@ async fn m13_repeated_descent_returns_the_original_head() {
 
 #[tokio::test]
 async fn m14_capture_requires_a_historian_restart() {
-    let (pair, _) = uncut().await;
+    let (pair, first) = uncut().await;
     let mut state = held(&pair);
     let codec = codec_of(&state);
+    state.fold_entries(codec, None).unwrap();
+    let count = state.aggregates.historian_input.count();
+    // A persisted floor alone does not prove that the prelude begins at a
+    // historian restart; the indexed source must certify that position.
+    state.aggregates.historian_input = historian_tail::InputIndex::seeded(first - 4, count);
     assert_eq!(
         state
-            .capture_cut_seed(pair.resident.store(), codec, 96)
+            .capture_cut_seed(pair.resident.store(), codec, first)
             .unwrap()
             .unwrap_err(),
         cut_seed::CaptureRefusal::NotAtRestartPoint

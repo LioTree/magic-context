@@ -746,11 +746,17 @@ impl Pair {
         let mut entries = self.transcript.entries.lock().unwrap();
         let next = entries.last().map_or(0, |entry| entry.ordinal + 1);
         let mut review = self.review.borrow_mut();
-        entries.extend((next..next + count).map(|n| {
-            review
+        for n in next..next + count {
+            let mut entry = review
                 .message(self.profile, n, salt)
-                .unwrap_or_else(|| message(self.profile, n, salt))
-        }));
+                .unwrap_or_else(|| message(self.profile, n, salt));
+            if self.profile == Profile::Pi {
+                if let Some(parent) = entries.last() {
+                    entry.message["parentId"] = json!(parent.mid);
+                }
+            }
+            entries.push(entry);
+        }
     }
 
     /// Run `op` on both sides, require identical answers and stores, and

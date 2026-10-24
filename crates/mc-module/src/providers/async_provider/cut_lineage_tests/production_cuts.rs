@@ -49,9 +49,11 @@ fn verify_passes(pair: &Pair, seed: u64) -> usize {
 }
 
 async fn descend_pair(pair: &mut Pair, first: u64, child: &str) {
+    for side in [&pair.resident, &pair.oracle] {
+        assert_published_cut_support(side, &pair.reference);
+    }
     let full = load(pair.oracle.store(), &pair.reference).unwrap().unwrap();
     let codec = codec::Codec::from_params(&Value::Object(full.setup.params.clone())).unwrap();
-    let rows = tag_rows(&full, codec).unwrap();
     let mut request = serde_json::to_value(&full.setup).unwrap();
     request["lineage_id"] = json!(child);
     request["descends_from"] = json!({"lineage_id":full.lineage,"through_ordinal":first - 1});
@@ -81,7 +83,12 @@ async fn descend_pair(pair: &mut Pair, first: u64, child: &str) {
         .checkout(store, &pair.reference)
         .unwrap()
         .unwrap();
-    oracle.entries = full.entries;
+    // Restore only the immutable prefix on the full-input reference. Each
+    // side independently adopted its own staged live-window snapshot; newer
+    // parent rows are read after Setup, not silently copied from the future.
+    for (ordinal, entry) in full.entries.range(..first) {
+        oracle.entries.insert(*ordinal, Arc::clone(entry));
+    }
     oracle.cut_seed = None;
     oracle.cut_first_ordinal = None;
     oracle.logical_prefix = None;
@@ -93,6 +100,7 @@ async fn descend_pair(pair: &mut Pair, first: u64, child: &str) {
     oracle.journal.persisted_through = None;
     oracle.journal.indexed_through = None;
     oracle.journal.truncate = Some(None);
+    let rows = tag_rows(&oracle, codec).unwrap();
     oracle.save(store, &rows).unwrap();
     pair.oracle.h.checkin(oracle);
     let held = load(pair.resident.store(), &pair.reference)

@@ -5,6 +5,8 @@ use super::*;
 pub(super) struct PublishedCut {
     pub(super) lineage: String,
     pub(super) version: u64,
+    #[serde(default)]
+    pub(super) covered_through: Option<u64>,
     pub(super) generation: u64,
     head: String,
     #[serde(default)]
@@ -48,6 +50,20 @@ pub(super) fn split_head_at(ranges: &mut Vec<view::ViewRange>, first: u64) {
 }
 
 impl AsyncRecord {
+    pub(super) fn active_seed_is_unsafe(&self, store: &McStore) -> Result<bool, HandlerOutcome> {
+        let Some(first) = self.cut_first_ordinal else {
+            return Ok(false);
+        };
+        if let Some(seed) = &self.cut_seed {
+            return Ok(!seed.boundary_safe());
+        }
+        Ok(store
+            .load_async_compaction_baseline(&self.reference(), &cut_seed::CutSeed::slot(first))
+            .map_err(transient)?
+            .and_then(|raw| serde_json::from_str::<cut_seed::CutSeed>(&raw).ok())
+            .is_none_or(|seed| !seed.boundary_safe()))
+    }
+
     pub(super) fn cleanup_retired_cut_stages(
         &mut self,
         store: &McStore,
@@ -80,6 +96,12 @@ impl AsyncRecord {
         store: &McStore,
     ) -> Result<Option<Arc<cut_seed::CutSeed>>, HandlerOutcome> {
         if let Some(seed) = &self.cut_seed {
+            if !seed.boundary_safe() {
+                return Err(error(
+                    "unsafe_cut_seed",
+                    "the stored head requires a fresh full lineage",
+                ));
+            }
             return Ok(Some(Arc::clone(seed)));
         }
         if self.lineage_first_ordinal == 0 {
@@ -235,6 +257,9 @@ impl AsyncRecord {
                 return Ok(());
             }
         };
+        if !seed.boundary_safe() {
+            return Ok(());
+        }
         // The new lineage adopts this published view, not a parent's older
         // applied view. Its candidate must satisfy the same pruning guard;
         // parent views remain available only on the parent until descent.
@@ -320,6 +345,7 @@ impl AsyncRecord {
             PublishedCut {
                 lineage: view.lineage_id.clone(),
                 version: view.view_version,
+                covered_through: seed.summary_end(),
                 generation,
                 head: serde_json::to_string(&head).map_err(transient)?,
                 parent_namespace: self.namespace(),
@@ -340,7 +366,60 @@ impl AsyncRecord {
             ));
         }
         self.pending_cut_seeds.insert(first, seed);
+        #[cfg(test)]
+        measurements::staged(store);
         Ok(())
+    }
+}
+
+#[cfg(test)]
+pub(super) mod measurements {
+    use super::*;
+    #[derive(Clone, Copy, Debug, Default)]
+    pub(crate) struct Stats {
+        pub max_prelude_bytes: usize,
+        pub largest_deferred_bytes: usize,
+        pub deferred_cuts: u64,
+        pub staged_cuts: u64,
+    }
+    fn rows() -> &'static Mutex<BTreeMap<usize, Stats>> {
+        static ROWS: OnceLock<Mutex<BTreeMap<usize, Stats>>> = OnceLock::new();
+        ROWS.get_or_init(|| Mutex::new(BTreeMap::new()))
+    }
+    pub(crate) fn prelude(store: &McStore, bytes: usize, deferred: bool) {
+        let mut rows = rows().lock().unwrap();
+        let stats = rows.entry(store as *const McStore as usize).or_default();
+        if deferred {
+            stats.deferred_cuts += 1;
+            stats.largest_deferred_bytes = stats.largest_deferred_bytes.max(bytes);
+        } else {
+            stats.max_prelude_bytes = stats.max_prelude_bytes.max(bytes);
+        }
+    }
+    pub(crate) fn staged(store: &McStore) {
+        rows()
+            .lock()
+            .unwrap()
+            .entry(store as *const McStore as usize)
+            .or_default()
+            .staged_cuts += 1;
+    }
+    pub(crate) fn take(store: &McStore) -> Stats {
+        rows()
+            .lock()
+            .unwrap()
+            .remove(&(store as *const McStore as usize))
+            .unwrap_or_default()
+    }
+    impl Stats {
+        pub(crate) fn merge(&mut self, other: Self) {
+            self.max_prelude_bytes = self.max_prelude_bytes.max(other.max_prelude_bytes);
+            self.largest_deferred_bytes = self
+                .largest_deferred_bytes
+                .max(other.largest_deferred_bytes);
+            self.deferred_cuts += other.deferred_cuts;
+            self.staged_cuts += other.staged_cuts;
+        }
     }
 }
 
@@ -371,6 +450,13 @@ impl McHandler {
         }
         if state.setup.descends_from == request.descends_from && state.lineage == request.lineage_id
         {
+            if state.active_seed_is_unsafe(store)? {
+                return bytes(&compact::setup::SetupAnswer::refuse(
+                    &request.request_id,
+                    compact::errors::RefuseCode::from_code("unsafe_cut_seed"),
+                    "The stored head depends on rows outside its cut. Set up a fresh full lineage.",
+                ));
+            }
             let mut answer = state.initial;
             answer["request_id"] = json!(request.request_id);
             return bytes(&with_checkpoint(answer, None));
@@ -397,13 +483,16 @@ impl McHandler {
             return unknown();
         };
         let seed: cut_seed::CutSeed = serde_json::from_str(&raw).map_err(transient)?;
-        // A cut may be prepared before the parent appends more messages. Those
-        // rows are already held by the provider, but were not in the staged
-        // tag namespace. Copy only tags allocated after the staged high-water
-        // mark; never reread transcript history.
-        let inherited_tags = store
-            .load_tags_after(&cut.parent_namespace, cut.tag_high_water)
-            .map_err(transient)?;
+        if !seed.boundary_safe() {
+            return bytes(&compact::setup::SetupAnswer::refuse(
+                &request.request_id,
+                compact::errors::RefuseCode::from_code("unsafe_cut_seed"),
+                "The stored head depends on rows outside its cut. Set up a fresh full lineage.",
+            ));
+        }
+        // A saved stage is immutable. A descendant gets its own namespace and
+        // reads the live window on its next notice, so an undo cannot inherit
+        // the parent's removed window rows or tag identities.
         if let Some(edits) = store
             .load_async_compaction_baseline(&state.reference(), "frozen_edits")
             .map_err(transient)?
@@ -429,10 +518,27 @@ impl McHandler {
             ));
         }
         state.lineage = request.lineage_id.clone();
-        state.generation = cut.generation;
+        state.generation = state
+            .published_cuts
+            .values()
+            .map(|cut| cut.generation)
+            .fold(state.generation, u64::max)
+            .checked_add(1)
+            .ok_or_else(|| transient("async generation exhausted"))?;
         state.lineage_first_ordinal = first;
         state.journal = Journal::new_record();
+        state.journal.truncate = Some(None);
         state.journal.truncate_below = Some(first);
+        let namespace = state.namespace();
+        store
+            .replace_compartments(&namespace, &seed.recovery_history)
+            .map_err(transient)?;
+        store
+            .adopt_compartment_history_identity(
+                &format!("{}:async:{}", state.key.engine_key(), cut.generation),
+                &namespace,
+            )
+            .map_err(transient)?;
         state.begin_at_cut(store, seed, cut_seed::CutStart::Descending)?;
         let mut engine = state.engine_with_baselines()?;
         for view in [&mut engine.last_produced, &mut engine.last_applied]
@@ -475,7 +581,7 @@ impl McHandler {
         }
         state.initial = serde_json::to_value(answer).map_err(transient)?;
         state.initial["serializer_profile"] = json!(codec.wire_id());
-        state.save(store, &inherited_tags)?;
+        state.save(store, &[])?;
         self.provider_store
             .async_runtime
             .resident

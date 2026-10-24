@@ -268,13 +268,17 @@ fn historian_input(side: &Side, reference: &str) -> String {
     .unwrap();
     let through = state.entries.last_key_value().map(|(n, _)| *n);
     let mut parsed = side.h.async_historian_request(&state).unwrap();
-    historian_tail::prepare_input(
+    historian_tail::prepare_cut_input(
         store,
         reference,
         window.through(through),
         codec,
         &mut parsed,
         &state.reminder_echoes,
+        state
+            .cut_seed
+            .as_ref()
+            .and_then(|seed| seed.historian_prelude.as_ref()),
     )
     .unwrap();
     format!(
@@ -283,11 +287,61 @@ fn historian_input(side: &Side, reference: &str) -> String {
     )
 }
 
+fn assert_published_cut_support(side: &Side, reference: &str) {
+    static SUMMARY: OnceLock<regex::Regex> = OnceLock::new();
+    let summary = SUMMARY.get_or_init(|| regex::Regex::new(r"summary through (\d+)").unwrap());
+    for (_, raw, engine, _) in side
+        .store()
+        .load_async_compaction_views(reference)
+        .unwrap()
+        .0
+    {
+        let view: view::CompactionView = serde_json::from_str(&raw).unwrap();
+        let Some(cut) = &view.cut else {
+            continue;
+        };
+        if let Some(engine) = engine {
+            let engine: Value = serde_json::from_str(&engine).unwrap();
+            if let Some(covered) = engine["history_through"].as_u64() {
+                assert!(
+                    covered <= cut.through_ordinal,
+                    "view {}: C={covered} exceeds P={}",
+                    view.view_version,
+                    cut.through_ordinal
+                );
+            }
+        }
+        let mut observed = 0;
+        for range in &view.ranges {
+            if let view::ViewRange::Replace { bytes, .. } = range {
+                for capture in summary.captures_iter(bytes) {
+                    let end = capture[1].parse::<u64>().unwrap();
+                    assert!(
+                        end <= cut.through_ordinal,
+                        "view {} serves summary through {end} beyond cut {}",
+                        view.view_version,
+                        cut.through_ordinal
+                    );
+                    observed += 1;
+                }
+            }
+        }
+        assert!(
+            observed > 0,
+            "cut view {} must actually render its summary",
+            view.view_version
+        );
+    }
+}
+
 impl Pair {
     /// After a step: nothing read below the cut, and the historian input and
     /// the engine state compared (`both` already compared views, answers,
     /// decisions and sends).
     fn check_cut(&self, first: u64) {
+        for side in [&self.resident, &self.oracle] {
+            assert_published_cut_support(side, &self.reference);
+        }
         if std::env::var_os("MC_CUT_TRACE").is_some() {
             // `replay_cut_session` prints the state instead.
             return;
@@ -516,12 +570,7 @@ async fn cut_session_start(
             .unwrap()
             .meta
             .coverage_ordinal;
-        let first = coverage.and_then(|coverage| {
-            state
-                .aggregates
-                .historian_input
-                .restart_at_or_below(coverage.min(history_end))
-        });
+        let first = coverage.and_then(|coverage| coverage.checked_add(1));
         if let Some(first) = first.filter(|first| *first > 0) {
             break (codec, first);
         }
@@ -952,12 +1001,7 @@ async fn covered_pair(profile: Profile, number: u64) -> (Pair, Rng, u64) {
         let codec = codec::Codec::from_params(&Value::Object(state.setup.params.clone())).unwrap();
         state.fold_entries(codec, None).unwrap();
         if let Some(first) = coverage
-            .and_then(|coverage| {
-                state
-                    .aggregates
-                    .historian_input
-                    .restart_at_or_below(coverage)
-            })
+            .and_then(|coverage| coverage.checked_add(1))
             .filter(|first| *first > 0)
         {
             return (pair, rng, first);

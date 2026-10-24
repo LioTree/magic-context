@@ -61,6 +61,16 @@ impl InputIndex {
         }
     }
 
+    pub(super) fn seed_prelude(&mut self, from: u64, ordinal_base: u64, reset_next: bool) {
+        self.keep_prelude_start(from, ordinal_base);
+        self.reset_next = reset_next;
+    }
+
+    pub(super) fn keep_prelude_start(&mut self, from: u64, ordinal_base: u64) {
+        self.starts.insert(from, ordinal_base);
+        self.floor = Some((from, ordinal_base));
+    }
+
     /// Messages indexed so far, including any a seed stands for.
     // Only cut capture and pruning (`cut_seed`) call this; only tests drive them so far.
     #[cfg_attr(not(test), allow(dead_code))]
@@ -93,8 +103,8 @@ impl InputIndex {
 
 #[derive(Clone, Copy, Default)]
 pub(super) struct InputWindow {
-    from: u64,
-    ordinal_base: u64,
+    pub(super) from: u64,
+    pub(super) ordinal_base: u64,
     through: Option<u64>,
 }
 
@@ -117,6 +127,7 @@ pub(super) fn applied_window(
     Ok((coverage, index.window(coverage)))
 }
 
+#[cfg(test)]
 pub(super) fn prepare_input(
     store: &McStore,
     reference: &str,
@@ -125,18 +136,42 @@ pub(super) fn prepare_input(
     parsed: &mut TransformRequest,
     echoes: &reminder_echoes::ReminderEchoes,
 ) -> Result<ck_wire::FlatProjection, HandlerOutcome> {
+    prepare_cut_input(store, reference, window, codec, parsed, echoes, None)
+}
+
+pub(super) fn prepare_cut_input(
+    store: &McStore,
+    reference: &str,
+    window: InputWindow,
+    codec: codec::Codec,
+    parsed: &mut TransformRequest,
+    echoes: &reminder_echoes::ReminderEchoes,
+    prelude: Option<&cut_seed::HistorianPrelude>,
+) -> Result<ck_wire::FlatProjection, HandlerOutcome> {
+    let live_from = prelude
+        .and_then(|p| p.messages.last())
+        .map_or(0, |m| m.ordinal.saturating_add(1));
     let rows = match window.through {
         Some(through) => store
-            .load_async_compaction_entries_range(reference, window.from, through)
+            .load_async_compaction_entries_range(reference, window.from.max(live_from), through)
             .map_err(transient)?,
         None => Vec::new(),
     };
     #[cfg(test)]
     DECODED_ROWS.with(|count| count.set(count.get() + rows.len()));
-    let messages = rows
+    let mut messages = prelude
         .into_iter()
-        .map(|(_, raw)| HeldEntry::from_stored(raw)?.inbound())
-        .collect::<Result<Vec<_>, _>>()?;
+        .flat_map(|p| &p.messages)
+        .filter(|m| {
+            m.ordinal >= window.from && window.through.is_some_and(|through| m.ordinal <= through)
+        })
+        .cloned()
+        .collect::<Vec<_>>();
+    messages.extend(
+        rows.into_iter()
+            .map(|(_, raw)| HeldEntry::from_stored(raw)?.inbound())
+            .collect::<Result<Vec<_>, _>>()?,
+    );
     echoes.prepare_with(codec, parsed, &messages, true, |parsed, messages| {
         codec.prepare_request(parsed, messages)?;
         if codec == codec::Codec::Pi {

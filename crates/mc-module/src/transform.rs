@@ -11849,6 +11849,29 @@ fn resolve_boundary_state(
         return Ok((BoundaryState::LivePresent, None));
     }
 
+    if req.logical_prefix.as_ref().is_some_and(|prefix| {
+        prefix.certifies_omitted_boundary(
+            core,
+            meta,
+            req.messages
+                .iter()
+                .filter(|message| {
+                    message.ordinal >= prefix.tail_from
+                        && !message.ck.meta.synthetic
+                        && message.ck.role != "system"
+                })
+                .map(|message| message.ordinal)
+                .min(),
+        )
+    }) {
+        // The validated cut certificate binds the closed summary prefix to
+        // this boundary. No source row at or below the cut is live input, so
+        // its absence is a certified trim, not a transcript revert. This lets
+        // a rebuild compose its head without feeding historian-prelude text
+        // into the model request.
+        return Ok((BoundaryState::DeclaredTrimValidated, None));
+    }
+
     let Some(declared) = req.declared_trim.as_ref() else {
         return Ok((BoundaryState::Absent, None));
     };
