@@ -402,8 +402,7 @@ impl<C: Clock> Engine<C> {
                 hold_ok: order.hold_ok,
             };
             let selected =
-                tokio::time::timeout(remaining, order.scope_route.select(&provider, &params))
-                    .await;
+                tokio::time::timeout(remaining, order.scope_route.select(&provider, &params)).await;
             let choice = match selected {
                 Ok(Ok(choice)) => choice,
                 Ok(Err(source)) => {

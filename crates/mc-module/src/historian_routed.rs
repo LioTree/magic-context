@@ -188,7 +188,9 @@ pub(crate) async fn run_routed_summary(
 ) -> Result<HistorianDriveOutcome, HistorianDriveError> {
     let catalog = match summary.routing.catalog().await {
         Ok(catalog) => catalog,
-        Err(detail) => return refuse_without_send(&summary, "mc_routing_unavailable", &detail, None),
+        Err(detail) => {
+            return refuse_without_send(&summary, "mc_routing_unavailable", &detail, None)
+        }
     };
     if catalog.providers.is_empty() {
         return refuse_without_send(
@@ -286,9 +288,11 @@ fn summary_work_order<'a>(
         consumer: frozen.consumer.clone(),
         requirements,
         pin: None,
+        // One key per conversation lineage, so successive summaries of one
+        // session prefer the model that served the previous one.
         affinity: bounded(format!(
             "{}:{}:{lineage}",
-            frozen.consumer, route.project_key
+            frozen.consumer, summary.project_slug
         )),
         concurrency_slots: None,
         // The drive bounds each attempt by its own timeout, so the work
@@ -467,7 +471,13 @@ fn render_frozen(
     let route = persona.routing();
     let render_digest = rendered.digest.hex();
     Ok(FrozenSummaryPersona {
-        identity: frozen_identity(&render_digest, temperature, &route.consumer, route.iq, route.eq),
+        identity: frozen_identity(
+            &render_digest,
+            temperature,
+            &route.consumer,
+            route.iq,
+            route.eq,
+        ),
         render_digest,
         bytes: rendered.text,
         temperature,
@@ -573,11 +583,15 @@ impl<'s> Runner<RoutedScope<'s>> for SummaryRunner<'_> {
                 0,
             )
             .await;
-            let usage = recording.last.as_ref().and_then(|output| output.usage).map(|usage| Usage {
-                input_tokens: usage.input,
-                output_tokens: usage.output,
-                cost_usd: None,
-            });
+            let usage = recording
+                .last
+                .as_ref()
+                .and_then(|output| output.usage)
+                .map(|usage| Usage {
+                    input_tokens: usage.input,
+                    output_tokens: usage.output,
+                    cost_usd: None,
+                });
             match result {
                 Ok(HistorianDriveOutcome::Completed(success)) => {
                     let mut result = RunResult::new(Outcome::Completed, Some(success));
@@ -767,7 +781,10 @@ impl HistorianProducerDriver for Recording<'_> {
         run_id: &str,
         timeout: Duration,
     ) -> Result<ProducerOutput, HistorianProducerError> {
-        let output = self.inner.redrain_output_with_timeout(run_id, timeout).await;
+        let output = self
+            .inner
+            .redrain_output_with_timeout(run_id, timeout)
+            .await;
         self.seen(output)
     }
     async fn status(&mut self, run_id: &str) -> Result<RunState, HistorianProducerError> {
@@ -804,9 +821,10 @@ impl SubcSummaryRouting {
         method: &str,
         params: serde_json::Value,
     ) -> Result<T, Refusal> {
-        use subc_client_rs::{CallError, CallOptions, CloseRouteOptions, ConsumerOptions, SubcConsumer};
-        let unavailable =
-            |detail: String| Refusal::new(RefusalCode::RoutingUnavailable, detail);
+        use subc_client_rs::{
+            CallError, CallOptions, CloseRouteOptions, ConsumerOptions, SubcConsumer,
+        };
+        let unavailable = |detail: String| Refusal::new(RefusalCode::RoutingUnavailable, detail);
         let options = ConsumerOptions {
             handshake_timeout: ROUTING_CALL_TIMEOUT,
             call_timeout: ROUTING_CALL_TIMEOUT,
@@ -910,8 +928,13 @@ impl SummaryRouting for SubcSummaryRouting {
     ) -> Result<RoutedChoice, Refusal> {
         let params = serde_json::to_value(params)
             .map_err(|error| Refusal::new(RefusalCode::RoutingUnavailable, error.to_string()))?;
-        self.call(provider, scope, cortexkit_role_routing::ops::ROUTE_SELECT, params)
-            .await
+        self.call(
+            provider,
+            scope,
+            cortexkit_role_routing::ops::ROUTE_SELECT,
+            params,
+        )
+        .await
     }
 
     async fn report(
@@ -922,8 +945,13 @@ impl SummaryRouting for SubcSummaryRouting {
     ) -> Result<ReportAnswer, Refusal> {
         let params = serde_json::to_value(report)
             .map_err(|error| Refusal::new(RefusalCode::RoutingUnavailable, error.to_string()))?;
-        self.call(provider, scope, cortexkit_role_routing::ops::ROUTE_REPORT, params)
-            .await
+        self.call(
+            provider,
+            scope,
+            cortexkit_role_routing::ops::ROUTE_REPORT,
+            params,
+        )
+        .await
     }
 
     async fn connect_runner(

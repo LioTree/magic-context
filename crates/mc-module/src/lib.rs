@@ -47,9 +47,9 @@ pub mod config;
 mod dream_claim;
 pub mod dream_dispatch;
 pub mod dream_tasks;
+pub mod historian_routed;
 mod memory_actions;
 mod model_work;
-pub mod historian_routed;
 pub mod persona_host;
 
 /// Names reserved for scoped, non-tool management requests. These are not facade
@@ -7800,10 +7800,11 @@ impl McHandler {
             .cloned()
             .collect();
         let project_slug = project_slug(&binding.project_root);
-        let assembler = if publication_fence.is_some() {
-            historian_chunk::assemble_provider_historian_firing
-        } else {
-            assemble_historian_firing
+        let assembler = match (publication_fence.is_some(), routed) {
+            (true, false) => historian_chunk::assemble_provider_historian_firing,
+            (false, false) => assemble_historian_firing,
+            (true, true) => historian_chunk::assemble_routed_provider_historian_firing,
+            (false, true) => historian_chunk::assemble_routed_historian_firing,
         };
         let assembler_config = HistorianAssemblerConfig {
             expand_tools: cfg.historian_expand_tools.clone(),
@@ -8127,10 +8128,11 @@ impl McHandler {
                     true,
                 )
             });
-        let assembler = if publication_fence.is_some() {
-            historian_chunk::assemble_provider_historian_firing
-        } else {
-            assemble_historian_firing
+        let assembler = match (publication_fence.is_some(), routed) {
+            (true, false) => historian_chunk::assemble_provider_historian_firing,
+            (false, false) => assemble_historian_firing,
+            (true, true) => historian_chunk::assemble_routed_provider_historian_firing,
+            (false, true) => historian_chunk::assemble_routed_historian_firing,
         };
         let assemble = assembler(
             &store,
@@ -26037,6 +26039,8 @@ mod tests {
 
     #[path = "background_run_limits.rs"]
     mod background_run_limits;
+    #[path = "summary_routing.rs"]
+    mod summary_routing;
 
     #[derive(Default)]
     struct ProducerState {

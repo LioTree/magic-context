@@ -1523,7 +1523,10 @@ impl HistorianProducer {
             // A routed summary runs under the conversation's scope, the same stamp
             // routing selected under. Other historian routes carry no scope and
             // run under the module's own identity.
-            scope: self.routed_runner.as_ref().map(|routed| routed.scope.clone()),
+            scope: self
+                .routed_runner
+                .as_ref()
+                .map(|routed| routed.scope.clone()),
             // The historian runner is an llm-runner management surface.
             role_versions: Some(crate::session_resolver::llm_runner_role_versions()),
         };
