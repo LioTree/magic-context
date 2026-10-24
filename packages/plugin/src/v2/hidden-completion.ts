@@ -831,6 +831,9 @@ export async function createV2HiddenCompletionExecutor(
                     hasHistorianToolActivity([attempt.observedMessages, row.data]);
                 run.completion = {
                     ...(toolActivity ? { toolActivity: true } : {}),
+                    ...(attempt.observedToolSurface !== undefined
+                        ? { observedToolSurface: [...attempt.observedToolSurface] }
+                        : {}),
                     text,
                     tokenLog: runTokenLog(tokens, run.identity.maxOutputTokens, row.data.finish),
                     ...(hiddenToolLoop(run.identity)

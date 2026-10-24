@@ -5,6 +5,7 @@ import { readFileSync } from "node:fs";
 import { PassThrough } from "node:stream";
 import { acquireCompartmentLease } from "@magic-context/core/features/magic-context/compartment-lease";
 import { getCompartments } from "@magic-context/core/features/magic-context/compartment-storage";
+import { CHECK_SCHEMA_CONTRACT } from "@magic-context/core/features/magic-context/memory/historian-schema";
 import { CHECK_SYSTEM_PROMPTS } from "@magic-context/core/features/magic-context/memory/lifecycle-gates";
 import { lifecycleTextHash } from "@magic-context/core/features/magic-context/memory/lifecycle-text";
 import { resolveProjectIdentity } from "@magic-context/core/features/magic-context/memory/project-identity";
@@ -23,10 +24,16 @@ import {
 	TurnTwoOutcomeUnknownError,
 	type TurnTwoStageReply,
 } from "@magic-context/core/features/magic-context/memory/turn-two";
+import {
+	lifecycleToolHash,
+	matchesReportedProfile,
+} from "@magic-context/core/features/magic-context/memory/turn-two-allowlist";
+import identityVectors from "@magic-context/core/features/magic-context/memory/turn-two-identity-vectors.json";
 import { closeDatabase } from "@magic-context/core/features/magic-context/storage";
 import { COMPARTMENT_AGENT_SYSTEM_PROMPT } from "@magic-context/core/hooks/magic-context/compartment-prompt";
 import type { RawMessage } from "@magic-context/core/hooks/magic-context/read-session-raw";
 import { closeQuietly } from "@magic-context/core/shared/sqlite-helpers";
+import { __setPiHarnessKindForTesting } from "./pi-harness-kind";
 import { type PiHistorianDeps, runPiHistorian } from "./pi-historian-runner";
 import {
 	createPiTurnTwoCarrier,
@@ -178,9 +185,144 @@ function base(
 	};
 }
 
-afterEach(() => closeDatabase());
+afterEach(() => {
+	closeDatabase();
+	__setPiHarnessKindForTesting(undefined);
+});
 
 describe("Pi historian RPC parity", () => {
+	for (const harness of ["pi", "omp"] as const) {
+		it(`${harness} reports every C1 key without confusing configured thinking with variant`, async () => {
+			__setPiHarnessKindForTesting(harness);
+			const f = rpcFixture(() => '{"verdicts":[]}');
+			const options = {
+				agent: "historian",
+				model: "test/validated-model",
+				systemPrompt: "system",
+				userMessage: "turn one",
+				thinkingLevel: "high",
+				temperature: 0.1,
+				tokenBudget: 1_000_000,
+				timeoutMs: 1000,
+			};
+			const first = await f.runner.runRetainedHistorian(options, "first");
+			if (!first.child) throw new Error("expected retained child");
+			try {
+				const carrier = createPiTurnTwoCarrier({
+					child: first.child,
+					runner: f.runner,
+					options,
+					turnOneText: first.result.ok ? first.result.assistantText : "",
+					formatInstructions: "format\n",
+				});
+				expect(carrier.harness).toBe(harness);
+				expect(carrier.variant).toBeNull();
+				const reply = await carrier.send("turn two", "second");
+				const profile = {
+					lane: harness,
+					carrier: PI_RPC_CARRIER,
+					provider: "test",
+					modelId: "validated-model",
+					variant: null,
+					temperature: null,
+					thinkingLevel: null,
+					systemHash: lifecycleTextHash("system"),
+					schemaHash: lifecycleTextHash("format\n"),
+					toolHash: lifecycleToolHash([]),
+				};
+				expect(reply.profile).toEqual(profile);
+				expect(matchesReportedProfile(reply.profile, profile)).toBe(true);
+				expect(
+					matchesReportedProfile(
+						{ ...reply.profile, lane: harness === "pi" ? "omp" : "pi" },
+						profile,
+					),
+				).toBe(false);
+				const check = await carrier.check({
+					key: "check",
+					kind: "support",
+					system: "check system",
+					systemHash: "stale caller hash",
+					operands: [],
+					pairs: [],
+					input: "input",
+				});
+				expect(check.profile).toEqual({
+					...profile,
+					systemHash: lifecycleTextHash("check system"),
+					schemaHash: lifecycleTextHash(CHECK_SCHEMA_CONTRACT),
+				});
+				expect(check.profile.toolHash).toBe(
+					identityVectors.toolHashes.find((vector) =>
+						vector.carriers?.includes(PI_RPC_CARRIER),
+					)?.sha256,
+				);
+				for (const child of f.children)
+					expect(child.args).toContain("--no-tools");
+			} finally {
+				await first.child.close();
+			}
+		});
+	}
+
+	it("Pi RPC prefix uses the same child with spawn-fixed system and tools and never rewrites raw history", async () => {
+		const format =
+			"Return JSON with result.step and result.xml or result.decisions.\n";
+		const raw =
+			' \n{ "result": { "xml": "<compartments>raw\\nreply</compartments>", "step": "turn_one" } }\n';
+		const f = rpcFixture((prompt) =>
+			prompt.id === "one"
+				? raw
+				: '{"result":{"step":"turn_two","decisions":[]}}',
+		);
+		const options = {
+			agent: "historian",
+			systemPrompt: `system\n${format}`,
+			userMessage: `${format}turn one`,
+			model: "test/validated-model",
+			tokenBudget: 1_000_000,
+			timeoutMs: 1000,
+		};
+		const first = await f.runner.runRetainedHistorian(options, "one");
+		if (!first.child || !first.result.ok)
+			throw new Error("expected retained child");
+		try {
+			expect(first.result.assistantText).toBe(raw);
+			const child = f.children[0];
+			if (!child) throw new Error("expected spawned child");
+			const spawn = JSON.stringify({ args: child.args, system: child.system });
+			const prefix = child.prompts
+				.map((prompt) => `${JSON.stringify(prompt)}\n`)
+				.join("");
+			const carrier = createPiTurnTwoCarrier({
+				child: first.child,
+				runner: f.runner,
+				options,
+				turnOneText: raw,
+				formatInstructions: format,
+			});
+			await carrier.send(`${format}turn two`, "two");
+			expect(f.children).toHaveLength(1);
+			expect(JSON.stringify({ args: child.args, system: child.system })).toBe(
+				spawn,
+			);
+			expect(child.system).toBe(options.systemPrompt);
+			expect(child.args).toContain("--no-tools");
+			expect(
+				child.prompts
+					.map((prompt) => `${JSON.stringify(prompt)}\n`)
+					.join("")
+					.startsWith(prefix),
+			).toBe(true);
+			expect(child.prompts).toEqual([
+				{ type: "prompt", id: "one", message: options.userMessage },
+				{ type: "prompt", id: "two", message: `${format}turn two` },
+			]);
+			expect(carrier.baseline).toBe(lifecycleTextHash(raw));
+		} finally {
+			await first.child.close();
+		}
+	});
 	it("Pi RPC carries tool-result contamination even when followed by a valid wrapper", async () => {
 		const wrapped = '{"result":{"step":"turn_two","decisions":[]}}';
 		const f = rpcFixture(() => wrapped, true, [

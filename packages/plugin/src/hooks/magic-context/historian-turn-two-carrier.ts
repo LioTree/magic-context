@@ -9,6 +9,12 @@
  * prompt (the OpenCode agent registration can add its own).
  */
 
+import {
+    buildHiddenAgentConfig,
+    buildHiddenAgentRegistrations,
+    buildZenReadAgentRegistrations,
+} from "../../agents/hidden-agent-registrations";
+import { CHECK_SCHEMA_CONTRACT } from "../../features/magic-context/memory/historian-schema";
 import { hasHistorianToolActivity } from "../../features/magic-context/memory/historian-wire";
 import type {
     CheckReply,
@@ -25,9 +31,14 @@ import type {
 } from "../../features/magic-context/memory/turn-two";
 import { TurnTwoOutcomeUnknownError } from "../../features/magic-context/memory/turn-two";
 import {
+    lifecycleToolHash,
+    turnTwoLaneForReport,
+} from "../../features/magic-context/memory/turn-two-allowlist";
+import {
     closeTurnTwoChild,
     retainedTurnTwoChild,
 } from "../../features/magic-context/memory/turn-two-children";
+import { needsBlockedRead, ZEN_READ_AGENT_SUFFIX } from "../../shared/hidden-zen-read";
 import { modelBodyField, toModelEntry } from "../../shared/resolve-fallbacks";
 import type {
     HiddenCompletion,
@@ -71,20 +82,73 @@ function answeredBy(completion: HiddenCompletion): { provider: string; modelId: 
     return null;
 }
 
+/** Hash only the surface authored here, never the host's tool-definition text. */
+export function openCodeTurnTwoToolHash(args: {
+    harness: string;
+    carrier: string;
+    agent: string;
+    provider?: string;
+    observedToolSurface?: readonly string[];
+}): string | null {
+    const lane = turnTwoLaneForReport(args);
+    if (lane === "opencode-2")
+        return args.observedToolSurface === undefined
+            ? null
+            : lifecycleToolHash(args.observedToolSurface);
+    if (lane !== "opencode-1") return null;
+    const registrations = buildHiddenAgentRegistrations({
+        dreamerPrompt: undefined,
+        historianPrompt: undefined,
+        historianEditorPrompt: undefined,
+        historianDisallowed: [],
+    });
+    const agent = needsBlockedRead(args.agent, args.provider)
+        ? `${args.agent}${ZEN_READ_AGENT_SUFFIX}`
+        : args.agent;
+    const registration = [...registrations, ...buildZenReadAgentRegistrations(registrations)].find(
+        (entry) => entry.id === agent,
+    );
+    if (!registration) return null;
+    if (registration.allowedTools.length === 0) return lifecycleToolHash([]);
+    const config = buildHiddenAgentConfig(
+        "",
+        registration.allowedTools,
+        registration.maxSteps,
+        registration.overrides,
+        registration.id,
+        registration.lockPermissions,
+    );
+    return lifecycleToolHash({
+        allowedTools: registration.allowedTools,
+        permissions: config.permission,
+    });
+}
+
 function reportedProfile(
     completion: HiddenCompletion,
     model: RetainedHistorianChild["model"],
     systemHash: string,
+    identity: { harness: string; carrier: string; agent: string },
+    formatInstructions?: string,
 ): ReportedProfile | null {
     const answered = answeredBy(completion);
     if (!answered) return null;
     return {
+        lane: turnTwoLaneForReport(identity),
+        carrier: identity.carrier,
         provider: answered.provider,
         modelId: answered.modelId,
         variant: toModelEntry(model)?.qualifier ?? null,
         // No OpenCode carrier reports the sampling temperature.
         temperature: null,
+        thinkingLevel: null,
         systemHash,
+        schemaHash: formatInstructions === undefined ? null : lifecycleTextHash(formatInstructions),
+        toolHash: openCodeTurnTwoToolHash({
+            ...identity,
+            provider: answered.provider,
+            observedToolSurface: completion.observedToolSurface,
+        }),
     };
 }
 
@@ -117,6 +181,8 @@ export function createOpenCodeTurnTwoCarrier(args: {
     /** Turn one's reply; a later reply that differs from it is turn two's. */
     turnOneText: string;
     timeoutMs: number;
+    /** The persisted format-instruction bytes used on both historian turns. */
+    formatInstructions?: string;
 }): TurnTwoCarrier {
     const { child } = args;
     const historianSystemHash = lifecycleTextHash(child.system);
@@ -153,12 +219,17 @@ export function createOpenCodeTurnTwoCarrier(args: {
                 text: completion.text ?? "",
                 lengthCapped: completion.lengthCapped,
                 toolActivity,
-                profile: reportedProfile(completion, child.model, historianSystemHash),
+                profile: reportedProfile(
+                    completion,
+                    child.model,
+                    historianSystemHash,
+                    { ...args, agent: child.agent },
+                    args.formatInstructions,
+                ),
                 usage: completion.usage,
             };
         },
-        check: (request) =>
-            sendCheck(child.executor, child, args.parentSessionId, request, args.timeoutMs),
+        check: (request) => sendCheck(child.executor, child, args, request),
     };
 }
 
@@ -169,10 +240,10 @@ export function createOpenCodeTurnTwoCarrier(args: {
 async function sendCheck(
     executor: HiddenCompletionExecutor,
     child: RetainedHistorianChild,
-    parentSessionId: string,
+    identity: { parentSessionId: string; harness: string; carrier: string; timeoutMs: number },
     request: CheckRequest,
-    timeoutMs: number,
 ): Promise<CheckReply> {
+    const { parentSessionId, timeoutMs } = identity;
     const handle = await executor.open({
         parentSessionId,
         agent: child.agent,
@@ -211,7 +282,13 @@ async function sendCheck(
         });
         const completion = await executor.collect(handle, 10);
         settled = true;
-        const profile = reportedProfile(completion, child.model, request.systemHash);
+        const profile = reportedProfile(
+            completion,
+            child.model,
+            lifecycleTextHash(request.system),
+            { ...identity, agent: child.agent },
+            CHECK_SCHEMA_CONTRACT,
+        );
         if (!profile) throw new Error("check carrier reported no model");
         let verdicts: CheckReply["verdicts"];
         try {
@@ -326,10 +403,19 @@ function recoveredProfile(
     const answered = answeredBy(completion);
     if (!answered || !record.historianSystemHash) return null;
     return {
+        lane: turnTwoLaneForReport(record),
+        carrier: record.carrier,
         provider: answered.provider,
         modelId: answered.modelId,
         variant: record.variant,
         temperature: null,
+        thinkingLevel: null,
         systemHash: record.historianSystemHash,
+        // Old stage records do not retain the format bytes or the registered agent.
+        schemaHash: null,
+        toolHash:
+            record.harness === "opencode2" && completion.observedToolSurface !== undefined
+                ? lifecycleToolHash(completion.observedToolSurface)
+                : null,
     };
 }
