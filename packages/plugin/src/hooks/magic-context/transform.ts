@@ -625,8 +625,8 @@ export interface TransformDeps {
     /** When true, run a second editor pass after historian to clean U: lines.
      *  Enables the historian-editor agent. Controlled by `historian.two_pass` config. */
     historianTwoPass?: boolean;
-    /** `historian.turn_two`, the memory-lifecycle off switch. Absent means the
-     *  schema default, "allowlist". */
+    /** `historian.turn_two`, the memory-lifecycle off switch. Absent means
+     *  "allowlist", the value the schema gives a configured historian block. */
     historianTurnTwo?: "allowlist" | "off";
     historianExpandTools?: Record<string, string | false>;
     liveModelBySession?: LiveModelBySession;

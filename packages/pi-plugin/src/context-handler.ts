@@ -1570,7 +1570,7 @@ export interface PiHistorianOptions {
 	 *  clean low-signal U: lines and cross-compartment duplicates. Mirrors
 	 *  OpenCode's `historian.two_pass` config. */
 	twoPass?: boolean;
-	/** The `historian.turn_two` switch. Absent means the schema default, "allowlist". */
+	/** The `historian.turn_two` switch. Absent means "allowlist". */
 	turnTwo?: "allowlist" | "off";
 	expandTools?: Record<string, string | false>;
 	/** Pi only: explicit thinking level for historian/compressor subagent
