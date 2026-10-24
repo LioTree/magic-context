@@ -18,6 +18,9 @@ use super::dispatcher::TaskExecutor;
 use super::host_carrier::{DreamQueue, HostCarrier};
 use super::primer_host::{PrimerCarrier, PrimerHost};
 use super::retrospective_host::{HostError, RetrospectiveHost};
+use super::routed::carrier::{RoutedCarrier, RoutedCarrierParts, RoutedParks, ROUTE_WAITING};
+use super::routed::scope::EntorhinalProjectId;
+use super::routed::wire::DreamWire;
 use super::session_reader;
 use super::verify_host::VerifyHost;
 use crate::dream_runner::{
@@ -31,6 +34,7 @@ use mc_store::McStore;
 use serde_json::{json, Value};
 use std::collections::HashMap;
 use std::path::PathBuf;
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 
 /// Makes one Broca port per task run. A port carries the llm-runner ops of the
@@ -87,12 +91,23 @@ pub enum Transport<B: BrocaPorts> {
         routes: Arc<BrocaToolRoute>,
         module_id: String,
     },
+    /// Place every child through routing, under the run's own project scope,
+    /// on the runner routing names (see `routed::carrier`).
+    Routed {
+        wire: Arc<dyn DreamWire>,
+        routes: Arc<BrocaToolRoute>,
+        module_id: String,
+        /// Entorhinal's answer for the run's folder, resolved before the run.
+        project_id: EntorhinalProjectId,
+        parks: Arc<RoutedParks>,
+    },
 }
 
-/// The carrier of one task run, over either transport.
+/// The carrier of one task run, over any transport.
 pub enum TaskCarrier<P: BrocaPort> {
     Host(HostCarrier),
     Broca(Box<BrocaCarrier<P>>),
+    Routed(Box<RoutedCarrier>),
 }
 
 impl<P: BrocaPort> DreamCarrier for TaskCarrier<P> {
@@ -100,6 +115,7 @@ impl<P: BrocaPort> DreamCarrier for TaskCarrier<P> {
         match self {
             Self::Host(c) => c.open(request).await,
             Self::Broca(c) => c.open(request).await,
+            Self::Routed(c) => c.open(request).await,
         }
     }
     async fn complete(
@@ -110,12 +126,14 @@ impl<P: BrocaPort> DreamCarrier for TaskCarrier<P> {
         match self {
             Self::Host(c) => c.complete(child, request).await,
             Self::Broca(c) => c.complete(child, request).await,
+            Self::Routed(c) => c.complete(child, request).await,
         }
     }
     async fn close(&mut self, child: &str, settled: bool) -> Result<(), CarrierError> {
         match self {
             Self::Host(c) => c.close(child, settled).await,
             Self::Broca(c) => c.close(child, settled).await,
+            Self::Routed(c) => c.close(child, settled).await,
         }
     }
 }
@@ -232,6 +250,9 @@ pub struct DreamExecutor<B: BrocaPorts> {
     pub published: Vec<TaskName>,
     /// Host identity used by classification's shareability check.
     pub sensitive: SensitiveContext,
+    /// Set by a routed child that parked on a timed refusal during the current
+    /// task run, to the reset time routing named.
+    parked: Arc<AtomicU64>,
 }
 
 impl<B: BrocaPorts> DreamExecutor<B> {
@@ -257,6 +278,7 @@ impl<B: BrocaPorts> DreamExecutor<B> {
                 home: std::env::var("HOME").unwrap_or_default(),
                 username: std::env::var("USER").unwrap_or_default(),
             },
+            parked: Arc::default(),
         }
     }
 
@@ -292,6 +314,28 @@ impl<B: BrocaPorts> DreamExecutor<B> {
                     privacy_sensitive: false,
                 },
             ))),
+            Transport::Routed {
+                wire,
+                routes,
+                module_id,
+                project_id,
+                parks,
+            } => TaskCarrier::Routed(Box::new(RoutedCarrier::new(RoutedCarrierParts {
+                wire: wire.clone(),
+                routes: routes.clone(),
+                context: context.clone(),
+                router,
+                observer: Arc::new(Discard),
+                scheduler: self.scheduler.clone(),
+                policy: BrocaPolicy {
+                    module_id: module_id.clone(),
+                    require_hard_cap: false,
+                    privacy_sensitive: false,
+                },
+                project_id: project_id.clone(),
+                parks: parks.clone(),
+                parked: self.parked.clone(),
+            }))),
         }
     }
 
@@ -363,6 +407,23 @@ impl<B: BrocaPorts> TaskExecutor for DreamExecutor<B> {
     }
 
     async fn run(&mut self, context: &TaskContext) -> RunOutcome {
+        self.parked.store(0, Ordering::Release);
+        let outcome = self.run_host(context).await;
+        let parked = self.parked.load(Ordering::Acquire);
+        if parked > 0 {
+            // Routing asked the task to wait: give the slot back without
+            // recording an attempt, so the next tick after the reset retries it.
+            return failed(format!(
+                "{}{ROUTE_WAITING}: until {parked}",
+                super::dispatcher::ABANDON_PREFIX
+            ));
+        }
+        outcome
+    }
+}
+
+impl<B: BrocaPorts> DreamExecutor<B> {
+    async fn run_host(&mut self, context: &TaskContext) -> RunOutcome {
         let context = shared(context);
         match context.task {
             TaskName::Classify | TaskName::Map => {

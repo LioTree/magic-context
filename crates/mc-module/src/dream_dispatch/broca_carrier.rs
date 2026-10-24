@@ -107,6 +107,17 @@ pub trait BrocaPort {
     fn session_runner_parent(&self) -> Option<&str> {
         None
     }
+    /// Whether routing chose this port's runner, and the child request's model
+    /// is routing's answer. Such a child needs no user-configured Broca runner.
+    fn routed(&self) -> bool {
+        false
+    }
+    /// The session name to bind the child to, when the port's owner names it (a
+    /// routed dream run names its session after its project and run). `None`
+    /// lets the carrier mint one.
+    fn session_name(&self) -> Option<String> {
+        None
+    }
 }
 
 /// Task-level choices the executor makes once, with the trusted task context.
@@ -345,7 +356,11 @@ impl McHandler {
         request: &Value,
     ) -> Option<HandlerOutcome> {
         let binding = self.facade_binding(channel).ok()?;
-        if !binding.session.starts_with(SESSION_PREFIX) {
+        if !binding.session.starts_with(SESSION_PREFIX)
+            && !binding
+                .session
+                .starts_with(super::routed::scope::SESSION_PREFIX)
+        {
             return None;
         }
         let name = request.get("name").and_then(Value::as_str);
@@ -477,6 +492,7 @@ impl<P: BrocaPort> BrocaCarrier<P> {
         // that host, so a port to it needs no configured Broca runner.
         let session_parent = self.port.session_runner_parent();
         if session_parent.is_none()
+            && !self.port.routed()
             && (request.runner.kind != HistorianRunnerKind::Broca
                 || request.runner.source != RunnerSource::Configured)
         {
@@ -1092,7 +1108,10 @@ impl<P: BrocaPort> DreamCarrier for BrocaCarrier<P> {
             return Err(error("prior_cleanup_required"));
         }
         let (provider, name, budget) = self.admit(request)?;
-        let session = format!("{SESSION_PREFIX}{}", secret()?);
+        let session = match self.port.session_name() {
+            Some(session) => session,
+            None => format!("{SESSION_PREFIX}{}", secret()?),
+        };
         let allowed = request
             .allowed_tools
             .iter()

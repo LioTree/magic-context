@@ -313,8 +313,11 @@ pub async fn run_dream_task<T>(
     if !activated {
         return report;
     }
-    if request.parent_session_id.is_empty()
-        || !request.directory.is_absolute()
+    // No parent session is required: a routed dream run belongs to its project
+    // and has none. The carriers that still run children inside a conversation
+    // (host claimant, configured Broca, a conversation's own runner) check their
+    // parent against the task scope themselves.
+    if !request.directory.is_absolute()
         || request.timeout.is_zero()
         || request.token_budget == Some(0)
     {
@@ -882,7 +885,7 @@ mod tests {
         .await;
         assert_eq!(report.result, Err(Failure::Inactive));
         let mut req = request();
-        req.parent_session_id = "";
+        req.directory = Path::new("relative/project");
         let report = run_dream_task(
             true,
             &McModuleConfig::default(),
@@ -895,6 +898,27 @@ mod tests {
         assert_eq!(report.result, Err(Failure::InvalidRequest));
         assert!(carrier.opened.is_empty());
         assert!(carrier.closed.is_empty());
+    }
+
+    /// A routed dream run belongs to its project and has no parent session; the
+    /// task runner must open its child all the same.
+    #[tokio::test]
+    async fn a_run_without_a_parent_session_opens_its_child() {
+        let mut carrier = FakeCarrier::default();
+        let mut req = request();
+        req.parent_session_id = "";
+        let report = run_dream_task(
+            true,
+            &McModuleConfig::default(),
+            &config(),
+            &req,
+            &mut carrier,
+            |c| Ok(c.text.clone()),
+        )
+        .await;
+        assert_eq!(report.result, Ok("valid".into()));
+        assert_eq!(carrier.opened.len(), 1);
+        assert_eq!(carrier.opened[0].parent_session_id, "");
     }
 
     #[tokio::test]

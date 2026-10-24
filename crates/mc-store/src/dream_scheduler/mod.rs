@@ -8,6 +8,7 @@ pub mod budget;
 pub mod cron;
 mod leases;
 pub mod schedules;
+pub mod targets;
 
 use crate::parity_schema_manifest::*;
 use rusqlite::{Connection, TransactionBehavior};
@@ -74,7 +75,8 @@ impl SqliteDreamScheduler {
         tx.execute_batch("PRAGMA application_id=1296254035;
             CREATE TABLE IF NOT EXISTS dream_schedules(project TEXT NOT NULL, task TEXT NOT NULL, state TEXT NOT NULL, PRIMARY KEY(project,task));
             CREATE TABLE IF NOT EXISTS dream_leases(domain TEXT PRIMARY KEY, token TEXT NOT NULL, expires_at INTEGER NOT NULL);
-            CREATE TABLE IF NOT EXISTS dream_runs(project TEXT NOT NULL, invocation TEXT NOT NULL, token TEXT NOT NULL UNIQUE, state TEXT NOT NULL, PRIMARY KEY(project,invocation));")?;
+            CREATE TABLE IF NOT EXISTS dream_runs(project TEXT NOT NULL, invocation TEXT NOT NULL, token TEXT NOT NULL UNIQUE, state TEXT NOT NULL, PRIMARY KEY(project,invocation));
+            CREATE TABLE IF NOT EXISTS dream_targets(project TEXT PRIMARY KEY, workdir TEXT NOT NULL, project_id TEXT, seen_at INTEGER NOT NULL);")?;
         tx.commit()?;
         Ok(Self {
             db: Some(Mutex::new(db)),

@@ -14,24 +14,10 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
 use std::time::Duration;
 
-/// Register only tasks proven to apply durable effects through real model-session
-/// transports. Planners alone cannot take execution away from TypeScript. Curate,
-/// classify and review-user-memories have an end-to-end test through
-/// `dream_dispatch::tick` with a scripted dream-claim-v1 claimant
-/// (`dream_claim::tests::tick`). map-memories, verify and verify-broad read the
-/// repository, so publication names them only for a carrier that declares file
-/// reads (a claimant with a filesystem fence and the read tools, or a Broca runner
-/// with `Wiring::broca_file_read`); their end-to-end tests run through the Broca
-/// executor with the fake Broca reading a fixture repository
-/// (`broca_carrier::tests::executor`).
-pub const OPERATIONAL_TASKS: &[TaskName] = &[
-    TaskName::Curate,
-    TaskName::Classify,
-    TaskName::ReviewUserMemories,
-    TaskName::Map,
-    TaskName::Verify,
-    TaskName::VerifyBroad,
-];
+/// The tasks this build runs, one per registration in
+/// `routed::registry::REGISTRATIONS`. A new task registers there, next to its
+/// host; this dispatcher never lists tasks itself.
+pub use super::routed::registry::OPERATIONAL_TASKS;
 
 /// An executor that could not start any work, for a reason that says nothing
 /// about the task (an earlier process's child may still be running), reports a

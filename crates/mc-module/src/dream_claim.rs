@@ -135,6 +135,8 @@ impl McHandler {
                 session_runner: None,
             },
         );
+        self.dream_handles()
+            .persist_target(project, &binding.project_root);
         // Tests drive runs explicitly; a background timer would race them.
         #[cfg(not(test))]
         self.dream_handles().ensure_timer();
@@ -239,6 +241,7 @@ impl McHandler {
                 session_runner: Some(route),
             },
         );
+        self.dream_handles().persist_target(project, directory);
         #[cfg(not(test))]
         self.dream_handles().ensure_timer();
         true

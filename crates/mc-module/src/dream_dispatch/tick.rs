@@ -11,6 +11,15 @@
 //! runner module) sends its children to that runner, under that session, through
 //! the same llm-runner carrier as Broca and without any host claimant.
 //!
+//! When this build can register a dream project scope, a run instead takes the
+//! routed path (`routed`): every child is placed by routing under the run's own
+//! project scope, with no conversation and no parent session. Which path a
+//! project takes is `routed::choose_path`.
+//!
+//! Projects to tick are remembered in memory (the route a project was last
+//! seen on) and in the scheduler database's `dream_targets` table, so a restart
+//! keeps ticking every project served within [`PERSISTED_TARGET_TTL_MS`].
+//!
 //! Before planning, each task's Rust schedule adopts the TypeScript scheduler's
 //! progress, and after the run the TypeScript row adopts Rust's (see
 //! `mc_store::dream_schedule_bridge`), so a flip of ownership inside one cron
@@ -27,19 +36,24 @@ use super::dispatcher::{DispatchOutcome, Dispatcher};
 use super::executor::{BrocaPorts, DreamExecutor, NoBroca, Transport};
 use super::host_carrier::DreamQueue;
 use super::ownership::{self, ClaimantRegistry, OwnershipInput, Wiring};
+use super::routed::carrier::RoutedParks;
+use super::routed::registry::OPERATIONAL_TASKS;
+use super::routed::wire::{DreamWire, ProductionWire, WireRefusal};
+use super::routed::{choose_path, DreamPath};
 use crate::background::{self, ConfigInput};
 use crate::config_parity::{ConfigResolveRequest, CoreConfigResolver};
 use crate::dream_runner::resolve_task_models;
 use crate::historian_runner::{uses_session_runner, HistorianRunnerKind};
 use crate::route_targets::{RouteTargetConfig, SessionRunnerRoute};
 use mc_store::dream_scheduler::schedules::{TaskConfig, TaskName};
+use mc_store::dream_scheduler::targets::DreamTargetRow;
 use mc_store::dream_scheduler::SqliteDreamScheduler;
 use mc_store::parity_schema_manifest::{
     CapabilityResult, Generation, ProjectId, SessionId, StoreScope,
 };
 use mc_store::McStore;
 use std::collections::{HashMap, HashSet};
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex, OnceLock};
 use std::time::Duration;
@@ -49,6 +63,21 @@ use std::time::Duration;
 pub const TICK_INTERVAL: Duration = Duration::from_secs(60);
 /// A project not seen on any dream route for this long is no longer ticked.
 pub const TARGET_TTL_MS: i64 = 60 * 60_000;
+/// A project in `dream_targets` not served for this long stops being ticked and
+/// its row is deleted. Three days covers a weekend away from a project, so its
+/// nightly dreams keep running, while a deleted or abandoned project stops
+/// within days rather than lingering.
+pub const PERSISTED_TARGET_TTL_MS: i64 = 3 * 24 * 60 * 60_000;
+/// How often one project's sighting is written to `dream_targets`. Every
+/// served turn sees the project; a row a few minutes old ticks just as well.
+const PERSIST_EVERY_MS: i64 = 5 * 60_000;
+/// The store session of a routed run's schedule claims. A routed run has no
+/// conversation; the scheduler still needs a non-empty session to fence its
+/// leases, and this name is that fence, never a parent session.
+pub const ROUTED_STORE_SESSION: &str = "mc-dream-project";
+/// Entorhinal had no registered project for the folder right before the run,
+/// so the run was skipped.
+pub const PROJECT_UNRESOLVED: &str = "mc_dream_project_unresolved";
 /// The longest one task may run before the dispatcher aborts it.
 pub const TASK_TIMEOUT: Duration = Duration::from_secs(30 * 60);
 
@@ -86,6 +115,12 @@ pub struct DreamRuns {
     connection_file: Option<PathBuf>,
     resolver: OnceLock<Arc<dyn CoreConfigResolver>>,
     clock: OnceLock<Arc<dyn Clock>>,
+    /// How routed runs reach Entorhinal, the daemon, routing and runners.
+    wire: OnceLock<Arc<dyn DreamWire>>,
+    /// Routing's timed refusals, per project and consumer, across runs.
+    parks: Arc<RoutedParks>,
+    /// When each project's sighting was last written to `dream_targets`.
+    persisted: Mutex<HashMap<String, i64>>,
 }
 
 impl DreamRuns {
@@ -101,6 +136,9 @@ impl DreamRuns {
             connection_file,
             resolver: OnceLock::new(),
             clock: OnceLock::new(),
+            wire: OnceLock::new(),
+            parks: Arc::default(),
+            persisted: Mutex::default(),
         }
     }
 
@@ -166,6 +204,31 @@ impl DreamRuns {
     fn clock(&self) -> Arc<dyn Clock> {
         self.clock.get_or_init(|| Arc::new(SystemClock)).clone()
     }
+
+    /// Replace the routed wire for a hermetic test; production uses
+    /// [`ProductionWire`].
+    pub fn use_wire(&self, wire: Arc<dyn DreamWire>) {
+        let _ = self.wire.set(wire);
+    }
+
+    fn wire(&self) -> Arc<dyn DreamWire> {
+        self.wire.get_or_init(|| Arc::new(ProductionWire)).clone()
+    }
+}
+
+/// The scheduler database of `store`'s dream runs, opened active. Only callers
+/// that already know the Rust dreamer is switched on use it.
+pub(crate) fn open_scheduler(store: &McStore) -> Result<SqliteDreamScheduler, String> {
+    let root = store
+        .data_dir()
+        .ok_or("dream data directory unavailable")?
+        .join("dream");
+    mc_store::private_permissions::ensure_directory(&root, true).map_err(|e| e.to_string())?;
+    SqliteDreamScheduler::open(root.join("scheduler.db"), true).map_err(|e| format!("{e:?}"))
+}
+
+fn persisted_target(store: &McStore, project: &str) -> Option<DreamTargetRow> {
+    open_scheduler(store).ok()?.target(project).ok().flatten()
 }
 
 /// What one run did, task by task. Empty when nothing was published or due.
@@ -211,8 +274,8 @@ pub type Job = std::thread::JoinHandle<Result<Option<Result<RunReport, String>>,
 impl DreamHandles {
     /// Start one run for `project` on a background worker: the scheduled tick, or
     /// with `manual` one forced task on the manual entry. Returns `None` when the
-    /// project was never seen on a dream route, its store is not open, or a run
-    /// for it is already in flight.
+    /// project was never seen (neither on a dream route nor in `dream_targets`),
+    /// its store is not open, or a run for it is already in flight.
     pub fn start(&self, project: &str, manual: Option<ManualRun>) -> Option<Job> {
         let store = self.store.get()?.clone();
         // Declarations are stamped with the wall clock when they arrive, so their
@@ -223,37 +286,87 @@ impl DreamHandles {
         // under that session, whatever claimant may still be declared. Otherwise
         // host children are queued on the claimant's session in its root; without a
         // claimant only a Broca run is possible, on the route the project was seen on.
-        let (directory, session, harness, session_runner) = match (&claimant, target) {
+        let legacy = match (&claimant, target) {
             (_, Some(t)) if t.session_runner.is_some() => {
-                (t.directory, t.session, t.harness, t.session_runner)
+                Some((t.directory, t.session, t.harness, t.session_runner))
             }
-            (Some(c), _) if !c.directory.as_os_str().is_empty() => (
+            (Some(c), _) if !c.directory.as_os_str().is_empty() => Some((
                 c.directory.clone(),
                 c.session.clone(),
                 c.harness.clone(),
                 None,
-            ),
-            (_, Some(t)) => (t.directory, t.session, t.harness, None),
-            _ => return None,
+            )),
+            (_, Some(t)) => Some((t.directory, t.session, t.harness, None)),
+            _ => None,
         };
-        {
-            let mut in_flight = self.runs.in_flight.lock().ok()?;
-            if !in_flight.insert(project.to_owned()) {
-                return None;
+        match choose_path(self.runs.wire().scope_support(), legacy.is_some()) {
+            Ok(DreamPath::Legacy) => self.start_legacy(store, project, claimant, legacy?, manual),
+            Ok(DreamPath::Routed) => {
+                // A routed run needs only the project's folder: the persisted
+                // sighting, or the route it was last seen on in this process.
+                let workdir = persisted_target(&store, project)
+                    .map(|row| PathBuf::from(row.workdir))
+                    .or_else(|| legacy.map(|(directory, ..)| directory))?;
+                self.start_routed(store, project, workdir, manual)
+            }
+            Err(refusal) => {
+                let row = persisted_target(&store, project)?;
+                self.start_refused(project, PathBuf::from(row.workdir), refusal, manual)
             }
         }
-        let guard = InFlight {
+    }
+
+    fn in_flight(&self, project: &str) -> Option<InFlight> {
+        let mut in_flight = self.runs.in_flight.lock().ok()?;
+        if !in_flight.insert(project.to_owned()) {
+            return None;
+        }
+        Some(InFlight {
             set: self.runs.in_flight.clone(),
             project: project.to_owned(),
-        };
-        let input = ConfigInput {
+        })
+    }
+
+    fn config_input(&self, directory: &Path) -> ConfigInput {
+        ConfigInput {
             resolver: self.runs.resolver(),
             request: ConfigResolveRequest {
                 user_config_path: String::new(),
                 project_root: directory.to_string_lossy().into_owned(),
                 generation: Generation(0),
             },
+        }
+    }
+
+    fn spawn(
+        input: ConfigInput,
+        manual: bool,
+        work: impl FnOnce(background::Unit) -> Result<RunReport, String> + Send + 'static,
+    ) -> Option<Job> {
+        let job = if manual {
+            background::manual_dream(input, work)
+        } else {
+            background::dreamer_tick(input, work)
         };
+        job.ok()
+    }
+
+    #[allow(clippy::type_complexity)]
+    fn start_legacy(
+        &self,
+        store: Arc<McStore>,
+        project: &str,
+        claimant: Option<ownership::ClaimantDeclaration>,
+        (directory, session, harness, session_runner): (
+            PathBuf,
+            String,
+            String,
+            Option<SessionRunnerRoute>,
+        ),
+        manual: Option<ManualRun>,
+    ) -> Option<Job> {
+        let guard = self.in_flight(project)?;
+        let input = self.config_input(&directory);
         let handles = self.clone();
         let project = project.to_owned();
         let manual_entry = manual.is_some();
@@ -271,12 +384,124 @@ impl DreamHandles {
             };
             run.execute(captured, manual)
         };
-        let job = if manual_entry {
-            background::manual_dream(input, work)
-        } else {
-            background::dreamer_tick(input, work)
+        Self::spawn(input, manual_entry, work)
+    }
+
+    fn start_routed(
+        &self,
+        store: Arc<McStore>,
+        project: &str,
+        workdir: PathBuf,
+        manual: Option<ManualRun>,
+    ) -> Option<Job> {
+        let guard = self.in_flight(project)?;
+        let input = self.config_input(&workdir);
+        let handles = self.clone();
+        let project = project.to_owned();
+        let manual_entry = manual.is_some();
+        let work = move |unit: background::Unit| {
+            let _guard = guard;
+            // A routed run has no conversation, so no harness block of the
+            // dreamer config applies; schedules are read harness-free anyway.
+            let captured = unit.captured_dream_config(String::new(), workdir);
+            RoutedRun {
+                handles: &handles,
+                store,
+                project: &project,
+            }
+            .execute(captured, manual)
         };
-        job.ok()
+        Self::spawn(input, manual_entry, work)
+    }
+
+    /// A project only the routed path could carry, while this build cannot
+    /// register its scope: the run reports every task refused by the scope's
+    /// refusal name and sends nothing.
+    fn start_refused(
+        &self,
+        project: &str,
+        workdir: PathBuf,
+        refusal: WireRefusal,
+        manual: Option<ManualRun>,
+    ) -> Option<Job> {
+        let guard = self.in_flight(project)?;
+        let input = self.config_input(&workdir);
+        let manual_entry = manual.is_some();
+        let work = move |_: background::Unit| {
+            let _guard = guard;
+            let tasks = manual.map_or_else(|| OPERATIONAL_TASKS.to_vec(), |m| vec![m.task]);
+            Ok(tasks
+                .into_iter()
+                .map(|task| (task, DispatchOutcome::Refused(refusal.code.clone())))
+                .collect())
+        };
+        Self::spawn(input, manual_entry, work)
+    }
+
+    /// Remember that `project` was served in `directory`, durably, so a restart
+    /// keeps ticking it. Throttled per project to [`PERSIST_EVERY_MS`]. Only
+    /// called while the Rust dreamer is switched on.
+    pub(crate) fn persist_target(&self, project: &str, directory: &Path) {
+        let now = crate::now_ms();
+        {
+            let Ok(mut persisted) = self.runs.persisted.lock() else {
+                return;
+            };
+            if persisted
+                .get(project)
+                .is_some_and(|at| now.saturating_sub(*at) < PERSIST_EVERY_MS)
+            {
+                return;
+            }
+            persisted.insert(project.to_owned(), now);
+        }
+        let Some(store) = self.store.get() else {
+            return;
+        };
+        let row = DreamTargetRow {
+            project: project.to_owned(),
+            workdir: directory.to_string_lossy().into_owned(),
+            project_id: None,
+            seen_at: now,
+        };
+        if let Err(error) = open_scheduler(store)
+            .and_then(|scheduler| scheduler.record_target(&row).map_err(|e| format!("{e:?}")))
+        {
+            tracing::warn!(project, error, "could not record the dream target");
+        }
+    }
+
+    /// Every project the timer should tick now: those seen in this process within
+    /// [`TARGET_TTL_MS`], and those in `dream_targets` within
+    /// [`PERSISTED_TARGET_TTL_MS`] (older rows are deleted here).
+    pub fn due_projects(&self) -> Vec<String> {
+        let now = self.runs.clock().now_ms();
+        let mut projects = self.runs.fresh_projects(now);
+        if let Some(store) = self.store.get() {
+            // Sightings are written with the wall clock, so they age by it too.
+            let persisted = open_scheduler(store)
+                .and_then(|scheduler| {
+                    scheduler
+                        .live_targets(crate::now_ms(), PERSISTED_TARGET_TTL_MS)
+                        .map_err(|e| format!("{e:?}"))
+                })
+                .unwrap_or_default();
+            for row in persisted {
+                if !projects.contains(&row.project) {
+                    projects.push(row.project);
+                }
+            }
+        }
+        projects
+    }
+
+    /// One timer tick: start a run for every due project. The workers run
+    /// detached; their outcomes land in the schedule rows.
+    pub fn tick_once(&self) -> Vec<Job> {
+        self.due_projects()
+            .iter()
+            .filter_map(|project| self.start(project, None))
+            .collect()
     }
 
     /// Start the process timer once, on the current tokio runtime.
@@ -294,11 +519,8 @@ impl DreamHandles {
             interval.tick().await;
             loop {
                 interval.tick().await;
-                let now = handles.runs.clock().now_ms();
-                for project in handles.runs.fresh_projects(now) {
-                    // The worker runs detached; its outcome is in the schedule rows.
-                    let _ = handles.start(&project, None);
-                }
+                // Each worker runs detached; its outcome is in the schedule rows.
+                drop(handles.tick_once());
             }
         });
     }
@@ -450,18 +672,7 @@ impl Run<'_> {
         task: TaskName,
         settings: &serde_json::Value,
     ) -> Result<TaskConfig, String> {
-        let legacy = self
-            .store
-            .legacy_task_schedule(self.project, task)
-            .map_err(|e| e.to_string())?;
-        Ok(TaskConfig {
-            task,
-            schedule: resolve_task_models(settings, self.harness, task.as_str())
-                .schedule
-                .unwrap_or_default(),
-            has_input: true,
-            legacy_last_run_at: legacy.and_then(|l| l.last_run_at),
-        })
+        task_config(&self.store, self.project, self.harness, task, settings)
     }
 
     #[allow(clippy::too_many_arguments)]
@@ -475,7 +686,7 @@ impl Run<'_> {
         published: &[TaskName],
         manual: Option<ManualRun>,
     ) -> RunReport {
-        let mut dispatcher = Dispatcher {
+        let dispatcher = Dispatcher {
             store: self.store.clone(),
             scheduler: scheduler.clone(),
             scope: scope.clone(),
@@ -495,27 +706,170 @@ impl Run<'_> {
         else {
             return Vec::new();
         };
-        runtime.block_on(async {
-            match manual {
-                Some(manual) => {
-                    let Some(config) = configs.iter().find(|c| c.task == manual.task) else {
-                        return vec![(manual.task, DispatchOutcome::Unavailable)];
-                    };
-                    let outcome = dispatcher
-                        .manual(
-                            config,
-                            &manual.command_id,
-                            TASK_TIMEOUT,
-                            Cancellation::default(),
-                        )
-                        .await;
-                    vec![(manual.task, outcome)]
-                }
-                None => dispatcher
-                    .tick(configs, captured.route.memory_enabled, TASK_TIMEOUT)
-                    .await
-                    .unwrap_or_default(),
+        runtime.block_on(drive(
+            dispatcher,
+            configs,
+            captured.route.memory_enabled,
+            manual,
+        ))
+    }
+}
+
+fn task_config(
+    store: &McStore,
+    project: &str,
+    harness: &str,
+    task: TaskName,
+    settings: &serde_json::Value,
+) -> Result<TaskConfig, String> {
+    let legacy = store
+        .legacy_task_schedule(project, task)
+        .map_err(|e| e.to_string())?;
+    Ok(TaskConfig {
+        task,
+        schedule: resolve_task_models(settings, harness, task.as_str())
+            .schedule
+            .unwrap_or_default(),
+        has_input: true,
+        legacy_last_run_at: legacy.and_then(|l| l.last_run_at),
+    })
+}
+
+/// Run the manual task, or every due task, through `dispatcher`.
+async fn drive<E: super::dispatcher::TaskExecutor>(
+    mut dispatcher: Dispatcher<E>,
+    configs: &[TaskConfig],
+    memory_enabled: bool,
+    manual: Option<ManualRun>,
+) -> RunReport {
+    match manual {
+        Some(manual) => {
+            let Some(config) = configs.iter().find(|c| c.task == manual.task) else {
+                return vec![(manual.task, DispatchOutcome::Unavailable)];
+            };
+            let outcome = dispatcher
+                .manual(
+                    config,
+                    &manual.command_id,
+                    TASK_TIMEOUT,
+                    Cancellation::default(),
+                )
+                .await;
+            vec![(manual.task, outcome)]
+        }
+        None => dispatcher
+            .tick(configs, memory_enabled, TASK_TIMEOUT)
+            .await
+            .unwrap_or_default(),
+    }
+}
+
+/// One routed run of a project: every registered task, placed by routing under
+/// the run's own project scope, with no conversation behind it.
+struct RoutedRun<'a> {
+    handles: &'a DreamHandles,
+    store: Arc<McStore>,
+    project: &'a str,
+}
+
+impl RoutedRun<'_> {
+    fn execute(
+        &self,
+        captured: Arc<super::context::CapturedConfig>,
+        manual: Option<ManualRun>,
+    ) -> Result<RunReport, String> {
+        let root = self
+            .store
+            .data_dir()
+            .ok_or("dream data directory unavailable")?
+            .join("dream");
+        mc_store::private_permissions::ensure_directory(&root, true).map_err(|e| e.to_string())?;
+        let scheduler = Arc::new(
+            SqliteDreamScheduler::open(root.join("scheduler.db"), captured.activated)
+                .map_err(|e| format!("{e:?}"))?,
+        );
+        let scope = StoreScope {
+            project: ProjectId(self.project.to_owned()),
+            session: SessionId(ROUTED_STORE_SESSION.to_owned()),
+            generation: Generation(1),
+        };
+        let configs: Vec<TaskConfig> = OPERATIONAL_TASKS
+            .iter()
+            .map(|task| task_config(&self.store, self.project, "", *task, &captured.effective))
+            .collect::<Result<_, String>>()?;
+        for config in &configs {
+            if let Ok(Some(legacy)) = self.store.legacy_task_schedule(self.project, config.task) {
+                let _ = scheduler.adopt_legacy(&scope, config, &legacy);
             }
-        })
+        }
+        let Ok(runtime) = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+        else {
+            return Ok(Vec::new());
+        };
+        let wire = self.handles.runs.wire();
+        let report = runtime.block_on(async {
+            // The project id is Entorhinal's answer for this folder right now,
+            // never the id a previous run stored.
+            let Some(project_id) = wire.lookup_project(&captured.directory).await else {
+                let tasks =
+                    manual.map_or_else(|| OPERATIONAL_TASKS.to_vec(), |m| vec![m.task]);
+                return tasks
+                    .into_iter()
+                    .map(|task| (task, DispatchOutcome::Refused(PROJECT_UNRESOLVED.into())))
+                    .collect();
+            };
+            match scheduler.set_target_project_id(self.project, project_id.as_str()) {
+                Ok(Some(previous)) if previous != project_id.as_str() => {
+                    crate::project_identity::log_once(
+                        format!("dream-target-project:{}:{}", self.project, project_id.as_str()),
+                        &format!(
+                            "Entorhinal now answers {} for dream target {} (was {previous}); using the new answer",
+                            project_id.as_str(),
+                            self.project
+                        ),
+                    );
+                }
+                _ => {}
+            }
+            let dispatcher = Dispatcher {
+                store: self.store.clone(),
+                scheduler: scheduler.clone(),
+                scope: scope.clone(),
+                config: captured.clone(),
+                clock: self.handles.runs.clock(),
+                executor: DreamExecutor::new(
+                    self.store.clone(),
+                    scheduler.clone(),
+                    Transport::<NoBroca>::Routed {
+                        wire: wire.clone(),
+                        routes: self.handles.broca_routes.clone(),
+                        module_id: self.handles.module_id.clone(),
+                        project_id,
+                        parks: self.handles.runs.parks.clone(),
+                    },
+                    OPERATIONAL_TASKS,
+                    OPERATIONAL_TASKS,
+                ),
+            };
+            drive(
+                dispatcher,
+                &configs,
+                captured.route.memory_enabled,
+                manual,
+            )
+            .await
+        });
+        for config in &configs {
+            if let CapabilityResult::Available { value: Some(state) } =
+                scheduler.schedule(&scope, config.task)
+            {
+                let _ = self
+                    .store
+                    .publish_task_schedule(self.project, config.task, &state);
+            }
+        }
+        Ok(report)
     }
 }
