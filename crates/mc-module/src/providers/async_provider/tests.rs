@@ -1,5 +1,6 @@
 use super::*;
 use cortexkit_bus_inmemory::{InMemoryBus, InMemoryConfig};
+mod broca_tag_rows;
 mod descriptors_read;
 mod full_array_setup;
 mod moved_session;
