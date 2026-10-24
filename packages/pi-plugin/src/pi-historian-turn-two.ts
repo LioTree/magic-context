@@ -244,7 +244,7 @@ export function recoverLostPiRpcStages(
 	return released;
 }
 
-function reportedProfile(
+export function reportedProfile(
 	result: SubagentRunResult,
 	options: SubagentRunOptions,
 	systemHash: string,
@@ -460,9 +460,11 @@ export function schedulePiHistorianTurnTwo(args: {
 	turnOneText: string;
 	memoryEnabled: boolean;
 	autoPromote: boolean;
-	validatedProfiles: readonly ReportedProfile[];
+	validatedProfiles?: readonly ReportedProfile[];
+	trialAuthorization?: import("@magic-context/core/features/magic-context/memory/turn-two-allowlist").TurnTwoTrialAuthorization;
 	formatInstructions?: string;
 	log: (message: string) => void;
+	beforeResolve?: () => Promise<boolean | void>;
 	readExcerpt?: TurnTwoExcerptReader;
 }): void {
 	liveChildren.set(args.child.id, args.child);
@@ -507,11 +509,67 @@ export function schedulePiHistorianTurnTwo(args: {
 	const task = new Promise<void>((resolve) => setTimeout(resolve, 0)).then(
 		async () => {
 			try {
+				if ((await args.beforeResolve?.()) === false) {
+					await closeTurnTwoChild(args.child.id);
+					return;
+				}
+				const recovery = recoverLivePiRpcStage(args.db);
 				const result = await runTurnTwo(args.db, {
 					...args,
 					lane: "enabled",
-					carrier,
-					recover: recoverLivePiRpcStage(args.db),
+					carrier: {
+						...carrier,
+						send: async (...input) => {
+							if ((await args.beforeResolve?.()) === false)
+								throw new Error("Turn two was revoked before send");
+							try {
+								return await carrier.send(...input);
+							} finally {
+								await args.beforeResolve?.();
+							}
+						},
+						check: async (...input) => {
+							if ((await args.beforeResolve?.()) === false)
+								throw new Error("Turn two was revoked before check");
+							try {
+								return await carrier.check(...input);
+							} finally {
+								await args.beforeResolve?.();
+							}
+						},
+					},
+					recover: (record) => {
+						const recovered = recovery(record);
+						if (!recovered || recovered === "busy") return recovered;
+						return {
+							...recovered,
+							check: async (...input) => {
+								if ((await args.beforeResolve?.()) === false)
+									throw new Error("Recovered stage was revoked before check");
+								try {
+									return await recovered.check(...input);
+								} finally {
+									await args.beforeResolve?.();
+								}
+							},
+							reattach: async () => {
+								try {
+									return await recovered.reattach();
+								} finally {
+									await args.beforeResolve?.();
+								}
+							},
+							reattachCheck: recovered.reattachCheck
+								? async (...input) => {
+										try {
+											return await recovered.reattachCheck!(...input);
+										} finally {
+											await args.beforeResolve?.();
+										}
+									}
+								: undefined,
+						};
+					},
 				});
 				if (result.childInFlight) return;
 			} catch (error) {

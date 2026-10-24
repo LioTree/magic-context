@@ -219,11 +219,16 @@ export interface CompartmentRunnerDeps<
      */
     autoPromote?: boolean;
     /**
-     * Which historian turn one this lane runs (see `TurnOneLane`). Unset means
-     * `dormant`, the production default until profile authorization is available.
-     * Both lanes request their format through the prompt and validate locally.
+     * Test-only lane override. It can exercise publication without an allowlist,
+     * but never authorizes application; turn two still requires a complete allowlisted identity.
+     * Production selects against the reviewed allowlist or trial evidence.
      */
     memoryLifecycleLane?: TurnOneLane;
+    historianTurnTwo?: "allowlist" | "off";
+    /** Reads the current switch after asynchronous replies, including config reloads. */
+    historianTurnTwoIsEnabled?: () => boolean;
+    memoryLifecycleAllowlist?: import("../../features/magic-context/memory/turn-two-allowlist").TurnTwoAllowlist;
+    memoryLifecycleTrialAuthorization?: import("../../features/magic-context/memory/turn-two-allowlist").TurnTwoTrialAuthorization;
     /**
      * Historian and check model profiles (`ReportedProfile`) that a recorded replay
      * validated for turn two. None is validated yet, so on an enabled lane every
@@ -316,10 +321,12 @@ export interface RetainedHistorianChild {
     /** The model the provider reported for turn one, when the carrier exposes it. */
     providerId?: string;
     modelId?: string;
+    reportedProfile?: import("../../features/magic-context/memory/lifecycle-gates").ReportedProfile;
     close(): Promise<void>;
 }
 
 export interface HistorianRunResult {
+    reportedProfile?: import("../../features/magic-context/memory/lifecycle-gates").ReportedProfile;
     /** Set only when the caller asked to retain the child and the run succeeded. */
     retained?: RetainedHistorianChild;
     refusal?: HiddenCompletionRefusal;
@@ -358,11 +365,13 @@ export type ValidatedHistorianPassResult =
           invocationId?: number | null;
           /** The child that produced the published reply, kept open for turn two. */
           retainedChild?: RetainedHistorianChild;
+          reportedProfile?: import("../../features/magic-context/memory/lifecycle-gates").ReportedProfile;
       }
     | {
           ok: false;
           error: string;
           failureReason?: string;
+          reportedProfile?: import("../../features/magic-context/memory/lifecycle-gates").ReportedProfile;
           invocationId?: number | null;
       };
 

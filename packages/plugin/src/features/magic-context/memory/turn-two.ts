@@ -342,7 +342,7 @@ export function freezeTurnOneProfile(
     if (!changed) throw new Error("Turn-one actual identity is immutable");
 }
 
-function trialRootMatches(db: Database, authorization: TurnTwoTrialAuthorization): boolean {
+export function trialRootMatches(db: Database, authorization: TurnTwoTrialAuthorization): boolean {
     try {
         const root = authorization.attestedRoot;
         if (!isAbsolute(root) || resolve(root) !== root || realpathSync(root) !== root)

@@ -19,12 +19,15 @@ import {
     getCompartments,
     replaceAllCompartments,
 } from "../../features/magic-context/compartment-storage";
+import { HISTORIAN_FORMAT_INSTRUCTION } from "../../features/magic-context/memory/turn-one-publication";
+import { authorizationFixture } from "../../features/magic-context/memory/turn-two-test-fixtures.test";
 import { closeDatabase, openDatabase } from "../../features/magic-context/storage";
 import type { PluginContext } from "../../plugin/types";
 import { __resetNotificationStateForTests } from "../../shared/rpc-notifications";
 import { Database } from "../../shared/sqlite";
 import { closeQuietly } from "../../shared/sqlite-helpers";
 import { createTestTempDirFromPath } from "../../shared/test-temp-dir";
+import { COMPARTMENT_AGENT_COMBINED_SYSTEM_PROMPT } from "./compartment-prompt";
 import { runCompartmentAgent } from "./compartment-runner";
 import { settleHistorianTurnTwoRuns } from "./historian-turn-two-step";
 import {
@@ -126,6 +129,20 @@ async function runEnabledHistorian(
     directory: string,
     reply: string,
 ): Promise<void> {
+    const authorization = authorizationFixture(
+        {
+            lane: "opencode-1",
+            carrier: "opencode-session",
+            provider: "test",
+            modelId: "fixture-historian",
+            variant: null,
+            temperature: null,
+            thinkingLevel: null,
+        },
+        COMPARTMENT_AGENT_COMBINED_SYSTEM_PROMPT,
+        [],
+        HISTORIAN_FORMAT_INSTRUCTION,
+    );
     const client = {
         session: {
             get: mock(async () => ({ data: { directory } })),
@@ -135,7 +152,7 @@ async function runEnabledHistorian(
                 data: [
                     {
                         info: { role: "assistant", time: { created: 1 } },
-                        parts: [{ type: "text", text: reply }],
+                        parts: [{ type: "text", text: authorization.turnOne(reply) }],
                     },
                 ],
             })),
@@ -155,6 +172,7 @@ async function runEnabledHistorian(
                 compartmentLeaseHolderId: holderId,
                 forceDrainQuota: true,
                 memoryLifecycleLane: "enabled",
+                memoryLifecycleValidatedProfiles: authorization.rows,
             }),
         );
     } finally {
