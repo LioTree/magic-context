@@ -1568,7 +1568,9 @@ async fn covered_tail_latency_benchmark() {
         // Seed capture belongs to the fold that publishes a cut, not to a
         // later step. The runner starts the timed lineage at that real cut.
         if std::env::var_os("MC_ASYNC_FRESH_CUT").is_some() {
-            *rig.runner.cut.lock().unwrap() = Some(("L".into(), covered.saturating_sub(4)));
+            // An external cut must close the entire stored summary prefix;
+            // no summarized source row may remain on its mutable live side.
+            *rig.runner.cut.lock().unwrap() = Some(("L".into(), covered + 1));
         } else {
             rig.try_timed_notice(0, None, est_tokens).await.2.unwrap();
             let version = rig.newest_view().expect("published fold");

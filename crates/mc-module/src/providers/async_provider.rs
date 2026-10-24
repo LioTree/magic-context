@@ -1651,7 +1651,22 @@ fn checked_async_view(
     codec: codec::Codec,
     kept: &tool_arcs::KeptMessages,
 ) -> Result<Result<view::CompactionView, Vec<String>>, HandlerOutcome> {
-    view.check().map_err(|error| transient(error.name()))?;
+    view.check().map_err(|error| {
+        #[cfg(test)]
+        if std::env::var_os("MC_CUT_DIFF_DETAIL").is_some() {
+            eprintln!(
+                "VIEW CHECK {} cut={:?} through={:?} ranges={:?}",
+                error.name(),
+                view.cut,
+                view.covers_through,
+                view.ranges
+                    .iter()
+                    .map(|range| (range.from(), range.to()))
+                    .collect::<Vec<_>>()
+            );
+        }
+        transient(error.name())
+    })?;
     let splits = tool_arcs::split_pairs(codec, kept, &view.ranges);
     if !splits.is_empty() {
         return Ok(Err(splits));
@@ -4370,8 +4385,9 @@ impl McHandler {
         cut_seed::pass_trace::record(
             Arc::as_ptr(store) as usize,
             format!(
-                "action={} prefix={:?} cut_prefix={} messages={} first={:?}",
+                "action={} reason={:?} prefix={:?} cut_prefix={} messages={} first={:?}",
                 output.engine.response.action,
+                output.engine.response.materialize_reason,
                 template
                     .logical_prefix
                     .as_ref()
@@ -4577,7 +4593,12 @@ impl McHandler {
             }
         }
         let shaped = emptied_messages::shape(codec, &kept, &state.frozen_edits, ranges);
-        let ranges = shaped.ranges;
+        let mut ranges = shaped.ranges;
+        if let Some(first) = cut_first {
+            // Empty window replacements can coalesce with the history head
+            // during shaping. Keep the cut at an explicit range boundary.
+            cut_runtime::split_head_at(&mut ranges, first);
+        }
         let version = store
             .reserve_async_compaction_version(&state.reference(), state.applied.unwrap_or(0))
             .map_err(transient)?;
@@ -4595,6 +4616,14 @@ impl McHandler {
         .with_cache_ttl(state.cache_ttl());
         if let Some(first) = cut_first {
             view = view.with_cut(view::ViewCut::new(format!("v{version}"), first - 1));
+        }
+        if view.cut.is_some() && view.check().is_err_and(|error| error.name() == "cut") {
+            // A native arc may keep a covered source row live. That view is
+            // still useful, but it cannot remove the row with a cut yet.
+            #[cfg(test)]
+            cut_runtime::measurements::deferred(store, "cut_view_shape");
+            view.cut = None;
+            view.digest = view.compute_digest();
         }
         let mut view = match checked_async_view(view, codec, &kept)? {
             Ok(view) => view,
@@ -4646,7 +4675,7 @@ impl McHandler {
         // The produced baseline is this published view; adopting after the
         // insert shares its serialized form instead of serializing it again.
         state.adopt_engine(engine)?;
-        if let Some(first) = cut_first {
+        if let Some(first) = cut_first.filter(|_| view.cut.is_some()) {
             state.keep_published_cut(store, codec, first, &view)?;
             if state
                 .published_cuts

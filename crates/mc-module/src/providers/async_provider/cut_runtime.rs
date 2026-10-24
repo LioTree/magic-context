@@ -36,6 +36,16 @@ pub(super) fn crash_after_stage_for_test() {
     CRASH_AFTER_STAGE.with(|flag| flag.set(true));
 }
 
+pub(super) fn split_head_at(ranges: &mut Vec<view::ViewRange>, first: u64) {
+    if let Some(index) = ranges.iter().position(|range| {
+        matches!(range, view::ViewRange::Replace { from, to, .. } if *from < first && first < *to)
+    }) {
+        let to = ranges[index].to();
+        if let view::ViewRange::Replace { to, .. } = &mut ranges[index] { *to = first; }
+        ranges.insert(index + 1, view::ViewRange::replace(first, to, "[]"));
+    }
+}
+
 impl AsyncRecord {
     pub(super) fn restore_undo_edits(&mut self, store: &McStore) -> Result<(), HandlerOutcome> {
         if !self.pending_undo_edits {
@@ -522,13 +532,24 @@ impl McHandler {
         else {
             return unknown();
         };
-        let seed: cut_seed::CutSeed = serde_json::from_str(&raw).map_err(transient)?;
+        let mut seed: cut_seed::CutSeed = serde_json::from_str(&raw).map_err(transient)?;
         if !seed.boundary_safe() {
             return bytes(&compact::setup::SetupAnswer::refuse(
                 &request.request_id,
                 compact::errors::RefuseCode::from_code("unsafe_cut_seed"),
                 "The stored head depends on rows outside its cut. Set up a fresh full lineage.",
             ));
+        }
+        if state.lineage.as_deref() == Some(cut.lineage.as_str()) {
+            // The current parent may have read more of this same live window
+            // since staging. Reuse that observed cache, with matching tags,
+            // without asking the runner; an older-cut undo uses its snapshot.
+            seed.window.entries = store
+                .load_async_compaction_entries_range(&state.reference(), first, i64::MAX as u64)
+                .map_err(transient)?
+                .into_iter()
+                .map(|(ordinal, raw)| (ordinal, raw))
+                .collect();
         }
         // A saved stage is immutable. A descendant gets its own namespace and
         // reads the live window on its next notice, so an undo cannot inherit

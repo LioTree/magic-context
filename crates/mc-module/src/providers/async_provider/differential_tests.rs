@@ -801,6 +801,22 @@ impl Pair {
             ));
             return resident;
         }
+        if resident != oracle && std::env::var_os("MC_CUT_DIFF_DETAIL").is_some() {
+            let left = serde_json::from_str::<Value>(&resident).ok();
+            let right = serde_json::from_str::<Value>(&oracle).ok();
+            if let (Some(left), Some(right)) = (left, right) {
+                eprintln!(
+                    "ANSWER DIFF first={}",
+                    cut_lineage_tests::first_difference(&left, &right, String::new())
+                );
+                if let (Ok(a), Ok(b)) = (
+                    serde_json::from_value::<view::CompactionView>(left["view"].clone()),
+                    serde_json::from_value::<view::CompactionView>(right["view"].clone()),
+                ) {
+                    eprintln!("ANSWER VIEW DIFF model_equal={} ranges_equal={} cut_left={:?} cut_right={:?} digest_left={} digest_right={}", self.model_bytes(&a)==self.model_bytes(&b), a.ranges==b.ranges, a.cut,b.cut,a.digest,b.digest);
+                }
+            }
+        }
         assert_eq!(
             resident,
             oracle,
@@ -836,6 +852,19 @@ impl Pair {
             if let Some(baseline) = meta.get_mut("tail_hygiene_baseline") {
                 if let Some(baseline) = baseline.as_object_mut() {
                     baseline.remove("computed_at_ms");
+                }
+            }
+            if let Some(decisions) = meta
+                .pointer_mut("/historian/recent_decisions")
+                .and_then(Value::as_array_mut)
+            {
+                for decision in decisions {
+                    if let Some(fields) = decision.as_object_mut() {
+                        // These two fields record this provider's wall-clock
+                        // observation time, not a historian decision or extent.
+                        fields.remove("at_ms");
+                        fields.remove("request_observed_at_ms");
+                    }
                 }
             }
             if let Value::Object(fields) = &mut meta {
@@ -941,8 +970,9 @@ impl Pair {
             }
             assert!(
                 left == right,
-                "{:?} view {version} bytes diverged after {label}; steps: {:?}",
+                "{:?} view {version} bytes diverged after {label}; native model bytes equal; first difference {}; steps: {:?}",
                 self.profile,
+                cut_lineage_tests::first_difference(&serde_json::from_str(left).unwrap(), &serde_json::from_str(right).unwrap(), String::new()),
                 self.log
             );
         }

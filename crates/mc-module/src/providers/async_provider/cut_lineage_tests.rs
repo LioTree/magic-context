@@ -137,7 +137,7 @@ fn without_rows_below(value: Value, first: u64) -> Value {
 }
 
 /// Where `full` and `cut` first differ, as a path and the two values there.
-fn first_difference(full: &Value, cut: &Value, path: String) -> String {
+pub(super) fn first_difference(full: &Value, cut: &Value, path: String) -> String {
     match (full, cut) {
         (Value::Object(a), Value::Object(b)) => {
             for key in a.keys().chain(b.keys()) {
@@ -951,6 +951,23 @@ async fn a_lineage_that_begins_at_a_cut_serves_what_full_processing_serves() {
 #[tokio::test(flavor = "multi_thread", worker_threads = 8)]
 async fn a_fresh_start_at_a_cut_rebuilds_once_and_keeps_the_cache_rules() {
     cut_differential(8, 20, 9_000, CutMode::BootstrapAtCut).await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn fresh_cut_does_not_rebuild_twice_for_one_history_publication() {
+    let mut failures = Vec::new();
+    for (profile, seed) in [
+        (Profile::Anthropic, 210_015),
+        (Profile::Pi, 210_094),
+        (Profile::Anthropic, 210_099),
+    ] {
+        if let Err(error) =
+            tokio::spawn(cut_session(profile, seed, 24, CutMode::BootstrapAtCut)).await
+        {
+            failures.push(format!("{profile:?} {seed}: {error}"));
+        }
+    }
+    assert!(failures.is_empty(), "{failures:#?}");
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 8)]

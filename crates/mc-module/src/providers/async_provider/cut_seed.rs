@@ -602,7 +602,13 @@ impl AsyncRecord {
         let Some(cut) = first.checked_sub(1) else {
             return Ok(Err(CaptureRefusal::Unheld));
         };
-        if first <= base || !self.entries.contains_key(&cut) || !self.entries.contains_key(&first) {
+        let renewal = previous
+            .as_ref()
+            .is_some_and(|seed| seed.first_ordinal == first);
+        if first < base
+            || (!renewal && !self.entries.contains_key(&cut))
+            || !self.entries.contains_key(&first)
+        {
             return Ok(Err(CaptureRefusal::Unheld));
         }
         let namespace = self.namespace();
@@ -778,12 +784,32 @@ impl AsyncRecord {
         if context_bytes > MAX_CONTEXT_BYTES {
             return Ok(Err(CaptureRefusal::Oversize));
         }
-        let cut_entry = self.entries[&cut].read()?;
-        let cut_decoded = decoded_entry(codec, &self.entries[&cut].inbound()?)?;
-        let time_basis = Some((
-            cut_decoded.ck.meta.created_at_ms,
-            cut_decoded.ck.meta.completed_at_ms,
-        ));
+        let (cut_mid, cut_digest, time_basis, reset_next) =
+            if let Some(entry) = self.entries.get(&cut) {
+                let raw = entry.read()?;
+                let decoded = decoded_entry(codec, &entry.inbound()?)?;
+                (
+                    raw.mid.clone(),
+                    served_digest(&raw)?,
+                    Some((
+                        decoded.ck.meta.created_at_ms,
+                        decoded.ck.meta.completed_at_ms,
+                    )),
+                    decoded.ck.role != "assistant" && decoded.ck.role != "tool",
+                )
+            } else {
+                // Re-advertising an already certified cut refreshes only its live
+                // window. The closed prefix facts come from the existing seed.
+                let seed = previous.as_ref().expect("renewal needs its prefix seed");
+                (
+                    seed.cut_mid.clone(),
+                    seed.cut_digest.clone(),
+                    seed.time_basis,
+                    seed.historian_prelude
+                        .as_ref()
+                        .is_some_and(|p| p.reset_next),
+                )
+            };
         // Protected tool tags whose block is not in the window.
         let below = |block: &str| {
             self.mid_index
@@ -999,7 +1025,7 @@ impl AsyncRecord {
             previous.as_deref(),
             historian_window,
             first,
-            cut_decoded.ck.role != "assistant" && cut_decoded.ck.role != "tool",
+            reset_next,
         )? {
             Ok(prelude) => prelude,
             Err(reason) => return Ok(Err(reason)),
@@ -1018,8 +1044,8 @@ impl AsyncRecord {
             window,
             first_ordinal: first,
             lineage_from,
-            cut_mid: cut_entry.mid.clone(),
-            cut_digest: served_digest(&cut_entry)?,
+            cut_mid,
+            cut_digest,
             compartment_seq: loaded.meta.coverage_compartment_seq.unwrap_or_else(|| {
                 newest_compartment.map_or(loaded.meta.folded_compartment_seq, |c| c.sequence)
             }),

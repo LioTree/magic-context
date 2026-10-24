@@ -90,8 +90,8 @@ fn restore_oracle_prefix(pair: &Pair, full: State, first: u64) {
         .unwrap()
         .unwrap();
     // Restore only the immutable prefix on the full-input reference. Each
-    // side independently adopted its own staged live-window snapshot; newer
-    // parent rows are read after Setup, not silently copied from the future.
+    // side independently adopted its parent's observed window cache, or its
+    // own immutable snapshot when revisiting an earlier cut.
     for (ordinal, entry) in full.entries.range(..first) {
         oracle.entries.insert(*ordinal, Arc::clone(entry));
     }
