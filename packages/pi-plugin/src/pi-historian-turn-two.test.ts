@@ -29,6 +29,7 @@ import {
 	matchesReportedProfile,
 } from "@magic-context/core/features/magic-context/memory/turn-two-allowlist";
 import identityVectors from "@magic-context/core/features/magic-context/memory/turn-two-identity-vectors.json";
+import { authorizationFixture } from "@magic-context/core/features/magic-context/memory/turn-two-test-fixtures.test";
 import { closeDatabase } from "@magic-context/core/features/magic-context/storage";
 import { COMPARTMENT_AGENT_SYSTEM_PROMPT } from "@magic-context/core/hooks/magic-context/compartment-prompt";
 import type { RawMessage } from "@magic-context/core/hooks/magic-context/read-session-raw";
@@ -356,6 +357,19 @@ describe("Pi historian RPC parity", () => {
 	});
 	it("Pi RPC serialized requests stay prompt-only and recovery reuses the recorded reply without a send", async () => {
 		const db = createTestDb();
+		const authorization = authorizationFixture(
+			{
+				lane: "pi",
+				carrier: "pi-historian-rpc",
+				provider: "test",
+				modelId: "validated-model",
+				variant: null,
+				temperature: null,
+				thinkingLevel: null,
+			},
+			"combined prompt contract",
+			[],
+		);
 		const wrapped =
 			' \n{"result":{"step":"turn_two","decisions":[{"fact_id":1,"action":"new"}]}}\n';
 		const f = rpcFixture((prompt) =>
@@ -381,6 +395,7 @@ describe("Pi historian RPC parity", () => {
 				chunkStart: 1,
 				chunkEnd: 2,
 			});
+			authorization.persist(db, send.stageKey);
 			db.transaction(() =>
 				commitTurnOnePublication(db, {
 					send,
@@ -395,6 +410,7 @@ describe("Pi historian RPC parity", () => {
 				}),
 			)();
 			const carrier = createPiTurnTwoCarrier({
+				formatInstructions: authorization.request.formatInstruction,
 				child: first.child,
 				runner: f.runner,
 				options,
@@ -408,7 +424,7 @@ describe("Pi historian RPC parity", () => {
 				lane: "enabled",
 				memoryEnabled: true,
 				autoPromote: true,
-				validatedProfiles: [],
+				validatedProfiles: authorization.rows,
 				carrier: {
 					...carrier,
 					send: async (prompt, key) => {
@@ -445,7 +461,7 @@ describe("Pi historian RPC parity", () => {
 				projectPath,
 				memoryEnabled: true,
 				autoPromote: true,
-				validatedProfiles: [],
+				validatedProfiles: authorization.rows,
 				resolver: (record) => {
 					expect(record.stageKey).toBe(stage.stageKey!);
 					return {

@@ -407,7 +407,20 @@ export async function runMemoryChecks(
         };
     for (const check of plan.checks) {
         const request = makeCheckRequest(key, check, context.historianProfile);
-        const expectedProfile = { ...context.historianProfile, systemHash: request.systemHash };
+        const checkRow = context.validatedProfiles.find(
+            (candidate) =>
+                candidate.lane === context.historianProfile.lane &&
+                candidate.carrier === context.historianProfile.carrier &&
+                sameInferenceTuple(candidate, context.historianProfile) &&
+                candidate.systemHash === request.systemHash &&
+                candidate.schemaHash === lifecycleTextHash(CHECK_SCHEMA_CONTRACT),
+        );
+        const expectedProfile = {
+            ...context.historianProfile,
+            systemHash: request.systemHash,
+            schemaHash: lifecycleTextHash(CHECK_SCHEMA_CONTRACT),
+            toolHash: checkRow?.toolHash,
+        };
         if (
             request.systemHash === context.historianProfile.systemHash ||
             !validated(expectedProfile, context.validatedProfiles)
@@ -426,6 +439,7 @@ export async function runMemoryChecks(
             reply.profile.carrier !== context.historianProfile.carrier ||
             !sameInferenceTuple(reply.profile, context.historianProfile) ||
             reply.profile.systemHash !== request.systemHash ||
+            !matchesReportedProfile(reply.profile, expectedProfile) ||
             !validated(reply.profile, context.validatedProfiles)
         )
             return {

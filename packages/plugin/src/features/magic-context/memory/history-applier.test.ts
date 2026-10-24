@@ -20,9 +20,10 @@ import {
     applyHistorianRevision,
     applyMemoryAdmission,
 } from "./lifecycle-applier";
-import { CHECK_SYSTEM_PROMPTS, type RevisionDecision } from "./lifecycle-gates";
+import type { RevisionDecision } from "./lifecycle-gates";
 import { lifecycleTextHash } from "./lifecycle-text";
 import { getMemoryById, insertMemory, setMemoryClassification } from "./storage-memory";
+import { authorizationFixture } from "./turn-two-test-fixtures.test";
 
 function fixture() {
     const { dir: directory, cleanup } = createTestTempDir("memory-history-undo-");
@@ -659,13 +660,19 @@ async function historianOperation(
     }
     const before = sources.map((source) => memoryHistorySnapshot(f.db, source.id)!);
     const evidence = { blockStartOrdinal: 42, excerpt: "New rule." };
-    const profile = {
-        provider: "test",
-        modelId: "undo",
-        variant: null,
-        temperature: 0,
-        systemHash: "historian",
-    };
+    const authorization = authorizationFixture(
+        {
+            lane: "opencode-1",
+            carrier: "hidden-completion",
+            provider: "test",
+            modelId: "undo",
+            variant: null,
+            temperature: 0,
+            thinkingLevel: null,
+        },
+        "historian",
+    );
+    const profile = authorization.profile;
     const decision: RevisionDecision = {
         key: "historian-operation",
         action,
@@ -704,17 +711,11 @@ async function historianOperation(
                 revision: row.revision,
             })),
             historianProfile: profile,
-            validatedProfiles: [
-                profile,
-                ...Object.values(CHECK_SYSTEM_PROMPTS).map((system) => ({
-                    ...profile,
-                    systemHash: lifecycleTextHash(system),
-                })),
-            ],
+            validatedProfiles: authorization.rows,
         },
         { sessionId: "undo", harness: "opencode" },
         async (request) => ({
-            profile: { ...profile, systemHash: request.systemHash },
+            profile: authorization.checkProfile(request.systemHash),
             verdicts: (request.kind === "compatibility" ? request.pairs : request.operands).map(
                 (operand) => ({
                     id: operand.id,
