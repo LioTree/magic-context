@@ -816,6 +816,7 @@ export function answer(request: CatalogRequest, config: ResolvedConfig): JsonObj
     if (request.system_text) checkParams(request.system_text.params, TEXT_PARAMS, "system_text.params");
     checkCompositionMatches(request, servedToolIds(request, config));
     const content: JsonObject = {};
+    if (request.preset === undefined) content.presets = [...PRESETS];
     const compositionDigest = request.composition ? sha256Hex(jcs(request.composition)) : undefined;
     if (compositionDigest) content.composition_digest = compositionDigest;
     content.tools = catalogTools(request, config);
@@ -903,6 +904,10 @@ interface Example {
 }
 
 const EXAMPLES: Example[] = [
+    {
+        name: "presetless",
+        request: { params: {} },
+    },
     {
         name: "preflight",
         request: { preset: "head", params: {} },
