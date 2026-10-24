@@ -47,6 +47,20 @@ pub(super) fn split_head_at(ranges: &mut Vec<view::ViewRange>, first: u64) {
 }
 
 impl AsyncRecord {
+    pub(super) fn next_generation(&self) -> Result<u64, HandlerOutcome> {
+        self.published_cuts
+            .values()
+            .map(|cut| cut.generation)
+            .chain(
+                self.retired_cut_stages
+                    .iter()
+                    .filter_map(|namespace| namespace.rsplit(':').next()?.parse::<u64>().ok()),
+            )
+            .fold(self.generation, u64::max)
+            .checked_add(1)
+            .ok_or_else(|| transient("async generation exhausted"))
+    }
+
     pub(super) fn restore_undo_edits(&mut self, store: &McStore) -> Result<(), HandlerOutcome> {
         if !self.pending_undo_edits {
             return Ok(());
@@ -588,13 +602,7 @@ impl McHandler {
             ));
         }
         state.lineage = request.lineage_id.clone();
-        state.generation = state
-            .published_cuts
-            .values()
-            .map(|cut| cut.generation)
-            .fold(state.generation, u64::max)
-            .checked_add(1)
-            .ok_or_else(|| transient("async generation exhausted"))?;
+        state.generation = state.next_generation()?;
         state.lineage_first_ordinal = first;
         state.journal = Journal::new_record();
         state.journal.truncate = Some(None);

@@ -287,6 +287,37 @@ async fn historian_prelude_is_not_live_or_model_input() {
 }
 
 #[tokio::test]
+async fn a_zero_source_frozen_head_requires_its_cut_to_survive() {
+    let mut pair = Pair::open_with(Profile::Broca, false, Some("L"), false, false).await;
+    pair.append(120);
+    let mut rng = Rng(0xF20);
+    review_history(&mut pair, 99).await;
+    pair.notice(&mut rng, None).await;
+    descend_pair(&mut pair, 100, "child").await;
+    review_ride(&mut pair, "surface_change").await;
+    let version = newest_version(&pair).unwrap();
+    let store = pair.resident.store();
+    let mut state = load(store, &pair.reference).unwrap().unwrap();
+    state.applied = Some(version);
+    state.capture_resync_sources(store).unwrap();
+    let head = state.resync_sources.as_ref().unwrap().head.as_ref().unwrap();
+    assert!(head.messages.is_empty(), "the opaque prefix must not have held source rows");
+    assert!(head.required_cut.is_some());
+    assert!(summaries_in(&head.bytes).contains(&99));
+    state.cut_seed = None;
+    state.cut_first_ordinal = None;
+    state.lineage_first_ordinal = 0;
+    let codec = codec::Codec::from_params(&Value::Object(state.setup.params.clone())).unwrap();
+    state.restore_sources(store, codec).unwrap();
+    assert!(state.restored_head.is_none(), "an empty row proof cannot preserve the undone cut's summary");
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn full_revert_does_not_revalidate_an_opaque_cut_head() {
+    review_session_inner(Profile::Broca, 1_779_033_719, 12, true, Some(vec![0,1,2,3,4,5,6,9,10,11]), true).await;
+}
+
+#[tokio::test]
 async fn legacy_seed_crossing_its_wire_cut_is_refused_then_restarts_fresh() {
     let mut pair = Pair::open_with(Profile::OpenCode, false, Some("L"), false, false).await;
     pair.append(180);

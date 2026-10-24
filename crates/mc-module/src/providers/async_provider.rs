@@ -590,6 +590,10 @@ struct HistorianCadence {
 struct HistoryHeadSource {
     bytes: String,
     messages: Vec<SourceMessage>,
+    /// An opaque cut head may have no held source rows. Its proof is the
+    /// retained cut, not an empty digest list; undoing that cut invalidates it.
+    #[serde(default)]
+    required_cut: Option<(u64, String, String)>,
 }
 #[derive(Serialize, Deserialize)]
 struct RestoredHead {
@@ -1442,6 +1446,13 @@ impl State {
                         .range(..to)
                         .map(|(ordinal, entry)| source(ordinal, entry))
                         .collect(),
+                    required_cut: self.cut_seed.as_ref().map(|seed| {
+                        (
+                            seed.first_ordinal,
+                            seed.cut_mid.clone(),
+                            seed.cut_digest.clone(),
+                        )
+                    }),
                 })
             });
             self.resync_sources = Some(ResyncSources {
@@ -1474,13 +1485,7 @@ impl State {
         self.truncate_entries(None);
         self.todo_scan = None;
         self.lineage = None;
-        self.generation = self
-            .published_cuts
-            .values()
-            .map(|cut| cut.generation)
-            .fold(self.generation, u64::max)
-            .checked_add(1)
-            .ok_or_else(|| transient("async generation exhausted"))?;
+        self.generation = self.next_generation()?;
         self.engine = transform::compaction::State::new(self.reference(), self.engine.preset);
         self.produced_view = None;
         self.applied_view = None;
@@ -1885,11 +1890,13 @@ impl McHandler {
             .filter(|old| old.lineage != request.lineage_id || unsafe_existing)
         {
             self.authorize_async(binding, old)?;
-            let generation = old
-                .generation
-                .checked_add(old.engine.version_high_water)
-                .and_then(|v| v.checked_add(2))
-                .ok_or_else(|| transient("async generation exhausted"))?;
+            let generation = old.next_generation()?;
+            #[cfg(test)]
+            if std::env::var_os("MC_CUT_DIFF_DETAIL").is_some() {
+                let legacy = old.generation + old.engine.version_high_water + 2;
+                let namespace = format!("{}:async:{legacy}", old.key.engine_key());
+                eprintln!("FRESH NAMESPACE old={} engine_high={} legacy={legacy} selected={generation} max_stage={:?} legacy_occupied={}", old.generation, old.engine.version_high_water, old.published_cuts.values().map(|cut|cut.generation).max(), store.load_namespace_head(&namespace).map_err(transient)?.is_some());
+            }
             let history = store
                 .load_compartments(&old.namespace())
                 .map_err(transient)?;
@@ -1907,6 +1914,17 @@ impl McHandler {
                 let mut prior = load(store, &reference)?
                     .ok_or_else(|| transient("async session disappeared"))?;
                 prior.capture_resync_sources(store)?;
+                #[cfg(test)]
+                if std::env::var_os("MC_CUT_DIFF_DETAIL").is_some() {
+                    eprintln!(
+                        "FRESH HEAD PROOF {:?}",
+                        prior
+                            .resync_sources
+                            .as_ref()
+                            .and_then(|source| source.head.as_ref())
+                            .map(|head| (head.messages.len(), &head.required_cut))
+                    );
+                }
                 state.resync_sources = prior.resync_sources.take();
                 state.frozen_edits.merge(&prior.frozen_edits);
                 for archive in store.load_async_undo_edits(&reference).map_err(transient)? {
@@ -2321,6 +2339,7 @@ impl McHandler {
         let mut template: TransformRequest = decode(
             &json!({"v":2,"kind":"compaction.step","session_id":state.namespace(),"messages":[],"render_config":serde_json::to_string(&state.setup.params).map_err(transient)?,"model_key":model,"tool_present":false,"auto_search_enabled":false}),
         )?;
+        template.source_lineage_first_ordinal = Some(state.lineage_first_ordinal);
         #[cfg(test)]
         resident::counters::engine_pass();
         // The oracle deliberately never consults prefix selection or its proof.
@@ -5891,6 +5910,16 @@ impl AsyncRecord {
             .clear_async_compaction_drops(&source.namespace)
             .map_err(transient)?;
         if let Some(head) = &source.head {
+            let cut_supported = head
+                .required_cut
+                .as_ref()
+                .is_none_or(|(first, mid, digest)| {
+                    self.cut_seed.as_ref().is_some_and(|seed| {
+                        seed.first_ordinal == *first
+                            && seed.cut_mid == *mid
+                            && seed.cut_digest == *digest
+                    })
+                });
             let mapped = head
                 .messages
                 .iter()
@@ -5902,9 +5931,11 @@ impl AsyncRecord {
                 })
                 .collect::<Option<Vec<_>>>();
             if let Some(mapped) = mapped.filter(|mapped| {
-                mapped
-                    .windows(2)
-                    .all(|pair| pair[0].ordinal.checked_add(1) == Some(pair[1].ordinal))
+                cut_supported
+                    && (!mapped.is_empty() || head.required_cut.is_some())
+                    && mapped
+                        .windows(2)
+                        .all(|pair| pair[0].ordinal.checked_add(1) == Some(pair[1].ordinal))
                     && mapped.first().is_none_or(|first| {
                         self.entries
                             .first_key_value()

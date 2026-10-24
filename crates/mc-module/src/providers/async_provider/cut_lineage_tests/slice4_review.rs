@@ -1437,3 +1437,21 @@ async fn s4_replays_the_remaining_campaign_failures() {
     }
     assert!(failures.is_empty(), "{failures:#?}");
 }
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+#[ignore = "diagnostic replay of one native-host campaign session"]
+async fn s4_replay_host_campaign_seed() {
+    let number = std::env::var("MC_S4_REPLAY_SEED")
+        .unwrap()
+        .parse::<u64>()
+        .unwrap();
+    let profile = PROFILES[std::env::var("MC_S4_REPLAY_PROFILE")
+        .unwrap()
+        .parse::<usize>()
+        .unwrap()];
+    let kinds = std::env::var("MC_S4_KINDS")
+        .ok()
+        .map(|text| text.split(',').map(|n| n.parse::<u64>().unwrap()).collect());
+    let revert = std::env::var_os("MC_S4_NO_REVERT").is_none();
+    review_session_inner(profile, number, 12, revert, kinds, true).await;
+}

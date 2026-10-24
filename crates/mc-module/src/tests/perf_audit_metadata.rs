@@ -96,6 +96,7 @@ pub(crate) fn measure_fixture(
         || {
             std::hint::black_box(protected_tail_floor_ordinal(
                 &live,
+                req.source_lineage_first_ordinal.unwrap_or(0),
                 200_000.0,
                 70.0,
                 mc_tokenizer::estimate_tokens,

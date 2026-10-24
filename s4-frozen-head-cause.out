@@ -1,0 +1,15 @@
+ck motor run: job_id=01a16fdb-900d-743c-a838-4ef8bd7eec11 secret-file=/Users/ufukaltinok/.local/share/cortexkit/ck-motor/direct-secrets/01a16fdb-900d-743c-a838-4ef8bd7eec11
+cargo 1.99.0 (5f94df478 2026-08-27)
+   Compiling mc-module v0.49.13 (/Users/ufukaltinok/.local/share/cortexkit/alfonso/worktrees/8f93aad09f2535d0/bg_c644789ea485326b/crates/mc-module)
+    Finished `test` profile [unoptimized + debuginfo] target(s) in 52.44s
+
+running 1 test
+test providers::async_provider::differential_tests::cut_lineage_tests::production_cuts::slice4_review::s4_replay_host_campaign_seed ...      Running unittests src/lib.rs (/run/motor/target/debug/deps/mc_module-a100b82d7b7ce97d)
+FRESH NAMESPACE old=13 engine_high=10 legacy=25 selected=14 max_stage=Some(12) legacy_occupied=false
+FRESH HEAD PROOF Some((0, Some((156, "m155", "c0cb9646c44495d2616bef0c9c02a5008fb611a3398411ab4b387726962733f5"))))
+FRESH NAMESPACE old=13 engine_high=10 legacy=25 selected=14 max_stage=Some(12) legacy_occupied=false
+FRESH HEAD PROOF Some((156, None))
+ok
+
+test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 2986 filtered out; finished in 6.95s
+
