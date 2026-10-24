@@ -537,10 +537,20 @@ impl AsyncRecord {
             .range(window.from..first)
             .map(|(_, entry)| entry.inbound());
         let mut messages = Vec::new();
-        let mut bytes = 128usize;
+        let mut bytes = serde_json::to_vec(&HistorianPrelude {
+            from: window.from,
+            ordinal_base: window.ordinal_base,
+            reset_next,
+            messages: Vec::new(),
+        })
+        .map_err(transient)?
+        .len();
         for source in carried.chain(live) {
             let source = source?;
-            bytes = bytes.saturating_add(serde_json::to_vec(&source).map_err(transient)?.len() + 1);
+            bytes = bytes.saturating_add(
+                serde_json::to_vec(&source).map_err(transient)?.len()
+                    + usize::from(!messages.is_empty()),
+            );
             if bytes > MAX_HISTORIAN_PRELUDE_BYTES {
                 #[cfg(test)]
                 cut_runtime::measurements::prelude(_store, bytes, true);

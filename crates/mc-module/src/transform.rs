@@ -11850,16 +11850,14 @@ fn resolve_boundary_state(
     }
 
     if req.logical_prefix.as_ref().is_some_and(|prefix| {
+        // Continuity uses physical source ordinals. A delivered reminder can
+        // be synthetic for rendering while still being the first lineage row.
         prefix.certifies_omitted_boundary(
             core,
             meta,
             req.messages
                 .iter()
-                .filter(|message| {
-                    message.ordinal >= prefix.tail_from
-                        && !message.ck.meta.synthetic
-                        && message.ck.role != "system"
-                })
+                .filter(|message| message.ordinal >= prefix.tail_from)
                 .map(|message| message.ordinal)
                 .min(),
         )
