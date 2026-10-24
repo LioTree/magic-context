@@ -13,7 +13,6 @@ import { afterEach, beforeEach, describe, expect, it, spyOn } from "bun:test";
 import { mkdirSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
-import { historianRunConfig } from "@magic-context/core/config/live-run-config";
 import { LiveConfigReader } from "@magic-context/core/config/live-snapshot";
 import { acquireCompartmentLease } from "@magic-context/core/features/magic-context/compartment-lease";
 import { getCompartments } from "@magic-context/core/features/magic-context/compartment-storage";
@@ -31,6 +30,7 @@ import {
 	clearContextHandlerSession,
 	registerPiContextHandler,
 } from "./context-handler";
+import { piTurnTwoDeps } from "./index";
 import { __setPiHarnessKindForTesting } from "./pi-harness-kind";
 import * as piHistorian from "./pi-historian-runner";
 import { type PiHistorianDeps, runPiHistorian } from "./pi-historian-runner";
@@ -218,7 +218,7 @@ describe("a Pi firing selects turn two from the allowlist alone", () => {
 });
 
 describe("the Pi host re-reads the switch from its live reader while a reply is pending", () => {
-	it("the callback the handler passes follows a reload of the user config", () => {
+	it("the builder its resolver uses follows a real reload", () => {
 		const root = createTestTempDirFromPath(
 			join(tmpdir(), "mc-pi-live-switch-"),
 		);
@@ -237,23 +237,21 @@ describe("the Pi host re-reads the switch from its live reader while a reply is 
 				);
 			write("allowlist");
 
-			const directory = projectDir;
-			const boot = loadPiConfigDetailed({ cwd: directory }, false).config;
+			const boot = loadPiConfigDetailed({ cwd: projectDir }, false).config;
 			const reader = new LiveConfigReader(
-				directory,
+				projectDir,
 				boot,
-				() => loadPiConfigDetailed({ cwd: directory }, false).config,
+				() => loadPiConfigDetailed({ cwd: projectDir }, false).config,
 				() => {},
 			);
 			reader.poll();
-			// This is the expression resolveContextOptionsForProject builds: it
-			// re-polls the project's reader and samples the switch again.
-			const turnTwoIsEnabled = () =>
-				historianRunConfig(boot, reader.poll().effective).historian
-					?.turn_two !== "off";
-			expect(turnTwoIsEnabled()).toBe(true);
+			// `piTurnTwoDeps` builds the exact option the per-pass resolver hands the
+			// runner. Assert the dep itself, not just its effect.
+			const deps = piTurnTwoDeps(boot, () => reader.poll().effective);
+			expect(typeof deps.turnTwoIsEnabled).toBe("function");
+			expect(deps.turnTwoIsEnabled?.()).toBe(true);
 			write("off");
-			expect(turnTwoIsEnabled()).toBe(false);
+			expect(deps.turnTwoIsEnabled?.()).toBe(false);
 		} finally {
 			if (previousConfigHome === undefined) delete process.env.XDG_CONFIG_HOME;
 			else process.env.XDG_CONFIG_HOME = previousConfigHome;

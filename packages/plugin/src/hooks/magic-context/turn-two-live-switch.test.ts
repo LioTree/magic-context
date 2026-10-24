@@ -44,6 +44,7 @@ import type { PluginContext } from "../../plugin/types";
 import { Database } from "../../shared/sqlite";
 import { closeQuietly } from "../../shared/sqlite-helpers";
 import { createTestTempDirFromPath } from "../../shared/test-temp-dir";
+import { openCode2TurnTwoDeps } from "../../v2/hooks/context";
 import { COMPARTMENT_AGENT_COMBINED_SYSTEM_PROMPT } from "./compartment-prompt";
 import * as runnerModule from "./compartment-runner";
 import { runCompartmentAgent } from "./compartment-runner";
@@ -473,7 +474,7 @@ describe("the OpenCode 1 host builds a live callback from its own config samplin
 });
 
 describe("the OpenCode 2 host re-samples the switch through its live reader", () => {
-    it("the value its callback returns follows a reload of the user config", () => {
+    it("the turn-two deps its transform receives follow a real reload", () => {
         useTempConfigHome("turn-two-live-v2-config-");
         useProjectDirectory("turn-two-live-v2-project-");
         writeTurnTwo("allowlist");
@@ -485,12 +486,14 @@ describe("the OpenCode 2 host re-samples the switch through its live reader", ()
             () => {},
         );
         reader.poll();
-        // OpenCode 2 builds its per-run config from the live snapshot and passes
-        // the sampled boolean as a callback. Mirror that expression exactly.
-        const sampled = () =>
-            historianRunConfig(boot, reader.poll().effective).historian?.turn_two !== "off";
-        expect(sampled()).toBe(true);
+        // `openCode2TurnTwoDeps` builds exactly the two fields the transform gets.
+        const deps = openCode2TurnTwoDeps(boot, () => {
+            return historianRunConfig(boot, reader.poll().effective).historian?.turn_two;
+        });
+        expect(deps.historianTurnTwo).toBe("allowlist");
+        expect(typeof deps.historianTurnTwoIsEnabled).toBe("function");
+        expect(deps.historianTurnTwoIsEnabled?.()).toBe(true);
         writeTurnTwo("off");
-        expect(sampled()).toBe(false);
+        expect(deps.historianTurnTwoIsEnabled?.()).toBe(false);
     });
 });

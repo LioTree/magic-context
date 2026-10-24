@@ -646,6 +646,37 @@ function formatPiMarkerRehydrationLine(
 	);
 }
 
+/**
+ * The Pi live switch. The historian runner asks this after each provider reply, so
+ * it must answer from a fresh poll of the project's config reader: a reload of
+ * `historian.turn_two` to "off" then revokes a run whose reply is still pending,
+ * instead of applying decisions the user just turned off.
+ *
+ * `sampleEffective` returns the config the live reader holds after polling.
+ */
+export function piTurnTwoIsEnabled(
+	base: MagicContextConfig,
+	sampleEffective: () => MagicContextConfig,
+): boolean {
+	return (
+		historianRunConfig(base, sampleEffective()).historian?.turn_two !== "off"
+	);
+}
+
+/**
+ * The historian option that re-reads the switch after provider replies, so a
+ * reload of `historian.turn_two` to "off" revokes a run whose reply is still
+ * pending. `sampleEffective` re-polls the project's live config reader.
+ */
+export function piTurnTwoDeps(
+	base: MagicContextConfig,
+	sampleEffective: () => MagicContextConfig,
+): Pick<PiHistorianOptions, "turnTwoIsEnabled"> {
+	return {
+		turnTwoIsEnabled: () => piTurnTwoIsEnabled(base, sampleEffective),
+	};
+}
+
 export const __test = {
 	logPiConfigLoad,
 	formatPiMarkerRehydrationLine,
@@ -1839,14 +1870,17 @@ async function startPiMagicContextRuntime(
 		// re-polling inside the callback answers with the file as it reads now.
 		// That is what lets a reload to "off" revoke a turn two whose reply is
 		// still pending, instead of applying it on the start-time value.
-		const turnTwoIsEnabled = () =>
-			historianRunConfig(
-				project.config,
-				liveReaderFor(dir, project.config).poll().effective,
-			).historian?.turn_two !== "off";
 		return {
 			...project.contextOptions,
-			historian: historian ? { ...historian, turnTwoIsEnabled } : historian,
+			historian: historian
+				? {
+						...historian,
+						...piTurnTwoDeps(
+							project.config,
+							() => liveReaderFor(dir, project.config).poll().effective,
+						),
+					}
+				: historian,
 			cacheTtlConfig: sampled.cache_ttl,
 			cacheTtlConfigured: sampled.cacheTtlConfigured,
 		};
