@@ -43,7 +43,7 @@ chrono = { version = "0.4", default-features = false, features = ["clock"] }
 # unify with mc-store's and cortexkit-store's.
 rusqlite = { workspace = true }
 # subc-protocol is resolved from crates.io, matching the role crate's dependency.
-cortexkit-role-tool-provider = "=0.10.0"
+cortexkit-role-tool-provider = "=0.10.4"
 cortexkit-role-agent-data = "0.2.2"
 # Runner-owned tags and context-ceiling details for async compaction.
 cortexkit-role-llm-runner = "=0.5.2"
