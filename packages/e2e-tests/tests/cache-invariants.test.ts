@@ -211,15 +211,111 @@ function bumpProjectEpoch(): void {
     });
 }
 
+/** Open OpenCode 2's throwaway host store (the copy the plugin re-reads usage from). */
+function openOpenCode2HostDb(): Database {
+    const env = (h as unknown as { opencode: { env: { OPENCODE_DB: string } } }).opencode.env;
+    return openTestDb(join(h.dataDir, "opencode", env.OPENCODE_DB));
+}
+
+/**
+ * The completion time the host stored for the session's latest assistant
+ * reply, or undefined while it is not stored yet.
+ */
+async function latestAssistantCompletion(sessionId: string): Promise<number | undefined> {
+    if (h.host === "opencode2") {
+        const hostDb = openOpenCode2HostDb();
+        try {
+            const row = hostDb
+                .prepare(
+                    "SELECT json_extract(data, '$.time.completed') AS completed FROM session_message WHERE session_id = ? AND type = 'assistant' ORDER BY seq DESC LIMIT 1",
+                )
+                .get(sessionId) as { completed: unknown } | null;
+            return typeof row?.completed === "number" ? row.completed : undefined;
+        } finally {
+            hostDb.close();
+        }
+    }
+    if (h instanceof TestHarness) {
+        const response = await h.client.session.messages({ path: { id: sessionId } });
+        const messages = (response.data ?? []) as Array<{
+            info: { role: string; time?: { completed?: number } };
+        }>;
+        const assistant = messages.filter((message) => message.info.role === "assistant").at(-1);
+        return assistant?.info.time?.completed;
+    }
+    throw new Error(`no view of the host's reply completion time on ${h.host}`);
+}
+
+/** Hosts whose stored reply completion time the test can read. */
+function hostCompletionVisible(): boolean {
+    return h.host === "opencode2" || h instanceof TestHarness;
+}
+
+/**
+ * Wait until the plugin has stored the response clock of the turn that just
+ * finished.
+ *
+ * A host reports a turn as finished (OpenCode 1's prompt response, OpenCode 2's
+ * session wait) before the plugin's completion handler has stored that reply's
+ * completion time: OpenCode 1 stores it from a `message.updated` event and
+ * OpenCode 2 from its `session.execution.succeeded` subscriber, and both run
+ * asynchronously. Aging the clock before that write lands does not stick: the
+ * handler then stores a fresh clock for the reply (its completion time, or on
+ * OpenCode 1 the handler's own time when the update carries none), which is
+ * newer than the aged value, so the next pass sees a warm cache and never folds.
+ *
+ * Where the host's stored completion time is visible, the clock must equal it
+ * exactly. That excludes an earlier write for the same reply that stamped the
+ * handler's own time instead. Elsewhere, it must be newer than the moment the
+ * provider received this turn's request, which every earlier turn's clock
+ * predates.
+ */
+async function waitForResponseClock(sessionId: string): Promise<void> {
+    const turnRequest = mainAgentRequests(h.mock.requests()).at(-1);
+    if (!turnRequest) throw new Error("no main-agent request to measure the response clock against");
+    let completed: number | undefined;
+    if (hostCompletionVisible()) {
+        // The reply this turn produced: completed after its request reached the provider.
+        const deadline = Date.now() + 30_000;
+        for (;;) {
+            const value = await latestAssistantCompletion(sessionId);
+            if (value !== undefined && value > turnRequest.receivedAt) {
+                completed = value;
+                break;
+            }
+            if (Date.now() > deadline) {
+                throw new Error(
+                    `host never stored this turn's reply completion (latest=${value}, request at ${turnRequest.receivedAt})`,
+                );
+            }
+            await Bun.sleep(20);
+        }
+    }
+    await h.waitFor(
+        () => {
+            const row = writeContextDb((db) =>
+                db
+                    .prepare("SELECT last_response_time AS clock FROM session_meta WHERE session_id = ? AND harness = ?")
+                    .get(sessionId, h.harnessId),
+            ) as { clock: number } | null;
+            const clock = row?.clock ?? 0;
+            return completed !== undefined ? clock === completed : clock > turnRequest.receivedAt;
+        },
+        { timeoutMs: 30_000, intervalMs: 20, label: "plugin stores the last reply's response clock" },
+    );
+}
+
 /**
  * Age the session past its prompt-cache TTL: the idle-expiry rebuild, a
  * genuine HARD trigger. An external (dashboard) memory change no longer forces
  * a HARD of its own; it waits for the next natural rebuild, and an expired
  * cache is one. The fold clock moves with the response clock, so the last
  * response stays newer than the last fold and the next pass treats the expiry
- * as unconsumed.
+ * as unconsumed. The aging waits for the plugin to store the last reply's
+ * response clock first, or that late write would undo it.
  */
-function expireCache(sessionId: string): void {
+async function expireCache(sessionId: string): Promise<void> {
+    await waitForResponseClock(sessionId);
     const idle = 16.5 * 60 * 60 * 1000;
     writeContextDb((db) => {
         const result = db
@@ -232,8 +328,7 @@ function expireCache(sessionId: string): void {
     if (h.host === "opencode2") {
         // OpenCode 2 re-reads the last reply's completion time before scheduling;
         // age that host copy too, or it replaces the aged response clock.
-        const env = (h as unknown as { opencode: { env: { OPENCODE_DB: string } } }).opencode.env;
-        const hostDb = openTestDb(join(h.dataDir, "opencode", env.OPENCODE_DB));
+        const hostDb = openOpenCode2HostDb();
         try {
             hostDb
                 .prepare(
@@ -713,7 +808,7 @@ describe("cache invariants — m[0]/m[1] taxonomy (B class)", () => {
                 //#then — a genuine HARD trigger (an idle cache expiry) folds it into m[0].
                 h.mock.setDefault({ text: "B10 hard-pressure", usage: EXECUTE_USAGE });
                 await h.sendPrompt(sessionId, "B10 turn 8: high usage marks the next pass execute.");
-                expireCache(sessionId);
+                await expireCache(sessionId);
                 setDefer("B10 refold");
                 await h.sendPrompt(sessionId, "B10 turn 9: execute pass HARD-refolds m[0].");
                 requests = mainAgentRequests(h.mock.requests());
@@ -895,7 +990,7 @@ describe("cache invariants — m[0]/m[1] taxonomy (B class)", () => {
                 //#then — a genuine HARD trigger (an idle cache expiry) shows the new text.
                 h.mock.setDefault({ text: "B11 hard-pressure", usage: EXECUTE_USAGE });
                 await h.sendPrompt(sessionId, "B11 turn 8: high usage marks the next pass execute.");
-                expireCache(sessionId);
+                await expireCache(sessionId);
                 setDefer("B11 refold");
                 await h.sendPrompt(sessionId, "B11 turn 9: execute pass HARD-refolds m[0].");
                 requests = mainAgentRequests(h.mock.requests());
@@ -965,7 +1060,7 @@ describe("cache invariants — m[0]/m[1] taxonomy (B class)", () => {
                 // mustMaterialize must re-materialize m[0] on the expiry.
                 h.mock.setDefault({ text: "B12 hard-pressure", usage: EXECUTE_USAGE });
                 await h.sendPrompt(sessionId, "B12 turn 6: high usage marks the next pass execute.");
-                expireCache(sessionId);
+                await expireCache(sessionId);
                 setDefer("B12 refold");
                 await h.sendPrompt(sessionId, "B12 turn 7: execute pass HARD-refolds m[0].");
 
