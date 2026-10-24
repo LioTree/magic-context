@@ -32,6 +32,7 @@
     {"id":"clean4","ordinal":4,"role":"user","parts":[{"type":"text","text":"ignored but selected","ignored":true},{"type":"text","text":"meaningful"},{"type":"reasoning","text":"not selected"}],"createdAt":null,"completedAt":null},
     {"id":"clean5","ordinal":5,"role":"user","parts":[{"type":"text","text":"outside <system-reminder>\nThe user sent the following message:\nsteered words\n\nPlease address this message and continue with your tasks.\n</system-reminder> tail"}],"createdAt":null,"completedAt":null},
     {"id":"clean6","ordinal":6,"role":"user","parts":[{"type":"text","text":"<system-reminder>\nThe user sent the following message:\nonly wrapper\n\nPlease address this message and continue with your tasks.\n</system-reminder>"}],"createdAt":null,"completedAt":null},
-    {"id":"clean7","ordinal":7,"role":"tool","parts":[{"type":"text","text":"not indexed"}],"createdAt":null,"completedAt":null}
+    {"id":"clean7","ordinal":7,"role":"tool","parts":[{"type":"text","text":"not indexed"}],"createdAt":null,"completedAt":null},
+    {"id":"clean8","ordinal":8,"role":"assistant","parts":[{"type":"text","text":"before <SYSTEM-REMINDER source='host'>outer <system-reminder>inner</system-reminder> still hidden</SYSTEM-REMINDER> after <system-reminder/> end </system-reminder> visible"}],"createdAt":null,"completedAt":null}
   ]
 }
