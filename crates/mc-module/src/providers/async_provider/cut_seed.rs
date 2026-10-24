@@ -728,16 +728,36 @@ impl AsyncRecord {
             .max()
             .unwrap_or(0);
         let mut todo = previous.as_ref().and_then(|seed| seed.todo.clone());
-        let mut scan = super::super::runner_todo::TodoScan::default();
-        if let Some(latest) = scan.advance(
-            self.lineage.as_deref().unwrap_or_default(),
-            &prepared(self, codec, base..first, lineage_from)?.messages,
+        if let (Some(state_json), Some(owner), Some(hash)) = (
+            &loaded.meta.last_todo_state,
+            &loaded.meta.last_todo_state_owner_message_id,
+            &loaded.meta.last_todo_state_hash,
         ) {
-            todo = Some(SeedTodo {
-                state_json: latest.state_json,
-                owner_message_id: latest.owner_message_id,
-                state_hash: latest.state_hash,
-            });
+            if self
+                .mid_index
+                .get(owner)
+                .is_none_or(|ordinal| *ordinal < first)
+            {
+                // The transcript scan already proved this is the latest todo;
+                // when its owner is below the cut, no older rows need decoding.
+                todo = Some(SeedTodo {
+                    state_json: state_json.clone(),
+                    owner_message_id: owner.clone(),
+                    state_hash: hash.clone(),
+                });
+            } else {
+                let mut scan = super::super::runner_todo::TodoScan::default();
+                if let Some(latest) = scan.advance(
+                    self.lineage.as_deref().unwrap_or_default(),
+                    &prepared(self, codec, base..first, lineage_from)?.messages,
+                ) {
+                    todo = Some(SeedTodo {
+                        state_json: latest.state_json,
+                        owner_message_id: latest.owner_message_id,
+                        state_hash: latest.state_hash,
+                    });
+                }
+            }
         }
         // The window's state, keyed by the window's messages.
         let window_mids: HashSet<&str> = self

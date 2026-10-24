@@ -3665,10 +3665,12 @@ impl McHandler {
                 store
                     .replace_compartments(&state.namespace(), &retained)
                     .map_err(transient)?;
-                // Forked rows can reuse message ids with different block
-                // identities. Revalidate the surviving sources in a fresh
-                // namespace rather than carrying the parent's row cache.
-                state.reset(store)?;
+                // A cut lineage must rebuild from its surviving window when
+                // forked rows reuse ids with different block identities. A
+                // full lineage keeps the engine's verified-prefix descent.
+                if state.lineage_first_ordinal > 0 {
+                    state.reset(store)?;
+                }
                 descended = true;
             } else {
                 state.reset(store)?;
@@ -5211,7 +5213,15 @@ impl McHandler {
                 .ok_or_else(|| transient("store unavailable"))?;
             let loaded = store.load_meta(&state.namespace()).map_err(transient)?;
             let mut meta = loaded.meta;
-            let seed = state.recovery_seed(store)?;
+            let seed = if state
+                .entries
+                .first_key_value()
+                .is_some_and(|(n, _)| *n == 0)
+            {
+                None
+            } else {
+                state.recovery_seed(store)?
+            };
             let todo = seed.as_ref().and_then(|seed| seed.todo.as_ref());
             meta.last_todo_state = todo.map(|todo| todo.state_json.clone());
             meta.last_todo_state_owner_message_id = todo.map(|todo| todo.owner_message_id.clone());
