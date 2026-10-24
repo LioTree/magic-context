@@ -14,10 +14,9 @@ import {
     applyCurateMemoryMutation,
     applyHistorianRevision,
 } from "./lifecycle-applier";
-import { CHECK_SYSTEM_PROMPTS } from "./lifecycle-gates";
-import { lifecycleTextHash } from "./lifecycle-text";
 import { getMemoryById, insertMemory, setMemoryClassification } from "./storage-memory";
 import { recordItemScores } from "./turn-two-scoring";
+import { authorizationFixture } from "./turn-two-test-fixtures.test";
 
 function fixture() {
     const db = new Database(":memory:");
@@ -209,13 +208,19 @@ test("s02 P1: historian merge carries a retained safety clause into the survivor
     try {
         const text = "Use the release branch for explicit releases.";
         const evidence = { blockStartOrdinal: 42, excerpt: text };
-        const profile = {
-            provider: "review",
-            modelId: "review",
-            variant: null,
-            temperature: 0,
-            systemHash: "historian",
-        };
+        const authorization = authorizationFixture(
+            {
+                lane: "opencode-1",
+                carrier: "hidden-completion",
+                provider: "review",
+                modelId: "review",
+                variant: null,
+                temperature: 0,
+                thinkingLevel: null,
+            },
+            "historian",
+        );
+        const profile = authorization.profile;
         const sources = [f.rule.id, f.other.id].map((id) => ({
             ...getMemoryById(f.db, id)!,
             revision: 1,
@@ -249,17 +254,11 @@ test("s02 P1: historian merge carries a retained safety clause into the survivor
                 ],
                 sources,
                 historianProfile: profile,
-                validatedProfiles: [
-                    profile,
-                    ...Object.values(CHECK_SYSTEM_PROMPTS).map((system) => ({
-                        ...profile,
-                        systemHash: lifecycleTextHash(system),
-                    })),
-                ],
+                validatedProfiles: authorization.rows,
             },
             { sessionId: "ses-review", harness: "review" },
             async (request) => ({
-                profile: { ...profile, systemHash: request.systemHash },
+                profile: authorization.checkProfile(request.systemHash),
                 usage: { tokens: 1 },
                 verdicts: (request.kind === "compatibility" ? request.pairs : request.operands).map(
                     (operand) => ({

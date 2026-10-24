@@ -37,23 +37,23 @@ import {
     retainedTurnTwoChild,
 } from "./turn-two-children";
 import { coverageNotice, LEXICAL_ONLY_NOTICE } from "./turn-two-envelope";
+import { authorizationFixture } from "./turn-two-test-fixtures.test";
 
 const PROJECT = "git:turn-two";
-const HISTORIAN_HASH = lifecycleTextHash("historian system prompt");
-const PROFILE: ReportedProfile = {
-    provider: "test",
-    modelId: "validated-model",
-    variant: null,
-    temperature: 0,
-    systemHash: HISTORIAN_HASH,
-};
-const VALIDATED: ReportedProfile[] = [
-    PROFILE,
-    ...Object.values(CHECK_SYSTEM_PROMPTS).map((system) => ({
-        ...PROFILE,
-        systemHash: lifecycleTextHash(system),
-    })),
-];
+const AUTHORIZATION = authorizationFixture(
+    {
+        lane: "opencode-1",
+        carrier: "hidden-completion",
+        provider: "test",
+        modelId: "validated-model",
+        variant: null,
+        temperature: 0,
+        thinkingLevel: null,
+    },
+    "historian system prompt",
+);
+const PROFILE = AUTHORIZATION.profile;
+const VALIDATED = AUTHORIZATION.rows;
 
 function store(): Database {
     const db = new Database(":memory:");
@@ -85,6 +85,7 @@ function publish(
         chunkStart: 1,
         chunkEnd: 1000,
     });
+    AUTHORIZATION.persist(db, send.stageKey);
     const blocks: TurnOnePrintedBlock[] = facts.flatMap((fact) =>
         fact.block
             ? [
@@ -147,7 +148,7 @@ function passingVerdicts(request: CheckRequest): CheckReply {
         verdicts: (request.kind === "compatibility" ? request.pairs : request.operands).map(
             (operand) => ({ id: operand.id, verdict: passing as "yes" | "no" }),
         ),
-        profile: { ...PROFILE, systemHash: request.systemHash },
+        profile: AUTHORIZATION.checkProfile(request.systemHash),
         usage: { tokens: 7 },
     };
 }
@@ -928,7 +929,7 @@ describe("turn two gated edits", () => {
         }
     });
 
-    test("an unvalidated reported profile defers the edit (+1, reported id in the receipt) while a new fact in the reply is admitted; the cap makes it pending for good", async () => {
+    test("an unmatched identity retries every action without admitting its new sibling; the cap makes both pending for good", async () => {
         const db = store();
         try {
             const { memory, published, decision } = editFixture(db);
@@ -958,15 +959,14 @@ describe("turn two gated edits", () => {
             expect(fact(db, published.factIds[0]!)).toMatchObject({
                 state: "retryable",
                 fact_attempts: 1,
-                reason: "unvalidated_profile",
+                reason: "identity_mismatch",
             });
-            expect(fact(db, sibling.factIds[0]!)).toMatchObject({ state: "applied" });
-            const receipt = db
-                .prepare(
-                    "SELECT receipt_json FROM memory_decision_receipts WHERE fact_id=? AND receipt_json LIKE '%unvalidated%'",
-                )
-                .get(published.factIds[0]!) as { receipt_json: string };
-            expect(JSON.parse(receipt.receipt_json).reportedProfile.modelId).toBe("fallback-model");
+            expect(fact(db, sibling.factIds[0]!)).toMatchObject({
+                state: "retryable",
+                fact_attempts: 1,
+                reason: "identity_mismatch",
+            });
+            expect(getMemoryById(db, memory.id)?.content).toBe("Old rule. Keep rule.");
             // A differing variant on the configured model id also defers.
             await runOnce(publish(db, []).publicationId, { ...PROFILE, variant: "high" });
             await runOnce(publish(db, []).publicationId, { ...PROFILE, temperature: 1 });
@@ -1082,7 +1082,7 @@ describe("turn two narrow checks", () => {
                 expect(request.systemHash).toBe(
                     lifecycleTextHash(CHECK_SYSTEM_PROMPTS[request.kind]),
                 );
-                expect(request.systemHash).not.toBe(HISTORIAN_HASH);
+                expect(request.systemHash).not.toBe(PROFILE.systemHash);
                 expect(JSON.stringify(request)).not.toContain("SECRET");
                 expect(JSON.stringify(request)).not.toContain("## Fact");
             }
@@ -1465,6 +1465,7 @@ describe("turn two retrieval", () => {
                 chunkStart: 1,
                 chunkEnd: 2,
             });
+            AUTHORIZATION.persist(db, send.stageKey);
             db.transaction(() =>
                 commitTurnOnePublication(db, {
                     send,

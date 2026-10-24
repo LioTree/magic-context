@@ -23,15 +23,13 @@ import { initializeDatabase } from "../storage-db";
 import { applyMemoryAdmission } from "./lifecycle-applier";
 import { MAX_STAGE2_ATTEMPTS } from "./lifecycle-constants";
 import {
-    CHECK_SYSTEM_PROMPTS,
     type CheckReply,
     type CheckRequest,
     type GateContext,
     planMemoryRevision,
-    type ReportedProfile,
     type RevisionDecision,
 } from "./lifecycle-gates";
-import { lifecycleTextHash, splitMemoryClauses } from "./lifecycle-text";
+import { splitMemoryClauses } from "./lifecycle-text";
 import { getMemoryById, insertMemory } from "./storage-memory";
 import { saveEmbedding } from "./storage-memory-embeddings";
 import {
@@ -48,22 +46,23 @@ import {
     type TurnTwoStageReply,
 } from "./turn-two";
 import { retrieveTurnTwoNeighbours } from "./turn-two-retrieval";
+import { authorizationFixture } from "./turn-two-test-fixtures.test";
 
 const PROJECT = "git:turn-two-review";
-const PROFILE: ReportedProfile = {
-    provider: "test",
-    modelId: "validated-model",
-    variant: null,
-    temperature: 0,
-    systemHash: lifecycleTextHash("historian system prompt"),
-};
-const VALIDATED: ReportedProfile[] = [
-    PROFILE,
-    ...Object.values(CHECK_SYSTEM_PROMPTS).map((system) => ({
-        ...PROFILE,
-        systemHash: lifecycleTextHash(system),
-    })),
-];
+const AUTHORIZATION = authorizationFixture(
+    {
+        lane: "opencode-1",
+        carrier: "hidden-completion",
+        provider: "test",
+        modelId: "validated-model",
+        variant: null,
+        temperature: 0,
+        thinkingLevel: null,
+    },
+    "historian system prompt",
+);
+const PROFILE = AUTHORIZATION.profile;
+const VALIDATED = AUTHORIZATION.rows;
 
 function store(): Database {
     const db = new Database(":memory:");
@@ -88,6 +87,7 @@ function publish(
         chunkStart: 1,
         chunkEnd: 1000,
     });
+    AUTHORIZATION.persist(db, send.stageKey);
     const blocks: TurnOnePrintedBlock[] = facts.flatMap((fact) =>
         fact.block
             ? [
@@ -147,7 +147,7 @@ function passingVerdicts(request: CheckRequest): CheckReply {
         verdicts: (request.kind === "compatibility" ? request.pairs : request.operands).map(
             (operand) => ({ id: operand.id, verdict: passing as "yes" | "no" }),
         ),
-        profile: { ...PROFILE, systemHash: request.systemHash },
+        profile: AUTHORIZATION.checkProfile(request.systemHash),
         usage: null,
     };
 }
@@ -665,7 +665,7 @@ const carrier = {
         const passing = request.kind === "disproof" || request.kind === "support" ? "yes" : "no";
         return {
             verdicts: (request.kind === "compatibility" ? request.pairs : request.operands).map((o) => ({ id: o.id, verdict: passing })),
-            profile: { ...input.profile, systemHash: request.systemHash },
+            profile: input.validated.find(row => row.systemHash === request.systemHash),
             usage: null,
         };
     },
@@ -872,6 +872,7 @@ describe("S6 review probes: projection (passed at dafaede1)", () => {
                 chunkStart: 1,
                 chunkEnd: 50,
             });
+            AUTHORIZATION.persist(f.db, send.stageKey);
             f.db.transaction(() =>
                 commitTurnOnePublication(f.db, {
                     send,

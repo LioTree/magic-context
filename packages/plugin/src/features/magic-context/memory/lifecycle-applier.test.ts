@@ -9,10 +9,10 @@ import {
     memoryAdoptionClass,
 } from "./lifecycle-applier";
 import { checkMemoryRevision } from "./lifecycle-check-ledger";
-import { CHECK_SYSTEM_PROMPTS, type GateContext, type RevisionDecision } from "./lifecycle-gates";
-import { lifecycleTextHash } from "./lifecycle-text";
+import type { GateContext, RevisionDecision } from "./lifecycle-gates";
 import { promoteSessionFactsDurable } from "./promotion";
 import { getMemoryById, insertMemory } from "./storage-memory";
+import { authorizationFixture } from "./turn-two-test-fixtures.test";
 
 function store() {
     const db = new Database(":memory:");
@@ -201,13 +201,19 @@ describe("memory lifecycle applier", () => {
             const memory = insertMemory(db, { ...input, content: "Old rule. Keep rule." });
             const before = db.prepare("SELECT * FROM memories").all();
             const evidence = { blockStartOrdinal: 42, excerpt: "New rule." };
-            const profile = {
-                provider: "test",
-                modelId: "reported",
-                variant: null,
-                temperature: 0,
-                systemHash: "historian",
-            };
+            const authorization = authorizationFixture(
+                {
+                    lane: "opencode-1",
+                    carrier: "hidden-completion",
+                    provider: "test",
+                    modelId: "reported",
+                    variant: null,
+                    temperature: 0,
+                    thinkingLevel: null,
+                },
+                "historian",
+            );
+            const profile = authorization.profile;
             const decision: RevisionDecision = {
                 key: "edit",
                 action: "edit",
@@ -235,13 +241,7 @@ describe("memory lifecycle applier", () => {
                 ],
                 sources: [{ ...memory, revision: 1 }],
                 historianProfile: profile,
-                validatedProfiles: [
-                    profile,
-                    ...Object.values(CHECK_SYSTEM_PROMPTS).map((system) => ({
-                        ...profile,
-                        systemHash: lifecycleTextHash(system),
-                    })),
-                ],
+                validatedProfiles: authorization.rows,
             };
             let calls = 0;
             const send = async (
@@ -249,7 +249,7 @@ describe("memory lifecycle applier", () => {
             ) => {
                 calls++;
                 return {
-                    profile: { ...profile, systemHash: request.systemHash },
+                    profile: authorization.checkProfile(request.systemHash),
                     usage: { tokens: 10 },
                     verdicts: (request.kind === "compatibility"
                         ? request.pairs

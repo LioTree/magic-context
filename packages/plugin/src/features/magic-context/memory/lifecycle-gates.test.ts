@@ -1,4 +1,5 @@
 import { describe, expect, test } from "bun:test";
+import { CHECK_SCHEMA_CONTRACT } from "./historian-schema";
 import {
     CHECK_SYSTEM_PROMPTS,
     type CheckRequest,
@@ -23,7 +24,7 @@ function fixture(): { decision: RevisionDecision; context: GateContext } {
         thinkingLevel: null,
         systemHash: lifecycleTextHash("historian system"),
         schemaHash: lifecycleTextHash("schema contract"),
-        toolHash: lifecycleTextHash("[]"),
+        toolHash: lifecycleTextHash('["historian"]'),
     };
     const evidence = { blockStartOrdinal: 42, excerpt: "The limit was 32 KiB; it is now 64 KiB." };
     return {
@@ -67,6 +68,8 @@ function fixture(): { decision: RevisionDecision; context: GateContext } {
                 ...Object.values(CHECK_SYSTEM_PROMPTS).map((system) => ({
                     ...profile,
                     systemHash: lifecycleTextHash(system),
+                    schemaHash: lifecycleTextHash(CHECK_SCHEMA_CONTRACT),
+                    toolHash: lifecycleTextHash("[]"),
                 })),
             ],
         },
@@ -80,7 +83,12 @@ async function assess(f: ReturnType<typeof fixture>, fail?: (request: CheckReque
         calls.push(request);
         const passing = request.kind === "disproof" || request.kind === "support" ? "yes" : "no";
         return {
-            profile: { ...f.context.historianProfile, systemHash: request.systemHash },
+            profile: {
+                ...f.context.historianProfile,
+                systemHash: request.systemHash,
+                schemaHash: lifecycleTextHash(CHECK_SCHEMA_CONTRACT),
+                toolHash: lifecycleTextHash("[]"),
+            },
             usage: { tokens: 1 },
             verdicts: (request.kind === "compatibility" ? request.pairs : request.operands).map(
                 (operand) => ({
@@ -138,6 +146,8 @@ describe("memory revision deterministic gates", () => {
                         ...f.context.historianProfile,
                         [field]: value,
                         systemHash: request.systemHash,
+                        schemaHash: lifecycleTextHash(CHECK_SCHEMA_CONTRACT),
+                        toolHash: lifecycleTextHash("[]"),
                     },
                     usage: {},
                     verdicts: (request.kind === "compatibility"
@@ -166,7 +176,12 @@ describe("memory revision deterministic gates", () => {
         expect(plan.ok).toBe(true);
         if (!plan.ok) throw new Error("fixture must plan checks");
         const result = await runMemoryChecks(f.decision.key, plan, f.context, async (request) => ({
-            profile: { ...f.context.historianProfile, systemHash: request.systemHash },
+            profile: {
+                ...f.context.historianProfile,
+                systemHash: request.systemHash,
+                schemaHash: lifecycleTextHash(CHECK_SCHEMA_CONTRACT),
+                toolHash: lifecycleTextHash("[]"),
+            },
             usage: {},
             verdicts: [null] as never,
         }));
@@ -179,7 +194,12 @@ describe("memory revision deterministic gates", () => {
         if (!plan.ok) throw new Error("fixture must plan checks");
         expect(
             await runMemoryChecks(f.decision.key, plan, f.context, async (request) => ({
-                profile: { ...f.context.historianProfile, systemHash: request.systemHash },
+                profile: {
+                    ...f.context.historianProfile,
+                    systemHash: request.systemHash,
+                    schemaHash: lifecycleTextHash(CHECK_SCHEMA_CONTRACT),
+                    toolHash: lifecycleTextHash("[]"),
+                },
                 usage: {},
                 toolActivity: true,
                 verdicts: request.operands.map((operand) => ({ id: operand.id, verdict: "yes" })),
@@ -485,7 +505,12 @@ describe("memory revision deterministic gates", () => {
             makeCheckRequest(f.decision.key, compatibility[1]!, f.context.historianProfile).key,
         );
         const result = await runMemoryChecks(f.decision.key, plan, f.context, async (request) => ({
-            profile: { ...f.context.historianProfile, systemHash: request.systemHash },
+            profile: {
+                ...f.context.historianProfile,
+                systemHash: request.systemHash,
+                schemaHash: lifecycleTextHash(CHECK_SCHEMA_CONTRACT),
+                toolHash: lifecycleTextHash("[]"),
+            },
             usage: {},
             verdicts:
                 request.kind === "compatibility"
@@ -531,3 +556,64 @@ for (const [name, text, preserved] of [
         }
     });
 }
+
+describe("C1 check identity", () => {
+    test("each kind accepts its own system and check schema/tool hashes", async () => {
+        const result = await assess(fixture());
+        expect(result.ok).toBe(true);
+        expect(result.calls.map((request) => request.kind)).toEqual([
+            "disproof",
+            "support",
+            "kept-clause",
+            "compatibility",
+        ]);
+    });
+    for (const substitution of [
+        "historian schema",
+        "historian tool",
+        "historian system",
+        "another kind",
+        "tuple",
+    ] as const) {
+        test(`check identity refuses ${substitution}`, async () => {
+            const f = fixture();
+            const plan = planMemoryRevision(f.decision, f.context);
+            if (!plan.ok) throw new Error(plan.reason);
+            const result = await runMemoryChecks(
+                f.decision.key,
+                plan,
+                f.context,
+                async (request) => {
+                    const profile: ReportedProfile = {
+                        ...f.context.historianProfile,
+                        systemHash: request.systemHash,
+                        schemaHash: lifecycleTextHash(CHECK_SCHEMA_CONTRACT),
+                        toolHash: lifecycleTextHash("[]"),
+                    };
+                    if (substitution === "historian schema")
+                        profile.schemaHash = f.context.historianProfile.schemaHash;
+                    if (substitution === "historian tool")
+                        profile.toolHash = f.context.historianProfile.toolHash;
+                    if (substitution === "historian system")
+                        profile.systemHash = f.context.historianProfile.systemHash;
+                    if (substitution === "another kind")
+                        profile.systemHash = lifecycleTextHash(CHECK_SYSTEM_PROMPTS.support);
+                    if (substitution === "tuple") profile.modelId = "B";
+                    return {
+                        profile,
+                        usage: null,
+                        verdicts: request.operands.map((operand) => ({
+                            id: operand.id,
+                            verdict: "yes" as const,
+                        })),
+                    };
+                },
+            );
+            expect(result).toMatchObject({
+                ok: false,
+                reason: "unvalidated_profile",
+                retryable: true,
+            });
+        });
+    }
+});
