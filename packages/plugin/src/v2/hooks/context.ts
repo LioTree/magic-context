@@ -1,5 +1,5 @@
 import { setTimeout as delay } from "node:timers/promises";
-import { loadPluginConfigDetailed } from "../../config";
+import { loadPluginConfigDetailed, type MagicContextPluginConfig } from "../../config";
 import { isCompactionEnabled, isSmartNoteSurfaceAvailable } from "../../config/agent-disable";
 import { logConfigDependencyNotesOnce } from "../../config/dependency-notes";
 import { withLiveDreamerOutputCap } from "../../config/live-child-output-cap";
@@ -380,6 +380,32 @@ type V2ThresholdConfig = Pick<
  * OpenCode 1 hook builds them: the percentage and the absolute token threshold, which
  * overrides the percentage when set. Like OpenCode 1, both are read once at startup.
  */
+/**
+ * The OpenCode 2 live switch: the runner asks this after each provider reply, and
+ * it answers from `sample`, which polls the live config reader. A reload of
+ * `historian.turn_two` to "off" therefore revokes a run whose reply is still
+ * pending instead of applying decisions the user just turned off.
+ */
+export function openCode2TurnTwoIsEnabled(sample: () => "allowlist" | "off" | undefined): boolean {
+    return sample() !== "off";
+}
+
+/**
+ * The two turn-two dep fields OpenCode 2 hands the shared transform. The switch
+ * value is what this run started with; the callback is asked again after each
+ * provider reply, so a reload of `historian.turn_two` to "off" revokes a run whose
+ * reply is still pending instead of applying decisions the user just turned off.
+ */
+export function openCode2TurnTwoDeps(
+    config: { historian?: MagicContextPluginConfig["historian"] },
+    sample: () => "allowlist" | "off" | undefined,
+): Pick<TransformDeps, "historianTurnTwo" | "historianTurnTwoIsEnabled"> {
+    return {
+        historianTurnTwo: config.historian?.turn_two ?? "allowlist",
+        historianTurnTwoIsEnabled: () => openCode2TurnTwoIsEnabled(sample),
+    };
+}
+
 export function createV2ThresholdDeps(
     config: V2ThresholdConfig,
 ): Pick<TransformDeps, "scheduler" | "executeThresholdPercentage" | "executeThresholdTokens"> {
@@ -1000,6 +1026,7 @@ export async function registerContext(context: V2Context) {
             maxOutputTokens: fresh.historian?.maxTokens,
             timeoutMs: fresh.historian_timeout_ms,
             twoPass: fresh.historian?.two_pass === true,
+            turnTwo: fresh.historian?.turn_two ?? "allowlist",
             expandTools: fresh.historian?.expand_tools,
             autoPromote: fresh.memory?.auto_promote ?? true,
             userMemoriesEnabled: userObservationCollectionEnabled(fresh.dreamer),
@@ -1010,6 +1037,11 @@ export async function registerContext(context: V2Context) {
             ),
         };
     };
+    /**
+     * The switch as the config file reads right now. `sampleHistorian` polls the
+     * live reader on every call, so this answers for the current file, not the one
+     * that was loaded when the run started.
+     */
     const historianModels = resolveHistorianModel(config, "opencode");
     const channel1: NonNullable<TransformDeps["channel1StateBySession"]> = new Map();
     const variants = new Map<string, string | undefined>();
@@ -1906,6 +1938,7 @@ export async function registerContext(context: V2Context) {
                 // its own default, so no fallback belongs here.
                 historianMaxOutputTokens: config.historian?.maxTokens,
                 historianTwoPass: config.historian?.two_pass,
+                ...openCode2TurnTwoDeps(config, () => sampleHistorian().turnTwo),
                 historianExpandTools: config.historian?.expand_tools,
                 historianRunner: config.historian?.runner,
                 historianHostRunnerEnabled: config.historian?.host_runner?.enabled,
