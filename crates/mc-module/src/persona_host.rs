@@ -261,27 +261,35 @@ pub fn load_summary(
     approvals: &ApprovalSet,
     project_key: Option<&ProjectKey>,
 ) -> Result<SummaryPersona, PersonaError> {
-    load_role(SUMMARY_ROLE, tiers, approvals, project_key)
+    let role = load_role::<Routing>(SUMMARY_ROLE, tiers, approvals, project_key)?;
+    let persona = SummaryPersona { role };
+    validate_routing(persona.routing())?;
+    Ok(persona)
 }
 
-fn load_role(
+fn load_role<R>(
     id: &str,
     tiers: &[Tier],
     approvals: &ApprovalSet,
     project_key: Option<&ProjectKey>,
-) -> Result<SummaryPersona, PersonaError> {
+) -> Result<LoadedRole, PersonaError>
+where
+    R: DeserializeOwned + Serialize + Clone + Send + Sync + 'static,
+{
     let mut engine = PersonaEngine::new(MODULE)?;
-    engine.register_extension(operator_extension::<Routing>("routing"))?;
+    engine.register_extension(operator_extension::<R>("routing"))?;
     engine.register_extension(operator_extension::<Generation>("generation"))?;
     let mut request = LoadRequest::new(id, tiers, approvals);
     if let Some(key) = project_key {
         request = request.project_key(key);
     }
     let role = engine.load(request)?;
-    check_operator_only::<Routing>(&role, "routing")?;
+    check_operator_only::<R>(&role, "routing")?;
     check_operator_only::<Generation>(&role, "generation")?;
-    let persona = SummaryPersona { role };
-    let routing = persona.routing();
+    Ok(role)
+}
+
+fn validate_routing(routing: &Routing) -> Result<(), PersonaError> {
     if routing.consumer.trim().is_empty()
         || routing.iq > 100
         || routing.eq.is_some_and(|eq| eq > 100)
@@ -291,7 +299,7 @@ fn load_role(
             reason: "nonempty consumer and iq/eq in 0-100 required".into(),
         });
     }
-    Ok(persona)
+    Ok(())
 }
 
 /// Return LF-normalized text/bytes, SHA-256 digest and deterministic resolution

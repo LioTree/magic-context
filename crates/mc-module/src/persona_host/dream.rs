@@ -22,6 +22,16 @@ pub const KINDS: [Kind; 5] = [
 ];
 
 impl Kind {
+    fn task_name(self) -> mc_store::dream_scheduler::schedules::TaskName {
+        use mc_store::dream_scheduler::schedules::TaskName;
+        match self {
+            Self::Curate => TaskName::Curate,
+            Self::Classify => TaskName::Classify,
+            Self::Map => TaskName::Map,
+            Self::Verify => TaskName::Verify,
+            Self::ReviewUser => TaskName::ReviewUserMemories,
+        }
+    }
     pub fn id(self) -> &'static str {
         match self {
             Self::Curate => "mc_dream_curate",
@@ -104,23 +114,46 @@ pub struct Input<'a> {
     pub candidates: &'a str,
     pub profiles: &'a str,
     pub threshold: usize,
-    pub instruction: &'a str,
+    pub has_evidence: bool,
     pub evidence: &'a str,
 }
 
 #[derive(Debug)]
 pub struct DreamPersona {
     kind: Kind,
-    persona: SummaryPersona,
+    role: LoadedRole,
+    routing: Routing,
 }
 
 impl DreamPersona {
     pub fn routing(&self) -> &Routing {
-        self.persona.routing()
+        &self.routing
     }
     pub fn generation(&self) -> &Generation {
-        self.persona.generation()
+        &self
+            .role
+            .manifest()
+            .extension::<OperatorValue<Generation>>("generation")
+            .expect("required generation")
+            .value
     }
+}
+
+/// Like the summary mapping, an operator routing mapping replaces the lower
+/// mapping. Omitted fields fall back to this dream task, not to summary demand.
+#[derive(Clone, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct DreamRouting {
+    #[serde(default)]
+    consumer: Option<String>,
+    #[serde(default)]
+    iq: Option<u8>,
+    #[serde(default, deserialize_with = "declared_eq")]
+    eq: Option<Option<u8>>,
+}
+
+fn declared_eq<'de, D: serde::Deserializer<'de>>(d: D) -> Result<Option<Option<u8>>, D::Error> {
+    Option::<u8>::deserialize(d).map(Some)
 }
 
 /// Repository wording requires persona/v1 checksum approval. Cost fields still
@@ -131,9 +164,27 @@ pub fn load(
     approvals: &ApprovalSet,
     project_key: Option<&ProjectKey>,
 ) -> Result<DreamPersona, PersonaError> {
+    let role = load_role::<DreamRouting>(kind.id(), tiers, approvals, project_key)?;
+    let declared = &role
+        .manifest()
+        .extension::<OperatorValue<DreamRouting>>("routing")
+        .expect("required routing")
+        .value;
+    let defaults = crate::dream_dispatch::routed::registry::registration(kind.task_name())
+        .expect("registered dream persona");
+    let routing = Routing {
+        consumer: declared
+            .consumer
+            .clone()
+            .unwrap_or_else(|| defaults.consumer.into()),
+        iq: declared.iq.unwrap_or(defaults.iq),
+        eq: declared.eq.unwrap_or(defaults.eq),
+    };
+    validate_routing(&routing)?;
     Ok(DreamPersona {
         kind,
-        persona: load_role(kind.id(), tiers, approvals, project_key)?,
+        role,
+        routing,
     })
 }
 
@@ -148,6 +199,8 @@ struct Context<'a> {
     turn: &'static str,
     mode: &'a str,
     routing: &'a Routing,
+    language: LanguageContext,
+    project: ProjectContext,
     tools: Vec<Tool>,
     output: DreamOutput,
     input: &'a Input<'a>,
@@ -169,10 +222,16 @@ pub fn render(
     system: bool,
 ) -> Result<Rendered, PersonaError> {
     let kind = persona.kind;
+    let mut routing = persona.routing().clone();
+    if kind == Kind::Verify && mode == "broad" && routing.consumer == "mc.dream.verify" {
+        routing.consumer = "mc.dream.verify-broad".into();
+    }
     let module = Context {
         turn: if system { "system" } else { "task" },
         mode,
-        routing: persona.routing(),
+        routing: &routing,
+        language: LanguageContext::default(),
+        project: ProjectContext::default(),
         tools: kind
             .tools()
             .iter()
@@ -200,13 +259,8 @@ pub fn render(
         },
         input,
     };
-    persona.persona.role.render(
-        &context_for(
-            kind.id(),
-            persona.routing(),
-            &ProjectContext::default(),
-            module,
-        ),
+    persona.role.render(
+        &context_for(kind.id(), &routing, &ProjectContext::default(), module),
         &FragmentSources::new(),
     )
 }

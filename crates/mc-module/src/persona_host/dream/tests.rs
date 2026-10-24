@@ -12,8 +12,8 @@ fn input() -> Input<'static> {
         candidates: "Candidate α\nCandidate β",
         profiles: "Profile α\nProfile β",
         threshold: 3,
-        instruction: "Read each memory's backing files to check its claims.",
-        evidence: "\n\nDIFF",
+        has_evidence: false,
+        evidence: "",
     }
 }
 
@@ -45,23 +45,50 @@ fn every_dream_prompt_matches_accepted_bytes_in_lf_and_crlf() {
             }
             let persona =
                 load(kind, std::slice::from_ref(&tier), &ApprovalSet::new(), None).unwrap();
-            for mode in ["full", "broad"] {
-                for (system_turn, key) in [(true, "system"), (false, "task")] {
-                    let got = render(&persona, &input(), mode, system_turn).unwrap();
-                    assert_eq!(
-                        got.text,
-                        legacy["cases"][name][key].as_str().unwrap(),
-                        "{name} {mode} {key} crlf={crlf}"
-                    );
-                    let embedded = render(embedded(kind), &input(), mode, system_turn).unwrap();
-                    assert_eq!(
-                        (got.text.as_str(), got.digest),
-                        (embedded.text.as_str(), embedded.digest)
-                    );
-                    if crlf {
-                        assert!(lf.contains(&(got.text, got.digest)));
-                    } else {
-                        lf.push((got.text, got.digest));
+            let mut alternate = input();
+            let variant = match kind {
+                Kind::Curate => {
+                    alternate.candidates = "(none)";
+                    "curate_no_candidates"
+                }
+                Kind::Classify => {
+                    alternate.anchors = "";
+                    "classify_no_anchors"
+                }
+                Kind::Map => {
+                    alternate.memories = "";
+                    "map_empty"
+                }
+                Kind::Verify => {
+                    alternate.has_evidence = true;
+                    alternate.evidence = "\n\nDIFF";
+                    "verify_diff"
+                }
+                Kind::ReviewUser => {
+                    alternate.profiles = "";
+                    alternate.candidates = "";
+                    "review_user_empty"
+                }
+            };
+            for (name, input) in [(name, input()), (variant, alternate)] {
+                for mode in ["full", "broad"] {
+                    for (system_turn, key) in [(true, "system"), (false, "task")] {
+                        let got = render(&persona, &input, mode, system_turn).unwrap();
+                        assert_eq!(
+                            got.text,
+                            legacy["cases"][name][key].as_str().unwrap(),
+                            "{name} {mode} {key} crlf={crlf}"
+                        );
+                        let embedded = render(embedded(kind), &input, mode, system_turn).unwrap();
+                        assert_eq!(
+                            (got.text.as_str(), got.digest),
+                            (embedded.text.as_str(), embedded.digest)
+                        );
+                        if crlf {
+                            assert!(lf.contains(&(got.text, got.digest)));
+                        } else {
+                            lf.push((got.text, got.digest));
+                        }
                     }
                 }
             }
@@ -89,7 +116,7 @@ fn tiers(root: &Path) -> Vec<Tier> {
 
 fn approval(kind: Kind, tiers: &[Tier], key: &ProjectKey) -> ApprovalSet {
     let skipped = load(kind, tiers, &ApprovalSet::new(), Some(key)).unwrap();
-    let tier = skipped.persona.role.tiers().last().unwrap();
+    let tier = skipped.role.tiers().last().unwrap();
     assert_eq!(tier.approval, ApprovalState::Unapproved);
     let mut approvals = ApprovalSet::new();
     approvals.insert(Approval {
@@ -176,9 +203,13 @@ fn dream_operator_ladder_and_strict_context_are_preserved() {
             .join(kind.id())
             .join("PERSONA.md");
         fs::create_dir_all(path.parent().unwrap()).unwrap();
-        fs::write(&path, "---\nrouting: {consumer: mc.dream.operator, iq: 80}\ngeneration: {temperature: 0.25}\n---\n{% block instructions %}{{ module.unknown_field }}{% endblock %}").unwrap();
+        fs::write(&path, "---\nrouting: {iq: 80}\ngeneration: {temperature: 0.25}\n---\n{% block instructions %}{{ module.unknown_field }}{% endblock %}").unwrap();
         let persona = load(kind, &tiers(root.path()), &ApprovalSet::new(), None).unwrap();
         assert_eq!(persona.routing().iq, 80);
+        let defaults =
+            crate::dream_dispatch::routed::registry::registration(kind.task_name()).unwrap();
+        assert_eq!(persona.routing().consumer, defaults.consumer);
+        assert_eq!(persona.routing().eq, defaults.eq);
         assert_eq!(persona.generation().temperature, Some(0.25));
         let message = render(&persona, &Input::default(), "full", true)
             .unwrap_err()
@@ -188,6 +219,27 @@ fn dream_operator_ladder_and_strict_context_are_preserved() {
                 && message.contains("tier `user`")
                 && message.contains(kind.id()),
             "{message}"
+        );
+    }
+}
+
+#[test]
+fn dream_verify_modes_describe_their_own_consumer_and_read_only_tools() {
+    let root = tempfile::tempdir().unwrap();
+    let kind = Kind::Verify;
+    repo_file(root.path(), kind, "---\n---\n{% block instructions %}{{ module.routing.consumer }}:{{ module.mode }}:{% for tool in module.tools %}{{ tool.name }},{% endfor %}{% endblock %}");
+    let tiers = tiers(root.path());
+    let key = ProjectKey::new("project-identity").unwrap();
+    let approved = approval(kind, &tiers, &key);
+    let persona = load(kind, &tiers, &approved, Some(&key)).unwrap();
+    for (mode, consumer) in [
+        ("full", "mc.dream.verify"),
+        ("broad", "mc.dream.verify-broad"),
+    ] {
+        let rendered = render(&persona, &Input::default(), mode, true).unwrap();
+        assert_eq!(
+            rendered.text,
+            format!("{consumer}:{mode}:read,grep,glob,aft_outline,aft_zoom,aft_search,")
         );
     }
 }

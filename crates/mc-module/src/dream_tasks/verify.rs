@@ -181,11 +181,6 @@ pub(crate) fn build_prompt_with_mode(
         })
         .collect::<Vec<_>>()
         .join("\n\n");
-    let instruction = if evidence.is_some() {
-        "The git diff below is the evidence. If changed hunks do not touch a claim, mark it verified without opening files. Open files only when a diff suggests the claim may have changed. A rename or deletion requires an update or archive when positively supported; do not archive on uncertainty."
-    } else {
-        "Read each memory's backing files to check its claims."
-    };
     let suffix = evidence
         .map(|e| {
             format!(
@@ -213,7 +208,7 @@ pub(crate) fn build_prompt_with_mode(
         &crate::persona_host::dream::Input {
             project,
             memories: &list,
-            instruction,
+            has_evidence: evidence.is_some(),
             evidence: &suffix,
             ..Default::default()
         },

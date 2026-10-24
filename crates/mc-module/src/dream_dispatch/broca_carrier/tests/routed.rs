@@ -389,10 +389,6 @@ impl CarrierRig {
         }
     }
 
-    fn carrier(&self) -> RoutedCarrier {
-        self.carrier_for(self.f.context.task)
-    }
-
     fn carrier_for(&self, task: TaskName) -> RoutedCarrier {
         let c = &self.f.context;
         let context = Arc::new(TaskContext {
@@ -594,7 +590,7 @@ async fn routed_task_plans_request_capability_tags_not_modules() {
             assert!(log.capabilities.is_empty());
             assert!(log.plans[0].is_null());
         } else {
-            assert_eq!(log.capabilities, [tags.clone()]);
+            assert_eq!(log.capabilities.as_slice(), std::slice::from_ref(&tags));
             let provider = if tags == ["code.read/v1"] {
                 CODE_PROVIDER
             } else {

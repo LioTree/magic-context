@@ -388,7 +388,15 @@ impl Runner<RunScope> for RunRunner<'_> {
                 result.usage = usage;
                 result
             }
-            Ok(Err(e)) => outcome(Outcome::Failed, &runner_code(&e.message)),
+            Ok(Err(e)) => {
+                let code = runner_code(&e.message);
+                let status = if code == "tool_unavailable" {
+                    Outcome::Refused
+                } else {
+                    Outcome::Failed
+                };
+                outcome(status, &code)
+            }
             Err(_) => RunResult::new(Outcome::TimedOut, None),
         }
     }
