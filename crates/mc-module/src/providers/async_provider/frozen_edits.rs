@@ -213,12 +213,15 @@ impl FrozenEdits {
             };
             for (_, saved) in anchored.range(*from..*to) {
                 for part in saved {
-                    // A permitted pass may remove more content, but it must not restore a source
-                    // part just because a generation reset discarded its old engine unit.
-                    if !edits
-                        .iter()
-                        .any(|edit| edit.ordinal == part.ordinal && edit.part == part.part)
+                    // A rebuilt engine may express an old native replacement
+                    // as a generic drop. Keep the bytes already acknowledged
+                    // for the same source identity instead of rewriting them.
+                    if let Some(current) = edits
+                        .iter_mut()
+                        .find(|edit| edit.ordinal == part.ordinal && edit.part == part.part)
                     {
+                        *current = part.clone();
+                    } else {
                         edits.push(part.clone());
                     }
                 }

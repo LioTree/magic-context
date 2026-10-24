@@ -1770,6 +1770,17 @@ impl McHandler {
         binding: &SessionBinding,
         params: &Value,
     ) -> Result<Vec<u8>, HandlerOutcome> {
+        // Setup can hold both the old and new lineage records during recovery.
+        // Keep that future off the caller's stack, including on small runtimes.
+        Box::pin(self.async_setup_inner(channel, binding, params)).await
+    }
+
+    async fn async_setup_inner(
+        &self,
+        channel: u16,
+        binding: &SessionBinding,
+        params: &Value,
+    ) -> Result<Vec<u8>, HandlerOutcome> {
         let request: compact::setup::SetupRequest = decode(params)?;
         let bound_session = binding.session.as_str();
         // The session handle is an opaque caller-chosen string (compaction-provider
@@ -1871,6 +1882,12 @@ impl McHandler {
                     .ok_or_else(|| transient("async session disappeared"))?;
                 prior.capture_resync_sources(store)?;
                 state.resync_sources = prior.resync_sources.take();
+                state.frozen_edits.merge(&prior.frozen_edits);
+                for archive in store.load_async_undo_edits(&reference).map_err(transient)? {
+                    state
+                        .frozen_edits
+                        .merge(&frozen_edits::FrozenEdits::from_json(&archive)?);
+                }
                 store
                     .replace_compartments(&state.namespace(), &[])
                     .map_err(transient)?;
@@ -3443,7 +3460,7 @@ impl McHandler {
         account: &str,
         message: &cortexkit_bus_trait::Message,
     ) -> Result<(), HandlerOutcome> {
-        match self.advance_compaction_once(account, message).await {
+        match Box::pin(self.advance_compaction_once(account, message)).await {
             Err(HandlerOutcome::Error {
                 code,
                 message: reason,
@@ -4279,8 +4296,10 @@ impl McHandler {
         let mut engine = state.engine_with_baselines()?;
         #[cfg(test)]
         let meter = scaling_tests::save_meter::start_kind(&state.reference(), "pub:engine");
+
         let (template, output) =
             self.async_engine(channel, &binding, state, codec, &status, &mut engine)?;
+
         #[cfg(test)]
         cut_seed::pass_trace::record(
             Arc::as_ptr(store) as usize,
@@ -5689,22 +5708,9 @@ impl AsyncRecord {
                 first.ordinal as i64
             };
             compartment.end_message = last.ordinal as i64;
-            let start_part = compartment
-                .start_message_id
-                .rsplit_once('#')
-                .map(|(_, part)| part)
-                .unwrap_or("0")
-                .to_owned();
-            let end_part = compartment
-                .end_message_id
-                .rsplit_once('#')
-                .map(|(_, part)| part)
-                .unwrap_or("0")
-                .to_owned();
-            if compartment.start_message == first.ordinal as i64 {
-                compartment.start_message_id = format!("{}#{start_part}", first.mid);
-            }
-            compartment.end_message_id = format!("{}#{end_part}", last.mid);
+            // The proof maps by message identity and checks its whole digest.
+            // Keep the original boundary spelling too: changing `mid` to
+            // `mid#0` would manufacture a history revision on the next write.
             sequences.push((history.compartment.sequence, compartment.sequence));
             retained.push(compartment);
         }

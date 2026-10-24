@@ -103,6 +103,16 @@ impl McStore {
         ).optional()
         })?)
     }
+    /// Historical native edits are read only when a lineage restarts before
+    /// its cuts. Ordinary conversation loads exclude these archive rows.
+    pub fn load_async_undo_edits(&self, session_ref: &str) -> Result<Vec<String>, McStoreError> {
+        self.inner.with_read(|conn| {
+            conn.prepare("SELECT view_json FROM mc_async_compaction_baselines WHERE session_ref=?1 AND slot GLOB 'undo-native-edits:*' ORDER BY slot")?
+                .query_map([session_ref], |row| row.get(0))?
+                .collect::<rusqlite::Result<Vec<String>>>()
+        }).map_err(Into::into)
+    }
+
     /// Start counting this conversation's async-table writes (test builds only).
     #[cfg(feature = "test-support")]
     pub fn arm_async_write_meter(&self, session_ref: &str) {
@@ -312,7 +322,7 @@ impl McStore {
                     .query_map([session_ref], |row| Ok((row.get(0)?, row.get(1)?)))?
                     .collect::<rusqlite::Result<_>>()?;
                 let baselines = conn
-                    .prepare("SELECT slot,view_json FROM mc_async_compaction_baselines WHERE session_ref=?1")?
+                    .prepare("SELECT slot,view_json FROM mc_async_compaction_baselines WHERE session_ref=?1 AND slot NOT GLOB 'undo-native-edits:*'")?
                     .query_map([session_ref], |row| Ok((row.get(0)?, row.get(1)?)))?
                     .collect::<rusqlite::Result<_>>()?;
                 Ok(Some(AsyncCompactionRows {
@@ -683,6 +693,31 @@ mod tests {
     use super::*;
     use cortexkit_store_types::{Isolation, StorageBackend, StorageDescriptor};
     use std::time::Instant;
+
+    #[test]
+    fn undo_edit_archives_are_not_hydrated_on_ordinary_loads() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = McStore::open(&StorageDescriptor {
+            module_id: "magic-context".into(),
+            storage_namespace: "mc_cache".into(),
+            isolation: Isolation::Module,
+            backend: StorageBackend::Sqlite {
+                path: dir.path().join("store.db").to_string_lossy().into_owned(),
+            },
+        })
+        .unwrap();
+        let mut save = store.async_compaction_save("ref", "key", "session", "{}");
+        save.baseline("frozen_edits", Some("live".into()));
+        save.baseline("undo-native-edits:1:2", Some("archived".into()));
+        save.commit().unwrap();
+        let rows = store.load_async_compaction_rows("ref").unwrap().unwrap();
+        assert_eq!(rows.baselines, vec![("frozen_edits".into(), "live".into())]);
+        assert_eq!(
+            store.load_async_undo_edits("ref").unwrap(),
+            vec!["archived"]
+        );
+        assert!(store.load_async_undo_edits("another").unwrap().is_empty());
+    }
 
     fn entry(n: u64) -> (String, String) {
         let output = if n % 997 == 3 {

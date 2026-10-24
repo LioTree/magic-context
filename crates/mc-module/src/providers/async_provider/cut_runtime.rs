@@ -404,6 +404,24 @@ impl McHandler {
         let inherited_tags = store
             .load_tags_after(&cut.parent_namespace, cut.tag_high_water)
             .map_err(transient)?;
+        if let Some(edits) = store
+            .load_async_compaction_baseline(&state.reference(), "frozen_edits")
+            .map_err(transient)?
+        {
+            // These source-identified edits can become visible again after an
+            // undo below the cut. Archive them without loading older archives
+            // on the bounded descending-Setup path.
+            let record = serde_json::to_string(&state).map_err(transient)?;
+            let reference = state.reference();
+            let key = state.key.store_key().conversation_key();
+            let mut save =
+                store.async_compaction_save(&reference, &key, &state.key.session, &record);
+            save.baseline(
+                format!("undo-native-edits:{}:{}", state.generation, cut.version),
+                Some(edits),
+            );
+            save.commit().map_err(transient)?;
+        }
         if request.lineage_id.is_none() {
             return Err(invalid_field(
                 "lineage_id",

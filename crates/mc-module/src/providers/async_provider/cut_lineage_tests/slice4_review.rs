@@ -1345,3 +1345,58 @@ async fn s4_08_superseded_cut_stages_are_removed() {
     }
     assert!(problems.is_empty(), "{problems:#?}");
 }
+
+/// Earlier cut markers remain addressable after undo, so advancing cuts no
+/// longer retire their stages. Republishing the same cut still supersedes a
+/// stage and must reclaim it after the replacement is durably saved.
+#[tokio::test]
+async fn s4_08_same_cut_supersession_reclaims_the_old_stage() {
+    let mut pair = Pair::open_with(Profile::OpenCode, false, Some("L"), false, false).await;
+    pair.append(120);
+    review_history(&mut pair, 99).await;
+    pair.notice(&mut Rng(0xA908), None).await;
+    let store = pair.resident.store();
+    let state = load(store, &pair.reference).unwrap().unwrap();
+    let first = *state.published_cuts.keys().next_back().unwrap();
+    let old = state.published_cuts[&first].clone();
+    let old_namespace = format!("{}:async:{}", state.key.engine_key(), old.generation);
+    assert!(store.load_namespace_head(&old_namespace).unwrap().is_some());
+    store.arm_soft_refresh(&state.namespace()).unwrap();
+    review_ride(&mut pair, "surface_change").await;
+    let state = load(pair.resident.store(), &pair.reference)
+        .unwrap()
+        .unwrap();
+    assert!(state.published_cuts[&first].version > old.version);
+    assert!(pair
+        .resident
+        .store()
+        .load_namespace_head(&old_namespace)
+        .unwrap()
+        .is_none());
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn s4_replays_the_remaining_campaign_failures() {
+    let mut failures = Vec::new();
+    for (profile, seed, revert) in [
+        (Profile::OpenCode, 1_779_033_704, true),
+        (Profile::Anthropic, 1_779_034_034, true),
+        (Profile::OpenCode, 3_144_134_282, false),
+        (Profile::Pi, 3_144_134_303, false),
+        (Profile::Broca, 3_144_134_321, false),
+        (Profile::OpenCode, 3_144_134_350, false),
+        (Profile::OpenCode, 3_144_134_374, false),
+    ] {
+        if std::env::var("MC_S4_REPLAY_SEED")
+            .ok()
+            .is_some_and(|selected| selected != seed.to_string())
+        {
+            continue;
+        }
+        let kinds = revert.then(|| vec![0, 1, 2, 3, 4, 5, 6, 9, 10, 11]);
+        if let Err(error) = tokio::spawn(review_session(profile, seed, 12, revert, kinds)).await {
+            failures.push(format!("{profile:?} {seed}: {error}"));
+        }
+    }
+    assert!(failures.is_empty(), "{failures:#?}");
+}
