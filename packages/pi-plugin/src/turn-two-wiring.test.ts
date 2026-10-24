@@ -6,7 +6,7 @@
  * The Pi context handler must hand the historian runner the `historian.turn_two`
  * switch, and the runner must select turn two from the reviewed allowlist alone.
  * These tests capture the deps the registered context handler builds for a real
- * historian start, then check selection against the identity a Pi firing builds.
+ * historian start, then check selection against a test-supplied Pi identity.
  */
 
 import { afterEach, beforeEach, describe, expect, it, spyOn } from "bun:test";
