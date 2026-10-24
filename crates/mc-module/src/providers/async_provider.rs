@@ -717,17 +717,15 @@ fn missing_served_digest(entry: &ReadMessage, reason: impl std::fmt::Display) ->
 }
 
 /// Check a newly read message carries the runner's content identity:
-/// a message `digest` and one `part_digests` row per exposed part, keyed as
-/// its tag rows are. A runner that serves none in descriptors mode is
-/// refused by name; ck-mc never hashes a descriptor in its place.
-fn check_served_identity(entry: &ReadMessage) -> Result<(), HandlerOutcome> {
-    let keys = entry
-        .tags
-        .iter()
-        .map(|row| row.part.clone())
-        .collect::<Vec<_>>();
+/// a message `digest` and one `part_digests` row per top-level part of the
+/// message under the session's serializer profile, keyed exactly as its tag
+/// rows are and in the same order. The rule is llm-runner's own
+/// provider-side check, `ReadMessage::check_descriptor_rows`. A runner that
+/// serves none in descriptors mode is refused by name; ck-mc never hashes a
+/// descriptor in its place.
+fn check_served_identity(entry: &ReadMessage, codec: codec::Codec) -> Result<(), HandlerOutcome> {
     entry
-        .check_descriptors(&keys)
+        .check_descriptor_rows(codec.wire_id())
         .map_err(|reason| missing_served_digest(entry, reason))
 }
 
@@ -3901,11 +3899,13 @@ impl McHandler {
                         return Err(transient("async entry changed on re-read"));
                     }
                 } else {
-                    check_served_identity(&entry)?;
+                    let codec =
+                        codec::Codec::from_params(&Value::Object(state.setup.params.clone()))?;
+                    check_served_identity(&entry, codec)?;
                     if let Some(cadence) = &mut state.reminder_cadence {
                         state.reminder_echoes.ingest(
                             &entry,
-                            codec::Codec::from_params(&Value::Object(state.setup.params.clone()))?,
+                            codec,
                             &mut cadence.ledger,
                             now_ms().max(0) as u64,
                         )?;

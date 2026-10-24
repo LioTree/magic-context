@@ -567,7 +567,7 @@ fn proof_of(served: &[ReadMessage]) -> EntryInputProof {
             Arc::new(HeldEntry::from_read(&serve_descriptors(entry)).unwrap()),
         );
     }
-    EntryInputProof::of(&entries, LINEAGE, None)
+    EntryInputProof::of(&entries, LINEAGE, None, codec::Codec::OpencodeAiSdk)
         .unwrap()
         .unwrap()
 }
@@ -1287,7 +1287,8 @@ fn the_entry_proof_refuses_an_entry_without_served_digests() {
     let entry = appended("ses", 0, 1);
     let mut entries = held_entries::HeldEntries::default();
     entries.insert(0, Arc::new(HeldEntry::from_read(&entry).unwrap()));
-    let error = EntryInputProof::of(&entries, LINEAGE, None).unwrap_err();
+    let error =
+        EntryInputProof::of(&entries, LINEAGE, None, codec::Codec::OpencodeAiSdk).unwrap_err();
     assert!(
         format!("{error:?}").contains("served_digest_missing"),
         "{error:?}"
@@ -1297,9 +1298,11 @@ fn the_entry_proof_refuses_an_entry_without_served_digests() {
         0,
         Arc::new(HeldEntry::from_read(&serve_descriptors(&entry)).unwrap()),
     );
-    assert!(EntryInputProof::of(&served, LINEAGE, None)
-        .unwrap()
-        .is_some());
+    assert!(
+        EntryInputProof::of(&served, LINEAGE, None, codec::Codec::OpencodeAiSdk)
+            .unwrap()
+            .is_some()
+    );
 }
 
 /// A runner whose `role.describe` changed since the export, as a THALAMUS

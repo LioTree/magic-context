@@ -31,7 +31,10 @@ fn page(ordinals: std::ops::Range<u64>, next: Option<u64>) -> String {
 }
 
 fn parse(lines: &[String]) -> Result<Pages, Refusal> {
-    parse_pages((lines.join("\n") + "\n").as_bytes())
+    parse_pages(
+        (lines.join("\n") + "\n").as_bytes(),
+        crate::providers::codec::Codec::OpencodeAiSdk,
+    )
 }
 
 fn code(lines: &[String]) -> &'static str {

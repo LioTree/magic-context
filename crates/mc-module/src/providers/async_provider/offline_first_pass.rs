@@ -103,6 +103,7 @@ impl EntryInputProof {
         entries: &held_entries::HeldEntries,
         lineage: &str,
         count: Option<u64>,
+        codec: codec::Codec,
     ) -> Result<Option<Self>, HandlerOutcome> {
         let count = match count {
             Some(count) => count,
@@ -118,7 +119,7 @@ impl EntryInputProof {
             let entry = held.read()?;
             // Strict: an entry held from an inline read has no served digest,
             // and the proof never hashes one in the runner's place.
-            check_served_identity(&entry)?;
+            check_served_identity(&entry, codec)?;
             hash.update(ordinal.to_le_bytes());
             framed(&mut hash, entry.mid.as_bytes());
             framed(&mut hash, served_digest(&entry)?.as_bytes());
@@ -530,7 +531,8 @@ impl McHandler {
         state.reminder_cadence = cadence;
         state.lineage = held_lineage;
         read?;
-        EntryInputProof::of(&served, lineage, Some(count))
+        let codec = codec::Codec::from_params(&Value::Object(state.setup.params.clone()))?;
+        EntryInputProof::of(&served, lineage, Some(count), codec)
     }
 
     /// Adopt or discard an offline-prepared record on its first live notice;
@@ -772,7 +774,7 @@ impl McHandler {
         self.publish_async(0, &mut state, codec, false)
             .map_err(interrupted)?;
         state.engine_failed = false;
-        let proof = EntryInputProof::of(&state.entries, &lineage, None)
+        let proof = EntryInputProof::of(&state.entries, &lineage, None, codec)
             .map_err(interrupted)?
             .ok_or_else(|| {
                 OfflineError::Refused(

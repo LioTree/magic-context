@@ -149,7 +149,7 @@ fn broca_tag_rows_descriptor_identity_uses_unnumbered_row_keys() {
     let golden = &GOLDENS[1];
     for entry in entries(golden) {
         assert_eq!(entry.tags[0].tag, None);
-        check_served_identity(&entry).unwrap();
+        check_served_identity(&entry, codec::Codec::OwnedBroca).unwrap();
         let digests = entry.part_digests.as_ref().unwrap();
         assert_eq!(digests.len(), entry.tags.len());
         assert_eq!(digests[0].part, entry.tags[0].part);
@@ -404,7 +404,11 @@ async fn broca_tag_rows_offline_first_pass_accepts_all_goldens() {
     for golden in GOLDENS {
         let dir = tempfile::tempdir().unwrap();
         let page = served_page(golden, 0).to_string();
-        let pages = crate::offline_first_pass::parse_pages(std::io::Cursor::new(page)).unwrap();
+        let pages = crate::offline_first_pass::parse_pages(
+            std::io::Cursor::new(page),
+            crate::providers::codec::Codec::OwnedBroca,
+        )
+        .unwrap();
         assert_eq!(pages.entries, 4);
         assert_eq!(pages.lineage, "L");
         assert_eq!(pages.lowest_tag, golden.numbers.first().map(|n| *n as u64));
