@@ -1343,17 +1343,29 @@ describe("turn two crash recovery", () => {
                 },
                 check: async (request) => passingVerdicts(request),
             });
-            for (let attempt = 0; attempt < 2; attempt++)
+            for (let attempt = 0; attempt < 2; attempt++) {
                 await run(db, publish(db, []).publicationId, stubCarrier(() => reply([])).carrier, {
                     recover: resolver,
                 });
+                // Recovery records the edit and admission once each, including on its second run.
+                expect(
+                    db
+                        .prepare(
+                            "SELECT j.operation,h.memory_id AS memoryId,COUNT(*) AS n FROM memory_history h JOIN memory_journal j ON j.decision_key=h.decision_key GROUP BY j.operation,h.memory_id ORDER BY j.operation",
+                        )
+                        .all(),
+                ).toEqual([
+                    { operation: "edit", memoryId: memory.id, n: 1 },
+                    { operation: "new", memoryId: existing.id, n: 1 },
+                ]);
+            }
             expect(stub.prompts).toHaveLength(1);
             expect(fact(db, published.factIds[0]!)).toMatchObject({ state: "applied" });
             expect(fact(db, twin.factIds[0]!)).toMatchObject({
                 state: "applied",
                 reason: "live_match",
             });
-            expect(count(db, "SELECT COUNT(*) AS n FROM memory_history")).toBe(1);
+            expect(count(db, "SELECT COUNT(*) AS n FROM memory_history")).toBe(2);
             expect(getMemoryById(db, existing.id)?.seenCount).toBe(2);
             expect(getMemoryById(db, memory.id)?.content).toBe("New rule. Keep rule.");
         } finally {

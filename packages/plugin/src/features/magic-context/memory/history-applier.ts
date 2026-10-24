@@ -508,6 +508,8 @@ function planMemoryWrite(
                     "mergedFrom",
                     "metadataJson",
                     "safetyCritical",
+                    "sourceSessionId",
+                    "sourceType",
                 ].some(
                     (field) =>
                         current[field as keyof MemoryHistorySnapshot] !==
@@ -525,7 +527,10 @@ function planMemoryWrite(
                         },
                     ],
                 );
-            if (decision!.operation.includes("merge") && current.supersededByMemoryId !== null) {
+            if (
+                (decision!.operation.includes("merge") || decision!.operation === "replaces") &&
+                current.supersededByMemoryId !== null
+            ) {
                 const link = db
                     .prepare(
                         "SELECT decision_key FROM memory_successor_links WHERE source_id=? AND successor_id=?",
@@ -562,8 +567,14 @@ function planMemoryWrite(
                     "mergedFrom",
                     "metadataJson",
                     "safetyCritical",
+                    "sourceSessionId",
+                    "sourceType",
                 ] as const)
                     Object.assign(target, { [field]: row.before[field] });
+            if (row.before && ["new", "conflict"].includes(decision!.operation)) {
+                target.seenCount = row.before.seenCount;
+                target.lastSeenAt = row.before.lastSeenAt;
+            }
         } else {
             const change = request.changes.find((row) => row.memoryId === id)!;
             if (change.content !== undefined) target.content = change.content.trim();
@@ -654,7 +665,7 @@ function applyPlannedWrite(
     for (const [index, target] of plan.after.entries()) {
         const source = plan.before[index]!;
         db.prepare(
-            "UPDATE memories SET content=?,category=?,normalized_hash=?,importance=?,scope=?,status=?,expires_at=?,superseded_by_memory_id=?,merged_from=?,metadata_json=?,safety_critical=?,shareable=0,classified_at=NULL,verification_status='unverified',verified_at=NULL,updated_at=? WHERE id=? AND revision=?",
+            "UPDATE memories SET content=?,category=?,normalized_hash=?,importance=?,scope=?,status=?,expires_at=?,superseded_by_memory_id=?,merged_from=?,metadata_json=?,safety_critical=?,source_session_id=?,source_type=?,seen_count=?,last_seen_at=?,shareable=0,classified_at=NULL,verification_status='unverified',verified_at=NULL,updated_at=? WHERE id=? AND revision=?",
         ).run(
             target.content,
             target.category,
@@ -667,12 +678,22 @@ function applyPlannedWrite(
             target.mergedFrom,
             target.metadataJson,
             target.safetyCritical,
+            target.sourceSessionId,
+            target.sourceType,
+            target.seenCount,
+            target.lastSeenAt,
             now,
             target.id,
             source.revision + 1,
         );
         const changed = db.prepare("SELECT changes() n").get() as { n: number };
         if (changed.n !== 1) throw new Error("Memory revision changed during apply");
+        const restored = plan.decision?.rows.find((row) => row.memoryId === target.id)?.before;
+        if (restored)
+            // Evidence is revision-scoped: restoring text publishes its original evidence at the new revision.
+            db.prepare(
+                "INSERT INTO memory_clause_evidence(memory_id,revision,clause_ordinal,text_hash,evidence_json) SELECT memory_id,?,clause_ordinal,text_hash,evidence_json FROM memory_clause_evidence WHERE memory_id=? AND revision=?",
+            ).run(target.revision, target.id, restored.revision);
         db.prepare("DELETE FROM memory_embeddings WHERE memory_id=?").run(target.id);
         if (db.prepare("SELECT 1 FROM sqlite_master WHERE name='memory_verifications'").get())
             db.prepare("DELETE FROM memory_verifications WHERE memory_id=?").run(target.id);
@@ -694,10 +715,14 @@ function applyPlannedWrite(
                 `UPDATE memories SET ${derived.map((column) => `${column}=NULL`).join(",")} WHERE id=?`,
             ).run(target.id);
     }
-    if (plan.decision)
+    if (plan.decision) {
         db.prepare("DELETE FROM memory_successor_links WHERE decision_key=?").run(
             plan.decision.decisionKey,
         );
+        db.prepare("DELETE FROM memory_conflict_links WHERE decision_key=?").run(
+            plan.decision.decisionKey,
+        );
+    }
     for (const target of plan.after)
         if (target.supersededByMemoryId !== null)
             db.prepare(
