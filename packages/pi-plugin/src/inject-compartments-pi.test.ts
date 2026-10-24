@@ -554,8 +554,12 @@ it("Pi authorized two-pass publication freezes historian changes through defer a
 				.prepare("SELECT * FROM session_meta WHERE session_id=?")
 				.all(state.sessionId),
 		).toEqual(beforeCache);
-		expect(db.prepare("SELECT * FROM project_state").all()).toEqual(beforeProject);
-		expect(db.prepare("SELECT * FROM m0_mutation_log").all()).toEqual(beforeMutations);
+		expect(db.prepare("SELECT * FROM project_state").all()).toEqual(
+			beforeProject,
+		);
+		expect(db.prepare("SELECT * FROM m0_mutation_log").all()).toEqual(
+			beforeMutations,
+		);
 		expect(db.prepare("SELECT * FROM memory_mutation_log").all()).toEqual([]);
 		expect(mustMaterializePi(state, db).value).toBe(false);
 		for (const prepared of [false, true]) {

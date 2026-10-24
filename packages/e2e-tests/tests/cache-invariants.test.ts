@@ -30,7 +30,7 @@
 import { Database } from "bun:sqlite";
 import { afterEach, beforeEach, describe, expect, it } from "bun:test";
 import { createHash } from "node:crypto";
-import { mkdirSync, realpathSync, writeFileSync } from "node:fs";
+import { mkdirSync, realpathSync, rmSync, writeFileSync } from "node:fs";
 import { dirname, join, resolve as pathResolve } from 'node:path';
 import { computeNormalizedHash } from "../../plugin/src/features/magic-context/memory/normalize-hash";
 import { resolveProjectIdentity } from "../../plugin/src/features/magic-context/memory/project-identity";
@@ -372,6 +372,7 @@ function assertNoBusts(label: string): void {
 }
 
 forEachHost(import.meta.url, null, (host) => {
+    let reloadedIsolationRoot: string | undefined;
     beforeEach(async () => {
         h = await createScenarioHarness(host, {
             modelContextLimit: MODEL_LIMIT,
@@ -391,7 +392,13 @@ forEachHost(import.meta.url, null, (host) => {
     });
 
     afterEach(async () => {
-        await h.dispose();
+        try {
+            await h.dispose();
+        } finally {
+            // A reloaded host reuses isolation but no longer owns its directory cleanup.
+            if (reloadedIsolationRoot) rmSync(reloadedIsolationRoot, { recursive: true, force: true });
+            reloadedIsolationRoot = undefined;
+        }
     });
 
     describe("cache invariants — replay class", () => {
@@ -406,16 +413,27 @@ forEachHost(import.meta.url, null, (host) => {
                 mkdirSync(sidecars, { recursive: true });
                 writeFileSync(join(sidecars, `${createHash("sha256").update(directory).digest("hex")}.json`),
                     JSON.stringify({ directory, identity: projectPath }));
+                // Tools cache directory identities at startup, separately from the context hook.
+                reloadedIsolationRoot = dirname(h.workdir);
+                await h.reloadPlugin();
             }
             const sessionId = await h.createSession();
+            // Reply events settle asynchronously; wait so pressure really selects the next execute pass.
+            const waitForUsage = (usage: MockUsage) => h.waitFor(() => writeContextDb((db) => {
+                const row = db.prepare("SELECT last_input_tokens FROM session_meta WHERE session_id=? AND harness=?")
+                    .get(sessionId, h.harnessId) as { last_input_tokens: number } | null;
+                return row?.last_input_tokens === usage.input_tokens + (usage.cache_creation_input_tokens ?? 0) + (usage.cache_read_input_tokens ?? 0);
+            }), { timeoutMs: 15_000, label: "K1 parent usage recorded before the next pass" });
             const original = ["Old edit rule. Keep edit rule.", "Merge left rule. ", "Merge right rule.", "Old replacement rule."];
             const ids = original.map((text) => seedMemory(text, "PROJECT_RULES", projectPath));
             setDefer("K1 warmup");
             await h.sendPrompt(sessionId, "K1 warmup.");
             h.mock.setDefault({ text: "K1 pressure", usage: EXECUTE_USAGE });
             await h.sendPrompt(sessionId, "K1 prepare baseline.");
+            await waitForUsage(EXECUTE_USAGE);
             setDefer("K1 baseline");
             await h.sendPrompt(sessionId, "K1 materialize baseline.");
+            await waitForUsage(DEFER_USAGE);
             const baseline = mainAgentRequests(h.mock.requests()).at(-1)!.body;
             const m0 = extractM0(baseline)!;
             const m1 = extractM1(baseline);
@@ -496,8 +514,11 @@ forEachHost(import.meta.url, null, (host) => {
             // The same session's ctx_memory save is the positive control for SOFT fragments.
             const own = "Agent save still reaches the memory delta.";
             await runMemoryTool(sessionId, { action: "write", category: "PROJECT_RULES", content: own }, "K1 save an agent rule.");
+            expect(writeContextDb((db) => db.prepare("SELECT content FROM memories WHERE project_path=? AND source_session_id=? AND content=?")
+                .all(projectPath, sessionId, own))).toEqual([{ content: own }]);
             h.mock.setDefault({ text: "K1 soft pressure", usage: EXECUTE_USAGE });
             await h.sendPrompt(sessionId, "K1 prepare SOFT.");
+            await waitForUsage(EXECUTE_USAGE);
             setDefer("K1 soft");
             await h.sendPrompt(sessionId, "K1 SOFT refresh.");
             const soft = mainAgentRequests(h.mock.requests()).at(-1)!.body;
@@ -514,6 +535,7 @@ forEachHost(import.meta.url, null, (host) => {
             expect(findBusts(mainAgentRequests(h.mock.requests()).slice(-2)).length).toBe(0);
             h.mock.setDefault({ text: "K1 hard pressure", usage: EXECUTE_USAGE });
             await h.sendPrompt(sessionId, "K1 prepare natural rebuild.");
+            await waitForUsage(EXECUTE_USAGE);
             expireCache(sessionId);
             setDefer("K1 hard");
             await h.sendPrompt(sessionId, "K1 expired cache rebuild.");
