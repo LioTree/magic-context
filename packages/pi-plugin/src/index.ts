@@ -1099,6 +1099,11 @@ export function resolveHistorianFromConfig(
 		// historian round-trip's latency and token cost. Enable for
 		// long sessions where chunk dedupe matters more than speed.
 		twoPass: historian?.two_pass === true,
+		// The memory-lifecycle off switch. The schema defaults it to
+		// "allowlist"; a `historian` block built without the schema key
+		// stays permissive here, and the runner then matches only the
+		// shipped (empty) allowlist.
+		turnTwo: historian?.turn_two ?? "allowlist",
 		expandTools: historian?.expand_tools,
 		// Pi and OMP: explicit thinking level for historian subagent invocations.
 		// When set, passed as --thinking <level> to Pi subprocess.

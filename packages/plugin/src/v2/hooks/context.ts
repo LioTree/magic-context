@@ -963,6 +963,7 @@ export async function registerContext(context: V2Context) {
             maxOutputTokens: fresh.historian?.maxTokens,
             timeoutMs: fresh.historian_timeout_ms,
             twoPass: fresh.historian?.two_pass === true,
+            turnTwo: fresh.historian?.turn_two ?? "allowlist",
             expandTools: fresh.historian?.expand_tools,
             autoPromote: fresh.memory?.auto_promote ?? true,
             userMemoriesEnabled: userObservationCollectionEnabled(fresh.dreamer),
@@ -1827,6 +1828,7 @@ export async function registerContext(context: V2Context) {
                 // its own default, so no fallback belongs here.
                 historianMaxOutputTokens: config.historian?.maxTokens,
                 historianTwoPass: config.historian?.two_pass,
+                historianTurnTwo: config.historian?.turn_two ?? "allowlist",
                 historianExpandTools: config.historian?.expand_tools,
                 historianRunner: config.historian?.runner,
                 historianHostRunnerEnabled: config.historian?.host_runner?.enabled,

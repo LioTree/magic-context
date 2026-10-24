@@ -72,6 +72,8 @@ export interface ManagedRecompContext {
     userObservationsRequested?: boolean;
     /** Two-pass historian (editor cleanup) — config `historian.two_pass`. */
     historianTwoPass?: boolean;
+    /** `historian.turn_two`, the memory-lifecycle off switch. Absent means "allowlist". */
+    historianTurnTwo?: "allowlist" | "off";
     historianExpandTools?: Record<string, string | false>;
     getNotificationParams: (sessionId: string) => NotificationParams;
     ensureProjectRegistered?: (directory: string, db: Database) => Promise<void>;
@@ -212,6 +214,7 @@ export function buildRecompDeps(
         fallbackModelId:
             ctx.fallbackModelId ?? resolveLiveModelKey(ctx.liveSessionState, sessionId),
         historianTwoPass: ctx.historianTwoPass,
+        historianTurnTwo: ctx.historianTurnTwo,
         historianExpandTools: ctx.historianExpandTools,
         ensureProjectRegistered: ctx.ensureProjectRegistered,
         getNotificationParams: () => ctx.getNotificationParams(sessionId),
