@@ -995,8 +995,29 @@ async fn view_answer(rig: &Rig, version: u64) -> String {
 /// Retention keeps the runner's applied version, every version it has not
 /// acknowledged yet and the newest; an acknowledgement evicts the rest, and
 /// `view.get` of an evicted version answers `unknown_version`.
-#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn acknowledgement_evicts_only_superseded_views() {
+///
+/// The body runs on its own thread with an 8 MiB stack. In a debug build its
+/// notice and `view.get` sequence needs about the 2 MiB test-thread default
+/// (measured between 2.0 and 2.2 MiB), so any small change to that path
+/// would abort the whole test binary with a stack overflow.
+#[test]
+fn acknowledgement_evicts_only_superseded_views() {
+    std::thread::Builder::new()
+        .stack_size(8 << 20)
+        .spawn(|| {
+            tokio::runtime::Builder::new_multi_thread()
+                .worker_threads(2)
+                .enable_all()
+                .build()
+                .unwrap()
+                .block_on(acknowledgement_evicts_only_superseded_views_body())
+        })
+        .unwrap()
+        .join()
+        .unwrap();
+}
+
+async fn acknowledgement_evicts_only_superseded_views_body() {
     let dir = tempfile::tempdir().unwrap();
     let (mut rig, first) = conversation(dir.path(), 40).await;
     rig.history(22, "a second historian summary");

@@ -790,19 +790,40 @@ fn inline_digest(entry: &ReadMessage, body: &Value) -> Result<String, HandlerOut
     Ok(contract::digest::content_digest(body))
 }
 
-/// The stored records of the conversations a tool or flush call's route names:
-/// its attested runner and bound session. The route's folder plays no part.
-/// A caller that is not an attested runner names none.
+/// The stored records of the conversations a tool or flush call's route names.
+///
+/// A route attested to a session runner names its conversations by that
+/// runner and the bound session, whatever folder spelling the route carries.
+/// A route with no attested runner, such as a Claude Code MCP facade, names
+/// a conversation by its session, admitted only when the route's folder is
+/// exactly the folder of the route that delivered Setup. That folder filters
+/// such routes; it is never part of the conversation's key.
 pub(super) fn route_records(
     store: &McStore,
     binding: &SessionBinding,
 ) -> Result<Vec<String>, HandlerOutcome> {
-    let Some(runner) = records::attested_runner(binding) else {
-        return Ok(Vec::new());
-    };
-    store
-        .async_compaction_for_session(runner, &binding.session)
-        .map_err(transient)
+    if let Some(runner) = records::attested_runner(binding)
+        .filter(|module| crate::route_targets::SESSION_RUNNER_MODULE_IDS.contains(module))
+    {
+        return store
+            .async_compaction_for_session(runner, &binding.session)
+            .map_err(transient);
+    }
+    #[derive(Deserialize)]
+    struct SetupRoute {
+        runner_identity: session_resolver::RunnerBindIdentity,
+    }
+    let mut admitted = Vec::new();
+    for raw in store
+        .async_compaction_records_for_session(&binding.session)
+        .map_err(transient)?
+    {
+        let route: SetupRoute = serde_json::from_str(&raw).map_err(transient)?;
+        if route.runner_identity.project_root.as_os_str() == binding.project_root.as_os_str() {
+            admitted.push(raw);
+        }
+    }
+    Ok(admitted)
 }
 
 impl State {

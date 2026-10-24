@@ -227,3 +227,36 @@ async fn route_lookups_reach_the_conversation_through_another_folder_spelling() 
         None
     );
 }
+
+/// A route with no attested runner (a Claude Code MCP facade) reaches the
+/// conversation by its session only from the exact folder Setup's route
+/// carried. The same session from any other folder finds nothing.
+#[tokio::test]
+async fn a_route_without_a_runner_reaches_the_session_only_from_setups_folder() {
+    let dir = tempfile::tempdir().unwrap();
+    let other = tempfile::tempdir().unwrap();
+    let rig = Rig::open(
+        dir.path(),
+        "thalamus",
+        "claude-code",
+        json!({"serializer_profile":"anthropic-messages"}),
+    )
+    .await;
+    let namespace = rig.state().namespace();
+    rig.bind(8, "claude-code", "s");
+    let same_folder = rig.h.facade_binding(8).unwrap();
+    assert_eq!(
+        rig.h
+            .async_compaction_namespace(&same_folder, true)
+            .unwrap(),
+        Some(namespace)
+    );
+    let mut elsewhere = same_folder;
+    elsewhere.project_root = other.path().to_path_buf();
+    rig.h.bind_route(9, elsewhere);
+    let elsewhere = rig.h.facade_binding(9).unwrap();
+    assert_eq!(
+        rig.h.async_compaction_namespace(&elsewhere, true).unwrap(),
+        None
+    );
+}
