@@ -2,6 +2,251 @@ import { randomUUID } from "node:crypto";
 import type { Database } from "../../../shared/sqlite";
 import { PROMOTABLE_CATEGORIES } from "./constants";
 import { tsOwnsMemory } from "./lifecycle-applier";
+import type { ReportedProfile } from "./lifecycle-gates";
+import { sweepTurnTwoStages, type TurnOneAuthorizationRequest, trialRootMatches } from "./turn-two";
+import {
+    expandTurnTwoEntry,
+    loadTurnTwoAllowlist,
+    matchesReportedProfile,
+    matchesTurnTwoEntry,
+    matchesTurnTwoSelection,
+    type TurnOneFailureKey,
+    type TurnOneFailureRow,
+    type TurnTwoAllowlist,
+    type TurnTwoTrialAuthorization,
+    turnOneFailureCount,
+    turnOneFailureProfileHash,
+    turnOneFailurePublicationId,
+} from "./turn-two-allowlist";
+import { closeTurnTwoChild, retainedTurnTwoChild } from "./turn-two-children";
+
+/** Persisted once and appended unchanged to the first request; turn two retains its history. */
+export const HISTORIAN_FORMAT_INSTRUCTION =
+    'Reply with exactly one JSON object with a result object. On turn one use {"result":{"step":"turn_one","xml":"the complete compartment XML"}}. On turn two use {"result":{"step":"turn_two","decisions":[],"scores":[]}} with the decisions and scores described in the system contract. Do not call tools.';
+
+const turnOneChildren = new Map<string, () => Promise<void>>();
+
+/** Share a release guard between a live send and a dormant firing that revokes it. */
+export function registerTurnOneChild(id: string, close: () => Promise<void>): () => Promise<void> {
+    let closed = false;
+    const release = async () => {
+        if (closed) return;
+        closed = true;
+        turnOneChildren.delete(id);
+        await close();
+    };
+    turnOneChildren.set(id, release);
+    return release;
+}
+
+/** Revocation must close live children too; normal recovery deliberately treats them as busy. */
+export async function sweepDormantTurnTwo(
+    db: Database,
+    projectPath: string,
+    close?: (childId: string) => Promise<void>,
+): Promise<void> {
+    await sweepTurnTwoStages(db, {
+        projectPath,
+        resolver: (record) => ({
+            check: async () => {
+                throw new Error("Revoked stage cannot run checks");
+            },
+            reattach: async () => ({ kind: "unknown" }),
+            close: async () => {
+                if (!record.childSessionId) return;
+                if (retainedTurnTwoChild(record.childSessionId))
+                    await closeTurnTwoChild(record.childSessionId);
+                else await close?.(record.childSessionId);
+            },
+        }),
+    });
+    const sends = db
+        .prepare(
+            "SELECT stage_key,child_session_id FROM memory_stage_attempts WHERE project_path=? AND stage='turn_one' AND state IN ('sending','replied')",
+        )
+        .all(projectPath) as Array<{ stage_key: string; child_session_id: string | null }>;
+    for (const send of sends) {
+        const changed = db
+            .prepare(
+                "UPDATE memory_stage_attempts SET state='revoked' WHERE stage_key=? AND state IN ('sending','replied')",
+            )
+            .run(send.stage_key).changes;
+        if (changed && send.child_session_id) {
+            const release = turnOneChildren.get(send.child_session_id);
+            if (release) await release();
+            else await close?.(send.child_session_id);
+        }
+    }
+}
+
+export function parseEnabledTurnOne(text: string): string | null {
+    try {
+        const parsed = JSON.parse(text);
+        return parsed?.result?.step === "turn_one" && typeof parsed.result.xml === "string"
+            ? parsed.result.xml
+            : null;
+    } catch {
+        return null;
+    }
+}
+
+/** Trial evidence is exclusive: a bad trial must never fall through to the shipped list. */
+export function selectTurnOneExecution(
+    db: Database,
+    input: {
+        projectPath: string;
+        request: TurnOneAuthorizationRequest;
+        override?: TurnOneLane;
+        turnTwo?: "allowlist" | "off";
+        twoPass?: boolean;
+        canContinue: boolean;
+        hasUI?: boolean;
+        allowlist?: TurnTwoAllowlist;
+        validatedProfiles?: readonly ReportedProfile[];
+        trialAuthorization?: TurnTwoTrialAuthorization;
+    },
+): { lane: TurnOneLane; refused: boolean; validatedProfiles?: readonly ReportedProfile[] } {
+    const { request, trialAuthorization: trial } = input;
+    if (
+        trial &&
+        (!trialRootMatches(db, trial) ||
+            !matchesTurnTwoSelection(request.requestedIdentity, trial.candidate))
+    )
+        return { lane: "dormant", refused: true };
+    const rows = input.validatedProfiles ?? input.allowlist?.validatedProfiles;
+    const expected = expandTurnTwoEntry(request.requestedIdentity);
+    const testMatch =
+        expected.length === 5 &&
+        rows !== undefined &&
+        expected.every((wanted) =>
+            rows.some((row) =>
+                Object.entries(wanted).every(
+                    ([key, value]) =>
+                        key === "temperature" ||
+                        key === "thinkingLevel" ||
+                        row[key as keyof ReportedProfile] === value,
+                ),
+            ),
+        );
+    const selected =
+        !!trial ||
+        testMatch ||
+        (input.allowlist ?? loadTurnTwoAllowlist()).entries.some((entry) =>
+            matchesTurnTwoSelection(request.requestedIdentity, entry),
+        );
+    const eligible =
+        input.turnTwo !== "off" &&
+        input.canContinue &&
+        input.hasUI !== false &&
+        (input.override === "enabled" ||
+            (!input.twoPass && input.override !== "dormant" && selected));
+    return {
+        lane: eligible ? "enabled" : "dormant",
+        refused: !!trial && !eligible,
+        validatedProfiles: rows,
+    };
+}
+
+export function turnOneProfileAuthorized(
+    request: TurnOneAuthorizationRequest,
+    actual: ReportedProfile | undefined,
+    profiles?: readonly ReportedProfile[],
+    trial?: TurnTwoTrialAuthorization,
+): boolean {
+    if (!actual) return false;
+    const identity = {
+        ...request.requestedIdentity,
+        lane: actual.lane,
+        carrier: actual.carrier,
+        provider: actual.provider,
+        modelId: actual.modelId,
+        variant: actual.variant,
+        temperature: actual.temperature,
+        thinkingLevel: actual.thinkingLevel,
+    };
+    const rows = expandTurnTwoEntry(identity as typeof request.requestedIdentity);
+    if (rows.length !== 5 || !matchesReportedProfile(actual, rows[0])) return false;
+    if (trial) return matchesTurnTwoEntry(identity, trial.candidate);
+    if (profiles !== undefined)
+        return rows.every((row) =>
+            profiles.some((candidate) => matchesReportedProfile(row, candidate)),
+        );
+    return loadTurnTwoAllowlist().entries.some((candidate) =>
+        matchesTurnTwoEntry(identity, candidate),
+    );
+}
+
+export function turnOneCounterKey(
+    request: TurnOneAuthorizationRequest,
+    parentSessionId: string,
+    firstMessageId: string,
+): TurnOneFailureKey {
+    const identity = request.requestedIdentity;
+    return {
+        parentSessionId,
+        firstMessageId,
+        profileHash: turnOneFailureProfileHash(identity),
+        renderingHash: identity.historianSystemHash,
+        schemaHash: identity.combinedSchemaHash,
+        toolHash: identity.historianToolHash,
+    };
+}
+
+export function readTurnOneFailureCount(
+    db: Database,
+    projectPath: string,
+    key: TurnOneFailureKey,
+): number {
+    const id = turnOneFailurePublicationId(key);
+    return turnOneFailureCount(
+        id,
+        db
+            .prepare(
+                "SELECT publication_id,stage,run_attempt,state FROM memory_stage_attempts WHERE project_path=? AND publication_id=?",
+            )
+            .all(projectPath, id) as TurnOneFailureRow[],
+    );
+}
+
+/** Counter rows are independent of publications, so growing chunks and restarts keep the budget. */
+export function recordTurnOneCounter(
+    db: Database,
+    input: {
+        projectPath: string;
+        key: TurnOneFailureKey;
+        harness: string;
+        carrier: string;
+        state: "parse_failed" | "counter_reset";
+    },
+): void {
+    db.transaction(() => {
+        if (
+            input.state === "counter_reset" &&
+            readTurnOneFailureCount(db, input.projectPath, input.key) === 0
+        )
+            return;
+        const id = turnOneFailurePublicationId(input.key);
+        const prior = db
+            .prepare(
+                "SELECT COALESCE(MAX(run_attempt),0) AS n FROM memory_stage_attempts WHERE project_path=? AND publication_id=?",
+            )
+            .get(input.projectPath, id) as { n: number };
+        const attempt = prior.n + 1;
+        db.prepare(`INSERT INTO memory_stage_attempts(stage_key,project_path,publication_id,run_attempt,stage,session_id,harness,carrier,state,request_json,started_at)
+            VALUES(?,?,?,?,'turn_one',?,?,?,?,?,?)`).run(
+            `${id}:${attempt}`,
+            input.projectPath,
+            id,
+            attempt,
+            input.key.parentSessionId,
+            input.harness,
+            input.carrier,
+            input.state,
+            JSON.stringify(input.key),
+            Date.now(),
+        );
+    }).immediate();
+}
 
 /**
  * How a historian lane (one transport path to the historian model: the OpenCode host
@@ -28,6 +273,7 @@ export function resolveTurnOneLane(override?: TurnOneLane): TurnOneLane {
 
 /** The record persisted before turn one is dispatched. */
 export interface TurnOneSend {
+    recovery?: boolean;
     publicationId: string;
     runAttempt: number;
     stageKey: string;
@@ -55,6 +301,30 @@ export interface TurnOneSendInput {
 export function allocateTurnOneSend(db: Database, input: TurnOneSendInput): TurnOneSend {
     return db
         .transaction((): TurnOneSend => {
+            const unknown =
+                input.lane === "enabled"
+                    ? (db
+                          .prepare(`SELECT stage_key,publication_id,run_attempt FROM memory_stage_attempts
+                WHERE project_path=? AND session_id=? AND harness=? AND carrier=? AND stage='turn_one' AND state IN ('sending','replied') ORDER BY started_at DESC LIMIT 1`)
+                          .get(
+                              input.projectPath,
+                              input.sessionId,
+                              input.harness,
+                              input.carrier,
+                          ) as {
+                          stage_key: string;
+                          publication_id: string;
+                          run_attempt: number;
+                      } | null)
+                    : null;
+            if (unknown)
+                return {
+                    publicationId: unknown.publication_id,
+                    runAttempt: unknown.run_attempt,
+                    stageKey: unknown.stage_key,
+                    lane: input.lane,
+                    recovery: true,
+                };
             const reusable = db
                 .prepare(
                     `SELECT p.publication_id FROM memory_publications p
@@ -352,6 +622,11 @@ export function commitTurnOnePublication(
     db: Database,
     input: TurnOnePublicationInput,
 ): TurnOnePublicationResult {
+    const stage = db
+        .prepare("SELECT state FROM memory_stage_attempts WHERE stage_key=?")
+        .get(input.send.stageKey) as { state: string } | null;
+    if (stage?.state === "revoked" || stage?.state === "expired")
+        throw new Error("Turn-one send was released before publication");
     const now = Date.now();
     const committed = db
         .prepare(

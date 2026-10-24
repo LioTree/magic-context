@@ -27,6 +27,10 @@ export function authorizationFixture(
         request,
         profile: rows[0]!,
         rows,
+        /** Mirrors parseEnabledTurnOne's result.step and XML envelope. */
+        turnOne(xml: string): string {
+            return JSON.stringify({ result: { step: "turn_one", xml } });
+        },
         checkProfile(systemHash: string): ReportedProfile {
             const row = rows.slice(1).find((candidate) => candidate.systemHash === systemHash);
             if (!row) throw new Error("Unknown check system in fixture");

@@ -17,7 +17,10 @@ import {
     getMemoriesByProject,
     insertMemory,
 } from "../../features/magic-context/memory/storage-memory";
+import { HISTORIAN_FORMAT_INSTRUCTION } from "../../features/magic-context/memory/turn-one-publication";
+import { TurnTwoOutcomeUnknownError } from "../../features/magic-context/memory/turn-two";
 import { __turnTwoChildrenTest } from "../../features/magic-context/memory/turn-two-children";
+import { authorizationFixture } from "../../features/magic-context/memory/turn-two-test-fixtures.test";
 import {
     closeDatabase,
     getHistorianFailureState,
@@ -29,7 +32,10 @@ import { __resetNotificationStateForTests } from "../../shared/rpc-notifications
 import { Database } from "../../shared/sqlite";
 import { closeQuietly } from "../../shared/sqlite-helpers";
 import { createTestTempDirFromPath } from "../../shared/test-temp-dir";
-import { COMPARTMENT_AGENT_SYSTEM_PROMPT } from "./compartment-prompt";
+import {
+    COMPARTMENT_AGENT_COMBINED_SYSTEM_PROMPT,
+    COMPARTMENT_AGENT_SYSTEM_PROMPT,
+} from "./compartment-prompt";
 import { runCompartmentAgent as runCompartmentAgentImpl } from "./compartment-runner";
 import { createV1HiddenCompletionExecutor } from "./compartment-runner-historian";
 import { settleHistorianTurnTwoRuns } from "./historian-turn-two-step";
@@ -42,6 +48,20 @@ import { __ignoredNotificationTest } from "./send-session-notification";
 
 const tempDirs: string[] = [];
 const originalXdgDataHome = process.env.XDG_DATA_HOME;
+const combinedFixture = authorizationFixture(
+    {
+        lane: "opencode-1",
+        carrier: "opencode-session",
+        provider: "test",
+        modelId: "fixture-historian",
+        variant: null,
+        temperature: null,
+        thinkingLevel: null,
+    },
+    COMPARTMENT_AGENT_COMBINED_SYSTEM_PROMPT,
+    [],
+    HISTORIAN_FORMAT_INSTRUCTION,
+);
 
 beforeEach(async () => {
     await observeProducerModelsForTest(["test/fixture-historian"]);
@@ -151,7 +171,16 @@ function historianClient(directory: string, replies: () => string) {
                 data: [
                     {
                         info: { role: "assistant", time: { created: 1 } },
-                        parts: [{ type: "text", text: replies() }],
+                        parts: [
+                            {
+                                type: "text",
+                                text: sentPrompts(prompt)
+                                    .at(-1)
+                                    ?.includes(HISTORIAN_FORMAT_INSTRUCTION)
+                                    ? combinedFixture.turnOne(replies())
+                                    : replies(),
+                            },
+                        ],
                     },
                 ],
             })),
@@ -179,6 +208,25 @@ async function runHistorian(
                 historianChunkTokens: 10_000,
                 directory,
                 compartmentLeaseHolderId: holderId,
+                memoryLifecycleValidatedProfiles:
+                    extra.memoryLifecycleLane === "enabled"
+                        ? authorizationFixture(
+                              {
+                                  lane: "opencode-1",
+                                  carrier: extra.hiddenCompletionExecutor
+                                      ? "hidden-completion"
+                                      : "opencode-session",
+                                  provider: "test",
+                                  modelId: "fixture-historian",
+                                  variant: null,
+                                  temperature: null,
+                                  thinkingLevel: null,
+                              },
+                              COMPARTMENT_AGENT_COMBINED_SYSTEM_PROMPT,
+                              [],
+                              HISTORIAN_FORMAT_INSTRUCTION,
+                          ).rows
+                        : undefined,
                 ...extra,
             }),
         );
@@ -223,7 +271,7 @@ function publications(db: Database) {
 function turnOneSends(db: Database) {
     return db
         .prepare(
-            "SELECT publication_id, run_attempt, stage, session_id, state FROM memory_stage_attempts WHERE stage='turn_one' ORDER BY run_attempt",
+            "SELECT publication_id, run_attempt, stage, session_id, state FROM memory_stage_attempts WHERE stage='turn_one' AND publication_id NOT LIKE 't1fail:%' ORDER BY run_attempt",
         )
         .all() as Array<{
         publication_id: string;
@@ -362,6 +410,121 @@ describe("historian turn one on a dormant lane (production default)", () => {
 });
 
 describe("historian turn one on an enabled lane", () => {
+    it("invalid trial sends nothing even when the allowlist matches", async () => {
+        useTempDataHome("turn-one-invalid-trial-");
+        const sessionId = "ses-invalid-trial";
+        const directory = "/tmp/turn-one-invalid-trial";
+        createOpenCodeSession(sessionId);
+        const db = openDatabase();
+        seedPriorCompartment(db, sessionId);
+        const fixture = authorizationFixture(
+            {
+                lane: "opencode-1",
+                carrier: "opencode-session",
+                provider: "test",
+                modelId: "fixture-historian",
+                variant: null,
+                temperature: null,
+                thinkingLevel: null,
+            },
+            COMPARTMENT_AGENT_COMBINED_SYSTEM_PROMPT,
+            [],
+            HISTORIAN_FORMAT_INSTRUCTION,
+        );
+        const { client, prompt } = historianClient(directory, () => REPLY_WITH_FACTS);
+        for (const candidate of [
+            fixture.request.requestedIdentity,
+            { ...fixture.request.requestedIdentity, lane: "omp" as const },
+            { ...fixture.request.requestedIdentity, carrier: "pi-historian-rpc" as const },
+        ]) {
+            await runHistorian(db, sessionId, client, directory, {
+                memoryLifecycleAllowlist: {
+                    entries: [fixture.request.requestedIdentity],
+                    validatedProfiles: fixture.rows,
+                },
+                memoryLifecycleTrialAuthorization: { candidate, attestedRoot: directory },
+            });
+        }
+        expect(sentPrompts(prompt)).toEqual([]);
+        expect(getCompartments(db, sessionId)).toHaveLength(1);
+        expect(publications(db)).toEqual([]);
+        expect(pendingFacts(db)).toEqual([]);
+        expect(getMemoriesByProject(db, resolveProjectIdentity(directory))).toEqual([]);
+    });
+
+    it("three enabled parse failures survive restart and a growing chunk before dormant fallback", async () => {
+        useTempDataHome("turn-one-counter-");
+        const sessionId = "ses-counter";
+        const directory = "/tmp/turn-one-counter";
+        createOpenCodeSession(sessionId);
+        let db = openDatabase();
+        seedPriorCompartment(db, sessionId);
+        let reply = "not compartment XML";
+        const { client, prompt } = historianClient(directory, () => reply);
+        const options = { memoryLifecycleLane: "enabled" as const, forceDrainQuota: true };
+        await runHistorian(db, sessionId, client, directory, options);
+        await runHistorian(db, sessionId, client, directory, options);
+        expect(sentPrompts(prompt)).toHaveLength(2);
+        closeDatabase();
+        db = openDatabase();
+        const raw = new Database(join(process.env.XDG_DATA_HOME!, "opencode", "opencode.db"));
+        try {
+            raw.prepare("INSERT INTO message VALUES (?,?,?,?,?)").run(
+                "m-10",
+                sessionId,
+                10,
+                10,
+                JSON.stringify({ id: "m-10", role: "user", sessionID: sessionId }),
+            );
+            raw.prepare(
+                "INSERT INTO part (message_id,session_id,time_created,time_updated,data) VALUES (?,?,?,?,?)",
+            ).run(
+                "m-10",
+                sessionId,
+                10,
+                10,
+                JSON.stringify({ type: "text", text: "Appended tail" }),
+            );
+        } finally {
+            raw.close();
+        }
+        await runHistorian(db, sessionId, client, directory, options);
+        expect(sentPrompts(prompt)).toHaveLength(3);
+        expect(getCompartments(db, sessionId)).toHaveLength(1);
+        expect(pendingFacts(db)).toEqual([]);
+        const failures = db
+            .prepare(
+                "SELECT publication_id,run_attempt,stage_key,request_json FROM memory_stage_attempts WHERE state='parse_failed' ORDER BY run_attempt",
+            )
+            .all() as Array<{
+            publication_id: string;
+            run_attempt: number;
+            stage_key: string;
+            request_json: string;
+        }>;
+        expect(failures).toHaveLength(3);
+        expect(new Set(failures.map((row) => row.publication_id)).size).toBe(1);
+        expect(failures.map((row) => row.run_attempt)).toEqual([1, 2, 3]);
+        expect(failures.map((row) => JSON.parse(row.request_json).firstMessageId)).toEqual([
+            "m-3",
+            "m-3",
+            "m-3",
+        ]);
+        expect(sentPrompts(prompt)[2]).not.toBe(sentPrompts(prompt)[1]);
+        reply = REPLY_WITH_FACTS.replace('end="4"', 'end="5"');
+        await runHistorian(db, sessionId, client, directory, options);
+        expect(sentPrompts(prompt)).toHaveLength(4);
+        expect(sentPrompts(prompt)[3]).not.toContain(HISTORIAN_FORMAT_INSTRUCTION);
+        expect(getCompartments(db, sessionId)).toHaveLength(2);
+        expect(pendingFacts(db)).toEqual([]);
+        expect(
+            db
+                .prepare(
+                    "SELECT run_attempt FROM memory_stage_attempts WHERE state='counter_reset'",
+                )
+                .all(),
+        ).toEqual([{ run_attempt: 4 }]);
+    });
     it("omits the memory block and binds anchored candidates to this reply's durable compartment", async () => {
         useTempDataHome("turn-one-enabled-");
         const sessionId = "ses-enabled";
@@ -585,6 +748,217 @@ describe("historian turn one when the store is busy before dispatch", () => {
 });
 
 describe("historian turn two on an enabled lane", () => {
+    it("OpenCode turn-one reply revoked in flight publishes nothing and releases once", async () => {
+        useTempDataHome("turn-one-revoked-");
+        const sessionId = "ses-turn-one-revoked";
+        const directory = "/tmp/turn-one-revoked";
+        createOpenCodeSession(sessionId);
+        const db = openDatabase();
+        seedPriorCompartment(db, sessionId);
+        let enabled = true;
+        const { client, events } = twoTurnClient(directory, null);
+        const messages = client.session.messages.bind(client.session);
+        client.session.messages = (async (...input: Parameters<typeof messages>) => {
+            enabled = false;
+            return messages(...input);
+        }) as typeof client.session.messages;
+        await runHistorian(db, sessionId, client, directory, {
+            memoryLifecycleLane: "enabled",
+            historianTurnTwoIsEnabled: () => enabled,
+        });
+        expect(getCompartments(db, sessionId)).toHaveLength(1);
+        expect(pendingFacts(db)).toEqual([]);
+        expect(publications(db).map((row) => row.commit_order)).toEqual([null]);
+        expect(events).toEqual(["prompt:ses-child-1:1", "delete:ses-child-1"]);
+    });
+    for (const outcome of ["reply", "expired"] as const)
+        it(`OpenCode unknown turn one reattaches without resending then resolves ${outcome}`, async () => {
+            useTempDataHome(`turn-one-reattach-${outcome}-`);
+            const sessionId = `ses-reattach-${outcome}`;
+            const directory = `/tmp/turn-one-reattach-${outcome}`;
+            createOpenCodeSession(sessionId);
+            const db = openDatabase();
+            seedPriorCompartment(db, sessionId);
+            const { client, events } = twoTurnClient(directory, (prompt) =>
+                JSON.stringify({
+                    result: {
+                        step: "turn_two",
+                        decisions: [...prompt.matchAll(/^## Fact (\d+)/gm)].map((m) => ({
+                            fact_id: Number(m[1]),
+                            action: "abstain",
+                        })),
+                    },
+                }),
+            );
+            const original = createV1HiddenCompletionExecutor(client, db, directory);
+            let first = true;
+            let state: "active" | "terminal" | "unavailable" = "active";
+            const executor = {
+                ...original,
+                collect: async (...input: Parameters<typeof original.collect>) => {
+                    if (first) {
+                        first = false;
+                        throw new TurnTwoOutcomeUnknownError();
+                    }
+                    return original.collect(...input);
+                },
+                recoveryState: async () => state,
+                recover: async (id: string) => original.collect({ id, childSessionId: id }, 50),
+            };
+            const options = {
+                memoryLifecycleLane: "enabled" as const,
+                hiddenCompletionExecutor: executor,
+                forceDrainQuota: true,
+            };
+            await runHistorian(db, sessionId, client, directory, options);
+            const stage = db
+                .prepare("SELECT stage_key FROM memory_stage_attempts WHERE state='sending'")
+                .get();
+            expect(stage).not.toBeNull();
+            await runHistorian(db, sessionId, client, directory, options);
+            expect(events).toEqual(["prompt:ses-child-1:1"]);
+            expect(getCompartments(db, sessionId)).toHaveLength(1);
+            expect(pendingFacts(db)).toEqual([]);
+            state = outcome === "reply" ? "terminal" : "unavailable";
+            await runHistorian(db, sessionId, client, directory, options);
+            await settleHistorianTurnTwoRuns();
+            expect(
+                db
+                    .prepare("SELECT stage_key FROM memory_stage_attempts WHERE stage='turn_one'")
+                    .all(),
+            ).toEqual([stage]);
+            expect(getCompartments(db, sessionId)).toHaveLength(outcome === "reply" ? 2 : 1);
+            expect(events).toEqual(
+                outcome === "reply"
+                    ? ["prompt:ses-child-1:1", "prompt:ses-child-1:2", "delete:ses-child-1"]
+                    : ["prompt:ses-child-1:1", "delete:ses-child-1"],
+            );
+        });
+
+    it("automatic authorization persists requested bytes and freezes a known answering fallback", async () => {
+        useTempDataHome("turn-one-frozen-fallback-");
+        const sessionId = "ses-frozen-fallback";
+        const directory = "/tmp/turn-one-frozen-fallback";
+        createOpenCodeSession(sessionId);
+        const db = openDatabase();
+        seedPriorCompartment(db, sessionId);
+        const requested = authorizationFixture(
+            {
+                lane: "opencode-1",
+                carrier: "opencode-session",
+                provider: "test",
+                modelId: "fixture-historian",
+                variant: null,
+                temperature: null,
+                thinkingLevel: null,
+            },
+            COMPARTMENT_AGENT_COMBINED_SYSTEM_PROMPT,
+            [],
+            HISTORIAN_FORMAT_INSTRUCTION,
+        );
+        const fallback = authorizationFixture(
+            { ...requested.request.requestedIdentity, modelId: "known-fallback" },
+            COMPARTMENT_AGENT_COMBINED_SYSTEM_PROMPT,
+            [],
+            HISTORIAN_FORMAT_INSTRUCTION,
+        );
+        const { client } = twoTurnClient(
+            directory,
+            (prompt) =>
+                JSON.stringify({
+                    result: {
+                        step: "turn_two",
+                        decisions: [...prompt.matchAll(/^## Fact (\d+)/gm)].map((match) => ({
+                            fact_id: Number(match[1]),
+                            action: "abstain",
+                        })),
+                    },
+                }),
+            undefined,
+            "known-fallback",
+        );
+        await runHistorian(db, sessionId, client, directory, {
+            memoryLifecycleAllowlist: {
+                entries: [requested.request.requestedIdentity, fallback.request.requestedIdentity],
+                validatedProfiles: [...requested.rows, ...fallback.rows],
+            },
+        });
+        await settleHistorianTurnTwoRuns();
+        const row = db
+            .prepare(
+                "SELECT request_json,reported_profile_json FROM memory_stage_attempts WHERE stage='turn_one'",
+            )
+            .get() as { request_json: string; reported_profile_json: string };
+        const request = JSON.parse(row.request_json);
+        expect(request.requestedIdentity).toEqual(requested.request.requestedIdentity);
+        expect(request.system).toBe(COMPARTMENT_AGENT_COMBINED_SYSTEM_PROMPT);
+        expect(request.formatInstruction).toBe(HISTORIAN_FORMAT_INSTRUCTION);
+        expect(request.prompt).toContain(HISTORIAN_FORMAT_INSTRUCTION);
+        expect(JSON.parse(row.reported_profile_json)).toEqual(fallback.profile);
+        expect(
+            db.prepare("SELECT state FROM memory_stage_attempts WHERE stage='turn_two'").get(),
+        ).toEqual({ state: "resolved" });
+        expect(getMemoriesByProject(db, resolveProjectIdentity(directory))).toEqual([]);
+    });
+    it("OpenCode late reply after off applies nothing, charges nothing and releases once", async () => {
+        useTempDataHome("turn-two-live-off-");
+        const sessionId = "ses-live-off";
+        const directory = "/tmp/turn-two-live-off";
+        createOpenCodeSession(sessionId);
+        const db = openDatabase();
+        seedPriorCompartment(db, sessionId);
+        let enabled = true;
+        const { client, events } = twoTurnClient(directory, (prompt) => {
+            enabled = false;
+            return JSON.stringify({
+                result: {
+                    step: "turn_two",
+                    decisions: [...prompt.matchAll(/^## Fact (\d+)/gm)].map((m) => ({
+                        fact_id: Number(m[1]),
+                        action: "new",
+                    })),
+                },
+            });
+        });
+        await runHistorian(db, sessionId, client, directory, {
+            memoryLifecycleLane: "enabled",
+            historianTurnTwoIsEnabled: () => enabled,
+        });
+        await settleHistorianTurnTwoRuns();
+        expect(getMemoriesByProject(db, resolveProjectIdentity(directory))).toEqual([]);
+        expect(db.prepare("SELECT state,fact_attempts FROM memory_pending_facts").all()).toEqual([
+            { state: "retryable", fact_attempts: 0 },
+            { state: "retryable", fact_attempts: 0 },
+        ]);
+        expect(events.filter((event) => event.startsWith("delete:"))).toEqual([
+            "delete:ses-child-1",
+        ]);
+    });
+
+    it("one dormant OpenCode firing sweeps a sending stage without charging an attempt", async () => {
+        useTempDataHome("turn-two-dormant-sweep-");
+        const sessionId = "ses-dormant-sweep";
+        const directory = "/tmp/turn-two-dormant-sweep";
+        createOpenCodeSession(sessionId);
+        const db = openDatabase();
+        seedPriorCompartment(db, sessionId);
+        const { client, events } = twoTurnClient(directory, null);
+        await runHistorian(db, sessionId, client, directory, { memoryLifecycleLane: "enabled" });
+        await settleHistorianTurnTwoRuns();
+        expect(
+            db.prepare("SELECT state FROM memory_stage_attempts WHERE stage='turn_two'").get(),
+        ).toEqual({ state: "sending" });
+        await runHistorian(db, sessionId, client, directory, { historianTurnTwo: "off" });
+        expect(db.prepare("SELECT state,fact_attempts FROM memory_pending_facts").all()).toEqual([
+            { state: "retryable", fact_attempts: 0 },
+            { state: "retryable", fact_attempts: 0 },
+        ]);
+        expect(events.filter((event) => event.startsWith("delete:"))).toEqual([
+            "delete:ses-child-1",
+        ]);
+        expect(getMemoriesByProject(db, resolveProjectIdentity(directory))).toEqual([]);
+    });
+
     /**
      * A host whose hidden children answer turn one with `REPLY_WITH_FACTS` and a
      * later prompt in the same child with `turnTwo(prompt)`. `events` records every
@@ -594,6 +968,7 @@ describe("historian turn two on an enabled lane", () => {
         directory: string,
         turnTwo: ((prompt: string) => string) | null,
         beforeTurnTwo?: Promise<void>,
+        answeredModel = "fixture-historian",
     ) {
         const events: string[] = [];
         const replies = new Map<string, string>();
@@ -613,7 +988,13 @@ describe("historian turn two on an enabled lane", () => {
                         prompts.set(id, turn);
                         events.push(`prompt:${id}:${turn}`);
                         const text = input.body.parts[0]?.text ?? "";
-                        if (turn === 1) replies.set(id, REPLY_WITH_FACTS);
+                        if (turn === 1)
+                            replies.set(
+                                id,
+                                text.includes(HISTORIAN_FORMAT_INSTRUCTION)
+                                    ? combinedFixture.turnOne(REPLY_WITH_FACTS)
+                                    : REPLY_WITH_FACTS,
+                            );
                         else {
                             await beforeTurnTwo;
                             if (turnTwo) replies.set(id, turnTwo(text));
@@ -628,7 +1009,7 @@ describe("historian turn two on an enabled lane", () => {
                                 role: "assistant",
                                 time: { created: prompts.get(input.path.id) ?? 0 },
                                 providerID: "test",
-                                modelID: "fixture-historian",
+                                modelID: answeredModel,
                             },
                             parts: [{ type: "text", text: replies.get(input.path.id) ?? "" }],
                         },

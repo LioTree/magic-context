@@ -90,12 +90,17 @@ export function openCodeTurnTwoToolHash(args: {
     provider?: string;
     observedToolSurface?: readonly string[];
 }): string | null {
+    const surface = openCodeTurnTwoToolSurface(args);
+    return surface === undefined ? null : lifecycleToolHash(surface);
+}
+
+/** The exact Magic Context tool bytes used for both request persistence and carrier reports. */
+export function openCodeTurnTwoToolSurface(
+    args: Parameters<typeof openCodeTurnTwoToolHash>[0],
+): unknown {
     const lane = turnTwoLaneForReport(args);
-    if (lane === "opencode-2")
-        return args.observedToolSurface === undefined
-            ? null
-            : lifecycleToolHash(args.observedToolSurface);
-    if (lane !== "opencode-1") return null;
+    if (lane === "opencode-2") return args.observedToolSurface;
+    if (lane !== "opencode-1") return undefined;
     const registrations = buildHiddenAgentRegistrations({
         dreamerPrompt: undefined,
         historianPrompt: undefined,
@@ -108,8 +113,8 @@ export function openCodeTurnTwoToolHash(args: {
     const registration = [...registrations, ...buildZenReadAgentRegistrations(registrations)].find(
         (entry) => entry.id === agent,
     );
-    if (!registration) return null;
-    if (registration.allowedTools.length === 0) return lifecycleToolHash([]);
+    if (!registration) return undefined;
+    if (registration.allowedTools.length === 0) return [];
     const config = buildHiddenAgentConfig(
         "",
         registration.allowedTools,
@@ -118,13 +123,13 @@ export function openCodeTurnTwoToolHash(args: {
         registration.id,
         registration.lockPermissions,
     );
-    return lifecycleToolHash({
+    return {
         allowedTools: registration.allowedTools,
         permissions: config.permission,
-    });
+    };
 }
 
-function reportedProfile(
+export function reportedProfile(
     completion: HiddenCompletion,
     model: RetainedHistorianChild["model"],
     systemHash: string,

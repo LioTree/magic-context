@@ -1,20 +1,34 @@
 import { describe, expect, test } from "bun:test";
-import { readFileSync } from "node:fs";
-import { resolve } from "node:path";
+import { mkdirSync, readFileSync, realpathSync, rmSync, symlinkSync } from "node:fs";
+import { tmpdir } from "node:os";
+import { join, resolve } from "node:path";
 import { splitFactAnchorPrefix } from "../../../hooks/magic-context/compartment-parser";
+import {
+    openCodeTurnTwoToolHash,
+    openCodeTurnTwoToolSurface,
+} from "../../../hooks/magic-context/historian-turn-two-carrier";
+import { openCodeTurnOneAuthorization } from "../../../hooks/magic-context/historian-turn-two-step";
 import { Database } from "../../../shared/sqlite";
+import { cleanupTestTempDir, createTestTempDirFromPath } from "../../../shared/test-temp-dir";
 import { initializeDatabase } from "../storage-db";
+import vectors from "./turn-one-counter-vectors.json";
 import {
     allocateTurnOneSend,
     blocksSentToHistorian,
     commitTurnOnePublication,
     keepPublishedFact,
     publishedFacts,
+    readTurnOneFailureCount,
+    recordTurnOneCounter,
     resolveTurnOneFactAnchor,
     resolveTurnOneLane,
+    selectTurnOneExecution,
     type TurnOnePrintedBlock,
     type TurnOneSend,
 } from "./turn-one-publication";
+import { persistTurnOneAuthorization } from "./turn-two";
+import { loadTurnTwoAllowlist } from "./turn-two-allowlist";
+import { authorizationFixture } from "./turn-two-test-fixtures.test";
 
 interface AnchorGolden {
     compartments: Array<[number, number]>;
@@ -58,6 +72,175 @@ function store(): Database {
 
 const PROJECT = "git:turn-one";
 const SESSION = "ses-turn-one";
+
+describe("turn-one selection and durable counter", () => {
+    for (const harness of ["opencode", "opencode2"])
+        for (const provider of ["test", "opencode"]) {
+            test(`carrier surface extraction preserves ${harness}/${provider} hash and persisted bytes`, () => {
+                const carrier = harness === "opencode" ? "opencode-session" : "hidden-completion";
+                const input = {
+                    harness,
+                    carrier,
+                    provider,
+                    agent: "historian",
+                    observedToolSurface: provider === "test" ? [] : ["read"],
+                };
+                const beforeExtraction =
+                    provider === "test"
+                        ? "4f53cda18c2baa0c0354bb5f9a3ecbe5ed12ab4d8e11ba873c2f11161202b945"
+                        : harness === "opencode"
+                          ? "2d8ae24172e9dd76cba9ceb476941d7b82f3de88a9941b021cffbbd0b39b6133"
+                          : "8a2d0b87e8c712cc8e06c5c3f8de5e7f9dc8edcca03079a7aec0cb6436294927";
+                expect(openCodeTurnTwoToolHash(input)).toBe(beforeExtraction);
+                const request = openCodeTurnOneAuthorization({
+                    harness,
+                    carrier,
+                    model: `${provider}/model`,
+                    system: "combined",
+                });
+                const db = store();
+                try {
+                    const send = allocate(db);
+                    persistTurnOneAuthorization(db, send.stageKey, request);
+                    const row = db
+                        .prepare("SELECT request_json FROM memory_stage_attempts WHERE stage_key=?")
+                        .get(send.stageKey) as { request_json: string };
+                    expect(JSON.parse(row.request_json).toolSurface).toEqual(
+                        openCodeTurnTwoToolSurface(input),
+                    );
+                    expect(JSON.parse(row.request_json).checkToolSurface).toEqual(
+                        openCodeTurnTwoToolSurface(input),
+                    );
+                    expect(JSON.parse(row.request_json).requestedIdentity.historianToolHash).toBe(
+                        beforeExtraction,
+                    );
+                } finally {
+                    db.close();
+                }
+            });
+        }
+    const fixture = authorizationFixture(
+        {
+            lane: "opencode-1",
+            carrier: "opencode-session",
+            provider: "test",
+            modelId: "model",
+            variant: null,
+            temperature: null,
+            thinkingLevel: null,
+        },
+        "combined system",
+        [],
+    );
+    test("trial selection is exclusive and requires the attested non-symlinked disposable store", () => {
+        const base = join(realpathSync(tmpdir()), "magic-context");
+        mkdirSync(base, { recursive: true });
+        const root = createTestTempDirFromPath(join(base, "turn-one-trial-"));
+        const alias = `${root}-alias`;
+        const db = new Database(join(root, "store.db"));
+        initializeDatabase(db);
+        try {
+            symlinkSync(root, alias, "dir");
+            const input = {
+                projectPath: PROJECT,
+                request: fixture.request,
+                canContinue: true,
+                allowlist: loadTurnTwoAllowlist({
+                    version: 1,
+                    entries: [fixture.request.requestedIdentity],
+                }),
+            };
+            expect(
+                selectTurnOneExecution(db, {
+                    ...input,
+                    trialAuthorization: {
+                        candidate: fixture.request.requestedIdentity,
+                        attestedRoot: root,
+                    },
+                }),
+            ).toMatchObject({ lane: "enabled", refused: false });
+            for (const trialAuthorization of [
+                { candidate: fixture.request.requestedIdentity, attestedRoot: alias },
+                {
+                    candidate: { ...fixture.request.requestedIdentity, lane: "omp" as const },
+                    attestedRoot: root,
+                },
+                {
+                    candidate: {
+                        ...fixture.request.requestedIdentity,
+                        carrier: "hidden-completion" as const,
+                    },
+                    attestedRoot: root,
+                },
+                { candidate: fixture.request.requestedIdentity, attestedRoot: process.cwd() },
+            ])
+                expect(selectTurnOneExecution(db, { ...input, trialAuthorization })).toMatchObject({
+                    refused: true,
+                });
+        } finally {
+            db.close();
+            rmSync(alias, { force: true });
+            cleanupTestTempDir(root);
+        }
+    });
+    for (const turnTwo of ["allowlist", "off"] as const)
+        for (const twoPass of [false, true]) {
+            test(`automatic selection with turn_two=${turnTwo} and two_pass=${twoPass}`, () => {
+                const db = store();
+                try {
+                    const selection = selectTurnOneExecution(db, {
+                        projectPath: PROJECT,
+                        request: fixture.request,
+                        turnTwo,
+                        twoPass,
+                        canContinue: true,
+                        allowlist: loadTurnTwoAllowlist({
+                            version: 1,
+                            entries: [fixture.request.requestedIdentity],
+                        }),
+                    });
+                    expect(selection.lane).toBe(
+                        turnTwo === "allowlist" && !twoPass ? "enabled" : "dormant",
+                    );
+                } finally {
+                    db.close();
+                }
+            });
+        }
+    test("counter writes S1 rows and follows failure, failure, reset, failure", () => {
+        const db = store();
+        try {
+            for (const event of vectors.sequences[0]!.rows) {
+                recordTurnOneCounter(db, {
+                    projectPath: "/fixture-project",
+                    key: vectors.key,
+                    harness: "opencode2",
+                    carrier: "hidden-completion",
+                    state: event.row.state as "parse_failed" | "counter_reset",
+                });
+                expect(readTurnOneFailureCount(db, "/fixture-project", vectors.key)).toBe(
+                    event.expectedCount,
+                );
+            }
+            const actual = db
+                .prepare("SELECT * FROM memory_stage_attempts ORDER BY run_attempt")
+                .all() as Array<Record<string, unknown>>;
+            expect(actual).toHaveLength(4);
+            for (const [index, row] of actual.entries()) {
+                const expected = vectors.sequences[0]!.rows[index]!.row;
+                expect({
+                    ...row,
+                    request_json: JSON.parse(row.request_json as string),
+                }).toMatchObject({ ...expected, started_at: row.started_at });
+            }
+            expect(db.prepare("SELECT COUNT(*) AS n FROM memory_publications").get()).toEqual({
+                n: 0,
+            });
+        } finally {
+            db.close();
+        }
+    });
+});
 
 function allocate(db: Database, sessionId = SESSION): TurnOneSend {
     return allocateTurnOneSend(db, {

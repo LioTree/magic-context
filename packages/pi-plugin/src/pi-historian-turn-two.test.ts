@@ -17,6 +17,7 @@ import {
 import {
 	allocateTurnOneSend,
 	commitTurnOnePublication,
+	HISTORIAN_FORMAT_INSTRUCTION,
 } from "@magic-context/core/features/magic-context/memory/turn-one-publication";
 import {
 	recoverTurnTwoStages,
@@ -31,7 +32,7 @@ import {
 import identityVectors from "@magic-context/core/features/magic-context/memory/turn-two-identity-vectors.json";
 import { authorizationFixture } from "@magic-context/core/features/magic-context/memory/turn-two-test-fixtures.test";
 import { closeDatabase } from "@magic-context/core/features/magic-context/storage";
-import { COMPARTMENT_AGENT_SYSTEM_PROMPT } from "@magic-context/core/hooks/magic-context/compartment-prompt";
+import { COMPARTMENT_AGENT_COMBINED_SYSTEM_PROMPT } from "@magic-context/core/hooks/magic-context/compartment-prompt";
 import type { RawMessage } from "@magic-context/core/hooks/magic-context/read-session-raw";
 import { closeQuietly } from "@magic-context/core/shared/sqlite-helpers";
 import { __setPiHarnessKindForTesting } from "./pi-harness-kind";
@@ -58,6 +59,21 @@ const messages: RawMessage[] = Array.from({ length: 12 }, (_, index) => ({
 		{ type: "text", text: index === 0 ? "New rule." : `Turn ${index + 1}` },
 	],
 }));
+
+const combinedFixture = authorizationFixture(
+	{
+		lane: "pi",
+		carrier: PI_RPC_CARRIER,
+		provider: "test",
+		modelId: "validated-model",
+		variant: null,
+		temperature: null,
+		thinkingLevel: null,
+	},
+	COMPARTMENT_AGENT_COMBINED_SYSTEM_PROMPT,
+	[],
+	HISTORIAN_FORMAT_INSTRUCTION,
+);
 
 type Prompt = { type: string; id: string; message: string };
 function rpcFixture(
@@ -139,7 +155,15 @@ function rpcFixture(
 					item.prompts.push(prompt);
 					if (prompt.type === "prompt")
 						setImmediate(() => {
-							if (!item.killed) item.emit(reply(prompt, system, index));
+							if (!item.killed) {
+								const text = reply(prompt, system, index);
+								item.emit(
+									prompt.message.includes(HISTORIAN_FORMAT_INSTRUCTION) &&
+										text.trim().startsWith("<")
+										? combinedFixture.turnOne(text)
+										: text,
+								);
+							}
 						});
 				}
 			});
@@ -182,6 +206,20 @@ function base(
 		compartmentLeaseHolderId: "holder",
 		ensureProjectRegistered: () => {},
 		memoryLifecycleLane: "enabled",
+		validatedProfiles: authorizationFixture(
+			{
+				lane: "pi",
+				carrier: PI_RPC_CARRIER,
+				provider: "test",
+				modelId: "validated-model",
+				variant: null,
+				temperature: null,
+				thinkingLevel: null,
+			},
+			COMPARTMENT_AGENT_COMBINED_SYSTEM_PROMPT,
+			[],
+			HISTORIAN_FORMAT_INSTRUCTION,
+		).rows,
 		temperature: 0,
 	};
 }
@@ -192,6 +230,74 @@ afterEach(() => {
 });
 
 describe("Pi historian RPC parity", () => {
+	it("Pi enabled parse failures send no repair and the fourth firing publishes dormant", async () => {
+		const db = createTestDb();
+		const f = rpcFixture(() => "invalid turn-one envelope");
+		try {
+			const deps = { ...base(db, f.runner), forceDrainQuota: true };
+			for (let i = 1; i <= 3; i++) {
+				await runPiHistorian(deps);
+				expect(f.children).toHaveLength(i);
+				expect(f.children.at(-1)?.prompts).toHaveLength(1);
+				expect(getCompartments(db, "ses-rpc")).toEqual([]);
+				expect(
+					db.prepare("SELECT COUNT(*) AS n FROM memory_pending_facts").get(),
+				).toEqual({ n: 0 });
+			}
+			await runPiHistorian(deps);
+			expect(f.children).toHaveLength(4);
+			expect(f.children[3]?.prompts).toHaveLength(0);
+			expect(getCompartments(db, "ses-rpc")).toHaveLength(1);
+			expect(
+				db
+					.prepare(
+						"SELECT state,run_attempt FROM memory_stage_attempts WHERE publication_id LIKE 't1fail:%' ORDER BY run_attempt",
+					)
+					.all(),
+			).toEqual([
+				{ state: "parse_failed", run_attempt: 1 },
+				{ state: "parse_failed", run_attempt: 2 },
+				{ state: "parse_failed", run_attempt: 3 },
+				{ state: "counter_reset", run_attempt: 4 },
+			]);
+		} finally {
+			closeQuietly(db);
+		}
+	});
+	it("Pi late reply after off applies nothing, charges nothing and releases once", async () => {
+		const db = createTestDb();
+		let enabled = true;
+		const f = rpcFixture(() => {
+			if (f.children[0]?.prompts.length === 1) return xml;
+			enabled = false;
+			const fact = db.prepare("SELECT id FROM memory_pending_facts").get() as {
+				id: number;
+			};
+			return JSON.stringify({
+				result: {
+					step: "turn_two",
+					decisions: [{ fact_id: fact.id, action: "new" }],
+				},
+			});
+		});
+		try {
+			await runPiHistorian({
+				...base(db, f.runner),
+				turnTwoIsEnabled: () => enabled,
+			});
+			await settlePiHistorianTurnTwoRuns();
+			expect(getMemoriesByProject(db, projectPath)).toEqual([]);
+			expect(
+				db
+					.prepare("SELECT state,fact_attempts FROM memory_pending_facts")
+					.all(),
+			).toEqual([{ state: "retryable", fact_attempts: 0 }]);
+			expect(f.children).toHaveLength(1);
+			expect(f.children[0]?.killed).toBe(true);
+		} finally {
+			closeQuietly(db);
+		}
+	});
 	for (const harness of ["pi", "omp"] as const) {
 		it(`${harness} reports every C1 key without confusing configured thinking with variant`, async () => {
 			__setPiHarnessKindForTesting(harness);
@@ -594,16 +700,6 @@ describe("Pi historian RPC parity", () => {
 		});
 		try {
 			const deps = base(db, f.runner);
-			deps.validatedProfiles = [
-				COMPARTMENT_AGENT_SYSTEM_PROMPT,
-				...Object.values(CHECK_SYSTEM_PROMPTS),
-			].map((system) => ({
-				provider: "test",
-				modelId: "validated-model",
-				variant: null,
-				temperature: 0,
-				systemHash: lifecycleTextHash(system),
-			}));
 			await runPiHistorian(deps);
 			await settlePiHistorianTurnTwoRuns();
 			expect(getMemoryById(db, memory.id)?.content).toBe(
@@ -700,14 +796,15 @@ describe("Pi historian RPC parity", () => {
 		}
 	});
 
-	it("headless sends no historian turn and applies nothing", async () => {
+	it("headless runs dormant and publishes compartments without a second turn", async () => {
 		const db = createTestDb();
 		const f = rpcFixture(() => xml);
 		try {
 			await runPiHistorian({ ...base(db, f.runner), hasUI: false });
-			expect(f.children).toHaveLength(0);
-			expect(getMemoriesByProject(db, projectPath)).toHaveLength(0);
-			expect(getCompartments(db, "ses-rpc")).toHaveLength(0);
+			expect(f.children).toHaveLength(1);
+			expect(f.children[0]?.prompts).toHaveLength(0);
+			expect(getCompartments(db, "ses-rpc")).toHaveLength(1);
+			expect(getMemoriesByProject(db, projectPath)).toHaveLength(1);
 		} finally {
 			closeQuietly(db);
 		}
@@ -805,13 +902,13 @@ describe("Pi historian RPC parity", () => {
 					expect(recoverLostPiRpcStages(db)).toBe(2);
 				else
 					await runPiHistorian({
-						...base(db, {
-							harness: "pi",
-							run: async () => {
-								throw new Error("headless must not dispatch");
-							},
-						}),
-						hasUI: false,
+						...base(
+							db,
+							rpcFixture(() => {
+								throw new Error("empty session must not dispatch");
+							}).runner,
+						),
+						provider: { readMessages: () => [] },
 					});
 				expect(
 					db
