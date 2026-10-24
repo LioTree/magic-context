@@ -56,16 +56,29 @@ fn kind(harness: &str) -> Option<&'static str> {
         _ => None,
     }
 }
+/// A session this module saw bound. `runner` is the bare module id of the
+/// daemon-attested runner principal and, with `harness` and `session`, names
+/// the session's reference; `project_root` is route metadata only.
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 struct BindTuple {
+    runner: String,
     harness: String,
     project_root: String,
     session: String,
 }
 impl BindTuple {
     fn reference(&self) -> String {
-        cortexkit_role_llm_runner::session_ref(&self.harness, &self.project_root, &self.session)
+        session_ref(&self.runner, &self.harness, &self.session)
     }
+}
+/// The shared session reference (llm-runner §14.1) for a bare runner module
+/// id, harness and session, each used exactly as given.
+fn session_ref(runner: &str, harness: &str, session: &str) -> String {
+    cortexkit_role_llm_runner::session_ref(&cortexkit_role_llm_runner::SessionIdentity {
+        runner,
+        harness,
+        session,
+    })
 }
 #[derive(Clone, Debug, Serialize, Deserialize)]
 struct Receipt {
@@ -224,7 +237,13 @@ impl AgentDataService {
         if kind(&binding.harness).is_none() || binding.session.is_empty() {
             return Ok(());
         }
+        // A session's reference needs the runner the daemon attested on its
+        // route; a route without one names no reference this module can serve.
+        let Some(runner) = crate::providers::records::attested_runner(binding) else {
+            return Ok(());
+        };
         let tuple = BindTuple {
+            runner: runner.into(),
             harness: binding.harness.clone(),
             project_root: binding.project_root.to_string_lossy().into_owned(),
             session: binding.session.clone(),
@@ -306,6 +325,12 @@ fn fingerprint(
             ))
         })
         .collect()
+}
+/// Whether a provider row's first key column names this session. Runner
+/// conversations store their runner module id there and folder-keyed records
+/// store their project folder (see `providers::Key::store_key`).
+fn provider_row_names(column: &str, runner: &str, project_root: &str) -> bool {
+    column == runner || column == project_root
 }
 fn held(mover: &MoveStore, context: &ContextMoveStore, id: &Identity) -> Result<bool, ErrorBody> {
     for s in std::iter::once(&id.session).chain(id.namespaces.iter()) {
@@ -403,18 +428,10 @@ impl AgentDataService {
         if !REF_KINDS.contains(&r.ref_kind.as_str()) {
             return Err(unknown(r));
         }
+        // Provider rows name no attested runner, so they only contribute the
+        // engine namespaces of a session found through its observed binding.
         let providers = store.move_provider_identities().map_err(storage)?;
-        let mut tuples = self.tuples.lock().expect("move tuples").clone();
-        for (harness, root, session, _) in &providers {
-            let tuple = BindTuple {
-                harness: harness.clone(),
-                project_root: root.clone(),
-                session: session.clone(),
-            };
-            if !tuples.contains(&tuple) {
-                tuples.push(tuple);
-            }
-        }
+        let tuples = self.tuples.lock().expect("move tuples").clone();
         for tuple in tuples {
             if kind(&tuple.harness) == Some(r.ref_kind.as_str()) && tuple.reference() == r.r#ref {
                 if self
@@ -430,7 +447,9 @@ impl AgentDataService {
                 let namespaces = providers
                     .iter()
                     .filter(|(h, p, s, _)| {
-                        h == &tuple.harness && p == &tuple.project_root && s == &tuple.session
+                        h == &tuple.harness
+                            && provider_row_names(p, &tuple.runner, &tuple.project_root)
+                            && s == &tuple.session
                     })
                     .map(|(_, _, _, e)| e.clone())
                     .filter(|e| !e.is_empty() && e != &tuple.session)
@@ -438,6 +457,7 @@ impl AgentDataService {
                     .into_iter()
                     .collect();
                 let id = Identity {
+                    runner: tuple.runner,
                     harness: tuple.harness,
                     project_root: tuple.project_root,
                     session: tuple.session,
@@ -459,15 +479,15 @@ impl AgentDataService {
                 None
             }
         };
-        if let Some(found) = found {
+        // Entorhinal's answer is usable only when it names the runner: the
+        // reference cannot be checked without it, so the ref stays refused.
+        if let Some((found, runner)) =
+            found.and_then(|found| found.runner.clone().map(|runner| (found, runner)))
+        {
             if kind(&found.harness) == Some(r.ref_kind.as_str())
                 && found.ref_kind == r.ref_kind
                 && found.reference == r.r#ref
-                && cortexkit_role_llm_runner::session_ref(
-                    &found.harness,
-                    &found.project_root,
-                    &found.session_id,
-                ) == r.r#ref
+                && session_ref(&runner, &found.harness, &found.session_id) == r.r#ref
             {
                 if self
                     .activity
@@ -482,7 +502,9 @@ impl AgentDataService {
                 let namespaces = providers
                     .iter()
                     .filter(|(h, p, s, _)| {
-                        h == &found.harness && p == &found.project_root && s == &found.session_id
+                        h == &found.harness
+                            && provider_row_names(p, &runner, &found.project_root)
+                            && s == &found.session_id
                     })
                     .map(|(_, _, _, e)| e.clone())
                     .filter(|e| !e.is_empty() && e != &found.session_id)
@@ -490,6 +512,7 @@ impl AgentDataService {
                     .into_iter()
                     .collect();
                 let id = Identity {
+                    runner,
                     harness: found.harness,
                     project_root: found.project_root,
                     session: found.session_id,
@@ -1351,6 +1374,7 @@ impl AgentDataService {
                 let project_root = &snapshot.header.identity.project_root;
                 let mut tuples = self.tuples.lock().expect("move tuples");
                 let tuple = BindTuple {
+                    runner: snapshot.header.identity.runner.clone(),
                     harness: snapshot.header.identity.harness.clone(),
                     project_root: project_root.clone(),
                     session: snapshot.header.identity.session.clone(),

@@ -701,7 +701,7 @@ impl Pair {
                 .unwrap()
                 .set_budget(4_096);
         }
-        let reference = session_ref(profile.harness(), &project.path().to_string_lossy(), "s");
+        let reference = runner_session_ref("thalamus-harness", profile.harness(), "s");
         let mut pair = Self {
             profile,
             transcript,

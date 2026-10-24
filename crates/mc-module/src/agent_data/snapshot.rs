@@ -20,6 +20,9 @@ pub const HEADER_MAX: usize = 64 * 1024;
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct Identity {
+    /// The bare module id of the attested runner; with `harness` and
+    /// `session` it names the snapshot's session reference.
+    pub runner: String,
     pub harness: String,
     pub project_root: String,
     pub session: String,
@@ -104,11 +107,11 @@ impl Header {
             ));
         }
         {
-            if cortexkit_role_llm_runner::session_ref(
-                &self.identity.harness,
-                &self.identity.project_root,
-                &self.identity.session,
-            ) != reference
+            if cortexkit_role_llm_runner::session_ref(&cortexkit_role_llm_runner::SessionIdentity {
+                runner: &self.identity.runner,
+                harness: &self.identity.harness,
+                session: &self.identity.session,
+            }) != reference
             {
                 return Err(error(
                     RefusalCode::InvalidRequest,

@@ -32,16 +32,9 @@ async fn a_moved_session_answers_setup_with_its_checkpoint_and_the_runner_anchor
 
     // With no marker carrying a checkpoint, the runner anchors at the cut and
     // numbers the cut's first counted parts checkpoint + 1 and + 2.
-    // compaction-provider 0.5.1 re-exports the checkpoint type of the
-    // llm-runner release it was built against, which is a different copy from
-    // the one ck-mc depends on directly; rebuild it field by field.
-    let runner_checkpoint = tags::SetupCheckpoint::new(checkpoint.tag_checkpoint, &checkpoint.cut);
-    let anchor = tags::anchor(
-        &fixture::fixture_session(),
-        &[],
-        Some(&runner_checkpoint),
-        |mid| mid == cut,
-    )
+    let anchor = tags::anchor(&fixture::fixture_session(), &[], Some(&checkpoint), |mid| {
+        mid == cut
+    })
     .unwrap();
     assert_eq!(
         anchor,

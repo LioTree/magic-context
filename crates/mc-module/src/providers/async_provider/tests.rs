@@ -1,6 +1,7 @@
 use super::*;
 use cortexkit_bus_inmemory::{InMemoryBus, InMemoryConfig};
 mod broca_tag_rows;
+mod conversation_identity_probe;
 mod descriptors_read;
 mod full_array_setup;
 mod moved_session;
@@ -416,7 +417,7 @@ impl Rig {
             .start_compaction_bus(bus.clone(), "fixture".into())
             .await
             .unwrap();
-        let reference = session_ref(setup_harness, &dir.to_string_lossy(), setup_session);
+        let reference = runner_session_ref(module, setup_harness, setup_session);
         let rig = Self {
             h,
             resolver,
@@ -1007,9 +1008,6 @@ async fn restored_conversations_keep_the_setup_identity_and_use_it_for_reads() {
     )
     .await;
     assert_eq!(restored.state().runner_identity(), expected);
-    let mut old_record = restored.state();
-    old_record.runner_identity = None;
-    assert_eq!(old_record.runner_identity(), expected);
     *restored.runner.expected_bind_identity.lock().unwrap() = Some(expected.clone());
     restored.fill(10);
     restored.notice(1, 1_000, None).await;
@@ -2406,7 +2404,7 @@ async fn setup_echoes_the_accepted_serializer_profile_and_refuses_an_unknown_one
         }
         other => panic!("unknown profile was not refused by field: {other:?}"),
     }
-    let other = session_ref("claude-code", &dir.path().to_string_lossy(), "other");
+    let other = runner_session_ref("thalamus", "claude-code", "other");
     assert!(load(rig.h.store.get().unwrap(), &other).unwrap().is_none());
 }
 

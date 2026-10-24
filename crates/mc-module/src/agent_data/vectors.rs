@@ -288,8 +288,9 @@ fn published_refusal_rows_details_and_session_refs() {
     }
     for case in rows(&file("session-refs.json"), "cases") {
         let tuple = BindTuple {
+            runner: case["runner"].as_str().unwrap().into(),
             harness: case["harness"].as_str().unwrap().into(),
-            project_root: case["project_root"].as_str().unwrap().into(),
+            project_root: String::new(),
             session: case["session"].as_str().unwrap().into(),
         };
         assert_eq!(tuple.reference(), case["sessionRef"]);

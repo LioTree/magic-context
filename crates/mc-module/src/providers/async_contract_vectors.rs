@@ -78,14 +78,13 @@ fn async_fixture_matches_sha256sum() {
 #[test]
 fn session_ref_is_the_runner_roles_reference() {
     let file = file();
-    assert_eq!(
-        cortexkit_role_llm_runner::session_ref::session_ref(
-            str_of(&file, "harness"),
-            str_of(&file, "project_root"),
-            str_of(&file, "session"),
-        ),
-        str_of(&file, "session_ref")
-    );
+    let key = super::Key {
+        runner: str_of(&file, "runner_module_id").into(),
+        harness: str_of(&file, "harness").into(),
+        session: str_of(&file, "session").into(),
+    };
+    // The vector's `project_root` is route metadata: it never enters the key.
+    assert_eq!(key.reference(), str_of(&file, "session_ref"));
 }
 
 #[test]

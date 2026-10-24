@@ -64,6 +64,10 @@ pub struct LookupSession {
     pub harness: String,
     pub session_id: String,
     pub project_root: String,
+    /// The bare module id of the runner hosting the session. Without it the
+    /// reference cannot be checked, so the answer is treated as not found.
+    #[serde(default)]
+    pub runner: Option<String>,
 }
 #[async_trait]
 pub trait SessionLookup: Send + Sync {

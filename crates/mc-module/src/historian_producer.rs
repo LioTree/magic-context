@@ -3897,7 +3897,7 @@ pub(crate) mod tests {
             include_bytes!("../testdata/compaction-provider-v1/route-identity.json");
         assert_eq!(
             crate::sha256_hex(VECTORS),
-            "edbdc38f28373431f07b8e2e72c5f5c781d6b7fd48d6b2b6d8e20a8f5cea577a"
+            "a9a11e290293c8789a4472067dfe373ad68a2b625d53e579bf9bf7bf6d7d18d4"
         );
         let vectors: Value = serde_json::from_slice(VECTORS).unwrap();
         let case = vectors["identity_cases"]

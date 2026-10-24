@@ -643,7 +643,7 @@ impl Rig {
             .start_compaction_bus(bus.clone(), "fixture".into())
             .await
             .unwrap();
-        let reference = session_ref("opencode", &dir.to_string_lossy(), "s");
+        let reference = runner_session_ref("thalamus-harness", "opencode", "s");
         let rig = Self {
             h,
             runner,

@@ -279,11 +279,17 @@ async fn review_overlapping_refs_refusal_rolls_back_the_temporary_gate() {
     let h = make(dir.path(), Arc::new(FakeDoor::default())).await;
     seed(&h, SESSION);
     observe(&h, SESSION).await;
-    bind(&h, 2, "opencode2", SESSION, Principal::Direct).await;
-    let alias = Ref::new(
-        REF_KINDS[0],
-        cortexkit_role_llm_runner::session_ref("opencode2", ROOT, SESSION),
-    );
+    bind(
+        &h,
+        2,
+        "opencode2",
+        SESSION,
+        Principal::Reserved {
+            module_id: RUNNER.into(),
+        },
+    )
+    .await;
+    let alias = Ref::new(REF_KINDS[0], session_ref(RUNNER, "opencode2", SESSION));
     let refs = vec![reference(SESSION), alias];
     assert_eq!(
         refusal(call(&h, role::ops::PREPARE, params(&refs)).await),
@@ -333,6 +339,7 @@ async fn review_feature_off_does_not_write_bind_registry_and_preserves_stranded_
         let root = dir.path().join("agent-data");
         std::fs::create_dir(&root).unwrap();
         let identity = Identity {
+            runner: RUNNER.into(),
             harness: "opencode".into(),
             project_root: ROOT.into(),
             session: SESSION.into(),
