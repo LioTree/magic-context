@@ -119,3 +119,5 @@ nkeys = { version = "=0.4.5", default-features = false }
 cortexkit-role-tool-provider-conformance = "=0.10.0"
 cortexkit-role-llm-runner-conformance = "=0.10.2"
 cortexkit-role-routing-conformance = "=0.1.0"
+# The routing kit's fake uses the kit's protocol version, not our live wire SDK.
+routing-conformance-protocol = { package = "subc-protocol", version = "=0.33.0" }
