@@ -168,12 +168,47 @@ struct PendingReport {
     source: ReportFailure,
 }
 
+/// One boundary for accounting warnings: production emits structured logs, while
+/// tests can observe the same emission decisions without a global subscriber.
+trait ReportLog: Send + Sync {
+    fn unacknowledged(&self, pending: &PendingReport);
+    fn evicted(&self, pending: &PendingReport);
+}
+
+struct TracingReportLog;
+
+impl ReportLog for TracingReportLog {
+    fn unacknowledged(&self, pending: &PendingReport) {
+        let code = match &pending.source {
+            ReportFailure::Refused(refusal) => refusal.code.to_string(),
+            ReportFailure::TimedOut => "mc_route_report_timed_out".to_owned(),
+        };
+        tracing::warn!(
+            decision_id = %pending.report.decision_id,
+            routing_provider = %pending.provider,
+            scope_key = %pending.scope_key,
+            code,
+            "model work report unacknowledged; queued for retry"
+        );
+    }
+
+    fn evicted(&self, pending: &PendingReport) {
+        tracing::warn!(
+            decision_id = %pending.report.decision_id,
+            routing_provider = %pending.provider,
+            scope_key = %pending.scope_key,
+            "model work pending-report queue full; dropped oldest report"
+        );
+    }
+}
+
 pub struct Engine<C = WallClock> {
     clock: C,
     provider: Option<(u64, Result<String, WorkError>)>,
     parked: HashMap<(String, String), WorkError>,
     misconfigured: HashMap<(String, String), (u64, WorkError)>,
     pending_reports: VecDeque<PendingReport>,
+    report_log: Box<dyn ReportLog>,
 }
 
 impl<C: Clock> Engine<C> {
@@ -184,6 +219,7 @@ impl<C: Clock> Engine<C> {
             parked: HashMap::new(),
             misconfigured: HashMap::new(),
             pending_reports: VecDeque::new(),
+            report_log: Box::new(TracingReportLog),
         }
     }
 
@@ -220,35 +256,21 @@ impl<C: Clock> Engine<C> {
         }) {
             return;
         }
-        let code = match &source {
-            ReportFailure::Refused(refusal) => refusal.code.to_string(),
-            ReportFailure::TimedOut => "mc_route_report_timed_out".to_owned(),
+        let pending = PendingReport {
+            provider: provider.to_owned(),
+            scope_key: scope_key.to_owned(),
+            report,
+            source,
         };
-        tracing::warn!(
-            decision_id = %report.decision_id,
-            routing_provider = provider,
-            scope_key,
-            code,
-            "model work report unacknowledged; queued for retry"
-        );
+        self.report_log.unacknowledged(&pending);
         if self.pending_reports.len() == PENDING_REPORT_CAP {
             let oldest = self
                 .pending_reports
                 .pop_front()
                 .expect("report queue is full");
-            tracing::warn!(
-                decision_id = %oldest.report.decision_id,
-                routing_provider = %oldest.provider,
-                scope_key = %oldest.scope_key,
-                "model work pending-report queue full; dropped oldest report"
-            );
+            self.report_log.evicted(&oldest);
         }
-        self.pending_reports.push_back(PendingReport {
-            provider: provider.to_owned(),
-            scope_key: scope_key.to_owned(),
-            report,
-            source,
-        });
+        self.pending_reports.push_back(pending);
     }
 
     fn remaining_budget(&self, deadline_ms: u64, deadline: tokio::time::Instant) -> Duration {

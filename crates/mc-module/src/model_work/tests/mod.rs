@@ -15,7 +15,6 @@ use cortexkit_role_routing_conformance::{
 use serde::de::DeserializeOwned;
 use serde_json::{json, Value};
 use sha2::{Digest, Sha256};
-use tracing::instrument::WithSubscriber;
 
 use super::*;
 use kit_fake::{Defects, FakeRoute, FakeSubject};
@@ -48,16 +47,38 @@ struct Trace {
     sends: Vec<RoutedChoice>,
 }
 
-struct LogWriter(Arc<Mutex<Vec<u8>>>);
+#[derive(Debug, PartialEq, Eq)]
+struct LoggedReport {
+    provider: String,
+    scope_key: String,
+    decision_id: String,
+}
 
-impl std::io::Write for LogWriter {
-    fn write(&mut self, bytes: &[u8]) -> std::io::Result<usize> {
-        self.0.lock().unwrap().extend_from_slice(bytes);
-        Ok(bytes.len())
+impl From<&PendingReport> for LoggedReport {
+    fn from(pending: &PendingReport) -> Self {
+        Self {
+            provider: pending.provider.clone(),
+            scope_key: pending.scope_key.clone(),
+            decision_id: pending.report.decision_id.clone(),
+        }
+    }
+}
+
+#[derive(Default)]
+struct ReportLogRecords {
+    unacknowledged: Vec<LoggedReport>,
+    evicted: Vec<LoggedReport>,
+}
+
+struct RecordingReportLog(Arc<Mutex<ReportLogRecords>>);
+
+impl ReportLog for RecordingReportLog {
+    fn unacknowledged(&self, pending: &PendingReport) {
+        self.0.lock().unwrap().unacknowledged.push(pending.into());
     }
 
-    fn flush(&mut self) -> std::io::Result<()> {
-        Ok(())
+    fn evicted(&self, pending: &PendingReport) {
+        self.0.lock().unwrap().evicted.push(pending.into());
     }
 }
 
@@ -940,87 +961,76 @@ async fn pending_report_replay_limits_calls_and_bounds_each_timeout() {
 
 #[tokio::test]
 async fn pending_report_failures_log_once_and_queue_evicts_oldest_at_capacity() {
-    let logs = Arc::new(Mutex::new(Vec::new()));
-    let writer = logs.clone();
-    let subscriber = tracing_subscriber::fmt()
-        .with_writer(move || LogWriter(writer.clone()))
-        .with_ansi(false)
-        .without_time()
-        .finish();
-    async {
-        // Re-evaluate which log messages are enabled with this collector active;
-        // parallel tests may have first logged without a collector.
-        tracing::callsite::rebuild_interest_cache();
-        let rig = Rig::new().await;
-        let source = Refusal::unknown_decision();
+    let logs = Arc::new(Mutex::new(ReportLogRecords::default()));
+    let rig = Rig::new().await;
+    let source = Refusal::unknown_decision();
+    *rig.route.report_failure.lock().unwrap() = Some(source.clone());
+    let mut engine = Engine::new(rig.clock.clone());
+    engine.report_log = Box::new(RecordingReportLog(logs.clone()));
+    let done = engine
+        .run(&catalog(), &rig.order(), &rig.runner(vec![completed()]))
+        .await
+        .unwrap();
+    let original = LoggedReport::from(engine.pending_reports.front().unwrap());
+    assert_eq!(original.provider, PROVIDER);
+    assert_eq!(original.scope_key, rig.route.scope_key());
+    assert_eq!(original.decision_id, done.choice.decision_id);
+    let mut order = rig.order();
+    order.max_decisions = 0;
+    for _ in 0..2 {
         *rig.route.report_failure.lock().unwrap() = Some(source.clone());
-        let mut engine = Engine::new(rig.clock.clone());
-        let done = engine
-            .run(&catalog(), &rig.order(), &rig.runner(vec![completed()]))
+        let error = engine
+            .run(&catalog(), &order, &rig.runner(vec![]))
             .await
-            .unwrap();
-        let mut order = rig.order();
-        order.max_decisions = 0;
-        for _ in 0..2 {
-            *rig.route.report_failure.lock().unwrap() = Some(source.clone());
-            let error = engine
-                .run(&catalog(), &order, &rig.runner(vec![]))
-                .await
-                .unwrap_err();
-            assert_eq!(error.code, "mc_route_exhausted");
-        }
+            .unwrap_err();
+        assert_eq!(error.code, "mc_route_exhausted");
+    }
+    engine.queue_report(
+        PROVIDER,
+        rig.route.scope_key(),
+        done.attempts[0].report.clone(),
+        ReportFailure::Refused(source.clone()),
+    );
+    assert_eq!(engine.pending_reports.len(), 1);
+    let trace = rig.route.trace.lock().unwrap();
+    assert_eq!(trace.reports.len(), 3);
+    assert!(trace
+        .reports
+        .iter()
+        .all(|report| report == &done.attempts[0].report));
+    drop(trace);
+    {
+        let records = logs.lock().unwrap();
+        assert_eq!(records.unacknowledged, [original]);
+        assert!(records.evicted.is_empty());
+    }
+    for n in 1..=PENDING_REPORT_CAP {
         engine.queue_report(
             PROVIDER,
             rig.route.scope_key(),
-            done.attempts[0].report.clone(),
+            ReportRequest::new(format!("queued-{n}"), Outcome::Completed),
             ReportFailure::Refused(source.clone()),
         );
-        assert_eq!(engine.pending_reports.len(), 1);
-        let trace = rig.route.trace.lock().unwrap();
-        assert_eq!(trace.reports.len(), 3);
-        assert!(trace
-            .reports
-            .iter()
-            .all(|report| report == &done.attempts[0].report));
-        drop(trace);
-        let text = String::from_utf8(logs.lock().unwrap().clone()).unwrap();
-        assert_eq!(
-            text.matches("model work report unacknowledged; queued for retry")
-                .count(),
-            1,
-            "captured logs: {text:?}"
-        );
-        for n in 1..=PENDING_REPORT_CAP {
-            engine.queue_report(
-                PROVIDER,
-                rig.route.scope_key(),
-                ReportRequest::new(format!("queued-{n}"), Outcome::Completed),
-                ReportFailure::Refused(source.clone()),
-            );
-        }
-        assert_eq!(engine.pending_reports.len(), PENDING_REPORT_CAP);
-        assert_eq!(
-            engine.pending_reports.front().unwrap().report.decision_id,
-            "queued-1"
-        );
-        assert_eq!(
-            engine.pending_reports.back().unwrap().report.decision_id,
-            format!("queued-{PENDING_REPORT_CAP}")
-        );
-        let text = String::from_utf8(logs.lock().unwrap().clone()).unwrap();
-        assert_eq!(
-            text.matches("model work report unacknowledged; queued for retry")
-                .count(),
-            PENDING_REPORT_CAP + 1
-        );
-        assert_eq!(
-            text.matches("model work pending-report queue full; dropped oldest report")
-                .count(),
-            1
-        );
     }
-    .with_subscriber(subscriber)
-    .await;
+    assert_eq!(engine.pending_reports.len(), PENDING_REPORT_CAP);
+    assert_eq!(
+        engine.pending_reports.front().unwrap().report.decision_id,
+        "queued-1"
+    );
+    assert_eq!(
+        engine.pending_reports.back().unwrap().report.decision_id,
+        format!("queued-{PENDING_REPORT_CAP}")
+    );
+    let records = logs.lock().unwrap();
+    assert_eq!(records.unacknowledged.len(), PENDING_REPORT_CAP + 1);
+    assert_eq!(
+        records.evicted,
+        [LoggedReport {
+            provider: PROVIDER.into(),
+            scope_key: rig.route.scope_key().into(),
+            decision_id: done.choice.decision_id,
+        }]
+    );
 }
 
 #[tokio::test]
