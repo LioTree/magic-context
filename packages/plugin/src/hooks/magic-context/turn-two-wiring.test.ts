@@ -48,10 +48,7 @@ const originalXdgDataHome = process.env.XDG_DATA_HOME;
 
 const SESSION = "ses-turn-two-wiring";
 const DIRECTORY = join(tmpdir(), "turn-two-wiring-project");
-/**
- * A model id outside the producer-window observation list, so a start reaches the
- * historian runner instead of stopping at the window guard.
- */
+/** The historian model these tests configure and observe for the window guard. */
 const HISTORIAN_MODEL = "test/validation-historian";
 
 const RAW_MESSAGES = [
@@ -217,7 +214,7 @@ async function capturePhaseStarts(
 }
 
 describe("OpenCode hosts hand turn_two, the allowlist and trial evidence to the runner", () => {
-    it("the turned-two phase start forwards historian.turn_two and injects no host-side lane inputs", async () => {
+    it("the phase forwards historian.turn_two and injects no host-side lane inputs", async () => {
         useTempDataHome("turn-two-wiring-phase-");
         createOpenCodeSession(SESSION);
         const db = openDatabase();
@@ -305,12 +302,13 @@ describe("OpenCode hosts hand turn_two, the allowlist and trial evidence to the 
                 info: { id: message.id, role: message.role, sessionID: SESSION },
                 parts: [{ type: "text", text: message.text }],
             }));
-            await hook!["experimental.chat.messages.transform"]!(
-                {},
-                { messages } as unknown as Parameters<
-                    NonNullable<ReturnType<typeof createMagicContextHook>>["experimental.chat.messages.transform"]
-                >[1],
-            );
+            await hook!["experimental.chat.messages.transform"]!({}, {
+                messages,
+            } as unknown as Parameters<
+                NonNullable<
+                    ReturnType<typeof createMagicContextHook>
+                >["experimental.chat.messages.transform"]
+            >[1]);
             expect(started.length).toBeGreaterThan(0);
             // The hook samples config per firing; both switches arrive as configured.
             expect(started.at(-1)).toEqual({ turnTwo: "off", twoPass: true });
@@ -356,7 +354,9 @@ describe("the runner's selection against what the hosts hand it", () => {
             }).lane;
         expect(lane(matching)).toBe("enabled");
         expect(
-            lane(loadTurnTwoAllowlist({ version: 1, entries: [{ ...entry, lane: "omp" as const }] })),
+            lane(
+                loadTurnTwoAllowlist({ version: 1, entries: [{ ...entry, lane: "omp" as const }] }),
+            ),
         ).toBe("dormant");
         expect(
             lane(
@@ -394,6 +394,6 @@ describe("the runner's selection against what the hosts hand it", () => {
             trialAuthorization: { candidate: request.requestedIdentity, attestedRoot: other.root },
         });
         expect(wrongRoot).toMatchObject({ lane: "dormant", refused: true });
-        expect(other.db).toBeDefined();
+        other.db.close();
     });
 });
