@@ -421,6 +421,29 @@ dependencies = [
 ]
 
 [[package]]
+name = "cortexkit-role-routing"
+version = "0.1.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "53af017958feb05eb4db0f69b85952b515fbad2e637977659c200e86ddc188f4"
+dependencies = [
+ "serde",
+ "serde_json",
+]
+
+[[package]]
+name = "cortexkit-role-routing-conformance"
+version = "0.1.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "fe824dd3c5ecdc309e1f7f9e31b98eebe28580056a88dd3941a9ae302668faf9"
+dependencies = [
+ "async-trait",
+ "cortexkit-role-routing",
+ "serde",
+ "serde_json",
+ "subc-protocol 0.33.1",
+]
+
+[[package]]
 name = "cortexkit-role-tool-provider"
 version = "0.10.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -1062,6 +1085,8 @@ dependencies = [
  "cortexkit-role-compaction-provider 0.5.1",
  "cortexkit-role-llm-runner 0.6.10",
  "cortexkit-role-llm-runner-conformance",
+ "cortexkit-role-routing",
+ "cortexkit-role-routing-conformance",
  "cortexkit-role-tool-provider",
  "cortexkit-role-tool-provider-conformance",
  "cortexkit-store",
@@ -1088,6 +1113,7 @@ dependencies = [
  "subc-daemon",
  "subc-os",
  "subc-protocol 0.32.8",
+ "subc-protocol 0.33.1",
  "subc-transport",
  "syn 2.0.119",
  "tempfile",
