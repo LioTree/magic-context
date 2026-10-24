@@ -164,8 +164,14 @@ async fn old_numbers_are_refused_and_new_parts_land_above_the_floor() {
     assert_eq!(checkpoint.tag_checkpoint, 30);
     // The runner anchors at the cut and numbers from the checkpoint, as
     // llm-runner's own numbering does.
-    let anchor =
-        tags::anchor(SESSION, &[], Some(&checkpoint), |mid| mid == checkpoint.cut).unwrap();
+    // compaction-provider 0.5.1 re-exports the checkpoint type of the
+    // llm-runner release it was built against, which is a different copy from
+    // the one ck-mc depends on directly; rebuild it field by field.
+    let runner_checkpoint = tags::SetupCheckpoint::new(checkpoint.tag_checkpoint, &checkpoint.cut);
+    let anchor = tags::anchor(SESSION, &[], Some(&runner_checkpoint), |mid| {
+        mid == checkpoint.cut
+    })
+    .unwrap();
     assert_eq!(
         anchor,
         tags::Anchor::Setup {
