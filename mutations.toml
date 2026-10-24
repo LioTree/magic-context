@@ -539,6 +539,7 @@ target = '--lib'
 expect_red = ['private_permissions::tests::storage_creators_and_startup_tightening_are_owner_only']
 only = true
 
+# These two exact-test rows avoid ck-mutate 0.7.0's full mc-store libtest-summary mismatch, at the cost of --broad coverage.
 [[control]]
 id = 'rs-historian-report-lands-once'
 guards = 'a historian run accepts exactly one report; a second report for the same run is refused'
@@ -546,12 +547,11 @@ file = 'crates/mc-store/src/historian_claim.rs'
 old = '            if existing_report.is_some() {'
 new = '            if false {'
 test_file = 'crates/mc-store/src/historian_claim.rs'
-runner = 'cargo'
-package = 'mc-store'
-target = '--lib'
+runner = 'command'
+command = ['cargo', 'test', '--locked', '-p', 'mc-store', '--lib', '{test}', '--', '--exact']
+test_count_pattern = 'running {count} test'
 expect_red = ['historian_claim::tests::only_the_current_claim_may_leave_a_report_and_only_once']
 expect_message = 'right: Refused(AlreadyReported)'
-only = true
 
 [[control]]
 id = 'rs-historian-report-needs-current-claim'
@@ -572,12 +572,11 @@ new = '''
             }
             // A run whose own deadline'''
 test_file = 'crates/mc-store/src/historian_claim.rs'
-runner = 'cargo'
-package = 'mc-store'
-target = '--lib'
+runner = 'command'
+command = ['cargo', 'test', '--locked', '-p', 'mc-store', '--lib', '{test}', '--', '--exact']
+test_count_pattern = 'running {count} test'
 expect_red = ['historian_claim::tests::only_the_current_claim_may_leave_a_report_and_only_once']
 expect_message = "the replaced claimant's late report must not land"
-only = true
 
 # --- scan guards: each has a planted violation ---
 # A source scan that finds nothing in the shipped code passes whether or not it
