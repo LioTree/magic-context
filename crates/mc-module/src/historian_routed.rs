@@ -833,9 +833,7 @@ impl SubcSummaryRouting {
         let consumer = SubcConsumer::connect(&self.connection_file, options)
             .await
             .map_err(|error| unavailable(error.to_string()))?;
-        let target = subc_protocol::RouteTarget::ManagementSurface {
-            module_id: provider.to_string(),
-        };
+        let target = crate::route_targets::routed_module_target(provider);
         let identity = subc_protocol::BindIdentity::new(
             scope.identity.project_root.clone(),
             scope.identity.harness.as_str(),

@@ -1500,9 +1500,7 @@ impl HistorianProducer {
             .clone()
             .ok_or(HistorianProducerError::MissingSession)?;
         let target = match (&self.routed_runner, &self.session_runner) {
-            (Some(routed), _) => subc_protocol::RouteTarget::ManagementSurface {
-                module_id: routed.module_id.clone(),
-            },
+            (Some(routed), _) => crate::route_targets::routed_module_target(&routed.module_id),
             (None, Some(route)) => route.target(),
             (None, None) => self
                 .config

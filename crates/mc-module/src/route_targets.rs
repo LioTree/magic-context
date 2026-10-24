@@ -183,6 +183,16 @@ impl SessionRunnerRoute {
     }
 }
 
+/// The management surface of a module routing named at run time: the
+/// `routing/v1` provider a summary selects with, or the runner module its
+/// answer names. Like a session's own runner, the module id is not known when
+/// the manifest is built, so it is not a registered static route.
+pub(crate) fn routed_module_target(module_id: &str) -> RouteTarget {
+    RouteTarget::ManagementSurface {
+        module_id: module_id.to_string(),
+    }
+}
+
 /// Every route-opening purpose in this crate. Callers must select one of these instead of
 /// constructing a `RouteTarget` directly.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
