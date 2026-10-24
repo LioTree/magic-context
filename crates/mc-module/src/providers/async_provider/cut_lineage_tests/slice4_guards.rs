@@ -299,16 +299,32 @@ async fn m11_cut_registry_outlives_view_retention() {
 }
 
 #[tokio::test]
-async fn m12_publication_splits_history_at_restart() {
+async fn m12_publication_places_cut_after_the_complete_head() {
     let (pair, first) = uncut().await;
-    let state = held(&pair);
-    let raw = pair
-        .resident
+    let mut state = held(&pair);
+    let entry = state.entries[&first].read().unwrap();
+    // An acknowledged empty first-window message must stay outside the
+    // immutable head. The cut follows the entire summary, not an earlier
+    // historian restart that would leave a summarized row on the live side.
+    state
+        .frozen_edits
+        .insert_drop(&entry.mid, "0", &served_part_digest(&entry, "0").unwrap());
+    pair.resident
         .store()
-        .load_async_compaction_view(&pair.reference, state.published_cuts[&first].version)
+        .arm_soft_refresh(&state.namespace())
+        .unwrap();
+    let codec = codec_of(&state);
+    let view = pair
+        .resident
+        .h
+        .publish_async(0, &mut state, codec, true)
         .unwrap()
         .unwrap();
-    let view: view::CompactionView = serde_json::from_str(&raw).unwrap();
+    assert_eq!(
+        view.cut.as_ref().map(|cut| cut.through_ordinal + 1),
+        Some(first)
+    );
+    assert_published_cut_support(&pair.resident, &pair.reference);
     assert!(view.ranges.iter().any(|range| range.to() == first));
     assert!(view.ranges.iter().any(|range| range.from() == first));
 }

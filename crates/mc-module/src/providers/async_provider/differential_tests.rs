@@ -642,6 +642,9 @@ struct Pair {
     seq: u64,
     model: String,
     log: Vec<String>,
+    /// Only cuts the fake host actually applied, in active-branch order.
+    /// Merely publishing a view does not make its marker survive a rewind.
+    cut_checkpoints: Vec<u64>,
     /// Where the two providers' engine cache states first differed (a
     /// skipped engine pass leaves its writes out), for a failure message.
     /// It is a diagnostic, not part of the comparison.
@@ -719,6 +722,7 @@ impl Pair {
             seq: 0,
             model: "fixture".into(),
             log: Vec::new(),
+            cut_checkpoints: Vec::new(),
             engine_drift: None,
             record_only: false,
             mismatches: Vec::new(),

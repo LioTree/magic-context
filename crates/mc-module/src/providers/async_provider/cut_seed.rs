@@ -1330,7 +1330,10 @@ impl AsyncRecord {
                 "reminder_echoes" => {
                     let mut echoes: reminder_echoes::ReminderEchoes =
                         serde_json::from_value(value).map_err(transient)?;
-                    echoes.truncate_below(first);
+                    // Covered prelude rows still need their original reminder
+                    // classification when the historian replays that suffix.
+                    echoes
+                        .truncate_below(seed.historian_prelude.as_ref().map_or(first, |p| p.from));
                     self.reminder_echoes = echoes;
                 }
                 _ => {}
@@ -1439,7 +1442,8 @@ impl AsyncRecord {
         self.entries.retain(|ordinal, _| *ordinal >= first);
         self.mid_index.retain(|_, ordinal| *ordinal >= first);
         self.tag_index.retain(|_, address| address.ordinal >= first);
-        self.reminder_echoes.truncate_below(first);
+        self.reminder_echoes
+            .truncate_below(seed.historian_prelude.as_ref().map_or(first, |p| p.from));
         self.frozen_edits.forget_mids(&below);
         self.retired_frozen.forget_mids(&below);
         self.aggregates.historian_input.truncate_below(first);

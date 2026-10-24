@@ -53,7 +53,6 @@ async fn descend_pair(pair: &mut Pair, first: u64, child: &str) {
         assert_published_cut_support(side, &pair.reference);
     }
     let full = load(pair.oracle.store(), &pair.reference).unwrap().unwrap();
-    let codec = codec::Codec::from_params(&Value::Object(full.setup.params.clone())).unwrap();
     let mut request = serde_json::to_value(&full.setup).unwrap();
     request["lineage_id"] = json!(child);
     request["descends_from"] = json!({"lineage_id":full.lineage,"through_ordinal":first - 1});
@@ -72,10 +71,17 @@ async fn descend_pair(pair: &mut Pair, first: u64, child: &str) {
     assert_eq!(answer["answer"], "ready", "{answer}");
     *pair.transcript.lineage.lock().unwrap() = child.into();
     *pair.resident.runner.floor.lock().unwrap() = Some(first);
+    if !pair.cut_checkpoints.contains(&first) {
+        pair.cut_checkpoints.push(first);
+    }
 
-    // Setup has the same public semantics on both sides. Restore every source
-    // row only on the oracle, and remove its seed/certificate: subsequent oracle
-    // passes recompute from the full transcript, independently of cut facts.
+    restore_oracle_prefix(pair, full, first);
+}
+
+fn restore_oracle_prefix(pair: &Pair, full: State, first: u64) {
+    let codec = codec::Codec::from_params(&Value::Object(full.setup.params.clone())).unwrap();
+    // Setup has the same public semantics on both sides. Only the oracle gets
+    // original prefix rows instead of cut facts for its full-input engine.
     let store = pair.oracle.store();
     let mut oracle = pair
         .oracle

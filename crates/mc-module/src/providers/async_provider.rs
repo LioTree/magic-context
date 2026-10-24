@@ -358,6 +358,8 @@ pub(crate) struct AsyncRecord {
     pending_cut_seeds: BTreeMap<u64, cut_seed::CutSeed>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pending_parent_history: Option<cut_runtime::ParentHistory>,
+    #[serde(default)]
+    pending_undo_edits: bool,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     cut_signature: Option<crate::tail_hygiene::signature::SignaturePrefix>,
 }
@@ -833,6 +835,7 @@ impl State {
     fn ingest_read(&mut self, store: &McStore, codec: codec::Codec) -> Result<(), HandlerOutcome> {
         self.reindex()?;
         self.restore_sources(store, codec)?;
+        self.restore_undo_edits(store)?;
         self.bind_standalone_move(store, codec)?;
         let rows = self.unsaved_tag_rows(codec)?;
         self.save(store, &rows)
@@ -2167,6 +2170,7 @@ impl McHandler {
             retired_cut_stages: Vec::new(),
             pending_cut_seeds: BTreeMap::new(),
             pending_parent_history: None,
+            pending_undo_edits: false,
             cut_signature: None,
         };
         let route = state.runner()?;
@@ -2510,7 +2514,15 @@ impl McHandler {
         {
             cut_seed::pass_trace::record(
                 Arc::as_ptr(store) as usize,
-                format!("engine_input rows={}", template.messages.len()),
+                format!(
+                    "engine_input rows={} ordinals={:?}",
+                    template.messages.len(),
+                    template
+                        .messages
+                        .iter()
+                        .map(|message| message.ordinal)
+                        .collect::<Vec<_>>()
+                ),
             );
         }
         template.declared_trim = template
@@ -4305,6 +4317,7 @@ impl McHandler {
             .ok_or_else(|| transient("store unavailable"))?;
         state.cleanup_pending_cut_stage(store)?;
         state.forward_parent_history(store)?;
+        state.restore_undo_edits(store)?;
         let mut history = store
             .load_compartments(&state.namespace())
             .map_err(transient)?;
@@ -4562,7 +4575,6 @@ impl McHandler {
             ) {
                 state.cut_signature = Some(signature);
             }
-            cut_runtime::split_head_at(&mut ranges, first);
         }
         let shaped = emptied_messages::shape(codec, &kept, &state.frozen_edits, ranges);
         let ranges = shaped.ranges;
@@ -4603,6 +4615,7 @@ impl McHandler {
         let mut frozen_edits = frozen_edits::FrozenEdits::default();
         frozen_edits.capture(&view, &state.entries)?;
         frozen_edits.capture_edits(&shaped.removed, &state.entries)?;
+        frozen_edits.stamp_version(version);
         #[derive(Serialize)]
         struct PublishedEngine<'a> {
             #[serde(flatten)]

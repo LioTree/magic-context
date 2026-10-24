@@ -30,28 +30,116 @@ fn replace_new_ids(pair: &Pair, through: u64, lineage: &str) {
 }
 
 fn host_floor(
-    pair: &Pair,
+    pair: &mut Pair,
     through: u64,
     lineage: &str,
 ) -> Option<(u64, cut_runtime::PublishedCut)> {
     let state = load(pair.resident.store(), &pair.reference)
         .unwrap()
         .unwrap();
-    let selected = state
-        .published_cuts
-        .iter()
-        .rev()
-        .find(|(first, _)| first.saturating_sub(1) <= through)
-        .map(|(first, cut)| (*first, cut.clone()));
+    pair.cut_checkpoints
+        .retain(|first| first.saturating_sub(1) <= through);
+    let selected = pair
+        .cut_checkpoints
+        .last()
+        .map(|first| (*first, state.published_cuts[first].clone()));
     let head = selected
         .as_ref()
         .map(|(first, _)| cut_head(pair, lineage, *first));
     *pair.resident.runner.floor.lock().unwrap() = selected.as_ref().map(|(first, _)| *first);
     *pair.oracle.runner.floor.lock().unwrap() = None;
-    for side in [&pair.resident, &pair.oracle] {
-        *side.runner.head.lock().unwrap() = head.clone();
-    }
+    *pair.resident.runner.head.lock().unwrap() = head;
+    // The independent reference deliberately exposes the full transcript,
+    // including on a reset, rather than adopting the runner's physical cut.
+    *pair.oracle.runner.head.lock().unwrap() = None;
     selected
+}
+
+pub(super) async fn campaign_host_rewind(pair: &mut Pair, seed: u64, cut: u64) {
+    if !matches!(pair.profile, Profile::OpenCode | Profile::Pi) {
+        return;
+    }
+    let mut rng = Rng(seed ^ 0xB0A0_DA4E ^ cut);
+    let first = load(pair.resident.store(), &pair.reference)
+        .unwrap()
+        .unwrap()
+        .lineage_first_ordinal;
+    let period = if pair.profile == Profile::OpenCode {
+        5
+    } else {
+        4
+    };
+    let end = ((first + 12 + period - 1) / period) * period;
+    while newest_ordinal(pair) < end + 12 {
+        pair.append(4);
+    }
+    review_complete_turn(pair);
+    review_history(pair, end).await;
+    pair.notice(&mut rng, None).await;
+    let next = end + 1;
+    if !load(pair.resident.store(), &pair.reference)
+        .unwrap()
+        .unwrap()
+        .published_cuts
+        .contains_key(&next)
+    {
+        review_ride(pair, "surface_change").await;
+    }
+    descend_pair(pair, next, &format!("host-marker-{seed}-{cut}")).await;
+    let full = load(pair.oracle.store(), &pair.reference).unwrap().unwrap();
+    let through = end - 1;
+    pair.transcript
+        .entries
+        .lock()
+        .unwrap()
+        .truncate(through as usize + 1);
+    let lineage = format!("host-rewind-{seed}-{cut}");
+    *pair.transcript.lineage.lock().unwrap() = lineage.clone();
+    pair.append_salted(4, seed ^ cut ^ 0xB011);
+    replace_new_ids(pair, through, &lineage);
+    let selected = host_floor(pair, through, &lineage);
+    let descends = selected
+        .as_ref()
+        .map(|(first, saved)| json!({"lineage_id":saved.lineage,"through_ordinal":first-1}));
+    let request = setup_request(
+        pair,
+        &lineage,
+        descends,
+        &format!("host-rewind-setup-{seed}-{cut}"),
+    );
+    let name = if pair.profile == Profile::OpenCode {
+        "OpenCode user revert"
+    } else {
+        "Pi tree to assistant"
+    };
+    let answer = pair
+        .both(name, |side| Box::pin(side.dispatch(request.clone())))
+        .await;
+    let decoded: Value = serde_json::from_str(&answer).unwrap();
+    assert_eq!(decoded["answer"], "ready", "{answer}");
+    assert!(
+        summaries_in(&answer).iter().all(|end| *end <= through),
+        "{name} retained an abandoned summary: {answer}"
+    );
+    let first = if let Some((first, _)) = selected {
+        restore_oracle_prefix(pair, full, first);
+        first
+    } else {
+        0
+    };
+    pair.notice(&mut rng, None).await;
+    pair.check_cut(first);
+    if let Some((_, view, model, coverage)) = newest_view(pair) {
+        assert!(
+            summaries_in(&model).iter().all(|end| *end <= through),
+            "{name} serves an abandoned summary"
+        );
+        assert!(
+            missing_user_text(pair, &model, &view, coverage).is_empty(),
+            "{name} lost replacement text"
+        );
+    }
+    cut_runtime::measurements::host_rewind(pair.resident.store(), pair.profile == Profile::Pi);
 }
 
 async fn boundary_rewind(profile: Profile, fresh_ids: bool, setup: bool) {
@@ -79,7 +167,7 @@ async fn boundary_rewind(profile: Profile, fresh_ids: bool, setup: bool) {
     if fresh_ids {
         replace_new_ids(&pair, through, lineage);
     }
-    let selected = host_floor(&pair, through, lineage);
+    let selected = host_floor(&mut pair, through, lineage);
     let before = newest_version(&pair);
     if setup {
         let descends = selected
@@ -135,6 +223,67 @@ async fn fresh_id_setup_after_opencode_user_revert_serves_no_removed_summary() {
 #[tokio::test]
 async fn pi_tree_to_an_assistant_undoes_a_dependent_cut() {
     boundary_rewind(Profile::Pi, true, true).await;
+}
+
+#[tokio::test]
+async fn historian_prelude_is_not_live_or_model_input() {
+    let mut pair = Pair::open_with(Profile::Broca, false, Some("L"), false, false).await;
+    review_enable(&pair);
+    pair.append(120);
+    let mut rng = Rng(0xB0199);
+    review_history(&mut pair, 99).await;
+    pair.notice(&mut rng, None).await;
+    descend_pair(&mut pair, 100, "child").await;
+    let state = load(pair.resident.store(), &pair.reference)
+        .unwrap()
+        .unwrap();
+    let prelude = state
+        .cut_seed
+        .as_ref()
+        .unwrap()
+        .historian_prelude
+        .as_ref()
+        .unwrap();
+    assert_eq!(prelude.messages.last().unwrap().ordinal, 99);
+    assert!(state.entries.keys().all(|ordinal| *ordinal >= 100));
+    assert!(pair
+        .resident
+        .store()
+        .load_async_compaction_entries_range(&pair.reference, 0, 99)
+        .unwrap()
+        .is_empty());
+    assert!(historian_input(&pair.resident, &pair.reference).contains("answer 99.0"));
+    cut_seed::pass_trace::take(pair.resident.store() as *const McStore as usize);
+    pair.append(4);
+    pair.notice(&mut rng, None).await;
+    let trace = cut_seed::pass_trace::take(pair.resident.store() as *const McStore as usize);
+    let actions = trace
+        .iter()
+        .filter(|line| line.starts_with("action="))
+        .collect::<Vec<_>>();
+    assert!(!actions.is_empty(), "{trace:?}");
+    let inputs = trace
+        .iter()
+        .filter(|line| line.starts_with("engine_input "))
+        .collect::<Vec<_>>();
+    assert!(!inputs.is_empty(), "{trace:?}");
+    for line in inputs {
+        let ordinals: Vec<u64> =
+            serde_json::from_str(line.split_once("ordinals=").unwrap().1).unwrap();
+        assert!(
+            !ordinals.contains(&99),
+            "prelude row reached the engine: {line}"
+        );
+    }
+    let (_, _, model, _) = newest_view(&pair).unwrap();
+    assert!(!model.contains("answer 99.0"), "prelude leaked into a view");
+    assert!(pair
+        .resident
+        .runner
+        .reads_below_floor
+        .lock()
+        .unwrap()
+        .is_empty());
 }
 
 #[tokio::test]
@@ -206,8 +355,9 @@ async fn oversized_prelude_defers_only_the_cut_until_a_normal_restart() {
     let old_cut = state.published_cuts[&100].version;
     let original = Arc::clone(&state.entries[&99]);
     let mut large = original.read().unwrap();
-    // Opaque host metadata is not converted to a large-text descriptor. It
-    // makes the historian-only suffix exceed its actual retained byte budget.
+    // This opaque field stays embedded in the native message JSON rather than
+    // becoming an external content reference, so its bytes count against the
+    // historian prelude's retained byte budget.
     large.message["info"]["opaque_metadata"] =
         json!("x".repeat(cut_seed::MAX_HISTORIAN_PRELUDE_BYTES + 1));
     state
@@ -231,8 +381,9 @@ async fn oversized_prelude_defers_only_the_cut_until_a_normal_restart() {
     state.entries.insert(99, original);
     pair.resident.h.checkin(state);
 
-    // The next covered ordinary assistant is a new restart, so the oversized
-    // earlier row is no longer in the prelude and cannot pin the old cut.
+    // Summarizing through assistant message 103 makes 103 the newest restart
+    // (InputIndex indexes assistant ordinals). The new prelude starts there,
+    // excluding the large message 99, so the next cut can advance.
     pair.append(4);
     publish_history(&pair.resident, &pair.reference, 103);
     assert_eq!(

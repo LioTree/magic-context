@@ -113,6 +113,22 @@ impl McStore {
         }).map_err(Into::into)
     }
 
+    /// Re-anchor only the edits of the current live window. Archive lookup is
+    /// keyed by message id, so an old cut does not scan the session's history.
+    pub fn load_async_undo_edits_for_messages(
+        &self,
+        session_ref: &str,
+        mids: &[String],
+    ) -> Result<Vec<String>, McStoreError> {
+        let mids =
+            serde_json::to_string(mids).map_err(|error| McStoreError::Serde(error.to_string()))?;
+        self.inner.with_read(|conn| {
+            conn.prepare("SELECT b.view_json FROM json_each(?2) AS wanted CROSS JOIN mc_async_compaction_baselines b ON b.session_ref=?1 AND b.slot='undo-native-edits:mid:'||wanted.value")?
+                .query_map(params![session_ref, mids], |row| row.get(0))?
+                .collect::<rusqlite::Result<Vec<String>>>()
+        }).map_err(Into::into)
+    }
+
     /// Start counting this conversation's async-table writes (test builds only).
     #[cfg(feature = "test-support")]
     pub fn arm_async_write_meter(&self, session_ref: &str) {
@@ -779,6 +795,38 @@ mod tests {
                 .as_deref(),
             Some("without-cut")
         );
+    }
+
+    #[test]
+    fn undo_edit_lookup_reads_only_requested_message_archives() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = McStore::open(&StorageDescriptor {
+            module_id: "magic-context".into(),
+            storage_namespace: "mc_cache".into(),
+            isolation: Isolation::Module,
+            backend: StorageBackend::Sqlite {
+                path: dir.path().join("store.db").to_string_lossy().into_owned(),
+            },
+        })
+        .unwrap();
+        let mut save = store.async_compaction_save("ref", "key", "session", "{}");
+        save.baseline("undo-native-edits:mid:closed", Some("closed-prefix".into()));
+        save.baseline("undo-native-edits:mid:live", Some("live-window".into()));
+        save.commit().unwrap();
+        assert_eq!(
+            store
+                .load_async_undo_edits_for_messages("ref", &["live".into()])
+                .unwrap(),
+            vec!["live-window"]
+        );
+        assert!(store
+            .load_async_undo_edits_for_messages("ref", &["missing".into()])
+            .unwrap()
+            .is_empty());
+        assert!(store
+            .load_async_undo_edits_for_messages("other", &["live".into()])
+            .unwrap()
+            .is_empty());
     }
 
     fn entry(n: u64) -> (String, String) {

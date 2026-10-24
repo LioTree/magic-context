@@ -429,6 +429,9 @@ fn revert_transcript(pair: &Pair, through: u64, lineage: &str, salt: u64, add: u
         .unwrap()
         .truncate(through as usize + 1);
     *pair.transcript.lineage.lock().unwrap() = lineage.into();
+    for side in [&pair.resident, &pair.oracle] {
+        *side.runner.head.lock().unwrap() = None;
+    }
     pair.append_salted(add, salt);
 }
 
@@ -918,8 +921,23 @@ async fn review_session(
     revert: bool,
     kinds: Option<Vec<u64>>,
 ) -> (usize, usize) {
+    let (decisions, passes, _) =
+        review_session_inner(profile, seed, steps, revert, kinds, false).await;
+    (decisions, passes)
+}
+
+async fn review_session_inner(
+    profile: Profile,
+    seed: u64,
+    steps: u64,
+    revert: bool,
+    kinds: Option<Vec<u64>>,
+    host_cases: bool,
+) -> (usize, usize, cut_runtime::measurements::Stats) {
     let mut rng = Rng(seed ^ 0xD10F_629B_52A3_C947);
     let mut pair = Pair::open_with(profile, false, Some("L"), false, false).await;
+    cut_runtime::measurements::take(pair.resident.store());
+    cut_runtime::measurements::take(pair.oracle.store());
     review_enable(&pair);
     attest(&pair.resident);
     attest(&pair.oracle);
@@ -970,6 +988,11 @@ async fn review_session(
             for problem in content_problems(&pair, before) {
                 content.push(format!("CONTENT after {kind} (cut {first}): {problem}"));
             }
+        }
+        if host_cases {
+            slice4_boundaries::campaign_host_rewind(&mut pair, seed, cut).await;
+            decisions += decisions_agree(&pair, seed);
+            passes += verify_passes(&pair, seed);
         }
         previous = first;
     }
@@ -1035,7 +1058,9 @@ async fn review_session(
             .unwrap_or("CONTENT"),
         pair.log
     );
-    (decisions, passes)
+    let stats = cut_runtime::measurements::take(pair.resident.store());
+    cut_runtime::measurements::take(pair.oracle.store());
+    (decisions, passes, stats)
 }
 
 /// The failure's kind: its leading word with digits removed.
@@ -1076,6 +1101,7 @@ async fn s4_independent_campaign() {
     });
     let mut kinds = BTreeMap::<String, Vec<u64>>::new();
     let (mut decisions, mut passes, mut failed) = (0, 0, 0);
+    let mut stats = cut_runtime::measurements::Stats::default();
     for batch in (0..count).step_by(4) {
         let mut tasks = Vec::new();
         for index in batch..(batch + 4).min(count) {
@@ -1084,20 +1110,22 @@ async fn s4_independent_campaign() {
             tasks.push((
                 seed,
                 profile,
-                tokio::spawn(review_session(
+                tokio::spawn(review_session_inner(
                     profile,
                     seed,
                     steps,
                     revert,
                     step_kinds.clone(),
+                    true,
                 )),
             ));
         }
         for (seed, profile, task) in tasks {
             match task.await {
-                Ok((seen, proved)) => {
+                Ok((seen, proved, measured)) => {
                     decisions += seen;
                     passes += proved;
+                    stats.merge(measured);
                 }
                 Err(error) => {
                     failed += 1;
@@ -1138,10 +1166,17 @@ async fn s4_independent_campaign() {
         );
     }
     eprintln!(
-        "S4 SUMMARY sessions={count} seeds={start}..={} steps_per_cut={steps} step_kinds={step_kinds:?} codecs=4 failed={failed} matched_decisions={decisions} proved_full_passes={passes} revert={revert}",
+        "S4 SUMMARY sessions={count} seeds={start}..={} steps_per_cut={steps} step_kinds={step_kinds:?} codecs=4 failed={failed} matched_decisions={decisions} proved_full_passes={passes} revert={revert} max_prelude_bytes={} prelude_deferrals={} largest_deferred_bytes={} staged_cuts={} opencode_reverts={} pi_tree_switches={} cut_deferrals={:?}",
         start + count - 1
+        , stats.max_prelude_bytes, stats.deferred_cuts, stats.largest_deferred_bytes, stats.staged_cuts, stats.opencode_reverts, stats.pi_tree_switches, stats.deferrals
     );
     assert_eq!(failed, 0, "independent campaign failures: {kinds:?}");
+    if count >= 4 {
+        assert!(
+            stats.opencode_reverts > 0 && stats.pi_tree_switches > 0,
+            "host rewind cases were not reached: {stats:?}"
+        );
+    }
 }
 
 /// Control. In a lineage that begins at a cut, notices under context pressure

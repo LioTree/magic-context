@@ -36,20 +36,27 @@ pub(super) fn crash_after_stage_for_test() {
     CRASH_AFTER_STAGE.with(|flag| flag.set(true));
 }
 
-pub(super) fn split_head_at(ranges: &mut Vec<view::ViewRange>, first: u64) {
-    if let Some(index) = ranges.iter().position(|range| {
-        matches!(range,
-        view::ViewRange::Replace { from, to, .. } if *from < first && first < *to)
-    }) {
-        let to = ranges[index].to();
-        if let view::ViewRange::Replace { to, .. } = &mut ranges[index] {
-            *to = first;
-        }
-        ranges.insert(index + 1, view::ViewRange::replace(first, to, "[]"));
-    }
-}
-
 impl AsyncRecord {
+    pub(super) fn restore_undo_edits(&mut self, store: &McStore) -> Result<(), HandlerOutcome> {
+        if !self.pending_undo_edits {
+            return Ok(());
+        }
+        let mids = self
+            .entries
+            .range(self.lineage_first_ordinal..)
+            .map(|(_, entry)| entry.mid.clone())
+            .collect::<Vec<_>>();
+        for archive in store
+            .load_async_undo_edits_for_messages(&self.reference(), &mids)
+            .map_err(transient)?
+        {
+            self.frozen_edits
+                .merge(&frozen_edits::FrozenEdits::from_json(&archive)?);
+        }
+        self.pending_undo_edits = false;
+        Ok(())
+    }
+
     pub(super) fn active_seed_is_unsafe(&self, store: &McStore) -> Result<bool, HandlerOutcome> {
         let Some(first) = self.cut_first_ordinal else {
             return Ok(false);
@@ -249,6 +256,8 @@ impl AsyncRecord {
         let mut seed = match self.capture_cut_seed(store, codec, first)? {
             Ok(seed) => seed,
             Err(reason) => {
+                #[cfg(test)]
+                measurements::deferred(store, reason.code());
                 tracing::debug!(
                     first,
                     reason = reason.code(),
@@ -258,6 +267,8 @@ impl AsyncRecord {
             }
         };
         if !seed.boundary_safe() {
+            #[cfg(test)]
+            measurements::deferred(store, "unsafe_cut_seed");
             return Ok(());
         }
         // The new lineage adopts this published view, not a parent's older
@@ -270,6 +281,8 @@ impl AsyncRecord {
                     .any(|m| !m.meta.synthetic && m.meta.ordinal.is_some_and(|n| n < first))
             })
         }) {
+            #[cfg(test)]
+            measurements::deferred(store, "cut_retains_live_prefix");
             return Ok(());
         }
         let candidate = self
@@ -375,12 +388,15 @@ impl AsyncRecord {
 #[cfg(test)]
 pub(super) mod measurements {
     use super::*;
-    #[derive(Clone, Copy, Debug, Default)]
+    #[derive(Clone, Debug, Default)]
     pub(crate) struct Stats {
         pub max_prelude_bytes: usize,
         pub largest_deferred_bytes: usize,
         pub deferred_cuts: u64,
         pub staged_cuts: u64,
+        pub opencode_reverts: u64,
+        pub pi_tree_switches: u64,
+        pub deferrals: BTreeMap<String, u64>,
     }
     fn rows() -> &'static Mutex<BTreeMap<usize, Stats>> {
         static ROWS: OnceLock<Mutex<BTreeMap<usize, Stats>>> = OnceLock::new();
@@ -404,6 +420,25 @@ pub(super) mod measurements {
             .or_default()
             .staged_cuts += 1;
     }
+    pub(crate) fn deferred(store: &McStore, reason: &str) {
+        *rows()
+            .lock()
+            .unwrap()
+            .entry(store as *const McStore as usize)
+            .or_default()
+            .deferrals
+            .entry(reason.into())
+            .or_default() += 1;
+    }
+    pub(crate) fn host_rewind(store: &McStore, pi: bool) {
+        let mut rows = rows().lock().unwrap();
+        let stats = rows.entry(store as *const McStore as usize).or_default();
+        if pi {
+            stats.pi_tree_switches += 1;
+        } else {
+            stats.opencode_reverts += 1;
+        }
+    }
     pub(crate) fn take(store: &McStore) -> Stats {
         rows()
             .lock()
@@ -419,6 +454,11 @@ pub(super) mod measurements {
                 .max(other.largest_deferred_bytes);
             self.deferred_cuts += other.deferred_cuts;
             self.staged_cuts += other.staged_cuts;
+            self.opencode_reverts += other.opencode_reverts;
+            self.pi_tree_switches += other.pi_tree_switches;
+            for (reason, count) in other.deferrals {
+                *self.deferrals.entry(reason).or_default() += count;
+            }
         }
     }
 }
@@ -497,18 +537,27 @@ impl McHandler {
             .load_async_compaction_baseline(&state.reference(), "frozen_edits")
             .map_err(transient)?
         {
-            // These source-identified edits can become visible again after an
-            // undo below the cut. Archive them without loading older archives
-            // on the bounded descending-Setup path.
+            // These source-identified edits can reappear after undo. Archive
+            // each message separately; Setup reads only its current window,
+            // and a later read looks up only the surviving window's ids.
             let record = serde_json::to_string(&state).map_err(transient)?;
             let reference = state.reference();
             let key = state.key.store_key().conversation_key();
             let mut save =
                 store.async_compaction_save(&reference, &key, &state.key.session, &record);
-            save.baseline(
-                format!("undo-native-edits:{}:{}", state.generation, cut.version),
-                Some(edits),
-            );
+            for (mid, current) in
+                frozen_edits::FrozenEdits::from_json(&edits)?.message_snapshots()?
+            {
+                let slot = format!("undo-native-edits:mid:{mid}");
+                let mut merged = store
+                    .load_async_compaction_baseline(&reference, &slot)
+                    .map_err(transient)?
+                    .map(|raw| frozen_edits::FrozenEdits::from_json(&raw))
+                    .transpose()?
+                    .unwrap_or_default();
+                merged.merge(&frozen_edits::FrozenEdits::from_json(&current)?);
+                save.baseline(slot, Some(merged.json()?));
+            }
             save.commit().map_err(transient)?;
         }
         if request.lineage_id.is_none() {
@@ -563,6 +612,7 @@ impl McHandler {
                 namespace: cut.parent_namespace.clone(),
                 revision: cut.parent_revision.clone(),
             });
+        state.pending_undo_edits = true;
         let old: compact::setup::SetupAnswer = decode(&state.initial)?;
         let codec = codec::Codec::from_params(&Value::Object(request.params.clone()))?;
         let initial = compact::message::CompactionMessage::new(

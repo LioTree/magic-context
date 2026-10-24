@@ -65,12 +65,13 @@ fn attest(side: &Side) {
 }
 
 /// True when `text` names a fixture message (`m<n>`, alone or as a block
-/// `m<n>#<k>`, possibly after a `prefix:`) whose ordinal is below `first`.
+/// `m<n>#<k>`, possibly after a `prefix:` or fresh-lineage `prefix-`) whose
+/// ordinal is below `first`.
 fn names_below(text: &str, first: u64) -> bool {
     let bytes = text.as_bytes();
     let mut index = 0;
     while index < bytes.len() {
-        let starts = index == 0 || matches!(bytes[index - 1], b':' | b'\0' | b' ' | b'"');
+        let starts = index == 0 || matches!(bytes[index - 1], b':' | b'\0' | b' ' | b'"' | b'-');
         if bytes[index] == b'm' && starts {
             let digits = bytes[index + 1..]
                 .iter()
@@ -87,6 +88,13 @@ fn names_below(text: &str, first: u64) -> bool {
         index += 1;
     }
     false
+}
+
+#[test]
+fn fresh_host_ids_normalize_only_rows_below_the_cut() {
+    assert!(names_below("host-rewind-7-0-m104#1", 105));
+    assert!(!names_below("host-rewind-7-0-m104#1", 104));
+    assert!(!names_below("m0-mural", 105));
 }
 
 /// `value` without anything keyed to a message below `first`: object
