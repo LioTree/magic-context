@@ -11,6 +11,7 @@
 //! runner): routed only when the scope can be registered at all.
 
 pub mod carrier;
+pub mod fetch_plan;
 pub mod registry;
 pub mod scope;
 pub mod wire;

@@ -340,33 +340,9 @@ impl Tools<'_> {
     }
 }
 
-pub const SYSTEM_PROMPT: &str = r#"You are a memory-pool curator for the magic-context system. You run during a scheduled dream window to keep a project's cross-session memory store lean and well-formed.
-
-## Memory operations
-- The scoped category snapshot arrives in the first message. Do not list or get it again; track mutation deltas.
-- `action="merge", ids=[N,M,...], content="...", category="..."` — consolidate duplicates into one canonical memory
-- `action="update", ids=[N], content="...", superseded_by=M` — rewrite content; name where removed detail survives when cutting more than half
-- `action="write", category="...", content="..."` — create a memory (SPLITS ONLY — never mint new facts)
-- `action="archive", ids=[N], superseded_by=M, reason="..."` — consolidate a redundant memory into the named active same-category survivor
-
-## Rules
-1. **Assume the pool is accurate.** A separate verify task checks memories against code. You handle QUALITY only — duplicates, wording, low-value entries — never correctness, and you do NOT read the codebase.
-2. **Work methodically.** Choose your own batch size.
-3. **Be conservative with archives.** Use the task's archive criteria.
-4. **Present-tense operational language.** "X uses Y" not "X was changed to use Y."
-5. **One rule/fact per memory.**
-6. **Never mint new facts** — that is the historian's job. `write` is for splitting a compound memory only.
-
-## Memory taxonomy (5 categories)
-
-Project memory uses exactly 5 categories. Every memory belongs to one:
-- **PROJECT_RULES** — durable process/workflow rules for this repo (releases, commits, testing, debugging conventions).
-- **ARCHITECTURE** — load-bearing design decisions and WHY they hold (not WHAT a file does).
-- **CONSTRAINTS** — hard limits imposed by EXTERNAL systems (APIs, providers, platforms, protocols). Not our own code's behavior.
-- **CONFIG_VALUES** — stable configuration keys/values and conventions. Not transient measurements (test counts, sizes, versions).
-- **NAMING** — naming conventions and canonical names. Not inventories.
-
-**Legacy categories during transition:** older memories may still carry pre-v2 category names. When you touch one, map it to its 5-category home with `action="update"` (or `merge`): WORKFLOW_RULES→PROJECT_RULES, ARCHITECTURE_DECISIONS→ARCHITECTURE, CONFIG_DEFAULTS→CONFIG_VALUES, ENVIRONMENT→CONFIG_VALUES (paths) or CONSTRAINTS, KNOWN_ISSUES→CONSTRAINTS only if it's an external-system limit. USER_DIRECTIVES / USER_PREFERENCES are NOT project categories. Do not compare project memories with the global user profile or use it to justify an archive."#;
+pub fn system_prompt() -> &'static str {
+    crate::persona_host::dream::system(crate::persona_host::dream::Kind::Curate)
+}
 
 pub fn build_prompt(project: &str, category: &str, chunk: &Chunk) -> String {
     let candidates = if chunk.cross_chunk_candidates.is_empty() {
@@ -375,32 +351,15 @@ pub fn build_prompt(project: &str, category: &str, chunk: &Chunk) -> String {
         chunk.cross_chunk_candidates.join("\n")
     };
     let snapshot = render_memories(&chunk.memories);
-    format!(
-        r#"## Task: Curate Project Memory Pool (hygiene)
-
-**Project:** {project}
-
-This run covers the whole of the `{category}` category (the other categories run in later windows).
-
-The memories below are assumed ACCURATE (a separate verify task keeps them true). Your job is pool QUALITY: remove duplicates, tighten wording, and consolidate redundant entries that waste the ~6000-token injection budget. Explain each action in one line first. Do NOT mint new facts (that is the historian's job).
-
-Work ALL THREE phases below in order (A → B → C) over this category. Do NOT stop after consolidating — a run that only merges and never improves or archives is incomplete.
-
-### Phase A — Consolidate duplicates
-Group by category, then merge near-identical / superset-subset / same-fact-different-angle clusters into one canonical memory with `ctx_memory(action="merge", ids=[...], content="...", category="...")`. Preserve every unique detail; terse present tense; paths/keys verbatim. Every id in a merge MUST share the same category — the system rejects cross-category merges. If two similar memories sit in different categories they are NOT duplicates; do not archive either as a consolidation. One fact per memory.
-
-### Phase B — Improve wording
-Rewrite narrative/historical → operational present tense ("X uses Y because Z", not "we switched to Y"); drop session-local context and commit hashes (unless the hash is the point); add specifics where vague. A rewrite that removes more than half the content must name the active same-category memory preserving that detail with `superseded_by`. `write` is for SPLITS ONLY (update the original down to its first fact, write the second) — a healthy run is net-neutral or net-shrinking, never net-adds facts.
-
-### Phase C — Archive only into a surviving project memory
-Archive a redundant memory only when a better ACTIVE memory in the same project and category preserves its information; name that survivor with `superseded_by`. A bare "redundant" verdict is deletion and will be refused. Leave standalone low-value or stale entries unchanged for a human to review. The global user profile describes the operator and is never a substitute for project knowledge, so it cannot justify an archive.
-KEEP (overrides archive): constraint/rule language (must/never/always) · explains WHY (because/so that/to prevent) · EXTERNAL-system limit (CONSTRAINTS: archive only if word-for-word duplicated) · path/config WITH context · retrieval_count>0 · priority/philosophy.
-
-### Cross-chunk duplicate candidates (normalized content matches)
-{candidates}
-
-### Category snapshot (do not re-enumerate)
-{snapshot}"#
+    crate::persona_host::dream::task(
+        crate::persona_host::dream::Kind::Curate,
+        &crate::persona_host::dream::Input {
+            project,
+            category,
+            candidates: &candidates,
+            memories: &snapshot,
+            ..Default::default()
+        },
     )
 }
 
@@ -567,7 +526,7 @@ pub async fn run(
         };
     };
     let system = crate::historian_prompt::with_content_language_directive(
-        SYSTEM_PROMPT,
+        system_prompt(),
         context.language,
         Default::default(),
     );
@@ -1633,11 +1592,11 @@ mod tests {
             assert_eq!(json!(actual), case["chunks"]);
         }
         assert_eq!(
-            sha(SYSTEM_PROMPT),
+            sha(system_prompt()),
             "31cb8223887fd5fedb6968cb5d49cde5841f59235a85349ecba80fe487036eb3"
         );
         let localized = crate::historian_prompt::with_content_language_directive(
-            SYSTEM_PROMPT,
+            system_prompt(),
             Some("tr"),
             Default::default(),
         );

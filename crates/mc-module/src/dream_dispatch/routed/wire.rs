@@ -14,6 +14,7 @@ use cortexkit_role_routing::{
 use serde_json::Value;
 use subc_client_rs::async_trait;
 
+use super::fetch_plan::Provider;
 use super::scope::{DreamScope, EntorhinalProjectId};
 use crate::dream_dispatch::broca_carrier::PortError;
 use crate::model_work::RoutingCatalog;
@@ -53,6 +54,13 @@ pub trait DreamWire: Send + Sync {
     async fn end_scope(&self, scope: &DreamScope);
     /// The routing/v1 providers in the module catalog right now.
     fn routing_catalog(&self) -> RoutingCatalog;
+    /// Resolve tags against providers reachable under this scope. The resolved
+    /// provider modules also restrict which modules the runner may call here.
+    async fn tool_providers(
+        &self,
+        scope: &DreamScope,
+        capabilities: &[&str],
+    ) -> Result<Vec<Provider>, WireRefusal>;
     /// `route.select` on a route opened under `scope`. Answers the provider's
     /// answer as sent, so members this crate version does not decode (such as a
     /// runner's hosted harness) are still visible to the caller.
@@ -140,6 +148,13 @@ impl DreamWire for ProductionWire {
             generation: 0,
             providers: Vec::new(),
         }
+    }
+    async fn tool_providers(
+        &self,
+        _: &DreamScope,
+        _: &[&str],
+    ) -> Result<Vec<Provider>, WireRefusal> {
+        Err(unsupported())
     }
     async fn select(&self, _: &DreamScope, _: &str, _: &SelectRequest) -> Result<Value, Refusal> {
         Err(unsupported_refusal())

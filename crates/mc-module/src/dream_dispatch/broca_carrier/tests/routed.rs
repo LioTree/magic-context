@@ -19,6 +19,7 @@ use crate::dream_dispatch::executor::{DreamExecutor, NoBroca, Transport};
 use crate::dream_dispatch::routed::carrier::{
     RoutedCarrier, RoutedCarrierParts, RoutedParks, HARNESS_UNKNOWN,
 };
+use crate::dream_dispatch::routed::fetch_plan::{self, Provider};
 use crate::dream_dispatch::routed::scope::{DreamScope, EntorhinalProjectId};
 use crate::dream_dispatch::routed::wire::{DreamWire, RunnerBind, WireRefusal, SCOPE_UNSUPPORTED};
 use crate::dream_dispatch::tick::{ManualRun, RunReport, PROJECT_UNRESOLVED};
@@ -37,6 +38,7 @@ use subc_protocol::Principal;
 
 const PROVIDER: &str = "routing";
 const ENTORHINAL_ID: &str = "pj-entorhinal";
+const CODE_PROVIDER: &str = "fixture-code-reader";
 
 /// One answer the fake routing provider can give.
 #[derive(Clone)]
@@ -74,6 +76,8 @@ struct WireLog {
     lookups: Vec<PathBuf>,
     /// For each select, whether the task's domain lease was still held.
     lease_held: Vec<bool>,
+    capabilities: Vec<Vec<String>>,
+    plans: Vec<Value>,
 }
 
 type Probe = Box<dyn Fn() -> bool + Send + Sync>;
@@ -89,6 +93,8 @@ struct FakeWire {
     log: Mutex<WireLog>,
     decisions: AtomicU64,
     lease_probe: Mutex<Option<Probe>>,
+    tool_unavailable: Mutex<bool>,
+    old_routing: Mutex<bool>,
 }
 
 impl FakeWire {
@@ -119,6 +125,8 @@ impl FakeWire {
             log: Mutex::default(),
             decisions: AtomicU64::new(0),
             lease_probe: Mutex::default(),
+            tool_unavailable: Mutex::default(),
+            old_routing: Mutex::default(),
         }
     }
 
@@ -194,6 +202,35 @@ impl DreamWire for FakeWire {
         }
     }
 
+    async fn tool_providers(
+        &self,
+        _: &DreamScope,
+        capabilities: &[&str],
+    ) -> Result<Vec<Provider>, WireRefusal> {
+        self.log()
+            .capabilities
+            .push(capabilities.iter().map(|s| (*s).to_owned()).collect());
+        capabilities
+            .iter()
+            .map(|tag| {
+                let module = match *tag {
+                    fetch_plan::CODE_READ => CODE_PROVIDER,
+                    fetch_plan::MEMORY | fetch_plan::SEARCH => "magic-context",
+                    _ => {
+                        return Err(WireRefusal {
+                            code: "tool_unavailable".into(),
+                            detail: tag.to_string(),
+                        })
+                    }
+                };
+                Ok(Provider {
+                    capability: tag.to_string(),
+                    module: module.into(),
+                })
+            })
+            .collect()
+    }
+
     async fn select(
         &self,
         scope: &DreamScope,
@@ -215,6 +252,12 @@ impl DreamWire for FakeWire {
                 serde_json::to_value(request).unwrap(),
             ));
             log.lease_held.extend(held);
+        }
+        if *self.old_routing.lock().unwrap() && request.requirements.tool_capabilities.is_some() {
+            return Err(Refusal::invalid_requirements(
+                "tool_capabilities",
+                "unsupported requirement",
+            ));
         }
         if let Some(reset) = *self.timed_reset.lock().unwrap() {
             return Err(Refusal::no_route(
@@ -282,6 +325,14 @@ impl DreamWire for FakeWire {
             log.events.push(op.to_owned());
             log.ops.push((scope.clone(), bind.clone(), op.to_owned()));
         }
+        if op == "session.send" {
+            self.log()
+                .plans
+                .push(params.get("plan").cloned().unwrap_or(Value::Null));
+            if *self.tool_unavailable.lock().unwrap() {
+                return Err(refusal("tool_unavailable", "plan"));
+            }
+        }
         match bind.module.as_str() {
             "thalamus-harness" if bind.harness != "opencode" => {
                 return Err(refusal("invalid_params", "harness"));
@@ -290,6 +341,7 @@ impl DreamWire for FakeWire {
             _ => {}
         }
         let mut runner = self.runners[bind.module.as_str()].clone();
+        runner.state().file_provider = Some(CODE_PROVIDER.into());
         runner.call(&bind.session, op, params).await
     }
 
@@ -338,10 +390,26 @@ impl CarrierRig {
     }
 
     fn carrier(&self) -> RoutedCarrier {
+        self.carrier_for(self.f.context.task)
+    }
+
+    fn carrier_for(&self, task: TaskName) -> RoutedCarrier {
+        let c = &self.f.context;
+        let context = Arc::new(TaskContext {
+            task,
+            scope: c.scope.clone(),
+            config: c.config.clone(),
+            domain_lease: c.domain_lease.clone(),
+            task_lease: c.task_lease.clone(),
+            cancellation: c.cancellation.clone(),
+            clock: c.clock.clone(),
+            deadline_ms: c.deadline_ms,
+            control: c.control.clone(),
+        });
         RoutedCarrier::new(RoutedCarrierParts {
             wire: self.wire.clone(),
             routes: self.f.handler.broca_dream_tools(),
-            context: self.f.context.clone(),
+            context,
             router: self.f.effects.clone(),
             observer: self.f.effects.clone(),
             scheduler: self.f.scheduler.clone(),
@@ -354,7 +422,15 @@ impl CarrierRig {
 
     /// One child with `tools`, opened, completed and closed.
     async fn child(&self, tools: &'static [&'static str]) -> Result<Completion, CarrierError> {
-        let mut carrier = self.carrier();
+        self.child_for(self.f.context.task, tools).await
+    }
+
+    async fn child_for(
+        &self,
+        task: TaskName,
+        tools: &'static [&'static str],
+    ) -> Result<Completion, CarrierError> {
+        let mut carrier = self.carrier_for(task);
         let request = self.f.request(tools, 5);
         bounded(async {
             let child = carrier.open(&request).await?;
@@ -430,7 +506,7 @@ async fn routed_children_bind_fresh_project_named_sessions() {
 #[tokio::test]
 async fn routed_tool_child_lists_the_chosen_runner_as_carrier() {
     let rig = CarrierRig::new(vec![candidate("broca", "model-a", Some("claude-code"))]);
-    rig.child(&["ctx_memory", "read"]).await.expect("completes");
+    rig.child(&["ctx_memory"]).await.expect("completes");
     let sends = rig.wire.sends();
     assert_eq!(sends.len(), 1);
     let (scope, bind) = &sends[0];
@@ -443,10 +519,7 @@ async fn routed_tool_child_lists_the_chosen_runner_as_carrier() {
             module_id: "broca".into()
         }
     );
-    assert_eq!(
-        carriers[0].targets,
-        Some(vec!["magic-context".to_owned(), "aft".to_owned()])
-    );
+    assert_eq!(carriers[0].targets, Some(vec!["magic-context".to_owned()]));
     // The daemon learned of the carrier before the runner was asked anything.
     let log = rig.wire.log();
     let carried_sync = log
@@ -477,6 +550,149 @@ impl WireLog {
             .map(|(_, s)| s["requirements"]["tools"].as_str().unwrap().to_owned())
             .collect()
     }
+}
+
+#[tokio::test]
+async fn routed_task_plans_request_capability_tags_not_modules() {
+    for (task, tools, tags) in [
+        (TaskName::Curate, &["ctx_memory"][..], vec!["mc.memory/v1"]),
+        (TaskName::Classify, &[][..], vec![]),
+        (TaskName::ReviewUserMemories, &[][..], vec![]),
+        (
+            TaskName::Map,
+            &[
+                "read",
+                "grep",
+                "glob",
+                "aft_outline",
+                "aft_zoom",
+                "aft_search",
+            ][..],
+            vec!["code.read/v1"],
+        ),
+        (TaskName::Verify, &["read"][..], vec!["code.read/v1"]),
+        (TaskName::VerifyBroad, &["read"][..], vec!["code.read/v1"]),
+    ] {
+        let rig = CarrierRig::new(vec![candidate("broca", "model-a", Some("claude-code"))]);
+        rig.child_for(task, tools).await.expect("completes");
+        let log = rig.wire.log();
+        let request = &log.selects[0].1;
+        let got: Vec<String> = serde_json::from_value(
+            request["requirements"]
+                .get("tool_capabilities")
+                .cloned()
+                .unwrap_or(json!([])),
+        )
+        .unwrap();
+        assert_eq!(got, tags, "{}", task.as_str());
+        assert_eq!(request["consumer"], format!("mc.dream.{}", task.as_str()));
+        assert_eq!(
+            request["requirements"]["tools"],
+            if tags.is_empty() { "none" } else { "required" }
+        );
+        if tags.is_empty() {
+            assert!(log.capabilities.is_empty());
+            assert!(log.plans[0].is_null());
+        } else {
+            assert_eq!(log.capabilities, [tags.clone()]);
+            let provider = if tags == ["code.read/v1"] {
+                CODE_PROVIDER
+            } else {
+                "magic-context"
+            };
+            let plan = &log.plans[0];
+            assert_eq!(plan["items"][0]["provider"], provider);
+            assert_eq!(plan["items"][0]["params"]["tools"], json!(tools));
+            let scope = &log.syncs[1];
+            assert_eq!(
+                scope.record.carriers[0].targets,
+                Some(vec![provider.into()])
+            );
+            if provider == CODE_PROVIDER {
+                assert_eq!(plan["items"][0]["params"]["root"], json!(scope.workdir));
+            }
+        }
+    }
+}
+
+#[tokio::test]
+async fn routed_two_tool_unavailable_refusals_stop_before_a_third_selection() {
+    let rig = CarrierRig::new(vec![
+        candidate("broca", "model-a", Some("claude-code")),
+        candidate("broca", "model-b", Some("claude-code")),
+        candidate("broca", "model-c", Some("claude-code")),
+    ]);
+    *rig.wire.tool_unavailable.lock().unwrap() = true;
+    let error = rig.child_for(TaskName::Map, &["read"]).await.unwrap_err();
+    assert!(
+        error.message.starts_with("mc_dream_tool_unavailable:"),
+        "{error:?}"
+    );
+    assert!(error.message.contains("code.read/v1"), "{error:?}");
+    assert!(!error.retryable);
+    let log = rig.wire.log();
+    assert_eq!(log.selects.len(), 2, "only one retry is allowed");
+    assert_eq!(log.plans.len(), 2);
+    assert_eq!(log.selects[1].1["exclude"], json!(["vendor/model-a"]));
+    assert_eq!(log.reports.len(), 2);
+    for (_, report) in &log.reports {
+        assert_eq!(report.outcome, Outcome::Refused);
+        assert_eq!(report.runner_code.as_deref(), Some("tool_unavailable"));
+    }
+    assert_eq!(log.ends.len(), 1);
+}
+
+#[tokio::test]
+async fn routed_old_routing_refuses_tool_tasks_but_not_no_tool_tasks() {
+    let rig = CarrierRig::new(vec![candidate("broca", "model-a", Some("claude-code"))]);
+    *rig.wire.old_routing.lock().unwrap() = true;
+    let error = rig.child_for(TaskName::Map, &["read"]).await.unwrap_err();
+    assert!(
+        error.message.starts_with("mc_route_misconfigured:"),
+        "{error:?}"
+    );
+    assert!(rig.wire.sends().is_empty());
+    rig.child_for(TaskName::Classify, &[])
+        .await
+        .expect("no-tool tasks still run");
+    assert_eq!(rig.wire.sends().len(), 1);
+}
+
+#[tokio::test]
+async fn routed_code_read_provider_refuses_path_escape() {
+    let rig = CarrierRig::new(vec![candidate("broca", "model-a", Some("claude-code"))]);
+    let root = &rig.f.context.config.directory;
+    let outside = tempfile::tempdir_in(root.parent().unwrap()).unwrap();
+    let secret = outside.path().join("secret.txt");
+    std::fs::write(&secret, "OUTSIDE-SECRET").unwrap();
+    std::fs::write(root.join("inside.txt"), "INSIDE").unwrap();
+    let traversal = format!(
+        "../{}/secret.txt",
+        outside.path().file_name().unwrap().to_string_lossy()
+    );
+    let mut calls = vec![
+        ("read", json!({"filePath": "inside.txt"})),
+        ("read", json!({"filePath": traversal})),
+        ("read", json!({"filePath": secret})),
+    ];
+    #[cfg(unix)]
+    {
+        std::os::unix::fs::symlink(&secret, root.join("escape.txt")).unwrap();
+        calls.push(("read", json!({"filePath": "escape.txt"})));
+    }
+    rig.wire.script(vec![step(1, calls), answer("done")]);
+    rig.child_for(TaskName::Map, &["read"])
+        .await
+        .expect("completes with refused tool results");
+    let state = rig.wire.runners["broca"].state();
+    assert_eq!(state.results[0].1["content"], "INSIDE");
+    assert!(state.results.len() >= 3);
+    for (_, result) in &state.results[1..] {
+        assert_eq!(result["ok"], false, "{result}");
+        assert_eq!(result["error"], "path_not_readable");
+        assert!(result.get("content").is_none());
+    }
+    assert_eq!(rig.wire.log().capabilities, [["code.read/v1"]]);
 }
 
 /// When routing names the runner's hosted harness, the session is bound with

@@ -297,7 +297,7 @@ impl<C: DreamCarrier> RetrospectiveHost<C> {
         let batch = self
             .model(
                 DreamRole::Reviewer,
-                REVIEW_SYSTEM,
+                review_system(),
                 &review_prompt(&snapshot, threshold),
                 |c| plan::plan_user_review(&lease, now, threshold, &rows, &c.text),
             )
@@ -436,7 +436,9 @@ Return only XML in this exact shape:
     )
 }
 
-const REVIEW_SYSTEM: &str = "You are a user-profile reviewer for the magic-context system. You run during a scheduled dream window to decide which recurring behavioral observations about the human user are real, persistent patterns worth keeping in their global user profile.\n\nYou do NOT call any tools and you do NOT touch project memories — you read the candidate observations the host gives you and return a JSON verdict. Distill durable patterns; never transcribe a single moment. Phrase promoted or updated memories as concise, present-tense verb-first statements without a subject (for example, \"Prefers concise explanations\" or \"Expects changes to be tested\"). Output only the JSON the task asks for, with no surrounding prose.";
+fn review_system() -> &'static str {
+    crate::persona_host::dream::system(crate::persona_host::dream::Kind::ReviewUser)
+}
 
 fn review_prompt(snapshot: &durable::ReviewSnapshot, threshold: usize) -> String {
     let candidates = snapshot
@@ -459,23 +461,14 @@ fn review_prompt(snapshot: &durable::ReviewSnapshot, threshold: usize) -> String
         .map(|p| format!("- Memory #{}: {:?}", p.id, p.content))
         .collect::<Vec<_>>()
         .join("\n");
-    format!(
-        r#"## Task: Review User Memory Candidates
-
-You are reviewing behavioral observations about a human user to decide which patterns are real and persistent.
-
-### Current Stable User Memories
-{profiles}
-
-### Candidate Observations (from recent historian runs)
-{candidates}
-
-Look for recurring patterns across independent sessions. A candidate must appear in at least {threshold} semantically similar variants before promotion. Only promote universal user traits, never project-specific preferences, framework choices, one-off moods or task-local frustrations. Merge equivalent traits and update existing memories when appropriate. Phrase promoted and updated memories as concise, present-tense verb-first statements without a subject.
-
-Return only valid JSON:
-{{"promote":[{{"content":"Clean universal observation text","candidate_ids":[1,3,7]}}],"update_existing":[{{"memory_id":5,"content":"Updated text","candidate_ids":[2]}}],"dismiss_existing":[{{"memory_id":3,"reason":"No longer supported"}}],"consume_candidate_ids":[1,2,3,7]}}
-
-Return empty arrays if no promotions are warranted. Always consume ALL reviewed candidates, including rejected or already covered observations, so they do not accumulate indefinitely."#
+    crate::persona_host::dream::task(
+        crate::persona_host::dream::Kind::ReviewUser,
+        &crate::persona_host::dream::Input {
+            profiles: &profiles,
+            candidates: &candidates,
+            threshold,
+            ..Default::default()
+        },
     )
 }
 

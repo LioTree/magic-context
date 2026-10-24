@@ -13,6 +13,8 @@ use cortexkit_persona::{
 };
 use serde::{de::DeserializeOwned, Deserialize, Serialize};
 
+pub mod dream;
+
 pub const MODULE: &str = "magic-context";
 pub const SUMMARY_ROLE: &str = "mc_summary";
 pub const SUMMARY_CONTRACT: &str = "mc.summary.xml/v1";
@@ -204,7 +206,7 @@ struct ModuleContext<'a> {
 
 /// The compiled base works without any persona files on the host filesystem.
 pub fn embedded_base() -> EmbeddedTier {
-    EmbeddedTier::new()
+    dream::with_embedded(EmbeddedTier::new())
         .with_file(SUMMARY_ROLE, "PERSONA.md", SUMMARY_PERSONA)
         .expect("fixed summary persona path")
         .with_file(SUMMARY_ROLE, "fragments/system.md", HISTORIAN_SYSTEM_PROMPT)
@@ -259,10 +261,19 @@ pub fn load_summary(
     approvals: &ApprovalSet,
     project_key: Option<&ProjectKey>,
 ) -> Result<SummaryPersona, PersonaError> {
+    load_role(SUMMARY_ROLE, tiers, approvals, project_key)
+}
+
+fn load_role(
+    id: &str,
+    tiers: &[Tier],
+    approvals: &ApprovalSet,
+    project_key: Option<&ProjectKey>,
+) -> Result<SummaryPersona, PersonaError> {
     let mut engine = PersonaEngine::new(MODULE)?;
     engine.register_extension(operator_extension::<Routing>("routing"))?;
     engine.register_extension(operator_extension::<Generation>("generation"))?;
-    let mut request = LoadRequest::new(SUMMARY_ROLE, tiers, approvals);
+    let mut request = LoadRequest::new(id, tiers, approvals);
     if let Some(key) = project_key {
         request = request.project_key(key);
     }
@@ -308,11 +319,34 @@ fn render_context<'a>(
     context: &'a SummaryContext,
     routing: &'a Routing,
 ) -> RenderContext<ModuleContext<'a>> {
+    context_for(
+        role,
+        routing,
+        &context.project,
+        ModuleContext {
+            routing,
+            language: &context.language,
+            project: &context.project,
+            output: OutputContext {
+                id: SUMMARY_CONTRACT,
+                format: "xml",
+                schema_text: HISTORIAN_SYSTEM_PROMPT,
+            },
+        },
+    )
+}
+
+fn context_for<T>(
+    role: &str,
+    routing: &Routing,
+    project: &ProjectContext,
+    module: T,
+) -> RenderContext<T> {
     RenderContext {
         agent: AgentContext {
             name: None,
             agent_id: None,
-            project: context.project.name.clone(),
+            project: project.name.clone(),
             workspace: None,
             role: role.into(),
         },
@@ -341,16 +375,7 @@ fn render_context<'a>(
             timezone: "UTC".into(),
             locale: "en".into(),
         },
-        module: ModuleContext {
-            routing,
-            language: &context.language,
-            project: &context.project,
-            output: OutputContext {
-                id: SUMMARY_CONTRACT,
-                format: "xml",
-                schema_text: HISTORIAN_SYSTEM_PROMPT,
-            },
-        },
+        module,
     }
 }
 

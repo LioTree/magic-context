@@ -13,7 +13,7 @@
 //! carrier remembers the reset per project and consumer, asks nothing before it,
 //! and tells the executor, which gives the slot back without recording a run.
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
@@ -26,11 +26,12 @@ use cortexkit_role_routing::{
 use mc_store::dream_scheduler::SqliteDreamScheduler;
 use serde_json::{json, Value};
 
+use super::fetch_plan::{self, Grant, Provider};
 use super::registry::{self, DreamTaskRegistration};
 use super::scope::{session_name, DreamScope, EntorhinalProjectId};
 use super::wire::{DreamWire, RunnerBind};
 use crate::dream_dispatch::broca_carrier::{
-    BrocaCarrier, BrocaPolicy, BrocaPort, BrocaToolRoute, PortError, FILE_TOOL_PROVIDER, MC_TOOLS,
+    BrocaCarrier, BrocaPolicy, BrocaPort, BrocaToolRoute, PortError,
 };
 use crate::dream_dispatch::context::{ChildObserver, TaskContext, TaskToolRouter};
 use crate::dream_runner::{CarrierError, ChildRequest, Completion, DreamCarrier, ModelEntry};
@@ -53,6 +54,7 @@ pub const ROUTE_WAITING: &str = "mc_route_waiting";
 /// A runner session could not be shown to have stopped, so no further paid run
 /// may start for this child.
 pub const CLEANUP_FAILED: &str = "mc_dream_cleanup_failed";
+pub const TOOL_UNAVAILABLE: &str = "mc_dream_tool_unavailable";
 /// Decisions one child may use before it is refused `mc_route_exhausted`.
 pub const MAX_DECISIONS: usize = 3;
 /// Time kept back from each send so a timed-out run can still be cancelled and
@@ -121,20 +123,6 @@ impl RoutedParks {
     }
 }
 
-/// The modules a child's tools are served by: Magic Context's own tools by this
-/// module, every other tool (file reads) by AFT. The scope lets the runner open
-/// routes to these and nothing else.
-fn tool_modules(tools: &[&str], module_id: &str) -> Vec<String> {
-    let mut modules = Vec::new();
-    if tools.iter().any(|tool| MC_TOOLS.contains(tool)) {
-        modules.push(module_id.to_owned());
-    }
-    if tools.iter().any(|tool| !MC_TOOLS.contains(tool)) {
-        modules.push(FILE_TOOL_PROVIDER.to_owned());
-    }
-    modules
-}
-
 /// The runner's code inside a carrier error: `op: code: message` names the
 /// code second, an admission refusal (`unavailable: retention`) first.
 fn runner_code(message: &str) -> String {
@@ -158,10 +146,19 @@ struct WirePort {
     wire: Arc<dyn DreamWire>,
     scope: DreamScope,
     bind: RunnerBind,
+    plan: Value,
 }
 
 impl BrocaPort for WirePort {
-    async fn call(&mut self, _: &str, op: &str, params: Value) -> Result<Value, PortError> {
+    async fn call(&mut self, _: &str, op: &str, mut params: Value) -> Result<Value, PortError> {
+        if op == "session.send" {
+            // The shared carrier still builds the legacy provider-specific plan.
+            // Only routed sends replace it with capability-resolved providers.
+            params.as_object_mut().expect("send object").remove("plan");
+            if !self.plan["items"].as_array().is_none_or(Vec::is_empty) {
+                params["plan"] = self.plan.clone();
+            }
+        }
         self.wire
             .runner_call(&self.scope, &self.bind, op, params)
             .await
@@ -188,6 +185,7 @@ struct RunScope {
     scope_key: String,
     project_key: String,
     harnesses: Mutex<HashMap<String, Option<String>>>,
+    tool_refusals: Mutex<HashSet<String>>,
 }
 
 impl RunScope {
@@ -223,6 +221,11 @@ impl ScopeRoute for RunScope {
         provider: &str,
         request: &SelectRequest,
     ) -> Result<RoutedChoice, Refusal> {
+        // Retrying a report for the same decision must not count as another
+        // runner admission refusal. Stop before a third selection.
+        if self.tool_refusals.lock().expect("tool refusals").len() >= 2 {
+            return Err(Refusal::new(RefusalCode::NoRoute, "tool_unavailable twice"));
+        }
         let scope = self.current();
         let answer = self.wire.select(&scope, provider, request).await?;
         let choice: RoutedChoice = serde_json::from_value(answer.clone()).map_err(|e| {
@@ -242,6 +245,12 @@ impl ScopeRoute for RunScope {
         provider: &str,
         request: &ReportRequest,
     ) -> Result<ReportAnswer, Refusal> {
+        if request.runner_code.as_deref() == Some("tool_unavailable") {
+            self.tool_refusals
+                .lock()
+                .expect("tool refusals")
+                .insert(request.decision_id.clone());
+        }
         let scope = self.current();
         self.wire.report(&scope, provider, request).await
     }
@@ -258,6 +267,7 @@ struct RunRunner<'a> {
     scheduler: Arc<SqliteDreamScheduler>,
     policy: BrocaPolicy,
     request: &'a ChildRequest,
+    grants: Vec<Grant>,
 }
 
 impl Runner<RunScope> for RunRunner<'_> {
@@ -276,7 +286,38 @@ impl Runner<RunScope> for RunRunner<'_> {
             return outcome(Outcome::Refused, AUTH_UNSUPPORTED);
         }
         let mut dream_scope = scope.current();
-        let modules = tool_modules(self.request.allowed_tools, &self.policy.module_id);
+        let capabilities: Vec<_> = self.grants.iter().map(|grant| grant.capability).collect();
+        let providers = if capabilities.is_empty() {
+            Vec::new()
+        } else {
+            match self.wire.tool_providers(&dream_scope, &capabilities).await {
+                Ok(providers) => providers,
+                Err(_) => return outcome(Outcome::Refused, "tool_unavailable"),
+            }
+        };
+        let mut items = Vec::new();
+        let mut modules = Vec::new();
+        for grant in &self.grants {
+            let Some(Provider { module, .. }) = providers
+                .iter()
+                .find(|provider| provider.capability == grant.capability)
+            else {
+                return outcome(Outcome::Refused, "tool_unavailable");
+            };
+            let tools: Vec<_> = grant
+                .tools
+                .iter()
+                .filter(|tool| self.request.allowed_tools.contains(tool))
+                .collect();
+            let mut params = json!({"tools": tools});
+            if grant.capability == fetch_plan::CODE_READ {
+                params["root"] = json!(dream_scope.workdir);
+            }
+            items.push(json!({"provider": module, "item": "tools", "params": params}));
+            if !modules.contains(module) {
+                modules.push(module.clone());
+            }
+        }
         if !modules.is_empty() || !dream_scope.record.carriers.is_empty() {
             dream_scope.carry_for(&choice.runner.module, modules);
             if let Err(refusal) = self.wire.sync_scope(&dream_scope).await {
@@ -309,6 +350,7 @@ impl Runner<RunScope> for RunRunner<'_> {
             wire: self.wire.clone(),
             scope: dream_scope,
             bind,
+            plan: json!({"items": items}),
         };
         let mut carrier = BrocaCarrier::new(
             port,
@@ -410,7 +452,15 @@ impl RoutedCarrier {
                 .attempts
                 .iter()
                 .all(|a| a.report.runner_code.as_deref() == Some(HARNESS_UNKNOWN));
-        let code = if harness_only && matches!(failure.code, "mc_route_exhausted" | "mc_no_route") {
+        let unavailable = failure
+            .attempts
+            .iter()
+            .filter(|a| a.report.runner_code.as_deref() == Some("tool_unavailable"))
+            .count()
+            >= 2;
+        let code = if unavailable {
+            TOOL_UNAVAILABLE
+        } else if harness_only && matches!(failure.code, "mc_route_exhausted" | "mc_no_route") {
             HARNESS_UNKNOWN
         } else {
             failure.code
@@ -430,7 +480,15 @@ impl RoutedCarrier {
                 )
             })
             .collect();
-        error(format!("{code}: attempts [{}]", attempts.join("; ")))
+        let tags: Vec<_> = fetch_plan::plan(self.parts.context.task)
+            .iter()
+            .map(|grant| grant.capability)
+            .collect();
+        error(format!(
+            "{code}: tags [{}]; attempts [{}]",
+            tags.join(", "),
+            attempts.join("; ")
+        ))
     }
 }
 
@@ -490,6 +548,7 @@ impl DreamCarrier for RoutedCarrier {
             project_key: self.project_key().to_owned(),
             scope: Mutex::new(scope),
             harnesses: Mutex::default(),
+            tool_refusals: Mutex::default(),
         };
         let runner = RunRunner {
             wire: self.parts.wire.clone(),
@@ -500,6 +559,7 @@ impl DreamCarrier for RoutedCarrier {
             scheduler: self.parts.scheduler.clone(),
             policy: self.parts.policy.clone(),
             request,
+            grants: fetch_plan::child_plan(self.parts.context.task, request.allowed_tools),
         };
         let tools = if request.allowed_tools.is_empty() {
             ToolsRequirement::None
@@ -514,6 +574,13 @@ impl DreamCarrier for RoutedCarrier {
                 iq: registration.iq,
                 eq: registration.eq,
                 tools: Some(tools),
+                tool_capabilities: (!runner.grants.is_empty()).then(|| {
+                    runner
+                        .grants
+                        .iter()
+                        .map(|grant| grant.capability.to_owned())
+                        .collect()
+                }),
                 ..Requirements::default()
             },
             pin: None,
