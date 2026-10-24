@@ -52,10 +52,11 @@ pub struct Generation {
     pub temperature: Option<f64>,
 }
 
-// SPEC.md §5 calls a custom merge once per applied layer in ladder order; §7
-// reports those same layers in ladder order. Keep declaration flags in memory
-// so policy can join them to trust/path without re-reading approved files.
-// Only the value is serialized into the manifest/source revision (§6).
+// The cortexkit-persona crate's SPEC.md (§5) calls a custom merge once per
+// applied layer in ladder order, and its report (§7) lists those same layers in
+// ladder order. Keep declaration flags in memory so policy can join them to
+// trust/path without re-reading approved files. Only the value is serialized
+// into the manifest/source revision (SPEC.md §6).
 #[derive(Clone, Serialize, Deserialize)]
 #[serde(transparent)]
 struct OperatorValue<T> {
