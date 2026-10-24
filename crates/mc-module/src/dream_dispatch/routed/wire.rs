@@ -93,9 +93,10 @@ pub trait DreamWire: Send + Sync {
 /// ck-mc pins subc-protocol 0.32.8, whose `ScopeRecord` has no `project_id` or
 /// `workdir` member (they arrive in subc-protocol 0.32.12), so a project scope
 /// carrying them cannot be sent. Rather than register a scope routing and the
-/// runners could not attribute, every operation refuses with
-/// [`SCOPE_UNSUPPORTED`], and the dreamer keeps its older transports. Replacing
-/// this needs the SDK bump, a `ModuleHandle` for `scope.sync`, and live routing
+/// runners could not attribute, `scope_support` and `sync_scope` refuse with
+/// [`SCOPE_UNSUPPORTED`], so the dreamer keeps its older transports; the other
+/// operations are never reached and refuse or answer nothing. Replacing this
+/// needs the SDK bump, a `ModuleHandle` for `scope.sync`, and live routing
 /// catalog discovery.
 pub struct ProductionWire;
 

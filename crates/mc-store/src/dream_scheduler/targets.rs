@@ -90,8 +90,9 @@ impl SqliteDreamScheduler {
         })
     }
 
-    /// Store the project id Entorhinal answered for `project`'s folder. Returns
-    /// the id that was stored before, so the caller can tell whether it changed.
+    /// Store the project id Entorhinal answered for `project`'s folder on its
+    /// existing row (nothing is stored when the project has no row). Returns
+    /// the id stored before, so the caller can tell whether it changed.
     pub fn set_target_project_id(&self, project: &str, project_id: &str) -> Result<Option<String>> {
         self.write(|db| {
             let previous: Option<Option<String>> = db

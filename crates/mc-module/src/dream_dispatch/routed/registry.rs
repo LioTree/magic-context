@@ -29,8 +29,8 @@ pub struct DreamTaskRegistration {
 /// (`dream_claim::tests::tick`). map-memories, verify and verify-broad read the
 /// repository; their end-to-end tests run through the Broca executor with the
 /// fake Broca reading a fixture repository (`broca_carrier::tests::executor`).
-/// Every task here also runs through the routed carrier
-/// (`broca_carrier::tests::routed`).
+/// Classify also runs end to end through the routed carrier, and the carrier
+/// itself is tested on a curate context (`broca_carrier::tests::routed`).
 pub const REGISTRATIONS: [DreamTaskRegistration; 6] = [
     DreamTaskRegistration {
         task: TaskName::Curate,

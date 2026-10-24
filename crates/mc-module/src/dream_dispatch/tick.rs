@@ -415,8 +415,9 @@ impl DreamHandles {
     }
 
     /// A project only the routed path could carry, while this build cannot
-    /// register its scope: the run reports every task refused by the scope's
-    /// refusal name and sends nothing.
+    /// register its scope: the run sends nothing and reports its tasks refused
+    /// by the scope refusal's name (every registered task for a scheduled tick,
+    /// the requested task for a manual run).
     fn start_refused(
         &self,
         project: &str,

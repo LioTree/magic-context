@@ -1047,7 +1047,7 @@ async fn supported_scope_moves_the_same_project_to_the_routed_path() {
         )]
     );
     assert_eq!(classified(&store_of(&handler)), 10);
-    assert_eq!(wire.log().lookups, [p.directory.clone()]);
+    assert_eq!(wire.log().lookups, std::slice::from_ref(&p.directory));
     assert_eq!(wire.sends().len(), 1);
 }
 
@@ -1092,7 +1092,7 @@ async fn a_restart_keeps_ticking_projects_from_dream_targets() {
     let wire = supporting_wire(&restarted, &p.directory);
     let handles = restarted.dream_handles();
     assert!(restarted.dream_runs.target_for_test(&p.key).is_none());
-    assert_eq!(handles.due_projects(), [p.key.clone()]);
+    assert_eq!(handles.due_projects(), std::slice::from_ref(&p.key));
     let mut jobs = handles.tick_once();
     assert_eq!(jobs.len(), 1);
     let report = finish(jobs.pop().unwrap()).await;

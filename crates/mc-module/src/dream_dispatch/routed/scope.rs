@@ -54,8 +54,8 @@ impl EntorhinalProjectId {
 /// 32 lowercase hex characters, fresh for each call. The standard library's
 /// `RandomState` is seeded from the operating system once per process and
 /// re-keyed for every instance; mixing in a counter, the clock and the process
-/// id keeps ids distinct even across processes started in the same instant.
-/// Unlike reading `/dev/urandom`, this also works on Windows.
+/// id makes a collision unlikely even between processes started in the same
+/// instant. Unlike reading `/dev/urandom`, this also works on Windows.
 pub(crate) fn fresh_id() -> String {
     static NEXT: AtomicU64 = AtomicU64::new(0);
     let sequence = NEXT.fetch_add(1, Ordering::Relaxed);
