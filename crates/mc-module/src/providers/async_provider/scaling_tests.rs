@@ -2005,7 +2005,9 @@ fn cost_rule_150k_vs_1k() {
             .unwrap();
         let stderr = String::from_utf8_lossy(&output.stderr);
         let stdout = String::from_utf8_lossy(&output.stdout);
-        for line in stderr.lines().filter(|line| line.starts_with("BENCH ")) {
+        for line in stderr.lines().filter(|line| {
+            line.starts_with("BENCH ") || line.contains("| setup for a descending lineage |")
+        }) {
             eprintln!("{line}");
         }
         assert!(
