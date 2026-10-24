@@ -1,6 +1,7 @@
 import { describe, expect, test } from "bun:test";
 import { Database } from "../../../shared/sqlite";
 import { initializeDatabase } from "../storage-db";
+import { listMemoryHistory, memoryHistorySnapshot } from "./history-applier";
 import {
     applyCurateMemoryMutation,
     applyHistorianRevision,
@@ -52,6 +53,10 @@ describe("memory lifecycle applier", () => {
             expect(getMemoryById(db, saved.memoryId!)?.seenCount).toBe(2);
             expect(renderingState(db)).toEqual(before);
             expect(db.prepare("SELECT COUNT(*) AS n FROM memory_journal").get()).toEqual({ n: 2 });
+            const history = listMemoryHistory(db, { projectPath: input.projectPath }).decisions;
+            expect(history).toHaveLength(2);
+            expect(history.every((decision) => decision.restorable)).toBe(true);
+            expect(memoryHistorySnapshot(db, saved.memoryId!)?.revision).toBe(2);
         } finally {
             db.close();
         }
