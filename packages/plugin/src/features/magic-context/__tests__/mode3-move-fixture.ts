@@ -16,6 +16,7 @@
  * compute.
  */
 import { join } from "node:path";
+import { byteSize } from "../../../hooks/magic-context/tag-content-primitives";
 import { tagMessages } from "../../../hooks/magic-context/transform-operations";
 import { Database } from "../../../shared/sqlite";
 import {
@@ -220,7 +221,21 @@ export async function buildMode3MoveFixture(dir: string): Promise<Mode3MoveFixtu
         info: { id: message.id, sessionID: session, role: message.role },
         parts: message.parts.map((part) => structuredClone(part)),
     }));
-    tagMessages(session, transformInput as never, tagger, db);
+    const fileMessageIndex = transformInput.findIndex((message) => message.info.id === "msg_m009");
+    tagMessages(
+        session,
+        structuredClone(transformInput.slice(0, fileMessageIndex + 1)) as never,
+        tagger,
+        db,
+    );
+    // Fresh files no longer allocate visible tags. Preserve the fixture's
+    // historical file-drop case by creating the old row after its preceding
+    // text tag, then let the ordinary walk bind it on the next pass.
+    const filePart = transformInput[fileMessageIndex]?.parts[1];
+    if (filePart?.type !== "file" || typeof filePart.url !== "string")
+        throw new Error("mode-3 fixture historical file part is missing");
+    tagger.assignTag(session, "msg_m009:file1", "file", byteSize(filePart.url), db);
+    tagMessages(session, transformInput.slice(fileMessageIndex) as never, tagger, db);
 
     const textTag = (mid: string, index: number) => {
         const tag = tagger.getTag(session, `${mid}:p${index}`, "message");

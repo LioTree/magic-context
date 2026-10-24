@@ -115,6 +115,7 @@ impl session_resolver::ProviderRunner for Served {
                 return Ok(json!({"state":"pending","submission_id":"reminder"}));
             }
             "role.describe" => return Ok(self.describe.lock().unwrap().clone()),
+            "session.head" => return Ok(json!({"first_ordinal":0})),
             _ => assert_eq!(method, "session.read"),
         }
         self.reads

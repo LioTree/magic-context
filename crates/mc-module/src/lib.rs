@@ -16143,6 +16143,29 @@ impl McHandler {
             Ok(transcripts) => transcripts,
             Err(error) => return tool_error_result(format!("Error: {error}")),
         };
+        if let Ok(binding) = self.facade_binding(channel) {
+            match self
+                .async_history_expand(&binding, session_id, &compartments, start, bounded_end)
+                .await
+            {
+                Ok(Some(messages)) => {
+                    return mcp_text_result(
+                        if verbose {
+                            render_verbose_expand_result(
+                                start,
+                                bounded_end,
+                                render_verbose_range_expand(&messages, start, bounded_end),
+                            )
+                        } else {
+                            render_durable_range_expand(start, bounded_end, &messages)
+                        },
+                        false,
+                    );
+                }
+                Ok(None) => {}
+                Err(outcome) => return outcome,
+            }
+        }
         if verbose {
             let durable_messages = durable_expand_messages(&transcripts);
             let rendered = self
@@ -38012,6 +38035,57 @@ mod tests {
             other => panic!("expected a refusal: {other:?}"),
         }
         assert_eq!(producer.starts.load(Ordering::SeqCst), 0);
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn classify_primary_that_times_out_with_no_answer_advances_to_the_fallback() {
+        // A model that stops answering times out on its await and again on the
+        // recovery read. The module walks its own chain, so the next model must
+        // still get a turn rather than the whole classify run failing.
+        let producer = Arc::new(ProducerState::default());
+        producer
+            .await_results
+            .lock()
+            .expect("await results mutex")
+            .extend([
+                Err(HistorianProducerError::TimedOut),
+                Err(HistorianProducerError::TimedOut),
+                Ok(ProducerOutput {
+                    text: "<classify></classify>".to_string(),
+                    length_capped: false,
+                    usage: None,
+                }),
+            ]);
+        let (handler, store, _dir, project) =
+            handler_with_store(Arc::clone(&producer), default_test_config());
+        let route_root = project.to_str().unwrap();
+        handler.bind_route(7, binding(route_root, "ses"));
+        activate_module_authority(&store, "context", "git:identity", route_root, "memories");
+
+        let outcome = handler
+            .handle_dreamer_run_task(
+                7,
+                &json!({
+                    "v": 1,
+                    "session_id": "ses",
+                    "task": CLASSIFY_TASK,
+                    "command_id": "timed-out-then-fallback",
+                    "model_chain": ["test/first", "test/second"],
+                    "payload": { "prompt_body": "classify", "items": [] },
+                }),
+            )
+            .await;
+        let response = match outcome {
+            HandlerOutcome::Response(bytes) => serde_json::from_slice::<Value>(&bytes).unwrap(),
+            other => panic!("the fallback attempt must produce a manifest: {other:?}"),
+        };
+
+        assert_eq!(
+            producer.models.lock().expect("models mutex").as_slice(),
+            ["test/first", "test/second"]
+        );
+        assert_eq!(response["diagnostics"]["model"], json!("test/second"));
+        assert_eq!(response["diagnostics"]["attempts"], json!(2));
     }
 
     #[tokio::test(flavor = "current_thread")]

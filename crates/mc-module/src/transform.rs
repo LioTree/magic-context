@@ -2438,7 +2438,7 @@ pub fn transform_with_projection(
 /// this engine seam neither resolves handles nor calls a gateway.
 pub mod compaction {
     mod logical_prefix;
-    pub(crate) use logical_prefix::LogicalPrefix;
+    pub(crate) use logical_prefix::{user_turns_below, CutPrefixFacts, LogicalPrefix};
     #[cfg(test)]
     thread_local! {
         // Observe the exact request passed to the real engine, not a separate
@@ -8050,8 +8050,13 @@ fn apply_once(
     profile_end!(perf_overlay_maps);
     profile_start!(perf_hygiene, "evolution_hygiene");
     profile_start!(perf_hygiene_tags, "hygiene_tag_rows");
-    let hygiene_tag_rows =
-        tag_rows_for_hygiene(&projection, &tag_rows, &tag_overlay, !tagging_active);
+    let hygiene_tag_rows = tag_rows_for_hygiene(
+        &projection,
+        &tag_rows,
+        &tag_overlay,
+        !tagging_active,
+        req.runner_owned_reminders,
+    );
     profile_end!(perf_hygiene_tags);
     profile_start!(perf_hygiene_measure, "hygiene_measure");
     let adopted_tools_policy = if is_bust_pass || loaded.meta.tail_hygiene_baseline.is_none() {
@@ -8133,6 +8138,21 @@ fn apply_once(
     }
     if let Some(prefix) = &req.native_fold_prefix {
         hygiene_measurement.content_signature = prefix.signature(&hygiene_measurement.parts);
+    } else if let Some(prefix) = req
+        .logical_prefix
+        .as_ref()
+        .and_then(|prefix| prefix.signature_prefix.as_ref())
+    {
+        hygiene_measurement.content_signature =
+            prefix.signature(&projection, &hygiene_measurement.parts);
+    }
+    if req.runner_owned_reminders {
+        hygiene_measurement.omit_excluded_baseline_parts();
+        if let Some(baseline) = &mut meta.tail_hygiene_baseline {
+            baseline
+                .baseline_parts
+                .retain(|part| part.kind != mc_store::TailHygienePartKind::Excluded);
+        }
     }
     profile_end!(perf_hygiene_measure);
     profile_start!(perf_hygiene_refresh, "hygiene_refresh");
@@ -12897,19 +12917,26 @@ fn timestamp_temporal_marks(
     lineage_anchor_mid: Option<&str>,
 ) -> Vec<TemporalMarkInput> {
     let first_text_blocks = first_text_block_by_message(projection);
-    let mut previous = None;
+    // A lineage that begins at a cut has no message below its first one; the
+    // cut prefix carries that message's times, so the first window message is
+    // compared against the same predecessor full processing would use.
+    let cut_basis = req
+        .logical_prefix
+        .as_ref()
+        .filter(|prefix| prefix.is_cut())
+        .and_then(|prefix| Some((prefix.tail_from, prefix.cut_time_basis?)));
+    let mut previous: Option<(Option<i64>, Option<i64>)> = None;
     let mut marks = Vec::new();
     for message in &req.messages {
+        if let Some((_, basis)) = cut_basis.filter(|(first, _)| *first == message.ordinal) {
+            previous = Some(basis);
+        }
         if is_authored_user_message(message)
             && mutation_exempt_mid != Some(message.mid.as_str())
             && lineage_anchor_mid != Some(message.mid.as_str())
         {
-            let marker_text = previous.and_then(|prior: &CkIngressMessage| {
-                temporal_marker_from_timestamps(
-                    prior.ck.meta.created_at_ms,
-                    prior.ck.meta.completed_at_ms,
-                    message.ck.meta.created_at_ms,
-                )
+            let marker_text = previous.and_then(|(created, completed)| {
+                temporal_marker_from_timestamps(created, completed, message.ck.meta.created_at_ms)
             });
             if let Some(marker_text) = marker_text {
                 if let Some(block_id) = first_text_blocks.get(message.mid.as_str()) {
@@ -12921,7 +12948,10 @@ fn timestamp_temporal_marks(
                 }
             }
         }
-        previous = Some(message);
+        previous = Some((
+            message.ck.meta.created_at_ms,
+            message.ck.meta.completed_at_ms,
+        ));
     }
     marks
 }
@@ -14799,11 +14829,19 @@ fn prune_channel1_units(
     });
 }
 
+/// The tag rows hygiene measures with. `runner_numbers` is set on the runner
+/// lane (`runner_owned_reminders`), where the runner numbers every part itself
+/// and its numbers are stored per block id: those stored rows are the numbers
+/// the model sees, so they are kept for projected blocks too and nothing is
+/// numbered by position. A positional number would depend on which rows the
+/// request holds (a whole lineage or a certified tail) and could equal a
+/// persisted protected number of another part.
 fn tag_rows_for_hygiene(
     projection: &FlatProjection,
     stored_rows: &[McTagRow],
     overlay: &TagOverlayState,
     derive_when_empty: bool,
+    runner_numbers: bool,
 ) -> Vec<McTagRow> {
     let projected_ids = projection
         .blocks
@@ -14815,7 +14853,8 @@ fn tag_rows_for_hygiene(
     let mut rows = stored_rows
         .iter()
         .filter(|row| {
-            !projected_ids.contains(row.block_id.as_str())
+            runner_numbers
+                || !projected_ids.contains(row.block_id.as_str())
                 || overlay.tag_by_block_id.get(&row.block_id) == Some(&row.tag_number)
         })
         .map(|row| McTagRow {
@@ -14850,7 +14889,7 @@ fn tag_rows_for_hygiene(
             source_bytes: Default::default(),
         });
     }
-    if rows.is_empty() && derive_when_empty {
+    if rows.is_empty() && derive_when_empty && !runner_numbers {
         for (index, block) in projection
             .blocks
             .iter()
@@ -22553,6 +22592,46 @@ pub(crate) mod tests {
         }
     }
 
+    /// On the runner lane hygiene measures every part with the runner's own number,
+    /// whether the request holds the whole lineage or only a certified tail, so a
+    /// protected number can only ever mark the part that carries it.
+    #[test]
+    fn runner_lane_hygiene_keeps_runner_numbers_and_never_numbers_by_position() {
+        let tail =
+            project_messages(&[item("live-b", 2, "second"), item("live-c", 3, "third")]).unwrap();
+        let lineage = project_messages(&[
+            item("live-a", 1, "first"),
+            item("live-b", 2, "second"),
+            item("live-c", 3, "third"),
+        ])
+        .unwrap();
+        let stored = vec![
+            payload_tag(7, "live-a#0", "first"),
+            payload_tag(8, "live-b#0", "second"),
+            payload_tag(9, "live-c#0", "third"),
+        ];
+        let numbers = |projection: &FlatProjection, rows: &[McTagRow]| {
+            tag_rows_for_hygiene(projection, rows, &TagOverlayState::default(), true, true)
+                .into_iter()
+                .map(|row| (row.block_id, row.tag_number))
+                .collect::<BTreeMap<_, _>>()
+        };
+        let in_tail = numbers(&tail, &stored[1..]);
+        let in_lineage = numbers(&lineage, &stored);
+        assert_eq!(in_tail.get("live-b#0"), Some(&8));
+        assert_eq!(in_tail.get("live-c#0"), Some(&9));
+        assert_eq!(in_lineage.get("live-b#0"), Some(&8));
+        assert_eq!(in_lineage.get("live-c#0"), Some(&9));
+        // Without the runner's rows nothing is numbered by position.
+        assert!(numbers(&tail, &[]).is_empty());
+        // The host lane keeps its positional fallback.
+        let host = tag_rows_for_hygiene(&tail, &[], &TagOverlayState::default(), true, false);
+        assert_eq!(
+            host.iter().map(|row| row.tag_number).collect::<Vec<_>>(),
+            vec![1, 2]
+        );
+    }
+
     /// Hygiene preparation keeps exactly the rows, order and identities the cloning version
     /// kept, but none of their stored payload bytes.
     #[test]
@@ -22578,7 +22657,8 @@ pub(crate) mod tests {
             ..Default::default()
         };
         for derive_when_empty in [false, true] {
-            let view = tag_rows_for_hygiene(&projection, &stored, &overlay, derive_when_empty);
+            let view =
+                tag_rows_for_hygiene(&projection, &stored, &overlay, derive_when_empty, false);
             assert!(view.iter().all(|row| row.source_bytes.is_empty()));
             let identities = |rows: &[McTagRow]| {
                 rows.iter()
@@ -23109,6 +23189,13 @@ pub(crate) mod tests {
             "\u{a7}39\u{a7}BEAT",
             "a token without a separator is not an imitation"
         );
+    }
+
+    #[test]
+    fn strip_leading_tag_imitations_preserves_decimal_section_references() {
+        for reference in ["§12.3", "§5.1", "§12.3 of the spec"] {
+            assert_eq!(strip_leading_tag_imitations(reference), reference);
+        }
     }
 
     #[test]
@@ -26338,9 +26425,9 @@ pub(crate) mod tests {
         let dir = tempfile::tempdir().unwrap();
         let s = store(dir.path());
         bootstrap_covering_a(&s);
-        // Large enough that the force batch clears the emergency minimum achievable
-        // reclaim; this test is about when the producer gate runs.
-        let huge = "x".repeat(100_000);
+        // Token-rich results keep non-reclaimable overhead below the selection
+        // limit. This fixture checks when automatic reductions can run.
+        let huge = "payload information ".repeat(50_000);
         let force_messages = vec![
             item("a", 1, "raw"),
             assistant_tool_call("force_old", 2, "force_old_call"),
@@ -27442,7 +27529,10 @@ pub(crate) mod tests {
         let dir = tempfile::tempdir().unwrap();
         let s = store(dir.path());
         bootstrap_covering_a(&s);
-        let context = smart_pctx();
+        // Non-reclaimable overhead must stay below the selection limit even at
+        // 96% usage. Only protection of tool messages should prevent drops below 95%.
+        let mut context = smart_pctx();
+        context.execute_threshold_percentage = 88.0;
         let mut messages = vec![item("a", 1, "raw")];
         for n in 0..5 {
             let mut call =
@@ -28231,9 +28321,9 @@ pub(crate) mod tests {
     fn subagent_emergency_sample_latch_prevents_repeat_selection() {
         let dir = tempfile::tempdir().unwrap();
         let s = store(dir.path());
-        // Large enough that the first batch clears the emergency minimum achievable
-        // reclaim; this test is about the same-sample latch, not that minimum.
-        let huge = "x".repeat(100_000);
+        // These results account for enough of the reported usage to make deletion
+        // useful. A long run of "x" tokenizes too cheaply to model that situation.
+        let huge = "payload information ".repeat(50_000);
         let messages = vec![
             item("head", 1, "raw"),
             assistant_tool_call("old", 2, "old_call"),
@@ -28263,10 +28353,8 @@ pub(crate) mod tests {
         );
         let first_bytes = serde_json::to_vec(&first.ck_messages).unwrap();
 
-        // Reset only the age watermark so this test remains about the emergency selector's
-        // same-sample latch. The first force pass advances the age watermark; without this
-        // reset, the second pass could legitimately select the emergency-reserved newer arc
-        // through the separate two-pass selector.
+        // Reset the saved age cutoff so the separate two-pass age rule cannot
+        // legitimately select the surviving newer result on the second call.
         let loaded = s.load("subagent").unwrap();
         let mut meta = loaded.meta.clone();
         meta.last_execute_ordinal = 0;

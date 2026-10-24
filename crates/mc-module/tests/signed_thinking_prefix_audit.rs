@@ -1126,6 +1126,14 @@ fn control(profile: &str, lane: Lane) {
     f.next_user_turn("prompt-next");
     let before = f.wire();
     f.arm_and_bust(false);
+    if lane == Lane::Wall95 {
+        // Keep the 95% positive control reachable with this small history. When fixed
+        // overhead alone exceeds the ceiling, emergency selection must preserve tools.
+        f.req.usage = serde_json::from_value(
+            json!({"current_total_input_tokens":9_500,"context_limit_tokens":10_000}),
+        )
+        .unwrap();
+    }
     f.served = f.pass();
     let after = f.wire();
     let error = f.mock.check(&after);

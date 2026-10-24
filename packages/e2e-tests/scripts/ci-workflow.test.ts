@@ -14,7 +14,7 @@ const differentialBase = (await Bun.file(resolve(root, ".github/standalone-diffe
     .find((line) => line.trim().length > 0 && !line.trim().startsWith("#"))
     ?.trim();
 type Step = { name?: string; run?: string; if?: string; uses?: string; with?: Record<string, string>; env?: Record<string, string> };
-type Job = { name: string; needs?: string[]; if?: string; "timeout-minutes"?: number; permissions?: Record<string, string>; steps: Step[]; strategy?: { "fail-fast": boolean; matrix: { shard: number[]; mode?: string[] } } };
+type Job = { name: string; needs?: string[]; if?: string; "timeout-minutes"?: number; permissions?: Record<string, string>; steps: Step[]; strategy?: { "fail-fast": boolean; matrix: { shard: number[]; mode?: string[]; version?: string[] } } };
 const workflow = Bun.YAML.parse(text) as { jobs: Record<string, Job> };
 const releaseWorkflow = Bun.YAML.parse(releaseText) as { jobs: Record<string, Job> };
 const allWorkflowDocuments = await Promise.all(
@@ -44,6 +44,25 @@ test("summary rejects failed, cancelled, skipped and missing legs", () => {
     expect(() => failedRequiredJobs([], {})).toThrow();
 });
 
+test("dists publish before independent checks without removing preflight gates", () => {
+    const preflight = workflow.jobs.preflight!;
+    const publish = preflight.steps.findIndex((step) => step.uses === "actions/upload-artifact@v4");
+    expect(publish).toBeGreaterThan(preflight.steps.findIndex((step) => step.name === "Check compiled contracts"));
+    for (const name of ["Layout, manifest and shard contracts", "Format check", "TypeScript typecheck", "Lint"]) {
+        const index = preflight.steps.findIndex((step) => step.name === name);
+        expect(index).toBeGreaterThan(publish);
+        expect(preflight.steps[index]!.if).toBe("${{ !cancelled() }}");
+    }
+    expect(workflow.jobs["ci-summary"]!.needs).toContain("preflight");
+});
+
+test("native producers start without waiting for unrelated preflight checks", () => {
+    for (const id of ["rust-clippy", "rust-lib-archive", "e2e-rust-hermetic-build"]) {
+        expect(workflow.jobs[id]!.needs).toBeUndefined();
+        expect(workflow.jobs["ci-summary"]!.needs).toContain(id);
+    }
+});
+
 test("artifact consumers start setup immediately and gate tests on artifacts", () => {
     for (const id of ["unit-plugin", "unit-pi-plugin", "check-plugin-compat", "e2e-opencode", "e2e-opencode2", "e2e-pi", "e2e-omp", "e2e-host-opencode", "e2e-host-opencode2", "e2e-host-pi", "e2e-host-omp", "rust-mc-module-integration", "rust-workspace-crates", "rust-mc-module-lib", "rust-mc-module-parity", "e2e-rust-hermetic"]) {
         const job = workflow.jobs[id]!;
@@ -58,7 +77,7 @@ test("artifact consumers start setup immediately and gate tests on artifacts", (
         }
     }
     expect(workflow.jobs["e2e-host-opencode"]!.strategy).toEqual({ "fail-fast": false, matrix: { shard: [0, 1, 2, 3] } });
-    expect(workflow.jobs["e2e-host-opencode2"]!.strategy).toEqual({ "fail-fast": false, matrix: { shard: [0, 1] } });
+    expect(workflow.jobs["e2e-host-opencode2"]!.strategy).toEqual({ "fail-fast": false, matrix: { shard: [0, 1], version: ["2.0.22", "2.1.0"] } });
 });
 
 test("same-run artifact downloads retry transient failures and guard consumers", () => {

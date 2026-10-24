@@ -229,6 +229,15 @@ fn raw_sequences_match_the_real_typescript_indexer() {
 }
 
 #[test]
+fn unclosed_system_reminder_body_is_not_searchable() {
+    let parts = [json!({
+        "type": "text",
+        "text": "  searchable <system-reminder>injected tail without a closing tag"
+    })];
+    assert_eq!(store::indexable_content("assistant", &parts), "searchable");
+}
+
+#[test]
 fn content_projection_and_oversize_policy_match_typescript() {
     let fixture = fixture();
     let messages: Vec<RawMessage> =

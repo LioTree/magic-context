@@ -6,9 +6,11 @@
 use super::*;
 use sha2::{Digest, Sha256};
 
-/// Digest of the system prompt, user prompt, and model sent to the provider.
+/// Digest of the system prompt, user prompt, and model sent to the provider,
+/// including the rule that when every message belongs to a compartment,
+/// unprocessed_from is the chunk's last ordinal plus one.
 const EXPECTED_REQUEST_DIGEST: &str =
-    "9da0ff5bd934e7ac0332804f38aa825c8d73ac3882a575dfefb8de13a4fa1cb8";
+    "352361ea655b6b241c645b8a1ddb52f03f6525ab7ba0e7d6a9468eeac48b2abd";
 
 /// Digest of the message array returned by a fold pass.
 const BASELINE_SERVED_DIGEST: &str =

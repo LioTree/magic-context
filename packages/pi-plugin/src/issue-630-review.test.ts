@@ -21,7 +21,7 @@ import {
 	userMessage,
 } from "./test-utils.test";
 
-function fixture(sessionId: string) {
+function fixture(sessionId: string, signedThinkingHold?: "off" | "on") {
 	const db = createTestDb();
 	getOrCreateSessionMeta(db, sessionId);
 	updateSessionMeta(db, sessionId, {
@@ -32,6 +32,7 @@ function fixture(sessionId: string) {
 	const fake = createFakePi();
 	registerPiContextHandler(fake.pi as never, {
 		db,
+		signedThinkingHold,
 		protectedTokens: 4000,
 		heuristics: { clearReasoningAge: 1000 },
 	});
@@ -111,7 +112,7 @@ for (const order of ["start", "end"] as const) {
 
 test("review issue630 Pi 95 percent without unsafe work still serves unchanged thinking", async () => {
 	const sessionId = "review-pi-no-held-work";
-	const { db, pass } = fixture(sessionId);
+	const { db, pass } = fixture(sessionId, "on");
 	try {
 		const before = (await pass()).messages;
 		const after = (await pass(95_000)).messages;

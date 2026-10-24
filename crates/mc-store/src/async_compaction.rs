@@ -90,6 +90,19 @@ macro_rules! metered {
 }
 
 impl McStore {
+    /// Read one kept baseline without hydrating the session's transcript.
+    pub fn load_async_compaction_baseline(
+        &self,
+        reference: &str,
+        slot: &str,
+    ) -> Result<Option<String>, McStoreError> {
+        Ok(self.inner.with_conn(|conn| {
+            conn.query_row(
+            "SELECT view_json FROM mc_async_compaction_baselines WHERE session_ref=?1 AND slot=?2",
+            params![reference, slot], |row| row.get(0),
+        ).optional()
+        })?)
+    }
     /// Start counting this conversation's async-table writes (test builds only).
     #[cfg(feature = "test-support")]
     pub fn arm_async_write_meter(&self, session_ref: &str) {
@@ -107,6 +120,51 @@ impl McStore {
                     "DELETE FROM pending_agent_drops WHERE session_id=?1",
                     [namespace],
                 )
+            })
+            .map_err(Into::into)
+    }
+
+    /// Delete an engine namespace's per-message rows for the messages `mids`,
+    /// in one transaction: their tag rows (and the consumed marks of those
+    /// tags), block identities, temporal marks, user hints, Channel-1
+    /// appends and queued drops. For a cut: the messages below it never
+    /// render again. Frozen units live in the cache state and are pruned
+    /// through a cache-state commit. Returns the number of queued drops
+    /// removed.
+    pub fn prune_namespace_messages(
+        &self,
+        namespace: &str,
+        mids: &[String],
+    ) -> Result<usize, McStoreError> {
+        if mids.is_empty() {
+            return Ok(0);
+        }
+        let mids =
+            serde_json::to_string(mids).map_err(|error| McStoreError::Serde(error.to_string()))?;
+        // A block id is `mid#index`; a few tables key whole messages by mid.
+        const MID: &str = "CASE WHEN instr(block_id,'#')>0 THEN substr(block_id,1,instr(block_id,'#')-1) ELSE block_id END";
+        self.inner
+            .with_conn_fenced(|conn| {
+                conn.execute(
+                    &format!("DELETE FROM mc_provider_consumed_tags_v1 WHERE engine_namespace=?1 AND tag_number IN
+                        (SELECT tag_number FROM mc_tags WHERE session_id=?1 AND {MID} IN (SELECT value FROM json_each(?2)))"),
+                    params![namespace, mids],
+                )?;
+                for table in ["mc_tags", "mc_temporal_marks", "mc_user_hints", "mc_channel1_appends"] {
+                    conn.execute(
+                        &format!("DELETE FROM {table} WHERE session_id=?1 AND {MID} IN (SELECT value FROM json_each(?2))"),
+                        params![namespace, mids],
+                    )?;
+                }
+                conn.execute(
+                    "DELETE FROM mc_block_identities WHERE session_id=?1 AND mid IN (SELECT value FROM json_each(?2))",
+                    params![namespace, mids],
+                )?;
+                let drops = conn.execute(
+                    &format!("DELETE FROM pending_agent_drops WHERE session_id=?1 AND {} IN (SELECT value FROM json_each(?2))", MID.replace("block_id", "target_id")),
+                    params![namespace, mids],
+                )?;
+                Ok(drops)
             })
             .map_err(Into::into)
     }
@@ -149,6 +207,19 @@ impl McStore {
     }
     pub fn retire_unannounced_async_views(&self, session_ref: &str) -> Result<(), McStoreError> {
         metered!(session_ref, self.inner.with_conn_fenced(held(|conn|conn.execute("UPDATE mc_async_compaction_views SET announced=-1 WHERE session_ref=?1 AND announced=0",[session_ref]).map(|rows|((),rows as u64,0)))).map_err(McStoreError::from))
+    }
+
+    /// A failed cut stage must not announce a view with no saved adoption seed.
+    pub fn retire_unannounced_async_view(
+        &self,
+        reference: &str,
+        version: u64,
+    ) -> Result<(), McStoreError> {
+        self.inner.with_conn_fenced(|tx| {
+            tx.execute("UPDATE mc_async_compaction_views SET announced=-1 WHERE session_ref=?1 AND version=?2 AND announced=0", params![reference, version])?;
+            Ok(())
+        })?;
+        Ok(())
     }
     pub fn async_compaction_for_session(
         &self,
@@ -206,6 +277,7 @@ impl McStore {
             tags: &[],
             forget_tags_of: Vec::new(),
             truncate_entries: None,
+            truncate_below: None,
             entries: Vec::new(),
             baselines: Vec::new(),
             clear_engine_views: false,
@@ -338,6 +410,59 @@ impl McStore {
             .map_err(Into::into)
     }
 
+    /// The conversation's retained views: `(version, view_json, engine_json,
+    /// announced)` in version order, and its version high-water.
+    #[allow(clippy::type_complexity)]
+    pub fn load_async_compaction_views(
+        &self,
+        session_ref: &str,
+    ) -> Result<(Vec<(u64, String, Option<String>, bool)>, u64), McStoreError> {
+        self.inner
+            .with_read(|conn| {
+                let views = conn
+                    .prepare("SELECT version,view_json,engine_json,announced FROM mc_async_compaction_views WHERE session_ref=?1 ORDER BY version")?
+                    .query_map([session_ref], |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get::<_, i64>(3)? != 0)))?
+                    .collect::<rusqlite::Result<Vec<_>>>()?;
+                let high = conn
+                    .query_row(
+                        "SELECT version_high_water FROM mc_async_compaction WHERE session_ref=?1",
+                        [session_ref],
+                        |row| row.get(0),
+                    )
+                    .optional()?
+                    .unwrap_or(0);
+                Ok((views, high))
+            })
+            .map_err(Into::into)
+    }
+
+    /// Store views a conversation keeps from the lineage it descends from,
+    /// with their announcement state, and raise its version high-water to at
+    /// least `high`. The conversation's record must exist.
+    pub fn adopt_async_compaction_views(
+        &self,
+        session_ref: &str,
+        views: &[(u64, String, Option<String>, bool)],
+        high: u64,
+    ) -> Result<(), McStoreError> {
+        self.inner
+            .with_conn_fenced(|conn| {
+                for (version, view, engine, announced) in views {
+                    conn.execute(
+                        "INSERT OR REPLACE INTO mc_async_compaction_views(session_ref,session,version,view_json,engine_json,announced)
+                            SELECT ?1,session,?2,?3,?4,?5 FROM mc_async_compaction WHERE session_ref=?1",
+                        params![session_ref, version, view, engine, *announced as i64],
+                    )?;
+                }
+                conn.execute(
+                    "UPDATE mc_async_compaction SET version_high_water=max(version_high_water,?2) WHERE session_ref=?1",
+                    params![session_ref, high],
+                )?;
+                Ok(())
+            })
+            .map_err(Into::into)
+    }
+
     pub fn pending_async_compaction_views(
         &self,
     ) -> Result<Vec<(String, u64, String)>, McStoreError> {
@@ -391,8 +516,9 @@ pub struct AsyncCompactionSave<'a> {
     tags: &'a [McTagRow],
     forget_tags_of: Vec<String>,
     truncate_entries: Option<Option<u64>>,
+    truncate_below: Option<u64>,
     entries: Vec<(u64, String, String)>,
-    baselines: Vec<(&'static str, Option<String>)>,
+    baselines: Vec<(String, Option<String>)>,
     clear_engine_views: bool,
     retain_views_from: Option<u64>,
 }
@@ -425,6 +551,13 @@ impl<'a> AsyncCompactionSave<'a> {
         self
     }
 
+    /// Delete held entries before `first` (the rows below a cut). Several
+    /// calls keep the latest cut.
+    pub fn truncate_below(&mut self, first: u64) -> &mut Self {
+        self.truncate_below = Some(self.truncate_below.map_or(first, |held| held.max(first)));
+        self
+    }
+
     /// Append one new held entry. An ordinal that is already stored is an
     /// error, never an overwrite: held entries are immutable.
     pub fn append_entry(
@@ -438,8 +571,8 @@ impl<'a> AsyncCompactionSave<'a> {
     }
 
     /// Store (`Some`) or remove (`None`) the baseline kept in `slot`.
-    pub fn baseline(&mut self, slot: &'static str, view_json: Option<String>) -> &mut Self {
-        self.baselines.push((slot, view_json));
+    pub fn baseline(&mut self, slot: impl Into<String>, view_json: Option<String>) -> &mut Self {
+        self.baselines.push((slot.into(), view_json));
         self
     }
 
@@ -468,6 +601,7 @@ impl<'a> AsyncCompactionSave<'a> {
             tags,
             ref forget_tags_of,
             truncate_entries,
+            truncate_below,
             ref entries,
             ref baselines,
             clear_engine_views,
@@ -482,6 +616,12 @@ impl<'a> AsyncCompactionSave<'a> {
                 rows += conn.execute(
                     "DELETE FROM mc_async_compaction_entries WHERE session_ref=?1 AND ordinal>?2",
                     params![session_ref, through.map_or(-1, |n| n as i64)],
+                )? as u64;
+            }
+            if let Some(first) = truncate_below {
+                rows += conn.execute(
+                    "DELETE FROM mc_async_compaction_entries WHERE session_ref=?1 AND ordinal<?2",
+                    params![session_ref, first as i64],
                 )? as u64;
             }
             if !entries.is_empty() {

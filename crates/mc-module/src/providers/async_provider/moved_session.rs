@@ -57,19 +57,25 @@ pub(super) fn setup_fence(
         .map_err(transient)?;
     Ok(match record {
         Some(Ok(record)) => Fence::Moved(record),
-        Some(Err(reason)) => Fence::Refuse(json!({
-            "answer": "refuse",
-            "request_id": request_id,
-            "code": MOVED_RECORD_UNREADABLE,
-            "reason": format!("The moved record for this session cannot be read: {reason}"),
-        })),
-        None if standalone => Fence::Refuse(json!({
-            "answer": "refuse",
-            "request_id": request_id,
-            "code": offline_move::STANDALONE_SESSION_NOT_MIGRATED,
-            "reason": "This session is still managed by the standalone Magic Context plugin. \
-                       Move it with `ck-mc offline move-session` in a restart window first.",
-        })),
+        Some(Err(reason)) => Fence::Refuse(
+            serde_json::to_value(contract::setup::SetupAnswer::refuse(
+                request_id,
+                contract::errors::RefuseCode::from_code(MOVED_RECORD_UNREADABLE),
+                format!("The moved record for this session cannot be read: {reason}"),
+            ))
+            .map_err(transient)?,
+        ),
+        None if standalone => Fence::Refuse(
+            serde_json::to_value(contract::setup::SetupAnswer::refuse(
+                request_id,
+                contract::errors::RefuseCode::from_code(
+                    offline_move::STANDALONE_SESSION_NOT_MIGRATED,
+                ),
+                "This session is still managed by the standalone Magic Context plugin. \
+             Move it with `ck-mc offline move-session` in a restart window first.",
+            ))
+            .map_err(transient)?,
+        ),
         None => Fence::Fresh,
     })
 }
@@ -99,12 +105,14 @@ pub(super) fn tag_checkpoint_refusal(request_id: &str, why: CheckpointSource) ->
              above the ones the model has seen."
         }
     };
-    json!({
-        "answer": "refuse",
-        "request_id": request_id,
-        "code": contract::errors::refuse_codes::TAG_CHECKPOINT_UNSUPPORTED,
-        "reason": reason,
-    })
+    serde_json::to_value(contract::setup::SetupAnswer::refuse(
+        request_id,
+        contract::errors::RefuseCode::from_code(
+            contract::errors::refuse_codes::TAG_CHECKPOINT_UNSUPPORTED,
+        ),
+        reason,
+    ))
+    .expect("Setup refusal serializes")
 }
 
 impl StandaloneMove {

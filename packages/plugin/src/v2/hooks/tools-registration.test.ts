@@ -11,6 +11,11 @@ import {
     openDatabase,
 } from "../../features/magic-context/storage";
 import { createTestTempDirFromPath } from "../../shared/test-temp-dir";
+import {
+    SESSION_ID,
+    seedTypeScriptTagHistory,
+    TS_TAG_TEXT,
+} from "../../tools/ctx-expand/tag-history.test-support";
 import { registerTools } from "./tools";
 import type { V2Context } from "./types";
 
@@ -65,4 +70,27 @@ test("the registered ctx_note tool reads the host store", async () => {
         { sessionID: "ses-1", messageID: "msg-1", agent: "build", progress: () => {} },
     );
     expect(typeof result.content).toBe("string");
+});
+
+/** Exercise the host-registered tool, not only its standalone factory. */
+async function expandTagOnV2(): Promise<string> {
+    const cleanup = seedTypeScriptTagHistory(db);
+    try {
+        const config = parsePluginConfig({ memory: { enabled: true } });
+        const registered: RegisteredTool[] = [];
+        await registerTools(hostContext(registered), db, config, undefined);
+        const expand = registered.find((tool) => tool.name === "ctx_expand");
+        expect(expand).toBeDefined();
+        const result = await expand!.execute(
+            { tag: "[dropped §75386§]" },
+            { sessionID: SESSION_ID, messageID: "msg-1", agent: "build", progress: () => {} },
+        );
+        return result.content;
+    } finally {
+        cleanup();
+    }
+}
+
+test("TypeScript-mode ctx_expand keeps resolving tags from the host", async () => {
+    expect(await expandTagOnV2()).toContain(TS_TAG_TEXT);
 });

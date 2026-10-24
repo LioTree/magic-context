@@ -175,6 +175,9 @@ async function openCode(host: "oc1" | "oc2", signed: boolean, seed: number, acti
     const memoryProject = s02 ? resolveProjectIdentityForSession(project) : project;
     const deps: TransformDeps = {
         db,
+        // The stored provider-request digests cover strict signed-thinking
+        // admission. Active rounds leave signedThinkingHold unset to test its default.
+        signedThinkingHold: signed && !active ? "on" : undefined,
         tagger: createTagger(),
         scheduler: createScheduler({ executeThresholdPercentage: 65 }),
         contextUsageMap: new Map(),
@@ -191,6 +194,10 @@ async function openCode(host: "oc1" | "oc2", signed: boolean, seed: number, acti
         directory: project,
         projectPath: project,
         historianRunnable: false,
+        hostRawMessages: () => [],
+        hostMessageReconciliationSource: () => [],
+        hostPrepareRawOrdinals: async () => true,
+        hostModelFallback: () => null,
         protectedTools: { read: 0 },
         memoryConfig: { enabled: s02, injectionBudgetTokens: 1000, autoPromote: false },
         client: {
@@ -464,6 +471,7 @@ async function pi(signed: boolean, seed: number, active = false) {
     });
     piContext.registerPiContextHandler(fake.pi as never, {
         db,
+        signedThinkingHold: signed && !active ? "on" : undefined,
         protectedTokens: 1000,
         injection: { injectionBudgetTokens: 1000, memoryEnabled: s02, injectDocs: false },
         protectedTools: { read: 0 },
@@ -737,6 +745,10 @@ it("independent differential retains base content across the admitted-thinking-s
         );
     expect(summaries).toHaveLength(seeds.length * (s02 ? 3 : 9));
     if (!s02 && passes === 80 && !process.env.REVIEW_OUT) {
+        // Signed digests use the fixture's baseCommit with only its referencePatch
+        // guard applied. The impossible-fixed-floor guard preserves tool results
+        // instead of dropping them when no amount of reclaim can fit the turn.
+        // Unsigned digests remain the original byte-for-byte baseline.
         // Collect every row before asserting, so one run reports each drifted key.
         const actual: Record<string, string | undefined> = {};
         const expected: Record<string, string | undefined> = {};

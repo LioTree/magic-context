@@ -55,6 +55,14 @@ impl ReminderEchoes {
         }
     }
 
+    /// Forget the echoes below `first`, whose rows a cut removed.
+    // Only cut capture and pruning (`cut_seed`) call this; only tests drive them so far.
+    #[cfg_attr(not(test), allow(dead_code))]
+    pub(super) fn truncate_below(&mut self, first: u64) {
+        self.blocks.retain(|echo| echo.ordinal >= first);
+        self.awaiting_resync.retain(|echo| echo.ordinal >= first);
+    }
+
     pub(super) fn finish_resync(&mut self) {
         self.awaiting_resync.clear();
     }

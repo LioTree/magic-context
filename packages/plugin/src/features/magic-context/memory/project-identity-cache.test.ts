@@ -9,6 +9,7 @@ import { createTestTempDirFromPath } from "../../../shared/test-temp-dir";
 import {
     findPinnedIdentityByGitCommonDir,
     projectDirectoryKey,
+    pruneMissingProjectIdentities,
     readRememberedGitIdentity,
     readRememberedProjectIdentity,
     rememberGitIdentity,
@@ -239,4 +240,43 @@ describe("common-dir pin matching", () => {
         writeRecord(join(storageDir, "a"), "pj-A", "/metadata/repo.git");
         expect(findPinnedIdentityByGitCommonDir("/metadata/repo.git/", storageDir)).toBeUndefined();
     });
+});
+
+test("maintenance prunes only identity records whose directory is definitely ENOENT", async () => {
+    const root = testRoot;
+    const projects = ["gone", "live", "denied", "io-error", "not-directory"].map((name) =>
+        join(root, name),
+    );
+    const stat = fs.promises.stat.bind(fs);
+    let probe: ReturnType<typeof spyOn> | undefined;
+    try {
+        for (const directory of projects) {
+            fs.mkdirSync(directory);
+            rememberGitIdentity(directory, "git:abcdef1234");
+        }
+        fs.rmSync(projects[0]!, { recursive: true });
+        const records = await fs.promises.readdir(join(storageDir, "project-identities"));
+        const goneRecord = records
+            .map((name) => join(storageDir, "project-identities", name))
+            .find((file) => JSON.parse(fs.readFileSync(file, "utf8")).directory === projects[0]);
+        probe = spyOn(fs.promises, "stat").mockImplementation(((directory: string) => {
+            const code =
+                directory === projects[2]
+                    ? "EACCES"
+                    : directory === projects[3]
+                      ? "EIO"
+                      : directory === projects[4]
+                        ? "ENOTDIR"
+                        : undefined;
+            if (code) return Promise.reject(Object.assign(new Error(code), { code }));
+            return stat(directory);
+        }) as typeof fs.promises.stat);
+        const removed = await pruneMissingProjectIdentities();
+        expect(removed).toBe(1);
+        expect(fs.existsSync(goneRecord!)).toBe(false);
+        for (const directory of projects.slice(1))
+            expect(readRememberedGitIdentity(directory)).toBe("git:abcdef1234");
+    } finally {
+        probe?.mockRestore();
+    }
 });

@@ -121,6 +121,7 @@ pub fn describe() -> HandlerOutcome {
             "stability": "alpha"
         }));
     answer["runner_groups"] = json!(runner_groups());
+    answer["setup_descends_from"] = json!(true);
     answer["reminder_templates"] = crate::runner_reminders::catalog();
     // ck-mc extension: the `params.serializer_profile` values Setup accepts,
     // in the codec registry's fixed order.

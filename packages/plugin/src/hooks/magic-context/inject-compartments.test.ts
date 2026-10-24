@@ -487,7 +487,14 @@ describe("prepareCompartmentInjection — empty compartments fallback", () => {
     it("returns null when compartments, facts, and memories are all empty", () => {
         db = makeDb();
         const messages: MessageLike[] = [userMessage("m1", "hi")];
-        const result = prepareCompartmentInjection(db, SESSION_ID, messages, true, PROJECT_PATH);
+        const result = prepareCompartmentInjection(
+            db,
+            SESSION_ID,
+            messages,
+            true,
+            [],
+            PROJECT_PATH,
+        );
         expect(result).toBeNull();
         expect(messages.length).toBe(1);
     });
@@ -501,7 +508,14 @@ describe("prepareCompartmentInjection — empty compartments fallback", () => {
         });
 
         const messages: MessageLike[] = [userMessage("m1", "original")];
-        const result = prepareCompartmentInjection(db, SESSION_ID, messages, true, PROJECT_PATH);
+        const result = prepareCompartmentInjection(
+            db,
+            SESSION_ID,
+            messages,
+            true,
+            [],
+            PROJECT_PATH,
+        );
 
         expect(result).not.toBeNull();
         expect(result?.compartmentCount).toBe(0);
@@ -527,7 +541,14 @@ describe("prepareCompartmentInjection — empty compartments fallback", () => {
         );
 
         const messages: MessageLike[] = [userMessage("m1", "go")];
-        const result = prepareCompartmentInjection(db, SESSION_ID, messages, true, PROJECT_PATH);
+        const result = prepareCompartmentInjection(
+            db,
+            SESSION_ID,
+            messages,
+            true,
+            [],
+            PROJECT_PATH,
+        );
 
         // v2 faithful facts: session_facts is no longer a render source. With no
         // compartments and no memories, there is nothing to inject — facts alone
@@ -550,7 +571,14 @@ describe("prepareCompartmentInjection — empty compartments fallback", () => {
         );
 
         const messages: MessageLike[] = [userMessage("m1", "hello")];
-        const result = prepareCompartmentInjection(db, SESSION_ID, messages, true, PROJECT_PATH);
+        const result = prepareCompartmentInjection(
+            db,
+            SESSION_ID,
+            messages,
+            true,
+            [],
+            PROJECT_PATH,
+        );
 
         expect(result).not.toBeNull();
         expect(result?.compartmentCount).toBe(0);
@@ -571,7 +599,14 @@ describe("prepareCompartmentInjection — empty compartments fallback", () => {
         });
 
         const messages: MessageLike[] = [userMessage("m1", "original")];
-        const prepared = prepareCompartmentInjection(db, SESSION_ID, messages, true, PROJECT_PATH);
+        const prepared = prepareCompartmentInjection(
+            db,
+            SESSION_ID,
+            messages,
+            true,
+            [],
+            PROJECT_PATH,
+        );
         expect(prepared).not.toBeNull();
         if (!prepared) return;
 
@@ -605,6 +640,7 @@ describe("prepareCompartmentInjection — cross-database cache isolation", () =>
                 SESSION_ID,
                 [userMessage("m1", "hi")],
                 true,
+                [],
                 PROJECT_PATH,
             );
             expect(populated?.block).toContain("MEMORY-ONLY-IN-FIRST-DATABASE");
@@ -616,7 +652,14 @@ describe("prepareCompartmentInjection — cross-database cache isolation", () =>
         // path that replays the cached injection.
         db = makeDb();
         const messages: MessageLike[] = [userMessage("m1", "hi")];
-        const replayed = prepareCompartmentInjection(db, SESSION_ID, messages, false, PROJECT_PATH);
+        const replayed = prepareCompartmentInjection(
+            db,
+            SESSION_ID,
+            messages,
+            false,
+            [],
+            PROJECT_PATH,
+        );
 
         expect(replayed?.block ?? "").not.toContain("MEMORY-ONLY-IN-FIRST-DATABASE");
         expect(replayed).toBeNull();
@@ -737,6 +780,7 @@ describe("prepareCompartmentInjection — transition from empty to compartment",
             SESSION_ID,
             pass1Messages,
             true,
+            [],
             PROJECT_PATH,
         );
         expect(pass1?.compartmentCount).toBe(0);
@@ -773,6 +817,7 @@ describe("prepareCompartmentInjection — transition from empty to compartment",
             SESSION_ID,
             pass2Messages,
             true,
+            [],
             PROJECT_PATH,
         );
         expect(pass2?.compartmentCount).toBe(1);
@@ -800,6 +845,7 @@ describe("prepareCompartmentInjection — transition from empty to compartment",
             SESSION_ID,
             bustMessages,
             true,
+            [],
             PROJECT_PATH,
         );
         expect(busted?.compartmentCount).toBe(0);
@@ -811,6 +857,7 @@ describe("prepareCompartmentInjection — transition from empty to compartment",
             SESSION_ID,
             deferMessages,
             false,
+            [],
             PROJECT_PATH,
         );
         // Replayed-from-cache output must match the busted output structurally
@@ -1163,6 +1210,7 @@ describe("prepareCompartmentInjection — SQLITE_BUSY handling (issue #23)", () 
             SESSION_ID,
             messages,
             true,
+            [],
             PROJECT_PATH,
         );
 
@@ -1188,7 +1236,7 @@ describe("prepareCompartmentInjection — SQLITE_BUSY handling (issue #23)", () 
 
         const messages: MessageLike[] = [userMessage("m1", "hello")];
         expect(() =>
-            prepareCompartmentInjection(errorProxy, SESSION_ID, messages, true, PROJECT_PATH),
+            prepareCompartmentInjection(errorProxy, SESSION_ID, messages, true, [], PROJECT_PATH),
         ).toThrow("schema mismatch");
     });
 });

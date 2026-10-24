@@ -1,7 +1,7 @@
 /// <reference types="bun-types" />
 
 import { afterEach, describe, expect, it } from "bun:test";
-import { rmSync } from "node:fs";
+import { mkdirSync, rmSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { type ToolDefinition, tool } from "@opencode-ai/plugin";
@@ -21,6 +21,11 @@ import {
     LIGHT_TOOL_DESCRIPTIONS,
 } from "../shared/prompt-surface-runtime";
 import { createTestTempDirFromPath } from "../shared/test-temp-dir";
+import {
+    SESSION_ID,
+    seedTypeScriptTagHistory,
+    TS_TAG_TEXT,
+} from "../tools/ctx-expand/tag-history.test-support";
 import {
     FULL_PARAMETER_DESCRIPTIONS,
     LIGHT_PARAMETER_DESCRIPTIONS,
@@ -432,5 +437,30 @@ describe("createToolRegistry — user-owned registration default", () => {
 
         expect(registry.ctx_search.description).toBe("User-owned search description");
         expect(warnings).toEqual([]);
+    });
+});
+
+describe("createToolRegistry — ctx_expand tag lookup", () => {
+    async function expandTag(): Promise<unknown> {
+        const root = join(tmpdir(), "magic-context", "expand-tag");
+        mkdirSync(root, { recursive: true });
+        const dir = createTestTempDirFromPath(join(root, "registry-"));
+        tempDirs.push(dir);
+        process.env.XDG_DATA_HOME = dir;
+        const db = openDatabase();
+        if (!db) throw new Error("test database unavailable");
+        const cleanup = seedTypeScriptTagHistory(db);
+        try {
+            const tools = buildRegistry({});
+            return await tools.ctx_expand!.execute({ tag: 75386 }, {
+                sessionID: SESSION_ID,
+            } as never);
+        } finally {
+            cleanup();
+        }
+    }
+
+    it("keeps tag lookup for the TypeScript transform", async () => {
+        expect(await expandTag()).toContain(TS_TAG_TEXT);
     });
 });

@@ -1,4 +1,5 @@
 import { buildMagicContextSection } from "../../agents/magic-context-prompt";
+import { isPrefixBoundThinkingModel } from "../../features/magic-context/overflow-detection";
 import { computeHardCacheExpired } from "../../features/magic-context/scheduler";
 import {
     type ContextDatabase,
@@ -28,6 +29,11 @@ import { estimateTokens } from "./read-session-formatting";
 import { clearMarkerSystem, recordMarkerSystem } from "./standalone-marker-envelope";
 import { systemPromptDates } from "./system-prompt-dates";
 import { isHeldHeadForRequest, recordSystemPromptForRequest } from "./system-prompt-delivery";
+import {
+    describeSystemPromptChange,
+    type SystemPromptSnapshot,
+    snapshotSystemPrompt,
+} from "./system-prompt-diagnostics";
 
 const MAGIC_CONTEXT_MARKER = "## Magic Context";
 const SYSTEM_PROMPT_GUIDANCE_SEPARATOR = "\n\n";
@@ -244,6 +250,9 @@ export function createSystemPromptHashHandler(deps: {
     // and only update it on cache-busting passes. This prevents a midnight date
     // flip from causing an unnecessary flush + cache rebuild.
     const stickyDateBySession = new Map<string, string>();
+    // Only the previous in-process prompt is retained for byte offsets. It is
+    // never persisted; a cold handler explicitly reports an unknown baseline.
+    const diagnosticPrompts = new Map<string, SystemPromptSnapshot>();
 
     const processSystemPrompt = async (
         input: {
@@ -491,17 +500,33 @@ export function createSystemPromptHashHandler(deps: {
             deps.historyRefreshSessions,
             dateRequest,
         );
+        // An idle-expired request rewrites the provider cache, but a signed
+        // thinking block of the open turn that the messages pass kept on the wire
+        // stays bound to every byte in front of it, the system date included. On
+        // a prefix-bound model the date therefore advances on such a request only
+        // when the messages pass left no open-turn signed thinking (it stripped
+        // the turn or there was none), as on any other bust.
+        const signedThinkingKept = systemDateSignedThinkingKept(
+            deps.historyRefreshSessions,
+            dateRequest,
+        );
+        const idleDateMayAdvance = idleCacheExpired && signedThinkingKept !== true;
+        const prefixBoundModel = isPrefixBoundThinkingModel(
+            liveModel?.providerID,
+            liveModel?.modelID,
+        );
         // A queued refresh alone cannot change the prompt before an assistant's
         // encrypted thinking that still requires its original earlier messages.
         // If the system hook runs first, wait for a permitted messages rebuild;
         // if the messages hook ran first, use its completed rebuild decision.
+        // On a prefix-bound model an idle-expired request waits the same way,
+        // for the messages pass to say whether it kept the open turn's thinking.
         let deferredDateRefresh = false;
         if (
             currentDate &&
             stickyDate &&
             currentDate !== stickyDate &&
-            isCacheBusting &&
-            !idleCacheExpired &&
+            (idleCacheExpired ? prefixBoundModel : isCacheBusting) &&
             !contentOrPresetChanged &&
             !requestMessagesFinal
         ) {
@@ -509,8 +534,8 @@ export function createSystemPromptHashHandler(deps: {
             deferredDateRefresh = waitForSystemDateRefresh(
                 deps.historyRefreshSessions,
                 dateRequest,
-                (permitted) => {
-                    if (!permitted) {
+                (permitted, keptSignedThinking) => {
+                    if (!permitted && !(idleCacheExpired && keptSignedThinking !== true)) {
                         deps.systemPromptRefreshSessions.add(sessionId);
                         return;
                     }
@@ -545,8 +570,7 @@ export function createSystemPromptHashHandler(deps: {
         // request's messages already went out keeping signed thinking, a
         // date-only change would invalidate that thinking and waits instead.
         const dateMayAdvance =
-            (idleCacheExpired &&
-                systemDateThinkingHeld(deps.historyRefreshSessions, dateRequest) !== true) ||
+            (idleDateMayAdvance && !deferredDateRefresh) ||
             contentOrPresetChanged ||
             (isCacheBusting &&
                 !deferredDateRefresh &&
@@ -616,10 +640,16 @@ export function createSystemPromptHashHandler(deps: {
             return;
         }
         const sessionMeta = sessionMetaEarly;
+        const previousPrompt = diagnosticPrompts.get(sessionId);
+        const currentPrompt =
+            previousPrompt && previousHash === currentHash
+                ? previousPrompt
+                : snapshotSystemPrompt(output.system, promptSurface.preset);
+        diagnosticPrompts.set(sessionId, currentPrompt);
         if (previousHash !== "" && previousHash !== "0" && previousHash !== currentHash) {
             sessionLog(
                 sessionId,
-                `system prompt hash changed: ${previousHash} → ${currentHash} (len=${systemContent.length}), ${idleCacheExpired ? "adopting on idle-expired request" : requestMessagesFinal ? "adopting on the request whose messages are already final" : "triggering flush"}`,
+                `system prompt hash changed: ${previousHash} → ${currentHash} (len=${systemContent.length}), ${idleCacheExpired ? "adopting on idle-expired request" : requestMessagesFinal ? "adopting on the request whose messages are already final" : "triggering flush"}; ${describeSystemPromptChange(previousPrompt, currentPrompt)}`,
             );
             // This request carries the new prompt, so the provider rewrites its
             // cache from the system block onward whatever the messages pass did.
@@ -743,6 +773,7 @@ export function createSystemPromptHashHandler(deps: {
     return {
         handler,
         clearSession: (sessionId: string) => {
+            diagnosticPrompts.delete(sessionId);
             clearSystemDateRefresh(deps.historyRefreshSessions, sessionId);
             guidanceEpochs.clear(sessionId);
             clearSystemPromptHashSession(sessionId, {
@@ -764,6 +795,6 @@ import {
     type SystemDateRequestIdentity,
     systemDateRefreshPermission,
     systemDateRequestForOutput,
-    systemDateThinkingHeld,
+    systemDateSignedThinkingKept,
     waitForSystemDateRefresh,
 } from "./system-date-refresh";

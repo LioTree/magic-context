@@ -578,7 +578,7 @@ async function historyFixture(
 
 describe("signed-thinking s03a review: Pi stable-id migration", () => {
 	test("handler refuses unproven stable-id migration under thinking without losing the placeholder", async () => {
-		const f = await historyFixture("s03a-handler-cutover", true, "off");
+		const f = await historyFixture("s03a-handler-cutover", true, "on");
 		try {
 			const before = await f.pass();
 			const record = readServedPrefix(f.db, f.sessionId);

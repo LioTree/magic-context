@@ -50,7 +50,11 @@ afterEach(() => {
 	else process.env.XDG_CACHE_HOME = oldCache;
 });
 
-function fixture(sessionId: string, path = ":memory:") {
+function fixture(
+	sessionId: string,
+	path = ":memory:",
+	signedThinkingHold?: "off" | "on",
+) {
 	const { dir: root } = createTestTempDir("pi-note-nudge-review-");
 	roots.push(root);
 	process.env.XDG_DATA_HOME = root;
@@ -59,7 +63,8 @@ function fixture(sessionId: string, path = ":memory:") {
 	databases.push(db);
 	sessions.push(sessionId);
 	const fake = createFakePi();
-	const register = () => registerPiContextHandler(fake.pi as never, { db });
+	const register = () =>
+		registerPiContextHandler(fake.pi as never, { db, signedThinkingHold });
 	register();
 	const raw: PiMessage[] = [userMessage("warm", now)];
 	const ids = ["warm"];
@@ -199,7 +204,7 @@ describe("independent Pi note-nudge cache review", () => {
 		const { dir: root } = createTestTempDir("pi-note-nudge-review-reopen-");
 		roots.push(root);
 		const sessionId = "pi-review-liveness";
-		const f = fixture(sessionId, join(root, "db.sqlite"));
+		const f = fixture(sessionId, join(root, "db.sqlite"), "on");
 		f.raw.push(
 			assistantMessage("working", now + 1, {
 				provider: "anthropic",

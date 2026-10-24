@@ -290,6 +290,11 @@ impl session_resolver::ProviderRunner for PagesRunner {
         if method == "role.describe" {
             return Ok(self.describe.clone());
         }
+        if method == "session.head" {
+            // Exported first-pass pages describe an uncut lineage. No pre-cut
+            // facts may be inferred from their first page's position.
+            return Ok(json!({"first_ordinal":0}));
+        }
         if method != "session.read" {
             return Err(SessionResolveError::InvalidResponse(format!(
                 "the offline first pass serves session.read and role.describe only, not {method}"

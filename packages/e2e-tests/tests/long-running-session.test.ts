@@ -413,6 +413,8 @@ forEachHost(import.meta.url, "long-running OpenCode Magic Context session", (hos
                 execute_threshold_percentage: 20,
                 embedding: { provider: "off" },
                 protected_tags: 1,
+                // Pi's task-list tool is opt-in; this session exercises its capture and replay.
+                todowrite: { enabled: true },
                 memory: {
                     enabled: true,
                     auto_promote: false,

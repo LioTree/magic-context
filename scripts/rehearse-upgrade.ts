@@ -2,6 +2,8 @@ import { Database } from "bun:sqlite";
 import { spawnSync } from "node:child_process";
 import {
 	copyFileSync,
+	cpSync,
+	constants,
 	existsSync,
 	mkdirSync,
 	mkdtempSync,
@@ -20,7 +22,15 @@ import {
 	inventory,
 	snapshotRoot,
 	version,
+	versionAfterCrash,
+	hashFile,
 } from "./lib/upgrade-audit";
+
+import { EFFECTS, CONTEXT_CRASH_VERSIONS, STORE_CRASH_VERSIONS, assertEffects, assertCrashCoverage, assertBundles, assertDoctor, assertFullDoctorTarget, assertMigrationMetrics, assertArtifactIdentity, type MigrationMetric } from "./lib/upgrade-contract";
+import type { PayloadProof } from "./lib/upgrade-payloads";
+import { HOSTS, assertHostCoverage } from "./lib/upgrade-seats";
+import { openInterval, type OpenInterval } from "./lib/upgrade-roots";
+import { assertApplicationSchema, LEGACY_TABLES, LEGACY_COLUMNS, LEGACY_INDEXES } from "./lib/upgrade-schema";
 
 const repo = resolve(import.meta.dir, "..");
 const args = process.argv.slice(2);
@@ -33,17 +43,20 @@ const option = (name: string): string | undefined => {
 };
 if (args.includes("--help")) {
 	console.log(
-		"bun scripts/rehearse-upgrade.ts [--snapshot <offline-pair-directory>] [--release-archive <v0.49.7.tar>] [--report <markdown-path>]\nRequires Linux, Bun, Cargo offline dependencies and GNU /usr/bin/time. All execution and stores live under $TMPDIR/magic-context/rehearsal-early/run-*/.",
+		"bun scripts/rehearse-upgrade.ts [--snapshot <offline-pair-directory>] [--release-archive <v0.49.7.tar>] [--report <markdown-path>] [--artifacts <prebuilt-directory>] [--candidate <full-git-sha>] [--export-artifacts <directory>]\nRequires Linux, Bun and GNU /usr/bin/time. Cargo offline dependencies are needed unless --artifacts is supplied. --candidate is required with prebuilt artifacts when Git metadata is not mounted. All execution and stores live under $TMPDIR/magic-context/rehearsal-early/run-*/.",
 	);
 	process.exit(0);
 }
 for (let i = 0; i < args.length; i += 2)
-	if (!["--snapshot", "--release-archive", "--report"].includes(args[i]))
+	if (!["--snapshot", "--release-archive", "--report", "--artifacts", "--candidate", "--export-artifacts"].includes(args[i]))
 		throw new Error(`Unknown option ${args[i]}`);
 // Resolve and reject live locations before changing HOME for child processes.
 const snapshot = option("--snapshot")
 	? snapshotRoot(option("--snapshot")!)
 	: undefined;
+const artifacts = option("--artifacts") ? resolve(option("--artifacts")!) : undefined;
+if (option("--candidate") && !artifacts) throw new Error("--candidate is only valid with --artifacts");
+if (snapshot && option("--export-artifacts")) throw new Error("Export binaries only from a synthetic run, never from private snapshot execution");
 const parent = join(tmpdir(), "magic-context", "rehearsal-early");
 mkdirSync(parent, { recursive: true });
 const root = realpathSync(mkdtempSync(join(parent, "run-")));
@@ -54,7 +67,7 @@ const reportPath = resolve(
 	option("--report") ??
 		join(
 			repo,
-			".cortexkit/internal-docs/reports",
+			".cortexkit/internal-docs/investigations",
 			`upgrade-rehearsal-${new Date().toISOString().slice(0, 10)}.md`,
 		),
 );
@@ -79,6 +92,10 @@ const evidence: Record<string, unknown> = {
 	crashes: [],
 	prompts: [],
 	refusals: [],
+	preservation: [],
+	storeOpens: [],
+	schemaCompatibility: [],
+	doctor: [],
 };
 const env: NodeJS.ProcessEnv = {
 	...process.env,
@@ -113,7 +130,7 @@ function run(
 ): string {
 	const usage = join(root, `${steps.length}-usage.txt`);
 	const result = spawnSync(
-		"/usr/bin/time",
+		artifacts ? join(artifacts, "gnu-time") : "/usr/bin/time",
 		["-f", "%e %M", "-o", usage, ...command],
 		{
 			cwd,
@@ -156,26 +173,26 @@ function pairCopy(source: string, name: string): string {
 	const dest = join(root, name);
 	mkdirSync(dest, { recursive: true, mode: 0o700 });
 	for (const db of ["context.db", "store.db"])
-		copyFileSync(join(source, db), join(dest, db));
+		copyFileSync(join(source, db), join(dest, db), constants.COPYFILE_FICLONE);
 	return dest;
 }
 
-function check(label: string, body: () => void): void {
+function check(label: string, body: () => void): boolean {
 	try {
 		body();
 		(evidence.checks as Record<string, string>)[label] = "passed";
 		console.log(`${label}: passed`);
+		return true;
 	} catch (error) {
 		(evidence.checks as Record<string, string>)[label] = "finding";
 		findings.push(`${label}: ${String(error)}`);
 		console.log(`${label}: finding`);
+		return false;
 	}
 }
 
 function hash(path: string): string {
-	return new Bun.CryptoHasher("sha256")
-		.update(readFileSync(path))
-		.digest("hex");
+	return hashFile(path);
 }
 function fileHashes(dir: string): Record<string, string> {
 	return Object.fromEntries(
@@ -184,9 +201,12 @@ function fileHashes(dir: string): Record<string, string> {
 			.map((f) => [f, hash(join(dir, f))]),
 	);
 }
-function assertPreserved(before: string, after: string): void {
+function assertPreserved(before: string, after: string, storeBefore = before): void {
+	if (!storeOpens.has(after)) throw new Error(`Missing McStore opener clock interval: ${after}`);
 	for (const name of ["context.db", "store.db"]) {
-		const difference = firstDifference(join(before, name), join(after, name));
+		const proof = { payloads: [] as PayloadProof[], tables: [] as {name: string; rows: number; sha256: string}[] };
+		const difference = firstDifference(join(name === "store.db" ? storeBefore : before, name), join(after, name), undefined, proof, name === "store.db" ? storeOpens.get(after) : undefined);
+		(evidence.preservation as unknown[]).push({ route: after.split("/").at(-1), database: name, ...proof });
 		if (difference)
 			throw new Error(
 				`${name} migrations ${name === "context.db" ? "96+" : "64+"}: ${difference}`,
@@ -203,6 +223,12 @@ type Fingerprints = {
 	store_schema: unknown;
 };
 let helper = "";
+const storeOpens = new Map<string, OpenInterval>();
+function openStore(step: string, dir: string): void {
+	const interval = openInterval(run(step, [helper, "store", dir]));
+	storeOpens.set(dir, interval);
+	(evidence.storeOpens as unknown[]).push({ step, route: dir.split("/").at(-1), ...interval });
+}
 function fingerprints(dir: string): Fingerprints {
 	return JSON.parse(
 		run(`fingerprint-${dir.split("/").at(-1)}`, [helper, "fingerprint", dir]),
@@ -259,6 +285,8 @@ async function crash(
 	dbName = "context.db",
 ): Promise<void> {
 	const started = performance.now();
+	const marker = join(dir, "crash-ready");
+	rmSync(marker, {force: true});
 	const child = Bun.spawn(command, {
 		env: {
 			...env,
@@ -271,7 +299,6 @@ async function crash(
 	});
 	const stdout = new Response(child.stdout).text();
 	const stderr = new Response(child.stderr).text();
-	const marker = join(dir, "crash-ready");
 	const deadline = performance.now() + 30_000;
 	// Wait for a transaction-internal barrier, not an estimated startup delay.
 	while (
@@ -281,6 +308,7 @@ async function crash(
 	)
 		await Bun.sleep(10);
 	const reached = existsSync(marker);
+	const aliveAtBarrier = child.exitCode === null;
 	const status = existsSync(`/proc/${child.pid}/status`)
 		? readFileSync(`/proc/${child.pid}/status`, "utf8")
 		: "";
@@ -296,13 +324,14 @@ async function crash(
 		exit: -9,
 		output: text,
 	});
-	if (!reached)
+	if (!reached || !aliveAtBarrier || child.signalCode !== "SIGKILL")
 		throw new Error(
 			`${name} migration ${migration}: transaction barrier not reached; ${text.slice(-2000)}`,
 		);
 	const barrier = readFileSync(marker, "utf8");
-	const recorded = version(join(dir, dbName));
-	if (recorded >= migration)
+	if (!barrier.includes(`${dbName} migration ${migration}`)) throw new Error(`Wrong crash barrier: ${barrier}`);
+	const recorded = versionAfterCrash(join(dir, dbName));
+	if (recorded !== migration - 1)
 		throw new Error(
 			`${name}: barrier transaction unexpectedly committed v${recorded}`,
 		);
@@ -312,6 +341,7 @@ async function crash(
 		barrier,
 		signal: "SIGKILL",
 		recordedAfterKill: recorded,
+		complete: false,
 	});
 }
 
@@ -354,33 +384,20 @@ function writeReport(): void {
 		"",
 		"## Intended migration effects",
 		"",
-		"- context 96: additive lkg_slots columns and lkg_served_markers; no old content rewrite.",
-		"- context 97: new host_runner_* tables; no old content rewrite.",
-		"- context 98: new rescore/score tables, session_meta watermark default 0 and activation clock; compartments/history remain unchanged.",
-		"- context 99: memory lifecycle tables and additive memory revision/verification columns; original memory content remains unchanged.",
-		"- context 100: nullable session_meta served_prefix / held_release; old keys remain unchanged.",
-		"- context 101: indexes for trimmed-source tag retirement; no table content rewrite.",
-		"- context 102: nullable lkg_served_markers.served_digest; existing markers keep NULL, which certifies nothing until the next served save binds it. No old content rewrite.",
-		"- store 64: new move inventory tables; no release-domain content reset.",
-		"- store 65: new provider sessions/catalogs; no old cache reset.",
-		"- store 66: copies provider records into conversation/message/answer/view/tag ledgers. Release 63 has no deployed provider rows.",
-		"- store 67: fence-only step; no data rewrite.",
-		"- store 68: new provider policy summaries and triggers; no old cache reset.",
-		"- store 69: new memory projection tables; no old memory content reset.",
-		"- store 70: rebuilds mc_provider_conversations_v2 with native generation columns, preserving existing columns/identities; recreated dependent triggers.",
-		"- store 71: adds policy revision/preparation caches and revision triggers; invalidates derived preparations on input changes. No release-63 table rewrite.",
-		"- store 72: discards undeployed OpenCode provider projections (introduced at 65+), adds frozen-policy facts, cut/override/view tables and a frontier invalidation trigger. These tables do not exist in released store 63; every released row remains subject to exact preservation checks.",
-		"- store 73: resets only conversations that own a mc_provider_views_v1 row (introduced at 66, never released) and drops that table; Broca and Claude Code views now persist as mc_provider_views_v2 recipes. Released store 63 has no such rows.",
+		...Object.entries(EFFECTS).flatMap(([kind, effects]) => Object.entries(effects).map(([version, effect]) => `- ${kind} ${version}: ${effect}.`)),
 		"",
 		"## Coverage",
 		"",
 		"TypeScript owns context.db migration on first host open; Rust McStore owns store.db on both paired routes. The other route uses Rust context_schema::migrations_legacy::upgrade. Fresh context bootstraps are independently produced by TypeScript and Rust. Context fingerprints use parity-1A's exact Rust snapshot/digest. Store fingerprints use the same digest and equivalent structural metadata with the mc_cache namespace ledger.",
 		"",
-		"Every pre-existing non-shadow table is compared column-for-column on all old columns (including session_meta). Ordinary tables include rowid to preserve identity and duplicates. FTS shadow counts are reported but their physical bytes are not content contracts. All original context ledger rows must be unchanged; mc_cache version advancement and SQLite bookkeeping are excluded from content equality. New columns are checked structurally by fingerprint, not treated as original content.",
+		"Every retained original column is compared in both directions, with row counts and row-level SHA-256 streams. Removed session_meta payloads must match their original bytes, SQLite storage class and NULL/empty distinction through production accessors; every chunk is reconstructed. Unknown removed columns fail. Ordinary tables include rowid to preserve identity and duplicates. FTS shadow counts are reported but their physical bytes are not content contracts. All original context ledger rows must be unchanged; mc_cache version advancement and SQLite bookkeeping are excluded from content equality.",
+		"Fresh-to-upgraded application compatibility requires every fresh table, column and index, including declared types, defaults, nullability, keys, constraints, triggers and views. SQL whitespace, comments, keyword case, identifier quotation, outer table-declaration order and index column ordinals are cosmetic. Types must match after case/whitespace normalization except session_meta.system_prompt_hash TEXT DEFAULT '' may remain INTEGER DEFAULT 0; thinking_binding_recovery_target may remain nullable. Only exact reviewed legacy table/column/index names and column-type profiles are admitted; unknown objects or other declaration changes fail. Fingerprints remain diagnostic evidence and same-route parity checks, not a fresh-to-upgraded compatibility requirement.",
+		`Reviewed legacy tables: ${JSON.stringify(LEGACY_TABLES)}. Reviewed session_meta columns: ${JSON.stringify(LEGACY_COLUMNS)}. Reviewed legacy indexes: ${JSON.stringify(LEGACY_INDEXES)}. Actual allowances are recorded under schemaCompatibility.`,
+		"McStore opener wall-clock intervals bracket its strict 30-day lineage-root expiry. A deleted root must be expired by the interval's end, with no move fence and no cache activity at or after the cutoff; a root already eligible at the interval's start must not survive. Boundary-crossing roots are counted explicitly, and a single clock inside the interval must explain every deletion and survivor. Every retained row and rowid is unchanged; all existing fence/cache dependency rows remain in the ordinary preservation audit. Migration 64 introduces the fence table, so released-63 inputs use the newly migrated fence table. Crash store audits compare against the original baseline using their own opener interval, never against an earlier pruned reference.",
 		"",
 		"Five ordered sessions use the real old/candidate materializeM0 renderer, both m[0] and m[1], defaults, frozen clock and an empty project-docs directory. This is the prefix renderer, not a live provider request. Rendering runs on separate copies so cache/render side effects cannot conceal migration loss.",
 		"",
-		"Crash barriers cover three uncommitted context migration transactions per implementation and six store migration transactions. Store crashes use an ignored unit-test helper to install a ledger hook on the real cortexkit-store migrator and McStore SQL chain; reopen uses McStore::open. SIGKILL step peak RSS is the paused child process VmHWM from /proc; all other peaks come from GNU time.",
+		"Crash barriers cover four uncommitted context migration transactions per implementation (including 103) and seven store migration transactions (including 74). Store crashes use an ignored unit-test helper to install a ledger hook on the real cortexkit-store migrator and McStore SQL chain; reopen uses McStore::open. SIGKILL step peak RSS is the paused child process VmHWM from /proc; all other peaks come from GNU time.",
 		"",
 		"Old plugin refusal and the placed release ck-mc offline command are checked on both paired and individually advanced stores, with DB/WAL hashes before/after. The release McStore opener is checked separately; the offline command is not a live subc handshake.",
 		"",
@@ -415,19 +432,29 @@ function writeReport(): void {
 try {
 	if (process.platform !== "linux")
 		throw new Error("Rehearsal requires Linux and GNU /usr/bin/time");
-	evidence.candidate = spawnSync("git", ["rev-parse", "HEAD"], {
+	evidence.candidate = option("--candidate") ?? spawnSync("git", ["rev-parse", "HEAD"], {
 		cwd: repo,
 		encoding: "utf8",
 	}).stdout.trim();
 	evidence.toolchain = Object.fromEntries(
-		["bun", "cargo", "rustc"].map((tool) => [
+		(artifacts ? ["bun"] : ["bun", "cargo", "rustc"]).map((tool) => [
 			tool,
 			run(`${tool}-version`, [tool, "--version"]).trim(),
 		]),
 	);
-	const archive = option("--release-archive") ?? join(root, "release.tar");
-	if (!option("--release-archive"))
-		run("archive-release", ["git", "archive", "origin/master", "-o", archive]);
+	if (artifacts) {
+		const manifest = JSON.parse(readFileSync(join(artifacts, "manifest.json"), "utf8"));
+		assertArtifactIdentity(manifest, String(evidence.candidate), process.arch);
+		for (const [name, expected] of Object.entries(manifest.files as Record<string, string>))
+			if (hash(join(artifacts, name)) !== expected) throw new Error(`Prebuilt artifact checksum mismatch: ${name}`);
+		evidence.artifacts = manifest;
+	} else run("build-plugin-pi-cli-bundles", [process.execPath, "run", "build"], repo, {NODE_ENV: "production", MAGIC_CONTEXT_TEST_DATA_DIR: ""});
+	const bundleRoot = artifacts ?? join(repo, "packages");
+	const loadedBundles = run("load-plugin-pi-bundles", [process.execPath, "-e", `const loaded=[]; await import(${JSON.stringify(join(bundleRoot, "plugin/dist/index.js"))}); loaded.push('plugin'); await import(${JSON.stringify(join(bundleRoot, "pi-plugin/dist/index.js"))}); loaded.push('pi-plugin'); console.log(JSON.stringify(loaded));`]);
+	assertBundles(JSON.parse(loadedBundles));
+	const archive = option("--release-archive") ?? (artifacts ? join(artifacts, "release.tar") : join(root, "release.tar"));
+	if (!option("--release-archive") && !artifacts)
+		run("archive-release", ["git", "-c", `safe.directory=${repo}`, "archive", "v0.49.7", "-o", archive]);
 	run("extract-release", ["tar", "-xf", resolve(archive), "-C", oldTree]);
 	evidence.releaseArchiveSha256 = hash(resolve(archive));
 	const pkg = JSON.parse(
@@ -452,7 +479,7 @@ try {
 		join(examples, "upgrade_release_store.rs"),
 	);
 	// Compile the release helper in the tagged tree so its schema ceiling cannot come from the candidate.
-	run(
+	if (!artifacts) run(
 		"build-release",
 		[
 			"cargo",
@@ -470,7 +497,7 @@ try {
 		],
 		oldTree,
 	);
-	run(
+	if (!artifacts) run(
 		"build-release-ck-mc",
 		[
 			"cargo",
@@ -488,7 +515,7 @@ try {
 		],
 		oldTree,
 	);
-	run("build-candidate-helper", [
+	if (!artifacts) run("build-candidate-helper", [
 		"cargo",
 		"build",
 		"--offline",
@@ -502,7 +529,7 @@ try {
 		"--target-dir",
 		join(repo, "target"),
 	]);
-	const testBuild = run("build-store-crash-helper", [
+	const testBuild = artifacts ? JSON.stringify({reason: "compiler-artifact", target: {name: "mc_store"}, profile: {test: true}, executable: join(artifacts, "store-tests")}) : run("build-store-crash-helper", [
 		"cargo",
 		"test",
 		"--offline",
@@ -531,27 +558,23 @@ try {
 	if (!testArtifact)
 		throw new Error("Store crash helper test binary not produced");
 	const storeCrashHelper: string = testArtifact.executable;
-	helper = join(repo, "target/debug/examples/rehearse_upgrade");
-	const oldHelper = join(
+	helper = artifacts ? join(artifacts, "candidate-helper") : join(repo, "target/debug/examples/rehearse_upgrade");
+	const oldHelper = artifacts ? join(artifacts, "release-helper") : join(
 		repo,
 		"target/rehearsal-release/debug/examples/upgrade_release_store",
 	);
 	const bin = join(root, "bin");
 	mkdirSync(bin);
 	const oldBinary = join(bin, "ckdev-rehearsal-049");
-	copyFileSync(join(repo, "target/rehearsal-release/debug/ck-mc"), oldBinary);
+	copyFileSync(artifacts ? join(artifacts, "release-ck-mc") : join(repo, "target/rehearsal-release/debug/ck-mc"), oldBinary);
 	evidence.placedReleaseVersion = run("placed-release-version", [
 		oldBinary,
 		"--version",
 	]).trim();
 	if (snapshot) {
 		for (const name of ["context.db", "store.db"]) {
-			const db = new Database(join(snapshot, name), { readonly: true });
-			try {
-				writeFileSync(join(baseline, name), db.serialize());
-			} finally {
-				db.close();
-			}
+			if (existsSync(join(snapshot, `${name}-wal`))) throw new Error("Snapshot must be a consistent offline VACUUM INTO pair without WAL sidecars");
+			copyFileSync(join(snapshot, name), join(baseline, name), constants.COPYFILE_FICLONE);
 		}
 	} else {
 		run("seed-release-context", [
@@ -562,6 +585,11 @@ try {
 			baseline,
 		]);
 		run("seed-release-store", [oldHelper, "seed", baseline]);
+		const seedStore = new Database(join(baseline, "store.db"));
+		try {
+			// The first host pass must preserve newer Rust tag numbers rather than replace them with older TypeScript numbers.
+			for (let s = 0; s < 20; s++) seedStore.query("INSERT INTO mc_tags(session_id,tag_number,block_id,kind,created_at_ms) VALUES(?,?,?,'message',?)").run(`session-${String(s).padStart(2,"0")}`, 60001+s, `signed-${s}#1`, 1_800_000_001_000);
+		} finally { seedStore.close(); }
 	}
 	if (
 		version(join(baseline, "context.db")) !== 95 ||
@@ -575,6 +603,11 @@ try {
 		(evidence.integrity as Record<string, unknown>)[`before/${name}`] =
 			integrity(join(baseline, name));
 	}
+	const measurementDir = pairCopy(baseline, "per-migration-measurements");
+	const measurementOutput = run("measure-context-migrations", [process.execPath, host, "measure-context", repo, measurementDir]) + run("measure-store-migrations", [storeCrashHelper, "--exact", "upgrade_rehearsal::measure_store_process", "--ignored", "--nocapture"], repo, {REHEARSAL_ROOT: measurementDir});
+	evidence.migrations = [...measurementOutput.matchAll(/REHEARSAL_METRIC (\{[^\n]+\})/g)].map((match) => JSON.parse(match[1]));
+	assertMigrationMetrics(evidence.migrations as MigrationMetric[]);
+	rmSync(measurementDir, {recursive: true, force: true});
 	const oldState = snapshot ? undefined : run("release-lkg-recovery-state", [process.execPath, host, "state", oldTree, baseline]);
 	const oldRender = pairCopy(baseline, "old-render");
 	run("render-release", [
@@ -585,10 +618,11 @@ try {
 		oldRender,
 		join(root, "prompts-old"),
 	]);
+	rmSync(oldRender, {recursive: true, force: true});
 	const fresh = join(root, "fresh-rust");
 	mkdirSync(fresh);
 	run("fresh-rust-context", [helper, "fresh-context", fresh]);
-	run("fresh-rust-store", [helper, "store", fresh]);
+	openStore("fresh-rust-store", fresh);
 	const freshFp = fingerprints(fresh);
 	(evidence.fingerprints as Record<string, unknown>).freshRust = freshFp;
 	const freshHost = pairCopy(fresh, "fresh-host");
@@ -607,10 +641,7 @@ try {
 	check("fresh TypeScript/Rust parity", () =>
 		assertFingerprint(freshFp, hostFp),
 	);
-	if (freshFp.store_version > 73 || freshFp.context_version > 102)
-		findings.push(
-			`Migration effects manifest needs review for candidate context ${freshFp.context_version} / store ${freshFp.store_version}; identify every new reset/rewrite before approving it`,
-		);
+	assertEffects(freshFp.context_version, freshFp.store_version);
 	for (const route of ["typescript", "rust"]) {
 		const dir = pairCopy(baseline, route);
 		run(
@@ -619,7 +650,7 @@ try {
 				? [process.execPath, host, "migrate", repo, dir]
 				: [helper, "context", dir],
 		);
-		run(`${route}-store-migrate`, [helper, "store", dir]);
+		openStore(`${route}-store-migrate`, dir);
 		for (const name of ["context.db", "store.db"]) {
 			(evidence.tables as Record<string, unknown>)[`${route}/${name}`] =
 				inventory(join(dir, name));
@@ -644,9 +675,10 @@ try {
 		});
 		const fp = fingerprints(dir);
 		(evidence.fingerprints as Record<string, unknown>)[route] = fp;
-		check(`${route} fresh schema fingerprint`, () =>
-			assertFingerprint(freshFp, fp),
-		);
+		check(`${route} application schema compatibility`, () => {
+			for (const name of ["context.db", "store.db"])
+				(evidence.schemaCompatibility as unknown[]).push({ route, database: name, allowances: assertApplicationSchema(join(fresh, name), join(dir, name), name === "context.db") });
+		});
 		const renderDir = pairCopy(dir, `${route}-render`);
 		const output = join(root, `prompts-${route}`);
 		run(`render-${route}`, [
@@ -715,6 +747,7 @@ try {
 				throw new Error("Old plugin modified DB/WAL bytes");
 		});
 		(evidence.refusals as unknown[]).push({ route, plugin: refusal });
+		rmSync(refused, {recursive: true, force: true});
 		const oldStore = pairCopy(dir, `${route}-old-store`);
 		const storeBefore = fileHashes(oldStore);
 		run(
@@ -735,6 +768,44 @@ try {
 			if (JSON.stringify(fileHashes(oldStore)) !== JSON.stringify(storeBefore))
 				throw new Error("Old McStore modified DB/WAL bytes");
 		});
+		rmSync(oldStore, {recursive: true, force: true});
+		rmSync(renderDir, {recursive: true, force: true});
+	}
+	const sessionRunner = join(repo, "scripts/lib/upgrade-session-pass.ts");
+	const samplePath = join(root, "session-sample.json");
+	const planDir = pairCopy(join(root, "typescript"), "session-plan");
+	run("select-real-session-sample", [process.execPath, sessionRunner, planDir, "plan", samplePath]);
+	rmSync(planDir, {recursive: true, force: true});
+	evidence.sessionSample = JSON.parse(readFileSync(samplePath, "utf8"));
+	const sessionResults: {host: typeof HOSTS[number]; session: string; status: string}[] = [];
+	for (const adapter of HOSTS) {
+		const dir = pairCopy(join(root, "typescript"), `session-pass-${adapter}`);
+		const outputPath = join(root, `session-results-${adapter}.json`);
+		run(`real-session-pass-${adapter}`, [process.execPath, sessionRunner, dir, adapter, samplePath, outputPath], repo, {}, true);
+		const rows = existsSync(outputPath) ? JSON.parse(readFileSync(outputPath, "utf8")) : [];
+		sessionResults.push(...rows);
+		check(`${adapter} TypeScript session reads without refusal`, () => {
+			if (steps.at(-1)!.exit !== 0 || rows.length === 0 || rows.some((r: {status: string}) => r.status !== "passed")) throw new Error(`Session replay failed: ${JSON.stringify(rows)}`);
+		});
+		rmSync(dir, {recursive: true, force: true});
+	}
+	evidence.sessionPasses = sessionResults;
+	check("all selected sessions on all three host adapters", () => {
+		const sample = evidence.sessionSample as {largest: {session: string}[]; random: {session: string}[]};
+		assertHostCoverage([...sample.largest, ...sample.random].map((s) => s.session), sessionResults.filter((r) => r.status === "passed"));
+	});
+	for (const route of ["typescript", "rust"]) {
+		const dir = pairCopy(join(root, route), `doctor-${route}`);
+		const scoped = run(`database-doctor-${route}`, [process.execPath, join(repo, "scripts/lib/upgrade-doctor.ts"), dir]);
+		assertDoctor(scoped);
+		const doctors: unknown[] = [];
+		for (const adapter of ["opencode", "pi"]) {
+			const output = run(`full-doctor-${route}-${adapter}`, [process.execPath, join(bundleRoot, "cli/dist/index.js"), "doctor", "--harness", adapter], dir, {MAGIC_CONTEXT_STORAGE_DIR: dir, MAGIC_CONTEXT_TEST_DATA_DIR: "", NODE_ENV: "production"}, true);
+			assertFullDoctorTarget(steps.at(-1)!.output, dir, adapter);
+			doctors.push({host: adapter, exit: steps.at(-1)!.exit, output: steps.at(-1)!.output || output});
+		}
+		(evidence.doctor as unknown[]).push({route, database: JSON.parse(scoped), full: doctors});
+		rmSync(dir, {recursive: true, force: true});
 	}
 	check("TypeScript/Rust upgraded schema parity", () =>
 		assertFingerprint(
@@ -796,9 +867,10 @@ try {
 				throw new Error("Release ck-mc modified DB/WAL bytes");
 		});
 		(evidence.refusals as unknown[]).push({ binary: shape, output });
+		rmSync(dir, {recursive: true, force: true});
 	}
 	for (const route of ["typescript", "rust"])
-		for (const migration of [96, 98, 100]) {
+		for (const migration of CONTEXT_CRASH_VERSIONS) {
 			const dir = pairCopy(baseline, `crash-${route}-${migration}`);
 			const command =
 				route === "typescript"
@@ -807,11 +879,11 @@ try {
 			try {
 				await crash(route, command, dir, migration);
 				run(`reopen-${route}-${migration}`, command);
-				run(`reopen-store-${route}-${migration}`, [helper, "store", dir]);
-				check(`crash ${route} v${migration} preservation`, () =>
-					assertPreserved(join(root, route), dir),
+				openStore(`reopen-store-${route}-${migration}`, dir);
+				const preserved = check(`crash ${route} v${migration} preservation`, () =>
+					assertPreserved(join(root, route), dir, baseline),
 				);
-				check(`crash ${route} v${migration} schema`, () =>
+				const schema = check(`crash ${route} v${migration} schema`, () =>
 					assertFingerprint(
 						(evidence.fingerprints as Record<string, Fingerprints>)[route],
 						fingerprints(dir),
@@ -819,13 +891,14 @@ try {
 				);
 				for (const name of ["context.db", "store.db"])
 					integrity(join(dir, name));
+				(evidence.crashes as {complete: boolean}[]).at(-1)!.complete = preserved && schema;
 			} catch (error) {
 				findings.push(
 					`Crash ${route} context migration ${migration}: ${String(error)}`,
 				);
-			}
+			} finally { rmSync(dir, {recursive: true, force: true}); }
 		}
-	for (const migration of [64, 66, 70, 71, 72, 73]) {
+	for (const migration of STORE_CRASH_VERSIONS) {
 		const dir = pairCopy(baseline, `crash-store-${migration}`);
 		try {
 			await crash(
@@ -841,30 +914,44 @@ try {
 				migration,
 				"store.db",
 			);
-			run(`reopen-store-${migration}`, [helper, "store", dir]);
+			openStore(`reopen-store-${migration}`, dir);
 			run(`reopen-context-store-${migration}`, [helper, "context", dir]);
-			check(`crash store v${migration} preservation`, () =>
-				assertPreserved(join(root, "rust"), dir),
+			const preserved = check(`crash store v${migration} preservation`, () =>
+				assertPreserved(join(root, "rust"), dir, baseline),
 			);
-			check(`crash store v${migration} schema`, () =>
+			const schema = check(`crash store v${migration} schema`, () =>
 				assertFingerprint(
 					(evidence.fingerprints as Record<string, Fingerprints>).rust,
 					fingerprints(dir),
 				),
 			);
 			for (const name of ["context.db", "store.db"]) integrity(join(dir, name));
+			(evidence.crashes as {complete: boolean}[]).at(-1)!.complete = preserved && schema;
 		} catch (error) {
 			findings.push(`Crash store migration ${migration}: ${String(error)}`);
-		}
+		} finally { rmSync(dir, {recursive: true, force: true}); }
 	}
-	check("candidate module post-upgrade transforms", () => {
+	assertCrashCoverage(evidence.crashes as {name: string; migration: number}[]);
+	if (!snapshot) check("candidate module post-upgrade transforms", () => {
 		const dir = pairCopy(join(root, "rust"), "module-drill");
-		const output = run("module-post-upgrade-transforms", ["cargo", "test", "--offline", "--locked", "-j", "4", "-p", "mc-module", "--lib", "single_store_drill_post_migration_passes", "--", "--ignored", "--nocapture"], repo, { MC_DRILL_DIR: dir, MC_DRILL_PROJECT: "git:upgrade-rehearsal" });
+		const output = run("module-post-upgrade-transforms", artifacts ? [join(artifacts, "module-tests"), "single_store_drill_post_migration_passes", "--ignored", "--nocapture"] : ["cargo", "test", "--offline", "--locked", "-j", "4", "-p", "mc-module", "--lib", "single_store_drill_post_migration_passes", "--", "--ignored", "--nocapture"], repo, { MC_DRILL_DIR: dir, MC_DRILL_PROJECT: "git:upgrade-rehearsal" });
 		evidence.moduleDrillOutput = output;
 		if (!output.includes("1 passed") || !output.includes("DRILL pass4")) throw new Error(`Transform drill did not run: ${output}`);
 	});
-	run("build-candidate-ck-mc", ["cargo", "build", "--offline", "--locked", "-j", "4", "-p", "mc-module", "--bin", "ck-mc"]);
-	evidence.candidateBinaryVersion = run("candidate-ck-mc-version", [join(repo, "target/debug/ck-mc"), "--version"]).trim();
+	if (!artifacts) run("build-candidate-ck-mc", ["cargo", "build", "--offline", "--locked", "-j", "4", "-p", "mc-module", "--bin", "ck-mc"]);
+	evidence.candidateBinaryVersion = run("candidate-ck-mc-version", [artifacts ? join(artifacts, "ck-mc") : join(repo, "target/debug/ck-mc"), "--version"]).trim();
+	if (option("--export-artifacts")) {
+		if (artifacts) throw new Error("Cannot re-export prebuilt artifacts");
+		const destination = resolve(option("--export-artifacts")!);
+		mkdirSync(destination, {recursive: true, mode: 0o700});
+		const moduleBuild = run("build-module-test-artifact", ["cargo", "test", "--offline", "--locked", "-j", "4", "-p", "mc-module", "--lib", "--no-run", "--message-format=json"]);
+		const moduleTest = moduleBuild.split("\n").filter((line) => line.startsWith("{")).map((line) => JSON.parse(line)).find((row) => row.reason === "compiler-artifact" && row.target.name === "mc_module" && row.profile.test && row.executable)?.executable;
+		if (!moduleTest) throw new Error("Module test artifact not found");
+		for (const [name, file] of Object.entries({"release.tar": archive, "release-helper": oldHelper, "release-ck-mc": oldBinary, "candidate-helper": helper, "store-tests": storeCrashHelper, "module-tests": moduleTest, "ck-mc": join(repo, "target/debug/ck-mc"), "gnu-time": "/usr/bin/time"})) copyFileSync(file, join(destination, name));
+		for (const pkg of ["plugin", "pi-plugin", "cli"]) cpSync(join(repo, "packages", pkg, "dist"), join(destination, pkg, "dist"), {recursive: true});
+		writeFileSync(join(destination, "manifest.json"), JSON.stringify({candidate: evidence.candidate, arch: process.arch, platform: process.platform, toolchain: evidence.toolchain, files: Object.fromEntries(readdirSync(destination).filter((name) => !["plugin", "pi-plugin", "cli", "manifest.json"].includes(name)).map((name) => [name, hash(join(destination, name))]))}, null, 2));
+		console.log(`Exported Linux rehearsal artifacts: ${destination}`);
+	}
 } catch (error) {
 	findings.push(`Rehearsal execution: ${String(error)}`);
 } finally {
@@ -872,3 +959,4 @@ try {
 	rmSync(root, { recursive: true, force: true });
 }
 process.exitCode = findings.length ? 1 : 0;
+console.log(findings.length ? `REHEARSAL_FAIL findings=${findings.length}` : "REHEARSAL_PASS context=103 store=74 session_hosts=3 sample=10 crash_proofs=15 database_doctor=clean");

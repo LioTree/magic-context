@@ -11,6 +11,10 @@ pub(super) struct InputIndex {
     starts: BTreeMap<u64, u64>,
     reset_next: bool,
     count: u64,
+    /// For a lineage that begins at a cut: its first ordinal and the messages
+    /// below it. Before the engine has folded anything (no coverage), the
+    /// historian input starts there, the earliest row the lineage has.
+    floor: Option<(u64, u64)>,
 }
 
 impl InputIndex {
@@ -31,11 +35,59 @@ impl InputIndex {
                 ordinal_base,
                 through: None,
             })
+            .or_else(|| {
+                self.floor.map(|(from, ordinal_base)| InputWindow {
+                    from,
+                    ordinal_base,
+                    through: None,
+                })
+            })
             .unwrap_or_default()
     }
 
     pub(super) fn retained_bytes(&self) -> usize {
         self.starts.len() * 48
+    }
+
+    /// The index of a lineage that begins at `first` after `count` messages
+    /// it does not hold: its first message is a restart point, numbered after
+    /// them.
+    pub(super) fn seeded(first: u64, count: u64) -> Self {
+        Self {
+            starts: BTreeMap::new(),
+            reset_next: false,
+            count,
+            floor: Some((first, count)),
+        }
+    }
+
+    /// Messages indexed so far, including any a seed stands for.
+    // Only cut capture and pruning (`cut_seed`) call this; only tests drive them so far.
+    #[cfg_attr(not(test), allow(dead_code))]
+    pub(super) fn count(&self) -> u64 {
+        self.count
+    }
+
+    // Only cut capture and pruning (`cut_seed`) call this; only tests drive them so far.
+    #[cfg_attr(not(test), allow(dead_code))]
+    pub(super) fn is_start(&self, ordinal: u64) -> bool {
+        self.starts.contains_key(&ordinal)
+    }
+
+    /// The newest restart point at or below `ordinal`: where a cut can put
+    /// its first window message without moving the historian's input.
+    // Only cut capture and pruning (`cut_seed`) call this; only tests drive them so far.
+    #[cfg_attr(not(test), allow(dead_code))]
+    pub(super) fn restart_at_or_below(&self, ordinal: u64) -> Option<u64> {
+        self.starts.range(..=ordinal).next_back().map(|(n, _)| *n)
+    }
+
+    /// Forget the restart points below `first`, whose rows are gone.
+    // Only cut capture and pruning (`cut_seed`) call this; only tests drive them so far.
+    #[cfg_attr(not(test), allow(dead_code))]
+    pub(super) fn truncate_below(&mut self, first: u64) {
+        self.starts = self.starts.split_off(&first);
+        self.floor = self.starts.get(&first).map(|count| (first, *count));
     }
 }
 

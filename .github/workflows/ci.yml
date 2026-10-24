@@ -32,12 +32,13 @@ env:
 # Pipeline shape on every push to master/main:
 #
 #   Consumers check out/install immediately, then wait for verified same-attempt artifacts.
-#   preflight (layout, manifest, fmt, typecheck, lint, complete dists)
+#   preflight publishes complete dists before independent checks
 #        ├─ unit suites and packaging smokes
 #        ├─ Docker install smokes (independent of unit/host results)
 #        ├─ host behavior (OC1: four whole-file shards; OC2: two)
-#        ├─ Rust clippy, lib archive → lib partitions + parity
-#        └─ Rust integration/doctests/remaining crates and hermetic build → shards
+#   Rust clippy and lib archive → lib partitions + parity start immediately.
+#   Rust integration/doctests/remaining crates consume dists.
+#   Hermetic build → shards runs independently of preflight checks.
 #   ci-summary always checks every required leg, including cancelled/skipped jobs.
 #
 # Two e2e layers cover different concerns:
@@ -55,7 +56,7 @@ env:
 #
 #   rust-crates          legacy-named aggregate for clippy, lib/parity, integration,
 #                        binary, doctest and remaining-workspace targets
-#   e2e-rust-hermetic-build → e2e-rust-hermetic (4 shards)
+#   e2e-rust-hermetic-build → e2e-rust-hermetic (9 shards)
 #
 # The mc-module integration tests always build ck-subc from its Cargo.lock revision.
 # Hermetic push builds use that same revision; the nightly build intentionally builds
@@ -79,7 +80,38 @@ jobs:
           components: rustfmt
       - name: Install dependencies
         run: bun install --frozen-lockfile
+      - name: Build complete dists
+        run: |
+          bun run build
+          bun run --cwd packages/pi-plugin build:e2e-argv
+          bun run --cwd packages/dashboard build
+      - name: Check compiled contracts
+        run: |
+          bun run --cwd packages/plugin check:tui-compiled
+          bun crates/mc-module/gen/gen-historian-prompt-golden.ts --check
+          bun crates/mc-module/gen/gen-memory-actions-golden.ts --check
+          bun crates/mc-module/gen/gen-curate-undo-golden.ts --check
+          bun test packages/e2e-tests/scripts/ci-dists.test.ts
+      - name: Package same-commit dists
+        run: |
+          tar -czf ci-dists.tar.gz packages/plugin/dist packages/pi-plugin/dist packages/cli/dist packages/retina-local-fs/dist packages/dashboard/dist tests/docker/.generated
+          sha256sum ci-dists.tar.gz > ci-dists.sha256
+          printf '%s\n' "$GITHUB_SHA" > ci-dists.commit
+      - uses: actions/upload-artifact@v4
+        with:
+          name: ci-dists-${{ github.sha }}-${{ github.run_attempt }}
+          path: |
+            ci-dists.tar.gz
+            ci-dists.sha256
+            ci-dists.commit
+          compression-level: 0
+          if-no-files-found: error
+          retention-days: 1
+
+      # Consumers verify these same-commit dists, but need not wait for unrelated
+      # checks. CI (required) still rejects any failed preflight check.
       - name: Layout, manifest and shard contracts
+        if: ${{ !cancelled() }}
         run: |
           bash scripts/check-cortexkit-layout.sh
           bash scripts/check-docs-layout.sh
@@ -116,33 +148,6 @@ jobs:
             bun run --cwd "packages/$package" lint || status=1
           done
           exit "$status"
-      - name: Build complete dists
-        run: |
-          bun run build
-          bun run --cwd packages/pi-plugin build:e2e-argv
-          bun run --cwd packages/dashboard build
-      - name: Check compiled contracts
-        run: |
-          bun run --cwd packages/plugin check:tui-compiled
-          bun crates/mc-module/gen/gen-historian-prompt-golden.ts --check
-          bun crates/mc-module/gen/gen-memory-actions-golden.ts --check
-          bun crates/mc-module/gen/gen-curate-undo-golden.ts --check
-          bun test packages/e2e-tests/scripts/ci-dists.test.ts
-      - name: Package same-commit dists
-        run: |
-          tar -czf ci-dists.tar.gz packages/plugin/dist packages/pi-plugin/dist packages/cli/dist packages/retina-local-fs/dist packages/dashboard/dist tests/docker/.generated
-          sha256sum ci-dists.tar.gz > ci-dists.sha256
-          printf '%s\n' "$GITHUB_SHA" > ci-dists.commit
-      - uses: actions/upload-artifact@v4
-        with:
-          name: ci-dists-${{ github.sha }}-${{ github.run_attempt }}
-          path: |
-            ci-dists.tar.gz
-            ci-dists.sha256
-            ci-dists.commit
-          compression-level: 0
-          if-no-files-found: error
-          retention-days: 1
 
   check-docs-layout:
     name: Check (public documentation layout)
@@ -582,12 +587,15 @@ jobs:
            bun test --timeout 600000 $files
 
   e2e-host-opencode2:
-    name: E2E (OpenCode 2.0.22, host behavior ${{ matrix.shard }}/2)
+    name: E2E (OpenCode ${{ matrix.version }}, host behavior ${{ matrix.shard }}/2)
     runs-on: ubuntu-latest
     strategy:
       fail-fast: false
       matrix:
         shard: [0, 1]
+        version: [2.0.22, 2.1.0]
+    env:
+      MC_E2E_OPENCODE2_VERSION: ${{ matrix.version }}
     timeout-minutes: 40
     steps:
       - uses: actions/checkout@v5
@@ -612,8 +620,15 @@ jobs:
           OPENCODE_VERSION=1.18.31 bash tests/docker/install-opencode.sh
           echo "$HOME/.opencode/bin" >> "$GITHUB_PATH"
 
+      - name: Install the selected exact host
+        run: |
+          mkdir -p target/oc2-host
+          printf '{"private":true,"dependencies":{"@opencode/cli":"%s"},"trustedDependencies":["@opencode/cli"]}\n' '${{ matrix.version }}' > target/oc2-host/package.json
+          bun install --cwd target/oc2-host
+          echo "MC_E2E_OPENCODE2_CLI=$PWD/target/oc2-host/node_modules/@opencode/cli/bin/opencode.exe" >> "$GITHUB_ENV"
+
       - name: Verify the GA host binary
-        run: bun -e "const { CLI } = await import('./packages/e2e-tests/src/opencode2-runner/spawn.ts'); const { execFileSync } = await import('node:child_process'); const version = execFileSync(CLI, ['--version']).toString().trim(); console.log(CLI, version); if (version !== 'opencode v2.0.22') throw new Error('OpenCode 2 host lane requires 2.0.22')"
+        run: bun -e "const { CLI } = await import('./packages/e2e-tests/src/opencode2-runner/spawn.ts'); const { execFileSync } = await import('node:child_process'); const version = execFileSync(CLI, ['--version']).toString().trim(); console.log(CLI, version); if (version !== 'opencode v' + process.env.MC_E2E_OPENCODE2_VERSION) throw new Error('OpenCode 2 host lane requires its exact matrix version')"
 
       - uses: ./.github/actions/restore-ci-dists
         id: dists
@@ -760,7 +775,6 @@ jobs:
   rust-clippy:
     name: Rust (clippy)
     runs-on: ubuntu-latest
-    needs: [preflight]
     timeout-minutes: 45
     steps:
       - uses: actions/checkout@v5
@@ -789,7 +803,6 @@ jobs:
   rust-lib-archive:
     name: Rust (mc-module lib archive)
     runs-on: ubuntu-latest
-    needs: [preflight]
     timeout-minutes: 45
     steps:
       - uses: actions/checkout@v5
@@ -975,7 +988,6 @@ jobs:
     # Cargo.lock pins the published crate versions and both git dependency revisions.
     # On schedule the daemon checkout below intentionally switches to upstream HEAD.
     runs-on: ubuntu-latest
-    needs: [preflight]
     timeout-minutes: 120
     permissions:
       contents: read
@@ -1081,14 +1093,14 @@ jobs:
           retention-days: 1
 
   e2e-rust-hermetic:
-    name: E2E (Rust hermetic ${{ matrix.shard }}/4)
+    name: E2E (Rust hermetic ${{ matrix.shard }}/9)
     runs-on: ubuntu-latest
     # Artifact waits allow 30 minutes of queue time beyond the producer timeout; tests retain their own timeouts.
     timeout-minutes: 180
     strategy:
       fail-fast: false
       matrix:
-        shard: [0, 1, 2, 3]
+        shard: [0, 1, 2, 3, 4, 5, 6, 7, 8]
     permissions:
       contents: read
       actions: read
@@ -1131,7 +1143,7 @@ jobs:
           done
       - name: Run manifest shard
         env:
-          MC_E2E_SHARD: ${{ matrix.shard }}/4
+          MC_E2E_SHARD: ${{ matrix.shard }}/9
           MC_E2E_CK_MC_PREBUILT_BIN: ${{ github.workspace }}/packages/e2e-tests/.cache/prebuilt/ckdev-mc-e2e
           MC_E2E_CK_MC_DRIVE_FAULT_BIN: ${{ github.workspace }}/packages/e2e-tests/.cache/prebuilt/ckdev-mc-e2e-drive-fault
           MC_E2E_CK_SUBC_BIN: ${{ github.workspace }}/packages/e2e-tests/.cache/prebuilt/ckdev-subc

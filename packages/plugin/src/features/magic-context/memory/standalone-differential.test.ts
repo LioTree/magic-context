@@ -94,7 +94,10 @@ for (const scenario of ["stable", "plain", "unborn", "recovering"]) {
     const transform = createTransform({
         ...(v2 ? v2.createHostSeams({}, read, read, new Map()) : {}),
         db, tagger: createTagger(), scheduler: { shouldExecute: () => "defer" },
-        contextUsageMap: new Map(), historyRefreshSessions: new Set(),
+        contextUsageMap: new Map([[session, {
+            usage: { percentage: 70, inputTokens: 140000 },
+            updatedAt: Date.now(), hasUsageTokens: true,
+        }]]), historyRefreshSessions: new Set(),
         pendingMaterializationSessions: new Set(), lastHeuristicsTurnId: new Map(),
         clearReasoningAge: 50, protectedTokens: 0, historianRunnable: false,
         directory, sessionDirectoryBySession: directories,
@@ -196,7 +199,8 @@ for (const scenario of ["outside", "resolved-outside", "revalidate", "move"]) {
         const messages = [{ info: { id: "user-1", role: "user", sessionID: session },
             parts: [{ type: "text", text: "continue" }] }];
         if (!scenario.endsWith("outside") && phase >= 1) messages.push({
-            info: { id: "assistant-2", role: "assistant", sessionID: session, finish: "tool-calls" },
+            info: { id: "assistant-2", role: "assistant", sessionID: session, finish: "tool-calls",
+                tokens: { reasoning: 1600 } },
             parts: [{ type: "reasoning", text: "signed thought", metadata: { anthropic: { signature: "signed-loop" } } },
                 { type: "tool", callID: "read-call", tool: "read", state: { status: "completed", input: {}, output: "small result" } }],
         });

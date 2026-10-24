@@ -5,6 +5,10 @@ import {
     providerSubjectPart,
     rememberOpenCodeHostReplay,
 } from "../../hooks/magic-context/host-runner/opencode-adapter";
+import {
+    isCoveredInstructionRow,
+    markCoveredInstructionRow,
+} from "../../hooks/magic-context/host-served-rows";
 import { providerNativePart } from "../../hooks/magic-context/provider-visible-parts";
 import { modelAcceptsEmptyContent } from "../../hooks/magic-context/sentinel";
 import { getEmptyImageParts } from "../../hooks/magic-context/strip-content";
@@ -498,6 +502,8 @@ export function adaptPayload(
             ]),
         }));
         originals.set(mapped, message);
+        // The transform decides whether a restored covered instruction is served.
+        if (isCoveredInstructionRow(message)) markCoveredInstructionRow(mapped.info);
         if (typeof message.id !== "string") bridgesByCarrier.set(mapped, byCallID);
         messages.push(mapped);
     }

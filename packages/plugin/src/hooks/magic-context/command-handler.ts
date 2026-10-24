@@ -216,7 +216,11 @@ function throwSentinel(command: string): never {
     const sentinel = new Error(`${SENTINEL_PREFIX}${command.toUpperCase()}_HANDLED__`) as Error &
         Record<string, unknown>;
     sentinel[HTTP_SERVER_RESPONSE_TYPE_ID] = HTTP_SERVER_RESPONSE_TYPE_ID;
-    sentinel[ERROR_REPORTER_IGNORE] = true;
+    // effect 4 rc declares this key on the global Error interface as readonly, so
+    // any program that also loads those typings (the e2e OpenCode 2 harness does)
+    // rejects a direct write. The sentinel is the producer of the flag, so write it
+    // through the plain record view; the runtime object and key are unchanged.
+    (sentinel as Record<string, unknown>)[ERROR_REPORTER_IGNORE] = true;
     sentinel.status = 204;
     sentinel.statusText = undefined;
     sentinel.headers = {};

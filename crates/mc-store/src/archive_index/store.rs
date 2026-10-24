@@ -443,17 +443,44 @@ fn reminders_removed(text: &str) -> String {
     let lower = text.to_ascii_lowercase();
     let mut result = String::new();
     let mut cursor = 0;
-    while let Some(start) = lower[cursor..].find("<system-reminder>") {
-        let start = cursor + start;
-        let body = start + "<system-reminder>".len();
-        let Some(end) = lower[body..].find("</system-reminder>") else {
+    let mut search = 0;
+    let mut depth: usize = 0;
+    // Match TypeScript's nested-block scanner: an unclosed reminder hides its
+    // entire remaining body, and unmatched closing tags are removed as well.
+    while let Some(start) = lower[search..].find('<') {
+        let start = search + start;
+        search = start + 1;
+        let closing = lower[search..].starts_with('/');
+        let name_start = search + usize::from(closing);
+        if !lower[name_start..].starts_with("system-reminder") {
+            continue;
+        }
+        let name_end = name_start + "system-reminder".len();
+        let Some(end) = lower[name_end..].find('>') else {
             break;
         };
-        result.push_str(&text[cursor..start]);
-        cursor = body + end + "</system-reminder>".len();
+        let end = name_end + end;
+        let suffix = &text[name_end..end];
+        if suffix.contains('<')
+            || !(suffix.is_empty() || suffix == "/" || suffix.chars().next().is_some_and(js_space))
+        {
+            continue;
+        }
+        if depth == 0 {
+            result.push_str(&text[cursor..start]);
+        }
+        if closing {
+            depth = depth.saturating_sub(1);
+        } else if !suffix.ends_with('/') {
+            depth += 1;
+        }
+        cursor = end + 1;
+        search = cursor;
     }
-    result.push_str(&text[cursor..]);
-    result
+    if depth == 0 {
+        result.push_str(&text[cursor..]);
+    }
+    trim(&result).to_owned()
 }
 
 fn clean_user_segment(text: &str) -> String {

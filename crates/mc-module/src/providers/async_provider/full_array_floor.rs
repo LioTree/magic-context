@@ -140,12 +140,14 @@ pub(super) fn setup_floor(
     let family = KeyFamily::for_session(session);
     let refuse = |code: &str, reason: String| {
         tracing::error!(session, code, reason, "full-array floor refused setup");
-        Floor::Refuse(json!({
-            "answer": "refuse",
-            "request_id": request_id,
-            "code": code,
-            "reason": reason,
-        }))
+        Floor::Refuse(
+            serde_json::to_value(contract::setup::SetupAnswer::refuse(
+                request_id,
+                contract::errors::RefuseCode::from_code(code),
+                reason,
+            ))
+            .expect("Setup refusal serializes"),
+        )
     };
     let rows = match store.tag_high_water_by_session_prefix(&family.exact, &family.prefix) {
         Ok(rows) => rows,

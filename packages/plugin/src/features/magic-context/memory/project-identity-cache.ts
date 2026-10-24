@@ -1,5 +1,5 @@
 import { createHash } from "node:crypto";
-import { readdirSync, readFileSync } from "node:fs";
+import { promises as fs, readdirSync, readFileSync } from "node:fs";
 import path from "node:path";
 import { getMagicContextStorageDir } from "../../../shared/data-path";
 import { log } from "../../../shared/logger";
@@ -153,4 +153,42 @@ export function findPinnedIdentityByGitCommonDir(
         }
     }
     return undefined;
+}
+
+/** Maintenance only: an inaccessible directory may still exist; prune only confirmed ENOENT records. */
+export async function pruneMissingProjectIdentities(
+    storageDir = getMagicContextStorageDir(),
+): Promise<number> {
+    const directory = path.join(storageDir, "project-identities");
+    let removed = 0;
+    let entries: string[];
+    try {
+        entries = await fs.readdir(directory);
+    } catch {
+        return 0;
+    }
+    for (const entry of entries) {
+        if (!/^[0-9a-f]{64}\.json$/.test(entry)) continue;
+        const file = path.join(directory, entry);
+        try {
+            const record = JSON.parse(await fs.readFile(file, "utf8"));
+            if (
+                typeof record.directory !== "string" ||
+                !path.isAbsolute(record.directory) ||
+                cachePath(record.directory, storageDir) !== file ||
+                !/^git:[0-9a-f]{7,64}$/.test(record.identity)
+            )
+                continue;
+            try {
+                await fs.stat(record.directory);
+            } catch (error) {
+                if ((error as NodeJS.ErrnoException).code !== "ENOENT") continue;
+                await fs.unlink(file);
+                removed++;
+            }
+        } catch {
+            // Damaged records and storage failures are not proof a project is gone.
+        }
+    }
+    return removed;
 }
