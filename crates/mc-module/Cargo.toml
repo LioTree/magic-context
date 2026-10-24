@@ -49,6 +49,7 @@ cortexkit-role-agent-data = "0.2.2"
 # Runner-owned tags and context-ceiling details for async compaction.
 cortexkit-role-llm-runner = "=0.5.2"
 cortexkit-role-compaction-provider = "=0.5.1"
+cortexkit-role-routing = "=0.1.0"
 # RFC 8785 (JCS) canonical JSON for tool.catalog's answer bytes and digests: the
 # same canonicaliser the role crate uses, so floats and non-ASCII keys in a
 # caller's composition hash exactly as the runner hashes them.
@@ -118,3 +119,6 @@ nkeys = { version = "=0.4.5", default-features = false }
 # role.describe (src/tests/tool_catalog_conformance.rs).
 cortexkit-role-tool-provider-conformance = "=0.10.0"
 cortexkit-role-llm-runner-conformance = "=0.10.2"
+cortexkit-role-routing-conformance = "=0.1.0"
+# The routing kit's fake uses the kit's protocol version, not our live wire SDK.
+routing-conformance-protocol = { package = "subc-protocol", version = "=0.33.0" }
