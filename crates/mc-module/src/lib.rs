@@ -39,6 +39,7 @@ pub mod agent_data;
 mod agent_fragments;
 pub mod boundary;
 pub mod caveman;
+mod child_retention;
 pub mod ck_wire;
 pub mod classify;
 pub mod codec;
@@ -14345,8 +14346,11 @@ impl McHandler {
                     // envelope remains; the host parser rejects malformed contents.
                     record_attempt("manifest", String::new());
                     output = Some((model.clone(), result, child_session.clone()));
-                    // Cleanup reports unsupported runner deletion and closes routes.
-                    // The classify result is independent of snapshot retention.
+                    // The result is consumed: release the child (on a runner declaring
+                    // `session_retention`), then close routes; without a release, cleanup
+                    // reports unsupported runner deletion. The classify result is
+                    // independent of snapshot retention.
+                    producer.release_child("dream", &ledger_session).await;
                     let _ = producer.purge_session(&child_session).await;
                     break;
                 }
@@ -14356,6 +14360,8 @@ impl McHandler {
                 ),
                 Err(error) => record_attempt("failed", error.to_string()),
             }
+            // This attempt is over and its child is never read again.
+            producer.release_child("dream", &ledger_session).await;
             let _ = producer.purge_session(&child_session).await;
         }
         if output.is_none() {

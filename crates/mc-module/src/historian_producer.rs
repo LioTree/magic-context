@@ -12,6 +12,7 @@ use std::{
     time::Duration,
 };
 
+use crate::child_retention::{self, ChildRetention, ReleaseOutcome};
 use crate::runner_follow::{self, FollowCapabilities};
 use crate::runner_limits::RunnerLimits;
 use cortexkit_role_llm_runner::run::{
@@ -60,8 +61,9 @@ struct SendModel<'a> {
     variant: Option<&'a str>,
 }
 
-/// Serialize `prompt`, `send_id`, and nested `model` first, followed by optional
-/// retention seconds, then this client's `tools`, `generation`, and `system` fields.
+/// Serialize `prompt`, `send_id`, and nested `model` first, followed by the one
+/// optional retention member (`retention` seconds or `retention_policy`), then this
+/// client's `tools`, `generation`, and `system` fields.
 /// Omitting `delivery` selects queued mode; put any requested variant in `model`.
 #[derive(Serialize)]
 struct SendParams<'a> {
@@ -70,6 +72,8 @@ struct SendParams<'a> {
     model: SendModel<'a>,
     #[serde(skip_serializing_if = "Option::is_none")]
     retention: Option<u64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    retention_policy: Option<cortexkit_role_llm_runner::session_retention::RetentionPolicy>,
     #[serde(skip_serializing_if = "Option::is_none")]
     tools: Option<&'a [Value]>,
     generation: GenerationRequest,
@@ -143,7 +147,7 @@ pub(crate) fn session_send_request<'a>(
     variant: Option<&'a str>,
     max_output_tokens: u32,
     temperature: Option<f64>,
-    retention: Option<u64>,
+    retention: ChildRetention,
 ) -> Result<SendRequest<'a>, HistorianProducerError> {
     let (provider, model_name) = model.split_once('/').ok_or_else(|| {
         HistorianProducerError::Subc(ProducerErrorBody::untagged(
@@ -164,7 +168,9 @@ pub(crate) fn session_send_request<'a>(
                 model: model_name,
                 variant: variant.filter(|variant| !variant.is_empty()),
             },
-            retention,
+            // At most one member: a runner refuses a send carrying both.
+            retention: retention.seconds(),
+            retention_policy: retention.policy(),
             tools: run
                 .no_tools()
                 .map_err(run_parameter_error)?
@@ -954,15 +960,19 @@ pub struct HistorianProducer {
     session_id: Option<String>,
     command_route: Option<OpenedRoute>,
     subscribe_route: Option<OpenedRoute>,
-    /// `None` means this route has not been queried; `Some(None)` means it declared no
-    /// usable retention group. This cache belongs to a route and is cleared on close.
-    route_retention: Option<Option<u64>>,
+    /// `None` means this route has not been queried; otherwise the retention member
+    /// its runner's `role.describe` selects. This cache belongs to a route and is
+    /// cleared on close.
+    route_retention: Option<ChildRetention>,
     route_limits: RunnerLimits,
     route_follow: FollowCapabilities,
     control_pending: bool,
     /// Freeze the first send's policy for this session. In particular, a session that
     /// began without retention must not opt in on a later send.
-    session_retention: Option<Option<u64>>,
+    session_retention: Option<ChildRetention>,
+    /// The child this producer sent `session.release` for, so no child is
+    /// released twice.
+    released: Option<String>,
     /// When set, every route opens to this session's own runner instead of the
     /// configured runner module. The child session remains its own bind identity.
     session_runner: Option<SessionRunnerRoute>,
@@ -1019,7 +1029,7 @@ impl HistorianProducer {
                 variant,
                 max_output_tokens,
                 temperature,
-                None,
+                ChildRetention::Nothing,
             )?
             .for_session_runner(self.route_limits)?,
         )?;
@@ -1125,6 +1135,7 @@ impl HistorianProducer {
             route_follow: FollowCapabilities::default(),
             control_pending: false,
             session_retention: None,
+            released: None,
             session_runner: None,
         })
     }
@@ -1204,9 +1215,9 @@ impl HistorianProducer {
     ) -> Result<RunHandle, HistorianProducerError> {
         self.bind_session(session_id.to_string());
         let route = self.ensure_command_route().await?;
-        // Check `role.describe` before building this send; include retention only when
-        // the runner advertises support. Its first accepted send fixes the session's
-        // lifetime, so repeat sends must keep that initial policy.
+        // Check `role.describe` before building this send; the groups it declares pick
+        // the retention member (see `child_retention`). Its first accepted send fixes the
+        // session's lifetime, so repeat sends must keep that initial policy.
         let declared_retention = self.retention_for_route(route).await?;
         self.require_follow()?;
         let retention = select_session_retention(&mut self.session_retention, declared_retention);
@@ -1342,11 +1353,59 @@ impl HistorianProducer {
         Ok(())
     }
 
+    /// Release the bound child session once its result has been consumed: one
+    /// `session.release {}` call when the runner declares `session_retention`
+    /// (every child ck-mc starts on such a runner was sent the keep-nothing
+    /// policy). The outcome is logged once with `parent` and never retried; a
+    /// child is never released twice. Returns `None` when nothing was called.
+    pub(crate) async fn release_child(
+        &mut self,
+        kind: &str,
+        parent: &str,
+    ) -> Option<ReleaseOutcome> {
+        let child = self.session_id.clone()?;
+        if self.released.as_deref() == Some(child.as_str()) {
+            return None;
+        }
+        let route = match self.ensure_command_route().await {
+            Ok(route) => route,
+            Err(error) => {
+                tracing::warn!(
+                    "[mc-module] {kind} child {child} of {parent}: no route to release it: {error}"
+                );
+                return None;
+            }
+        };
+        if self.retention_for_route(route).await.ok()? != ChildRetention::Policy {
+            return None;
+        }
+        self.released = Some(child.clone());
+        let body = json!({ "method": child_retention::SESSION_RELEASE, "params": {} });
+        let outcome = match self.send_request(route, body).await {
+            Err(error) => ReleaseOutcome::Unanswered(error.to_string()),
+            Ok(corr) => match self
+                .read_terminal_for(route, corr, self.config.request_timeout)
+                .await
+            {
+                Err(error) => ReleaseOutcome::Unanswered(error.to_string()),
+                Ok(frame) => release_outcome(frame.header.ty, &frame.body),
+            },
+        };
+        child_retention::log_release(kind, parent, &child, &outcome);
+        Some(outcome)
+    }
+
     /// Release routes, but report that the runner cannot delete session data.
     /// Dreamer sessions contain memory-pool snapshots; closing a route does not
-    /// remove those snapshots from Broca's append-only write-ahead log.
+    /// remove those snapshots from Broca's append-only write-ahead log. A child
+    /// already released through `release_child` is the runner's to delete, so
+    /// that case closes the routes and reports nothing.
     pub async fn purge_session(&mut self, session_id: &str) -> Result<(), HistorianProducerError> {
+        let released = self.released.as_deref() == Some(session_id);
         self.close().await;
+        if released {
+            return Ok(());
+        }
         static RETENTION_WARNING: std::sync::Once = std::sync::Once::new();
         RETENTION_WARNING.call_once(|| {
             tracing::warn!("[mc-module] runner cannot delete sessions: Broca has no session.delete operation and never deletes a session. Its write-ahead log is append-only, an idle session is moved into an archive byte for byte after 7 days and kept, and engram backs both up. Dreamer memory-pool snapshots sent to the runner therefore stay indefinitely; closing routes does not delete them.");
@@ -1376,7 +1435,7 @@ impl HistorianProducer {
     async fn retention_for_route(
         &mut self,
         route: OpenedRoute,
-    ) -> Result<Option<u64>, HistorianProducerError> {
+    ) -> Result<ChildRetention, HistorianProducerError> {
         if let Some(retention) = self.route_retention {
             return Ok(retention);
         }
@@ -1391,9 +1450,9 @@ impl HistorianProducer {
                 retention_from_role_describe(&answer)
             }
             Err(error) if error.is_runner_reply_shape() => return Err(error),
-            Err(_) => None,
+            Err(_) => ChildRetention::Nothing,
         };
-        if retention.is_none() {
+        if retention == ChildRetention::Nothing {
             static RETENTION_UNAVAILABLE_WARNING: std::sync::Once = std::sync::Once::new();
             RETENTION_UNAVAILABLE_WARNING.call_once(|| {
                 tracing::warn!("[mc-module] Broca does not declare a usable retention capability; historian and dreamer sessions will use the runner's default lifetime");
@@ -1731,48 +1790,77 @@ impl HistorianProducer {
     }
 }
 
-/// Return a policy only when `role.describe` names `retention` and provides positive
-/// limits. Older runners may not support the field, so omitting it when the group is
-/// absent keeps their `session.send` requests valid. `answer` is the answer inside
-/// the runner's reply envelope (see `unary_json`).
-fn retention_from_role_describe(answer: &Value) -> Option<u64> {
-    let declares_retention = answer
-        .get("capabilities")
-        .and_then(Value::as_array)
-        .is_some_and(|groups| {
-            groups
-                .iter()
-                .any(|group| group.as_str() == Some("retention"))
-        });
-    if !declares_retention {
-        return None;
+/// What a `session.release` reply frame says. An error frame is the runner's
+/// refusal, carried with its whole body as detail.
+fn release_outcome(ty: FrameType, body: &[u8]) -> ReleaseOutcome {
+    match ty {
+        FrameType::Response => match serde_json::from_slice::<Value>(body) {
+            Ok(reply) => match crate::session_resolver::read_runner_reply(reply) {
+                Ok(answer) => ReleaseOutcome::from_answer(&answer),
+                Err(shape) => ReleaseOutcome::Unanswered(shape.to_string()),
+            },
+            Err(error) => ReleaseOutcome::Unanswered(error.to_string()),
+        },
+        FrameType::Error => match serde_json::from_slice::<Value>(body) {
+            Ok(detail) => ReleaseOutcome::Refused {
+                code: detail
+                    .get("code")
+                    .and_then(Value::as_str)
+                    .unwrap_or("unknown")
+                    .to_string(),
+                detail,
+            },
+            Err(error) => ReleaseOutcome::Unanswered(error.to_string()),
+        },
+        other => ReleaseOutcome::Unanswered(format!("unexpected {other:?} frame")),
     }
-    let max_seconds = answer
+}
+
+/// The retention member a send carries, from the groups `role.describe` declares
+/// (see `child_retention`). With only the older `retention` group, return seconds
+/// only when its limits are positive: older runners may not support the field, so
+/// omitting it when unusable keeps their `session.send` requests valid. `answer`
+/// is the answer inside the runner's reply envelope (see `unary_json`).
+fn retention_from_role_describe(answer: &Value) -> ChildRetention {
+    match child_retention::member_of_describe(answer) {
+        child_retention::RetentionMember::Policy => return ChildRetention::Policy,
+        child_retention::RetentionMember::Nothing => return ChildRetention::Nothing,
+        child_retention::RetentionMember::Seconds => {}
+    }
+    let Some(max_seconds) = answer
         .get("retention")
         .and_then(|retention| retention.get("max_seconds"))
         .and_then(Value::as_u64)
-        .filter(|max_seconds| *max_seconds > 0)?;
+        .filter(|max_seconds| *max_seconds > 0)
+    else {
+        return ChildRetention::Nothing;
+    };
     let delete_within_ms = answer
         .get("retention")
         .and_then(|retention| retention.get("delete_within_ms"))
-        .and_then(Value::as_u64)?;
-    if delete_within_ms == 0 {
-        return None;
+        .and_then(Value::as_u64);
+    if delete_within_ms.is_none_or(|ms| ms == 0) {
+        return ChildRetention::Nothing;
     }
-    Some(HISTORIAN_SESSION_RETENTION_SECONDS.min(max_seconds))
+    ChildRetention::Seconds(HISTORIAN_SESSION_RETENTION_SECONDS.min(max_seconds))
 }
 
+/// The retention a send into this session carries. The first send's member is
+/// frozen: later sends repeat it while the runner still declares it (seconds
+/// shrinking to a lowered maximum), and otherwise carry none.
 fn select_session_retention(
-    frozen: &mut Option<Option<u64>>,
-    declared: Option<u64>,
-) -> Option<u64> {
-    let original = *frozen.get_or_insert(declared);
-    let (Some(maximum), Some(original)) = (declared, original) else {
-        return None;
-    };
-    let selected = original.min(maximum);
-    *frozen = Some(Some(selected));
-    Some(selected)
+    frozen: &mut Option<ChildRetention>,
+    declared: ChildRetention,
+) -> ChildRetention {
+    match (*frozen.get_or_insert(declared), declared) {
+        (ChildRetention::Policy, ChildRetention::Policy) => ChildRetention::Policy,
+        (ChildRetention::Seconds(original), ChildRetention::Seconds(maximum)) => {
+            let selected = ChildRetention::Seconds(original.min(maximum));
+            *frozen = Some(selected);
+            selected
+        }
+        _ => ChildRetention::Nothing,
+    }
 }
 
 impl Drop for HistorianProducer {
@@ -2642,6 +2730,21 @@ pub(crate) mod tests {
         goodbyes: Vec<u16>,
         statuses: Vec<Value>,
         results: Vec<Value>,
+        /// Each `session.release`: the session its route is bound to, and params.
+        releases: Vec<(String, Value)>,
+        /// The method of every llm-runner request, in arrival order.
+        methods: Vec<String>,
+    }
+
+    /// How the fake runner answers one `session.release`.
+    #[derive(Clone)]
+    enum ReleaseScript {
+        /// Answer with this release reply.
+        Answer(Value),
+        /// Refuse with this error body.
+        Refuse(Value),
+        /// Never answer.
+        Silent,
     }
 
     #[derive(Default)]
@@ -2649,6 +2752,9 @@ pub(crate) mod tests {
         statuses: VecDeque<Value>,
         result: Option<Value>,
         describe: Option<Value>,
+        /// Answers to `session.release`, in order; once they run out the runner
+        /// answers `deleted`.
+        releases: VecDeque<ReleaseScript>,
         /// Answer every llm-runner op bare instead of inside `{"result": ...}`,
         /// as a runner off the pinned reply shape would.
         bare: bool,
@@ -2740,11 +2846,40 @@ pub(crate) mod tests {
             let log = self.log.lock().await;
             (log.statuses.len(), log.results.len())
         }
+
+        /// The method of every llm-runner request, in arrival order.
+        pub(crate) async fn methods(&self) -> Vec<String> {
+            self.log.lock().await.methods.clone()
+        }
+
+        /// The session each `session.release` was bound to, in order.
+        pub(crate) async fn released_sessions(&self) -> Vec<String> {
+            let log = self.log.lock().await;
+            log.releases
+                .iter()
+                .map(|(session, _)| session.clone())
+                .collect()
+        }
     }
 
     pub(crate) async fn publication_follower(
         output: &str,
         open_controls: bool,
+    ) -> (HistorianProducer, FakeServer) {
+        publication_follower_described(
+            output,
+            open_controls,
+            json!({"capabilities":["no_tools","max_steps"]}),
+        )
+        .await
+    }
+
+    /// [`publication_follower`] against a runner whose `role.describe` answer is
+    /// `describe` plus the run capabilities every fake runner adds.
+    pub(crate) async fn publication_follower_described(
+        output: &str,
+        open_controls: bool,
+        describe: Value,
     ) -> (HistorianProducer, FakeServer) {
         let events = if open_controls {
             vec![
@@ -2761,7 +2896,7 @@ pub(crate) mod tests {
         let server = fake_server_with_role_describe(
             json!({"state":"active","run_id":"run-1"}),
             events,
-            json!({"capabilities":["no_tools","max_steps"]}),
+            describe,
             false,
         )
         .await;
@@ -2898,6 +3033,12 @@ pub(crate) mod tests {
                         }
                         FrameType::Request => {
                             let req: Value = serde_json::from_slice(&frame.body).unwrap();
+                            log_task.lock().await.methods.push(
+                                req.get("method")
+                                    .and_then(Value::as_str)
+                                    .unwrap_or_default()
+                                    .to_string(),
+                            );
                             match req.get("method").and_then(Value::as_str) {
                                 Some("role.describe") => {
                                     log_task.lock().await.role_describes.push(req.clone());
@@ -3001,6 +3142,46 @@ pub(crate) mod tests {
                                         runner_reply(&answers_task, json!({"ack":true})).await,
                                     )
                                     .await;
+                                }
+                                Some("session.release") => {
+                                    let session = route_sessions
+                                        .get(&frame.header.channel)
+                                        .cloned()
+                                        .unwrap_or_default();
+                                    log_task
+                                        .lock()
+                                        .await
+                                        .releases
+                                        .push((session, req["params"].clone()));
+                                    let script =
+                                        answers_task.lock().await.releases.pop_front().unwrap_or(
+                                            ReleaseScript::Answer(json!({"state": "deleted"})),
+                                        );
+                                    match script {
+                                        ReleaseScript::Answer(reply) => {
+                                            send_response_frame(
+                                                &mut stream,
+                                                frame.header.channel,
+                                                frame.header.epoch,
+                                                frame.header.corr,
+                                                runner_reply(&answers_task, reply).await,
+                                            )
+                                            .await;
+                                        }
+                                        ReleaseScript::Refuse(body) => {
+                                            let frame = Frame::build(
+                                                FrameType::Error,
+                                                Flags::new(false, Priority::Interactive, false),
+                                                frame.header.channel,
+                                                frame.header.epoch,
+                                                frame.header.corr,
+                                                serde_json::to_vec(&body).unwrap(),
+                                            )
+                                            .unwrap();
+                                            write_frame(&mut stream, &frame).await.unwrap();
+                                        }
+                                        ReleaseScript::Silent => {}
+                                    }
                                 }
                                 Some("session.retract") => {
                                     log_task.lock().await.retracts.push(req["params"].clone());
@@ -3188,6 +3369,210 @@ pub(crate) mod tests {
         let log = server.log.lock().await;
         assert_eq!(log.sends.len(), 1);
         assert!(log.sends[0].get("retention").is_none());
+    }
+
+    /// A describe declaring `session_retention` (with or without `retention`).
+    pub(crate) fn session_retention_describe(with_retention: bool) -> Value {
+        let mut capabilities = vec![
+            "no_tools",
+            "max_steps",
+            "max_output_tokens",
+            "session_retention",
+        ];
+        if with_retention {
+            capabilities.push("retention");
+        }
+        json!({
+            "capabilities": capabilities,
+            "retention": {"max_seconds": 2_592_000, "delete_within_ms": 3_600_000},
+            "session_retention": {"max_days": 30, "max_unreleased_hold_ms": 60_000, "required": false},
+        })
+    }
+
+    /// Each describe shape selects at most one retention member (none when the
+    /// runner declares neither group), and no send ever carries both.
+    #[tokio::test]
+    async fn each_describe_shape_picks_exactly_one_retention_member() {
+        let keep_nothing =
+            json!({"keep":"none","archive_after_days":0,"backup":false,"request_dumps":false});
+        let retention = json!({"max_seconds": 2_592_000, "delete_within_ms": 3_600_000});
+        for (describe, expected_retention, expected_policy) in [
+            (
+                session_retention_describe(true),
+                None,
+                Some(keep_nothing.clone()),
+            ),
+            (
+                session_retention_describe(false),
+                None,
+                Some(keep_nothing.clone()),
+            ),
+            (
+                json!({"capabilities":["retention","no_tools","max_steps"],"retention":retention}),
+                Some(json!(86_400)),
+                None,
+            ),
+            (
+                json!({"capabilities":["no_tools","max_steps"],"retention":retention}),
+                None,
+                None,
+            ),
+        ] {
+            let server = fake_server_with_role_describe(
+                json!({"state":"active","run_id":"run-1"}),
+                Vec::new(),
+                describe.clone(),
+                false,
+            )
+            .await;
+            let mut client = client(&server).await;
+            client
+                .start("mc-historian:proj:shape", "role", "prompt", "prov/model-a")
+                .await
+                .unwrap();
+            client.close().await;
+            let log = server.log.lock().await;
+            assert_eq!(log.sends.len(), 1);
+            let send = &log.sends[0];
+            assert_eq!(
+                send.get("retention"),
+                expected_retention.as_ref(),
+                "{describe}"
+            );
+            assert_eq!(
+                send.get("retention_policy"),
+                expected_policy.as_ref(),
+                "{describe}"
+            );
+            assert!(send.get("retention").is_none() || send.get("retention_policy").is_none());
+        }
+    }
+
+    /// The bound child is released with one `session.release {}` on its own
+    /// route; a second request for the same child sends nothing, and purging
+    /// a released child reports no unsupported deletion.
+    #[tokio::test]
+    async fn release_child_releases_the_bound_child_exactly_once() {
+        let child = "mc-historian:proj:release-once";
+        let server = fake_server_with_role_describe(
+            json!({"state":"active","run_id":"run-1"}),
+            Vec::new(),
+            session_retention_describe(true),
+            false,
+        )
+        .await;
+        let mut client = client(&server).await;
+        client
+            .start(child, "role", "prompt", "prov/model-a")
+            .await
+            .unwrap();
+        assert_eq!(
+            client.release_child("historian", "parent").await,
+            Some(ReleaseOutcome::Answered(
+                cortexkit_role_llm_runner::session_retention::ReleaseState::Deleted
+            ))
+        );
+        assert_eq!(client.release_child("historian", "parent").await, None);
+        client.purge_session(child).await.unwrap();
+        let log = server.log.lock().await;
+        assert_eq!(log.releases, vec![(child.to_string(), json!({}))]);
+        let lines = child_retention::release_lines(child);
+        assert_eq!(lines.len(), 1, "{lines:?}");
+        assert!(
+            lines[0].contains("of parent released: deleted"),
+            "{lines:?}"
+        );
+    }
+
+    /// A runner without `session_retention` gets no release, and purging still
+    /// reports that it cannot delete the session.
+    #[tokio::test]
+    async fn release_child_sends_nothing_without_session_retention() {
+        let child = "mc-historian:proj:no-release";
+        let server = fake_server(json!({"state":"active","run_id":"run-1"}), Vec::new()).await;
+        let mut client = client(&server).await;
+        client
+            .start(child, "role", "prompt", "prov/model-a")
+            .await
+            .unwrap();
+        assert_eq!(client.release_child("historian", "parent").await, None);
+        assert!(matches!(
+            client.purge_session(child).await,
+            Err(HistorianProducerError::RunnerSessionDeletionUnsupported { .. })
+        ));
+        assert!(server.log.lock().await.releases.is_empty());
+        assert!(child_retention::release_lines(child).is_empty());
+    }
+
+    /// A refusal is logged once with its detail, and a release that never
+    /// answers is logged once with its failure reason; neither is retried.
+    #[tokio::test]
+    async fn a_refused_or_unanswered_release_is_logged_once_and_never_retried() {
+        let frozen =
+            json!({"keep":{"days":3},"archive_after_days":0,"backup":false,"request_dumps":false});
+        for (name, script, expected) in [
+            (
+                "conflict",
+                ReleaseScript::Refuse(
+                    json!({"code":"retention_conflict","message":"policy differs","detail":{"frozen":frozen}}),
+                ),
+                "release refused retention_conflict",
+            ),
+            (
+                "released",
+                ReleaseScript::Refuse(json!({"code":"session_released","message":"pending"})),
+                "release refused session_released",
+            ),
+            (
+                "owner",
+                ReleaseScript::Refuse(
+                    json!({"code":"scope_owner_mismatch","message":"not the owner"}),
+                ),
+                "release refused scope_owner_mismatch",
+            ),
+            (
+                "invalid",
+                ReleaseScript::Refuse(
+                    json!({"code":"invalid_params","message":"bad","detail":{"field":"retention_policy"}}),
+                ),
+                "release refused invalid_params",
+            ),
+            ("silent", ReleaseScript::Silent, "release got no answer"),
+        ] {
+            let child = format!("mc-historian:proj:release-{name}");
+            let server = fake_server_with_role_describe(
+                json!({"state":"active","run_id":"run-1"}),
+                Vec::new(),
+                session_retention_describe(false),
+                false,
+            )
+            .await;
+            server.answers.lock().await.releases = [
+                script,
+                // A retry would be answered; none must be made.
+                ReleaseScript::Answer(json!({"state":"deleted"})),
+            ]
+            .into();
+            let mut client = client(&server).await;
+            client.config.request_timeout = Duration::from_millis(200);
+            client
+                .start(&child, "role", "prompt", "prov/model-a")
+                .await
+                .unwrap();
+            let outcome = client.release_child("historian", "parent").await.unwrap();
+            assert!(
+                !matches!(outcome, ReleaseOutcome::Answered(_)),
+                "{name}: {outcome:?}"
+            );
+            assert_eq!(client.release_child("historian", "parent").await, None);
+            assert_eq!(server.log.lock().await.releases.len(), 1, "{name}");
+            let lines = child_retention::release_lines(&child);
+            assert_eq!(lines.len(), 1, "{lines:?}");
+            assert!(lines[0].contains(expected), "{lines:?}");
+            if name == "conflict" {
+                assert!(lines[0].contains("\"frozen\""), "{lines:?}");
+            }
+        }
     }
 
     #[tokio::test]
@@ -3617,7 +4002,7 @@ pub(crate) mod tests {
                             None,
                             32_000,
                             None,
-                            None,
+                            ChildRetention::Nothing,
                         )
                         .unwrap()
                         .for_session_runner(limits)
@@ -3736,10 +4121,13 @@ pub(crate) mod tests {
         include_str!("../testdata/broca/send_request.model_variant_retention.json");
 
     fn golden_send_params(variant: Option<&str>) -> String {
-        golden_send_params_with_retention(variant, None)
+        golden_send_params_with_retention(variant, ChildRetention::Nothing)
     }
 
-    fn golden_send_params_with_retention(variant: Option<&str>, retention: Option<u64>) -> String {
+    fn golden_send_params_with_retention(
+        variant: Option<&str>,
+        retention: ChildRetention,
+    ) -> String {
         let request = session_send_request(
             "s-1",
             "",
@@ -3780,7 +4168,7 @@ pub(crate) mod tests {
             .strip_suffix('}')
             .expect("retention golden is one JSON object");
         assert_eq!(
-            golden_send_params_with_retention(Some("high"), Some(86_400)),
+            golden_send_params_with_retention(Some("high"), ChildRetention::Seconds(86_400)),
             format!(
                 "{golden_body},\"tools\":[],\"generation\":{{\"max_output_tokens\":{HISTORIAN_MAX_OUTPUT_TOKENS}}}}}"
             )
@@ -3793,48 +4181,97 @@ pub(crate) mod tests {
             retention_from_role_describe(
                 &json!({"capabilities": ["retention"], "retention": {"max_seconds": 2_592_000, "delete_within_ms": 3_600_000}})
             ),
-            Some(86_400)
+            ChildRetention::Seconds(86_400)
         );
         assert_eq!(
             retention_from_role_describe(
                 &json!({"capabilities": [], "retention": {"max_seconds": 2_592_000, "delete_within_ms": 3_600_000}})
             ),
-            None
+            ChildRetention::Nothing
         );
         assert_eq!(
             retention_from_role_describe(
                 &json!({"capabilities": ["retention"], "retention": {"max_seconds": 43_200, "delete_within_ms": 3_600_000}})
             ),
-            Some(43_200)
+            ChildRetention::Seconds(43_200)
         );
+    }
+
+    /// A runner declaring `session_retention` gets the policy whatever else it
+    /// declares, including the older group with usable limits.
+    #[test]
+    fn session_retention_selects_the_policy_over_retention_seconds() {
+        for capabilities in [
+            json!(["session_retention"]),
+            json!(["retention", "session_retention"]),
+        ] {
+            assert_eq!(
+                retention_from_role_describe(&json!({
+                    "capabilities": capabilities,
+                    "retention": {"max_seconds": 2_592_000, "delete_within_ms": 3_600_000},
+                    "session_retention": {"max_days": 30, "max_unreleased_hold_ms": 60_000, "required": false},
+                })),
+                ChildRetention::Policy
+            );
+        }
     }
 
     #[test]
     fn a_session_without_first_send_retention_cannot_opt_in_later() {
         let mut frozen = None;
-        assert_eq!(select_session_retention(&mut frozen, None), None);
         assert_eq!(
-            select_session_retention(&mut frozen, Some(86_400)),
-            None,
+            select_session_retention(&mut frozen, ChildRetention::Nothing),
+            ChildRetention::Nothing
+        );
+        assert_eq!(
+            select_session_retention(&mut frozen, ChildRetention::Seconds(86_400)),
+            ChildRetention::Nothing,
             "a later route cannot opt a session into retention"
         );
-        assert_eq!(frozen, Some(None));
+        assert_eq!(
+            select_session_retention(&mut frozen, ChildRetention::Policy),
+            ChildRetention::Nothing,
+            "a later route cannot opt a session into a policy"
+        );
+        assert_eq!(frozen, Some(ChildRetention::Nothing));
     }
 
     #[test]
     fn a_reconnected_session_can_only_shorten_its_frozen_retention() {
         let mut frozen = None;
         assert_eq!(
-            select_session_retention(&mut frozen, Some(86_400)),
-            Some(86_400)
+            select_session_retention(&mut frozen, ChildRetention::Seconds(86_400)),
+            ChildRetention::Seconds(86_400)
         );
         assert_eq!(
-            select_session_retention(&mut frozen, Some(43_200)),
-            Some(43_200)
+            select_session_retention(&mut frozen, ChildRetention::Seconds(43_200)),
+            ChildRetention::Seconds(43_200)
         );
         assert_eq!(
-            select_session_retention(&mut frozen, Some(172_800)),
-            Some(43_200)
+            select_session_retention(&mut frozen, ChildRetention::Seconds(172_800)),
+            ChildRetention::Seconds(43_200)
+        );
+        assert_eq!(
+            select_session_retention(&mut frozen, ChildRetention::Policy),
+            ChildRetention::Nothing,
+            "a session started with seconds never switches member"
+        );
+    }
+
+    #[test]
+    fn a_policy_session_keeps_its_policy_and_never_gains_seconds() {
+        let mut frozen = None;
+        assert_eq!(
+            select_session_retention(&mut frozen, ChildRetention::Policy),
+            ChildRetention::Policy
+        );
+        assert_eq!(
+            select_session_retention(&mut frozen, ChildRetention::Policy),
+            ChildRetention::Policy
+        );
+        assert_eq!(
+            select_session_retention(&mut frozen, ChildRetention::Seconds(86_400)),
+            ChildRetention::Nothing
         );
     }
 

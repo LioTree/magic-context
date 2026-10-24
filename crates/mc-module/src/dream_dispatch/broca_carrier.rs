@@ -13,6 +13,7 @@
 
 use super::context::{ChildEvent, ChildObserver, TaskContext, TaskToolRouter, ToolError};
 use super::domain_control::available;
+use crate::child_retention::{self, child_policy, ChildRetention, ReleaseOutcome, RetentionMember};
 use crate::dream_runner::{CarrierError, ChildRequest, Completion, DreamCarrier, Usage};
 use crate::historian_runner::{HistorianRunnerKind, RunnerSource};
 use crate::McHandler;
@@ -42,7 +43,8 @@ pub const SESSION_PREFIX: &str = "mc-dream-";
 pub const MC_TOOLS: &[&str] = &["ctx_memory", "ctx_search"];
 /// The module that serves file tools to a Broca child.
 pub const FILE_TOOL_PROVIDER: &str = "aft";
-/// Retention for an ordinary dream session: one day, as for historian sessions.
+/// Retention for an ordinary dream session on a runner with only the older
+/// `retention` group: one day, as for historian sessions.
 pub const ORDINARY_RETENTION_SECONDS: u64 = 86_400;
 /// A privacy-sensitive dream needs deletion of all runner-held content within an
 /// hour of its retention expiring; a runner promising less is unavailable.
@@ -88,14 +90,15 @@ pub struct PortError {
 #[allow(async_fn_in_trait)]
 pub trait BrocaPort {
     /// One unary op (`role.describe`, `session.send`, `run.status`, `run.result`, `run.cancel`,
-    /// `session.retract`) with its role params; answers the reply body as sent,
+    /// `session.retract`, `session.release`) with its role params; answers the reply body as sent,
     /// envelope included (the carrier reads the envelope, strictly).
     async fn call(&mut self, session: &str, op: &str, params: Value) -> Result<Value, PortError>;
     /// The next unit of the session's `session.subscribe` stream from its start,
     /// or `None` when no unit is ready yet.
     async fn next_unit(&mut self, session: &str) -> Result<Option<Value>, PortError>;
-    /// Release the session's routes. This is never a deletion: erasure is the
-    /// runner's retention promise, fixed on the first send.
+    /// Release the session's routes. This is never a deletion: a child sent
+    /// `retention_policy` was already released through `session.release`, and
+    /// any other child lives as long as the retention its first send fixed.
     async fn release(&mut self, session: &str);
     /// Returns the parent session for a runner-lane conversation when this port uses
     /// that conversation's runner instead of the configured Broca module. The carrier
@@ -410,6 +413,8 @@ struct Attempt {
     total: Usage,
     final_observed: bool,
     reports_usage: bool,
+    /// The child was sent `retention_policy`, so it is released on close.
+    release: bool,
 }
 
 /// One dream attempt per open, each in a fresh Broca session whose id is minted
@@ -515,7 +520,10 @@ impl<P: BrocaPort> BrocaCarrier<P> {
         describe: &RoleDescribe,
         request: &ChildRequest,
         budget: Option<u64>,
-    ) -> Result<(u64, Option<u64>, Option<&'static str>), CarrierError> {
+    ) -> Result<(ChildRetention, Option<u64>, Option<&'static str>), CarrierError> {
+        // Retention is required in one of its two groups; the declared group
+        // picks the send member (see `child_retention`).
+        let member = child_retention::member(|group| describe.declares(group));
         // Every dream child has a mandatory step bound; usage cancellation cannot
         // replace the runner sealing pending calls at that exact model response.
         let mut required = vec![
@@ -523,9 +531,11 @@ impl<P: BrocaPort> BrocaCarrier<P> {
             caps::RUN_OPS,
             caps::RUN_STATUS,
             caps::STREAMING,
-            caps::RETENTION,
             caps::MAX_STEPS,
         ];
+        if member == RetentionMember::Nothing {
+            required.insert(4, caps::RETENTION);
+        }
         if request.allowed_tools.is_empty() {
             required.push(caps::NO_TOOLS);
         }
@@ -536,23 +546,41 @@ impl<P: BrocaPort> BrocaCarrier<P> {
         if !missing.is_empty() {
             return Err(error(format!("unavailable: {}", missing.join(","))));
         }
-        let limits = describe
-            .retention
-            .filter(|r| r.max_seconds > 0 && r.delete_within_ms > 0)
-            .ok_or_else(|| error("unavailable: retention"))?;
-        if self.policy.privacy_sensitive && limits.delete_within_ms > PRIVATE_DELETE_WITHIN_MS {
-            return Err(error("unavailable: retention_deletion_too_slow"));
-        }
-        let retention = if self.policy.privacy_sensitive {
-            request
-                .timeout
-                .as_secs()
-                .saturating_add(u64::from(request.timeout.subsec_nanos() > 0))
-                .saturating_add(PRIVATE_RETENTION_SLACK_SECONDS)
+        let retention = if member == RetentionMember::Policy {
+            // A keep-nothing child is deleted on release, or at the latest
+            // `max_unreleased_hold_ms` after its run ends when no release
+            // arrives; a privacy-sensitive dream needs that within the hour.
+            let limits = describe
+                .session_retention
+                .as_ref()
+                .ok_or_else(|| error("unavailable: session_retention"))?;
+            if self.policy.privacy_sensitive
+                && limits.max_unreleased_hold_ms > PRIVATE_DELETE_WITHIN_MS
+            {
+                return Err(error("unavailable: retention_deletion_too_slow"));
+            }
+            ChildRetention::Policy
         } else {
-            ORDINARY_RETENTION_SECONDS
-        }
-        .min(limits.max_seconds);
+            let limits = describe
+                .retention
+                .filter(|r| r.max_seconds > 0 && r.delete_within_ms > 0)
+                .ok_or_else(|| error("unavailable: retention"))?;
+            if self.policy.privacy_sensitive && limits.delete_within_ms > PRIVATE_DELETE_WITHIN_MS {
+                return Err(error("unavailable: retention_deletion_too_slow"));
+            }
+            ChildRetention::Seconds(
+                if self.policy.privacy_sensitive {
+                    request
+                        .timeout
+                        .as_secs()
+                        .saturating_add(u64::from(request.timeout.subsec_nanos() > 0))
+                        .saturating_add(PRIVATE_RETENTION_SLACK_SECONDS)
+                } else {
+                    ORDINARY_RETENTION_SECONDS
+                }
+                .min(limits.max_seconds),
+            )
+        };
         let advertised = describe.declares(caps::INPUT_TOKEN_CAP);
         if budget.is_some() && !advertised && self.policy.require_hard_cap {
             return Err(error("unavailable: input_token_cap"));
@@ -582,7 +610,7 @@ impl<P: BrocaPort> BrocaCarrier<P> {
         session: &str,
         request: &ChildRequest,
         (provider, name): (&str, &str),
-        retention: u64,
+        retention: ChildRetention,
         cap: Option<u64>,
     ) -> Result<Value, CarrierError> {
         let mut params = Map::new();
@@ -604,8 +632,13 @@ impl<P: BrocaPort> BrocaCarrier<P> {
         // sends into a plan-admitted session must not carry a tools override.
         let mut send = SendRequest::new(request.prompt.clone(), session)
             .with_runner_params(params)
-            .with_max_steps(u64::from(request.max_steps))
-            .with_retention(retention);
+            .with_max_steps(u64::from(request.max_steps));
+        // Never both members: a runner refuses a send carrying both.
+        match retention {
+            ChildRetention::Policy => send = send.with_retention_policy(child_policy()),
+            ChildRetention::Seconds(seconds) => send = send.with_retention(seconds),
+            ChildRetention::Nothing => {}
+        }
         if request.allowed_tools.is_empty() {
             send = send.with_no_tools();
         }
@@ -998,6 +1031,35 @@ impl<P: BrocaPort> BrocaCarrier<P> {
             .await
             .map_err(|_| error("cleanup_unknown"))?
     }
+
+    /// Release a quiesced child whose result has been consumed: one
+    /// `session.release {}` call, its outcome logged once and never retried.
+    /// Only a child sent `retention_policy` is released, and only when its
+    /// send may have created the session.
+    async fn release_child(&mut self, session: &str) {
+        let Some(attempt) = self.attempt.as_ref() else {
+            return;
+        };
+        if !attempt.release || !attempt.sent || attempt.refused {
+            return;
+        }
+        let outcome = match self
+            .port
+            .call(session, child_retention::SESSION_RELEASE, json!({}))
+            .await
+        {
+            Ok(reply) => match reply_answer(child_retention::SESSION_RELEASE, reply) {
+                Ok(answer) => ReleaseOutcome::from_answer(&answer),
+                Err(e) => ReleaseOutcome::Unanswered(e.message),
+            },
+            Err(e) if !e.outcome_unknown => ReleaseOutcome::Refused {
+                code: e.code,
+                detail: e.detail,
+            },
+            Err(e) => ReleaseOutcome::Unanswered(e.message),
+        };
+        child_retention::log_release("dream", &self.context.scope.session.0, session, &outcome);
+    }
 }
 
 struct OpenGuard {
@@ -1085,6 +1147,7 @@ impl<P: BrocaPort> DreamCarrier for BrocaCarrier<P> {
             total: Usage::default(),
             final_observed: false,
             reports_usage: describe.declares(caps::RUN_USAGE),
+            release: retention == ChildRetention::Policy,
         });
         Ok(session)
     }
@@ -1125,6 +1188,7 @@ impl<P: BrocaPort> DreamCarrier for BrocaCarrier<P> {
         // No memory effect after close begins, whatever the run does next.
         self.routes.update(child, |e| e.stop = true);
         self.quiesce(child).await?;
+        self.release_child(child).await;
         self.routes.remove(child);
         self.port.release(child).await;
         self.attempt = None;

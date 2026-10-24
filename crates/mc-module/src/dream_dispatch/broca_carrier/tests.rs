@@ -162,6 +162,9 @@ struct State {
     /// Calls given the runner's never-executed result instead of a dispatch.
     never_executed: Vec<(String, String)>,
     released: Vec<String>,
+    /// Scripted answers to `session.release`, in order; once they run out the
+    /// runner answers `deleted`.
+    release_replies: VecDeque<Result<Value, PortError>>,
     /// When set, a step without tool calls answers with this text computed from
     /// every tool result so far, as a model would answer from what it read.
     compose: Option<ComposeFn>,
@@ -279,6 +282,21 @@ impl FakeBroca {
         request
             .check_retention(limits.as_ref(), None)
             .map_err(|_| refused("invalid_params", json!({"field": "retention"})))?;
+        // llm-runner §9.14, as a runner enforces it: `retention_policy` only to a
+        // runner declaring `session_retention`, never beside `retention`.
+        let session_limits = describe
+            .declares(caps::SESSION_RETENTION)
+            .then_some(describe.session_retention)
+            .flatten();
+        cortexkit_role_llm_runner::session_retention::check_policy(
+            request.retention_policy.as_ref(),
+            request.retention.is_some(),
+            session_limits.as_ref(),
+            true,
+            None,
+            None,
+        )
+        .map_err(|refusal| refused(&refusal.code, refusal.detail))?;
         request
             .check_plan(&describe.capabilities)
             .map_err(|field| refused("invalid_params", json!({"field": field})))?;
@@ -678,6 +696,16 @@ impl FakeBroca {
                 Ok(serde_json::to_value(status).unwrap())
             }
             "session.retract" => Ok(json!("not_pending")),
+            "session.release" => {
+                let mut s = self.state();
+                let describe: RoleDescribe = serde_json::from_value(s.describe.clone()).unwrap();
+                if !describe.declares(caps::SESSION_RETENTION) {
+                    return Err(refused("unknown_op", json!({"op": "session.release"})));
+                }
+                s.release_replies
+                    .pop_front()
+                    .unwrap_or_else(|| Ok(json!({"state": "deleted"})))
+            }
             other => Err(refused("unknown_op", json!({"op": other}))),
         }
     }
@@ -1631,6 +1659,8 @@ async fn broca_child_conformance_cap_cases_hold_through_the_carrier() {
 mod executor;
 
 mod session_runner;
+
+mod session_retention;
 
 #[tokio::test]
 async fn broca_child_open_controls_follow_status_and_result_without_parsing_bodies() {

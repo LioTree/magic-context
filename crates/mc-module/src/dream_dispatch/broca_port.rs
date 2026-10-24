@@ -5,8 +5,9 @@
 //! uses, `RegisteredRoute::HistorianRunner`) on a route bound to the child's Broca
 //! session, with the `{method, params}` envelope Broca serves. `next_unit` follows
 //! the session's `session.subscribe` stream from its start. `release` closes the
-//! routes; it never deletes anything, since erasure is the runner's retention
-//! promise fixed on the first send.
+//! routes and never deletes anything; the carrier asks the runner to delete a
+//! child with the `session.release` op before that, when the runner declares
+//! `session_retention`.
 //!
 //! For a runner-lane conversation the same ops go to that conversation's own runner
 //! instead ([`SessionRunnerRoute`]). Each child route stays bound to its child
@@ -82,7 +83,14 @@ fn call_error(error: CallError) -> PortError {
         CallError::Module(body) => PortError {
             code: body.code.clone(),
             message: body.message.clone(),
-            detail: json!({"code": body.code, "message": body.message}),
+            // The refusal's own detail (for example the frozen policy of a
+            // `retention_conflict`) rides along when the module sent one.
+            detail: match &body.detail {
+                Some(detail) => {
+                    json!({"code": body.code, "message": body.message, "detail": detail})
+                }
+                None => json!({"code": body.code, "message": body.message}),
+            },
             outcome_unknown: false,
         },
         other => port_error("transport", other.to_string(), true),
