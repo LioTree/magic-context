@@ -480,6 +480,14 @@ impl Drop for Side {
     }
 }
 
+/// The session handle of the pair whose project folder is `project`. Each
+/// pair has its own folder, and the session reference no longer depends on
+/// the folder, so the session names the folder to keep each pair's reference,
+/// and the test registries keyed by it, apart from concurrently running pairs.
+fn pair_session(project: &Path) -> String {
+    format!("s-{}", project.file_name().unwrap().to_string_lossy())
+}
+
 impl Side {
     async fn new(
         project: &Path,
@@ -524,7 +532,7 @@ impl Side {
                 scope: None,
                 project_root: project.into(),
                 harness: "runner".into(),
-                session: "s".into(),
+                session: pair_session(project),
                 model_key: None,
                 config,
                 history_budget_tokens: 4_000.0,
@@ -701,7 +709,8 @@ impl Pair {
                 .unwrap()
                 .set_budget(4_096);
         }
-        let reference = runner_session_ref("thalamus-harness", profile.harness(), "s");
+        let session = pair_session(project.path());
+        let reference = runner_session_ref("thalamus-harness", profile.harness(), &session);
         let mut pair = Self {
             profile,
             transcript,
@@ -719,7 +728,7 @@ impl Pair {
             engine_mismatches: Default::default(),
             _project: project,
         };
-        let mut setup = json!({"method":"compaction.setup","params":{"session":"s","harness":profile.harness(),"request_id":"setup","model":"fixture","context_window":100_000,"composition":{"render_tags":true},"params":{"serializer_profile":profile.wire()},"now":1}});
+        let mut setup = json!({"method":"compaction.setup","params":{"session":session,"harness":profile.harness(),"request_id":"setup","model":"fixture","context_window":100_000,"composition":{"render_tags":true},"params":{"serializer_profile":profile.wire()},"now":1}});
         if let Some(lineage) = setup_lineage {
             setup["params"]["lineage_id"] = json!(lineage);
         }

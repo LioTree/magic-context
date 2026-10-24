@@ -572,6 +572,10 @@ struct Rig {
     _bus: Arc<InMemoryBus>,
     task: tokio::task::JoinHandle<()>,
     reference: String,
+    /// Named after the rig's own folder: the session reference no longer
+    /// depends on the folder, so this keeps each rig's reference, and the
+    /// test registries keyed by it, apart from concurrently running rigs.
+    session: String,
     db: PathBuf,
     seq: u64,
 }
@@ -609,6 +613,7 @@ impl Rig {
         };
         let store = Arc::new(McStore::open_for_test(&descriptor).unwrap());
         let runner = Arc::new(PagedRunner::default());
+        let session = format!("s-{}", dir.file_name().unwrap().to_string_lossy());
         let mut h = McHandler::new();
         h.store.set(store).ok().unwrap();
         h.provider_runner = runner.clone();
@@ -628,7 +633,7 @@ impl Rig {
                 scope: None,
                 project_root: dir.into(),
                 harness: "runner".into(),
-                session: "s".into(),
+                session: session.clone(),
                 model_key: None,
                 config,
                 history_budget_tokens: 4_000.0,
@@ -643,17 +648,18 @@ impl Rig {
             .start_compaction_bus(bus.clone(), "fixture".into())
             .await
             .unwrap();
-        let reference = runner_session_ref("thalamus-harness", "opencode", "s");
+        let reference = runner_session_ref("thalamus-harness", "opencode", &session);
         let rig = Self {
             h,
             runner,
             _bus: bus,
             task,
             reference,
+            session,
             db,
             seq: 0,
         };
-        let answer = rig.op("compaction.setup",json!({"session":"s","harness":"opencode","request_id":"setup","model":"fixture","context_window":100_000,"composition":{"render_tags":true},"params":{"serializer_profile":"opencode-aisdk"},"lineage_id":"L","now":1})).await;
+        let answer = rig.op("compaction.setup",json!({"session":rig.session,"harness":"opencode","request_id":"setup","model":"fixture","context_window":100_000,"composition":{"render_tags":true},"params":{"serializer_profile":"opencode-aisdk"},"lineage_id":"L","now":1})).await;
         assert_eq!(answer["answer"], "ready", "{answer}");
         rig
     }
@@ -1884,7 +1890,7 @@ async fn covered_tail_latency_benchmark() {
             let wall = Instant::now();
             let thread = cpu_time::ThreadTime::now();
             let process = cpu_time::ProcessTime::now();
-            let answer = rig.op("compaction.setup",json!({"session":"s","harness":"opencode","request_id":format!("descending-setup-{attempt}"),"model":"fixture","context_window":100_000,"composition":{"render_tags":true},"params":{"serializer_profile":"opencode-aisdk"},"lineage_id":format!("L3-{attempt}"),"descends_from":{"lineage_id":parent,"through_ordinal":first - 1},"now":1})).await;
+            let answer = rig.op("compaction.setup",json!({"session":rig.session,"harness":"opencode","request_id":format!("descending-setup-{attempt}"),"model":"fixture","context_window":100_000,"composition":{"render_tags":true},"params":{"serializer_profile":"opencode-aisdk"},"lineage_id":format!("L3-{attempt}"),"descends_from":{"lineage_id":parent,"through_ordinal":first - 1},"now":1})).await;
             assert_eq!(answer["answer"], "ready", "{answer}");
             setups.push((
                 wall.elapsed().as_secs_f64() * 1e3,
