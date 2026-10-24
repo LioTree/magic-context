@@ -1,8 +1,9 @@
 //! Placement and outcome accounting for ck-mc's model work.
 //!
-//! The scoped routing transport and runner lifecycle are injected. No live caller
-//! uses this engine yet; summary and dream adapters will supply those transports.
-// Remove the dead-code allowance when the first summary or dream caller lands.
+//! The scoped routing transport and runner lifecycle are injected. Summaries
+//! supply them in `historian_routed`; dream runs will supply their own.
+// Parts of the engine (concurrency slots, pins, parking shared across work
+// orders) are used only by dream runs, which do not call it yet.
 #![allow(dead_code)]
 
 use std::collections::{HashMap, VecDeque};
@@ -14,6 +15,7 @@ use cortexkit_role_routing::{
     report::{Outcome, ReportAnswer, ReportRequest, Usage},
     select::{ConcurrencySlot, Requirements, SelectRequest},
 };
+use serde::Serialize;
 
 use crate::runner_choices::RoutedChoice;
 
@@ -28,13 +30,27 @@ pub trait ScopeRoute: Sync {
     fn select(
         &self,
         provider: &str,
-        request: &SelectRequest,
+        request: &SelectParams,
     ) -> impl Future<Output = Result<RoutedChoice, Refusal>> + Send;
     fn report(
         &self,
         provider: &str,
         request: &ReportRequest,
     ) -> impl Future<Output = Result<ReportAnswer, Refusal>> + Send;
+}
+
+/// The `route.select` body: the published request plus members routing/v1
+/// 0.1.0 does not define yet. Each extra member is omitted unless the caller
+/// has established that its provider accepts it, because a provider may refuse
+/// an unknown top-level member instead of ignoring it.
+#[derive(Clone, Debug, PartialEq, Serialize)]
+pub struct SelectParams {
+    #[serde(flatten)]
+    pub request: SelectRequest,
+    /// `false` asks routing to skip a ladder entry that is waiting on a quota
+    /// reset instead of holding the work until the reset.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub hold_ok: Option<bool>,
 }
 
 /// Catalog discovery is supplied by the owner of the scoped route, not inferred
@@ -54,6 +70,8 @@ pub struct WorkOrder<'a, S> {
     pub concurrency_slots: Option<Vec<ConcurrencySlot>>,
     pub deadline_ms: u64,
     pub max_decisions: usize,
+    /// Sent on every select of this order when set; see [`SelectParams::hold_ok`].
+    pub hold_ok: Option<bool>,
 }
 
 /// The adapter owns prompt construction, validation/repair and following a send
@@ -379,8 +397,12 @@ impl<C: Clock> Engine<C> {
             request.correlation_id = Some(order.work_id.clone());
             request.concurrency_slots = order.concurrency_slots.clone();
             request.exclude = (!exclude.is_empty()).then(|| exclude.clone());
+            let params = SelectParams {
+                request,
+                hold_ok: order.hold_ok,
+            };
             let selected =
-                tokio::time::timeout(remaining, order.scope_route.select(&provider, &request))
+                tokio::time::timeout(remaining, order.scope_route.select(&provider, &params))
                     .await;
             let choice = match selected {
                 Ok(Ok(choice)) => choice,
@@ -483,4 +505,4 @@ impl<C: Clock> Engine<C> {
 }
 
 #[cfg(test)]
-mod tests;
+pub(crate) mod tests;
