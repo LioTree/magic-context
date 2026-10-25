@@ -16,6 +16,7 @@ export function measurementTransport(options: {
     broca?: BrocaMeasurementRoute;
     /** An override must be HTTP on 127.0.0.1 without URL credentials; the caller must supply the mock. */
     mockAnthropicEndpoint?: string;
+    onProviderAttempt?(providerHost: string): void;
 } = {}): MeasurementTransport {
     if (options.mockAnthropicEndpoint) {
         const url = new URL(options.mockAnthropicEndpoint);
@@ -41,6 +42,7 @@ export function measurementTransport(options: {
             try { child = spawn(process.execPath, [entry], {
                 cwd: clientRoot, stdio: ["pipe", "pipe", "ignore"],
                 env: { PATH: process.env.PATH, HOME: clientRoot, ...env,
+                    BUN_RUNTIME_TRANSPILER_CACHE_PATH: "0",
                     ANTHROPIC_API_KEY: material,
                     TWO_PASS_WITNESS: join(clientRoot, "client-witness.jsonl"),
                     ...(options.mockAnthropicEndpoint ? { TWO_PASS_MOCK_ANTHROPIC_ENDPOINT: options.mockAnthropicEndpoint } : {}),
@@ -67,10 +69,14 @@ export function measurementTransport(options: {
                 try {
                     const value = JSON.parse(line);
                     if (value.ready === true) { ready(); return; }
+                    if (typeof value.providerAttempt?.providerHost === "string") {
+                        options.onProviderAttempt?.(value.providerAttempt.providerHost); return;
+                    }
                     const call = pending.get(value.id);
                     if (!call) throw new Error("unbound_measurement_reply");
                     pending.delete(value.id);
-                    if (value.error) call.reject(new Error("measurement_dispatch_failed"));
+                    if (value.error) call.reject(new Error(["credential_no_credit", "credential_rate_limited"].includes(value.error)
+                        ? value.error : "measurement_dispatch_failed"));
                     else call.resolve(value.result);
                 } catch { fail(); }
             });
@@ -91,7 +97,7 @@ export function measurementTransport(options: {
                 let first: MeasurementRequest | undefined;
                 let firstText: string | undefined;
                 return {
-                    id: randomUUID(), isolation, maxSteps: 1, hostRetries: 0,
+                    id: randomUUID(), isolation, maxSteps: 1, hostRetries: 2,
                     async send(request) {
                         if (closed || busy || nextId >= 2) throw new Error("measurement_session_bounds");
                         if (first && (request.system !== first.system || request.model !== first.model ||
@@ -104,7 +110,7 @@ export function measurementTransport(options: {
                         busy = true;
                         const id = ++nextId;
                         const result = new Promise<MeasurementReply>((resolve, reject) => pending.set(id, { resolve, reject }));
-                        const timer = setTimeout(() => { pending.get(id)?.reject(new Error("measurement_send_timeout")); void close(); }, 125_000);
+                        const timer = setTimeout(() => { pending.get(id)?.reject(new Error("measurement_send_timeout")); void close(); }, 425_000);
                         child.stdin!.write(`${JSON.stringify({ id, request })}\n`);
                         try {
                             const reply = await result;

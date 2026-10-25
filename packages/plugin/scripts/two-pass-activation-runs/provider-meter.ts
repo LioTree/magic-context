@@ -1,7 +1,7 @@
 import { createServer, type IncomingHttpHeaders } from "node:http";
 import type { AddressInfo } from "node:net";
 import { CostStop, type UsageStep } from "../two-pass-live-replay/artifact-schema";
-import { PostGateBudgetStop, type CallBound, type CallMeter } from "./activation-driver";
+import { PostGateBudgetStop, redact, type CallBound, type CallMeter } from "./activation-driver";
 
 type Json = Record<string, unknown>;
 const object = (value: unknown): Json =>
@@ -63,7 +63,7 @@ export function sumProviderSteps(steps: readonly UsageStep[]): UsageStep {
 
 export interface DispatchReceipt {
     reservation: number;
-    request: { path: string; body: string };
+    request: { path: string; body: string; providerHost?: string };
     response: { status: number; body: string; contentType: string };
     steps?: UsageStep[];
 }
@@ -82,16 +82,21 @@ export async function meteredDispatch(input: {
     return { reservation, response, steps };
 }
 
-/** Require a loopback upstream; the caller supplies the mock and disables external network access. */
+/** Default to loopback; paid callers must explicitly authorize the configured HTTPS provider. */
 export async function mockMeteringProxy(input: {
     upstream: string;
     meter: CallMeter;
     outputCeiling: number;
     classify(path: string, body: string): CallBound["kind"];
     beforeDispatch?(): Promise<void>;
+    paidProvider?: boolean;
+    secrets?: readonly string[];
+    forwardCredentials?: boolean;
+    onProviderAttempt?(providerHost: string): void;
 }) {
     const upstream = new URL(input.upstream);
-    if (upstream.protocol !== "http:" || upstream.hostname !== "127.0.0.1" || upstream.username || upstream.password)
+    if (upstream.username || upstream.password || (input.paidProvider ? upstream.protocol !== "https:"
+        : upstream.protocol !== "http:" || upstream.hostname !== "127.0.0.1"))
         throw new Error("mock_upstream_must_be_loopback");
     const receipts: DispatchReceipt[] = [];
     const failures: string[] = [];
@@ -120,14 +125,15 @@ export async function mockMeteringProxy(input: {
                 meter: input.meter, bound,
                 async dispatch() {
                     await input.beforeDispatch?.();
+                    input.onProviderAttempt?.(target.host);
                     const reply = await fetch(target, {
-                        method: request.method, headers: forwardHeaders(request.headers), body,
+                        method: request.method, headers: forwardHeaders(request.headers, input.forwardCredentials), body,
                         redirect: "error", signal: AbortSignal.timeout(120_000),
                     });
                     return { status: reply.status, body: await reply.text(), contentType: reply.headers.get("content-type") ?? "application/json" };
                 },
             });
-            receipts.push({ ...result, request: { path, body } });
+            receipts.push(redact({ ...result, request: { path, body, providerHost: target.host } }, input.secrets) as DispatchReceipt);
             response.writeHead(result.response.status, { "content-type": result.response.contentType });
             response.end(result.response.body);
         } catch (error) {
@@ -158,8 +164,8 @@ function requestOutputCeiling(body: string, configured: number): number {
         .filter((value) => value !== undefined && value !== null).map(tokens));
 }
 
-function forwardHeaders(headers: IncomingHttpHeaders): Record<string, string> {
+function forwardHeaders(headers: IncomingHttpHeaders, credentials = false): Record<string, string> {
     return Object.fromEntries(Object.entries(headers)
-        .filter(([key, value]) => typeof value === "string" && !["host", "connection", "content-length", "authorization", "x-api-key"].includes(key))
+        .filter(([key, value]) => typeof value === "string" && !["host", "connection", "content-length", ...credentials ? [] : ["authorization", "x-api-key"]].includes(key))
         .map(([key, value]) => [key, value as string]));
 }

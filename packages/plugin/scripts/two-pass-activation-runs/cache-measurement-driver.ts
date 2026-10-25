@@ -127,6 +127,7 @@ export async function runCacheMeasurement(options: {
     inputs: PersistedMeasurementInputs;
     outputCeiling: number;
     credentials?: ScopedCredentials;
+    anthropicGrant?: import("./activation-driver").CredentialId;
 }) {
     const env = disposableEnvironment(options.root);
     if (
@@ -138,9 +139,10 @@ export async function runCacheMeasurement(options: {
     const meter = callMeter(options.ledger, options.profile);
     const model = "claude-sonnet-5-5";
     const broca = await options.transport.openBroca({ root: options.root, env, model });
+    if (!broca && !options.anthropicGrant) throw new Error("anthropic_grant_required");
     return withCredential(
         options.credentials,
-        broca ? undefined : "apikey:anthropic",
+        broca ? undefined : options.anthropicGrant,
         options.transport.kind === "fake",
         async (credentialEnv, secrets) => {
             const session =
@@ -150,6 +152,7 @@ export async function runCacheMeasurement(options: {
                     env: { ...env, ...credentialEnv },
                     model,
                 }));
+            let credentialStop = false;
             try {
                 if (options.transport.kind === "real-host")
                     session.isolation = await attestHost(
@@ -221,13 +224,15 @@ export async function runCacheMeasurement(options: {
                     secrets,
                 );
             } catch (error) {
-                if (error instanceof PostGateBudgetStop) throw error;
+                credentialStop = error instanceof Error && ["credential_no_credit", "credential_rate_limited"].includes(error.message);
+                if (error instanceof PostGateBudgetStop || (error instanceof Error &&
+                    ["credential_no_credit", "credential_rate_limited"].includes(error.message))) throw error;
                 throw new Error("cache_measurement_failed");
             } finally {
                 try {
                     await session.close();
                 } catch {
-                    throw new Error("measurement_close_failed");
+                    if (!credentialStop) throw new Error("measurement_close_failed");
                 }
             }
         },

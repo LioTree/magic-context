@@ -41,7 +41,7 @@ test("first-party child retains raw history and reports observed cache usage aga
         expect(requests[1].messages[0]).toEqual(requests[0].messages[0]);
         expect(requests[1].messages[1].content).toEqual([{ type: "text", text: "raw first reply\n" }]);
         expect(session.maxSteps).toBe(1);
-        expect(session.hostRetries).toBe(0);
+        expect(session.hostRetries).toBe(2);
         expect(session.isolation.proof.pid).not.toBe(process.pid);
         expect(session.isolation.proof.output).toContain(root);
         await expect(session.send(first)).rejects.toThrow("measurement_session_bounds");
@@ -50,6 +50,28 @@ test("first-party child retains raw history and reports observed cache usage aga
 
 test("measurement endpoint overrides cannot target a real provider", () => {
     expect(() => measurementTransport({ mockAnthropicEndpoint: "https://api.anthropic.com/v1/messages" })).toThrow("mock_endpoint_not_loopback");
+});
+
+test("first-party worker propagates credential_no_credit and stops subsequent sends", async () => {
+    const parent = join(realpathSync(tmpdir()), "magic-context");
+    mkdirSync(parent, { recursive: true });
+    const root = mkdtempSync(join(parent, "anthropic-credit-"));
+    let calls = 0;
+    const mock = Bun.serve({ hostname: "127.0.0.1", port: 0, fetch() {
+        calls++;
+        return Response.json({ error: { type: "invalid_request_error", message: "Your credit balance is too low" } }, { status: 400 });
+    } });
+    const transport = measurementTransport({ mockAnthropicEndpoint: `${mock.url}v1/messages` });
+    let session: Awaited<ReturnType<typeof transport.openAnthropic>> | undefined;
+    try {
+        session = await transport.openAnthropic({ root, model: "claude-sonnet-5-5",
+            env: { ...disposableEnvironment(root), ANTHROPIC_API_KEY: "mock-credit-key" } });
+        const request: MeasurementRequest = { model: "claude-sonnet-5-5", maxOutputTokens: 10, system: "mock only",
+            messages: [{ role: "user", content: "mock only" }], tools: [], mode: "best_effort" };
+        await expect(session.send(request)).rejects.toThrow("credential_no_credit");
+        await expect(session.send(request)).rejects.toThrow("credential_no_credit");
+        expect(calls).toBe(1);
+    } finally { await session?.close(); mock.stop(true); rmSync(root, { recursive: true, force: true }); }
 });
 
 test("CKCRED adapter fetches only the exact authorized grant with an in-memory token", async () => {

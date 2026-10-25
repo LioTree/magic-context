@@ -167,6 +167,7 @@ function measurement(path: string, read: number | undefined = 95, fallback = fal
         inputs: inputs(),
         outputCeiling: 100,
         credentials: credentials(events),
+        anthropicGrant: "apikey:anthropic:ufukaltinokgmail" as const,
     };
     return { options, requests, replies, events };
 }
@@ -233,12 +234,12 @@ describe("cache measurement", () => {
         expect(JSON.parse(JSON.stringify(result)).route).toBe("ckcred-anthropic");
         expect(fake.events).toEqual([
             "broca",
-            "get:apikey:anthropic",
+            "get:apikey:anthropic:ufukaltinokgmail",
             "anthropic",
             "send",
             "send",
             "close",
-            "end:apikey:anthropic",
+            "end:apikey:anthropic:ufukaltinokgmail",
         ]);
         expect(
             redact({ env: { CLINE_API_KEY: secret }, headers: { "x-api-key": secret } }, [secret]),
@@ -274,7 +275,7 @@ describe("cache measurement", () => {
             throw new Error(secret);
         };
         await expect(runCacheMeasurement(fake.options)).rejects.toThrow("scoped_run_failed");
-        expect(fake.events).toEqual(["broca", "get:apikey:anthropic", "end:apikey:anthropic"]);
+        expect(fake.events).toEqual(["broca", "get:apikey:anthropic:ufukaltinokgmail", "end:apikey:anthropic:ufukaltinokgmail"]);
     });
 });
 
