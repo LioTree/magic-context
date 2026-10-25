@@ -294,12 +294,8 @@ fn failed(code: &str) -> RunResult<String> {
 fn vendored_kit_fake_matches_published_source() {
     let source = include_str!("kit_fake.rs");
     let (_, body) = source.split_once("// BEGIN VENDORED BODY\n").unwrap();
-    let original = body.replace(
-        "use routing_conformance_protocol::ErrorBody;",
-        "use subc_protocol::ErrorBody;",
-    );
     assert_eq!(
-        format!("{:x}", Sha256::digest(original.as_bytes())),
+        format!("{:x}", Sha256::digest(body.as_bytes())),
         "ef60939ceaff9be40af1a89bbf56f3a5bb1d5acaeea71527f2ab604db8e2db6f"
     );
 }
@@ -698,7 +694,7 @@ async fn no_provider_or_ambiguous_provider_sends_nothing_and_is_generation_cache
             .await
             .unwrap_err()
             .code,
-        "mc_routing_unavailable"
+        "routing_provider_missing"
     );
     assert_eq!(
         engine
@@ -706,7 +702,7 @@ async fn no_provider_or_ambiguous_provider_sends_nothing_and_is_generation_cache
             .await
             .unwrap_err()
             .code,
-        "mc_routing_unavailable"
+        "routing_provider_missing"
     );
     let ambiguous = RoutingCatalog {
         generation: 2,
@@ -716,7 +712,7 @@ async fn no_provider_or_ambiguous_provider_sends_nothing_and_is_generation_cache
         .run(&ambiguous, &rig.order(), &runner)
         .await
         .unwrap_err();
-    assert_eq!(error.code, "mc_routing_ambiguous");
+    assert_eq!(error.code, "routing_provider_ambiguous");
     assert_eq!(error.modules, ["one", "two"]);
     assert!(rig.route.trace.lock().unwrap().events.is_empty());
     let available = RoutingCatalog {

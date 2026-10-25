@@ -54,18 +54,9 @@ use crate::session_resolver::RunnerBindIdentity;
 /// Decisions one summary may take before it is refused `mc_route_exhausted`.
 pub const SUMMARY_MAX_DECISIONS: usize = 3;
 
-/// Whether the routing provider accepts `hold_ok` on `route.select`.
-/// routing/v1 as published (`cortexkit-role-routing` 0.1.0 through 0.2.0)
-/// defines no such member, and prefrontal's provider refuses an unknown
-/// top-level member, so sending it would make routing refuse exactly the
-/// pressure-driven summaries that must not wait. Turn this on with the routing
-/// release that adds `hold_ok` to `route.select`.
+/// A transport sends an optional select control only when its provider declares support.
+/// Production negotiates `select_hold_control` on the scoped provider route.
 pub const ROUTE_SELECT_HOLD_OK_SUPPORTED: bool = false;
-
-/// The production transport cannot place a summary yet. It answers this until
-/// ck-mc registers each firing's child scope with the daemon and discovers the
-/// routing provider live, which is what makes routed summaries safe to run.
-pub const SUMMARY_ROUTING_UNPROVEN: &str = "mc_summary_routing_unproven";
 
 /// Why a transport cannot place summaries, by name.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -95,8 +86,11 @@ pub fn choose_summary_path(support: Result<(), RoutingSupportRefusal>) -> Summar
 /// The routing a summary should use, or `None` to keep the chain path.
 pub(crate) fn active_routing(
     routing: Option<Arc<dyn SummaryRouting>>,
+    scope: Option<&ScopeStamp>,
 ) -> Option<Arc<dyn SummaryRouting>> {
-    routing.filter(|routing| choose_summary_path(routing.routing_support()) == SummaryPath::Routed)
+    routing.filter(|routing| {
+        choose_summary_path(routing.routing_support_for(scope)) == SummaryPath::Routed
+    })
 }
 
 /// Engines kept at most for this many sessions; past it, sessions whose engine
@@ -110,9 +104,26 @@ const SUMMARY_ENGINE_SESSION_CAP: usize = 256;
 #[derive(Default)]
 pub struct SummaryEngines {
     engines: Mutex<HashMap<String, Arc<tokio::sync::Mutex<Engine>>>>,
+    routing_outage: Mutex<bool>,
 }
 
 impl SummaryEngines {
+    fn note_outage(&self, code: &str, detail: &str) {
+        let mut outage = self.routing_outage.lock().expect("summary routing outage");
+        if !*outage {
+            *outage = true;
+            tracing::warn!(
+                code,
+                detail,
+                "summary routing provider unavailable; later firings will rediscover it"
+            );
+        }
+    }
+
+    fn routing_ready(&self) {
+        *self.routing_outage.lock().expect("summary routing outage") = false;
+    }
+
     fn for_session(&self, session_id: &str) -> Arc<tokio::sync::Mutex<Engine>> {
         let mut engines = self.engines.lock().expect("summary engines mutex");
         if let Some(engine) = engines.get(session_id) {
@@ -161,10 +172,12 @@ impl SummaryScope {
         )
     }
 
-    /// The project the scope serves. This subc-protocol release stamps no
-    /// project id, so the bound project root stands for it.
+    /// The project the scope serves, with the bound root for older unstamped sessions.
     fn project(&self) -> String {
-        self.identity.project_root.display().to_string()
+        self.stamp
+            .project_id
+            .clone()
+            .unwrap_or_else(|| self.identity.project_root.display().to_string())
     }
 }
 
@@ -175,6 +188,14 @@ pub trait SummaryRouting: Send + Sync {
     /// Whether this transport can place summaries at all. A summary takes the
     /// routed path only when it can; the refusal names what is missing.
     fn routing_support(&self) -> Result<(), RoutingSupportRefusal>;
+    fn routing_support_for(
+        &self,
+        _scope: Option<&ScopeStamp>,
+    ) -> Result<(), RoutingSupportRefusal> {
+        self.routing_support()
+    }
+    /// Check live provider admission while the session's scoped route is bound.
+    async fn observe_scope(&self, _scope: &SummaryScope) {}
     /// The `routing/v1` providers in the catalog, with its generation.
     async fn catalog(&self) -> Result<RoutingCatalog, String>;
     async fn select(
@@ -198,6 +219,9 @@ pub trait SummaryRouting: Send + Sync {
     /// Whether `route.select` may carry `hold_ok`.
     fn select_accepts_hold_ok(&self) -> bool {
         ROUTE_SELECT_HOLD_OK_SUPPORTED
+    }
+    fn select_accepts_hold_ok_for(&self, _scope: &SummaryScope) -> bool {
+        self.select_accepts_hold_ok()
     }
     /// The persona tiers the summary renders from.
     fn persona_tiers(&self, project_root: &Path) -> Result<Vec<Tier>, PersonaError> {
@@ -270,17 +294,31 @@ pub(crate) async fn run_routed_summary(
     let catalog = match summary.routing.catalog().await {
         Ok(catalog) => catalog,
         Err(detail) => {
-            return refuse_without_send(&summary, "mc_routing_unavailable", &detail, None)
+            summary
+                .engines
+                .note_outage("routing_provider_missing", &detail);
+            return refuse_without_send(&summary, "routing_provider_missing", &detail, None);
         }
     };
     if catalog.providers.is_empty() {
+        summary
+            .engines
+            .note_outage("routing_provider_missing", "no module provides routing/v1");
         return refuse_without_send(
             &summary,
-            "mc_routing_unavailable",
+            "routing_provider_missing",
             "no module provides routing/v1",
             None,
         );
     }
+    if catalog.providers.len() > 1 {
+        let detail = catalog.providers.join(", ");
+        summary
+            .engines
+            .note_outage("routing_provider_ambiguous", &detail);
+        return refuse_without_send(&summary, "routing_provider_ambiguous", &detail, None);
+    }
+    summary.engines.routing_ready();
     let Some(stamp) = summary.scope else {
         return refuse_without_send(
             &summary,
@@ -383,7 +421,8 @@ fn summary_work_order<'a>(
             .now_ms()
             .saturating_add(budget.as_millis() as u64 + 60_000),
         max_decisions: SUMMARY_MAX_DECISIONS,
-        hold_ok: (summary.pressure && summary.routing.select_accepts_hold_ok()).then_some(false),
+        hold_ok: (summary.pressure && summary.routing.select_accepts_hold_ok_for(route.scope))
+            .then_some(false),
     }
 }
 
@@ -456,10 +495,15 @@ fn refuse_without_send(
     summary
         .store
         .commit_meta(summary.session_id, loaded.row_version, &meta)?;
-    tracing::warn!(
-        "[mc-module][{}] summary not sent: {code}: {detail}",
-        summary.session_id
-    );
+    if !matches!(
+        code,
+        "routing_provider_missing" | "routing_provider_ambiguous"
+    ) {
+        tracing::warn!(
+            "[mc-module][{}] summary not sent: {code}: {detail}",
+            summary.session_id
+        );
+    }
     Err(routing_error(code, detail))
 }
 
@@ -893,9 +937,69 @@ const ROUTING_CALL_TIMEOUT: Duration = Duration::from_secs(10);
 pub struct SubcSummaryRouting {
     pub connection_file: PathBuf,
     pub route_targets: crate::route_targets::RouteTargetConfig,
+    readiness: Mutex<HashMap<String, Result<bool, RoutingSupportRefusal>>>,
 }
 
 impl SubcSummaryRouting {
+    pub fn new(
+        connection_file: PathBuf,
+        route_targets: crate::route_targets::RouteTargetConfig,
+    ) -> Self {
+        Self {
+            connection_file,
+            route_targets,
+            readiness: Mutex::default(),
+        }
+    }
+
+    fn stamp_key(stamp: &ScopeStamp) -> String {
+        format!(
+            "{}|{}|{}",
+            serde_json::to_string(&stamp.owner).expect("scope owner"),
+            stamp.scope_ref,
+            stamp.scope_epoch
+        )
+    }
+
+    async fn preflight(&self, scope: &SummaryScope) -> Result<bool, RoutingSupportRefusal> {
+        let catalog = self
+            .catalog()
+            .await
+            .map_err(|detail| RoutingSupportRefusal {
+                code: "routing_catalog_unavailable".into(),
+                detail,
+            })?;
+        let provider = match catalog.providers.as_slice() {
+            [] => {
+                return Err(RoutingSupportRefusal {
+                    code: "routing_provider_missing".into(),
+                    detail: "no module provides routing/v1".into(),
+                })
+            }
+            [provider] => provider,
+            providers => {
+                return Err(RoutingSupportRefusal {
+                    code: "routing_provider_ambiguous".into(),
+                    detail: providers.join(", "),
+                })
+            }
+        };
+        let describe: cortexkit_role_routing::describe::RoleDescribe = self
+            .call(provider, scope, "role.describe", serde_json::json!({}))
+            .await
+            .map_err(|error| RoutingSupportRefusal {
+                code: "mc_summary_route_unavailable".into(),
+                detail: error.to_string(),
+            })?;
+        cortexkit_role_routing::describe::check_describe(&describe).map_err(|error| {
+            RoutingSupportRefusal {
+                code: "mc_routing_role_invalid".into(),
+                detail: error.to_string(),
+            }
+        })?;
+        Ok(describe.serves(cortexkit_role_routing::capabilities::SELECT_HOLD_CONTROL))
+    }
+
     async fn call<T: serde::de::DeserializeOwned>(
         &self,
         provider: &str,
@@ -967,12 +1071,42 @@ impl SubcSummaryRouting {
 
 #[subc_client_rs::async_trait]
 impl SummaryRouting for SubcSummaryRouting {
+    fn routing_support_for(&self, scope: Option<&ScopeStamp>) -> Result<(), RoutingSupportRefusal> {
+        let Some(stamp) = scope else {
+            return Err(RoutingSupportRefusal {
+                code: "mc_session_scope_missing".into(),
+                detail: "no session scope".into(),
+            });
+        };
+        self.readiness
+            .lock()
+            .expect("summary readiness")
+            .get(&Self::stamp_key(stamp))
+            .cloned()
+            .unwrap_or_else(|| self.routing_support().map(|()| false))
+            .map(|_| ())
+    }
+
+    async fn observe_scope(&self, scope: &SummaryScope) {
+        let result = self.preflight(scope).await;
+        let mut readiness = self.readiness.lock().expect("summary readiness");
+        readiness.insert(Self::stamp_key(&scope.stamp), result);
+    }
+
+    fn select_accepts_hold_ok_for(&self, scope: &SummaryScope) -> bool {
+        matches!(
+            self.readiness
+                .lock()
+                .expect("summary readiness")
+                .get(&Self::stamp_key(&scope.stamp)),
+            Some(Ok(true))
+        )
+    }
+
     fn routing_support(&self) -> Result<(), RoutingSupportRefusal> {
         Err(RoutingSupportRefusal {
-            code: SUMMARY_ROUTING_UNPROVEN.into(),
-            detail: "routed summaries need a registered child scope per firing and live \
-                routing discovery; until then summaries keep the model-chain path"
-                .into(),
+            code: "mc_session_scope_missing".into(),
+            detail: "a session scope is required for the live routing check".into(),
         })
     }
 
@@ -1015,6 +1149,15 @@ impl SummaryRouting for SubcSummaryRouting {
         scope: &SummaryScope,
         params: &SelectParams,
     ) -> Result<RoutedChoice, Refusal> {
+        let mut params = params.clone();
+        if params.hold_ok.is_some() {
+            let describe: cortexkit_role_routing::describe::RoleDescribe = self
+                .call(provider, scope, "role.describe", serde_json::json!({}))
+                .await?;
+            if !describe.serves(cortexkit_role_routing::capabilities::SELECT_HOLD_CONTROL) {
+                params.hold_ok = None;
+            }
+        }
         let params = serde_json::to_value(params)
             .map_err(|error| Refusal::new(RefusalCode::RoutingUnavailable, error.to_string()))?;
         self.call(

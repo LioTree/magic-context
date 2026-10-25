@@ -311,7 +311,6 @@ impl<B: BrocaPorts> DreamExecutor<B> {
                 BrocaPolicy {
                     module_id: module_id.clone(),
                     require_hard_cap: false,
-                    privacy_sensitive: false,
                 },
             ))),
             Transport::Routed {
@@ -330,7 +329,6 @@ impl<B: BrocaPorts> DreamExecutor<B> {
                 policy: BrocaPolicy {
                     module_id: module_id.clone(),
                     require_hard_cap: false,
-                    privacy_sensitive: false,
                 },
                 project_id: project_id.clone(),
                 parks: parks.clone(),

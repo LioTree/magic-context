@@ -44,11 +44,11 @@ use crate::runner_choices::RoutedChoice;
 /// No route routing answered names a harness its runner hosts the session on,
 /// so no session could be bound.
 pub const HARNESS_UNKNOWN: &str = "mc_dream_runner_harness_unknown";
-/// Routing named a key pool for the route; llm-runner 0.6's `session.send`
+/// Routing named a key pool for the route; llm-runner 0.7.0's `session.send`
 /// has no member to pass it, and sending without it could bill another key.
 pub const AUTH_UNSUPPORTED: &str = "mc_dream_runner_auth_unsupported";
 /// No routing/v1 provider is in the catalog.
-pub const ROUTING_UNAVAILABLE: &str = "mc_routing_unavailable";
+pub const ROUTING_UNAVAILABLE: &str = "routing_provider_missing";
 /// Routing refused with a reset time; the task waits until then.
 pub const ROUTE_WAITING: &str = "mc_route_waiting";
 /// A runner session could not be shown to have stopped, so no further paid run
@@ -61,23 +61,9 @@ pub const MAX_DECISIONS: usize = 3;
 /// shown to have stopped before the work's deadline.
 const CLEANUP_MARGIN: Duration = Duration::from_secs(5);
 
-/// The harness to bind the chosen runner's session with, taken only from what
-/// the runner itself declared.
-///
-/// routing/v1 0.2.1 adds an optional `runner.harness` to the select answer,
-/// filled only from the runner's own declaration. The pinned
-/// `cortexkit-role-routing` 0.1.0 types drop that member, so it is read from
-/// the answer as the provider sent it; once the crate is 0.2.1 this becomes
-/// `choice.runner.harness.clone()`. llm-runner's `role.describe` (0.6.10 and
-/// 0.7.0) declares no hosted harness, so there is no second source. `None`
-/// means the route cannot be bound: ck-mc never supplies a harness of its own.
-pub(crate) fn hosted_harness(answer: &Value) -> Option<String> {
-    answer
-        .pointer("/runner/harness")
-        .and_then(Value::as_str)
-        .map(str::trim)
-        .filter(|harness| !harness.is_empty())
-        .map(str::to_owned)
+/// The published routing answer carries only a harness declared by the runner.
+pub(crate) fn hosted_harness(choice: &RoutedChoice) -> Option<String> {
+    choice.runner.harness.clone()
 }
 
 fn error(message: impl Into<String>) -> CarrierError {
@@ -235,7 +221,7 @@ impl ScopeRoute for RunScope {
             ));
         }
         let scope = self.current();
-        let answer = self.wire.select(&scope, provider, &request.request).await?;
+        let answer = self.wire.select(&scope, provider, request).await?;
         let choice: RoutedChoice = serde_json::from_value(answer.clone()).map_err(|e| {
             Refusal::new(
                 RefusalCode::InvalidRequest,
@@ -243,7 +229,7 @@ impl ScopeRoute for RunScope {
             )
         })?;
         if let Ok(mut harnesses) = self.harnesses.lock() {
-            harnesses.insert(choice.decision_id.clone(), hosted_harness(&answer));
+            harnesses.insert(choice.decision_id.clone(), hosted_harness(&choice));
         }
         Ok(choice)
     }
@@ -529,18 +515,20 @@ impl DreamCarrier for RoutedCarrier {
         }
         // Checked before any scope is registered: without a provider nothing
         // of this run can be placed, so nothing of it starts.
-        if self.parts.wire.routing_catalog().providers.is_empty() {
+        if self.parts.wire.routing_catalog().await.providers.is_empty() {
             return Err(error(ROUTING_UNAVAILABLE));
         }
         let scope = DreamScope::new(
             self.parts.project_id.clone(),
             &self.parts.context.config.directory,
         );
-        self.parts
-            .wire
-            .sync_scope(&scope)
-            .await
-            .map_err(|r| error(format!("{}: {}", r.code, r.detail)))?;
+        if let Err(refusal) = self.parts.wire.sync_scope(&scope).await {
+            // A lost registration reply may still have created the scope.
+            if self.parts.wire.end_scope(&scope).await.is_err() {
+                self.child = Some(scope);
+            }
+            return Err(error(format!("{}: {}", refusal.code, refusal.detail)));
+        }
         let child = scope.scope_ref().to_owned();
         self.child = Some(scope);
         Ok(child)
@@ -557,7 +545,7 @@ impl DreamCarrier for RoutedCarrier {
             .filter(|scope| scope.scope_ref() == child)
             .ok_or_else(|| error("child_mismatch"))?;
         let registration = self.registration()?;
-        let catalog: RoutingCatalog = self.parts.wire.routing_catalog();
+        let catalog: RoutingCatalog = self.parts.wire.routing_catalog().await;
         let run_scope = RunScope {
             wire: self.parts.wire.clone(),
             scope_key: child.to_owned(),
@@ -590,6 +578,11 @@ impl DreamCarrier for RoutedCarrier {
                 iq: registration.iq,
                 eq: registration.eq,
                 tools: Some(tools),
+                context_window: Some(
+                    (mc_tokenizer::estimate_tokens(&request.system)
+                        + mc_tokenizer::estimate_tokens(&request.prompt))
+                    .max(1) as u64,
+                ),
                 tool_capabilities: (!runner.grants.is_empty()).then(|| {
                     runner
                         .grants
@@ -607,7 +600,12 @@ impl DreamCarrier for RoutedCarrier {
                 registration.consumer,
                 self.parts.project_id.as_str()
             ),
-            concurrency_slots: None,
+            concurrency_slots: Some(vec![cortexkit_role_routing::select::ConcurrencySlot {
+                key: "mc_dream".into(),
+                running: 0,
+                limit: 2,
+                queued: None,
+            }]),
             deadline_ms: now_ms().saturating_add(request.timeout.as_millis() as u64),
             max_decisions: MAX_DECISIONS,
             // Dream runs are background work with no context pressure, so they
@@ -634,7 +632,37 @@ impl DreamCarrier for RoutedCarrier {
             return Err(error("child_mismatch"));
         }
         let scope = self.child.take().expect("checked above");
-        self.parts.wire.end_scope(&scope).await;
+        if let Err(refusal) = self.parts.wire.end_scope(&scope).await {
+            self.child = Some(scope);
+            return Err(error(format!("{}: {}", refusal.code, refusal.detail)));
+        }
         Ok(())
+    }
+}
+
+impl Drop for RoutedCarrier {
+    fn drop(&mut self) {
+        let Some(scope) = self.child.take() else {
+            return;
+        };
+        let wire = self.parts.wire.clone();
+        // Task cancellation can drop the carrier before close. The module's
+        // serving connection outlives task runtimes, so cleanup uses its own runtime.
+        let _ = std::thread::Builder::new()
+            .name("mc-dream-scope-release".into())
+            .spawn(move || {
+                if let Ok(runtime) = tokio::runtime::Builder::new_current_thread()
+                    .enable_all()
+                    .build()
+                {
+                    if let Err(refusal) = runtime.block_on(wire.end_scope(&scope)) {
+                        tracing::error!(
+                            code = refusal.code,
+                            detail = refusal.detail,
+                            "dream scope cleanup refused"
+                        );
+                    }
+                }
+            });
     }
 }

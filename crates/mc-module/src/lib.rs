@@ -5034,6 +5034,8 @@ struct HistorianFiringTask {
     /// under it.
     /// Boxed so the absent case keeps the task small.
     scope: Option<Box<subc_protocol::scope::ScopeStamp>>,
+    /// Frozen at preparation; a later readiness change cannot change this firing's path.
+    routing: Option<Arc<dyn historian_routed::SummaryRouting>>,
     /// Context pressure drove this firing, so a routed summary must not wait on
     /// a quota reset.
     pressure: bool,
@@ -5173,6 +5175,12 @@ fn retrieval_merge_messages(
 }
 
 impl McHandler {
+    /// Use the daemon-backed dream wire that owns this process's scope authority.
+    pub fn with_dream_wire(self, wire: Arc<dyn dream_dispatch::routed::wire::DreamWire>) -> Self {
+        self.dream_runs.use_wire(wire);
+        self
+    }
+
     pub fn new() -> Self {
         Self::new_with_connection_file(None)
     }
@@ -5219,10 +5227,10 @@ impl McHandler {
         });
         let producer_factory: Arc<dyn HistorianProducerFactory> = match connection_file.clone() {
             Some(path) => Arc::new(RealHistorianProducerFactory {
-                summary_routing: Arc::new(historian_routed::SubcSummaryRouting {
-                    connection_file: path.clone(),
-                    route_targets: route_targets.clone(),
-                }),
+                summary_routing: Arc::new(historian_routed::SubcSummaryRouting::new(
+                    path.clone(),
+                    route_targets.clone(),
+                )),
                 connection_file: path,
                 route_targets: route_targets.clone(),
             }),
@@ -5404,11 +5412,12 @@ impl McHandler {
         let store = Arc::clone(&self.store);
         let coordinator = Arc::clone(&self.store_open);
         let prime_serving_wal = true;
+        let dreams = self.dream_handles();
         tokio::spawn(async move {
             let _guard = StoreOpenWaiterGuard {
                 coordinator: Arc::clone(&coordinator),
             };
-            Self::run_store_open(store, coordinator, descriptor, prime_serving_wal).await;
+            Self::run_store_open(store, coordinator, descriptor, prime_serving_wal, dreams).await;
         });
     }
 
@@ -5417,6 +5426,7 @@ impl McHandler {
         coordinator: Arc<StoreOpenCoordinator>,
         descriptor: StorageDescriptor,
         prime_serving_wal: bool,
+        _dreams: dream_dispatch::tick::DreamHandles,
     ) {
         #[cfg(test)]
         {
@@ -5443,6 +5453,8 @@ impl McHandler {
                 }
                 let _ = store_slot.set(Arc::new(opened));
                 coordinator.set_phase(STORE_OPENED);
+                #[cfg(not(test))]
+                _dreams.ensure_timer();
                 return;
             }
             Err(error) if store_open_error_is_live_lease(&error) => error,
@@ -5512,6 +5524,8 @@ impl McHandler {
                     }
                     let _ = store_slot.set(Arc::new(opened));
                     coordinator.set_phase(STORE_OPENED);
+                    #[cfg(not(test))]
+                    _dreams.ensure_timer();
                     tracing::info!(
                         "mc-module: storage lease released; store opened after {:.2}s",
                         started.elapsed().as_secs_f64()
@@ -7641,8 +7655,11 @@ impl McHandler {
             .expect("a true historian trigger carries its firing rule");
         let trigger_reason = Some(trigger_rule.as_str().to_string());
         // A routed summary asks routing where to run; it never reads the host's chain.
-        let routed =
-            historian_routed::active_routing(self.producer_factory.summary_routing()).is_some();
+        let routing = historian_routed::active_routing(
+            self.producer_factory.summary_routing(),
+            binding.scope.as_ref(),
+        );
+        let routed = routing.is_some();
         let model_chain = if routed {
             Some(&[][..])
         } else {
@@ -7989,6 +8006,7 @@ impl McHandler {
                 session_runner,
                 runner_identity: runner_bind_identity(binding),
                 scope: binding.scope.clone().map(Box::new),
+                routing,
                 // The force band is context pressure; an armed emergency recovery
                 // means the provider is refusing turns for size.
                 pressure: trigger_rule == boundary::TriggerReason::ForceBand
@@ -8055,8 +8073,11 @@ impl McHandler {
         // Wrapup runs on the host's chain from the session's last transform, the same
         // chain the autonomous historian uses; the module has no chain of its own.
         // A routed wrapup asks routing where to run, like any other summary.
-        let routed =
-            historian_routed::active_routing(self.producer_factory.summary_routing()).is_some();
+        let routing = historian_routed::active_routing(
+            self.producer_factory.summary_routing(),
+            binding.scope.as_ref(),
+        );
+        let routed = routing.is_some();
         let model_chain = if routed {
             Some(Vec::new())
         } else {
@@ -8206,6 +8227,7 @@ impl McHandler {
             session_runner,
             runner_identity: runner_bind_identity(binding),
             scope: binding.scope.clone().map(Box::new),
+            routing,
             // A wrapup is requested by the user, not forced by context pressure.
             pressure: false,
             model_chain_generation,
@@ -8370,7 +8392,7 @@ impl McHandler {
         factory: Arc<dyn HistorianProducerFactory>,
         task: HistorianFiringTask,
     ) -> Result<historian::HistorianDriveOutcome, historian::HistorianDriveError> {
-        if let Some(routing) = historian_routed::active_routing(factory.summary_routing()) {
+        if let Some(routing) = task.routing.clone() {
             return Self::execute_routed_firing_task(routing, task).await;
         }
         let HistorianFiringTask {
@@ -8391,6 +8413,7 @@ impl McHandler {
             session_runner,
             runner_identity,
             scope: _,
+            routing: _,
             pressure: _,
             model_chain_generation,
             runner_refusal_cache,
@@ -16972,6 +16995,23 @@ impl ModuleHandler for McHandler {
         subc_client_rs::BindDecision::accept()
     }
 
+    async fn on_bound(&self, handle: &RouteHandle) {
+        let Ok(binding) = self.facade_binding(handle.channel) else {
+            return;
+        };
+        if let (Some(routing), Some(stamp)) = (
+            self.producer_factory.summary_routing(),
+            binding.scope.as_ref(),
+        ) {
+            routing
+                .observe_scope(&historian_routed::SummaryScope {
+                    stamp: stamp.clone(),
+                    identity: runner_bind_identity(&binding),
+                })
+                .await;
+        }
+    }
+
     /// Drop the route's binding on teardown so a reused channel can't resolve a stale
     /// project and the map doesn't leak.
     async fn on_route_gone(&self, handle: &RouteHandle) {
@@ -21843,6 +21883,22 @@ pub fn manifest(module_id: &str) -> ModuleManifest {
     manifest_with_route_targets(module_id, &RouteTargetConfig::default())
 }
 
+/// Temporary bridge for cortexkit-role-tool-provider 0.10.0's subc-protocol 0.32
+/// dependency. Remove the bridge and its conformance adapters when that role crate
+/// moves to subc-protocol 0.33. Refuse incompatible or lossy record conversions.
+pub(crate) fn compatible_wire<T: serde::de::DeserializeOwned + serde::Serialize>(
+    value: impl serde::Serialize,
+) -> Result<T, serde_json::Error> {
+    let source = serde_json::to_value(value)?;
+    let converted: T = serde_json::from_value(source.clone())?;
+    if serde_json::to_value(&converted)? != source {
+        return Err(<serde_json::Error as serde::de::Error>::custom(
+            "wire record changed during conversion",
+        ));
+    }
+    Ok(converted)
+}
+
 pub fn manifest_with_route_targets(
     module_id: &str,
     resolved_routes: &RouteTargetConfig,
@@ -21948,6 +22004,37 @@ pub fn manifest_with_route_targets_and_smart_notes(
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn hello_bytes_match_the_base_sdk_with_optional_manifest_members_unset() {
+        let mut hello = subc_protocol::ModuleHelloBody {
+            manifest: super::manifest(super::DEFAULT_MODULE_ID),
+            protocol_ver: subc_protocol::PROTOCOL_VERSION,
+            control_ops: Some(vec!["health.check".into()]),
+            launch_nonce: Some("compatibility-test-nonce".into()),
+        };
+        use sha2::{Digest, Sha256};
+        let production = serde_json::to_value(&hello).unwrap();
+        assert_eq!(
+            production["manifest"]["provenance"],
+            serde_json::json!({"wire_crate_version": "0.33.1"})
+        );
+        // The SDK version is truthful deployment metadata, not a wire-shape change.
+        // Normalize only /manifest/provenance/wire_crate_version to the old SDK;
+        // every other byte is compared to the measured 0.32.8 HELLO on 2462c22a.
+        hello
+            .manifest
+            .provenance
+            .as_mut()
+            .unwrap()
+            .wire_crate_version = Some("0.32.8".into());
+        let current = serde_json::to_vec(&hello).unwrap();
+        assert_eq!(current.len(), 13_151);
+        assert_eq!(
+            format!("{:x}", Sha256::digest(&current)),
+            "ca9ea694c36322084bf5f81de7b5c4b9efdaed90a710aa16bfb497c373b33c77"
+        );
+    }
+
     include!("tests/tool_attachment_memory_review.rs");
     include!("tests/subagent_invocations_read.rs");
     use super::*;
@@ -26113,7 +26200,7 @@ mod tests {
     #[path = "background_run_limits.rs"]
     mod background_run_limits;
     #[path = "summary_routing.rs"]
-    mod summary_routing;
+    pub(crate) mod summary_routing;
 
     #[derive(Default)]
     struct ProducerState {

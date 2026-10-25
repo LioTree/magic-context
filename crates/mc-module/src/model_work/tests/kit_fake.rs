@@ -1,7 +1,7 @@
 // Vendored from cortexkit-role-routing-conformance 0.1.0, tests/fake/mod.rs.
 // Original SHA-256: ef60939ceaff9be40af1a89bbf56f3a5bb1d5acaeea71527f2ab604db8e2db6f
 // Replace this copy once the kit exports its fake provider.
-// Only import change: subc_protocol -> routing_conformance_protocol (0.33.0).
+// Uses the same subc_protocol import as the published source.
 // BEGIN VENDORED BODY
 //! A reference in-process routing provider, used ONLY to test the kit.
 //!
@@ -49,7 +49,7 @@ use cortexkit_role_routing_conformance::{
 };
 use serde::Serialize;
 use serde_json::Value;
-use routing_conformance_protocol::ErrorBody;
+use subc_protocol::ErrorBody;
 
 /// How long a decision stays current.
 const DECISION_TTL_MS: u64 = 600_000;

@@ -15,7 +15,6 @@ use cortexkit_role_routing::{
     report::{Outcome, ReportAnswer, ReportRequest, Usage},
     select::{ConcurrencySlot, Requirements, SelectRequest},
 };
-use serde::Serialize;
 
 use crate::runner_choices::RoutedChoice;
 
@@ -39,19 +38,12 @@ pub trait ScopeRoute: Sync {
     ) -> impl Future<Output = Result<ReportAnswer, Refusal>> + Send;
 }
 
-/// The `route.select` body: the published request plus members routing/v1
-/// 0.1.0 does not define yet. Each extra member is omitted unless the caller
-/// has established that its provider accepts it, because a provider may refuse
-/// an unknown top-level member instead of ignoring it.
-#[derive(Clone, Debug, PartialEq, Serialize)]
-pub struct SelectParams {
-    #[serde(flatten)]
-    pub request: SelectRequest,
-    /// `false` asks routing to skip a ladder entry that is waiting on a quota
-    /// reset instead of holding the work until the reset.
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub hold_ok: Option<bool>,
-}
+/// The published request. Optional hold controls require provider negotiation.
+pub type SelectParams = SelectRequest;
+
+/// Bound paid routed work across all sessions and projects in this process.
+const ROUTED_WORK_LIMIT: usize = 2;
+static ROUTED_WORK: tokio::sync::Semaphore = tokio::sync::Semaphore::const_new(ROUTED_WORK_LIMIT);
 
 /// Catalog discovery is supplied by the owner of the scoped route, not inferred
 /// from runner configuration. Only routing/v1 providers belong in this list.
@@ -254,10 +246,10 @@ impl<C: Clock> Engine<C> {
             }
         }
         let result = match catalog.providers.as_slice() {
-            [] => Err(WorkError::new("mc_routing_unavailable")),
+            [] => Err(WorkError::new("routing_provider_missing")),
             [provider] => Ok(provider.clone()),
             providers => {
-                let mut error = WorkError::new("mc_routing_ambiguous");
+                let mut error = WorkError::new("routing_provider_ambiguous");
                 error.modules = providers.to_vec();
                 Err(error)
             }
@@ -363,6 +355,10 @@ impl<C: Clock> Engine<C> {
         // same work budget even if the wall clock moves backwards.
         let deadline = tokio::time::Instant::now()
             + Duration::from_millis(order.deadline_ms.saturating_sub(self.clock.now_ms()));
+        let _permit = tokio::time::timeout_at(deadline, ROUTED_WORK.acquire())
+            .await
+            .map_err(|_| WorkError::new("mc_run_timed_out"))?
+            .expect("routed work semaphore is never closed");
         self.retry_pending_reports(&provider, order.scope_route, order.deadline_ms, deadline)
             .await;
         let key = (
@@ -402,11 +398,15 @@ impl<C: Clock> Engine<C> {
             request.affinity = Some(order.affinity.clone());
             request.correlation_id = Some(order.work_id.clone());
             request.concurrency_slots = order.concurrency_slots.clone();
+            if let Some(slots) = &mut request.concurrency_slots {
+                for slot in slots.iter_mut().filter(|s| s.key == "mc_dream") {
+                    slot.running = (ROUTED_WORK_LIMIT - ROUTED_WORK.available_permits()) as u64;
+                    slot.limit = ROUTED_WORK_LIMIT as u64;
+                }
+            }
             request.exclude = (!exclude.is_empty()).then(|| exclude.clone());
-            let params = SelectParams {
-                request,
-                hold_ok: order.hold_ok,
-            };
+            request.hold_ok = order.hold_ok;
+            let params = request;
             let selected =
                 tokio::time::timeout(remaining, order.scope_route.select(&provider, &params)).await;
             let choice = match selected {

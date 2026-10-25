@@ -75,6 +75,17 @@ impl Drop for ConsumerLease {
 }
 
 impl EntorhinalResolver {
+    /// Resolve a background run's folder without deriving or persisting an identity.
+    pub(crate) async fn registered_project(&self, directory: &Path) -> Option<String> {
+        match self
+            .attempt(directory, "magic-context", "mc-project-lookup")
+            .await
+        {
+            ResolveAnswer::Registered { project_id, .. } => Some(project_id),
+            _ => None,
+        }
+    }
+
     pub fn new(connection_file: Option<PathBuf>) -> Self {
         Self { connection_file }
     }
@@ -219,7 +230,7 @@ pub(crate) fn decode_reply(bytes: &[u8]) -> ResolveAnswer {
         Ok(reply)
             if matches!(
                 reply.via.as_str(),
-                "root" | "walk" | "containment" | "worktree"
+                "root" | "walk" | "containment" | "alias" | "worktree"
             ) && is_project_pin(&reply.project_id) =>
         {
             ResolveAnswer::Registered {

@@ -82,9 +82,7 @@ pub fn session_name(project_id: &EntorhinalProjectId) -> String {
 
 /// One dream run's scope as ck-mc registers it.
 ///
-/// `record` holds the members the pinned subc protocol already defines. The
-/// project id and folder are kept beside it: the pinned `ScopeRecord` has no
-/// `project_id` or `workdir` member yet (see `wire::ProductionWire`).
+/// The record carries the same Entorhinal identity and folder used for binding.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct DreamScope {
     pub record: ScopeRecord,
@@ -100,7 +98,9 @@ impl DreamScope {
                 format!("{SCOPE_REF_PREFIX}{}", fresh_id()),
                 SCOPE_EPOCH,
                 ScopeKind::Ephemeral,
-            ),
+            )
+            .with_project_id(Some(project_id.as_str().to_owned()))
+            .with_workdir(Some(workdir.to_string_lossy().into_owned())),
             project_id,
             workdir: workdir.to_path_buf(),
         }
@@ -112,8 +112,8 @@ impl DreamScope {
 
     /// Let `runner_module` open routes under this scope, only to `tool_modules`.
     /// Replaces any earlier carrier: after a re-select, the runner that was
-    /// dropped loses its authority under the scope. With no tool modules the
-    /// run calls no tools and no carrier is listed.
+    /// dropped loses its authority under the scope. No-tool runs list no carrier:
+    /// the daemon refuses empty targets, while absent targets grant all modules.
     pub fn carry_for(&mut self, runner_module: &str, tool_modules: Vec<String>) {
         let carriers = if tool_modules.is_empty() {
             Vec::new()
@@ -130,6 +130,103 @@ impl DreamScope {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn no_tool_runs_have_no_carrier_and_tool_targets_are_exact() {
+        let project = EntorhinalProjectId::from_lookup_answer("pj-one").unwrap();
+        let mut scope = DreamScope::new(project, Path::new("/project"));
+        scope.carry_for("broca", vec![]);
+        assert!(scope.record.carriers.is_empty());
+        let modules = vec!["code-reader".into(), "magic-context".into()];
+        scope.carry_for("broca", modules.clone());
+        assert_eq!(scope.record.carriers.len(), 1);
+        assert_eq!(
+            scope.record.carriers[0].principal,
+            Principal::Reserved {
+                module_id: "broca".into()
+            }
+        );
+        assert_eq!(scope.record.carriers[0].targets.as_ref(), Some(&modules));
+        scope.carry_for("other-runner", vec![]);
+        assert!(scope.record.carriers.is_empty());
+    }
+
+    #[test]
+    fn every_carrier_constructor_sets_explicit_targets() {
+        use syn::visit::Visit;
+        #[derive(Default)]
+        struct Guard {
+            constructors: usize,
+            fenced: usize,
+        }
+        fn carrier_new(call: &syn::ExprCall) -> bool {
+            let syn::Expr::Path(path) = call.func.as_ref() else {
+                return false;
+            };
+            let names: Vec<_> = path
+                .path
+                .segments
+                .iter()
+                .map(|s| s.ident.to_string())
+                .collect();
+            names == ["ScopeCarrier", "new"]
+        }
+        impl<'ast> Visit<'ast> for Guard {
+            fn visit_macro(&mut self, mac: &'ast syn::Macro) {
+                if mac.path.is_ident("vec") {
+                    let tokens = &mac.tokens;
+                    if let Ok(expression) = syn::parse2::<syn::Expr>(quote::quote!([#tokens])) {
+                        let mut nested = Guard::default();
+                        nested.visit_expr(&expression);
+                        self.constructors += nested.constructors;
+                        self.fenced += nested.fenced;
+                    }
+                }
+            }
+            fn visit_item_mod(&mut self, module: &'ast syn::ItemMod) {
+                if module.ident != "tests" {
+                    syn::visit::visit_item_mod(self, module);
+                }
+            }
+            fn visit_expr_call(&mut self, call: &'ast syn::ExprCall) {
+                if carrier_new(call) {
+                    self.constructors += 1;
+                }
+                syn::visit::visit_expr_call(self, call);
+            }
+            fn visit_expr_method_call(&mut self, call: &'ast syn::ExprMethodCall) {
+                if call.method == "with_targets"
+                    && matches!(call.receiver.as_ref(), syn::Expr::Call(new) if carrier_new(new))
+                {
+                    let some = matches!(call.args.first(), Some(syn::Expr::Call(arg)) if matches!(arg.func.as_ref(), syn::Expr::Path(path) if path.path.is_ident("Some")));
+                    assert!(some, "carrier targets must be explicit, never None");
+                    self.fenced += 1;
+                }
+                syn::visit::visit_expr_method_call(self, call);
+            }
+        }
+        let mut guard = Guard::default();
+        for source in [
+            include_str!("scope.rs"),
+            include_str!("carrier.rs"),
+            include_str!("production.rs"),
+            include_str!("live.rs"),
+            include_str!("runner_port.rs"),
+            include_str!("wire.rs"),
+            include_str!("fetch_plan.rs"),
+            include_str!("registry.rs"),
+        ] {
+            guard.visit_file(&syn::parse_file(source).unwrap());
+        }
+        assert!(
+            guard.constructors > 0,
+            "carrier source guard must inspect a constructor"
+        );
+        assert_eq!(
+            guard.constructors, guard.fenced,
+            "every carrier constructor must restrict its targets"
+        );
+    }
 
     #[test]
     fn only_a_registered_entorhinal_answer_is_a_project_id() {

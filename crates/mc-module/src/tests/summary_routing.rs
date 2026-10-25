@@ -40,7 +40,8 @@ struct FakeRouting {
     providers: Vec<String>,
     accepts_hold_ok: bool,
     /// Whether this transport reports that it can place summaries.
-    supported: bool,
+    supported: std::sync::atomic::AtomicBool,
+    support_checks: AtomicUsize,
     config_home: PathBuf,
     producer: Arc<ProducerState>,
     trace: StdMutex<RoutingTrace>,
@@ -60,7 +61,8 @@ fn decode<T: DeserializeOwned>(reply: Reply) -> Result<T, Refusal> {
 #[async_trait]
 impl SummaryRouting for FakeRouting {
     fn routing_support(&self) -> Result<(), crate::historian_routed::RoutingSupportRefusal> {
-        if self.supported {
+        self.support_checks.fetch_add(1, Ordering::SeqCst);
+        if self.supported.load(Ordering::SeqCst) {
             Ok(())
         } else {
             Err(crate::historian_routed::RoutingSupportRefusal {
@@ -246,7 +248,8 @@ async fn rig_full(providers: &[&str], accepts_hold_ok: bool, supported: bool) ->
         route,
         providers: providers.iter().map(|p| p.to_string()).collect(),
         accepts_hold_ok,
-        supported,
+        supported: std::sync::atomic::AtomicBool::new(supported),
+        support_checks: AtomicUsize::new(0),
         config_home: dir.path().join("config"),
         producer: Arc::clone(&producer),
         trace: StdMutex::default(),
@@ -292,11 +295,50 @@ async fn rig() -> Rig {
     rig_with(&[PROVIDER], false).await
 }
 
+pub(crate) async fn run_live_summary(
+    routing: Arc<crate::historian_routed::SubcSummaryRouting>,
+    script: impl FnOnce(String),
+) {
+    let session = LiveSummarySession::new(routing).await;
+    let outcome = session.fire_at(now_ms(), script).await.unwrap();
+    assert!(
+        matches!(outcome, historian::HistorianDriveOutcome::Completed(_)),
+        "{outcome:?}"
+    );
+}
+
+#[tokio::test]
+async fn summary_path_is_frozen_when_prepared_even_if_readiness_changes() {
+    for initially_supported in [false, true] {
+        let rig = rig_full(&[PROVIDER], false, initially_supported).await;
+        let task = rig.task();
+        assert_eq!(task.routing.is_some(), initially_supported);
+        rig.routing
+            .supported
+            .store(!initially_supported, Ordering::SeqCst);
+        rig.fire(task).await.unwrap();
+        assert_eq!(
+            !rig.routing.trace.lock().unwrap().selects.is_empty(),
+            initially_supported
+        );
+        assert_eq!(rig.routing.support_checks.load(Ordering::SeqCst), 1);
+    }
+}
+
 fn messages() -> Vec<CkIngressMessage> {
     wrapup_messages(240, 800)
 }
 
 fn prepare_task(handler: &McHandler, store: Arc<McStore>, project: &Path) -> HistorianFiringTask {
+    prepare_task_at(handler, store, project, now_ms())
+}
+
+fn prepare_task_at(
+    handler: &McHandler,
+    store: Arc<McStore>,
+    project: &Path,
+    now: i64,
+) -> HistorianFiringTask {
     let parsed: TransformRequest = serde_json::from_value(request(messages())).unwrap();
     let projection = crate::ck_wire::project_messages(&parsed.messages).unwrap();
     let mut timings = HistorianTriggerTimings::default();
@@ -308,7 +350,7 @@ fn prepare_task(handler: &McHandler, store: Arc<McStore>, project: &Path) -> His
         &projection,
         HistorianPrepareContext {
             rust_background_enabled: Some(true),
-            now: now_ms(),
+            now,
             snapshot_generation: None,
             publication_fence: None,
             tag_snapshot: None,
@@ -516,7 +558,7 @@ async fn no_routing_provider_refuses_by_name_and_sends_nothing() {
     let rig = rig_with(&[], false).await;
     let error = rig.fire(rig.task()).await.unwrap_err();
     assert!(
-        error.to_string().contains("mc_routing_unavailable"),
+        error.to_string().contains("routing_provider_missing"),
         "{error}"
     );
     assert_eq!(rig.producer.starts.load(Ordering::SeqCst), 0);
@@ -525,7 +567,7 @@ async fn no_routing_provider_refuses_by_name_and_sends_nothing() {
     assert!(trace.runner_modules.is_empty());
     assert!(trace.reports.is_empty());
     let (failure, backoff) = rig.failure();
-    assert!(failure.unwrap().starts_with("mc_routing_unavailable"));
+    assert!(failure.unwrap().starts_with("routing_provider_missing"));
     assert!(backoff.is_some());
 }
 
@@ -759,28 +801,24 @@ async fn placement_never_changes_the_parents_served_prefix() {
     assert_eq!(direct_served, rerouted_served);
 }
 
-/// Production keeps the model-chain path until routed summaries are proven
-/// live: its transport reports that it cannot place summaries yet, so the gate
-/// gives no routing to a module built for production.
+/// Without a scoped preflight, production leaves the session on its chain path.
 #[tokio::test]
-async fn production_summaries_keep_the_chain_path_until_routing_is_proven() {
+async fn production_summaries_keep_the_chain_path_without_a_scoped_preflight() {
     let dir = tempfile::tempdir().unwrap();
-    let production = crate::historian_routed::SubcSummaryRouting {
-        connection_file: dir.path().join("subc.json"),
-        route_targets: RouteTargetConfig::default(),
-    };
+    let production = crate::historian_routed::SubcSummaryRouting::new(
+        dir.path().join("subc.json"),
+        RouteTargetConfig::default(),
+    );
     let refusal =
         crate::historian_routed::SummaryRouting::routing_support(&production).unwrap_err();
-    assert_eq!(
-        refusal.code,
-        crate::historian_routed::SUMMARY_ROUTING_UNPROVEN
-    );
+    assert_eq!(refusal.code, "mc_session_scope_missing");
     let handler = McHandler::new_with_connection_file(Some(dir.path().join("subc.json")));
     assert!(handler.producer_factory.summary_routing().is_some());
-    assert!(
-        crate::historian_routed::active_routing(handler.producer_factory.summary_routing())
-            .is_none()
-    );
+    assert!(crate::historian_routed::active_routing(
+        handler.producer_factory.summary_routing(),
+        None
+    )
+    .is_none());
 }
 
 /// A transport that cannot place summaries leaves the firing on the chain
@@ -839,4 +877,71 @@ async fn refused_report_is_sent_in_the_next_firing_under_its_original_scope() {
         "{firing_two:?}"
     );
     assert_eq!(firing_two.get(1).map(String::as_str), Some("select"));
+}
+
+struct LiveFactory(Arc<crate::historian_routed::SubcSummaryRouting>);
+
+#[async_trait]
+impl HistorianProducerFactory for LiveFactory {
+    async fn connect(
+        &self,
+        _: &Path,
+    ) -> Result<Box<dyn HistorianProducerDriver + Send>, HistorianProducerError> {
+        panic!("a proven session never falls back to a model chain")
+    }
+    fn summary_routing(&self) -> Option<Arc<dyn SummaryRouting>> {
+        Some(self.0.clone())
+    }
+}
+
+pub(crate) struct LiveSummarySession {
+    rig: Rig,
+}
+
+impl LiveSummarySession {
+    pub(crate) async fn new(routing: Arc<crate::historian_routed::SubcSummaryRouting>) -> Self {
+        let mut rig = rig().await;
+        crate::historian_routed::freeze_summary_persona(
+            &rig.store,
+            "ses",
+            rig.routing.as_ref(),
+            &rig.project,
+            None,
+            None,
+        )
+        .unwrap();
+        let scope = SummaryScope {
+            stamp: stamp(),
+            identity: runner_bind_identity(&routed_binding(&rig.project)),
+        };
+        routing.observe_scope(&scope).await;
+        assert!(routing.routing_support_for(Some(&scope.stamp)).is_ok());
+        rig.handler.producer_factory = Arc::new(LiveFactory(routing));
+        Self { rig }
+    }
+
+    pub(crate) async fn fire_at(
+        &self,
+        now: i64,
+        script: impl FnOnce(String),
+    ) -> Result<historian::HistorianDriveOutcome, historian::HistorianDriveError> {
+        let mut task = prepare_task_at(
+            &self.rig.handler,
+            self.rig.store.clone(),
+            &self.rig.project,
+            now,
+        );
+        assert!(
+            task.routing.is_some(),
+            "the session's accepted scope proof is retained"
+        );
+        task.pressure = true;
+        task.historian_await_timeout = Duration::from_secs(5);
+        script(historian_output_for_prompt(&task.firing.prompt));
+        self.rig.fire(task).await
+    }
+
+    pub(crate) fn failure(&self) -> (Option<String>, Option<i64>) {
+        self.rig.failure()
+    }
 }
