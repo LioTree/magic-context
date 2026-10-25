@@ -91,6 +91,8 @@ export function verifyIsolation(isolation: Isolation): void {
         )
     )
         throw new Error("live_store_handle");
+    if (proof.paths.some((path) => /\.db(?:-(?:wal|shm|journal))?$/.test(path) && !within(isolation.root, path)))
+        throw new Error("database_outside_disposable_root");
 }
 /** Inspect the host, not the runner: provider traffic must originate in the isolated host. */
 export async function attestHost(

@@ -2,6 +2,7 @@ import { mkdirSync, readFileSync, realpathSync, writeFileSync } from "node:fs";
 import { execFile, spawn } from "node:child_process";
 import { isAbsolute, join, relative, resolve, sep } from "node:path";
 import { promisify } from "node:util";
+import type { Readable, Writable } from "node:stream";
 import { Database } from "../../src/shared/sqlite";
 import type { TurnTwoEntry } from "../../src/features/magic-context/memory/turn-two-allowlist";
 import {
@@ -144,10 +145,10 @@ export function callMeter(ledger: CampaignLedger, profile: Profile): CallMeter {
 export interface ActivationHost {
     pid: number;
     lane: TurnTwoEntry["lane"];
-    carrier: TurnTwoEntry["carrier"];
+    carrier: TurnTwoEntry["carrier"] | "unobservable";
     pluginEntrypoint: string;
-    /** The transport must report the path to the store opened by the plugin. */
-    storePath: string;
+    /** Null until a lazy host has actually opened the plugin store; never infer a successful binding from a filename. */
+    storePath: string | null;
     /** Wait for background historian work and record host cache-rebuild events before returning. */
     runSession(prompt: string): Promise<unknown>;
     stop(): Promise<void>;
@@ -168,7 +169,7 @@ export interface ActivationTransport {
     testAttest?: typeof attestHost;
 }
 
-interface Command {
+export interface Command {
     argv: [string, ...string[]];
     cwd: string;
 }
@@ -178,26 +179,37 @@ export function processActivationTransport(plan: {
     stage(installRoot: string): Command;
     build(installRoot: string): Command;
     entrypoint(installRoot: string): string;
-    launch(input: { installRoot: string; pluginEntrypoint: string }): Command;
+    launch(input: { installRoot: string; pluginEntrypoint: string; env: Record<string, string>; meter: CallMeter }): Command | Promise<Command>;
     connect(input: {
         pid: number;
         env: Record<string, string>;
         meter: CallMeter;
+        installRoot: string;
+        stdout: Readable;
+        stderr: Readable;
+        stdin: Writable;
     }): Promise<Omit<ActivationHost, "pid" | "pluginEntrypoint" | "stop">>;
+    stopped?(): Promise<void>;
 }): ActivationTransport {
+    const buildEnvironment = (installRoot: string) => {
+        const root = resolve(installRoot, "..");
+        const env = { ...disposableEnvironment(root), HOME: join(root, "home"), TMPDIR: join(root, "tmp"), XDG_CACHE_HOME: join(root, "cache") };
+        for (const [key, path] of Object.entries(env)) mkdirSync(key === "OPENCODE_DB" ? resolve(path, "..") : path, { recursive: true, mode: 0o700 });
+        return { PATH: process.env.PATH, ...env };
+    };
     return {
         kind: "real-host",
         async stage(root) {
             const command = plan.stage(root);
-            await promisify(execFile)(command.argv[0], command.argv.slice(1), { cwd: command.cwd });
+            await promisify(execFile)(command.argv[0], command.argv.slice(1), { cwd: command.cwd, env: buildEnvironment(root), maxBuffer: 32 * 1024 * 1024 });
         },
         async build(root) {
             const command = plan.build(root);
-            await promisify(execFile)(command.argv[0], command.argv.slice(1), { cwd: command.cwd });
+            await promisify(execFile)(command.argv[0], command.argv.slice(1), { cwd: command.cwd, env: buildEnvironment(root), maxBuffer: 32 * 1024 * 1024 });
             return plan.entrypoint(root);
         },
         async start(input) {
-            const command = plan.launch(input);
+            const command = await plan.launch(input);
             const secrets = Object.entries(input.env)
                 .filter(([key]) => key.endsWith("_API_KEY"))
                 .map(([, value]) => value);
@@ -210,22 +222,33 @@ export function processActivationTransport(plan: {
                     HOME: resolve(input.installRoot, ".."),
                     ...input.env,
                 },
-                // Discard host output; redact session and store data before returning the artifact.
-                stdio: "ignore",
+                // Connection code consumes the endpoint handoff. The mock adapter saves raw logs privately, not in returned evidence.
+                stdio: ["pipe", "pipe", "pipe"],
+                detached: process.platform !== "win32",
             });
-            await new Promise<void>((resolve, reject) => {
-                child.once("spawn", resolve);
-                child.once("error", reject);
-            });
+            try {
+                await new Promise<void>((resolve, reject) => {
+                    child.once("spawn", resolve);
+                    child.once("error", reject);
+                });
+            } catch { await plan.stopped?.(); throw new Error("host_spawn_failed"); }
+            const signal = (value: NodeJS.Signals) => {
+                try {
+                    if (process.platform === "win32") child.kill(value);
+                    else process.kill(-child.pid!, value);
+                } catch (error) { if ((error as NodeJS.ErrnoException).code !== "ESRCH") throw error; }
+            };
             const stop = async () => {
-                if (child.exitCode !== null || child.signalCode !== null) return;
+                if (child.exitCode !== null || child.signalCode !== null) { signal("SIGKILL"); await plan.stopped?.(); return; }
                 const exited = new Promise<void>((resolve) => child.once("exit", () => resolve()));
-                child.kill("SIGTERM");
-                const timer = setTimeout(() => child.kill("SIGKILL"), 5000);
+                signal("SIGTERM");
+                const timer = setTimeout(() => signal("SIGKILL"), 5000);
                 try {
                     await exited;
                 } finally {
                     clearTimeout(timer);
+                    signal("SIGKILL");
+                    await plan.stopped?.();
                 }
             };
             try {
@@ -233,8 +256,12 @@ export function processActivationTransport(plan: {
                     pid: child.pid!,
                     env: input.env,
                     meter: input.meter,
+                    installRoot: input.installRoot,
+                    stdout: child.stdout!,
+                    stderr: child.stderr!,
+                    stdin: child.stdin!,
                 });
-                return { ...host, pid: child.pid!, pluginEntrypoint: input.pluginEntrypoint, stop };
+                return Object.assign(host, { pid: child.pid!, pluginEntrypoint: input.pluginEntrypoint, stop });
             } catch {
                 await stop();
                 throw new Error("host_connection_failed");
@@ -243,7 +270,7 @@ export function processActivationTransport(plan: {
     };
 }
 
-function readPluginStore(root: string, storePath: string) {
+export function readPluginStore(root: string, storePath: string) {
     const path = underRoot(root, storePath);
     const db = new Database(path, { readonly: true });
     try {
@@ -267,6 +294,22 @@ function readPluginStore(root: string, storePath: string) {
     } finally {
         db.close();
     }
+}
+
+/** A plausible filename is not evidence that the launched plugin opened that store. */
+export function assertObservedPluginStore(isolation: Isolation, storePath: string): string {
+    const path = underRoot(isolation.env.MAGIC_CONTEXT_STORAGE_DIR, storePath);
+    if (!isolation.proof.paths.some((open) => open === path || open === `${path}-wal`))
+        throw new Error("plugin_store_not_open_by_host");
+    const db = new Database(path, { readonly: true });
+    try {
+        const tables = db.prepare("SELECT name FROM sqlite_master WHERE type='table'").all() as Array<{ name: string }>;
+        for (const table of ["memories", "memory_stage_attempts", "memory_decision_receipts", "memory_history"])
+            if (!tables.some((row) => row.name === table)) throw new Error("not_plugin_store");
+    } finally {
+        db.close();
+    }
+    return path;
 }
 
 /** The turn-two authorization entry comes from the candidate JSON compiled into this isolated build. */
@@ -319,7 +362,7 @@ export async function runActivation(options: {
                 });
                 if (
                     host.lane !== profile.entry.lane ||
-                    host.carrier !== profile.entry.carrier ||
+                    (host.carrier !== "unobservable" && host.carrier !== profile.entry.carrier) ||
                     host.pluginEntrypoint !== pluginEntrypoint
                 )
                     throw new Error("activation_host_binding");
@@ -328,17 +371,24 @@ export async function runActivation(options: {
                 if (isolation.root !== root || isolation.proof.pid !== host.pid)
                     throw new Error("host_attestation_binding");
                 verifyIsolation(isolation);
-                underRoot(env.MAGIC_CONTEXT_STORAGE_DIR, host.storePath);
+                if (host.storePath !== null) {
+                    underRoot(env.MAGIC_CONTEXT_STORAGE_DIR, host.storePath);
+                    if (transport.kind === "real-host") assertObservedPluginStore(isolation, host.storePath);
+                }
                 const sessions = [];
                 const proofs = [isolation.proof];
                 for (const prompt of options.sessions) {
                     sessions.push(await host.runSession(prompt));
+                    if (host.carrier !== profile.entry.carrier) throw new Error("activation_carrier_unobserved_or_mismatched");
                     const after = await attest(root, env, host.pid);
                     if (after.root !== root || after.proof.pid !== host.pid)
                         throw new Error("host_attestation_binding");
                     verifyIsolation(after);
+                    if (host.storePath === null) throw new Error("plugin_store_unobservable");
+                    if (transport.kind === "real-host") assertObservedPluginStore(after, host.storePath);
                     proofs.push(after.proof);
                 }
+                if (host.storePath === null) throw new Error("plugin_store_unobservable");
                 const store = readPluginStore(root, host.storePath);
                 return redact(
                     {
