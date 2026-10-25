@@ -1,6 +1,5 @@
 use super::*;
 use cortexkit_persona::{Approval, ApprovalState};
-use serde_json::Value;
 use std::fs;
 
 fn input() -> Input<'static> {
@@ -18,12 +17,10 @@ fn input() -> Input<'static> {
 }
 
 #[test]
-fn every_dream_prompt_matches_accepted_bytes_in_lf_and_crlf() {
-    // The fixture records the prompt literals from commit 7bf675a0d39f5f86fe0568aa2f1dcea6df309945,
-    // independently of the templates under test. The task modules' pinned
-    // TypeScript parity tests separately check memory/evidence block assembly.
-    let legacy: Value =
-        serde_json::from_str(include_str!("../../../testdata/dream-personas/legacy.json")).unwrap();
+fn dream_persona_sources_normalize_lf_and_crlf_for_every_variant() {
+    // Builder byte parity is checked against executed base-code output in
+    // retrospective_host::builder_oracle. This checks source normalization
+    // independently of the prompt builders' memory/evidence assembly.
     for kind in KINDS {
         let name = kind.id().strip_prefix("mc_dream_").unwrap();
         let root = tempfile::tempdir().unwrap();
@@ -74,15 +71,11 @@ fn every_dream_prompt_matches_accepted_bytes_in_lf_and_crlf() {
                 for mode in ["full", "broad"] {
                     for (system_turn, key) in [(true, "system"), (false, "task")] {
                         let got = render(&persona, &input, mode, system_turn).unwrap();
-                        assert_eq!(
-                            got.text,
-                            legacy["cases"][name][key].as_str().unwrap(),
-                            "{name} {mode} {key} crlf={crlf}"
-                        );
                         let embedded = render(embedded(kind), &input, mode, system_turn).unwrap();
                         assert_eq!(
                             (got.text.as_str(), got.digest),
-                            (embedded.text.as_str(), embedded.digest)
+                            (embedded.text.as_str(), embedded.digest),
+                            "{name} {mode} {key} crlf={crlf}"
                         );
                         if crlf {
                             assert!(lf.contains(&(got.text, got.digest)));

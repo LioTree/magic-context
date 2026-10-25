@@ -473,6 +473,10 @@ fn review_prompt(snapshot: &durable::ReviewSnapshot, threshold: usize) -> String
 }
 
 #[cfg(test)]
+#[path = "../persona_host/dream/builder_oracle.rs"]
+mod builder_oracle;
+
+#[cfg(test)]
 mod tests {
     use super::*;
     use crate::dream_dispatch::context::{
