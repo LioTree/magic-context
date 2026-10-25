@@ -8,12 +8,11 @@ async fn descending_setup_uses_kept_head_without_runner_calls() {
     rig.history(130, "completed history");
     rig.notice(1, 90_000, None).await;
     let state = rig.state();
-    let first = *state
-        .published_cuts
-        .keys()
-        .next_back()
+    let cut = state
+        .newest_published_cut()
         .expect("published adoptable cut");
-    let version = state.published_cuts[&first].version;
+    let first = cut.first_ordinal;
+    let version = cut.version;
     let view = rig.get(version).await;
     assert_eq!(view.cut.as_ref().unwrap().through_ordinal, first - 1);
     let reads = rig
@@ -253,8 +252,8 @@ async fn parent_summary_after_staging_reaches_child_only_in_a_later_view() {
     rig.history(130, "head at the published cut");
     rig.notice(1, 90_000, None).await;
     let before = rig.state();
-    let first = *before.published_cuts.keys().next_back().unwrap();
-    let cut_version = before.published_cuts[&first].version;
+    let first = before.newest_published_cut().unwrap().first_ordinal;
+    let cut_version = before.cached_cut(first).unwrap().version;
     let cut_view = rig.get(cut_version).await;
     let mut exact_head = Vec::<Value>::new();
     for range in cut_view
@@ -343,8 +342,8 @@ async fn next_publication_cleans_an_unsaved_stage_without_accumulating_namespace
     rig.notice(1, 90_000, None).await;
     let store = rig.h.store.get().unwrap();
     let original = rig.state();
-    let first = *original.published_cuts.keys().next_back().unwrap();
-    let committed_version = original.published_cuts[&first].version;
+    let first = original.newest_published_cut().unwrap().first_ordinal;
+    let committed_version = original.cached_cut(first).unwrap().version;
     let codec = codec::Codec::from_params(&Value::Object(original.setup.params.clone())).unwrap();
     let mut last_orphan = None::<String>;
     for _ in 0..3 {
@@ -397,7 +396,8 @@ async fn next_publication_cleans_an_unsaved_stage_without_accumulating_namespace
             load_head(store, &rig.reference)
                 .unwrap()
                 .unwrap()
-                .published_cuts[&first]
+                .cached_cut(first)
+                .unwrap()
                 .version,
             committed_version
         );
@@ -478,7 +478,7 @@ async fn descending_setup_carries_tags_appended_after_the_cut_was_staged() {
     rig.history(130, "published head");
     rig.notice(1, 90_000, None).await;
     let staged = rig.state();
-    let first = *staged.published_cuts.keys().next_back().unwrap();
+    let first = staged.newest_published_cut().unwrap().first_ordinal;
     rig.fill(200);
     rig.notice(2, 1_000, None).await;
     let parent = rig.state();
@@ -518,7 +518,40 @@ async fn reset_binds_a_split_history_head_to_every_replaced_source() {
     rig.notice(1, 90_000, None).await;
     let version = rig.newest().unwrap();
     rig.notice(2, 1_000, Some(version)).await;
-    let view = rig.get(version).await;
+    let mut view = rig.get(version).await;
+    // Fragment the head explicitly: cut placement now follows the complete
+    // summary, but reset must still bind every leading replacement fragment.
+    let source_end = view.ranges[0].to();
+    if let view::ViewRange::Replace { to, .. } = &mut view.ranges[0] {
+        *to = source_end - 1;
+    }
+    view.ranges.insert(
+        1,
+        view::ViewRange::replace(source_end - 1, source_end, "[]"),
+    );
+    let store = rig.h.store.get().unwrap();
+    let engine = store
+        .load_async_compaction_views(&rig.reference)
+        .unwrap()
+        .0
+        .into_iter()
+        .find(|(stored, _, _, _)| *stored == version)
+        .unwrap()
+        .2
+        .unwrap();
+    let fragmented = store
+        .reserve_async_compaction_version(&rig.reference, version)
+        .unwrap();
+    view.view_version = fragmented;
+    view.digest = view.compute_digest();
+    store
+        .save_async_compaction_view(
+            &rig.reference,
+            fragmented,
+            &serde_json::to_string(&view).unwrap(),
+            &engine,
+        )
+        .unwrap();
     let end = view
         .ranges
         .iter()
@@ -531,6 +564,7 @@ async fn reset_binds_a_split_history_head_to_every_replaced_source() {
         "fixture must split the head's source span at the restart point"
     );
     let mut state = rig.state();
+    state.applied = Some(fragmented);
     state.reset(rig.h.store.get().unwrap()).unwrap();
     let source = state
         .resync_sources

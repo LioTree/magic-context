@@ -874,11 +874,17 @@ fn scrambled_blocks(rng: &mut Rng, count: usize) -> Vec<FlatBlock> {
 /// compare the early-stopping `protected_tail_floor_ordinal` against it.
 fn protected_tail_floor_ordinal_reference(
     live: &[&FlatBlock],
+    source_first_ordinal: u64,
     context_limit: f64,
     execute_threshold_percentage: f64,
     estimate_tokens: impl Fn(&str) -> usize,
 ) -> u64 {
-    let newest_live = live.iter().map(|block| block.ordinal).max().unwrap_or(0);
+    let newest_live = live
+        .iter()
+        .filter(|block| block.ordinal >= source_first_ordinal)
+        .map(|block| block.ordinal)
+        .max()
+        .unwrap_or(source_first_ordinal);
     let target =
         crate::boundary::derive_protected_tail_token_target(&crate::boundary::BoundaryContext {
             context_limit,
@@ -887,7 +893,10 @@ fn protected_tail_floor_ordinal_reference(
         });
     let floor_tokens = target.effective_floor.ceil().max(1.0) as usize;
     let mut tokens_by_ordinal = BTreeMap::<u64, usize>::new();
-    for block in live.iter().filter(|block| block.role != "system") {
+    for block in live
+        .iter()
+        .filter(|block| block.role != "system" && block.ordinal >= source_first_ordinal)
+    {
         let tokens = estimate_tokens(block.bytes.as_ref());
         *tokens_by_ordinal.entry(block.ordinal).or_default() += tokens;
     }
@@ -911,6 +920,13 @@ fn publication_floor_matches_the_full_walk_and_stops_at_the_floor() {
         let count = rng.below(60) as usize;
         let blocks = scrambled_blocks(&mut rng, count);
         let live = blocks.iter().collect::<Vec<_>>();
+        // Cover both a full source lineage and a lineage whose older half is
+        // represented by a closed cut prefix rather than eligible tail rows.
+        let source_first_ordinal = if case % 2 == 0 {
+            0
+        } else {
+            live.iter().map(|block| block.ordinal).max().unwrap_or(0) / 2
+        };
         // Small context limits put the floor inside the array; large ones walk it all.
         let context_limit = [800.0, 3_000.0, 20_000.0, 1_000_000.0][case % 4];
         // A fixed per-block cost keeps the cases fast and makes the floor reachable.
@@ -921,11 +937,20 @@ fn publication_floor_matches_the_full_walk_and_stops_at_the_floor() {
             estimate(text)
         };
         assert_eq!(
-            protected_tail_floor_ordinal(&live, context_limit, 65.0, counted),
-            protected_tail_floor_ordinal_reference(&live, context_limit, 65.0, estimate),
+            protected_tail_floor_ordinal(&live, source_first_ordinal, context_limit, 65.0, counted),
+            protected_tail_floor_ordinal_reference(
+                &live,
+                source_first_ordinal,
+                context_limit,
+                65.0,
+                estimate
+            ),
             "case {case}"
         );
-        let non_system = live.iter().filter(|block| block.role != "system").count();
+        let non_system = live
+            .iter()
+            .filter(|block| block.role != "system" && block.ordinal >= source_first_ordinal)
+            .count();
         assert!(calls.get() <= non_system, "case {case}");
         if calls.get() < non_system {
             stopped_early += 1;

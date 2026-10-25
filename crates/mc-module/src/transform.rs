@@ -800,6 +800,10 @@ pub struct TransformRequest {
     /// Wire requests cannot assert coverage or bypass complete-lineage validation.
     #[serde(skip)]
     pub(crate) logical_prefix: Option<Arc<compaction::LogicalPrefix>>,
+    /// Trusted source-lineage boundary. Raw prefix rows retained by a full
+    /// replay are not live tail candidates after a runner has applied a cut.
+    #[serde(skip)]
+    pub(crate) source_lineage_first_ordinal: Option<u64>,
     /// Set only by the native provider handler, never by a wire request.
     #[serde(skip)]
     pub native_tail_section: bool,
@@ -1313,6 +1317,7 @@ impl<'de> Deserialize<'de> for TransformRequest {
             native_tail_section: false,
             runner_owned_reminders: false,
             logical_prefix: None,
+            source_lineage_first_ordinal: None,
             native_reminder_strip_pending: false,
             native_fold_prefix: None,
             native_fold_sidecar: None,
@@ -7910,12 +7915,14 @@ fn apply_once(
     {
         // Freeze the estimator-derived floor only on a pass that is already rebuilding m0. Later
         // SOFT/defer passes consume this ordinal and cannot change decisions when tokenizers change.
-        meta.publication_floor_ordinal = Some(protected_tail_floor_ordinal(
+        let floor = protected_tail_floor_ordinal(
             &live,
+            req.source_lineage_first_ordinal.unwrap_or(0),
             context_limit_tokens,
             ctx.execute_threshold_percentage,
             estimate_tokens,
-        ));
+        );
+        meta.publication_floor_ordinal = Some(floor);
     }
     // A todo-only SOFT splice changes neither the m0/m1 divider nor the covered tail. Keep
     // divergence evidence across that bust so repeated todo churn cannot postpone repair. A
@@ -10671,12 +10678,18 @@ struct BoundaryDivergenceRecut {
 
 fn protected_tail_floor_ordinal(
     live: &[&FlatBlock],
+    source_first_ordinal: u64,
     context_limit: f64,
     execute_threshold_percentage: f64,
     estimate_tokens: impl Fn(&str) -> usize,
 ) -> u64 {
     profile_start!(_perf_floor, "rt16_protected_floor");
-    let newest_live = live.iter().map(|block| block.ordinal).max().unwrap_or(0);
+    let newest_live = live
+        .iter()
+        .filter(|block| block.ordinal >= source_first_ordinal)
+        .map(|block| block.ordinal)
+        .max()
+        .unwrap_or(source_first_ordinal);
     let target =
         crate::boundary::derive_protected_tail_token_target(&crate::boundary::BoundaryContext {
             context_limit,
@@ -10691,7 +10704,7 @@ fn protected_tail_floor_ordinal(
     let mut blocks: Vec<&FlatBlock> = live
         .iter()
         .copied()
-        .filter(|block| block.role != "system")
+        .filter(|block| block.role != "system" && block.ordinal >= source_first_ordinal)
         .collect();
     if !blocks
         .windows(2)
@@ -10716,6 +10729,21 @@ fn protected_tail_floor_ordinal(
         }
     }
     floor_ordinal.max(1)
+}
+
+#[cfg(test)]
+#[test]
+fn source_lineage_minimum_is_trusted_metadata_not_wire_input() {
+    let mut request: TransformRequest = serde_json::from_value(serde_json::json!({
+        "v":2, "kind":"compaction.step", "session_id":"trusted-source", "messages":[], "render_config":"",
+        "source_lineage_first_ordinal":96
+    })).unwrap();
+    assert_eq!(request.source_lineage_first_ordinal, None);
+    request.source_lineage_first_ordinal = Some(96);
+    assert!(serde_json::to_value(&request)
+        .unwrap()
+        .get("source_lineage_first_ordinal")
+        .is_none());
 }
 
 fn post_end_revision_inputs_moved(before: &M1RevisionSignal, after: &M1RevisionSignal) -> bool {
@@ -11847,6 +11875,27 @@ fn resolve_boundary_state(
             validate_live_boundary_ordinal(core.boundary_id.as_str(), expected_ordinal, live)?;
         }
         return Ok((BoundaryState::LivePresent, None));
+    }
+
+    if req.logical_prefix.as_ref().is_some_and(|prefix| {
+        // Continuity uses physical source ordinals. A delivered reminder can
+        // be synthetic for rendering while still being the first lineage row.
+        prefix.certifies_omitted_boundary(
+            core,
+            meta,
+            req.messages
+                .iter()
+                .filter(|message| message.ordinal >= prefix.tail_from)
+                .map(|message| message.ordinal)
+                .min(),
+        )
+    }) {
+        // The validated cut certificate binds the closed summary prefix to
+        // this boundary. No source row at or below the cut is live input, so
+        // its absence is a certified trim, not a transcript revert. This lets
+        // a rebuild compose its head without feeding historian-prelude text
+        // into the model request.
+        return Ok((BoundaryState::DeclaredTrimValidated, None));
     }
 
     let Some(declared) = req.declared_trim.as_ref() else {
@@ -23381,6 +23430,7 @@ pub(crate) mod tests {
             native_tail_section: false,
             runner_owned_reminders: false,
             logical_prefix: None,
+            source_lineage_first_ordinal: None,
             native_reminder_strip_pending: false,
             native_fold_prefix: None,
             native_fold_sidecar: None,

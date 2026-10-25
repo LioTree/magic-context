@@ -58,6 +58,36 @@ impl NamespaceHead {
 }
 
 impl McStore {
+    /// Immutable history snapshots retain these existing version columns, even
+    /// after their temporary namespace is reclaimed: generation, source version,
+    /// rewrite version, and the seeded flag.
+    pub fn compartment_history_identity(
+        &self,
+        namespace: &str,
+    ) -> Result<Option<(String, i64, i64, bool)>, McStoreError> {
+        use rusqlite::OptionalExtension;
+        self.context_read(|conn| {
+            conn.query_row("SELECT generation,version,rewrite_version,seeded FROM compartment_history_versions WHERE session_id=?1",
+                [namespace], |row| Ok((row.get(0)?,row.get(1)?,row.get(2)?,row.get(3)?))).optional()
+        })
+    }
+
+    /// Restore the identity of materialized immutable compartments without
+    /// depending on the continued existence of the old staging namespace.
+    pub fn set_compartment_history_identity(
+        &self,
+        namespace: &str,
+        identity: &(String, i64, i64, bool),
+    ) -> Result<(), McStoreError> {
+        self.context_write(&["compartment_history_versions"], |tx| {
+            tx.execute("INSERT INTO compartment_history_versions(session_id,generation,version,rewrite_version,seeded) VALUES(?1,?2,?3,?4,?5)
+                ON CONFLICT(session_id) DO UPDATE SET generation=excluded.generation,version=excluded.version,rewrite_version=excluded.rewrite_version,seeded=excluded.seeded",
+                params![namespace,identity.0,identity.1,identity.2,identity.3])?;
+            Ok(())
+        })?;
+        Ok(())
+    }
+
     /// Delete an unreferenced window stage. The caller keeps its durable intent
     /// until both stores have been cleaned, so interrupted deletion is retryable.
     pub fn discard_staged_namespace(
@@ -81,8 +111,8 @@ impl McStore {
         Ok(())
     }
 
-    /// A staged cut has exactly its parent's compartments. Preserve their
-    /// identity so adopting the stage does not look like a history rewrite.
+    /// Copied history preserves its source identity so adopting the same
+    /// compartments does not look like a new history rewrite.
     pub fn adopt_compartment_history_identity(
         &self,
         source: &str,

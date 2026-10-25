@@ -7,6 +7,12 @@ struct FrozenPart {
     part: String,
     digest: String,
     bytes: Option<String>,
+    #[serde(default, skip_serializing_if = "is_zero")]
+    ack_version: u64,
+}
+
+fn is_zero(value: &u64) -> bool {
+    *value == 0
 }
 
 impl FrozenPart {
@@ -54,6 +60,16 @@ impl FrozenEdits {
 
     fn insert(&mut self, part: FrozenPart) {
         let key = (part.mid.clone(), part.part.clone(), part.digest.clone());
+        // An old cut can replay an older edit of the same surviving source.
+        // Public view versions, not archive-read order, select the latest
+        // acknowledged bytes for that source.
+        if self
+            .parts
+            .get(&key)
+            .is_some_and(|old| old.ack_version > part.ack_version)
+        {
+            return;
+        }
         if self.parts.get(&key) == Some(&part) {
             return;
         }
@@ -72,6 +88,7 @@ impl FrozenEdits {
             part: part.to_owned(),
             digest: digest.to_owned(),
             bytes: None,
+            ack_version: 0,
         });
     }
 
@@ -79,6 +96,29 @@ impl FrozenEdits {
         for part in acknowledged.parts.values() {
             self.insert(part.clone());
         }
+    }
+
+    pub(super) fn stamp_version(&mut self, version: u64) {
+        for part in self.parts.values_mut() {
+            part.ack_version = part.ack_version.max(version);
+        }
+        self.dirty = true;
+    }
+
+    pub(super) fn message_snapshots(&self) -> Result<Vec<(String, String)>, HandlerOutcome> {
+        let mut messages = BTreeMap::<&str, Vec<&FrozenPart>>::new();
+        for part in self.parts.values() {
+            messages.entry(&part.mid).or_default().push(part);
+        }
+        messages
+            .into_iter()
+            .map(|(mid, parts)| {
+                Ok((
+                    mid.to_owned(),
+                    serde_json::to_string(&parts).map_err(transient)?,
+                ))
+            })
+            .collect()
     }
 
     /// Only the edits of the messages `mids`: a window's acknowledged edits,
@@ -117,7 +157,7 @@ impl FrozenEdits {
     ) -> Result<(), HandlerOutcome> {
         for range in &view.ranges {
             if let view::ViewRange::Keep { edits, .. } = range {
-                self.capture_edits(edits, entries)?;
+                self.capture_versioned_edits(edits, entries, view.view_version)?;
             }
         }
         Ok(())
@@ -131,6 +171,15 @@ impl FrozenEdits {
         &mut self,
         edits: &[view::PartEdit],
         entries: &BTreeMap<u64, Arc<HeldEntry>>,
+    ) -> Result<(), HandlerOutcome> {
+        self.capture_versioned_edits(edits, entries, 0)
+    }
+
+    fn capture_versioned_edits(
+        &mut self,
+        edits: &[view::PartEdit],
+        entries: &BTreeMap<u64, Arc<HeldEntry>>,
+        ack_version: u64,
     ) -> Result<(), HandlerOutcome> {
         let mut source = None;
         for edit in edits {
@@ -157,6 +206,7 @@ impl FrozenEdits {
                 part: edit.part.clone(),
                 digest,
                 bytes: edit.bytes.clone(),
+                ack_version,
             };
             self.insert(part);
         }
@@ -174,9 +224,10 @@ impl FrozenEdits {
 
     /// Re-anchor by source identity, never by an ordinal retained from another lineage.
     ///
-    /// Parts are filled one at a time, then each tool arc is made whole
-    /// (`tool_arcs::complete_dropped_arcs`): a re-anchored drop of a call must
-    /// not leave its result served, nor the other way round. Last, each keep
+    /// Parts are filled one at a time. A saved native replacement keeps its
+    /// companion source side, so a new drop cannot rewrite the saved bytes.
+    /// Remaining dropped arcs are made whole (`tool_arcs::complete_dropped_arcs`):
+    /// a re-anchored drop must not leave its other side served. Last, each keep
     /// range's edits are put in the order the contract requires: by ordinal,
     /// then by the part's position in its message (`tool_arcs::sort_edits`).
     pub(super) fn apply(
@@ -213,17 +264,21 @@ impl FrozenEdits {
             };
             for (_, saved) in anchored.range(*from..*to) {
                 for part in saved {
-                    // A permitted pass may remove more content, but it must not restore a source
-                    // part just because a generation reset discarded its old engine unit.
-                    if !edits
-                        .iter()
-                        .any(|edit| edit.ordinal == part.ordinal && edit.part == part.part)
+                    // A rebuilt engine may express an old native replacement
+                    // as a generic drop. Keep the bytes already acknowledged
+                    // for the same source identity instead of rewriting them.
+                    if let Some(current) = edits
+                        .iter_mut()
+                        .find(|edit| edit.ordinal == part.ordinal && edit.part == part.part)
                     {
+                        *current = part.clone();
+                    } else {
                         edits.push(part.clone());
                     }
                 }
             }
         }
+        tool_arcs::preserve_acknowledged_arcs(kept, &anchored, ranges);
         tool_arcs::complete_dropped_arcs(kept, ranges);
         for range in ranges.iter_mut() {
             if let view::ViewRange::Keep { edits, .. } = range {
@@ -287,6 +342,24 @@ impl RetiredViews {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn an_older_cut_cannot_overwrite_newer_acknowledged_bytes() {
+        let snapshot = |version, bytes| {
+            FrozenEdits::from_json(&json!([{
+            "mid":"m104", "part":"1", "digest":"same-source", "bytes":bytes, "ack_version":version
+        }]).to_string()).unwrap()
+        };
+        let old = snapshot(1, "old-cut");
+        let current = snapshot(6, "acknowledged");
+        let mut merged = current.clone();
+        merged.merge(&old);
+        assert!(merged.served("m104", "1", "acknowledged"));
+        assert!(!merged.served("m104", "1", "old-cut"));
+        let mut reversed = old;
+        reversed.merge(&current);
+        assert_eq!(merged.json().unwrap(), reversed.json().unwrap());
+    }
 
     /// An Anthropic assistant message of `count` text parts keyed "0", "1",
     /// ..., with a `tool_use` as its last part when `call` names one.

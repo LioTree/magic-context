@@ -384,6 +384,10 @@ struct Runner {
     /// below it is refused (`before_lineage_start`) and recorded.
     floor: Mutex<Option<u64>>,
     reads_below_floor: Mutex<Vec<u64>>,
+    /// A `session.head` answer to give instead of the default (a lineage
+    /// with no cut), for a test whose runner reports a lineage that begins
+    /// at a cut.
+    head: Mutex<Option<Value>>,
 }
 
 #[async_trait]
@@ -427,6 +431,9 @@ impl session_resolver::ProviderRunner for Runner {
             );
         }
         if method == "session.head" {
+            if let Some(head) = self.head.lock().unwrap().clone() {
+                return Ok(head);
+            }
             return Ok(json!({"first_ordinal":0}));
         }
         assert_eq!(method, "session.read");
@@ -504,6 +511,7 @@ impl Side {
             raw_sends: Mutex::new(Vec::new()),
             floor: Mutex::new(None),
             reads_below_floor: Mutex::new(Vec::new()),
+            head: Mutex::new(None),
         });
         let mut h = McHandler::new();
         h.store.set(store).ok().unwrap();
@@ -634,6 +642,10 @@ struct Pair {
     seq: u64,
     model: String,
     log: Vec<String>,
+    /// Only cuts the fake host actually applied, in active-branch order.
+    /// Merely publishing a view does not make its marker survive a rewind.
+    cut_checkpoints: Vec<u64>,
+    cut_checkpoint_lineages: BTreeMap<u64, String>,
     /// Where the two providers' engine cache states first differed (a
     /// skipped engine pass leaves its writes out), for a failure message.
     /// It is a diagnostic, not part of the comparison.
@@ -711,6 +723,8 @@ impl Pair {
             seq: 0,
             model: "fixture".into(),
             log: Vec::new(),
+            cut_checkpoints: Vec::new(),
+            cut_checkpoint_lineages: BTreeMap::new(),
             engine_drift: None,
             record_only: false,
             mismatches: Vec::new(),
@@ -738,11 +752,17 @@ impl Pair {
         let mut entries = self.transcript.entries.lock().unwrap();
         let next = entries.last().map_or(0, |entry| entry.ordinal + 1);
         let mut review = self.review.borrow_mut();
-        entries.extend((next..next + count).map(|n| {
-            review
+        for n in next..next + count {
+            let mut entry = review
                 .message(self.profile, n, salt)
-                .unwrap_or_else(|| message(self.profile, n, salt))
-        }));
+                .unwrap_or_else(|| message(self.profile, n, salt));
+            if self.profile == Profile::Pi {
+                if let Some(parent) = entries.last() {
+                    entry.message["parentId"] = json!(parent.mid);
+                }
+            }
+            entries.push(entry);
+        }
     }
 
     /// Run `op` on both sides, require identical answers and stores, and
@@ -783,6 +803,22 @@ impl Pair {
             ));
             return resident;
         }
+        if resident != oracle && std::env::var_os("MC_CUT_DIFF_DETAIL").is_some() {
+            let left = serde_json::from_str::<Value>(&resident).ok();
+            let right = serde_json::from_str::<Value>(&oracle).ok();
+            if let (Some(left), Some(right)) = (left, right) {
+                eprintln!(
+                    "ANSWER DIFF first={}",
+                    cut_lineage_tests::first_difference(&left, &right, String::new())
+                );
+                if let (Ok(a), Ok(b)) = (
+                    serde_json::from_value::<view::CompactionView>(left["view"].clone()),
+                    serde_json::from_value::<view::CompactionView>(right["view"].clone()),
+                ) {
+                    eprintln!("ANSWER VIEW DIFF model_equal={} ranges_equal={} cut_left={:?} cut_right={:?} digest_left={} digest_right={}", self.model_bytes(&a)==self.model_bytes(&b), a.ranges==b.ranges, a.cut,b.cut,a.digest,b.digest);
+                }
+            }
+        }
         assert_eq!(
             resident,
             oracle,
@@ -818,6 +854,19 @@ impl Pair {
             if let Some(baseline) = meta.get_mut("tail_hygiene_baseline") {
                 if let Some(baseline) = baseline.as_object_mut() {
                     baseline.remove("computed_at_ms");
+                }
+            }
+            if let Some(decisions) = meta
+                .pointer_mut("/historian/recent_decisions")
+                .and_then(Value::as_array_mut)
+            {
+                for decision in decisions {
+                    if let Some(fields) = decision.as_object_mut() {
+                        // These two fields record this provider's wall-clock
+                        // observation time, not a historian decision or extent.
+                        fields.remove("at_ms");
+                        fields.remove("request_observed_at_ms");
+                    }
                 }
             }
             if let Value::Object(fields) = &mut meta {
@@ -923,8 +972,9 @@ impl Pair {
             }
             assert!(
                 left == right,
-                "{:?} view {version} bytes diverged after {label}; steps: {:?}",
+                "{:?} view {version} bytes diverged after {label}; native model bytes equal; first difference {}; steps: {:?}",
                 self.profile,
+                cut_lineage_tests::first_difference(&serde_json::from_str(left).unwrap(), &serde_json::from_str(right).unwrap(), String::new()),
                 self.log
             );
         }

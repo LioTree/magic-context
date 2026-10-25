@@ -49,9 +49,10 @@ fn verify_passes(pair: &Pair, seed: u64) -> usize {
 }
 
 async fn descend_pair(pair: &mut Pair, first: u64, child: &str) {
+    for side in [&pair.resident, &pair.oracle] {
+        assert_published_cut_support(side, &pair.reference);
+    }
     let full = load(pair.oracle.store(), &pair.reference).unwrap().unwrap();
-    let codec = codec::Codec::from_params(&Value::Object(full.setup.params.clone())).unwrap();
-    let rows = tag_rows(&full, codec).unwrap();
     let mut request = serde_json::to_value(&full.setup).unwrap();
     request["lineage_id"] = json!(child);
     request["descends_from"] = json!({"lineage_id":full.lineage,"through_ordinal":first - 1});
@@ -70,10 +71,19 @@ async fn descend_pair(pair: &mut Pair, first: u64, child: &str) {
     assert_eq!(answer["answer"], "ready", "{answer}");
     *pair.transcript.lineage.lock().unwrap() = child.into();
     *pair.resident.runner.floor.lock().unwrap() = Some(first);
+    if !pair.cut_checkpoints.contains(&first) {
+        pair.cut_checkpoints.push(first);
+    }
+    pair.cut_checkpoint_lineages
+        .insert(first, full.lineage.clone().unwrap());
 
-    // Setup has the same public semantics on both sides. Restore every source
-    // row only on the oracle, and remove its seed/certificate: subsequent oracle
-    // passes recompute from the full transcript, independently of cut facts.
+    restore_oracle_prefix(pair, full, first);
+}
+
+fn restore_oracle_prefix(pair: &Pair, full: State, first: u64) {
+    let codec = codec::Codec::from_params(&Value::Object(full.setup.params.clone())).unwrap();
+    // Setup has the same public semantics on both sides. Only the oracle gets
+    // original prefix rows instead of cut facts for its full-input engine.
     let store = pair.oracle.store();
     let mut oracle = pair
         .oracle
@@ -81,7 +91,12 @@ async fn descend_pair(pair: &mut Pair, first: u64, child: &str) {
         .checkout(store, &pair.reference)
         .unwrap()
         .unwrap();
-    oracle.entries = full.entries;
+    // Restore only the immutable prefix on the full-input reference. Each
+    // side independently adopted its parent's observed window cache, or its
+    // own immutable snapshot when revisiting an earlier cut.
+    for (ordinal, entry) in full.entries.range(..first) {
+        oracle.entries.insert(*ordinal, Arc::clone(entry));
+    }
     oracle.cut_seed = None;
     oracle.cut_first_ordinal = None;
     oracle.logical_prefix = None;
@@ -93,6 +108,7 @@ async fn descend_pair(pair: &mut Pair, first: u64, child: &str) {
     oracle.journal.persisted_through = None;
     oracle.journal.indexed_through = None;
     oracle.journal.truncate = Some(None);
+    let rows = tag_rows(&oracle, codec).unwrap();
     oracle.save(store, &rows).unwrap();
     pair.oracle.h.checkin(oracle);
     let held = load(pair.resident.store(), &pair.reference)
@@ -191,10 +207,13 @@ async fn session(profile: Profile, number: u64, steps: u64) -> (usize, usize) {
                 .unwrap();
             first = held
                 .published_cuts
-                .keys()
-                .next_back()
-                .copied()
-                .filter(|first| *first > previous);
+                .values()
+                .filter(|cut| {
+                    cut.first_ordinal > previous
+                        && held.lineage.as_deref() == Some(cut.lineage.as_str())
+                })
+                .map(|cut| cut.first_ordinal)
+                .max();
             if first.is_some() {
                 break;
             }
@@ -300,3 +319,7 @@ async fn successive_production_cuts_match_full_processing_over_many_sessions() {
         .unwrap_or(24);
     differential(sessions, steps).await;
 }
+
+/// Additional adversarial cut-lineage tests use the same fixtures.
+#[path = "slice4_review.rs"]
+mod slice4_review;

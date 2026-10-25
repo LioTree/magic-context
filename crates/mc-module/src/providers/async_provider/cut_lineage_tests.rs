@@ -65,12 +65,13 @@ fn attest(side: &Side) {
 }
 
 /// True when `text` names a fixture message (`m<n>`, alone or as a block
-/// `m<n>#<k>`, possibly after a `prefix:`) whose ordinal is below `first`.
+/// `m<n>#<k>`, possibly after a `prefix:` or fresh-lineage `prefix-`) whose
+/// ordinal is below `first`.
 fn names_below(text: &str, first: u64) -> bool {
     let bytes = text.as_bytes();
     let mut index = 0;
     while index < bytes.len() {
-        let starts = index == 0 || matches!(bytes[index - 1], b':' | b'\0' | b' ' | b'"');
+        let starts = index == 0 || matches!(bytes[index - 1], b':' | b'\0' | b' ' | b'"' | b'-');
         if bytes[index] == b'm' && starts {
             let digits = bytes[index + 1..]
                 .iter()
@@ -87,6 +88,13 @@ fn names_below(text: &str, first: u64) -> bool {
         index += 1;
     }
     false
+}
+
+#[test]
+fn fresh_host_ids_normalize_only_rows_below_the_cut() {
+    assert!(names_below("host-rewind-7-0-m104#1", 105));
+    assert!(!names_below("host-rewind-7-0-m104#1", 104));
+    assert!(!names_below("m0-mural", 105));
 }
 
 /// `value` without anything keyed to a message below `first`: object
@@ -129,7 +137,7 @@ fn without_rows_below(value: Value, first: u64) -> Value {
 }
 
 /// Where `full` and `cut` first differ, as a path and the two values there.
-fn first_difference(full: &Value, cut: &Value, path: String) -> String {
+pub(super) fn first_difference(full: &Value, cut: &Value, path: String) -> String {
     match (full, cut) {
         (Value::Object(a), Value::Object(b)) => {
             for key in a.keys().chain(b.keys()) {
@@ -268,13 +276,17 @@ fn historian_input(side: &Side, reference: &str) -> String {
     .unwrap();
     let through = state.entries.last_key_value().map(|(n, _)| *n);
     let mut parsed = side.h.async_historian_request(&state).unwrap();
-    historian_tail::prepare_input(
+    historian_tail::prepare_cut_input(
         store,
         reference,
         window.through(through),
         codec,
         &mut parsed,
         &state.reminder_echoes,
+        state
+            .cut_seed
+            .as_ref()
+            .and_then(|seed| seed.historian_prelude.as_ref()),
     )
     .unwrap();
     format!(
@@ -283,11 +295,61 @@ fn historian_input(side: &Side, reference: &str) -> String {
     )
 }
 
+fn assert_published_cut_support(side: &Side, reference: &str) {
+    static SUMMARY: OnceLock<regex::Regex> = OnceLock::new();
+    let summary = SUMMARY.get_or_init(|| regex::Regex::new(r"summary through (\d+)").unwrap());
+    for (_, raw, engine, _) in side
+        .store()
+        .load_async_compaction_views(reference)
+        .unwrap()
+        .0
+    {
+        let view: view::CompactionView = serde_json::from_str(&raw).unwrap();
+        let Some(cut) = &view.cut else {
+            continue;
+        };
+        if let Some(engine) = engine {
+            let engine: Value = serde_json::from_str(&engine).unwrap();
+            if let Some(covered) = engine["history_through"].as_u64() {
+                assert!(
+                    covered <= cut.through_ordinal,
+                    "view {}: C={covered} exceeds P={}",
+                    view.view_version,
+                    cut.through_ordinal
+                );
+            }
+        }
+        let mut observed = 0;
+        for range in &view.ranges {
+            if let view::ViewRange::Replace { bytes, .. } = range {
+                for capture in summary.captures_iter(bytes) {
+                    let end = capture[1].parse::<u64>().unwrap();
+                    assert!(
+                        end <= cut.through_ordinal,
+                        "view {} serves summary through {end} beyond cut {}",
+                        view.view_version,
+                        cut.through_ordinal
+                    );
+                    observed += 1;
+                }
+            }
+        }
+        assert!(
+            observed > 0,
+            "cut view {} must actually render its summary",
+            view.view_version
+        );
+    }
+}
+
 impl Pair {
     /// After a step: nothing read below the cut, and the historian input and
     /// the engine state compared (`both` already compared views, answers,
     /// decisions and sends).
     fn check_cut(&self, first: u64) {
+        for side in [&self.resident, &self.oracle] {
+            assert_published_cut_support(side, &self.reference);
+        }
         if std::env::var_os("MC_CUT_TRACE").is_some() {
             // `replay_cut_session` prints the state instead.
             return;
@@ -516,12 +578,7 @@ async fn cut_session_start(
             .unwrap()
             .meta
             .coverage_ordinal;
-        let first = coverage.and_then(|coverage| {
-            state
-                .aggregates
-                .historian_input
-                .restart_at_or_below(coverage.min(history_end))
-        });
+        let first = coverage.and_then(|coverage| coverage.checked_add(1));
         if let Some(first) = first.filter(|first| *first > 0) {
             break (codec, first);
         }
@@ -896,6 +953,23 @@ async fn a_fresh_start_at_a_cut_rebuilds_once_and_keeps_the_cache_rules() {
     cut_differential(8, 20, 9_000, CutMode::BootstrapAtCut).await;
 }
 
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn fresh_cut_does_not_rebuild_twice_for_one_history_publication() {
+    let mut failures = Vec::new();
+    for (profile, seed) in [
+        (Profile::Anthropic, 210_015),
+        (Profile::Pi, 210_094),
+        (Profile::Anthropic, 210_099),
+    ] {
+        if let Err(error) =
+            tokio::spawn(cut_session(profile, seed, 24, CutMode::BootstrapAtCut)).await
+        {
+            failures.push(format!("{profile:?} {seed}: {error}"));
+        }
+    }
+    assert!(failures.is_empty(), "{failures:#?}");
+}
+
 #[tokio::test(flavor = "multi_thread", worker_threads = 8)]
 async fn a_conversation_pruned_below_its_cut_serves_what_full_processing_serves() {
     cut_differential(8, 20, 8_000, CutMode::PruneInPlace).await;
@@ -952,12 +1026,7 @@ async fn covered_pair(profile: Profile, number: u64) -> (Pair, Rng, u64) {
         let codec = codec::Codec::from_params(&Value::Object(state.setup.params.clone())).unwrap();
         state.fold_entries(codec, None).unwrap();
         if let Some(first) = coverage
-            .and_then(|coverage| {
-                state
-                    .aggregates
-                    .historian_input
-                    .restart_at_or_below(coverage)
-            })
+            .and_then(|coverage| coverage.checked_add(1))
             .filter(|first| *first > 0)
         {
             return (pair, rng, first);
