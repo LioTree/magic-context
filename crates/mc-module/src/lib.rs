@@ -21882,10 +21882,20 @@ pub fn manifest(module_id: &str) -> ModuleManifest {
     manifest_with_route_targets(module_id, &RouteTargetConfig::default())
 }
 
-/// Bridge identical wire records while role crates still pin the previous SDK minor.
-pub(crate) fn compatible_wire<T: serde::de::DeserializeOwned>(value: impl serde::Serialize) -> T {
-    serde_json::from_value(serde_json::to_value(value).expect("wire record serializes"))
-        .expect("additive SDK minors share this wire record")
+/// Temporary bridge for cortexkit-role-tool-provider 0.10.0's subc-protocol 0.32
+/// dependency. Remove the bridge and its conformance adapters when that role crate
+/// moves to subc-protocol 0.33. Refuse incompatible or lossy record conversions.
+pub(crate) fn compatible_wire<T: serde::de::DeserializeOwned + serde::Serialize>(
+    value: impl serde::Serialize,
+) -> Result<T, serde_json::Error> {
+    let source = serde_json::to_value(value)?;
+    let converted: T = serde_json::from_value(source.clone())?;
+    if serde_json::to_value(&converted)? != source {
+        return Err(<serde_json::Error as serde::de::Error>::custom(
+            "wire record changed during conversion",
+        ));
+    }
+    Ok(converted)
 }
 
 pub fn manifest_with_route_targets(
