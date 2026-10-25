@@ -23,6 +23,8 @@ use super::*;
 mod slice4_boundaries;
 #[path = "slice4_guards.rs"]
 mod slice4_guards;
+#[path = "slice4_rereview.rs"]
+mod slice4_rereview;
 use std::sync::atomic::Ordering::Relaxed;
 
 /// Turn on the full-input reference and the decision traces, as
