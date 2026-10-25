@@ -4,7 +4,7 @@ import { mkdirSync, readFileSync, writeFileSync } from "node:fs";
 import { createRequire } from "node:module";
 import { join, resolve } from "node:path";
 import { promisify } from "node:util";
-import { containerInvocation, validateRunConfig, type ContainerRunConfig } from "./container-config";
+import { containerInvocation, selectedJobs, validateRunConfig, type ContainerRunConfig } from "./container-config";
 import { assertNoMaterial, redactedLines, validateMaterial, type GrantRequest } from "./credential-protocol";
 
 export interface CredentialSource {
@@ -42,6 +42,10 @@ export async function fetchForRun(source: CredentialSource, grant: GrantRequest,
     } finally { served.material = ""; }
 }
 
+export async function materialForJob(source: CredentialSource, job: ContainerRunConfig["jobs"][number], runMs: number) {
+    return job.grant ? fetchForRun(source, job.grant, runMs) : "";
+}
+
 const docker = async (...args: string[]) => (await promisify(execFile)("docker", args, { maxBuffer: 16 * 1024 * 1024 })).stdout;
 
 export async function launchContainers(config: ContainerRunConfig, source: CredentialSource, output: string) {
@@ -49,8 +53,8 @@ export async function launchContainers(config: ContainerRunConfig, source: Crede
     mkdirSync(output, { recursive: true, mode: 0o700 });
     try {
         // Sequential containers also prevent concurrent cache-check workers using the same grant.
-        for (const [index, job] of config.jobs.entries()) {
-            let material = await fetchForRun(source, job.grant, config.runMs);
+        for (const [index, job] of selectedJobs(config).entries()) {
+            let material = await materialForJob(source, job, config.runMs);
             const secrets = [material];
             const name = `two-pass-credential-${randomUUID()}`;
             const logs: string[] = [];
@@ -78,9 +82,9 @@ export async function launchContainers(config: ContainerRunConfig, source: Crede
             };
             child.stdout.on("data", receive); child.stderr.on("data", receive);
             child.stdin.on("error", () => { failure = "credential_handoff_failed"; });
-            let payload = Buffer.from(JSON.stringify({ version: 1, grant: job.grant, material }));
+            let payload = job.grant ? Buffer.from(JSON.stringify({ version: 1, grant: job.grant, material })) : Buffer.alloc(0);
             try {
-                console.log(JSON.stringify({ lane: job.lane, grant: job.grant.name, network: config.network }));
+                console.log(JSON.stringify({ lane: job.lane, grant: job.grant?.name ?? null, network: config.network }));
                 const exited = new Promise<number | null>((resolve, reject) => {
                     child.once("error", () => reject(new Error("credential_docker_spawn_failed")));
                     child.once("close", resolve);
@@ -102,7 +106,7 @@ export async function launchContainers(config: ContainerRunConfig, source: Crede
                 if (!removed) throw new Error("credential_container_retained");
                 writeFileSync(join(output, `${index}-${job.lane}.log`), retained, { mode: 0o600 });
                 writeFileSync(join(output, `${index}-${job.lane}.json`), JSON.stringify({ boundary, removed, status,
-                    mock: config.mock, lane: job.lane, grant: job.grant.name, network: config.network }, null, 2), { mode: 0o600 });
+                    mock: config.mock, lane: job.lane, grant: job.grant?.name ?? null, network: config.network }, null, 2), { mode: 0o600 });
                 if (status !== 0) {
                     const reason = ["credential_no_credit", "credential_rate_limited"].find((code) => retained.includes(code));
                     throw new Error(reason ?? "credential_container_run_failed");
@@ -112,7 +116,7 @@ export async function launchContainers(config: ContainerRunConfig, source: Crede
                 child.stdin.destroy();
                 if (child.exitCode === null) await docker("kill", name).catch(() => {});
                 payload.fill(0); payload = Buffer.alloc(0); material = ""; scan = ""; secrets.fill("");
-                console.log(JSON.stringify({ lane: job.lane, grant: job.grant.name, credentialRunEnded: true }));
+                console.log(JSON.stringify({ lane: job.lane, grant: job.grant?.name ?? null, credentialRunEnded: true }));
             }
         }
     } finally { await source.close(); }
@@ -144,7 +148,9 @@ if (import.meta.main) {
         if (!output) throw new Error("credential_evidence_directory_required");
         const source: CredentialSource = config.mock ? {
             async getScoped() { return { material: `mock-bridge-${randomBytes(24).toString("hex")}`, expiresAtMs: null }; }, close() {},
-        } : await macCredentialSource(enrollmentPath);
+        } : selectedJobs(config).some((job) => job.grant) ? await macCredentialSource(enrollmentPath) : {
+            async getScoped() { throw new Error("credential_free_route_required"); }, close() {},
+        };
         await launchContainers(config, source, resolve(output));
     } catch (error) {
         const code = error instanceof Error && /^(credential_|mock_network_|paid_|real_grant_|exact_credential_|cache_measurement_)[a-z_]+$/.test(error.message)

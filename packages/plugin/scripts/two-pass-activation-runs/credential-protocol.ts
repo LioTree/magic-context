@@ -49,6 +49,17 @@ export async function readHandoff(input: AsyncIterable<Uint8Array>, expected: Gr
     } finally { raw = ""; bytes.fill(0); }
 }
 
+export async function readJobHandoff(input: AsyncIterable<Uint8Array>, grant?: GrantRequest): Promise<Handoff | undefined> {
+    if (grant) return readHandoff(input, grant);
+    // Grant-free jobs accept EOF only, never an unbound credential payload.
+    for await (const chunk of input) {
+        const nonempty = chunk.length > 0;
+        chunk.fill(0);
+        if (nonempty) throw new Error("credential_free_handoff_refused");
+    }
+    return undefined;
+}
+
 /** Retain an incomplete line until it can be redacted, including secrets split across writes. */
 export function redactedLines(secrets: string[], emit: (text: string) => void) {
     let pending = "";

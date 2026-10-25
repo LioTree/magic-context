@@ -189,12 +189,44 @@ bun packages/plugin/scripts/two-pass-activation-runs/container-launcher.ts \
   .cortexkit/internal-docs/investigations/two-pass-credential-bridge/evidence
 ```
 
-`paid-credential-run.json` names `apikey:anthropic:ufukaltinokgmail` and
-`apikey:cline-pass`, not code defaults. Its jobs are deliberately empty until
-approved route/catalog, tariff, prompts, container image and model inputs are
-provided. A filled config uses the same command with its path plus an explicit
-enrollment-file path as the third argument. Paid configs **must** specify
-`network: "bridge"` and a nonempty exact grant list; missing network or grants
+`paid-credential-run.json` is now a **preparation plan, not an executable
+campaign**. It inventories every matrix row plus the cache check, names the two
+exact grants, records current sources and proposed grader/budget inputs, and
+explicitly excludes only the two dropped Sonnet fallback rows. Other unresolved
+jobs stay visible and prevent dispatch with `credential_unresolved_jobs`.
+`preparationOnly: true` also refuses with `credential_campaign_driver_required`,
+even if all unresolved rows are excluded: the credential probe cannot load a
+corpus, run the replay schedule/graders, or share a ledger across containers.
+Its `@corpus:` / `@persisted-measurement:` prompt references must never be sent
+as literal model prompts. Selected-candidate images, real read-tool/origin
+evidence, billing gaps and prior-spend reconciliation are still outstanding.
+
+Run the static, provider-free preparation check from the repository root:
+
+```sh
+bun packages/plugin/scripts/two-pass-activation-runs/paid-preflight.ts \
+  --mock-preflight packages/plugin/scripts/two-pass-activation-runs/paid-credential-run.json \
+  <private-preflight-result.json>
+```
+
+Run it on Linux or in a capped offline container with the private corpus mounted
+read-only. It uses the native corpus/profile preflight and existing token
+counter, emits only case ids/sizes/counts, and exits **1 while anything is
+unresolved**. Static profile acceptance is not an effective host-profile report
+or live authorization. Grading estimates use recorded-output proxies and full
+output allowances; the proposed retry ceiling is conditional on caps a future
+campaign driver must enforce. Actual unknown charges remain null, not zero.
+The temporary `corpus-readonly` path must be restaged from the authorized bundle
+before reproducing the check; the private data is never committed.
+
+For separately prepared credential probes, the launcher accepts config, evidence
+directory and explicit enrollment-file path. Network mode must be
+`network: "bridge"` for non-mock jobs. Paid jobs require an exact listed grant;
+grant-free jobs require provider `opencode` on an OpenCode lane, an explicit zero
+tariff with a nonempty `source`, and `checkedAt` equal to today's UTC date.
+They receive no secret stdin payload or credential environment and never open
+the vault. OpenCode uses its literal `public` API marker for free access; that
+marker is not a user credential or a grant. Missing network or paid grants
 refuse with `paid_network_bridge_required` or `real_grant_list_required`.
 Mock configs can never select bridge networking. The launcher
 logs the selected network once per job. The proxy records each upstream host
