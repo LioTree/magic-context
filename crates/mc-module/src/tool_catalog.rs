@@ -473,6 +473,16 @@ pub(crate) fn catalog_answer(
         .map_err(|error| CatalogError::invalid("composition", error.to_string()))?;
 
     let mut content = Map::new();
+    if request.preset.is_none() {
+        content.insert(
+            "presets".to_string(),
+            json!([
+                Preset::Head.as_str(),
+                Preset::Worker.as_str(),
+                Preset::Reader.as_str()
+            ]),
+        );
+    }
     if let Some(digest) = &composition_digest {
         content.insert("composition_digest".to_string(), json!(digest));
     }

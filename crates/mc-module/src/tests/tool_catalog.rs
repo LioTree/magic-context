@@ -108,7 +108,7 @@ fn examples() -> Vec<(String, Value, Vec<u8>)> {
 fn every_example_request_gets_exactly_the_pinned_answer_bytes() {
     let config = example_catalog_config();
     let examples = examples();
-    assert_eq!(examples.len(), 11, "the fixture pins eleven examples");
+    assert_eq!(examples.len(), 12, "the fixture pins twelve examples");
     for (name, request, expected) in examples {
         let actual = tool_catalog::catalog_answer_bytes(&request, &config)
             .unwrap_or_else(|error| panic!("{name}: {error:?}"));
@@ -284,6 +284,63 @@ fn every_role_and_compaction_cell_serves_its_exact_tools_and_text() {
                     assert_eq!(other["tools"], answer["tools"]);
                     assert_eq!(other["system_text"]["text"], answer["system_text"]["text"]);
                 }
+            }
+        }
+    }
+}
+
+#[test]
+fn presetless_catalog_lists_exactly_the_three_served_presets() {
+    let config = example_catalog_config();
+    let answer = tool_catalog::catalog_answer(&json!({}), &config).unwrap();
+    assert_eq!(answer["presets"], json!(["head", "worker", "reader"]));
+    for compacting in [false, true] {
+        for surface in ["light", "full"] {
+            let mut request = role_request("head", compacting, surface);
+            request.as_object_mut().unwrap().remove("preset");
+            let answer = tool_catalog::catalog_answer(&request, &config).unwrap();
+            assert_eq!(answer["presets"], json!(["head", "worker", "reader"]));
+
+            let mut content = answer.as_object().unwrap().clone();
+            let digest = content.remove("catalog_digest").unwrap();
+            assert_eq!(content.remove("generation").unwrap(), digest);
+            assert_eq!(
+                digest,
+                json!(sha256_hex(&serde_jcs::to_vec(&content).unwrap()))
+            );
+
+            request["digest_only"] = json!(true);
+            let digest_only = tool_catalog::catalog_answer(&request, &config).unwrap();
+            assert_eq!(
+                digest_only,
+                json!({"generation": digest, "catalog_digest": digest})
+            );
+        }
+    }
+}
+
+#[test]
+fn preset_catalogs_do_not_list_presets() {
+    let config = example_catalog_config();
+    for preset in [
+        "head",
+        "worker",
+        "reader",
+        "primary",
+        "subagent",
+        "tools-only",
+    ] {
+        let role = match preset {
+            "primary" | "tools-only" => "head",
+            "subagent" => "worker",
+            other => other,
+        };
+        for compacting in [false, true] {
+            for surface in ["light", "full"] {
+                let mut request = role_request(role, compacting, surface);
+                request["preset"] = json!(preset);
+                let answer = tool_catalog::catalog_answer(&request, &config).unwrap();
+                assert!(answer.get("presets").is_none(), "{preset}");
             }
         }
     }

@@ -397,9 +397,9 @@ dependencies = [
 
 [[package]]
 name = "cortexkit-role-tool-provider"
-version = "0.10.0"
+version = "0.10.4"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "a79eb3694d3937c32077401e8a81b37116982dc83560962f62810a0d1c9f124f"
+checksum = "ca097348ffbd27d40a327528b078140bcbc3fa06ac096c13f84a7c7dc908ccc4"
 dependencies = [
  "serde",
  "serde_jcs",
