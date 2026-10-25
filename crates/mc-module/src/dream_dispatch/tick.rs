@@ -81,6 +81,35 @@ pub const PROJECT_UNRESOLVED: &str = "mc_dream_project_unresolved";
 /// The longest one task may run before the dispatcher aborts it.
 pub const TASK_TIMEOUT: Duration = Duration::from_secs(30 * 60);
 
+static ROUTED_RUNS: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
+struct RoutedRunPermit;
+
+impl RoutedRunPermit {
+    fn acquire() -> Option<Self> {
+        let mut running = ROUTED_RUNS.load(Ordering::Acquire);
+        loop {
+            if running >= 2 {
+                return None;
+            }
+            match ROUTED_RUNS.compare_exchange_weak(
+                running,
+                running + 1,
+                Ordering::AcqRel,
+                Ordering::Acquire,
+            ) {
+                Ok(_) => return Some(Self),
+                Err(current) => running = current,
+            }
+        }
+    }
+}
+
+impl Drop for RoutedRunPermit {
+    fn drop(&mut self) {
+        ROUTED_RUNS.fetch_sub(1, Ordering::AcqRel);
+    }
+}
+
 /// The route a project was last seen on: where its child sessions run and which
 /// conversation's runner the dispatcher should use.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -212,7 +241,14 @@ impl DreamRuns {
     }
 
     fn wire(&self) -> Arc<dyn DreamWire> {
-        self.wire.get_or_init(|| Arc::new(ProductionWire)).clone()
+        self.wire
+            .get_or_init(|| {
+                Arc::new(ProductionWire::new(
+                    self.connection_file.clone().unwrap_or_default(),
+                    crate::DEFAULT_MODULE_ID.into(),
+                ))
+            })
+            .clone()
     }
 }
 
@@ -299,15 +335,25 @@ impl DreamHandles {
             (_, Some(t)) => Some((t.directory, t.session, t.harness, None)),
             _ => None,
         };
-        match choose_path(self.runs.wire().scope_support(), legacy.is_some()) {
+        let wire = self.runs.wire();
+        let mut support = wire.scope_support();
+        let workdir = if support.is_ok() {
+            let folder = persisted_target(&store, project)
+                .map(|row| PathBuf::from(row.workdir))
+                .or_else(|| legacy.as_ref().map(|(directory, ..)| directory.clone()));
+            if let Some(folder) = &folder {
+                support = wire.scope_support_for(folder);
+            }
+            folder
+        } else {
+            None
+        };
+        match choose_path(support, legacy.is_some()) {
             Ok(DreamPath::Legacy) => self.start_legacy(store, project, claimant, legacy?, manual),
             Ok(DreamPath::Routed) => {
                 // A routed run needs only the project's folder: the persisted
                 // sighting, or the route it was last seen on in this process.
-                let workdir = persisted_target(&store, project)
-                    .map(|row| PathBuf::from(row.workdir))
-                    .or_else(|| legacy.map(|(directory, ..)| directory))?;
-                self.start_routed(store, project, workdir, manual)
+                self.start_routed(store, project, workdir?, manual)
             }
             Err(refusal) => {
                 let row = persisted_target(&store, project)?;
@@ -394,12 +440,14 @@ impl DreamHandles {
         workdir: PathBuf,
         manual: Option<ManualRun>,
     ) -> Option<Job> {
+        let permit = RoutedRunPermit::acquire()?;
         let guard = self.in_flight(project)?;
         let input = self.config_input(&workdir);
         let handles = self.clone();
         let project = project.to_owned();
         let manual_entry = manual.is_some();
         let work = move |unit: background::Unit| {
+            let _permit = permit;
             let _guard = guard;
             // A routed run has no conversation, so no harness block of the
             // dreamer config applies; schedules are read harness-free anyway.
@@ -872,5 +920,43 @@ impl RoutedRun<'_> {
             }
         }
         Ok(report)
+    }
+}
+
+#[cfg(test)]
+mod concurrency_tests {
+    use super::*;
+
+    #[test]
+    fn routed_runs_share_two_process_slots_and_return_them() {
+        let output = std::process::Command::new(std::env::current_exe().unwrap())
+            .args([
+                "--exact",
+                "dream_dispatch::tick::concurrency_tests::isolated_routed_run_slots",
+            ])
+            .env("MC_RUN_CAP_CHILD", "1")
+            .output()
+            .unwrap();
+        assert!(
+            output.status.success(),
+            "{}{}",
+            String::from_utf8_lossy(&output.stdout),
+            String::from_utf8_lossy(&output.stderr)
+        );
+    }
+
+    #[test]
+    fn isolated_routed_run_slots() {
+        if std::env::var_os("MC_RUN_CAP_CHILD").is_none() {
+            return;
+        }
+        let first = RoutedRunPermit::acquire().unwrap();
+        let second = RoutedRunPermit::acquire().unwrap();
+        assert!(RoutedRunPermit::acquire().is_none());
+        drop(first);
+        let next = RoutedRunPermit::acquire().unwrap();
+        assert!(RoutedRunPermit::acquire().is_none());
+        drop((second, next));
+        assert_eq!(ROUTED_RUNS.load(Ordering::Acquire), 0);
     }
 }

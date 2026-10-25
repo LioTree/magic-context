@@ -955,7 +955,6 @@ fn policy() -> BrocaPolicy {
     BrocaPolicy {
         module_id: "magic-context".into(),
         require_hard_cap: false,
-        privacy_sensitive: false,
     }
 }
 
@@ -1269,33 +1268,12 @@ async fn broca_child_lost_send_reply_resends_identical_send_only() {
 }
 
 #[tokio::test]
-async fn broca_child_sends_retention_and_private_dreams_use_the_shortest() {
+async fn broca_child_sends_retention_and_requires_retention_support() {
     let f = Fixture::new(BASE);
     f.script(vec![answer("done")]);
     let request = f.request(&[], 3);
     run(&f, &mut f.carrier(policy()), &request).await.0.unwrap();
     assert_eq!(f.sent()[0]["retention"], ORDINARY_RETENTION_SECONDS);
-    let private = BrocaPolicy {
-        privacy_sensitive: true,
-        ..policy()
-    };
-    let g = Fixture::new(BASE);
-    g.script(vec![answer("done")]);
-    run(&g, &mut g.carrier(private.clone()), &g.request(&[], 3))
-        .await
-        .0
-        .unwrap();
-    assert_eq!(
-        g.sent()[0]["retention"],
-        10 + PRIVATE_RETENTION_SLACK_SECONDS
-    );
-    // A runner that deletes too slowly, or declares no retention, gets nothing.
-    let slow = Fixture::new(BASE);
-    slow.broca.state().describe = describe(BASE, 1_000_000, PRIVATE_DELETE_WITHIN_MS + 1);
-    let refused = bounded(slow.carrier(private).open(&slow.request(&[], 3)))
-        .await
-        .unwrap_err();
-    assert_eq!(refused.message, "unavailable: retention_deletion_too_slow");
     let none = Fixture::new(&[
         "queue",
         "run_ops",
@@ -1310,7 +1288,7 @@ async fn broca_child_sends_retention_and_private_dreams_use_the_shortest() {
         .await
         .unwrap_err();
     assert_eq!(refused.message, "unavailable: retention");
-    assert!(slow.sent().is_empty() && none.sent().is_empty());
+    assert!(none.sent().is_empty());
 }
 
 #[tokio::test]
@@ -1521,13 +1499,11 @@ async fn broca_child_golden_runner_stops_at_exactly_the_cap() {
     ]);
     let mut request = f.request(&["ctx_memory"], 10);
     request.token_budget = Some(10);
-    // The golden runner deletes within an hour, so even a private dream is admitted.
-    let private = BrocaPolicy {
-        privacy_sensitive: true,
+    let capped = BrocaPolicy {
         require_hard_cap: true,
         ..policy()
     };
-    let (completion, _) = run(&f, &mut f.carrier(private), &request).await;
+    let (completion, _) = run(&f, &mut f.carrier(capped), &request).await;
     let failure = completion.unwrap_err();
     assert_eq!(
         failure.message,

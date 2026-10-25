@@ -46,12 +46,6 @@ pub const FILE_TOOL_PROVIDER: &str = "aft";
 /// Retention for an ordinary dream session on a runner with only the older
 /// `retention` group: one day, as for historian sessions.
 pub const ORDINARY_RETENTION_SECONDS: u64 = 86_400;
-/// A privacy-sensitive dream needs deletion of all runner-held content within an
-/// hour of its retention expiring; a runner promising less is unavailable.
-pub const PRIVATE_DELETE_WITHIN_MS: u64 = 3_600_000;
-/// Slack added to a privacy-sensitive session's retention past its attempt
-/// timeout, so cancellation and quiescence checks still find the session.
-pub const PRIVATE_RETENTION_SLACK_SECONDS: u64 = 60;
 const MAX_BODY: usize = 1024 * 1024;
 const MAX_CALLS: usize = 4096;
 const SEND_ATTEMPTS: usize = 3;
@@ -128,9 +122,6 @@ pub struct BrocaPolicy {
     /// The task needs a runner-enforced input-token cap: a runner that does not
     /// advertise `input_token_cap` is unavailable rather than merely stopped late.
     pub require_hard_cap: bool,
-    /// The prompt carries private memory: use the shortest retention and require
-    /// deletion within [`PRIVATE_DELETE_WITHIN_MS`] of expiry.
-    pub privacy_sensitive: bool,
 }
 
 #[derive(Debug, Clone, PartialEq)]
@@ -563,39 +554,17 @@ impl<P: BrocaPort> BrocaCarrier<P> {
             return Err(error(format!("unavailable: {}", missing.join(","))));
         }
         let retention = if member == RetentionMember::Policy {
-            // A keep-nothing child is deleted on release, or at the latest
-            // `max_unreleased_hold_ms` after its run ends when no release
-            // arrives; a privacy-sensitive dream needs that within the hour.
-            let limits = describe
+            describe
                 .session_retention
                 .as_ref()
                 .ok_or_else(|| error("unavailable: session_retention"))?;
-            if self.policy.privacy_sensitive
-                && limits.max_unreleased_hold_ms > PRIVATE_DELETE_WITHIN_MS
-            {
-                return Err(error("unavailable: retention_deletion_too_slow"));
-            }
             ChildRetention::Policy
         } else {
             let limits = describe
                 .retention
                 .filter(|r| r.max_seconds > 0 && r.delete_within_ms > 0)
                 .ok_or_else(|| error("unavailable: retention"))?;
-            if self.policy.privacy_sensitive && limits.delete_within_ms > PRIVATE_DELETE_WITHIN_MS {
-                return Err(error("unavailable: retention_deletion_too_slow"));
-            }
-            ChildRetention::Seconds(
-                if self.policy.privacy_sensitive {
-                    request
-                        .timeout
-                        .as_secs()
-                        .saturating_add(u64::from(request.timeout.subsec_nanos() > 0))
-                        .saturating_add(PRIVATE_RETENTION_SLACK_SECONDS)
-                } else {
-                    ORDINARY_RETENTION_SECONDS
-                }
-                .min(limits.max_seconds),
-            )
+            ChildRetention::Seconds(ORDINARY_RETENTION_SECONDS.min(limits.max_seconds))
         };
         let advertised = describe.declares(caps::INPUT_TOKEN_CAP);
         if budget.is_some() && !advertised && self.policy.require_hard_cap {

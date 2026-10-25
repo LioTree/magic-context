@@ -7,7 +7,7 @@
 use std::path::Path;
 
 use cortexkit_role_routing::{
-    errors::{Refusal, RefusalCode},
+    errors::Refusal,
     report::{ReportAnswer, ReportRequest},
     select::SelectRequest,
 };
@@ -19,8 +19,7 @@ use super::scope::{DreamScope, EntorhinalProjectId};
 use crate::dream_dispatch::broca_carrier::PortError;
 use crate::model_work::RoutingCatalog;
 
-/// A dream run cannot register its project scope with this build. Production
-/// answers it until the subc SDK can carry a scope's project and folder.
+/// No registered module connection has proven project-scope support yet.
 pub const SCOPE_UNSUPPORTED: &str = "mc_dream_scope_unsupported";
 
 /// A refusal from the scope seam, by name.
@@ -45,15 +44,19 @@ pub trait DreamWire: Send + Sync {
     /// Whether this build can register a project scope at all. A run takes the
     /// routed path only when it can; the refusal names what is missing.
     fn scope_support(&self) -> Result<(), WireRefusal>;
+    /// A refused folder must not disable routing for unrelated projects.
+    fn scope_support_for(&self, _workdir: &Path) -> Result<(), WireRefusal> {
+        self.scope_support()
+    }
     /// Entorhinal's project id for exactly this folder, or `None` when it has no
     /// registered answer. Never a derived identity.
     async fn lookup_project(&self, workdir: &Path) -> Option<EntorhinalProjectId>;
     /// Register (or update) `scope` with the daemon, ck-mc as its owner.
     async fn sync_scope(&self, scope: &DreamScope) -> Result<(), WireRefusal>;
     /// End `scope`; nothing more runs under it.
-    async fn end_scope(&self, scope: &DreamScope);
+    async fn end_scope(&self, scope: &DreamScope) -> Result<(), WireRefusal>;
     /// The routing/v1 providers in the module catalog right now.
-    fn routing_catalog(&self) -> RoutingCatalog;
+    async fn routing_catalog(&self) -> RoutingCatalog;
     /// Resolve tags against providers reachable under this scope. The resolved
     /// provider modules also restrict which modules the runner may call here.
     async fn tool_providers(
@@ -96,92 +99,4 @@ pub trait DreamWire: Send + Sync {
     async fn runner_release(&self, scope: &DreamScope, bind: &RunnerBind);
 }
 
-/// The production wire of this build: it cannot register a dream scope.
-///
-/// ck-mc pins subc-protocol 0.32.8, whose `ScopeRecord` has no `project_id` or
-/// `workdir` member (they arrive in subc-protocol 0.32.12), so a project scope
-/// carrying them cannot be sent. Rather than register a scope routing and the
-/// runners could not attribute, `scope_support` and `sync_scope` refuse with
-/// [`SCOPE_UNSUPPORTED`], so the dreamer keeps its older transports; the other
-/// operations are never reached and refuse or answer nothing. Replacing this
-/// needs the SDK bump, a `ModuleHandle` for `scope.sync`, and live routing
-/// catalog discovery.
-pub struct ProductionWire;
-
-const UNSUPPORTED_DETAIL: &str = "a dream project scope needs subc-protocol >= 0.32.12 \
-    (ScopeRecord.project_id and ScopeRecord.workdir); this build pins subc-protocol 0.32.8";
-
-fn unsupported() -> WireRefusal {
-    WireRefusal {
-        code: SCOPE_UNSUPPORTED.into(),
-        detail: UNSUPPORTED_DETAIL.into(),
-    }
-}
-
-fn unsupported_refusal() -> Refusal {
-    Refusal::new(RefusalCode::InvalidRequest, UNSUPPORTED_DETAIL)
-}
-
-fn unsupported_port() -> PortError {
-    PortError {
-        code: SCOPE_UNSUPPORTED.into(),
-        message: UNSUPPORTED_DETAIL.into(),
-        detail: Value::Null,
-        outcome_unknown: false,
-    }
-}
-
-#[async_trait]
-impl DreamWire for ProductionWire {
-    fn scope_support(&self) -> Result<(), WireRefusal> {
-        Err(unsupported())
-    }
-    async fn lookup_project(&self, _: &Path) -> Option<EntorhinalProjectId> {
-        None
-    }
-    async fn sync_scope(&self, _: &DreamScope) -> Result<(), WireRefusal> {
-        Err(unsupported())
-    }
-    async fn end_scope(&self, _: &DreamScope) {}
-    fn routing_catalog(&self) -> RoutingCatalog {
-        RoutingCatalog {
-            generation: 0,
-            providers: Vec::new(),
-        }
-    }
-    async fn tool_providers(
-        &self,
-        _: &DreamScope,
-        _: &[&str],
-    ) -> Result<Vec<Provider>, WireRefusal> {
-        Err(unsupported())
-    }
-    async fn select(&self, _: &DreamScope, _: &str, _: &SelectRequest) -> Result<Value, Refusal> {
-        Err(unsupported_refusal())
-    }
-    async fn report(
-        &self,
-        _: &DreamScope,
-        _: &str,
-        _: &ReportRequest,
-    ) -> Result<ReportAnswer, Refusal> {
-        Err(unsupported_refusal())
-    }
-    async fn runner_call(
-        &self,
-        _: &DreamScope,
-        _: &RunnerBind,
-        _: &str,
-        _: Value,
-    ) -> Result<Value, PortError> {
-        Err(unsupported_port())
-    }
-    async fn runner_next_unit(
-        &self,
-        _: &DreamScope,
-        _: &RunnerBind,
-    ) -> Result<Option<Value>, PortError> {
-        Err(unsupported_port())
-    }
-    async fn runner_release(&self, _: &DreamScope, _: &RunnerBind) {}
-}
+pub use super::production::ProductionWire;

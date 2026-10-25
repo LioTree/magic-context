@@ -694,7 +694,7 @@ async fn no_provider_or_ambiguous_provider_sends_nothing_and_is_generation_cache
             .await
             .unwrap_err()
             .code,
-        "mc_routing_unavailable"
+        "routing_provider_missing"
     );
     assert_eq!(
         engine
@@ -702,7 +702,7 @@ async fn no_provider_or_ambiguous_provider_sends_nothing_and_is_generation_cache
             .await
             .unwrap_err()
             .code,
-        "mc_routing_unavailable"
+        "routing_provider_missing"
     );
     let ambiguous = RoutingCatalog {
         generation: 2,
@@ -712,7 +712,7 @@ async fn no_provider_or_ambiguous_provider_sends_nothing_and_is_generation_cache
         .run(&ambiguous, &rig.order(), &runner)
         .await
         .unwrap_err();
-    assert_eq!(error.code, "mc_routing_ambiguous");
+    assert_eq!(error.code, "routing_provider_ambiguous");
     assert_eq!(error.modules, ["one", "two"]);
     assert!(rig.route.trace.lock().unwrap().events.is_empty());
     let available = RoutingCatalog {

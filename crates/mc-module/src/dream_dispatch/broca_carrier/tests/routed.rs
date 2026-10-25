@@ -11,6 +11,7 @@
 //!   that hosts only person-started sessions does.
 
 use super::*;
+mod live_shape;
 use crate::config_parity::{
     ConfigResolveRequest, CoreConfig, CoreConfigResolver, ProtectedTokenTiers, TrustFlags,
 };
@@ -189,13 +190,14 @@ impl DreamWire for FakeWire {
         Ok(())
     }
 
-    async fn end_scope(&self, scope: &DreamScope) {
+    async fn end_scope(&self, scope: &DreamScope) -> Result<(), WireRefusal> {
         let mut log = self.log();
         log.events.push("end".into());
         log.ends.push(scope.scope_ref().to_owned());
+        Ok(())
     }
 
-    fn routing_catalog(&self) -> RoutingCatalog {
+    async fn routing_catalog(&self) -> RoutingCatalog {
         RoutingCatalog {
             generation: 1,
             providers: self.providers.clone(),
@@ -1090,7 +1092,7 @@ async fn routed_run_without_a_routing_provider_is_refused_by_name() {
         .schedule()
         .and_then(|state| state.last_error)
         .unwrap_or_default();
-    assert!(error.contains("mc_routing_unavailable"), "{error}");
+    assert!(error.contains("routing_provider_missing"), "{error}");
     let log = rig.wire.log();
     assert!(log.syncs.is_empty() && log.selects.is_empty() && log.ops.is_empty());
     assert_eq!(classified(&rig.store), 0);
@@ -1375,4 +1377,22 @@ async fn a_folder_entorhinal_cannot_answer_skips_the_run_by_name() {
     );
     let log = wire.log();
     assert!(log.syncs.is_empty() && log.selects.is_empty() && log.ops.is_empty());
+}
+
+#[tokio::test]
+async fn routed_context_floor_covers_both_assembled_prompt_parts() {
+    let rig = CarrierRig::new(vec![candidate("broca", "model-a", Some("claude-code"))]);
+    let mut carrier = rig.carrier_for(rig.f.context.task);
+    let mut request = rig.f.request(&[], 5);
+    request.system = "alpha beta gamma delta ".repeat(1_000);
+    request.prompt = "one two three four ".repeat(1_000);
+    let child = carrier.open(&request).await.unwrap();
+    carrier.complete(&child, &request).await.unwrap();
+    carrier.close(&child, true).await.unwrap();
+    assert!(
+        rig.wire.log().selects[0].1["requirements"]["context_window"]
+            .as_u64()
+            .unwrap()
+            > 4_000
+    );
 }
