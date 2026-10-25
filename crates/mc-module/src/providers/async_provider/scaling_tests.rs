@@ -1721,7 +1721,6 @@ async fn covered_tail_latency_benchmark() {
             }
         }
         percentiles("quiet notice (+4 msgs)", size, &mut notices);
-        let quiet_p50 = median_wall(&notices);
         if !historian.is_empty() {
             percentiles(
                 "historian evaluation (process CPU after notice)",
@@ -1806,7 +1805,6 @@ async fn covered_tail_latency_benchmark() {
         }
         percentiles("ride attempt", size, &mut rides);
         percentiles("publishing notice attempt", size, &mut publishes);
-        let (ride_p50, publish_p50) = (median_wall(&rides), median_wall(&publishes));
         eprintln!(
             "ride errors={ride_errors}/{views}, publishing notice errors={publish_errors}/{views}"
         );
@@ -1898,17 +1896,15 @@ async fn covered_tail_latency_benchmark() {
         // which the provider does not own.
         let cost = CostSample {
             size,
-            first_notice_ms: bootstrap.0 .0,
-            quiet_p50_ms: quiet_p50,
-            ride_p50_ms: ride_p50,
-            publish_p50_ms: publish_p50,
+            first_notice: CostTiming::from_samples(&[bootstrap.0]),
+            quiet: CostTiming::from_samples(&notices),
+            ride: CostTiming::from_samples(&rides),
+            publish: CostTiming::from_samples(&publishes),
             peak_rss_net_bytes: peak.saturating_sub(rss_before),
             resident_held_bytes: held as u64,
-            descending_setup_p50_ms: median_wall(&setups),
+            descending_setup: CostTiming::from_samples(&setups),
             cut_seed_bytes,
             descending_setup_runner_calls: setup_runner_calls,
-            first_notice_thread_cpu_ms: bootstrap.0 .1,
-            first_notice_process_cpu_ms: bootstrap.0 .2,
             first_notice_engine_input: first_work.engine_input,
             first_notice_decoded_entries: first_work.decoded_entries,
             first_notice_read_rows: first_read_rows,
@@ -1949,21 +1945,17 @@ struct FirstNoticeSample {
     process_cpu_ms: f64,
 }
 
-fn first_notice_medians(samples: &[FirstNoticeSample]) -> FirstNoticeSample {
+fn first_notice_medians(samples: &[FirstNoticeSample]) -> CostTiming {
     assert!(
         samples.len() >= 5,
         "first-notice median needs at least five fresh samples"
     );
-    let median = |get: fn(&FirstNoticeSample) -> f64| {
-        let mut values = samples.iter().map(get).collect::<Vec<_>>();
-        values.sort_by(f64::total_cmp);
-        values[values.len() / 2]
-    };
-    FirstNoticeSample {
-        wall_ms: median(|sample| sample.wall_ms),
-        thread_cpu_ms: median(|sample| sample.thread_cpu_ms),
-        process_cpu_ms: median(|sample| sample.process_cpu_ms),
-    }
+    CostTiming::from_samples(
+        &samples
+            .iter()
+            .map(|sample| (sample.wall_ms, sample.thread_cpu_ms, sample.process_cpu_ms))
+            .collect::<Vec<_>>(),
+    )
 }
 
 #[test]
@@ -1997,28 +1989,30 @@ fn first_notice_medians_use_all_fresh_samples_and_preserve_cpu_measurements() {
     ];
     assert_eq!(
         first_notice_medians(&samples),
-        FirstNoticeSample {
-            wall_ms: 30.0,
-            thread_cpu_ms: 4.0,
-            process_cpu_ms: 5.0,
+        CostTiming {
+            wall_p50_ms: 30.0,
+            wall_p90_ms: 900.0,
+            thread_cpu_p50_ms: 4.0,
+            process_cpu_p50_ms: 5.0,
+            process_cpu_p90_ms: 8.0,
         }
     );
+    let even = CostTiming::from_samples(&[(1.0, 2.0, 3.0), (4.0, 5.0, 6.0)]);
+    assert_eq!((even.wall_p50_ms, even.process_cpu_p50_ms), (4.0, 6.0));
 }
 
 #[derive(Serialize, Deserialize, Debug, Clone)]
 struct CostSample {
     size: u64,
-    first_notice_ms: f64,
-    quiet_p50_ms: f64,
-    ride_p50_ms: f64,
-    publish_p50_ms: f64,
+    first_notice: CostTiming,
+    quiet: CostTiming,
+    ride: CostTiming,
+    publish: CostTiming,
     peak_rss_net_bytes: u64,
     resident_held_bytes: u64,
-    descending_setup_p50_ms: f64,
+    descending_setup: CostTiming,
     cut_seed_bytes: u64,
     descending_setup_runner_calls: u64,
-    first_notice_thread_cpu_ms: f64,
-    first_notice_process_cpu_ms: f64,
     first_notice_engine_input: usize,
     first_notice_decoded_entries: usize,
     first_notice_read_rows: u64,
@@ -2032,22 +2026,78 @@ struct CostSample {
     first_notice_phases: String,
 }
 
-fn median_wall(samples: &[(f64, f64, f64)]) -> f64 {
-    let mut walls = samples.iter().map(|sample| sample.0).collect::<Vec<_>>();
-    walls.sort_by(f64::total_cmp);
-    walls.get(walls.len() / 2).copied().unwrap_or(f64::NAN)
+#[derive(Serialize, Deserialize, Debug, Clone, Copy, PartialEq)]
+struct CostTiming {
+    wall_p50_ms: f64,
+    wall_p90_ms: f64,
+    thread_cpu_p50_ms: f64,
+    process_cpu_p50_ms: f64,
+    process_cpu_p90_ms: f64,
+}
+
+impl CostTiming {
+    fn from_samples(samples: &[(f64, f64, f64)]) -> Self {
+        assert!(!samples.is_empty(), "a cost row needs measured samples");
+        let pick = |get: fn(&(f64, f64, f64)) -> f64, p90: bool| {
+            let mut values = samples.iter().map(get).collect::<Vec<_>>();
+            values.sort_by(f64::total_cmp);
+            // Preserve the upper median used by the original cost assertions.
+            let index = if p90 {
+                (values.len() * 9).div_ceil(10) - 1
+            } else {
+                values.len() / 2
+            };
+            values[index]
+        };
+        Self {
+            wall_p50_ms: pick(|sample| sample.0, false),
+            wall_p90_ms: pick(|sample| sample.0, true),
+            thread_cpu_p50_ms: pick(|sample| sample.1, false),
+            process_cpu_p50_ms: pick(|sample| sample.2, false),
+            process_cpu_p90_ms: pick(|sample| sample.2, true),
+        }
+    }
+}
+
+fn cpu_cost_failure(name: &str, small: CostTiming, large: CostTiming) -> Option<String> {
+    let ratio = large.process_cpu_p50_ms / small.process_cpu_p50_ms;
+    eprintln!("cost rule {name}: 1k process CPU p50 {:.1} / p90 {:.1} ms, wall p50 {:.1} / p90 {:.1} ms; 150k process CPU p50 {:.1} / p90 {:.1} ms, wall p50 {:.1} / p90 {:.1} ms; process CPU ratio {ratio:.2}",
+        small.process_cpu_p50_ms, small.process_cpu_p90_ms, small.wall_p50_ms, small.wall_p90_ms,
+        large.process_cpu_p50_ms, large.process_cpu_p90_ms, large.wall_p50_ms, large.wall_p90_ms);
+    (!ratio.is_finite() || ratio > 2.0).then(|| format!("{name} process CPU p50 {ratio:.2}x"))
+}
+
+#[test]
+fn cpu_cost_bar_rejects_work_growth_but_not_wall_stalls() {
+    let small = CostTiming::from_samples(&[(10.0, 10.0, 10.0); 5]);
+    let stalled = CostTiming::from_samples(&[(3_600.0, 20.0, 20.0); 5]);
+    assert_eq!(cpu_cost_failure("stall", small, stalled), None);
+    let growth = CostTiming {
+        process_cpu_p50_ms: 20.1,
+        ..stalled
+    };
+    assert_eq!(
+        cpu_cost_failure("growth", small, growth),
+        Some("growth process CPU p50 2.01x".into())
+    );
+    let invalid = CostTiming {
+        process_cpu_p50_ms: f64::NAN,
+        ..stalled
+    };
+    assert!(cpu_cost_failure("invalid", small, invalid).is_some());
 }
 
 /// The cost rule as an assertion: per-step work scales with new messages and
 /// resident memory with the window, so a 150,000-message session whose
 /// compartments cover all but the same ~40k-token tail must cost no more than
-/// twice a 1,000-message one on every measured step, and hold no more than
+/// twice a 1,000-message one in process CPU on every measured step, and hold no more than
 /// twice the memory.
 ///
 /// Each size runs `covered_tail_latency_benchmark` in its own child process
 /// of this test binary, because the peak resident set (VmHWM) of a process
-/// never decreases. First-notice wall time is the median of five fresh child
-/// processes; all samples include thread and process CPU time for diagnosis.
+/// never decreases. First-notice CPU time is the median of five fresh child
+/// processes. Wall p50/p90 stay visible beside CPU but are not a pass bar:
+/// scheduling and I/O stalls on a shared host are not session-sized CPU work.
 /// Other measurements still come from one full benchmark per size and mode.
 /// Linux only (RSS comes from /proc). Run with:
 ///
@@ -2136,32 +2186,38 @@ fn cost_rule_150k_vs_1k() {
                 if fresh { "fresh" } else { "descending" },
                 serde_json::to_string(&samples).unwrap()
             );
-            let medians = first_notice_medians(&samples);
-            cost.first_notice_ms = medians.wall_ms;
-            cost.first_notice_thread_cpu_ms = medians.thread_cpu_ms;
-            cost.first_notice_process_cpu_ms = medians.process_cpu_ms;
+            cost.first_notice = first_notice_medians(&samples);
             cost
         };
         let small = sample(1_000);
         let large = sample(150_000);
         eprintln!("cost rule 1k: {small:?}");
         eprintln!("cost rule 150k: {large:?}");
+        let time_checks = [
+            (
+                "first notice (5 fresh samples)",
+                small.first_notice,
+                large.first_notice,
+            ),
+            ("quiet notice", small.quiet, large.quiet),
+            ("ride", small.ride, large.ride),
+            ("publishing notice", small.publish, large.publish),
+            (
+                "setup for a descending lineage",
+                small.descending_setup,
+                large.descending_setup,
+            ),
+        ];
         let checks = [
             (
-                "first notice p50 ms (5 fresh samples)",
-                small.first_notice_ms,
-                large.first_notice_ms,
+                "first notice rows read",
+                small.first_notice_read_rows as f64,
+                large.first_notice_read_rows as f64,
             ),
             (
-                "quiet notice p50 ms",
-                small.quiet_p50_ms,
-                large.quiet_p50_ms,
-            ),
-            ("ride p50 ms", small.ride_p50_ms, large.ride_p50_ms),
-            (
-                "publishing notice p50 ms",
-                small.publish_p50_ms,
-                large.publish_p50_ms,
+                "first notice bytes read",
+                small.first_notice_read_bytes as f64,
+                large.first_notice_read_bytes as f64,
             ),
             (
                 "peak RSS net of the fixture, bytes",
@@ -2178,11 +2234,6 @@ fn cost_rule_150k_vs_1k() {
                 small.cut_seed_bytes as f64,
                 large.cut_seed_bytes as f64,
             ),
-            (
-                "setup for a descending lineage p50 ms",
-                small.descending_setup_p50_ms,
-                large.descending_setup_p50_ms,
-            ),
         ];
         let mut failures = checks
             .iter()
@@ -2194,6 +2245,11 @@ fn cost_rule_150k_vs_1k() {
             .filter(|(_, ratio)| !ratio.is_finite() || *ratio > 2.0)
             .map(|(name, ratio)| format!("{name} {ratio:.2}x"))
             .collect::<Vec<_>>();
+        failures.extend(
+            time_checks
+                .iter()
+                .filter_map(|(name, small, large)| cpu_cost_failure(name, *small, *large)),
+        );
         for sample in [&small, &large] {
             if sample.descending_setup_runner_calls != 0 {
                 failures.push(format!(
