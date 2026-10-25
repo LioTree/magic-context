@@ -80,7 +80,7 @@ pub(super) async fn campaign_host_rewind(pair: &mut Pair, seed: u64, cut: u64) {
     } else {
         4
     };
-    let end = ((first + 12 + period - 1) / period) * period;
+    let end = (first + 12).div_ceil(period) * period;
     while newest_ordinal(pair) < end + 12 {
         pair.append(4);
     }

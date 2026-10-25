@@ -9,13 +9,15 @@ use subc_transport::{
 };
 use tokio::net::TcpListener;
 
+type RecordedRoute = (
+    RouteTarget,
+    subc_protocol::BindIdentity,
+    Option<BTreeMap<String, String>>,
+);
+
 #[derive(Default)]
 struct WireLog {
-    routes: Vec<(
-        RouteTarget,
-        subc_protocol::BindIdentity,
-        Option<BTreeMap<String, String>>,
-    )>,
+    routes: Vec<RecordedRoute>,
     describes: usize,
     sends: Vec<Value>,
 }
@@ -40,7 +42,7 @@ impl Server {
         let key = generate_key().unwrap();
         let daemon_id = generate_daemon_id().unwrap();
         write_atomic(
-            &root.path().join("connection.json"),
+            root.path().join("connection.json"),
             &ConnectionInfo {
                 schema: SCHEMA_VERSION,
                 wire_version: Some(subc_protocol::PROTOCOL_VERSION),

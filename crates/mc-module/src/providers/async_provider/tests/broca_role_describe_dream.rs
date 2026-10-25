@@ -201,7 +201,11 @@ async fn broca_role_describe_dream_child_admission_and_negotiated_send() {
                 carrier.close(&child, true).await.unwrap();
                 assert!(!routes.is_live(&child), "{name}");
                 let port = carrier.port();
-                assert_eq!(port.released, [child.clone()], "{name}");
+                assert_eq!(
+                    port.released.as_slice(),
+                    std::slice::from_ref(&child),
+                    "{name}"
+                );
                 assert!(
                     port.calls.iter().all(|(session, _, _)| session == &child),
                     "{name}: discovery and sends bind the child, not the parent"

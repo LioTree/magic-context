@@ -7,7 +7,7 @@ async fn prepare_capture(
     description: Value,
 ) -> Result<Prepared, command::RunError> {
     let (paths, session, served) = moved_stores(store, fixture_stores);
-    pin_history_generation(&paths.context_db, project, &session, &[0, 1]);
+    pin_history_generation(&paths.context_db, &session, &[0, 1]);
     let work = tempfile::tempdir().unwrap();
     let mut setup = setup_file(project, &setup_request(&session, "fixture"));
     setup["runner_describe"] = description;

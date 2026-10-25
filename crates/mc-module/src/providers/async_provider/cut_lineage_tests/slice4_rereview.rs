@@ -573,7 +573,7 @@ async fn same_ordinal_branches(
     let mut pair = Pair::open_with(profile, false, Some("lineage-A"), false, false).await;
     *pair.transcript.lineage.lock().unwrap() = "lineage-A".into();
     pair.append(120);
-    let mut rng = Rng(0xABAB_100);
+    let mut rng = Rng(0x0ABA_B100);
     branch_summary(&mut pair, "branch-A-only-summary", 99).await;
     pair.notice(&mut rng, None).await;
     let saved_a = pair.transcript.entries.lock().unwrap().clone();
@@ -697,7 +697,7 @@ async fn r02_same_ordinal_branches_restore_their_own_exact_cut_after_eviction() 
         pair.cut_checkpoint_lineages
             .insert(first, "lineage-A".into());
         restore_oracle_prefix(&pair, full_a, first);
-        let mut rng = Rng(0xABAB_101);
+        let mut rng = Rng(0x0ABA_B101);
         for index in 0..3 {
             pair.append_salted(4, 91_000 + index);
             review_complete_turn(&pair);
@@ -734,7 +734,7 @@ async fn same_ordinal_head_refusal(profile: Profile, ambiguous: bool) {
     }
     *pair.resident.runner.head.lock().unwrap() = Some(head);
     let before = newest_version(&pair);
-    let mut rng = Rng(0xABAB_102);
+    let mut rng = Rng(0x0ABA_B102);
     for _ in 0..2 {
         let outcome = resident_notice(&mut pair, &mut rng, None).await;
         assert!(

@@ -407,7 +407,8 @@ async fn broca_role_describe_reminder_delivery_modes() {
 async fn broca_role_describe_upgrade_retries_refused_reminder_list_once() {
     use crate::runner_reminders::{send_due_reminders, ReminderState};
     let all = captures();
-    for pair in all.chunks_exact(2) {
+    let (pairs, _) = all.as_chunks::<2>();
+    for pair in pairs {
         let runner = ReminderRunner {
             description: Mutex::new(pair[0].2.clone()),
             sends: Mutex::new(Vec::new()),
