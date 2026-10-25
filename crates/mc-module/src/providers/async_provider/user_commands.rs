@@ -166,9 +166,7 @@ impl McHandler {
             .store
             .get()
             .ok_or_else(|| transient("store unavailable"))?;
-        let rows = store
-            .async_compaction_for_session(&binding.project_root.to_string_lossy(), &binding.session)
-            .map_err(transient)?;
+        let rows = super::route_records(store, binding)?;
         match rows.as_slice() {
             [] => Err(refused("async_compaction_required", "user_command.invoke")),
             [raw] => serde_json::from_str(raw).map_err(transient),

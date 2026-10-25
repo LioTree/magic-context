@@ -12106,6 +12106,7 @@ impl McHandler {
                     },
                     "storage_versions": storage_versions_block(&store),
                     "memory_holders": self.memory_holder_metrics(),
+                    "async_bus": self.async_bus_health(),
                 })),
                 Err(e) => HandlerOutcome::Error {
                     code: "store_load_failed".to_string(),
@@ -12173,6 +12174,7 @@ impl McHandler {
                 "state_sync_resume": true,
             },
             "storage_versions": storage_versions_block(&store),
+            "async_bus": self.async_bus_health(),
         }))
     }
 
@@ -16836,8 +16838,9 @@ impl ModuleHandler for McHandler {
         self.start_async_compaction_background();
     }
 
-    /// Return an atomics-only liveness snapshot. The SDK invokes this on its separate
-    /// channel-0 health task, so neither the store nor a handler lock is touched here.
+    /// Return a liveness snapshot without touching the store or dispatch lane.
+    /// The SDK invokes this on its separate channel-0 health task; bus status is
+    /// copied under short-lived in-memory locks.
     async fn health(&self) -> HealthReport {
         let now = now_ms().max(0) as u64;
         let report = if let Some(waiting) = self.store_open.waiting_report(now) {
@@ -16847,7 +16850,14 @@ impl ModuleHandler for McHandler {
         } else {
             self.augment_runner_choice_health(DISPATCH_HEALTH.report(now))
         };
-        with_pinned_epochs_health(report)
+        let mut report = with_pinned_epochs_health(report);
+        report
+            .metrics
+            .as_mut()
+            .and_then(Value::as_object_mut)
+            .expect("health metrics object")
+            .insert("async_bus".into(), self.async_bus_health());
+        report
     }
 
     /// Record the route's {project_root, session} so the transform path can resolve the
@@ -39535,6 +39545,7 @@ mod tests {
         let session =
             decode(handler.handle_status_value(&json!({ "kind": "status", "session_id": "ses" })));
         for status in [&health, &session] {
+            assert_eq!(status.get("async_bus"), Some(&Value::Null));
             let versions = &status["storage_versions"];
             // The module does not read the host's context.db; the TS surface owns it.
             assert!(versions["context_db_schema_version"].is_null());

@@ -258,7 +258,7 @@ impl Arm {
     }
 
     fn reference(&self) -> String {
-        session_ref("opencode", &self.project.to_string_lossy(), &self.session)
+        runner_session_ref(MODULE, "opencode", &self.session)
     }
 
     async fn setup(&self, request: Value) -> Value {
@@ -458,9 +458,9 @@ fn moved_stores(
 /// compartments when they are first written. The m1 revision digests the
 /// engine commits hash it, so two stores compared with each other need the
 /// same value; within one store nothing changes.
-fn pin_history_generation(context_db: &Path, project: &Path, session: &str, generations: &[u64]) {
+fn pin_history_generation(context_db: &Path, session: &str, generations: &[u64]) {
     let key = Key {
-        project: project.into(),
+        runner: MODULE.into(),
         session: session.into(),
         harness: "opencode".into(),
     };
@@ -534,7 +534,7 @@ async fn prepared(
     write: impl FnOnce(&Path) -> (StorePaths, String),
 ) -> (Prepared, OfflineOutcome) {
     let (paths, session, served) = moved_stores(store, write);
-    pin_history_generation(&paths.context_db, project, &session, &[0, 1]);
+    pin_history_generation(&paths.context_db, &session, &[0, 1]);
     let work = tempfile::tempdir().unwrap();
     let args = command_args(
         work.path(),
@@ -832,12 +832,7 @@ async fn a_changed_entry_discards_the_offline_first_pass_and_runs_the_ordinary_o
     // never saw the offline command, commits the same engine state.
     let control_store = tempfile::tempdir().unwrap();
     let (control_paths, _, _) = moved_stores(control_store.path(), fixture_stores);
-    pin_history_generation(
-        &control_paths.context_db,
-        project.path(),
-        &prep.session,
-        &[0],
-    );
+    pin_history_generation(&control_paths.context_db, &prep.session, &[0]);
     let control = Arm::open(
         control_store.path(),
         project.path(),
@@ -957,7 +952,7 @@ async fn an_offline_run_that_stopped_before_its_proof_is_never_adopted() {
     let (prep, _) = prepared(store.path(), project.path(), fixture_stores).await;
     // The record as a run stopped before its last save leaves it: marked, but
     // with no proof.
-    let reference = session_ref("opencode", &project.path().to_string_lossy(), &prep.session);
+    let reference = runner_session_ref(MODULE, "opencode", &prep.session);
     let conn = rusqlite::Connection::open(store.path().join("store.db")).unwrap();
     let raw: String = conn
         .query_row(
@@ -1272,7 +1267,7 @@ async fn a_runner_describe_without_tag_checkpoint_is_refused_offline_by_name() {
         refusal_code(first_pass(&args, project.path(), &fixture::NoHolders).await),
         "tag_checkpoint_unsupported"
     );
-    let reference = session_ref("opencode", &project.path().to_string_lossy(), &session);
+    let reference = runner_session_ref(MODULE, "opencode", &session);
     let store = McStore::open_for_test(&fixture::store_descriptor(store.path())).unwrap();
     assert!(
         load_head(&store, &reference).unwrap().is_none(),
@@ -1514,7 +1509,7 @@ async fn differential(
         "{label}: {outcome:?}"
     );
     let (live_paths, session, served) = moved_stores(live_dir.path(), &write);
-    pin_history_generation(&live_paths.context_db, project.path(), &session, &[0, 1]);
+    pin_history_generation(&live_paths.context_db, &session, &[0, 1]);
     assert_eq!(
         served, prep.served,
         "{label}: both arms serve the same entries"
@@ -1892,7 +1887,7 @@ async fn first_notice_at(
         "{label}: {outcome:?}"
     );
     let (live_paths, session, served) = moved_stores(live_dir.path(), &write);
-    pin_history_generation(&live_paths.context_db, project.path(), &session, &[0, 1]);
+    pin_history_generation(&live_paths.context_db, &session, &[0, 1]);
     let live = Arm::open(
         live_dir.path(),
         project.path(),

@@ -2,14 +2,33 @@
 use super::*;
 use serde::Deserialize;
 
+/// A runner conversation's identity: the attested runner, Setup's harness and
+/// Setup's session (compaction-provider contract §1). The project folder is
+/// route metadata and never part of it, so every spelling of one folder (a
+/// symlink, `/var` and `/private/var`, a trailing slash) reaches the same state.
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct Key {
-    pub project: PathBuf,
+    /// The bare module id of the daemon-attested runner principal, exactly as
+    /// the daemon stamped it, never a `reserved:` display form.
+    pub runner: String,
     pub session: String,
     pub harness: String,
 }
 
+/// The bare module id of the runner the daemon attested on `binding`'s route,
+/// or `None` when the caller is not a reserved module. The id comes only from
+/// the daemon-stamped principal, never from a request body.
+pub(crate) fn attested_runner(binding: &SessionBinding) -> Option<&str> {
+    match &binding.principal {
+        Some(subc_protocol::Principal::Reserved { module_id }) => Some(module_id),
+        _ => None,
+    }
+}
+
 impl Key {
+    /// `session` and `harness` are kept exactly as given: the session reference
+    /// hashes them without normalisation, so trimming here would key the same
+    /// session differently from a caller that hashes the raw value.
     pub fn new(
         binding: &SessionBinding,
         session: &str,
@@ -21,10 +40,22 @@ impl Key {
         if harness.trim().is_empty() {
             return Err(invalid("harness must be non-empty"));
         }
+        let runner = attested_runner(binding)
+            .ok_or_else(|| invalid_field("compaction_mode", "async requires an attested runner"))?;
         Ok(Self {
-            project: binding.project_root.clone(),
-            session: session.trim().into(),
+            runner: runner.into(),
+            session: session.into(),
             harness: harness.into(),
+        })
+    }
+
+    /// The conversation's session reference (llm-runner §14.1), the key of
+    /// every piece of state ck-mc keeps for it.
+    pub fn reference(&self) -> String {
+        cortexkit_role_llm_runner::session_ref(&cortexkit_role_llm_runner::SessionIdentity {
+            runner: &self.runner,
+            harness: &self.harness,
+            session: &self.session,
         })
     }
 
@@ -152,9 +183,14 @@ impl Storage {
 }
 
 impl Key {
+    /// The store's provider key for this conversation. Its first column is
+    /// named `project_root` for the folder-keyed records that share these
+    /// tables; a runner conversation stores its runner module id there
+    /// instead, so no folder enters the key. A module id is never an absolute
+    /// path, so the two kinds of record cannot collide.
     pub fn store_key(&self) -> mc_store::ProviderSessionKey {
         mc_store::ProviderSessionKey {
-            project_root: self.project.to_string_lossy().into_owned(),
+            project_root: self.runner.clone(),
             session: self.session.clone(),
             harness: self.harness.clone(),
             generation: None,

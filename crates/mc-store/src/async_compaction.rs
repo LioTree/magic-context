@@ -221,16 +221,34 @@ impl McStore {
         })?;
         Ok(())
     }
+    /// The records of every conversation `runner` holds for `session`, whatever
+    /// its harness. A runner conversation's key starts with its runner module
+    /// id, never a project folder.
     pub fn async_compaction_for_session(
         &self,
-        project: &str,
+        runner: &str,
         session: &str,
     ) -> Result<Vec<String>, McStoreError> {
         self.inner.with_conn(|conn| {
             let mut query=conn.prepare("SELECT state_json FROM mc_async_compaction WHERE session=?2 AND json_extract(conversation_key,'$[0]')=?1")?;
-            let rows=query.query_map(params![project,session],|row|row.get(0))?;
+            let rows=query.query_map(params![runner,session],|row|row.get(0))?;
             rows.collect()
         }).map_err(Into::into)
+    }
+    /// The records of every conversation held for `session`, whatever its
+    /// runner or harness. The caller decides which of them it may reach.
+    pub fn async_compaction_records_for_session(
+        &self,
+        session: &str,
+    ) -> Result<Vec<String>, McStoreError> {
+        self.inner
+            .with_conn(|conn| {
+                let mut query =
+                    conn.prepare("SELECT state_json FROM mc_async_compaction WHERE session=?1")?;
+                let rows = query.query_map([session], |row| row.get(0))?;
+                rows.collect()
+            })
+            .map_err(Into::into)
     }
     pub fn load_async_compaction(&self, session_ref: &str) -> Result<Option<String>, McStoreError> {
         self.inner

@@ -479,7 +479,7 @@ async fn cut_session_start(
     // everything; the pair's two sides then both start fresh at the cut.
     let full_side = if mode == CutMode::BootstrapAtCut {
         let side = Side::new(pair._project.path(), &pair.transcript, false, inject_docs).await;
-        let setup = json!({"method":"compaction.setup","params":{"session":"s","harness":profile.harness(),"request_id":"setup","model":"fixture","context_window":100_000,"composition":{"render_tags":true},"params":{"serializer_profile":profile.wire()},"now":1,"lineage_id":"L"}});
+        let setup = json!({"method":"compaction.setup","params":{"session":pair_session(pair._project.path()),"harness":profile.harness(),"request_id":"setup","model":"fixture","context_window":100_000,"composition":{"render_tags":true},"params":{"serializer_profile":profile.wire()},"now":1,"lineage_id":"L"}});
         side.dispatch(setup).await;
         publish_history(&side, &pair.reference, history_end);
         Some(side)

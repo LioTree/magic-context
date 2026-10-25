@@ -18,7 +18,7 @@ fn v2_pi_recipe_round_trips_the_whole_host_view() {
     })
     .unwrap();
     let key = Key {
-        project: dir.path().to_path_buf(),
+        runner: "thalamus-harness".into(),
         session: "pi-session".into(),
         harness: "pi".into(),
     };
