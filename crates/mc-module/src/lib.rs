@@ -51,6 +51,7 @@ pub mod dream_tasks;
 pub mod historian_routed;
 mod memory_actions;
 mod memory_context;
+mod memory_profile;
 mod model_work;
 pub mod persona_host;
 
@@ -12706,6 +12707,32 @@ impl McHandler {
             }
             Err(e) => return reject_transform(e),
         };
+        if result.response.committed
+            && self.module_knows_transform_session(&binding.session, &binding.project_root)
+        {
+            let connection_file = self
+                .provider_store
+                .async_runtime
+                .connection_file
+                .lock()
+                .expect("connection file mutex")
+                .clone();
+            memory_profile::bind_session(
+                &store,
+                connection_file,
+                subc_protocol::BindIdentity::new(
+                    binding.project_root.clone(),
+                    &binding.harness,
+                    &binding.session,
+                ),
+                &binding.session,
+                binding
+                    .scope
+                    .as_ref()
+                    .and_then(|scope| scope.attributes.agent_id.as_deref()),
+            )
+            .await;
+        }
         let transform_execute_ms = transform_execute_started_at.elapsed().as_secs_f64() * 1_000.0;
         profile_end!(perf_execute);
         let handler_followup_started_at = Instant::now();
@@ -15330,6 +15357,28 @@ impl McHandler {
             });
         }
 
+        let connection_file = self
+            .provider_store
+            .async_runtime
+            .connection_file
+            .lock()
+            .expect("connection file mutex")
+            .clone();
+        memory_profile::bind_session(
+            self.store.get().expect("proven facade store"),
+            connection_file,
+            subc_protocol::BindIdentity::new(
+                binding.project_root.clone(),
+                &binding.harness,
+                &binding.session,
+            ),
+            &conversation_key,
+            binding
+                .scope
+                .as_ref()
+                .and_then(|scope| scope.attributes.agent_id.as_deref()),
+        )
+        .await;
         Ok(FacadeScope {
             memory_project_path,
             route_project_root,
@@ -16967,6 +17016,27 @@ impl ModuleHandler for McHandler {
                     self.unbind_route(req.handle.channel);
                     return subc_client_rs::BindDecision::reject("unavailable", error.message);
                 }
+            }
+        }
+        if self.module_knows_transform_session(&req.identity.session, &req.identity.project_root) {
+            if let Ok(store) = self.store_for_request().await {
+                let connection_file = self
+                    .provider_store
+                    .async_runtime
+                    .connection_file
+                    .lock()
+                    .expect("connection file mutex")
+                    .clone();
+                memory_profile::bind_session(
+                    &store,
+                    connection_file,
+                    req.identity.clone(),
+                    &req.identity.session,
+                    req.scope
+                        .as_ref()
+                        .and_then(|scope| scope.attributes.agent_id.as_deref()),
+                )
+                .await;
             }
         }
         subc_client_rs::BindDecision::accept()

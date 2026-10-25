@@ -5038,6 +5038,9 @@ pub struct SessionCacheTtlPolicy {
 /// The non-CoreState durable blob: bootstrap + epoch-detection + coverage watermark.
 #[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
 pub struct ModuleMeta {
+    /// Resolved memory-profile context captured at session bind; never read by renderers.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub memory_context: Option<serde_json::Value>,
     /// The memory view stored with the baseline/delta text blocks and mural image.
     /// A SOFT delta refresh adds only immutable operations from the owning session.
     #[serde(default, skip_serializing_if = "Option::is_none")]

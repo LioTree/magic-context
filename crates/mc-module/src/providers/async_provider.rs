@@ -1825,240 +1825,284 @@ impl McHandler {
         }
         let mut key = Key::new(binding, &request.session, &request.harness)?;
         key.session.clone_from(&request.session);
+        let pin_session = key.engine_key();
         let _serial = self.provider_serial.lock_for(&key).await;
         let store = self
             .store
             .get()
             .ok_or_else(|| transient("store unavailable"))?;
-        let runtime = &self.provider_store.async_runtime;
-        let publisher_ready = || runtime.publisher.lock().expect("async publisher").is_some();
-        if !publisher_ready() {
-            runtime.bus_link.wait_for_attach(ASYNC_BUS_SETUP_WAIT).await;
-        }
-        if !publisher_ready() {
-            self.provider_store
-                .async_runtime
-                .unconfigured_logged
-                .get_or_init(|| tracing::warn!("async compaction bus not configured"));
-            let reason = format!(
-                "Async compaction bus not ready ({})",
-                self.provider_store.async_runtime.bus_link.describe()
-            );
-            return bytes(
-                &compact::setup::SetupAnswer::refuse(
-                    &request.request_id,
-                    compact::errors::RefuseCode::from_code("provider_busy"),
-                    reason,
-                )
-                .with_provider_code("bus_not_ready"),
-            );
-        }
-        // Checked before an existing record is answered: a session the standalone
-        // plugin still owns must never be served, whatever ck-mc holds for it.
-        let standalone_move = match moved_session::setup_fence(
+        let connection_file = self
+            .provider_store
+            .async_runtime
+            .connection_file
+            .lock()
+            .expect("connection file mutex")
+            .clone();
+        let pin = crate::memory_profile::resolve_session_pin(
             store,
-            &request.harness,
-            &request.session,
-            &request.request_id,
-        )? {
-            moved_session::Fence::Fresh => None,
-            moved_session::Fence::Moved(record) => Some(record),
-            moved_session::Fence::Refuse(answer) => return bytes(&answer),
-        };
-        let reference = key.reference();
-        let existing = load_head(store, &reference)?;
-        if request.descends_from.is_some() {
-            return self
-                .setup_cut_descent(binding, &request, existing, store)
-                .await;
-        }
-        if let Some(old) = existing
-            .as_ref()
-            .filter(|old| old.lineage != request.lineage_id)
-        {
-            self.authorize_async(binding, old)?;
-            let generation = old
-                .generation
-                .checked_add(old.engine.version_high_water)
-                .and_then(|v| v.checked_add(2))
-                .ok_or_else(|| transient("async generation exhausted"))?;
-            let history = store
-                .load_compartments(&old.namespace())
-                .map_err(transient)?;
-            let mut state =
-                self.new_async_record(channel, binding, &request, key, None, generation)?;
-            state.cache_policy = old.cache_policy.clone();
-            store
-                .replace_compartments(&state.namespace(), &history)
-                .map_err(transient)?;
-            self.ensure_lineage_window(&mut state, Duration::from_secs(10))
-                .await?;
-            state.journal.truncate = Some(None);
-            state.save(store, &[])?;
+            connection_file,
+            subc_protocol::BindIdentity::new(
+                binding.project_root.clone(),
+                &request.harness,
+                &request.session,
+            ),
+            &pin_session,
+            binding
+                .scope
+                .as_ref()
+                .and_then(|scope| scope.attributes.agent_id.as_deref()),
+        )
+        .await
+        .map_err(transient)?;
+        let answer = async {
+            let runtime = &self.provider_store.async_runtime;
+            let publisher_ready = || runtime.publisher.lock().expect("async publisher").is_some();
+            if !publisher_ready() {
+                runtime.bus_link.wait_for_attach(ASYNC_BUS_SETUP_WAIT).await;
+            }
+            if !publisher_ready() {
+                self.provider_store
+                    .async_runtime
+                    .unconfigured_logged
+                    .get_or_init(|| tracing::warn!("async compaction bus not configured"));
+                let reason = format!(
+                    "Async compaction bus not ready ({})",
+                    self.provider_store.async_runtime.bus_link.describe()
+                );
+                return bytes(
+                    &compact::setup::SetupAnswer::refuse(
+                        &request.request_id,
+                        compact::errors::RefuseCode::from_code("provider_busy"),
+                        reason,
+                    )
+                    .with_provider_code("bus_not_ready"),
+                );
+            }
+            // Checked before an existing record is answered: a session the standalone
+            // plugin still owns must never be served, whatever ck-mc holds for it.
+            let standalone_move = match moved_session::setup_fence(
+                store,
+                &request.harness,
+                &request.session,
+                &request.request_id,
+            )? {
+                moved_session::Fence::Fresh => None,
+                moved_session::Fence::Moved(record) => Some(record),
+                moved_session::Fence::Refuse(answer) => return bytes(&answer),
+            };
+            let reference = key.reference();
+            let existing = load_head(store, &reference)?;
+            if request.descends_from.is_some() {
+                return self
+                    .setup_cut_descent(binding, &request, existing, store)
+                    .await;
+            }
+            if let Some(old) = existing
+                .as_ref()
+                .filter(|old| old.lineage != request.lineage_id)
+            {
+                self.authorize_async(binding, old)?;
+                let generation = old
+                    .generation
+                    .checked_add(old.engine.version_high_water)
+                    .and_then(|v| v.checked_add(2))
+                    .ok_or_else(|| transient("async generation exhausted"))?;
+                let history = store
+                    .load_compartments(&old.namespace())
+                    .map_err(transient)?;
+                let mut state =
+                    self.new_async_record(channel, binding, &request, key, None, generation)?;
+                state.cache_policy = old.cache_policy.clone();
+                store
+                    .replace_compartments(&state.namespace(), &history)
+                    .map_err(transient)?;
+                self.ensure_lineage_window(&mut state, Duration::from_secs(10))
+                    .await?;
+                state.journal.truncate = Some(None);
+                state.save(store, &[])?;
+                self.provider_store
+                    .async_runtime
+                    .resident
+                    .lock()
+                    .expect("async resident cache")
+                    .forget(&reference);
+                return bytes(&state.initial);
+            }
+            // A record the offline first pass prepared is kept only for the exact
+            // Setup it was prepared under; any other Setup discards it and sets the
+            // conversation up fresh in the next generation.
+            let mut discarded = existing.as_ref().and_then(|state| {
+                offline_first_pass::setup_mismatch(state, binding, &request)
+                    .map(|reason| (state.generation, reason))
+            });
+            // It is also kept only for the runner `role.describe` it was prepared
+            // against. The answer read here serves the moved session's checkpoint
+            // check below as well, so this Setup asks the runner once.
+            let mut live_describe = None;
+            if let Some(state) = existing
+                .as_ref()
+                .filter(|state| discarded.is_none() && state.offline_first_pass.is_some())
+            {
+                let describe = self
+                    .runner_describe(&state.runner()?, &state.runner_identity())
+                    .await?;
+                discarded = offline_first_pass::describe_mismatch(state, &describe)
+                    .map(|reason| (state.generation, reason));
+                live_describe = Some(describe);
+            }
+            // A record discarded for a fresh generation keeps the floor it stored.
+            let stored_floor = existing
+                .as_ref()
+                .and_then(|state| state.full_array_floor.clone());
+            if let Some(state) = existing.filter(|_| discarded.is_none()) {
+                self.authorize_async(binding, &state)?;
+                let project = self.historian_lane_project(channel, binding, store)?;
+                self.record_session_runner_dream_target(
+                    &project,
+                    state.project(),
+                    &state.key.harness,
+                    state.runner()?,
+                );
+                if state.setup.params != request.params
+                    || state.setup.composition != request.composition
+                    || state.setup.preset != request.preset
+                {
+                    return Err(invalid_field("params", "async setup plan is frozen"));
+                }
+                let checkpoint = state
+                    .standalone_move
+                    .as_ref()
+                    .map(moved_session::StandaloneMove::checkpoint)
+                    .or_else(|| {
+                        standalone_move.as_ref().map(|record| {
+                            contract::setup::SetupCheckpoint::new(
+                                record.tag_checkpoint,
+                                &record.cut,
+                            )
+                        })
+                    });
+                // A conversation set up with a full-array floor answers the floor
+                // it stored; the full-array state is never read again.
+                let (checkpoint, why) = match (checkpoint, &state.full_array_floor) {
+                    (Some(checkpoint), _) => (Some(checkpoint), CheckpointSource::StandaloneMove),
+                    (None, Some(floor)) => (Some(floor.checkpoint()), CheckpointSource::FullArray),
+                    (None, None) => (None, CheckpointSource::StandaloneMove),
+                };
+                if let Some(refusal) = self
+                    .refuse_checkpoint_unsupported(
+                        checkpoint.as_ref(),
+                        why,
+                        &state.runner()?,
+                        &state.runner_identity(),
+                        &request.request_id,
+                        live_describe,
+                    )
+                    .await?
+                {
+                    return bytes(&refusal);
+                }
+                let mut answer = state.initial;
+                answer["request_id"] = json!(request.request_id);
+                return bytes(&with_checkpoint(answer, checkpoint));
+            }
+            let checkpoint = standalone_move.as_ref().map(|record| {
+                contract::setup::SetupCheckpoint::new(record.tag_checkpoint, &record.cut)
+            });
+            // A Claude Code conversation ck-mc served on the full-array route
+            // numbers its parts above every number that route allocated for it.
+            // Read once, here, and stored with the record.
+            let full_array_floor = match (&checkpoint, stored_floor) {
+                (Some(_), _) => None,
+                (None, Some(floor)) => Some(floor),
+                (None, None) => match full_array_floor::setup_floor(
+                    store,
+                    &request.harness,
+                    &request.session,
+                    &request.request_id,
+                ) {
+                    full_array_floor::Floor::None => None,
+                    full_array_floor::Floor::Carried(floor) => Some(floor),
+                    full_array_floor::Floor::Refuse(answer) => return bytes(&answer),
+                },
+            };
+            let (checkpoint, why) = match (checkpoint, &full_array_floor) {
+                (Some(checkpoint), _) => (Some(checkpoint), CheckpointSource::StandaloneMove),
+                (None, Some(floor)) => (Some(floor.checkpoint()), CheckpointSource::FullArray),
+                (None, None) => (None, CheckpointSource::StandaloneMove),
+            };
+            if let Some(checkpoint) = &checkpoint {
+                // Refused before anything is stored, so a later Setup from a
+                // runner that declares the group sets the session up afresh.
+                let route = crate::route_targets::SessionRunnerRoute::for_principal(
+                    binding.principal.as_ref(),
+                    &request.session,
+                )
+                .ok_or_else(|| invalid_field("runner", "unsupported session runner principal"))?;
+                let identity = session_resolver::RunnerBindIdentity {
+                    project_root: binding.project_root.clone(),
+                    harness: request.harness.clone(),
+                    session: request.session.clone(),
+                };
+                if let Some(refusal) = self
+                    .refuse_checkpoint_unsupported(
+                        Some(checkpoint),
+                        why,
+                        &route,
+                        &identity,
+                        &request.request_id,
+                        live_describe,
+                    )
+                    .await?
+                {
+                    return bytes(&refusal);
+                }
+            }
+            let generation = match discarded {
+                Some((generation, reason)) => {
+                    offline_first_pass::log_discard(&reference, reason);
+                    generation
+                        .checked_add(1)
+                        .ok_or_else(|| transient("async generation exhausted"))?
+                }
+                None => 0,
+            };
+            let mut state = self.new_async_record(
+                channel,
+                binding,
+                &request,
+                key,
+                standalone_move,
+                generation,
+            )?;
+            state.full_array_floor = full_array_floor;
+            if discarded.is_some() {
+                state.forget_discarded_rows();
+            }
+            // A conversation set up again under the same reference must never
+            // reuse a resident copy of an earlier one.
             self.provider_store
                 .async_runtime
                 .resident
                 .lock()
                 .expect("async resident cache")
                 .forget(&reference);
-            return bytes(&state.initial);
-        }
-        // A record the offline first pass prepared is kept only for the exact
-        // Setup it was prepared under; any other Setup discards it and sets the
-        // conversation up fresh in the next generation.
-        let mut discarded = existing.as_ref().and_then(|state| {
-            offline_first_pass::setup_mismatch(state, binding, &request)
-                .map(|reason| (state.generation, reason))
-        });
-        // It is also kept only for the runner `role.describe` it was prepared
-        // against. The answer read here serves the moved session's checkpoint
-        // check below as well, so this Setup asks the runner once.
-        let mut live_describe = None;
-        if let Some(state) = existing
-            .as_ref()
-            .filter(|state| discarded.is_none() && state.offline_first_pass.is_some())
-        {
-            let describe = self
-                .runner_describe(&state.runner()?, &state.runner_identity())
-                .await?;
-            discarded = offline_first_pass::describe_mismatch(state, &describe)
-                .map(|reason| (state.generation, reason));
-            live_describe = Some(describe);
-        }
-        // A record discarded for a fresh generation keeps the floor it stored.
-        let stored_floor = existing
-            .as_ref()
-            .and_then(|state| state.full_array_floor.clone());
-        if let Some(state) = existing.filter(|_| discarded.is_none()) {
-            self.authorize_async(binding, &state)?;
-            let project = self.historian_lane_project(channel, binding, store)?;
-            self.record_session_runner_dream_target(
-                &project,
-                state.project(),
-                &state.key.harness,
-                state.runner()?,
-            );
-            if state.setup.params != request.params
-                || state.setup.composition != request.composition
-                || state.setup.preset != request.preset
-            {
-                return Err(invalid_field("params", "async setup plan is frozen"));
+            state.save(store, &[])?;
+            if discarded.is_some() {
+                store
+                    .retire_unannounced_async_views(&reference)
+                    .map_err(transient)?;
             }
-            let checkpoint = state
-                .standalone_move
-                .as_ref()
-                .map(moved_session::StandaloneMove::checkpoint)
-                .or_else(|| {
-                    standalone_move.as_ref().map(|record| {
-                        contract::setup::SetupCheckpoint::new(record.tag_checkpoint, &record.cut)
-                    })
-                });
-            // A conversation set up with a full-array floor answers the floor
-            // it stored; the full-array state is never read again.
-            let (checkpoint, why) = match (checkpoint, &state.full_array_floor) {
-                (Some(checkpoint), _) => (Some(checkpoint), CheckpointSource::StandaloneMove),
-                (None, Some(floor)) => (Some(floor.checkpoint()), CheckpointSource::FullArray),
-                (None, None) => (None, CheckpointSource::StandaloneMove),
-            };
-            if let Some(refusal) = self
-                .refuse_checkpoint_unsupported(
-                    checkpoint.as_ref(),
-                    why,
-                    &state.runner()?,
-                    &state.runner_identity(),
-                    &request.request_id,
-                    live_describe,
-                )
-                .await?
-            {
-                return bytes(&refusal);
-            }
-            let mut answer = state.initial;
-            answer["request_id"] = json!(request.request_id);
-            return bytes(&with_checkpoint(answer, checkpoint));
+            bytes(&with_checkpoint(state.initial.clone(), checkpoint))
         }
-        let checkpoint = standalone_move.as_ref().map(|record| {
-            contract::setup::SetupCheckpoint::new(record.tag_checkpoint, &record.cut)
-        });
-        // A Claude Code conversation ck-mc served on the full-array route
-        // numbers its parts above every number that route allocated for it.
-        // Read once, here, and stored with the record.
-        let full_array_floor = match (&checkpoint, stored_floor) {
-            (Some(_), _) => None,
-            (None, Some(floor)) => Some(floor),
-            (None, None) => match full_array_floor::setup_floor(
-                store,
-                &request.harness,
-                &request.session,
-                &request.request_id,
-            ) {
-                full_array_floor::Floor::None => None,
-                full_array_floor::Floor::Carried(floor) => Some(floor),
-                full_array_floor::Floor::Refuse(answer) => return bytes(&answer),
-            },
-        };
-        let (checkpoint, why) = match (checkpoint, &full_array_floor) {
-            (Some(checkpoint), _) => (Some(checkpoint), CheckpointSource::StandaloneMove),
-            (None, Some(floor)) => (Some(floor.checkpoint()), CheckpointSource::FullArray),
-            (None, None) => (None, CheckpointSource::StandaloneMove),
-        };
-        if let Some(checkpoint) = &checkpoint {
-            // Refused before anything is stored, so a later Setup from a
-            // runner that declares the group sets the session up afresh.
-            let route = crate::route_targets::SessionRunnerRoute::for_principal(
-                binding.principal.as_ref(),
-                &request.session,
-            )
-            .ok_or_else(|| invalid_field("runner", "unsupported session runner principal"))?;
-            let identity = session_resolver::RunnerBindIdentity {
-                project_root: binding.project_root.clone(),
-                harness: request.harness.clone(),
-                session: request.session.clone(),
-            };
-            if let Some(refusal) = self
-                .refuse_checkpoint_unsupported(
-                    Some(checkpoint),
-                    why,
-                    &route,
-                    &identity,
-                    &request.request_id,
-                    live_describe,
-                )
-                .await?
-            {
-                return bytes(&refusal);
+        .await;
+        if let Ok(bytes) = &answer {
+            let value: Value = serde_json::from_slice(bytes).map_err(transient)?;
+            if value["answer"] == "ready" {
+                crate::memory_profile::persist_session_pin(store, &pin_session, &pin)
+                    .map_err(transient)?;
             }
         }
-        let generation = match discarded {
-            Some((generation, reason)) => {
-                offline_first_pass::log_discard(&reference, reason);
-                generation
-                    .checked_add(1)
-                    .ok_or_else(|| transient("async generation exhausted"))?
-            }
-            None => 0,
-        };
-        let mut state =
-            self.new_async_record(channel, binding, &request, key, standalone_move, generation)?;
-        state.full_array_floor = full_array_floor;
-        if discarded.is_some() {
-            state.forget_discarded_rows();
-        }
-        // A conversation set up again under the same reference must never
-        // reuse a resident copy of an earlier one.
-        self.provider_store
-            .async_runtime
-            .resident
-            .lock()
-            .expect("async resident cache")
-            .forget(&reference);
-        state.save(store, &[])?;
-        if discarded.is_some() {
-            store
-                .retire_unannounced_async_views(&reference)
-                .map_err(transient)?;
-        }
-        bytes(&with_checkpoint(state.initial.clone(), checkpoint))
+        answer
     }
 
     /// A new conversation record for `request`, with Setup's engine pass run
