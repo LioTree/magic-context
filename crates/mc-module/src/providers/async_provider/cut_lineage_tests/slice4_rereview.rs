@@ -3,6 +3,11 @@
 //! mode3-slice4-fix-rereview.md` and is ignored with that finding's id.
 use super::*;
 
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn r03_unseen_descent_is_attempted_on_the_notice_path() {
+    review_session_inner(Profile::Pi, 3_144_134_339, 12, false, None, true).await;
+}
+
 /// A cut lineage whose runner forks it at an endpoint ck-mc has not read
 /// yet, after rewriting a held window row, so neither descent proof holds.
 /// The runner keeps the physical cut: its `session.head` for the new
@@ -39,7 +44,14 @@ async fn unverifiable_fork_in_a_cut_lineage(profile: Profile) -> String {
     review_complete_turn(&pair);
     *pair.resident.runner.head.lock().unwrap() = Some(cut_head(&pair, "edited-fork", first));
     let before = newest_version(&pair);
-    trail.push(resident_notice(&mut pair, &mut rng, Some(format!("child:{through}:{digest}"))).await);
+    trail.push(
+        resident_notice(
+            &mut pair,
+            &mut rng,
+            Some(format!("child:{through}:{digest}")),
+        )
+        .await,
+    );
     for _ in 0..3 {
         pair.append(4);
         review_complete_turn(&pair);
@@ -51,7 +63,13 @@ async fn unverifiable_fork_in_a_cut_lineage(profile: Profile) -> String {
     let state = load(pair.resident.store(), &pair.reference)
         .unwrap()
         .unwrap();
-    let reads = pair.resident.runner.reads_below_floor.lock().unwrap().clone();
+    let reads = pair
+        .resident
+        .runner
+        .reads_below_floor
+        .lock()
+        .unwrap()
+        .clone();
     let served = newest_view(&pair)
         .filter(|(version, ..)| before.is_none_or(|before| *version > before))
         .map(|(version, view, model, coverage)| {
@@ -61,10 +79,14 @@ async fn unverifiable_fork_in_a_cut_lineage(profile: Profile) -> String {
                 missing_user_text(&pair, &model, &view, coverage),
             )
         });
-    let healthy = trail.iter().all(|outcome| !outcome.contains("Err") && !outcome.contains("error"))
+    let healthy = trail
+        .iter()
+        .all(|outcome| !outcome.contains("Err") && !outcome.contains("error"))
         && reads.is_empty()
         && !state.failed()
-        && served.as_ref().is_some_and(|(_, _, missing)| missing.is_empty());
+        && served
+            .as_ref()
+            .is_some_and(|(_, _, missing)| missing.is_empty());
     if healthy {
         String::new()
     } else {
@@ -83,7 +105,6 @@ async fn unverifiable_fork_in_a_cut_lineage(profile: Profile) -> String {
 /// cut, so the reset must rebuild from the cut with the history that covers
 /// the rows below it, and keep publishing, without reading below the cut.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-#[ignore = "R-01: an unverifiable fork in a cut lineage must keep publishing from the cut"]
 async fn r01_unverifiable_fork_in_a_cut_lineage_keeps_publishing_from_the_cut() {
     let mut problems = Vec::new();
     for profile in PROFILES {

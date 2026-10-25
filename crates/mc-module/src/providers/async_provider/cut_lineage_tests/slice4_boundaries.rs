@@ -362,6 +362,7 @@ async fn unseen_fork_proof(extra: u64, fault: &str) {
     if fault != "missing" {
         pair.append(extra);
     }
+    review_complete_turn(&pair);
     let digest = {
         let mut entries = pair.transcript.entries.lock().unwrap();
         if fault == "overlap" {
@@ -372,7 +373,7 @@ async fn unseen_fork_proof(extra: u64, fault: &str) {
             .map(|entry| contract::digest::content_digest(&entry.message))
             .unwrap_or_else(|| "0".repeat(64))
     };
-    let digest = if fault == "digest" {
+    let digest = if fault == "digest" || fault.starts_with("unretained") {
         "f".repeat(64)
     } else {
         digest
@@ -396,12 +397,48 @@ async fn unseen_fork_proof(extra: u64, fault: &str) {
         assert_eq!(proof, Some(through));
     } else {
         assert_eq!(proof, None, "invalid {fault} proof must start fresh");
-        let _ = resident_notice(&mut pair, &mut rng, Some(header)).await;
+        let reported_first = if fault == "unretained_ordinal" {
+            first + 4
+        } else {
+            first
+        };
+        let mut head = cut_head(&pair, "unseen-fork", reported_first);
+        if fault == "unretained_digest" {
+            head["cut"]["digest"] = json!("0".repeat(64));
+        }
+        *pair.resident.runner.head.lock().unwrap() = Some(head);
+        let outcome = resident_notice(&mut pair, &mut rng, Some(header)).await;
+        if fault.starts_with("unretained") {
+            assert!(outcome.contains("cut_rebootstrap_required"), "{outcome}");
+            assert!(!outcome.contains("unknown_cut"), "{outcome}");
+            assert!(pair
+                .resident
+                .runner
+                .reads_below_floor
+                .lock()
+                .unwrap()
+                .is_empty());
+            return;
+        }
+        assert_eq!(
+            outcome, "ok",
+            "invalid descent must recover from the retained physical cut"
+        );
+        assert!(pair
+            .resident
+            .runner
+            .reads_below_floor
+            .lock()
+            .unwrap()
+            .is_empty());
         let reset = load(pair.resident.store(), &pair.reference)
             .unwrap()
             .unwrap();
-        assert!(reset.cut_seed.is_none() && reset.cut_first_ordinal.is_none());
-        assert_eq!(reset.lineage_first_ordinal, 0);
+        assert_ne!(reset.generation, state.generation);
+        assert!(reset.cut_seed.is_some());
+        assert_eq!(reset.cut_first_ordinal, Some(first));
+        assert_eq!(reset.lineage_first_ordinal, first);
+        assert!(!reset.failed());
     }
 }
 
@@ -433,6 +470,16 @@ async fn unseen_fork_below_the_cut_starts_fresh() {
 #[tokio::test]
 async fn unseen_fork_with_a_missing_through_row_starts_fresh() {
     unseen_fork_proof(2, "missing").await;
+}
+
+#[tokio::test]
+async fn unretained_head_cut_digest_requests_rebootstrap_without_reading() {
+    unseen_fork_proof(2, "unretained_digest").await;
+}
+
+#[tokio::test]
+async fn unretained_head_cut_ordinal_requests_rebootstrap_without_reading() {
+    unseen_fork_proof(2, "unretained_ordinal").await;
 }
 
 #[tokio::test]

@@ -820,7 +820,7 @@ impl McHandler {
         );
         seed.cut_digest = cut.digest;
         seed.time_basis = Some((i64::try_from(cut.written_at).ok(), None));
-        let compartments = store
+        let mut compartments = store
             .load_compartments(&state.namespace())
             .map_err(transient)?;
         let mut next = 0i64;
@@ -832,10 +832,50 @@ impl McHandler {
             }
         }
         if next < first as i64 {
-            return Err(error(
-                "unknown_cut",
-                "history does not cover the runner's cut",
-            ));
+            // A failed descent proof discards the old window, not a physical
+            // cut the runner still holds. Only a matching published cut can
+            // certify the unreadable prefix in the new namespace.
+            let retained = store
+                .load_async_compaction_baseline(
+                    &state.reference(),
+                    &format!("published-cut:{first}"),
+                )
+                .map_err(transient)?
+                .map(|raw| serde_json::from_str::<cut_seed::CutSeed>(&raw).map_err(transient))
+                .transpose()?
+                .filter(|saved| {
+                    saved.first_ordinal == first
+                        && saved.cut_mid == seed.cut_mid
+                        && saved.cut_digest == seed.cut_digest
+                        && saved.boundary_safe()
+                });
+            let Some(retained) = retained else {
+                return Err(error("cut_rebootstrap_required",
+                    "the runner's cut is not retained; start a full lineage or restore a published cut"));
+            };
+            compartments = retained
+                .recovery_history
+                .iter()
+                .filter(|row| row.end_message < first as i64)
+                .cloned()
+                .collect();
+            let mut restored_through = 0i64;
+            let mut ordered = compartments.iter().collect::<Vec<_>>();
+            ordered.sort_by_key(|row| row.start_message);
+            for row in ordered {
+                if row.start_message <= restored_through && row.end_message >= restored_through {
+                    restored_through = row.end_message.saturating_add(1);
+                }
+            }
+            if restored_through < first as i64 {
+                return Err(error(
+                    "cut_rebootstrap_required",
+                    "retained history no longer covers the runner's cut; start a full lineage",
+                ));
+            }
+            store
+                .replace_compartments(&state.namespace(), &compartments)
+                .map_err(transient)?;
         }
         seed.recovery_history = compartments.clone();
         if let Some(last) = compartments
