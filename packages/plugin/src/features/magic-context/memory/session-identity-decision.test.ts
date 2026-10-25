@@ -26,6 +26,7 @@ import { createTestTempDir } from "../../../shared/test-temp-dir";
 import { recordSessionProjectIdentity } from "../session-project-storage";
 import { closeDatabase, openDatabase } from "../storage";
 import { createTagger } from "../tagger";
+import { ENTORHINAL_RESOLVE_DEADLINE_MS } from "./entorhinal-resolve";
 import {
     __clearProjectIdentityResolutionCacheForTests,
     __resetProjectIdentityForTests,
@@ -497,10 +498,11 @@ function rendered(output: { messages: unknown[] }): string {
 }
 
 describe("OpenCode session decision integration", () => {
-    test("a 400 ms session.created and first transform share pj while the directory cache holds git", async () => {
+    test("a 250 ms session.created and first transform share pj while the directory cache holds git", async () => {
         const directory = folder("slow");
         const fake = await fakeEndpoint(directory);
-        fake.delay = 400;
+        // Leave half the end-to-end deadline for connection setup and scheduling under load.
+        fake.delay = ENTORHINAL_RESOLVE_DEADLINE_MS / 2;
         const db = hostDatabase();
         const session = "slow-created";
         const fallback = resolveProjectIdentityForSession(directory);
