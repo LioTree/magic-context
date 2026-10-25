@@ -50,6 +50,7 @@ pub mod dream_dispatch;
 pub mod dream_tasks;
 pub mod historian_routed;
 mod memory_actions;
+mod memory_context;
 mod model_work;
 pub mod persona_host;
 

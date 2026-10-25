@@ -47,9 +47,9 @@ pub struct EntorhinalResolver {
     connection_file: Option<PathBuf>,
 }
 
-type ConsumerSlot = tokio::sync::Mutex<Option<SubcConsumer>>;
+pub(crate) type ConsumerSlot = tokio::sync::Mutex<Option<SubcConsumer>>;
 
-fn consumer_slot(path: &Path) -> Arc<ConsumerSlot> {
+pub(crate) fn consumer_slot(path: &Path) -> Arc<ConsumerSlot> {
     static CONSUMERS: OnceLock<Mutex<HashMap<PathBuf, Arc<ConsumerSlot>>>> = OnceLock::new();
     CONSUMERS
         .get_or_init(Mutex::default)
@@ -62,7 +62,7 @@ fn consumer_slot(path: &Path) -> Arc<ConsumerSlot> {
 
 // A cancelled or failed attempt must not put a potentially broken consumer back
 // in the process cache. Closing asynchronously also covers the outer resolve deadline.
-struct ConsumerLease(Option<SubcConsumer>);
+pub(crate) struct ConsumerLease(pub(crate) Option<SubcConsumer>);
 
 impl Drop for ConsumerLease {
     fn drop(&mut self) {
