@@ -804,6 +804,27 @@ fn inline_digest(entry: &ReadMessage, body: &Value) -> Result<String, HandlerOut
 }
 
 impl State {
+    fn applied_lineage(
+        &self,
+        store: &McStore,
+        version: u64,
+    ) -> Result<Option<String>, HandlerOutcome> {
+        // Map by public version, never by the engine baseline's own counter:
+        // engine counters can be reused after selecting an older cut.
+        if let Some(view) = self.published_engine.get(&version) {
+            return Ok(Some(view.identity.1.lineage_id.clone()));
+        }
+        store
+            .load_async_compaction_view(&self.reference(), version)
+            .map_err(transient)?
+            .map(|raw| {
+                serde_json::from_str::<view::CompactionView>(&raw)
+                    .map(|view| view.lineage_id)
+                    .map_err(transient)
+            })
+            .transpose()
+    }
+
     fn runner_identity(&self) -> session_resolver::RunnerBindIdentity {
         self.runner_identity.clone().unwrap_or_else(|| {
             // For older records without a stored identity, rebuild it from the
@@ -3661,7 +3682,7 @@ impl McHandler {
         account: &str,
         message: &cortexkit_bus_trait::Message,
     ) -> Result<(), HandlerOutcome> {
-        let notice = notice::AdvanceNotice::from_headers(&message.headers)
+        let mut notice = notice::AdvanceNotice::from_headers(&message.headers)
             .map_err(|e| invalid_field("notice", e.name()))?;
         if bus_id(&notice.session_ref, "advanced", notice.seq) != message.id
             || notice.digest() != message.digest.to_string()
@@ -3762,19 +3783,6 @@ impl McHandler {
             return Ok(());
         }
         let duplicate = notice.seq <= state.seq;
-        // A historian replacement can move its covered message range backward.
-        // Capture acknowledged edits before coverage pruning evicts their engine units.
-        if !duplicate {
-            if let Some(version) = notice.applied_view_version.filter(|version| {
-                state.frozen_edits_version != Some(*version)
-                    && !notice.events.iter().any(|event| matches!(event,
-                        notice::Event::ViewDeferred { view_version, .. }
-                        | notice::Event::ViewRefused { view_version, .. } if view_version == version))
-            }) {
-                state.capture_frozen_version(store, version)?;
-                state.frozen_edits_version = Some(version);
-            }
-        }
         let mut descended = false;
         if let Some(lineage) = message
             .headers
@@ -3839,7 +3847,60 @@ impl McHandler {
                 state.save(store, &[])?;
             }
         }
+        let foreign_ack = if let Some(version) = notice.applied_view_version {
+            state.lineage.is_none()
+                || state.applied_lineage(store, version)?.as_deref() != state.lineage.as_deref()
+        } else {
+            false
+        };
+        if foreign_ack {
+            // The runner renders Setup's initial until a view for this lineage
+            // applies. The contract has no named error for an older-lineage ack;
+            // ignore it without importing its edits, baseline or decision facts.
+            static LOGGED: OnceLock<Mutex<HashSet<String>>> = OnceLock::new();
+            if LOGGED
+                .get_or_init(Default::default)
+                .lock()
+                .expect("foreign ack log")
+                .insert(state.reference())
+            {
+                tracing::warn!(session_ref=%state.reference(), version=?notice.applied_view_version,
+                    "ignoring acknowledgement without a verified current compaction lineage");
+            }
+            let rejected = notice
+                .applied_view_version
+                .expect("foreign acknowledgement");
+            notice.events.retain(|event| match event {
+                // Marker outcomes describe the rejected applied view, not the
+                // selected lineage's initial or any baseline we retain below.
+                notice::Event::MarkerOutcome { .. } => false,
+                notice::Event::ViewDeferred { view_version, .. }
+                | notice::Event::ViewRefused { view_version, .. } => *view_version != rejected,
+                _ => true,
+            });
+            notice.applied_view_version = match state.applied {
+                Some(version)
+                    if state.lineage.is_some()
+                        && state.applied_lineage(store, version)?.as_deref()
+                            == state.lineage.as_deref() =>
+                {
+                    Some(version)
+                }
+                _ => None,
+            };
+        }
+        // A historian replacement can move its covered message range backward.
+        // Capture only lineage-validated acknowledged edits before pruning.
         if !duplicate {
+            if let Some(version) = notice.applied_view_version.filter(|version| {
+                state.frozen_edits_version != Some(*version)
+                    && !notice.events.iter().any(|event| matches!(event,
+                        notice::Event::ViewDeferred { view_version, .. }
+                        | notice::Event::ViewRefused { view_version, .. } if view_version == version))
+            }) {
+                state.capture_frozen_version(store, version)?;
+                state.frozen_edits_version = Some(version);
+            }
             state.applied = notice.applied_view_version;
             // Re-assign (and so re-store) the baseline only when the runner
             // acknowledges a different view; it repeats its applied version on

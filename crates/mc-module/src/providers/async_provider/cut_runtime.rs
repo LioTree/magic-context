@@ -938,6 +938,9 @@ impl McHandler {
                 "descending Setup needs a lineage",
             ));
         }
+        // The selected cut certifies this lineage's prefix. Reset sources can
+        // belong to an abandoned branch and must not overwrite that selection.
+        state.resync_sources = None;
         state.lineage = request.lineage_id.clone();
         state.generation = state.next_generation()?;
         state.lineage_first_ordinal = first;

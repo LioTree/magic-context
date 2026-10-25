@@ -1,8 +1,209 @@
-//! Opt-in independent campaigns for retained cuts and branch selection.
+//! Independent campaigns for retained cuts and branch selection.
 use super::*;
 
-fn enabled() -> bool {
-    std::env::var("MC_REVIEW_S4FINAL").as_deref() == Ok("1")
+async fn final_archive_fixture() -> (Pair, State, cut_seed::CutSeed) {
+    let mut pair = Pair::open_with(Profile::Broca, false, Some("L"), false, false).await;
+    pair.append(120);
+    review_history(&mut pair, 99).await;
+    let mut rng = Rng(0xF003);
+    pair.notice(&mut rng, None).await;
+    descend_pair(&mut pair, 100, "archive-child").await;
+    let state = load(pair.resident.store(), &pair.reference)
+        .unwrap()
+        .unwrap();
+    let seed = state.cut_seed.as_ref().unwrap().as_ref().clone();
+    assert_eq!(
+        seed.recovery_compartments(pair.resident.store(), &pair.reference)
+            .unwrap()
+            .len(),
+        1
+    );
+    (pair, state, seed)
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn final_f03_changed_existing_archive_object_is_refused() {
+    let (pair, state, seed) = final_archive_fixture().await;
+    let store = pair.resident.store();
+    let slot = format!("cut-history:{}", seed.history_root().unwrap());
+    let raw = store
+        .load_async_compaction_baseline(&pair.reference, &slot)
+        .unwrap()
+        .unwrap();
+    let mut value: Value = serde_json::from_str(&raw).unwrap();
+    assert!(value["Compartment"].is_object());
+    value["Compartment"]["content"] = json!("changed payload under the original identity");
+    let reference = state.reference();
+    let key = state.key.store_key().conversation_key();
+    let record = serde_json::to_string(&state).unwrap();
+    let mut save = store.async_compaction_save(&reference, &key, &state.key.session, &record);
+    save.baseline(slot, Some(value.to_string()));
+    save.commit().unwrap();
+    let outcome = seed.recovery_compartments(store, &reference);
+    assert!(
+        matches!(outcome, Err(ref error) if format!("{error:?}").contains("retained history identity changed")),
+        "{outcome:?}"
+    );
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn final_f03_intact_archive_with_inconsistent_count_is_refused() {
+    let (pair, _, seed) = final_archive_fixture().await;
+    let mut value = serde_json::to_value(seed).unwrap();
+    assert_eq!(value["recovery_history_ref"]["count"], 1);
+    value["recovery_history_ref"]["count"] = json!(2);
+    let seed: cut_seed::CutSeed = serde_json::from_value(value).unwrap();
+    let outcome = seed.recovery_compartments(pair.resident.store(), &pair.reference);
+    assert!(
+        matches!(outcome, Err(ref error) if format!("{error:?}").contains("retained history is incomplete")),
+        "{outcome:?}"
+    );
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn final_f03_hash_valid_gapped_prefix_is_refused() {
+    let (pair, mut state, mut seed) = final_archive_fixture().await;
+    let store = pair.resident.store();
+    let mut history = seed.recovery_compartments(store, &pair.reference).unwrap();
+    history[0].start_message = 1;
+    history[0].start_message_id = "m1".into();
+    seed.set_recovery_history(history, None, None).unwrap();
+    let cut = state.cached_cut(100).unwrap().clone();
+    let reference = state.reference();
+    let key = state.key.store_key().conversation_key();
+    let record = serde_json::to_string(&state).unwrap();
+    let mut save = store.async_compaction_save(&reference, &key, &state.key.session, &record);
+    for (slot, raw) in &seed.pending_history_objects {
+        save.immutable_baseline(slot, raw.clone());
+    }
+    save.baseline(
+        format!("published-cut:{}", cut.key()),
+        Some(serde_json::to_string(&seed).unwrap()),
+    );
+    save.baseline(
+        format!("published-cut-root:{}", cut.key()),
+        Some(serde_json::to_string(&seed.history_root()).unwrap()),
+    );
+    save.commit().unwrap();
+    seed.pending_history_objects.clear();
+    assert_eq!(
+        seed.recovery_compartments(store, &reference).unwrap()[0].start_message,
+        1
+    );
+    state.reset(store).unwrap();
+    state.cut_seed = None;
+    state.cut_first_ordinal = None;
+    *pair.resident.runner.head.lock().unwrap() = Some(cut_head(&pair, "archive-child", 100));
+    let outcome = pair
+        .resident
+        .h
+        .ensure_lineage_window(&mut state, Duration::from_secs(30))
+        .await;
+    assert!(
+        matches!(outcome, Err(ref error) if format!("{error:?}").contains("retained history no longer covers")),
+        "{outcome:?}"
+    );
+    assert!(pair
+        .resident
+        .runner
+        .reads_below_floor
+        .lock()
+        .unwrap()
+        .is_empty());
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn final_f01_cross_lineage_ack_never_becomes_baseline() {
+    let (mut pair, _, saved_a, first) = same_ordinal_branches(Profile::Broca, 2, true).await;
+    let abandoned = newest_version(&pair).unwrap();
+    let mut rng = Rng(7_365_311_877_800_031_669);
+    *pair.transcript.lineage.lock().unwrap() = "ambiguous".into();
+    *pair.resident.runner.head.lock().unwrap() = Some(cut_head(&pair, "ambiguous", first));
+    assert!(resident_notice(&mut pair, &mut rng, None)
+        .await
+        .contains("cut_rebootstrap_required"));
+    *pair.transcript.entries.lock().unwrap() = saved_a[..first as usize + 8].to_vec();
+    let request = setup_request(
+        &pair,
+        "selected-A",
+        Some(json!({"lineage_id":"lineage-A","through_ordinal":first-1})),
+        "selected-A",
+    );
+    assert!(pair
+        .resident
+        .dispatch(request)
+        .await
+        .contains("branch-A-only-summary"));
+    *pair.transcript.lineage.lock().unwrap() = "selected-A".into();
+    *pair.resident.runner.head.lock().unwrap() = Some(cut_head(&pair, "selected-A", first));
+    assert_eq!(
+        resident_notice_at(&mut pair, 1_000, Some(abandoned)).await,
+        "ok"
+    );
+    let state = load(pair.resident.store(), &pair.reference)
+        .unwrap()
+        .unwrap();
+    assert_ne!(state.applied, Some(abandoned));
+    assert_ne!(
+        state
+            .conditions
+            .as_ref()
+            .unwrap()
+            .get("applied_view_version"),
+        Some(&abandoned.to_string())
+    );
+    assert!(state
+        .applied_view
+        .as_ref()
+        .is_none_or(|view| view.identity.1.lineage_id == "selected-A"));
+    let (_, view, model, _) = newest_view(&pair).unwrap();
+    assert_eq!(view.lineage_id, "selected-A");
+    assert!(model.contains("branch-A-only-summary") && !model.contains("branch-B-only-summary"));
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn final_f01_current_lineage_ack_is_accepted() {
+    for profile in PROFILES {
+        let mut pair = Pair::open_with(profile, false, Some("L"), false, false).await;
+        pair.append(120);
+        review_history(&mut pair, 99).await;
+        pair.notice(&mut Rng(0xACCE), None).await;
+        let version = newest_version(&pair).unwrap();
+        assert_eq!(
+            resident_notice_at(&mut pair, 1_000, Some(version)).await,
+            "ok"
+        );
+        let state = load(pair.resident.store(), &pair.reference)
+            .unwrap()
+            .unwrap();
+        assert_eq!(state.applied, Some(version), "{profile:?}");
+        assert_eq!(
+            state.applied_view.as_ref().unwrap().identity.1.lineage_id,
+            "L"
+        );
+    }
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn final_f01_unknown_ack_cannot_supply_an_unverified_baseline() {
+    let mut pair = Pair::open_with(Profile::Broca, false, Some("L"), false, false).await;
+    pair.append(120);
+    review_history(&mut pair, 99).await;
+    pair.notice(&mut Rng(0xACCE), None).await;
+    let version = newest_version(&pair).unwrap();
+    assert_eq!(
+        resident_notice_at(&mut pair, 1_000, Some(version)).await,
+        "ok"
+    );
+    assert_eq!(
+        resident_notice_at(&mut pair, 1_000, Some(1_000_000)).await,
+        "ok"
+    );
+    let state = load(pair.resident.store(), &pair.reference)
+        .unwrap()
+        .unwrap();
+    assert_eq!(state.applied, Some(version));
+    assert!(newest_version(&pair).unwrap() < 1_000_000);
 }
 
 fn complete_tool_pairs(pair: &Pair, served: &[Value]) -> Vec<String> {
@@ -128,11 +329,7 @@ fn checked(pair: &Pair, seed: u64, before: Option<u64>) -> (usize, usize) {
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-#[ignore = "independent final review; requires MC_REVIEW_S4FINAL=1"]
 async fn final_pair_checker_detects_removed_results_in_every_codec() {
-    if !enabled() {
-        return;
-    }
     for profile in PROFILES {
         let pair = Pair::open_with(profile, false, Some("L"), false, false).await;
         pair.append(4);
@@ -167,12 +364,10 @@ async fn final_pair_checker_detects_removed_results_in_every_codec() {
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-#[ignore = "independent final review; requires MC_REVIEW_S4FINAL=1"]
 async fn final_fresh_campaign_matches_full_processing() {
-    if !enabled() {
-        return;
-    }
-    let mut seeds = Rng(15_506_593_889_518_924_707);
+    let mut seeds = Rng(std::env::var("MC_S4FINAL_MASTER_SEED")
+        .map(|seed| seed.parse().expect("MC_S4FINAL_MASTER_SEED is a u64"))
+        .unwrap_or(15_506_593_889_518_924_707));
     let (mut decisions, mut passes, mut sessions, mut host_rewinds) = (0, 0, 0, 0);
     for profile in PROFILES {
         for _ in 0..4 {
@@ -285,11 +480,7 @@ fn rng_seed_bit(seed: u64, cut: u64) -> bool {
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-#[ignore = "independent final review; requires MC_REVIEW_S4FINAL=1"]
 async fn final_f01_named_setup_after_refusal_cannot_restore_another_branch() {
-    if !enabled() {
-        return;
-    }
     let mut failures = Vec::new();
     for profile in PROFILES {
         let (mut pair, _, saved_a, first) = same_ordinal_branches(profile, 6, true).await;
@@ -347,12 +538,13 @@ async fn final_f01_named_setup_after_refusal_cannot_restore_another_branch() {
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-#[ignore = "independent final review; requires MC_REVIEW_S4FINAL=1"]
 async fn final_hundreds_of_cuts_revisit_every_evicted_target() {
-    if !enabled() {
-        return;
-    }
-    let mut seeds = Rng(467_088_571_471_423_312);
+    let mut seeds = Rng(std::env::var("MC_S4FINAL_RETENTION_MASTER_SEED")
+        .map(|seed| {
+            seed.parse()
+                .expect("MC_S4FINAL_RETENTION_MASTER_SEED is a u64")
+        })
+        .unwrap_or(467_088_571_471_423_312));
     for profile in PROFILES {
         let seed = seeds.next();
         if std::env::var("MC_S4FINAL_PROFILE")
@@ -497,11 +689,7 @@ async fn final_hundreds_of_cuts_revisit_every_evicted_target() {
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-#[ignore = "independent final review; requires MC_REVIEW_S4FINAL=1"]
 async fn final_same_ordinal_branches_refuse_ambiguity_and_return_exact_heads() {
-    if !enabled() {
-        return;
-    }
     let mut seeds = Rng(15_506_593_889_518_924_707 ^ 0xC07B_A11C);
     for profile in PROFILES {
         let seed = seeds.next();

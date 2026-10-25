@@ -595,8 +595,10 @@ impl McStore {
                     .prepare("SELECT version,engine_json FROM mc_async_compaction_views WHERE session_ref=?1 AND engine_json IS NOT NULL ORDER BY version")?
                     .query_map([session_ref], |row| Ok((row.get(0)?, row.get(1)?)))?
                     .collect::<rusqlite::Result<_>>()?;
+                // Equality probes use the existing (session_ref, slot) key.
+                // Excluding archive prefixes would still visit every cold key.
                 let baselines = conn
-                    .prepare("SELECT slot,view_json FROM mc_async_compaction_baselines WHERE session_ref=?1 AND slot NOT GLOB 'undo-native-edits:*' AND slot NOT GLOB 'published-cut:*' AND slot NOT GLOB 'published-cut-meta:*' AND slot NOT GLOB 'published-cut-candidate:*' AND slot NOT GLOB 'published-cut-root:*' AND slot NOT GLOB 'cut-history:*' AND slot NOT GLOB 'cut:*'")?
+                    .prepare("SELECT slot,view_json FROM mc_async_compaction_baselines WHERE session_ref=?1 AND slot IN ('applied','produced','frozen_edits','retired_native_edits','pending-cut-stage')")?
                     .query_map([session_ref], |row| Ok((row.get(0)?, row.get(1)?)))?
                     .collect::<rusqlite::Result<_>>()?;
                 Ok(Some(AsyncCompactionRows {
@@ -1028,11 +1030,7 @@ mod tests {
     use std::time::Instant;
 
     #[test]
-    #[ignore = "independent final review; requires MC_REVIEW_S4FINAL=1"]
     fn final_ordinary_load_work_is_independent_of_retained_cut_count() {
-        if std::env::var("MC_REVIEW_S4FINAL").as_deref() != Ok("1") {
-            return;
-        }
         let dir = tempfile::tempdir().unwrap();
         let store = McStore::open(&StorageDescriptor {
             module_id: "magic-context".into(),
@@ -1317,6 +1315,52 @@ mod tests {
                 .as_deref(),
             Some("without-cut")
         );
+    }
+
+    #[test]
+    fn final_f03_active_cut_root_change_prevents_archive_deletion() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = McStore::open(&StorageDescriptor {
+            module_id: "magic-context".into(),
+            storage_namespace: "mc_cache".into(),
+            isolation: Isolation::Module,
+            backend: StorageBackend::Sqlite {
+                path: dir.path().join("store.db").to_string_lossy().into_owned(),
+            },
+        })
+        .unwrap();
+        let mut save = store.async_compaction_save("ref", "key", "session", "{}");
+        save.baseline(
+            "cut:100",
+            Some(r#"{"recovery_history_ref":{"root":"c:old"}}"#.into()),
+        );
+        save.immutable_baseline("cut-history:c:old", "old payload".into());
+        save.commit().unwrap();
+        let (roots, objects) = store.async_cut_history_index("ref").unwrap();
+        assert_eq!(objects, vec!["cut-history:c:old".to_owned()]);
+        // After taking the root snapshot, change only cut:100 from c:old to c:new.
+        let mut save = store.async_compaction_save("ref", "key", "session", "{}");
+        save.baseline(
+            "cut:100",
+            Some(r#"{"recovery_history_ref":{"root":"c:new"}}"#.into()),
+        );
+        save.immutable_baseline("cut-history:c:new", "new payload".into());
+        save.commit().unwrap();
+        assert!(!store
+            .discard_async_cut_history_objects("ref", &objects, &roots)
+            .unwrap());
+        assert!(store
+            .load_async_compaction_baseline("ref", "cut-history:c:old")
+            .unwrap()
+            .is_some());
+        let (current_roots, _) = store.async_cut_history_index("ref").unwrap();
+        assert!(store
+            .discard_async_cut_history_objects("ref", &objects, &current_roots)
+            .unwrap());
+        assert!(store
+            .load_async_compaction_baseline("ref", "cut-history:c:old")
+            .unwrap()
+            .is_none());
     }
 
     #[test]
