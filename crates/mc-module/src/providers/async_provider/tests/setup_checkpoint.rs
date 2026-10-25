@@ -8,6 +8,9 @@ use super::*;
 use crate::offline_move::{self, tests as fixture};
 use contract::{errors::RefuseCode, setup::SetupAnswer};
 
+#[path = "broca_role_describe.rs"]
+pub(super) mod broca_role_describe;
+
 const MODULE: &str = "thalamus-harness";
 
 #[tokio::test]

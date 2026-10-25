@@ -8,6 +8,9 @@
 //! every message as `serve_descriptors` serves it, with the runner's digests.
 use super::moved_session::served_entries;
 use super::*;
+
+#[path = "broca_role_describe_offline.rs"]
+mod broca_role_describe;
 use crate::offline_first_pass as command;
 use crate::offline_move::{self, tests as fixture, HolderCheck, StorePaths};
 use crate::providers::offline_first_pass_engine::{EntryInputProof, OfflineOutcome, PagesRunner};
