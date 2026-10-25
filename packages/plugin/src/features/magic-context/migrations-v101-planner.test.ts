@@ -1,6 +1,8 @@
 import { expect, it, spyOn } from "bun:test";
 import { Database } from "../../shared/sqlite";
 import { installTrimSourceIndexes } from "./migration-v101-trim-indexes";
+import { runMigrations } from "./migrations";
+import { initializeDatabase } from "./storage-db";
 import { TAG_SELECT_COLUMNS } from "./storage-tags";
 
 function fixture() {
@@ -97,6 +99,27 @@ it("trim index installation leaves never-analyzed stores on lazy statistics coll
         expect(indexes.map((row) => row.name)).toContain("idx_tags_session_message_nocase");
         expect(indexes.map((row) => row.name)).toContain("idx_tags_session_tool_owner");
     } finally {
+        db.close();
+    }
+});
+
+it("fresh migration replay preserves empty tag statistics without another analysis", () => {
+    const db = new Database(":memory:");
+    const execute = spyOn(db, "exec");
+    try {
+        initializeDatabase(db);
+        runMigrations(db);
+        const analyses = () => execute.mock.calls.filter(([sql]) => /ANALYZE\s+tags/i.test(sql));
+        expect(analyses()).toHaveLength(1);
+        const stats = () =>
+            db.prepare("SELECT idx, stat FROM sqlite_stat1 WHERE tbl='tags' ORDER BY idx").all();
+        const before = stats();
+        expect(before.length).toBeGreaterThan(0);
+        installTrimSourceIndexes(db);
+        expect(analyses()).toHaveLength(1);
+        expect(stats()).toEqual(before);
+    } finally {
+        execute.mockRestore();
         db.close();
     }
 });

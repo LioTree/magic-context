@@ -7,6 +7,10 @@ export function installTrimSourceIndexes(db: Database): void {
         CREATE INDEX IF NOT EXISTS idx_tags_session_tool_owner
         ON tags(session_id, tool_owner_message_id);`);
 
+    // Empty tag tables need no planner repair. Re-analyzing their zero-row
+    // statistics during bootstrap can displace the partial fallback-owner index.
+    if (!db.prepare("SELECT 1 FROM tags LIMIT 1").get()) return;
+
     if (
         !db
             .prepare("SELECT 1 FROM sqlite_master WHERE type = 'table' AND name = 'sqlite_stat1'")

@@ -230,7 +230,67 @@ fn apply(db: &Connection, step: &Step, now_ms: i64) -> Result<(), UpgradeError> 
             split_temporal(db)?;
         }
     }
+    if step.version == 101 {
+        refresh_trim_source_statistics(db)?;
+    }
     Ok(())
+}
+
+fn refresh_trim_source_statistics(db: &Connection) -> rusqlite::Result<()> {
+    if !exists(db, "sqlite_stat1")?
+        || !db.query_row("SELECT EXISTS(SELECT 1 FROM tags)", [], |row| {
+            row.get::<_, bool>(0)
+        })?
+    {
+        return Ok(());
+    }
+    let indexes = db
+        .prepare("SELECT idx FROM sqlite_stat1 WHERE tbl = 'tags'")?
+        .query_map([], |row| row.get::<_, Option<String>>(0))?
+        .collect::<rusqlite::Result<Vec<_>>>()?;
+    if indexes.is_empty()
+        || [
+            "idx_tags_session_message_nocase",
+            "idx_tags_session_tool_owner",
+        ]
+        .iter()
+        .all(|name| indexes.iter().any(|index| index.as_deref() == Some(*name)))
+    {
+        return Ok(());
+    }
+
+    // Keep index sampling bounded even when the caller left analysis unlimited.
+    // Honor a smaller configured limit and restore the original setting afterward.
+    let previous: u32 = db.pragma_query_value(None, "analysis_limit", |row| row.get(0))?;
+    let had_stat4 = exists(db, "sqlite_stat4")?;
+    db.pragma_update(
+        None,
+        "analysis_limit",
+        trim_statistics_analysis_limit(previous),
+    )?;
+    let result = db.execute_batch("ANALYZE tags");
+    let restored = db.pragma_update(None, "analysis_limit", previous);
+    result.and(restored)?;
+    // Bounded analysis collects no STAT4 samples. Avoid adding an unused internal
+    // table to stores initialized by SQLite builds that do not create STAT4.
+    if !had_stat4 && exists(db, "sqlite_stat4")? {
+        let empty: bool =
+            db.query_row("SELECT NOT EXISTS(SELECT 1 FROM sqlite_stat4)", [], |row| {
+                row.get(0)
+            })?;
+        if empty {
+            db.execute_batch("DROP TABLE sqlite_stat4")?;
+        }
+    }
+    Ok(())
+}
+
+fn trim_statistics_analysis_limit(previous: u32) -> u32 {
+    if previous == 0 {
+        400
+    } else {
+        previous.min(400)
+    }
 }
 
 fn hash(bytes: impl AsRef<[u8]>) -> String {
@@ -625,4 +685,107 @@ fn split_session_meta(db: &Connection, step: &Step) -> Result<(), UpgradeError> 
         db.execute_batch(&format!("ALTER TABLE session_meta DROP COLUMN {column}"))?;
     }
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn trim_index_store(analyzed: bool) -> Connection {
+        let db = Connection::open_in_memory().unwrap();
+        db.execute_batch(
+            "CREATE TABLE tags(id INTEGER PRIMARY KEY, session_id TEXT, message_id TEXT, tool_owner_message_id TEXT);
+             CREATE INDEX tags_old ON tags(session_id, id);
+             WITH RECURSIVE numbers(n) AS (VALUES(1) UNION ALL SELECT n+1 FROM numbers WHERE n<600)
+             INSERT INTO tags SELECT n, 'session', 'message-' || n, 'owner-' || n FROM numbers;",
+        )
+        .unwrap();
+        if analyzed {
+            db.execute_batch("ANALYZE tags").unwrap();
+        }
+        db.execute_batch(
+            "CREATE INDEX idx_tags_session_message_nocase ON tags(session_id, message_id COLLATE NOCASE);
+             CREATE INDEX idx_tags_session_tool_owner ON tags(session_id, tool_owner_message_id);",
+        )
+        .unwrap();
+        db
+    }
+
+    #[test]
+    fn trim_statistics_repair_adds_missing_indexes_and_restores_the_limit() {
+        for previous in [0_u32, 200, 1000] {
+            let db = trim_index_store(true);
+            db.pragma_update(None, "analysis_limit", previous).unwrap();
+            refresh_trim_source_statistics(&db).unwrap();
+            let restored: u32 = db
+                .pragma_query_value(None, "analysis_limit", |row| row.get(0))
+                .unwrap();
+            assert_eq!(restored, previous);
+            let repaired: u32 = db
+                .query_row(
+                    "SELECT count(*) FROM sqlite_stat1 WHERE tbl='tags' AND idx IN ('idx_tags_session_message_nocase','idx_tags_session_tool_owner')",
+                    [],
+                    |row| row.get(0),
+                )
+                .unwrap();
+            assert_eq!(repaired, 2);
+        }
+    }
+
+    #[test]
+    fn trim_statistics_repair_keeps_unanalyzed_tags_lazy() {
+        let db = trim_index_store(false);
+        refresh_trim_source_statistics(&db).unwrap();
+        assert!(!exists(&db, "sqlite_stat1").unwrap());
+    }
+
+    #[test]
+    fn trim_statistics_repair_preserves_the_existing_stat4_table_footprint() {
+        for existing_stat4 in [false, true] {
+            let db = trim_index_store(true);
+            if !existing_stat4 {
+                db.execute_batch("DROP TABLE IF EXISTS sqlite_stat4")
+                    .unwrap();
+            }
+            let before = exists(&db, "sqlite_stat4").unwrap();
+            refresh_trim_source_statistics(&db).unwrap();
+            assert_eq!(exists(&db, "sqlite_stat4").unwrap(), before);
+            assert_eq!(
+                db.query_row(
+                    "SELECT count(*) FROM sqlite_stat1 WHERE tbl='tags' AND idx IN ('idx_tags_session_message_nocase','idx_tags_session_tool_owner')",
+                    [],
+                    |row| row.get::<_, u32>(0),
+                ).unwrap(),
+                2
+            );
+        }
+    }
+
+    #[test]
+    fn trim_statistics_repair_leaves_empty_analyzed_tables_unchanged() {
+        let db = trim_index_store(true);
+        db.execute("DELETE FROM tags", []).unwrap();
+        let stats = || {
+            db.prepare("SELECT idx, stat FROM sqlite_stat1 WHERE tbl='tags' ORDER BY idx")
+                .unwrap()
+                .query_map([], |row| {
+                    Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?))
+                })
+                .unwrap()
+                .collect::<rusqlite::Result<Vec<_>>>()
+                .unwrap()
+        };
+        let before = stats();
+        assert_eq!(before.len(), 1);
+        assert_eq!(before[0].0, "tags_old");
+        refresh_trim_source_statistics(&db).unwrap();
+        assert_eq!(stats(), before);
+    }
+
+    #[test]
+    fn trim_statistics_analysis_budget_respects_smaller_limits() {
+        assert_eq!(trim_statistics_analysis_limit(0), 400);
+        assert_eq!(trim_statistics_analysis_limit(200), 200);
+        assert_eq!(trim_statistics_analysis_limit(1000), 400);
+    }
 }
