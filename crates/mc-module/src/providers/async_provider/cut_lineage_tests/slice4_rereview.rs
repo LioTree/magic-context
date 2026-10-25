@@ -779,3 +779,99 @@ async fn r01_ambiguous_same_ordinal_head_refuses_instead_of_choosing_a_branch() 
         same_ordinal_head_refusal(profile, true).await;
     }
 }
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn r05_restore_keeps_the_certified_prefix_without_a_cold_repair_backup() {
+    let mut pair = Pair::open_with(Profile::Broca, false, Some("L"), false, false).await;
+    pair.append(120);
+    let mut rng = Rng(0xA505);
+    review_history(&mut pair, 99).await;
+    pair.notice(&mut rng, None).await;
+    descend_pair(&mut pair, 100, "restore-only").await;
+    let store = pair.resident.store();
+    let mut state = load(store, &pair.reference).unwrap().unwrap();
+    let source_namespace = state.namespace();
+    let original_history = store.load_compartments(&source_namespace).unwrap();
+    assert_eq!(original_history.len(), 1);
+    assert_eq!(
+        (
+            original_history[0].start_message,
+            original_history[0].end_message
+        ),
+        (0, 99)
+    );
+    assert_eq!(state.entries.first_key_value().unwrap().0, &100);
+    state.reset(store).unwrap();
+    let sources = state.resync_sources.as_ref().unwrap();
+    assert_eq!(sources.history.len(), 1);
+    assert!(
+        sources.history[0].messages.is_empty(),
+        "rows below the physical cut are not held"
+    );
+    // Discarding archived recovery objects must not erase the stored source
+    // compartments. Restore fills the prefix without those discarded objects.
+    let (roots, objects) = store.async_cut_history_index(&pair.reference).unwrap();
+    assert!(!objects.is_empty());
+    assert!(store
+        .discard_async_cut_history_objects(&pair.reference, &objects, &roots)
+        .unwrap());
+    assert!(state
+        .cut_seed
+        .as_ref()
+        .unwrap()
+        .pending_history_objects
+        .is_empty());
+    assert!(
+        state
+            .cut_seed
+            .as_ref()
+            .unwrap()
+            .recovery_compartments(store, &pair.reference)
+            .is_err(),
+        "the repair backup must really be unavailable"
+    );
+    let progress = Box::pin(pair.resident.h.read_async_resumable(
+        &mut state,
+        0,
+        Duration::from_secs(30),
+    ))
+    .await
+    .unwrap();
+    assert!(matches!(progress, ReadProgress::Complete));
+    assert_eq!(state.entries.first_key_value().unwrap().0, &100);
+    state.reindex().unwrap();
+    let codec = codec::Codec::from_params(&Value::Object(state.setup.params.clone())).unwrap();
+    state.restore_sources(store, codec).unwrap();
+    let restored = store.load_compartments(&state.namespace()).unwrap();
+    assert_eq!(
+        serde_json::to_value(restored).unwrap(),
+        serde_json::to_value(&original_history).unwrap()
+    );
+    assert_eq!(
+        serde_json::to_value(store.load_compartments(&source_namespace).unwrap()).unwrap(),
+        serde_json::to_value(original_history).unwrap()
+    );
+    assert_eq!(
+        store
+            .load_meta(&state.namespace())
+            .unwrap()
+            .meta
+            .coverage_ordinal,
+        Some(99)
+    );
+    assert!(state.resync_sources.is_none());
+    assert!(state
+        .cut_seed
+        .as_ref()
+        .unwrap()
+        .recovery_compartments(store, &pair.reference)
+        .is_err());
+    assert!(state.entries.keys().all(|ordinal| *ordinal >= 100));
+    assert!(pair
+        .resident
+        .runner
+        .reads_below_floor
+        .lock()
+        .unwrap()
+        .is_empty());
+}
