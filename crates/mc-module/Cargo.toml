@@ -97,7 +97,7 @@ cortexkit-role-agent-data = { version = "0.2.3", features = ["test-vectors"] }
 cpu-time = "1"
 subc-core = { workspace = true }
 # Embedded real-daemon coverage of HELLO_ACK/open versus the first plan fetch.
-subc-daemon = "=0.36.19"
+subc-daemon = "=0.36.35"
 # Enable the store's seed helpers for mc-module's compose tests (populate memories +
 # mutations). The feature is gated so the writers never reach production builds.
 mc-store = { workspace = true, features = ["test-support"] }
@@ -124,5 +124,3 @@ cortexkit-role-llm-runner-conformance = "=0.14.0"
 # (src/providers/async_provider/tests/conversation_identity_probe.rs).
 cortexkit-role-compaction-provider = { version = "=0.7.0", features = ["conformance"] }
 cortexkit-role-routing-conformance = "=0.1.0"
-# The routing kit's fake uses the kit's protocol version, not our live wire SDK.
-routing-conformance-protocol = { package = "subc-protocol", version = "=0.33.1" }

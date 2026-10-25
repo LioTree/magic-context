@@ -21842,6 +21842,12 @@ pub fn manifest(module_id: &str) -> ModuleManifest {
     manifest_with_route_targets(module_id, &RouteTargetConfig::default())
 }
 
+/// Bridge identical wire records while role crates still pin the previous SDK minor.
+pub(crate) fn compatible_wire<T: serde::de::DeserializeOwned>(value: impl serde::Serialize) -> T {
+    serde_json::from_value(serde_json::to_value(value).expect("wire record serializes"))
+        .expect("additive SDK minors share this wire record")
+}
+
 pub fn manifest_with_route_targets(
     module_id: &str,
     resolved_routes: &RouteTargetConfig,
@@ -21947,6 +21953,37 @@ pub fn manifest_with_route_targets_and_smart_notes(
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn hello_bytes_match_the_base_sdk_with_optional_manifest_members_unset() {
+        let mut hello = subc_protocol::ModuleHelloBody {
+            manifest: super::manifest(super::DEFAULT_MODULE_ID),
+            protocol_ver: subc_protocol::PROTOCOL_VERSION,
+            control_ops: Some(vec!["health.check".into()]),
+            launch_nonce: Some("compatibility-test-nonce".into()),
+        };
+        use sha2::{Digest, Sha256};
+        let production = serde_json::to_value(&hello).unwrap();
+        assert_eq!(
+            production["manifest"]["provenance"],
+            serde_json::json!({"wire_crate_version": "0.33.1"})
+        );
+        // The SDK version is truthful deployment metadata, not a wire-shape change.
+        // Normalize only /manifest/provenance/wire_crate_version to the old SDK;
+        // every other byte is compared to the measured 0.32.8 HELLO on 2462c22a.
+        hello
+            .manifest
+            .provenance
+            .as_mut()
+            .unwrap()
+            .wire_crate_version = Some("0.32.8".into());
+        let current = serde_json::to_vec(&hello).unwrap();
+        assert_eq!(current.len(), 13_151);
+        assert_eq!(
+            format!("{:x}", Sha256::digest(&current)),
+            "ca9ea694c36322084bf5f81de7b5c4b9efdaed90a710aa16bfb497c373b33c77"
+        );
+    }
+
     include!("tests/tool_attachment_memory_review.rs");
     include!("tests/subagent_invocations_read.rs");
     use super::*;

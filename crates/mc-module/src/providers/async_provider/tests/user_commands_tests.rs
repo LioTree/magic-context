@@ -100,10 +100,14 @@ fn pending_history(rig: &Rig) {
 async fn person_admission_refuses_run_flow_and_unscoped_invokes() {
     let dir = tempfile::tempdir().unwrap();
     let rig = ready(dir.path()).await;
-    assert!(user_command::admitted(Some(&stamp())));
+    assert!(user_command::admitted(Some(&crate::compatible_wire(
+        stamp()
+    ))));
     let flow = stamp().with_attributes(ScopeAttributes::new().with_flow_id(Some("flow".into())));
     // The role's own admission still refuses a flow scope...
-    assert!(!user_command::admitted(Some(&flow)));
+    assert!(!user_command::admitted(Some(&crate::compatible_wire(
+        &flow
+    ))));
     // ...but a flow-scoped route never reaches it: the dispatcher's flow fence
     // refuses every method but the flow ops first.
     attest(&rig, Some(flow));

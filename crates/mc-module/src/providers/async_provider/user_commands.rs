@@ -92,7 +92,8 @@ fn principal_name(principal: &Principal) -> String {
         Principal::Unverified => "unverified".into(),
     }
 }
-fn wire_error(body: subc_protocol::ErrorBody) -> HandlerOutcome {
+fn wire_error(body: impl serde::Serialize) -> HandlerOutcome {
+    let body: subc_protocol::ErrorBody = crate::compatible_wire(body);
     HandlerOutcome::ErrorWithDetail {
         code: body.code,
         message: body.message,
@@ -184,7 +185,8 @@ impl McHandler {
             Ok(binding) => binding,
             Err(_) => return refused("user_command_not_admitted", op),
         };
-        if !command::admitted(binding.scope.as_ref()) {
+        let command_scope = binding.scope.as_ref().map(crate::compatible_wire);
+        if !command::admitted(command_scope.as_ref()) {
             return refused(errors::USER_COMMAND_NOT_ADMITTED, op);
         }
         if binding
