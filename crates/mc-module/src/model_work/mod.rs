@@ -241,6 +241,12 @@ impl<C: Clock> Engine<C> {
         }
     }
 
+    /// Reports still waiting for routing's acknowledgement. An engine holding
+    /// any must be kept, or routing never learns those outcomes.
+    pub fn pending_report_count(&self) -> usize {
+        self.pending_reports.len()
+    }
+
     fn provider(&mut self, catalog: &RoutingCatalog) -> Result<String, WorkError> {
         if let Some((generation, result)) = &self.provider {
             if *generation == catalog.generation {

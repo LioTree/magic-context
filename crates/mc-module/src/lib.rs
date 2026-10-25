@@ -4163,6 +4163,9 @@ pub struct McHandler {
     retrieval_reranker: Option<Arc<dyn retrieval::hybrid::RerankClient>>,
     config: Arc<Mutex<ConfigCache>>,
     historian_runner_refusals: Arc<HistorianRunnerRefusalCache>,
+    /// Routing engines for routed summaries, one per session, kept for the
+    /// module's lifetime so unacknowledged reports survive their firing.
+    summary_engines: Arc<historian_routed::SummaryEngines>,
     /// Runs queued for a claimant that a firing task in this process is still
     /// waiting on. Empty under the in-module runner.
     host_runs: Arc<HostRunLedger>,
@@ -5034,6 +5037,7 @@ struct HistorianFiringTask {
     pressure: bool,
     model_chain_generation: u64,
     runner_refusal_cache: Arc<HistorianRunnerRefusalCache>,
+    summary_engines: Arc<historian_routed::SummaryEngines>,
     live_guard: SessionSetGuard,
     connect_failure_commit_hook: ConnectFailureCommitHook,
     publication_fence: Option<Arc<dyn historian::HistorianPublicationFence>>,
@@ -5268,6 +5272,7 @@ impl McHandler {
             retrieval_reranker,
             config: Arc::new(Mutex::new(ConfigCache::default())),
             historian_runner_refusals: Arc::new(HistorianRunnerRefusalCache::default()),
+            summary_engines: Arc::default(),
             host_runs: Arc::new(HostRunLedger::new()),
             dream_children: Arc::new(dream_dispatch::host_carrier::DreamQueue::default()),
             broca_dream_tools: Arc::new(dream_dispatch::broca_carrier::BrocaToolRoute::default()),
@@ -5725,6 +5730,7 @@ impl McHandler {
             retrieval_reranker: None,
             config: Arc::new(Mutex::new(ConfigCache::default())),
             historian_runner_refusals: Arc::new(HistorianRunnerRefusalCache::default()),
+            summary_engines: Arc::default(),
             host_runs: Arc::new(HostRunLedger::new()),
             dream_children: Arc::new(dream_dispatch::host_carrier::DreamQueue::default()),
             broca_dream_tools: Arc::new(dream_dispatch::broca_carrier::BrocaToolRoute::default()),
@@ -7633,7 +7639,8 @@ impl McHandler {
             .expect("a true historian trigger carries its firing rule");
         let trigger_reason = Some(trigger_rule.as_str().to_string());
         // A routed summary asks routing where to run; it never reads the host's chain.
-        let routed = self.producer_factory.summary_routing().is_some();
+        let routed =
+            historian_routed::active_routing(self.producer_factory.summary_routing()).is_some();
         let model_chain = if routed {
             Some(&[][..])
         } else {
@@ -7986,6 +7993,7 @@ impl McHandler {
                     || parsed.emergency_recovery_armed,
                 model_chain_generation,
                 runner_refusal_cache: Arc::clone(&self.historian_runner_refusals),
+                summary_engines: Arc::clone(&self.summary_engines),
                 live_guard,
                 connect_failure_commit_hook: Arc::clone(&self.connect_failure_commit_hook),
                 // Organic pressure firings assemble and publish in one continuous drive
@@ -8045,7 +8053,8 @@ impl McHandler {
         // Wrapup runs on the host's chain from the session's last transform, the same
         // chain the autonomous historian uses; the module has no chain of its own.
         // A routed wrapup asks routing where to run, like any other summary.
-        let routed = self.producer_factory.summary_routing().is_some();
+        let routed =
+            historian_routed::active_routing(self.producer_factory.summary_routing()).is_some();
         let model_chain = if routed {
             Some(Vec::new())
         } else {
@@ -8199,6 +8208,7 @@ impl McHandler {
             pressure: false,
             model_chain_generation,
             runner_refusal_cache: Arc::clone(&self.historian_runner_refusals),
+            summary_engines: Arc::clone(&self.summary_engines),
             live_guard,
             connect_failure_commit_hook: Arc::clone(&self.connect_failure_commit_hook),
             publication_fence,
@@ -8314,6 +8324,7 @@ impl McHandler {
                 runner_identity,
                 scope,
                 pressure,
+                summary_engines,
                 live_guard,
                 publication_fence,
                 provider_completion,
@@ -8322,6 +8333,7 @@ impl McHandler {
             let _guard = live_guard;
             let result = historian_routed::run_routed_summary(historian_routed::RoutedSummary {
                 routing: routing.as_ref(),
+                engines: &summary_engines,
                 scope: scope.as_deref(),
                 identity: &runner_identity,
                 store: &store,
@@ -8356,7 +8368,7 @@ impl McHandler {
         factory: Arc<dyn HistorianProducerFactory>,
         task: HistorianFiringTask,
     ) -> Result<historian::HistorianDriveOutcome, historian::HistorianDriveError> {
-        if let Some(routing) = factory.summary_routing() {
+        if let Some(routing) = historian_routed::active_routing(factory.summary_routing()) {
             return Self::execute_routed_firing_task(routing, task).await;
         }
         let HistorianFiringTask {
@@ -8380,6 +8392,7 @@ impl McHandler {
             pressure: _,
             model_chain_generation,
             runner_refusal_cache,
+            summary_engines: _,
             live_guard,
             connect_failure_commit_hook,
             publication_fence,

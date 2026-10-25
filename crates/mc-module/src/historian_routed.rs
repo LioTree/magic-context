@@ -13,10 +13,16 @@
 //! and routing settings rendered with it. Every later summary of the
 //! conversation sends those stored bytes, even after a persona file changes, so
 //! the provider's cached prefix for the summarizer stays the same.
+//!
+//! Until routed summaries are proven live, a summary takes this path only when
+//! its transport's [`SummaryRouting::routing_support`] check passes
+//! ([`choose_summary_path`]); otherwise it keeps the model-chain path. The
+//! production transport does not pass yet, so production summaries still walk
+//! the chain. This gate goes away with the chain path.
 
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, HashMap};
 use std::path::{Path, PathBuf};
-use std::sync::Mutex;
+use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
 use cortexkit_persona::{ApprovalSet, PersonaError, Tier};
@@ -55,6 +61,76 @@ pub const SUMMARY_MAX_DECISIONS: usize = 3;
 /// pressure-driven summaries that must not wait. Turn this on with the routing
 /// release that adds `hold_ok` to `route.select`.
 pub const ROUTE_SELECT_HOLD_OK_SUPPORTED: bool = false;
+
+/// The production transport cannot place a summary yet. It answers this until
+/// ck-mc registers each firing's child scope with the daemon and discovers the
+/// routing provider live, which is what makes routed summaries safe to run.
+pub const SUMMARY_ROUTING_UNPROVEN: &str = "mc_summary_routing_unproven";
+
+/// Why a transport cannot place summaries, by name.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct RoutingSupportRefusal {
+    pub code: String,
+    pub detail: String,
+}
+
+/// How one summary is carried.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum SummaryPath {
+    /// Placed by routing, through [`run_routed_summary`].
+    Routed,
+    /// The model-chain drive summaries used before routing.
+    Chain,
+}
+
+/// The path a summary takes: routed only when the transport reports that it
+/// can place summaries. A summary never fails over from one path to the other.
+pub fn choose_summary_path(support: Result<(), RoutingSupportRefusal>) -> SummaryPath {
+    match support {
+        Ok(()) => SummaryPath::Routed,
+        Err(_) => SummaryPath::Chain,
+    }
+}
+
+/// The routing a summary should use, or `None` to keep the chain path.
+pub(crate) fn active_routing(
+    routing: Option<Arc<dyn SummaryRouting>>,
+) -> Option<Arc<dyn SummaryRouting>> {
+    routing.filter(|routing| choose_summary_path(routing.routing_support()) == SummaryPath::Routed)
+}
+
+/// Engines kept at most for this many sessions; past it, sessions whose engine
+/// is idle with no report waiting are forgotten.
+const SUMMARY_ENGINE_SESSION_CAP: usize = 256;
+
+/// One routing engine per session for the module's lifetime. An engine queues
+/// a report routing did not acknowledge and sends it again on the session's next
+/// summary, under the scope it was decided under; an engine made per firing
+/// would drop that report when the firing ended.
+#[derive(Default)]
+pub struct SummaryEngines {
+    engines: Mutex<HashMap<String, Arc<tokio::sync::Mutex<Engine>>>>,
+}
+
+impl SummaryEngines {
+    fn for_session(&self, session_id: &str) -> Arc<tokio::sync::Mutex<Engine>> {
+        let mut engines = self.engines.lock().expect("summary engines mutex");
+        if let Some(engine) = engines.get(session_id) {
+            return Arc::clone(engine);
+        }
+        if engines.len() >= SUMMARY_ENGINE_SESSION_CAP {
+            engines.retain(|_, engine| {
+                Arc::strong_count(engine) > 1
+                    || engine
+                        .try_lock()
+                        .map_or(true, |engine| engine.pending_report_count() > 0)
+            });
+        }
+        let engine = Arc::new(tokio::sync::Mutex::new(Engine::new(WallClock)));
+        engines.insert(session_id.to_string(), Arc::clone(&engine));
+        engine
+    }
+}
 
 /// Routing affinity and correlation ids are limited to this many characters.
 const ROUTING_KEY_MAX_CHARS: usize = 128;
@@ -96,6 +172,9 @@ impl SummaryScope {
 /// speaks subc ([`SubcSummaryRouting`]); tests supply fakes.
 #[subc_client_rs::async_trait]
 pub trait SummaryRouting: Send + Sync {
+    /// Whether this transport can place summaries at all. A summary takes the
+    /// routed path only when it can; the refusal names what is missing.
+    fn routing_support(&self) -> Result<(), RoutingSupportRefusal>;
     /// The `routing/v1` providers in the catalog, with its generation.
     async fn catalog(&self) -> Result<RoutingCatalog, String>;
     async fn select(
@@ -162,6 +241,8 @@ impl ScopeRoute for RoutedScope<'_> {
 /// Everything one routed summary needs, borrowed from the prepared firing.
 pub(crate) struct RoutedSummary<'a> {
     pub routing: &'a dyn SummaryRouting,
+    /// The module's engines, so reports outlive the firing that made them.
+    pub engines: &'a SummaryEngines,
     pub scope: Option<&'a ScopeStamp>,
     pub identity: &'a RunnerBindIdentity,
     pub store: &'a McStore,
@@ -238,7 +319,8 @@ pub(crate) async fn run_routed_summary(
         frozen: &frozen,
         stop: Mutex::new(None),
     };
-    let result = Engine::new(WallClock).run(&catalog, &order, &runner).await;
+    let engine = summary.engines.for_session(summary.session_id);
+    let result = engine.lock().await.run(&catalog, &order, &runner).await;
     if let Some(stopped) = runner.stop.lock().expect("summary stop mutex").take() {
         return stopped;
     }
@@ -885,6 +967,15 @@ impl SubcSummaryRouting {
 
 #[subc_client_rs::async_trait]
 impl SummaryRouting for SubcSummaryRouting {
+    fn routing_support(&self) -> Result<(), RoutingSupportRefusal> {
+        Err(RoutingSupportRefusal {
+            code: SUMMARY_ROUTING_UNPROVEN.into(),
+            detail: "routed summaries need a registered child scope per firing and live \
+                routing discovery; until then summaries keep the model-chain path"
+                .into(),
+        })
+    }
+
     async fn catalog(&self) -> Result<RoutingCatalog, String> {
         use subc_client_rs::{ConsumerOptions, SubcConsumer};
         let consumer = SubcConsumer::connect(

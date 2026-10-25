@@ -29,6 +29,9 @@ struct RoutingTrace {
     reports: Vec<ReportRequest>,
     runner_modules: Vec<String>,
     scope_refs: Vec<String>,
+    /// Every select and report in call order, a report with the decision it
+    /// reports and the scope it was sent under.
+    events: Vec<String>,
 }
 
 struct FakeRouting {
@@ -36,9 +39,13 @@ struct FakeRouting {
     route: FakeRoute,
     providers: Vec<String>,
     accepts_hold_ok: bool,
+    /// Whether this transport reports that it can place summaries.
+    supported: bool,
     config_home: PathBuf,
     producer: Arc<ProducerState>,
     trace: StdMutex<RoutingTrace>,
+    /// Refusals answered to the next reports, instead of forwarding them.
+    report_refusals: StdMutex<std::collections::VecDeque<Refusal>>,
 }
 
 fn decode<T: DeserializeOwned>(reply: Reply) -> Result<T, Refusal> {
@@ -52,6 +59,17 @@ fn decode<T: DeserializeOwned>(reply: Reply) -> Result<T, Refusal> {
 
 #[async_trait]
 impl SummaryRouting for FakeRouting {
+    fn routing_support(&self) -> Result<(), crate::historian_routed::RoutingSupportRefusal> {
+        if self.supported {
+            Ok(())
+        } else {
+            Err(crate::historian_routed::RoutingSupportRefusal {
+                code: "fixture_unproven".into(),
+                detail: "this fixture transport cannot place summaries".into(),
+            })
+        }
+    }
+
     async fn catalog(&self) -> Result<RoutingCatalog, String> {
         Ok(RoutingCatalog {
             generation: 1,
@@ -71,6 +89,7 @@ impl SummaryRouting for FakeRouting {
             let mut trace = self.trace.lock().unwrap();
             trace.selects.push(params.clone());
             trace.scope_refs.push(scope.stamp.scope_ref.clone());
+            trace.events.push("select".into());
         }
         let answer: RoutedChoice =
             decode(self.route.request("route.select", &params).await.unwrap())?;
@@ -89,6 +108,13 @@ impl SummaryRouting for FakeRouting {
             let mut trace = self.trace.lock().unwrap();
             trace.reports.push(report.clone());
             trace.scope_refs.push(scope.stamp.scope_ref.clone());
+            trace.events.push(format!(
+                "report {} under {}@{}",
+                report.decision_id, scope.stamp.scope_ref, scope.stamp.scope_epoch
+            ));
+        }
+        if let Some(refusal) = self.report_refusals.lock().unwrap().pop_front() {
+            return Err(refusal);
         }
         decode(
             self.route
@@ -135,11 +161,18 @@ struct RoutedFactory {
 
 #[async_trait]
 impl HistorianProducerFactory for RoutedFactory {
+    /// The chain path's connect. Routed summaries never use it.
     async fn connect(
         &self,
         _project_root: &Path,
     ) -> Result<Box<dyn HistorianProducerDriver + Send>, HistorianProducerError> {
-        panic!("a routed summary connects only to the runner routing answered");
+        self.routing
+            .producer
+            .connects
+            .fetch_add(1, Ordering::SeqCst);
+        Ok(Box::new(TestProducer {
+            state: Arc::clone(&self.routing.producer),
+        }))
     }
 
     fn summary_routing(&self) -> Option<Arc<dyn crate::historian_routed::SummaryRouting>> {
@@ -182,6 +215,10 @@ fn routed_binding(project: &Path) -> SessionBinding {
 }
 
 async fn rig_with(providers: &[&str], accepts_hold_ok: bool) -> Rig {
+    rig_full(providers, accepts_hold_ok, true).await
+}
+
+async fn rig_full(providers: &[&str], accepts_hold_ok: bool, supported: bool) -> Rig {
     let producer = Arc::new(ProducerState::default());
     let dir = tempfile::tempdir().unwrap();
     let data_home = dir.path().join("data");
@@ -209,9 +246,11 @@ async fn rig_with(providers: &[&str], accepts_hold_ok: bool) -> Rig {
         route,
         providers: providers.iter().map(|p| p.to_string()).collect(),
         accepts_hold_ok,
+        supported,
         config_home: dir.path().join("config"),
         producer: Arc::clone(&producer),
         trace: StdMutex::default(),
+        report_refusals: StdMutex::default(),
     });
     let handler = McHandler::with_producer_factory_config_resolver(
         Arc::new(RoutedFactory {
@@ -400,6 +439,7 @@ async fn routed_summary_selects_sends_exactly_the_answer_and_reports_on_the_sess
     assert_eq!(trace.reports.len(), 1);
     assert_eq!(trace.reports[0].decision_id, answer.decision_id);
     assert_eq!(trace.reports[0].outcome, Outcome::Completed);
+    assert_eq!(rig.producer.connects.load(Ordering::SeqCst), 0);
     // The persona renders today's system bytes and freezes them on the session.
     let systems = rig.producer.systems.lock().unwrap();
     assert_eq!(systems.as_slice(), [today_system_bytes()]);
@@ -717,4 +757,86 @@ async fn placement_never_changes_the_parents_served_prefix() {
     // The summary itself reaches the parent; only its placement must not.
     assert!(direct_served.contains("autonomous"), "{direct_served}");
     assert_eq!(direct_served, rerouted_served);
+}
+
+/// Production keeps the model-chain path until routed summaries are proven
+/// live: its transport reports that it cannot place summaries yet, so the gate
+/// gives no routing to a module built for production.
+#[tokio::test]
+async fn production_summaries_keep_the_chain_path_until_routing_is_proven() {
+    let dir = tempfile::tempdir().unwrap();
+    let production = crate::historian_routed::SubcSummaryRouting {
+        connection_file: dir.path().join("subc.json"),
+        route_targets: RouteTargetConfig::default(),
+    };
+    let refusal =
+        crate::historian_routed::SummaryRouting::routing_support(&production).unwrap_err();
+    assert_eq!(
+        refusal.code,
+        crate::historian_routed::SUMMARY_ROUTING_UNPROVEN
+    );
+    let handler = McHandler::new_with_connection_file(Some(dir.path().join("subc.json")));
+    assert!(handler.producer_factory.summary_routing().is_some());
+    assert!(
+        crate::historian_routed::active_routing(handler.producer_factory.summary_routing())
+            .is_none()
+    );
+}
+
+/// A transport that cannot place summaries leaves the firing on the chain
+/// path: the host's chain model is sent, and routing is never asked.
+#[tokio::test]
+async fn unproven_routing_keeps_the_chain_path() {
+    let rig = rig_full(&[PROVIDER], false, false).await;
+    let outcome = rig.fire(rig.task()).await.unwrap();
+    assert!(matches!(
+        outcome,
+        historian::HistorianDriveOutcome::Completed(_)
+    ));
+    assert_eq!(*rig.producer.models.lock().unwrap(), [TEST_HISTORIAN_MODEL]);
+    assert_eq!(rig.producer.connects.load(Ordering::SeqCst), 1);
+    let trace = rig.routing.trace.lock().unwrap();
+    assert!(trace.events.is_empty(), "{:?}", trace.events);
+    assert!(trace.runner_modules.is_empty());
+    assert!(rig
+        .store
+        .load_meta("ses")
+        .unwrap()
+        .meta
+        .summary_persona
+        .is_none());
+}
+
+/// A report routing refused in one firing is sent again at the start of the
+/// session's next firing, under the scope it was decided under, before that
+/// firing selects.
+#[tokio::test]
+async fn refused_report_is_sent_in_the_next_firing_under_its_original_scope() {
+    let rig = rig().await;
+    rig.routing
+        .report_refusals
+        .lock()
+        .unwrap()
+        .push_back(Refusal::new(
+            cortexkit_role_routing::errors::RefusalCode::RoutingUnavailable,
+            "fixture routing outage",
+        ));
+    // Firing one fails on both answerable routes; its first report is refused.
+    rig.fail_next_start("upstream_overloaded");
+    rig.fail_next_start("upstream_overloaded");
+    assert!(rig.fire(rig.task()).await.is_err());
+    let (refused, firing_one_events) = {
+        let trace = rig.routing.trace.lock().unwrap();
+        (trace.answers[0].decision_id.clone(), trace.events.len())
+    };
+    rig.clear_backoff();
+    rig.fire(rig.task()).await.unwrap();
+    let trace = rig.routing.trace.lock().unwrap();
+    let firing_two = &trace.events[firing_one_events..];
+    assert_eq!(
+        firing_two.first().map(String::as_str),
+        Some(format!("report {refused} under {SCOPE_REF}@1").as_str()),
+        "{firing_two:?}"
+    );
+    assert_eq!(firing_two.get(1).map(String::as_str), Some("select"));
 }
