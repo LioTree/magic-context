@@ -83,9 +83,11 @@ import {
 	freezeTurnOneProfile,
 	persistTurnOneAuthorization,
 } from "@magic-context/core/features/magic-context/memory/turn-two";
-import type {
-	TurnTwoAllowlist,
-	TurnTwoTrialAuthorization,
+import {
+	loadTurnTwoAllowlist,
+	matchesTurnTwoSelection,
+	type TurnTwoAllowlist,
+	type TurnTwoTrialAuthorization,
 } from "@magic-context/core/features/magic-context/memory/turn-two-allowlist";
 import {
 	clearEmergencyDrainLatch,
@@ -622,6 +624,20 @@ export async function runPiHistorian(deps: PiHistorianDeps): Promise<void> {
 	);
 	const selectionProject =
 		resolveProjectIdentityForSession(directory, allowHomeProject) ?? "";
+	// Probe only a matching allowlist profile or an explicitly enabled trial lane.
+	if (
+		harness === "omp" &&
+		twoPass !== true &&
+		deps.turnTwo !== "off" &&
+		(loadTurnTwoAllowlist(deps.allowlist).entries.some((entry) =>
+			matchesTurnTwoSelection(authorizationRequest.requestedIdentity, entry),
+		) ||
+			deps.memoryLifecycleLane === "enabled") &&
+		"prepareRetainedHistorian" in runner &&
+		typeof runner.prepareRetainedHistorian === "function"
+	) {
+		await runner.prepareRetainedHistorian(directory);
+	}
 	const rpcRunner = isPiRpcHistorianRunner(runner) ? runner : null;
 	const selection = selectTurnOneExecution(db, {
 		projectPath: selectionProject,
