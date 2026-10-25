@@ -127,10 +127,16 @@ pub(crate) struct CutSeed {
     /// The newest todo state below the cut. Fallback: none, so no
     /// synthetic todo pair shows until the next `todowrite` in the window.
     pub todo: Option<SeedTodo>,
-    /// History at the restart boundary, retained independently of later
-    /// historian replacements so a fork can rebuild the cut's covered prefix.
-    #[serde(default)]
+    /// Old seeds may embed history. New seeds refer to immutable shared objects
+    /// so another cut never copies all earlier compartment payloads again.
+    #[serde(default, skip_serializing)]
     pub recovery_history: Vec<mc_store::StoredCompartment>,
+    #[serde(default)]
+    pub(super) recovery_history_ref: Option<HistoryRef>,
+    /// New immutable objects commit atomically with the seed's root reference;
+    /// their payloads are never embedded in the serialized seed itself.
+    #[serde(skip)]
+    pub(super) pending_history_objects: BTreeMap<String, String>,
     /// Historian input only: never model input, live lineage, or session.read
     /// rows. Every row is at or below the wire cut, so a rewind changing one
     /// undoes that cut and cannot leave a stale prelude on a surviving lineage.
@@ -277,7 +283,149 @@ fn block_mid(block: &str) -> &str {
     ck_wire::split_block_id(block).map_or(block, |(mid, _)| mid)
 }
 
+/// One fixed-size reference to immutable compartment objects. The tree shares
+/// unchanged subtrees between cuts; only new source identities add payloads.
+#[derive(Clone, Debug, Serialize, Deserialize)]
+pub(super) struct HistoryRef {
+    root: Option<String>,
+    summary_end: Option<u64>,
+    /// Preserve version identity even after the disposable stage is gone.
+    pub(super) identity: Option<(String, i64, i64, bool)>,
+    count: usize,
+}
+
+#[derive(Serialize, Deserialize)]
+enum HistoryObject {
+    Compartment(mc_store::StoredCompartment),
+    Branch(String, String),
+}
+
 impl CutSeed {
+    pub(super) fn set_recovery_history(
+        &mut self,
+        compartments: Vec<mc_store::StoredCompartment>,
+        identity: Option<(String, i64, i64, bool)>,
+        summary_end: Option<u64>,
+    ) -> Result<(), HandlerOutcome> {
+        let count = compartments.len();
+        let summary_end = compartments
+            .iter()
+            .filter_map(|row| u64::try_from(row.end_message).ok())
+            .chain(summary_end)
+            .max();
+        let mut objects = BTreeMap::new();
+        let mut keep = |object: HistoryObject| -> Result<String, HandlerOutcome> {
+            let kind = match &object {
+                HistoryObject::Compartment(_) => "c",
+                HistoryObject::Branch(_, _) => "b",
+            };
+            let value = serde_json::to_value(object).map_err(transient)?;
+            let id = format!("{kind}:{}", contract::digest::content_digest(&value));
+            objects.insert(
+                format!("cut-history:{id}"),
+                serde_json::to_string(&value).map_err(transient)?,
+            );
+            Ok(id)
+        };
+        let mut level = compartments
+            .into_iter()
+            .map(|row| keep(HistoryObject::Compartment(row)))
+            .collect::<Result<Vec<_>, _>>()?;
+        while level.len() > 1 {
+            let mut next = Vec::with_capacity(level.len().div_ceil(2));
+            for pair in level.chunks(2) {
+                next.push(if pair.len() == 2 {
+                    keep(HistoryObject::Branch(pair[0].clone(), pair[1].clone()))?
+                } else {
+                    pair[0].clone()
+                });
+            }
+            level = next;
+        }
+        self.recovery_history_ref = Some(HistoryRef {
+            root: level.pop(),
+            summary_end,
+            identity,
+            count,
+        });
+        self.recovery_history.clear();
+        self.pending_history_objects.extend(objects);
+        Ok(())
+    }
+
+    pub(super) fn recovery_compartments(
+        &self,
+        store: &McStore,
+        reference: &str,
+    ) -> Result<Vec<mc_store::StoredCompartment>, HandlerOutcome> {
+        let Some(history) = &self.recovery_history_ref else {
+            return Ok(self.recovery_history.clone());
+        };
+        let mut pending = history.root.iter().cloned().collect::<Vec<_>>();
+        let archived = if self.pending_history_objects.is_empty() {
+            store
+                .load_async_cut_history_objects(reference, history.root.as_deref())
+                .map_err(transient)?
+                .ok_or_else(|| {
+                    error(
+                        "cut_rebootstrap_required",
+                        "retained history is missing; start a full lineage",
+                    )
+                })?
+                .into_iter()
+                .collect::<BTreeMap<_, _>>()
+        } else {
+            BTreeMap::new()
+        };
+        let mut rows = Vec::with_capacity(history.count);
+        let mut visited = HashSet::new();
+        while let Some(id) = pending.pop() {
+            if !visited.insert(id.clone()) {
+                return Err(error(
+                    "cut_rebootstrap_required",
+                    "retained history has a repeated object identity",
+                ));
+            }
+            let slot = format!("cut-history:{id}");
+            let raw = self
+                .pending_history_objects
+                .get(&slot)
+                .or_else(|| archived.get(&slot))
+                .ok_or_else(|| {
+                    error(
+                        "cut_rebootstrap_required",
+                        "retained history is missing; start a full lineage",
+                    )
+                })?;
+            let value: Value = serde_json::from_str(&raw).map_err(transient)?;
+            if contract::digest::content_digest(&value) != id.rsplit(':').next().unwrap_or_default()
+            {
+                return Err(error(
+                    "cut_rebootstrap_required",
+                    "retained history identity changed; start a full lineage",
+                ));
+            }
+            match serde_json::from_value::<HistoryObject>(value).map_err(transient)? {
+                HistoryObject::Compartment(row) => rows.push(row),
+                HistoryObject::Branch(left, right) => {
+                    pending.push(right);
+                    pending.push(left);
+                }
+            }
+        }
+        if rows.len() != history.count {
+            return Err(error(
+                "cut_rebootstrap_required",
+                "retained history is incomplete; start a full lineage",
+            ));
+        }
+        Ok(rows)
+    }
+
+    pub(super) fn history_root(&self) -> Option<&str> {
+        self.recovery_history_ref.as_ref()?.root.as_deref()
+    }
+
     pub(super) fn summary_end(&self) -> Option<u64> {
         self.recovery_history
             .iter()
@@ -287,6 +435,11 @@ impl CutSeed {
                     .head
                     .as_ref()
                     .and_then(|head| head.meta.coverage_ordinal),
+            )
+            .chain(
+                self.recovery_history_ref
+                    .as_ref()
+                    .and_then(|history| history.summary_end),
             )
             .max()
     }
@@ -332,6 +485,8 @@ impl CutSeed {
             max_tag: 0,
             todo: None,
             recovery_history: Vec::new(),
+            recovery_history_ref: None,
+            pending_history_objects: BTreeMap::new(),
             historian_prelude: None,
             window: CutWindow::default(),
         }
@@ -424,6 +579,18 @@ impl CutSeed {
                     .sum()
             })
             + self.pre_cut_tags.len() * 16
+            + self.recovery_history_ref.as_ref().map_or(0, |history| {
+                history.root.as_ref().map_or(0, String::len)
+                    + history
+                        .identity
+                        .as_ref()
+                        .map_or(0, |identity| identity.0.len())
+            })
+            + self
+                .pending_history_objects
+                .iter()
+                .map(|(key, value)| key.len() + value.len() + 64)
+                .sum::<usize>()
             + self
                 .signature_prefix
                 .as_ref()
@@ -494,6 +661,88 @@ fn user_turns(
 }
 
 impl AsyncRecord {
+    /// Reclaim superseded history after publication, never during an ordinary
+    /// record load. Only branch payloads are read; compartment bodies stay cold.
+    pub(super) fn gc_cut_history(&mut self, store: &McStore) -> Result<(), HandlerOutcome> {
+        let reference = self.reference();
+        let (roots, objects) = store
+            .async_cut_history_index(&reference)
+            .map_err(transient)?;
+        let expected_roots = roots.clone();
+        let objects = objects.into_iter().collect::<HashSet<_>>();
+        let mut pending = Vec::new();
+        for root in roots {
+            if let Some(root) = serde_json::from_str::<Option<String>>(&root).map_err(transient)? {
+                pending.push(root);
+            }
+        }
+        if let Some(root) = self.cut_seed.as_ref().and_then(|seed| seed.history_root()) {
+            pending.push(root.to_owned());
+        }
+        let mut live = HashSet::new();
+        while let Some(id) = pending.pop() {
+            let slot = format!("cut-history:{id}");
+            if !live.insert(slot.clone()) {
+                continue;
+            }
+            if !objects.contains(&slot) {
+                return Err(error(
+                    "cut_rebootstrap_required",
+                    "retained history has a missing object",
+                ));
+            }
+            if id.starts_with("c:") {
+                continue;
+            }
+            if !id.starts_with("b:") {
+                return Err(error(
+                    "cut_rebootstrap_required",
+                    "retained history has an invalid object identity",
+                ));
+            }
+            let raw = store
+                .load_async_compaction_baseline(&reference, &slot)
+                .map_err(transient)?
+                .ok_or_else(|| {
+                    error(
+                        "cut_rebootstrap_required",
+                        "retained history branch is missing",
+                    )
+                })?;
+            let value: Value = serde_json::from_str(&raw).map_err(transient)?;
+            if contract::digest::content_digest(&value) != id.rsplit(':').next().unwrap_or_default()
+            {
+                return Err(error(
+                    "cut_rebootstrap_required",
+                    "retained history branch identity changed",
+                ));
+            }
+            match serde_json::from_value::<HistoryObject>(value).map_err(transient)? {
+                HistoryObject::Branch(left, right) => {
+                    pending.push(left);
+                    pending.push(right);
+                }
+                HistoryObject::Compartment(_) => {
+                    return Err(error(
+                        "cut_rebootstrap_required",
+                        "retained history branch is not a branch",
+                    ))
+                }
+            }
+        }
+        let garbage = objects.difference(&live).cloned().collect::<Vec<_>>();
+        if !garbage.is_empty() {
+            if !store
+                .discard_async_cut_history_objects(&reference, &garbage, &expected_roots)
+                .map_err(transient)?
+            {
+                return Ok(());
+            }
+        }
+        self.cut_history_gc_pending = false;
+        Ok(())
+    }
+
     /// The ordinal the next transcript read starts at: the newest held entry
     /// (read again to check the overlap), or the first ordinal of the
     /// lineage when nothing is held. A lineage that begins at a cut is never
@@ -1038,9 +1287,11 @@ impl AsyncRecord {
         if summary_end.is_none_or(|end| end > cut) {
             return Ok(Err(CaptureRefusal::SummaryBeyondCut));
         }
-        Ok(Ok(CutSeed {
+        let mut seed = CutSeed {
             historian_prelude: Some(historian_prelude),
-            recovery_history: compartments.clone(),
+            recovery_history: Vec::new(),
+            recovery_history_ref: None,
+            pending_history_objects: BTreeMap::new(),
             window,
             first_ordinal: first,
             lineage_from,
@@ -1092,7 +1343,15 @@ impl AsyncRecord {
             pre_cut_tags,
             max_tag,
             todo,
-        }))
+        };
+        seed.set_recovery_history(
+            compartments,
+            store
+                .compartment_history_identity(&self.namespace())
+                .map_err(transient)?,
+            summary_end,
+        )?;
+        Ok(Ok(seed))
     }
 }
 
@@ -1148,9 +1407,15 @@ impl AsyncRecord {
             ));
         }
         if seed.summary_end().is_none() && start == CutStart::Fresh {
-            seed.recovery_history = store
-                .load_compartments(&self.namespace())
-                .map_err(transient)?;
+            seed.set_recovery_history(
+                store
+                    .load_compartments(&self.namespace())
+                    .map_err(transient)?,
+                store
+                    .compartment_history_identity(&self.namespace())
+                    .map_err(transient)?,
+                None,
+            )?;
         }
         if !seed.boundary_safe() {
             return Err(error(
@@ -1181,6 +1446,9 @@ impl AsyncRecord {
             .as_deref()
             .map(|lineage| seed.todo_scan(lineage));
         self.cut_first_ordinal = Some(seed.first_ordinal);
+        // Adoption consumed the cached window. Ordinary restarts need only
+        // prefix facts and the immutable history reference, not another cache.
+        seed.window = CutWindow::default();
         self.cut_seed = Some(Arc::new(seed));
         self.aggregates = self.base_aggregates();
         self.journal.cut_seed_dirty = true;
@@ -1320,7 +1588,11 @@ impl AsyncRecord {
     /// Begin a lineage that descends from a cut this conversation published:
     /// adopt the namespace's folded head and the record's cadence state as
     /// they stand, with the window's state, so nothing is rebuilt.
-    fn adopt_folded_head(&mut self, store: &McStore, seed: CutSeed) -> Result<(), HandlerOutcome> {
+    fn adopt_folded_head(
+        &mut self,
+        store: &McStore,
+        mut seed: CutSeed,
+    ) -> Result<(), HandlerOutcome> {
         let first = seed.first_ordinal;
         let head = seed
             .window
@@ -1431,6 +1703,7 @@ impl AsyncRecord {
             .as_deref()
             .map(|lineage| seed.todo_scan(lineage));
         self.cut_first_ordinal = Some(first);
+        seed.window = CutWindow::default();
         self.cut_seed = Some(Arc::new(seed));
         self.aggregates = self.base_aggregates();
         self.journal.cut_seed_dirty = true;
@@ -1445,7 +1718,7 @@ impl AsyncRecord {
     pub(super) fn prune_below_cut(
         &mut self,
         store: &McStore,
-        seed: CutSeed,
+        mut seed: CutSeed,
     ) -> Result<Result<(), PruneRefusal>, HandlerOutcome> {
         let first = seed.first_ordinal;
         let base = self.cut_seed.as_ref().map_or(0, |held| held.first_ordinal);
@@ -1533,6 +1806,7 @@ impl AsyncRecord {
         self.journal.truncate_below = Some(first);
         self.journal.persisted_through = self.entries.last_key_value().map(|(n, _)| *n);
         self.cut_first_ordinal = Some(first);
+        seed.window = CutWindow::default();
         self.cut_seed = Some(Arc::new(seed));
         self.journal.cut_seed_dirty = true;
         self.save(store, &[])?;

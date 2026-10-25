@@ -8,7 +8,8 @@ pub(super) struct PublishedCut {
     #[serde(default)]
     pub(super) covered_through: Option<u64>,
     pub(super) generation: u64,
-    head: String,
+    #[serde(default)]
+    pub(super) head: String,
     #[serde(default)]
     parent_namespace: String,
     #[serde(default)]
@@ -47,6 +48,44 @@ pub(super) fn split_head_at(ranges: &mut Vec<view::ViewRange>, first: u64) {
 }
 
 impl AsyncRecord {
+    pub(super) fn published_cut(
+        &self,
+        store: &McStore,
+        first: u64,
+    ) -> Result<Option<PublishedCut>, HandlerOutcome> {
+        if let Some(cut) = self.published_cuts.get(&first) {
+            return Ok(Some(cut.clone()));
+        }
+        store
+            .load_async_compaction_baseline(
+                &self.reference(),
+                &format!("published-cut-meta:{first}"),
+            )
+            .map_err(transient)?
+            .map(|raw| serde_json::from_str(&raw).map_err(transient))
+            .transpose()
+    }
+
+    fn trim_published_cut_cache(&mut self) {
+        while self.published_cuts.len() > 4 {
+            let first = *self
+                .published_cuts
+                .iter()
+                .min_by_key(|(_, cut)| cut.version)
+                .unwrap()
+                .0;
+            let old = self.published_cuts.remove(&first).unwrap();
+            // The immutable seed and history remain durable undo targets; only
+            // the disposable namespace and in-record cache entry are evicted.
+            self.retired_cut_stages.push(format!(
+                "{}:async:{}",
+                self.key.engine_key(),
+                old.generation
+            ));
+            self.pending_cut_metadata.insert(first, old);
+        }
+    }
+
     pub(super) fn next_generation(&self) -> Result<u64, HandlerOutcome> {
         self.published_cuts
             .values()
@@ -174,10 +213,9 @@ impl AsyncRecord {
         // a fork. The staged history is the last independent source for the
         // unreadable prefix; window messages are replayed from held rows.
         let mut restored = seed
-            .recovery_history
-            .iter()
+            .recovery_compartments(store, &self.reference())?
+            .into_iter()
             .filter(|c| through.is_none_or(|end| c.end_message <= end as i64))
-            .cloned()
             .collect::<Vec<_>>();
         let end = restored.iter().map(|c| c.end_message).max().unwrap_or(-1);
         restored.extend(history.iter().filter(|c| c.start_message > end).cloned());
@@ -357,15 +395,15 @@ impl AsyncRecord {
                 .adopt_namespace_head(&namespace, head)
                 .map_err(transient)?;
         }
-        let compartments = store
-            .load_compartments(&self.namespace())
-            .map_err(transient)?;
-        store
-            .replace_compartments(&namespace, &compartments)
-            .map_err(transient)?;
-        store
-            .adopt_compartment_history_identity(&self.namespace(), &namespace)
-            .map_err(transient)?;
+        if let Some(identity) = seed
+            .recovery_history_ref
+            .as_ref()
+            .and_then(|history| history.identity.as_ref())
+        {
+            store
+                .set_compartment_history_identity(&namespace, identity)
+                .map_err(transient)?;
+        }
         let tags = tag_rows_for(self.entries.range(first..).map(|(_, entry)| entry), codec)?;
         let record = serde_json::to_string(&*self).map_err(transient)?;
         let reference = self.reference();
@@ -377,31 +415,33 @@ impl AsyncRecord {
         if CRASH_AFTER_STAGE.with(|flag| flag.get()) {
             std::process::abort();
         }
-        let superseded = self.published_cuts.insert(
-            first,
-            PublishedCut {
-                lineage: view.lineage_id.clone(),
-                version: view.view_version,
-                covered_through: seed.summary_end(),
-                generation,
-                head: serde_json::to_string(&head).map_err(transient)?,
-                parent_namespace: self.namespace(),
-                parent_revision: store
-                    .compartment_source_revision(&self.namespace())
-                    .map_err(transient)?,
-                tag_high_water: store
-                    .tag_cache_summary(&self.namespace())
-                    .map_err(transient)?
-                    .max_tag_number,
-            },
-        );
+        let superseded = self.published_cut(store, first)?;
+        let published = PublishedCut {
+            lineage: view.lineage_id.clone(),
+            version: view.view_version,
+            covered_through: seed.summary_end(),
+            generation,
+            head: serde_json::to_string(&head).map_err(transient)?,
+            parent_namespace: self.namespace(),
+            parent_revision: store
+                .compartment_source_revision(&self.namespace())
+                .map_err(transient)?,
+            tag_high_water: store
+                .tag_cache_summary(&self.namespace())
+                .map_err(transient)?
+                .max_tag_number,
+        };
+        self.pending_cut_metadata.insert(first, published.clone());
+        self.published_cuts.insert(first, published);
         if let Some(old) = superseded {
+            self.cut_history_gc_pending = true;
             self.retired_cut_stages.push(format!(
                 "{}:async:{}",
                 self.key.engine_key(),
                 old.generation
             ));
         }
+        self.trim_published_cut_cache();
         self.pending_cut_seeds.insert(first, seed);
         #[cfg(test)]
         measurements::staged(store);
@@ -532,21 +572,31 @@ impl McHandler {
         let Some(first) = descends.through_ordinal.checked_add(1) else {
             return unknown();
         };
-        let Some(cut) = state
-            .published_cuts
-            .get(&first)
-            .filter(|cut| cut.lineage == descends.lineage_id)
-            .cloned()
-        else {
-            return unknown();
-        };
-        let Some(raw) = store
-            .load_async_compaction_baseline(&state.reference(), &format!("published-cut:{first}"))
+        let Some(bundle) = store
+            .load_async_cut_bundle(&state.reference(), first)
             .map_err(transient)?
         else {
             return unknown();
         };
-        let mut seed: cut_seed::CutSeed = serde_json::from_str(&raw).map_err(transient)?;
+        let mut seed: cut_seed::CutSeed = serde_json::from_str(&bundle.seed).map_err(transient)?;
+        // Legacy seeds kept descriptors inline. Archived seeds require their
+        // descriptor and payload to come from the same reader snapshot.
+        let cut = bundle
+            .metadata
+            .as_ref()
+            .map(|raw| serde_json::from_str::<PublishedCut>(raw).map_err(transient))
+            .transpose()?
+            .or_else(|| {
+                if seed.recovery_history_ref.is_none() {
+                    state.published_cuts.get(&first).cloned()
+                } else {
+                    None
+                }
+            });
+        let Some(cut) = cut.filter(|cut| cut.lineage == descends.lineage_id) else {
+            return unknown();
+        };
+        seed.pending_history_objects.extend(bundle.history_objects);
         if !seed.boundary_safe() {
             return bytes(&compact::setup::SetupAnswer::refuse(
                 &request.request_id,
@@ -554,7 +604,9 @@ impl McHandler {
                 "The stored head depends on rows outside its cut. Set up a fresh full lineage.",
             ));
         }
-        if state.lineage.as_deref() == Some(cut.lineage.as_str()) {
+        let current_parent_cut = state.lineage.as_deref() == Some(cut.lineage.as_str())
+            && state.published_cuts.values().map(|cut| cut.version).max() == Some(cut.version);
+        if current_parent_cut {
             // The current parent may have read more of this same live window
             // since staging. Reuse that observed cache, with matching tags,
             // without asking the runner; an older-cut undo uses its snapshot.
@@ -609,14 +661,27 @@ impl McHandler {
         state.journal.truncate_below = Some(first);
         let namespace = state.namespace();
         store
-            .replace_compartments(&namespace, &seed.recovery_history)
-            .map_err(transient)?;
-        store
-            .adopt_compartment_history_identity(
-                &format!("{}:async:{}", state.key.engine_key(), cut.generation),
+            .replace_compartments(
                 &namespace,
+                &seed.recovery_compartments(store, &state.reference())?,
             )
             .map_err(transient)?;
+        if let Some(identity) = seed
+            .recovery_history_ref
+            .as_ref()
+            .and_then(|history| history.identity.as_ref())
+        {
+            store
+                .set_compartment_history_identity(&namespace, identity)
+                .map_err(transient)?;
+        } else {
+            store
+                .adopt_compartment_history_identity(
+                    &format!("{}:async:{}", state.key.engine_key(), cut.generation),
+                    &namespace,
+                )
+                .map_err(transient)?;
+        }
         state.begin_at_cut(store, seed, cut_seed::CutStart::Descending)?;
         let mut engine = state.engine_with_baselines()?;
         for view in [&mut engine.last_produced, &mut engine.last_applied]
@@ -636,8 +701,8 @@ impl McHandler {
         state.setup.descends_from = request.descends_from.clone();
         // The initial answer is the published cut's exact head. A historian
         // completion on the parent after staging is folded only by a later view.
-        state.pending_parent_history =
-            (!cut.parent_namespace.is_empty()).then_some(ParentHistory {
+        state.pending_parent_history = (current_parent_cut && !cut.parent_namespace.is_empty())
+            .then_some(ParentHistory {
                 namespace: cut.parent_namespace.clone(),
                 revision: cut.parent_revision.clone(),
             });
@@ -836,12 +901,14 @@ impl McHandler {
             // cut the runner still holds. Only a matching published cut can
             // certify the unreadable prefix in the new namespace.
             let retained = store
-                .load_async_compaction_baseline(
-                    &state.reference(),
-                    &format!("published-cut:{first}"),
-                )
+                .load_async_cut_bundle(&state.reference(), first)
                 .map_err(transient)?
-                .map(|raw| serde_json::from_str::<cut_seed::CutSeed>(&raw).map_err(transient))
+                .map(|bundle| {
+                    let mut seed = serde_json::from_str::<cut_seed::CutSeed>(&bundle.seed)
+                        .map_err(transient)?;
+                    seed.pending_history_objects.extend(bundle.history_objects);
+                    Ok::<_, HandlerOutcome>(seed)
+                })
                 .transpose()?
                 .filter(|saved| {
                     saved.first_ordinal == first
@@ -849,15 +916,14 @@ impl McHandler {
                         && saved.cut_digest == seed.cut_digest
                         && saved.boundary_safe()
                 });
-            let Some(retained) = retained else {
+            let Some(mut retained) = retained else {
                 return Err(error("cut_rebootstrap_required",
                     "the runner's cut is not retained; start a full lineage or restore a published cut"));
             };
             compartments = retained
-                .recovery_history
-                .iter()
+                .recovery_compartments(store, &state.reference())?
+                .into_iter()
                 .filter(|row| row.end_message < first as i64)
-                .cloned()
                 .collect();
             let mut restored_through = 0i64;
             let mut ordered = compartments.iter().collect::<Vec<_>>();
@@ -876,16 +942,28 @@ impl McHandler {
             store
                 .replace_compartments(&state.namespace(), &compartments)
                 .map_err(transient)?;
+            // The fork keeps the certified prefix facts but discards the
+            // parent's live window; replay and revalidate those source rows.
+            retained.window = cut_seed::CutWindow::default();
+            seed = retained;
         }
-        seed.recovery_history = compartments.clone();
-        if let Some(last) = compartments
-            .iter()
-            .filter(|c| c.end_message < first as i64)
-            .max_by_key(|c| c.sequence)
-        {
-            seed.compartment_seq = last.sequence;
-            seed.boundary_id = last.end_message_id.clone();
+        if seed.boundary_id.is_empty() {
+            if let Some(last) = compartments
+                .iter()
+                .filter(|c| c.end_message < first as i64)
+                .max_by_key(|c| c.sequence)
+            {
+                seed.compartment_seq = last.sequence;
+                seed.boundary_id = last.end_message_id.clone();
+            }
         }
+        seed.set_recovery_history(
+            compartments,
+            store
+                .compartment_history_identity(&state.namespace())
+                .map_err(transient)?,
+            None,
+        )?;
         state.begin_at_cut(store, seed, cut_seed::CutStart::Fresh)?;
         state.initial["initial"]["range"] = json!({"from":first,"to":first});
         Ok(())

@@ -39,10 +39,15 @@ fn host_floor(
         .unwrap();
     pair.cut_checkpoints
         .retain(|first| first.saturating_sub(1) <= through);
-    let selected = pair
-        .cut_checkpoints
-        .last()
-        .map(|first| (*first, state.published_cuts[first].clone()));
+    let selected = pair.cut_checkpoints.last().map(|first| {
+        (
+            *first,
+            state
+                .published_cut(pair.resident.store(), *first)
+                .unwrap()
+                .unwrap(),
+        )
+    });
     let head = selected
         .as_ref()
         .map(|(first, _)| cut_head(pair, lineage, *first));
@@ -439,6 +444,12 @@ async fn unseen_fork_proof(extra: u64, fault: &str) {
         assert_eq!(reset.cut_first_ordinal, Some(first));
         assert_eq!(reset.lineage_first_ordinal, first);
         assert!(!reset.failed());
+        let before = state.cut_seed.as_ref().unwrap();
+        let after = reset.cut_seed.as_ref().unwrap();
+        assert_eq!(
+            (after.max_tag, after.real_users, after.covered_user_turns),
+            (before.max_tag, before.real_users, before.covered_user_turns)
+        );
     }
 }
 

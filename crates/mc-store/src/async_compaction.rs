@@ -89,7 +89,107 @@ macro_rules! metered {
     }};
 }
 
+fn cut_history_roots(
+    conn: &rusqlite::Connection,
+    reference: &str,
+) -> rusqlite::Result<Vec<String>> {
+    let mut roots = conn.prepare("SELECT view_json FROM mc_async_compaction_baselines WHERE session_ref=?1 AND slot GLOB 'published-cut-root:*'
+        UNION ALL SELECT CASE WHEN json_valid(view_json) THEN json_quote(json_extract(view_json,'$.recovery_history_ref.root')) ELSE 'null' END
+        FROM mc_async_compaction_baselines WHERE session_ref=?1 AND slot GLOB 'cut:*'")?
+        .query_map([reference], |row| row.get(0))?.collect::<rusqlite::Result<Vec<String>>>()?;
+    roots.sort();
+    Ok(roots)
+}
+
+// Decode only the root pointer, without allocating the archived window fields.
+#[derive(serde::Deserialize)]
+struct CutArchiveRoot {
+    #[serde(default)]
+    recovery_history_ref: Option<CutArchiveRootId>,
+}
+
+#[derive(serde::Deserialize)]
+struct CutArchiveRootId {
+    root: Option<String>,
+}
+
+fn cut_history_objects(
+    conn: &rusqlite::Connection,
+    reference: &str,
+    root: Option<&str>,
+) -> rusqlite::Result<Option<Vec<(String, String)>>> {
+    let mut pending = root
+        .into_iter()
+        .map(|id| format!("cut-history:{id}"))
+        .collect::<Vec<_>>();
+    let mut seen = std::collections::BTreeSet::new();
+    let mut objects = Vec::new();
+    while let Some(slot) = pending.pop() {
+        if !seen.insert(slot.clone()) {
+            continue;
+        }
+        let Some(raw) = conn.query_row("SELECT view_json FROM mc_async_compaction_baselines WHERE session_ref=?1 AND slot=?2",
+            params![reference,slot], |row| row.get::<_, String>(0)).optional()? else { return Ok(None) };
+        if slot.starts_with("cut-history:b:") {
+            if let Ok(value) = serde_json::from_str::<serde_json::Value>(&raw) {
+                if let Some(children) = value.get("Branch").and_then(|value| value.as_array()) {
+                    for id in children.iter().filter_map(|value| value.as_str()) {
+                        pending.push(format!("cut-history:{id}"));
+                    }
+                }
+            }
+        }
+        objects.push((slot, raw));
+    }
+    Ok(Some(objects))
+}
+
 impl McStore {
+    /// Read a selected target and its immutable history in one snapshot. A
+    /// concurrent supersession cannot reclaim nodes between these reads.
+    pub fn load_async_cut_bundle(
+        &self,
+        reference: &str,
+        first: u64,
+    ) -> Result<Option<AsyncCutBundle>, McStoreError> {
+        self.inner.with_read(|conn| {
+            let snapshot = if conn.is_autocommit() { Some(conn.unchecked_transaction()?) } else { None };
+            let seed = conn.query_row("SELECT view_json FROM mc_async_compaction_baselines WHERE session_ref=?1 AND slot=?2",
+                params![reference,format!("published-cut:{first}")], |row| row.get::<_, String>(0)).optional()?;
+            let Some(seed) = seed else { return Ok(None) };
+            let metadata = conn.query_row("SELECT view_json FROM mc_async_compaction_baselines WHERE session_ref=?1 AND slot=?2",
+                params![reference,format!("published-cut-meta:{first}")], |row| row.get(0)).optional()?;
+            let root = serde_json::from_str::<CutArchiveRoot>(&seed).ok()
+                .and_then(|value| value.recovery_history_ref).and_then(|value| value.root);
+            let Some(history_objects) = cut_history_objects(conn, reference, root.as_deref())? else { return Ok(None) };
+            if let Some(snapshot) = snapshot { snapshot.commit()?; }
+            Ok(Some(AsyncCutBundle { metadata, seed, history_objects }))
+        }).map_err(Into::into)
+    }
+
+    /// Recovery of active cut facts needs only the selected immutable graph,
+    /// also under a reader snapshot rather than one transaction per object.
+    pub fn load_async_cut_history_objects(
+        &self,
+        reference: &str,
+        root: Option<&str>,
+    ) -> Result<Option<Vec<(String, String)>>, McStoreError> {
+        self.inner
+            .with_read(|conn| {
+                let snapshot = if conn.is_autocommit() {
+                    Some(conn.unchecked_transaction()?)
+                } else {
+                    None
+                };
+                let objects = cut_history_objects(conn, reference, root)?;
+                if let Some(snapshot) = snapshot {
+                    snapshot.commit()?;
+                }
+                Ok(objects)
+            })
+            .map_err(Into::into)
+    }
+
     /// Read one kept baseline without hydrating the session's transcript.
     pub fn load_async_compaction_baseline(
         &self,
@@ -306,13 +406,49 @@ impl McStore {
             truncate_below: None,
             entries: Vec::new(),
             baselines: Vec::new(),
+            immutable_baselines: Vec::new(),
+            active_cut_slot: None,
             clear_engine_views: false,
             retain_views_from: None,
         }
     }
 
-    /// Everything needed to rebuild a held conversation, read in one snapshot
-    /// from a reader connection so a long transcript never holds the writer.
+    /// Small root references and object names for publication-time archive GC.
+    /// This index never reads archived seed or compartment payloads.
+    pub fn async_cut_history_index(
+        &self,
+        reference: &str,
+    ) -> Result<(Vec<String>, Vec<String>), McStoreError> {
+        self.inner.with_read(|conn| {
+            let roots = cut_history_roots(conn, reference)?;
+            let objects = conn.prepare("SELECT slot FROM mc_async_compaction_baselines WHERE session_ref=?1 AND slot GLOB 'cut-history:*'")?
+                .query_map([reference], |row| row.get(0))?.collect::<rusqlite::Result<_>>()?;
+            Ok((roots, objects))
+        }).map_err(Into::into)
+    }
+
+    /// Reclaim only archive objects whose roots have already been replaced
+    /// durably. The caller completes reachability marking before any deletion.
+    /// Return false if a root changed under the writer fence, leaving all
+    /// objects intact so a later publication can retry with the new roots.
+    pub fn discard_async_cut_history_objects(
+        &self,
+        reference: &str,
+        slots: &[String],
+        expected_roots: &[String],
+    ) -> Result<bool, McStoreError> {
+        metered!(reference, self.inner.with_conn_fenced(held(|conn| {
+            if cut_history_roots(conn, reference)? != expected_roots { return Ok((false, 0, 0)); }
+            let mut rows = 0;
+            let mut delete = conn.prepare_cached("DELETE FROM mc_async_compaction_baselines WHERE session_ref=?1 AND slot=?2 AND slot GLOB 'cut-history:*'")?;
+            for slot in slots { rows += delete.execute(params![reference, slot])? as u64; }
+            Ok((true, rows, 0))
+        }))).map_err(Into::into)
+    }
+
+    /// Hot record, entries and engine baselines in one reader snapshot, so a
+    /// long transcript never holds the writer. Cold cut/undo archives are
+    /// excluded and fetched by identity only when recovery selects them.
     pub fn load_async_compaction_rows(
         &self,
         session_ref: &str,
@@ -338,7 +474,7 @@ impl McStore {
                     .query_map([session_ref], |row| Ok((row.get(0)?, row.get(1)?)))?
                     .collect::<rusqlite::Result<_>>()?;
                 let baselines = conn
-                    .prepare("SELECT slot,view_json FROM mc_async_compaction_baselines WHERE session_ref=?1 AND slot NOT GLOB 'undo-native-edits:*'")?
+                    .prepare("SELECT slot,view_json FROM mc_async_compaction_baselines WHERE session_ref=?1 AND slot NOT GLOB 'undo-native-edits:*' AND slot NOT GLOB 'published-cut:*' AND slot NOT GLOB 'published-cut-meta:*' AND slot NOT GLOB 'published-cut-root:*' AND slot NOT GLOB 'cut-history:*' AND slot NOT GLOB 'cut:*'")?
                     .query_map([session_ref], |row| Ok((row.get(0)?, row.get(1)?)))?
                     .collect::<rusqlite::Result<_>>()?;
                 Ok(Some(AsyncCompactionRows {
@@ -538,7 +674,15 @@ impl McStore {
     }
 }
 
-/// The stored rows of one async conversation, as read by
+/// A selected cut's descriptor, full seed and immutable history, owned by the
+/// caller after the reader snapshot ends and old archive nodes may be reclaimed.
+pub struct AsyncCutBundle {
+    pub metadata: Option<String>,
+    pub seed: String,
+    pub history_objects: Vec<(String, String)>,
+}
+
+/// The hot rows of one async conversation, as read by
 /// [`McStore::load_async_compaction_rows`].
 pub struct AsyncCompactionRows {
     pub state: String,
@@ -547,7 +691,8 @@ pub struct AsyncCompactionRows {
     /// `(version, engine_json)` for published views still usable as an
     /// engine baseline, in version order.
     pub engine_views: Vec<(u64, String)>,
-    /// `(slot, view_json)` for baselines stored outside the published views.
+    /// `(slot, view_json)` for hot baselines outside the published views.
+    /// Cut facts and cold cut/history/undo archives use named point reads.
     pub baselines: Vec<(String, String)>,
 }
 
@@ -565,6 +710,8 @@ pub struct AsyncCompactionSave<'a> {
     truncate_below: Option<u64>,
     entries: Vec<(u64, String, String)>,
     baselines: Vec<(String, Option<String>)>,
+    immutable_baselines: Vec<(String, String)>,
+    active_cut_slot: Option<Option<String>>,
     clear_engine_views: bool,
     retain_views_from: Option<u64>,
 }
@@ -622,6 +769,20 @@ impl<'a> AsyncCompactionSave<'a> {
         self
     }
 
+    /// Store an immutable, identity-addressed archive object only once. Reusing
+    /// an existing identity writes neither its payload nor another WAL copy.
+    pub fn immutable_baseline(&mut self, slot: impl Into<String>, value: String) -> &mut Self {
+        self.immutable_baselines.push((slot.into(), value));
+        self
+    }
+
+    /// Active cut facts are a cache, not retained undo targets. Keep at most
+    /// the current facts row; immutable published seeds have separate slots.
+    pub fn retain_cut_facts(&mut self, first: Option<u64>) -> &mut Self {
+        self.active_cut_slot = Some(first.map(|first| format!("cut:{first}")));
+        self
+    }
+
     /// Forget every published view's engine form; their immutable runner
     /// views stay retrievable.
     pub fn clear_engine_views(&mut self) -> &mut Self {
@@ -650,6 +811,8 @@ impl<'a> AsyncCompactionSave<'a> {
             truncate_below,
             ref entries,
             ref baselines,
+            ref immutable_baselines,
+            ref active_cut_slot,
             clear_engine_views,
             retain_views_from,
         } = *self;
@@ -658,6 +821,10 @@ impl<'a> AsyncCompactionSave<'a> {
                 ON CONFLICT(session_ref) DO UPDATE SET state_json=excluded.state_json",
                 params![session_ref,key,session,state])? as u64;
             let mut bytes = state.len();
+            if let Some(active) = active_cut_slot {
+                rows += conn.execute("DELETE FROM mc_async_compaction_baselines WHERE session_ref=?1 AND slot GLOB 'cut:*' AND (?2 IS NULL OR slot<>?2)",
+                    params![session_ref, active])? as u64;
+            }
             if let Some(through) = truncate_entries {
                 rows += conn.execute(
                     "DELETE FROM mc_async_compaction_entries WHERE session_ref=?1 AND ordinal>?2",
@@ -676,6 +843,14 @@ impl<'a> AsyncCompactionSave<'a> {
                     rows += insert.execute(params![session_ref, session, ordinal, entry, index])? as u64;
                     bytes += entry.len() + index.len();
                 }
+            }
+            for (slot, value) in immutable_baselines {
+                let inserted = conn.execute(
+                    "INSERT OR IGNORE INTO mc_async_compaction_baselines(session_ref,session,slot,view_json) VALUES(?1,?2,?3,?4)",
+                    params![session_ref, session, slot, value],
+                )? as u64;
+                rows += inserted;
+                if inserted != 0 { bytes += value.len(); }
             }
             for (slot, view) in baselines {
                 rows += match view {
@@ -753,6 +928,154 @@ mod tests {
             vec!["archived"]
         );
         assert!(store.load_async_undo_edits("another").unwrap().is_empty());
+    }
+
+    #[test]
+    fn cut_archives_are_point_loaded_and_shared_objects_are_immutable() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = McStore::open(&StorageDescriptor {
+            module_id: "magic-context".into(),
+            storage_namespace: "mc_cache".into(),
+            isolation: Isolation::Module,
+            backend: StorageBackend::Sqlite {
+                path: dir.path().join("store.db").to_string_lossy().into_owned(),
+            },
+        })
+        .unwrap();
+        let mut save = store.async_compaction_save("ref", "key", "session", "{}");
+        save.baseline("frozen_edits", Some("live".into()));
+        for slot in [
+            "cut:100",
+            "published-cut:100",
+            "published-cut-meta:100",
+            "published-cut-root:100",
+            "undo-native-edits:mid:m1",
+        ] {
+            save.baseline(slot, Some("lazy".into()));
+        }
+        save.immutable_baseline("cut-history:identity", "original".into());
+        save.commit().unwrap();
+        let mut save = store.async_compaction_save("ref", "key", "session", "{}");
+        save.immutable_baseline("cut-history:identity", "replacement".into());
+        save.commit().unwrap();
+        assert_eq!(
+            store
+                .load_async_compaction_rows("ref")
+                .unwrap()
+                .unwrap()
+                .baselines,
+            vec![("frozen_edits".into(), "live".into())]
+        );
+        assert_eq!(
+            store
+                .load_async_compaction_baseline("ref", "cut-history:identity")
+                .unwrap()
+                .as_deref(),
+            Some("original")
+        );
+        assert_eq!(
+            store
+                .load_async_compaction_baseline("ref", "published-cut:100")
+                .unwrap()
+                .as_deref(),
+            Some("lazy")
+        );
+        assert_eq!(
+            store
+                .load_async_compaction_baseline("ref", "cut:100")
+                .unwrap()
+                .as_deref(),
+            Some("lazy")
+        );
+        let mut save = store.async_compaction_save("ref", "key", "session", "{}");
+        save.baseline("cut:200", Some("current".into()));
+        save.retain_cut_facts(Some(200));
+        save.commit().unwrap();
+        assert!(store
+            .load_async_compaction_baseline("ref", "cut:100")
+            .unwrap()
+            .is_none());
+        assert_eq!(
+            store
+                .load_async_compaction_baseline("ref", "cut:200")
+                .unwrap()
+                .as_deref(),
+            Some("current")
+        );
+        let mut save = store.async_compaction_save("ref", "key", "session", "{}");
+        save.retain_cut_facts(None);
+        save.commit().unwrap();
+        assert!(store
+            .load_async_compaction_baseline("ref", "cut:200")
+            .unwrap()
+            .is_none());
+    }
+
+    #[test]
+    fn cut_history_snapshots_own_payloads_and_gc_rechecks_roots() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = McStore::open(&StorageDescriptor {
+            module_id: "magic-context".into(),
+            storage_namespace: "mc_cache".into(),
+            isolation: Isolation::Module,
+            backend: StorageBackend::Sqlite {
+                path: dir.path().join("store.db").to_string_lossy().into_owned(),
+            },
+        })
+        .unwrap();
+        let mut save = store.async_compaction_save("ref", "key", "session", "{}");
+        save.baseline("published-cut-meta:100", Some(r#"{"version":1}"#.into()));
+        save.baseline(
+            "published-cut:100",
+            Some(r#"{"recovery_history_ref":{"root":"c:old"},"marker":"old"}"#.into()),
+        );
+        save.baseline("published-cut-root:100", Some(r#""c:old""#.into()));
+        save.immutable_baseline(
+            "cut-history:c:old",
+            r#"{"Compartment":{"content":"old"}}"#.into(),
+        );
+        save.commit().unwrap();
+        let selected = store.load_async_cut_bundle("ref", 100).unwrap().unwrap();
+        assert_eq!(selected.metadata.as_deref(), Some(r#"{"version":1}"#));
+        assert_eq!(selected.history_objects.len(), 1);
+        let (roots, objects) = store.async_cut_history_index("ref").unwrap();
+        assert_eq!(roots, vec![r#""c:old""#.to_owned()]);
+        assert_eq!(objects, vec!["cut-history:c:old".to_owned()]);
+        let mut save = store.async_compaction_save("ref", "key", "session", "{}");
+        save.baseline("published-cut-meta:100", Some(r#"{"version":2}"#.into()));
+        save.baseline(
+            "published-cut:100",
+            Some(r#"{"recovery_history_ref":{"root":"c:new"},"marker":"new"}"#.into()),
+        );
+        save.baseline("published-cut-root:100", Some(r#""c:new""#.into()));
+        save.immutable_baseline(
+            "cut-history:c:new",
+            r#"{"Compartment":{"content":"new"}}"#.into(),
+        );
+        save.commit().unwrap();
+        assert!(!store
+            .discard_async_cut_history_objects("ref", &objects, &roots)
+            .unwrap());
+        assert!(store
+            .load_async_compaction_baseline("ref", "cut-history:c:old")
+            .unwrap()
+            .is_some());
+        let (current_roots, _) = store.async_cut_history_index("ref").unwrap();
+        assert!(store
+            .discard_async_cut_history_objects("ref", &objects, &current_roots)
+            .unwrap());
+        assert!(store
+            .load_async_compaction_baseline("ref", "cut-history:c:old")
+            .unwrap()
+            .is_none());
+        assert!(selected.seed.contains(r#""marker":"old""#));
+        assert_eq!(
+            selected.history_objects[0].1,
+            r#"{"Compartment":{"content":"old"}}"#
+        );
+        let latest = store.load_async_cut_bundle("ref", 100).unwrap().unwrap();
+        assert_eq!(latest.metadata.as_deref(), Some(r#"{"version":2}"#));
+        assert_eq!(latest.history_objects[0].0, "cut-history:c:new");
     }
 
     #[test]

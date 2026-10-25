@@ -340,9 +340,10 @@ pub(crate) struct AsyncRecord {
     /// written before cut seeds existed.
     #[serde(default)]
     record_version: u32,
-    /// The first ordinal of a lineage that begins at a cut: the slot
-    /// (`cut:<F>`) its seed is stored in. The seed itself is a baseline row,
-    /// so quiet notices never rewrite it.
+    /// The first ordinal of a lineage that begins at a cut. Its compact prefix
+    /// facts are stored in the `cut:<first ordinal>` slot. Archived window seeds
+    /// are stored separately and loaded when a lineage selects their cut;
+    /// quiet notices rewrite neither.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     cut_first_ordinal: Option<u64>,
     /// What the conversation keeps of the transcript below its cut.
@@ -350,12 +351,20 @@ pub(crate) struct AsyncRecord {
     cut_seed: Option<Arc<cut_seed::CutSeed>>,
     #[serde(default)]
     lineage_first_ordinal: u64,
+    /// Recent descriptors only. Older cut seeds remain in dedicated baseline
+    /// rows and are point-loaded when a lineage selects their cut.
     #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
     published_cuts: BTreeMap<u64, cut_runtime::PublishedCut>,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     retired_cut_stages: Vec<String>,
     #[serde(skip)]
     pending_cut_seeds: BTreeMap<u64, cut_seed::CutSeed>,
+    #[serde(skip)]
+    pending_cut_metadata: BTreeMap<u64, cut_runtime::PublishedCut>,
+    /// Reclamation follows the replacement commit and can retry after a crash.
+    /// Ordinary record loads never traverse the archive graph.
+    #[serde(default)]
+    cut_history_gc_pending: bool,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pending_parent_history: Option<cut_runtime::ParentHistory>,
     #[serde(default)]
@@ -905,11 +914,29 @@ impl State {
                 self.entry_index(*ordinal)?,
             ));
         }
+        let namespace = self.namespace();
+        if self.journal.cut_seed_dirty {
+            self.cut_history_gc_pending = true;
+            if let Some(seed) = self.cut_seed.as_mut() {
+                let seed = Arc::make_mut(seed);
+                if seed.recovery_history_ref.is_none() && !seed.recovery_history.is_empty() {
+                    let summary_end = seed.summary_end();
+                    let history = std::mem::take(&mut seed.recovery_history);
+                    seed.set_recovery_history(
+                        history,
+                        store
+                            .compartment_history_identity(&namespace)
+                            .map_err(transient)?,
+                        summary_end,
+                    )?;
+                }
+            }
+        }
         let reference = self.reference();
         let key = self.key.store_key().conversation_key();
-        let namespace = self.namespace();
         let state = serde_json::to_string(self).map_err(transient)?;
         let mut save = store.async_compaction_save(&reference, &key, &self.key.session, &state);
+        save.retain_cut_facts(self.cut_first_ordinal);
         save.tags(&namespace, tag_rows);
         save.forget_tags_of(self.journal.forget_tags_of.clone());
         if let Some(through) = self.journal.truncate {
@@ -919,15 +946,31 @@ impl State {
             save.truncate_below(first);
         }
         if let (true, Some(seed)) = (self.journal.cut_seed_dirty, &self.cut_seed) {
+            for (slot, raw) in &seed.pending_history_objects {
+                save.immutable_baseline(slot, raw.clone());
+            }
             save.baseline(
                 cut_seed::CutSeed::slot(seed.first_ordinal),
                 Some(serde_json::to_string(seed.as_ref()).map_err(transient)?),
             );
         }
         for (first, seed) in &self.pending_cut_seeds {
+            for (slot, raw) in &seed.pending_history_objects {
+                save.immutable_baseline(slot, raw.clone());
+            }
             save.baseline(
                 format!("published-cut:{first}"),
                 Some(serde_json::to_string(seed).map_err(transient)?),
+            );
+            save.baseline(
+                format!("published-cut-root:{first}"),
+                Some(serde_json::to_string(&seed.history_root()).map_err(transient)?),
+            );
+        }
+        for (first, cut) in &self.pending_cut_metadata {
+            save.baseline(
+                format!("published-cut-meta:{first}"),
+                Some(serde_json::to_string(cut).map_err(transient)?),
             );
         }
         if !self.pending_cut_seeds.is_empty() {
@@ -958,10 +1001,21 @@ impl State {
             return Err(transient(error));
         }
         self.cleanup_retired_cut_stages(store)?;
+        if self.cut_history_gc_pending && !self.pending_cut_seeds.is_empty() {
+            // Archive GC cannot make an otherwise usable conversation fail.
+            // Keep its durable retry flag if marking finds corrupt history.
+            if let Err(error) = self.gc_cut_history(store) {
+                tracing::warn!(?error, "cut history reclamation deferred");
+            }
+        }
         self.journal.truncate = None;
         self.journal.truncate_below = None;
         self.journal.cut_seed_dirty = false;
         self.pending_cut_seeds.clear();
+        self.pending_cut_metadata.clear();
+        if let Some(seed) = &mut self.cut_seed {
+            Arc::make_mut(seed).pending_history_objects.clear();
+        }
         self.journal.forget_tags_of.clear();
         self.frozen_edits.dirty = false;
         self.retired_frozen.dirty = false;
@@ -1482,6 +1536,9 @@ impl State {
         self.failure = None;
         self.restored_no_new_content = false;
         self.restored_head = None;
+        // A rebuilt window no longer proves that a parent's later summaries
+        // describe this lineage. Recover its certified cut history instead.
+        self.pending_parent_history = None;
         self.truncate_entries(None);
         self.todo_scan = None;
         self.lineage = None;
@@ -1602,8 +1659,9 @@ fn load(store: &McStore, reference: &str) -> Result<Option<State>, HandlerOutcom
         state.retired_frozen = frozen_edits::RetiredViews::from_json(&json)?;
     }
     if let Some(first) = state.cut_first_ordinal {
-        let json = stored
-            .remove(&cut_seed::CutSeed::slot(first))
+        let json = store
+            .load_async_compaction_baseline(&state.reference(), &cut_seed::CutSeed::slot(first))
+            .map_err(transient)?
             .ok_or_else(|| transient("async cut seed row missing"))?;
         state.cut_seed = Some(Arc::new(serde_json::from_str(&json).map_err(transient)?));
         state.aggregates = state.base_aggregates();
@@ -2185,6 +2243,8 @@ impl McHandler {
             published_cuts: BTreeMap::new(),
             retired_cut_stages: Vec::new(),
             pending_cut_seeds: BTreeMap::new(),
+            pending_cut_metadata: BTreeMap::new(),
+            cut_history_gc_pending: false,
             pending_parent_history: None,
             pending_undo_edits: false,
             cut_signature: None,

@@ -291,11 +291,16 @@ async fn m11_cut_registry_outlives_view_retention() {
     state.applied_view = None;
     state.engine_baselines = Default::default();
     state.save(pair.resident.store(), &[]).unwrap();
-    assert!(load_head(pair.resident.store(), &pair.reference)
+    let mut reloaded = load_head(pair.resident.store(), &pair.reference)
         .unwrap()
+        .unwrap();
+    // The bounded in-record cache may evict a cut; view retirement must not
+    // delete its durable descriptor or prevent a later lazy lookup.
+    reloaded.published_cuts.clear();
+    assert!(reloaded
+        .published_cut(pair.resident.store(), first)
         .unwrap()
-        .published_cuts
-        .contains_key(&first));
+        .is_some());
 }
 
 #[tokio::test]
