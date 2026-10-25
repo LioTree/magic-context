@@ -3,6 +3,8 @@ use super::*;
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub(super) struct PublishedCut {
+    #[serde(default)]
+    pub(super) first_ordinal: u64,
     pub(super) lineage: String,
     pub(super) version: u64,
     #[serde(default)]
@@ -15,6 +17,84 @@ pub(super) struct PublishedCut {
     #[serde(default)]
     parent_revision: Option<mc_store::CompartmentSourceRevision>,
     tag_high_water: i64,
+    #[serde(default)]
+    cut_mid: String,
+    #[serde(default)]
+    cut_digest: String,
+    /// Legacy payloads may outlive their staging namespace.
+    #[serde(default)]
+    history_identity: Option<(String, i64, i64, bool)>,
+    /// An older numeric payload slot can remain readable without copying it
+    /// into the new lineage-qualified slot or changing the store schema.
+    #[serde(default)]
+    pub(super) seed_suffix: Option<String>,
+}
+
+/// Group candidates by ordinal without treating arbitrary lineage text as slot
+/// syntax. Distinct publishing lineages at the same ordinal remain independent.
+pub(super) fn cut_key(first: u64, lineage: &str) -> String {
+    format!(
+        "{first:020}:{}",
+        contract::digest::content_digest(&json!(lineage))
+    )
+}
+
+impl PublishedCut {
+    pub(super) fn key(&self) -> String {
+        cut_key(self.first_ordinal, &self.lineage)
+    }
+    pub(super) fn candidate_json(&self) -> Result<String, HandlerOutcome> {
+        serde_json::to_string(&CutCandidate {
+            key: self.key(),
+            first_ordinal: self.first_ordinal,
+            mid: self.cut_mid.clone(),
+            digest: self.cut_digest.clone(),
+            version: self.version,
+            legacy_seed_suffix: self.seed_suffix.clone(),
+        })
+        .map_err(transient)
+    }
+}
+
+#[derive(Serialize, Deserialize)]
+struct CutCandidate {
+    key: String,
+    first_ordinal: u64,
+    mid: String,
+    digest: String,
+    version: u64,
+    legacy_seed_suffix: Option<String>,
+}
+
+pub(super) fn deserialize_cut_cache<'de, D: serde::Deserializer<'de>>(
+    deserializer: D,
+) -> Result<BTreeMap<String, PublishedCut>, D::Error> {
+    let value = Value::deserialize(deserializer)?;
+    let mut cuts = BTreeMap::<String, PublishedCut>::new();
+    for (key, raw) in value.as_object().into_iter().flatten() {
+        let Ok(mut cut) = serde_json::from_value::<PublishedCut>(raw.clone()) else {
+            continue;
+        };
+        if cut.first_ordinal == 0 {
+            let Some(first) = key
+                .split(':')
+                .next()
+                .and_then(|first| first.parse::<u64>().ok())
+            else {
+                continue;
+            };
+            cut.first_ordinal = first;
+            cut.seed_suffix = Some(first.to_string());
+        }
+        if cut.first_ordinal == 0 {
+            continue;
+        }
+        let key = cut.key();
+        if cuts.get(&key).is_none_or(|old| old.version <= cut.version) {
+            cuts.insert(key, cut);
+        }
+    }
+    Ok(cuts)
 }
 
 #[derive(Serialize, Deserialize)]
@@ -48,33 +128,215 @@ pub(super) fn split_head_at(ranges: &mut Vec<view::ViewRange>, first: u64) {
 }
 
 impl AsyncRecord {
-    pub(super) fn published_cut(
+    #[cfg(test)]
+    pub(super) fn newest_published_cut(&self) -> Option<&PublishedCut> {
+        self.published_cuts.values().max_by_key(|cut| cut.version)
+    }
+
+    #[cfg(test)]
+    pub(super) fn cached_cut(&self, first: u64) -> Option<&PublishedCut> {
+        self.published_cuts
+            .values()
+            .filter(|cut| cut.first_ordinal == first)
+            .max_by_key(|cut| cut.version)
+    }
+
+    pub(super) fn published_cut_for(
         &self,
         store: &McStore,
         first: u64,
+        lineage: &str,
     ) -> Result<Option<PublishedCut>, HandlerOutcome> {
-        if let Some(cut) = self.published_cuts.get(&first) {
+        let key = cut_key(first, lineage);
+        if let Some(cut) = self.published_cuts.get(&key) {
             return Ok(Some(cut.clone()));
         }
-        store
+        if let Some(raw) = store
+            .load_async_compaction_baseline(&self.reference(), &format!("published-cut-meta:{key}"))
+            .map_err(transient)?
+        {
+            return serde_json::from_str(&raw).map(Some).map_err(transient);
+        }
+        let mut old = store
             .load_async_compaction_baseline(
                 &self.reference(),
                 &format!("published-cut-meta:{first}"),
             )
             .map_err(transient)?
-            .map(|raw| serde_json::from_str(&raw).map_err(transient))
-            .transpose()
+            .map(|raw| serde_json::from_str::<PublishedCut>(&raw).map_err(transient))
+            .transpose()?
+            .filter(|cut| cut.lineage == lineage);
+        if let Some(cut) = &mut old {
+            cut.first_ordinal = first;
+            cut.seed_suffix = Some(first.to_string());
+        }
+        Ok(old)
     }
 
-    fn trim_published_cut_cache(&mut self) {
+    fn selected_cut_seed(
+        &self,
+        store: &McStore,
+        first: u64,
+        lineage: &str,
+    ) -> Result<Option<(PublishedCut, cut_seed::CutSeed)>, HandlerOutcome> {
+        let key = cut_key(first, lineage);
+        let mut selected = key.clone();
+        let mut bundle = store
+            .load_async_cut_bundle(&self.reference(), &selected)
+            .map_err(transient)?;
+        if bundle.is_none() {
+            let alias = self
+                .published_cut_for(store, first, lineage)?
+                .and_then(|cut| cut.seed_suffix);
+            let Some(alias) = alias else { return Ok(None) };
+            selected = alias;
+            bundle = store
+                .load_async_cut_bundle(&self.reference(), &selected)
+                .map_err(transient)?;
+        }
+        let Some(bundle) = bundle else {
+            return Ok(None);
+        };
+        let mut seed: cut_seed::CutSeed = serde_json::from_str(&bundle.seed).map_err(transient)?;
+        let cut = bundle
+            .metadata
+            .as_ref()
+            .map(|raw| serde_json::from_str::<PublishedCut>(raw).map_err(transient))
+            .transpose()?
+            .or_else(|| {
+                self.published_cuts
+                    .get(&key)
+                    .filter(|cut| cut.seed_suffix.is_some())
+                    .cloned()
+            });
+        let Some(mut cut) = cut else { return Ok(None) };
+        if cut.first_ordinal == 0 {
+            cut.first_ordinal = first;
+        }
+        if seed.first_ordinal != first || cut.first_ordinal != first {
+            return Ok(None);
+        }
+        if selected != key && cut.seed_suffix.is_none() {
+            cut.seed_suffix = Some(selected);
+        }
+        if cut.cut_mid.is_empty() {
+            cut.cut_mid = seed.cut_mid.clone();
+        }
+        if cut.cut_digest.is_empty() {
+            cut.cut_digest = seed.cut_digest.clone();
+        }
+        if cut.history_identity.is_none() {
+            cut.history_identity = seed
+                .recovery_history_ref
+                .as_ref()
+                .and_then(|history| history.identity.clone());
+            if cut.history_identity.is_none() {
+                cut.history_identity = store
+                    .compartment_history_identity(&format!(
+                        "{}:async:{}",
+                        self.key.engine_key(),
+                        cut.generation
+                    ))
+                    .map_err(transient)?;
+            }
+        }
+        seed.pending_history_objects.extend(bundle.history_objects);
+        Ok(Some((cut, seed)))
+    }
+
+    pub(super) fn prepare_cut_metadata(&mut self, store: &McStore) -> Result<(), HandlerOutcome> {
+        #[derive(Deserialize)]
+        struct Identity {
+            cut_mid: String,
+            cut_digest: String,
+            #[serde(default)]
+            recovery_history_ref: Option<IdentityRef>,
+        }
+        #[derive(Deserialize)]
+        struct IdentityRef {
+            identity: Option<(String, i64, i64, bool)>,
+        }
+        let reference = self.reference();
+        let engine_key = self.key.engine_key();
+        let mut prepared = Vec::new();
+        for cut in self
+            .published_cuts
+            .values_mut()
+            .chain(self.pending_cut_metadata.values_mut())
+        {
+            if !cut.cut_mid.is_empty() && !cut.cut_digest.is_empty() {
+                continue;
+            }
+            let suffix = cut.seed_suffix.clone().unwrap_or_else(|| cut.key());
+            let Some(raw) = store
+                .load_async_compaction_baseline(&reference, &format!("published-cut:{suffix}"))
+                .map_err(transient)?
+            else {
+                continue;
+            };
+            let identity: Identity = serde_json::from_str(&raw).map_err(transient)?;
+            cut.cut_mid = identity.cut_mid;
+            cut.cut_digest = identity.cut_digest;
+            cut.history_identity = identity
+                .recovery_history_ref
+                .and_then(|history| history.identity);
+            if cut.history_identity.is_none() {
+                cut.history_identity = store
+                    .compartment_history_identity(&format!("{engine_key}:async:{}", cut.generation))
+                    .map_err(transient)?;
+            }
+            prepared.push((cut.key(), cut.clone()));
+        }
+        for (key, cut) in prepared {
+            self.pending_cut_metadata.entry(key).or_insert(cut);
+        }
+        Ok(())
+    }
+
+    #[cfg(test)]
+    pub(super) fn published_cut(
+        &self,
+        store: &McStore,
+        first: u64,
+    ) -> Result<Option<PublishedCut>, HandlerOutcome> {
+        if let Some(cut) = self.cached_cut(first) {
+            return Ok(Some(cut.clone()));
+        }
+        let candidates = store
+            .load_async_cut_candidates(&self.reference(), first)
+            .map_err(transient)?
+            .into_iter()
+            .map(|raw| serde_json::from_str::<CutCandidate>(&raw).map_err(transient))
+            .collect::<Result<Vec<_>, _>>()?;
+        let slot = candidates
+            .into_iter()
+            .max_by_key(|cut| cut.version)
+            .map(|candidate| format!("published-cut-meta:{}", candidate.key))
+            .unwrap_or_else(|| format!("published-cut-meta:{first}"));
+        let mut cut = store
+            .load_async_compaction_baseline(&self.reference(), &slot)
+            .map_err(transient)?
+            .map(|raw| serde_json::from_str::<PublishedCut>(&raw).map_err(transient))
+            .transpose()?;
+        if let Some(cut) = &mut cut {
+            if cut.first_ordinal == 0 {
+                cut.first_ordinal = first;
+                cut.seed_suffix = Some(first.to_string());
+            }
+        }
+        Ok(cut)
+    }
+
+    pub(super) fn trim_published_cut_cache(&mut self) {
         while self.published_cuts.len() > 4 {
-            let first = *self
+            let key = self
                 .published_cuts
                 .iter()
                 .min_by_key(|(_, cut)| cut.version)
                 .unwrap()
-                .0;
-            let old = self.published_cuts.remove(&first).unwrap();
+                .0
+                .clone();
+            let old = self.published_cuts.remove(&key).unwrap();
             // The immutable seed and history remain durable undo targets; only
             // the disposable namespace and in-record cache entry are evicted.
             self.retired_cut_stages.push(format!(
@@ -82,7 +344,7 @@ impl AsyncRecord {
                 self.key.engine_key(),
                 old.generation
             ));
-            self.pending_cut_metadata.insert(first, old);
+            self.pending_cut_metadata.entry(key).or_insert(old);
         }
     }
 
@@ -175,6 +437,28 @@ impl AsyncRecord {
             return Ok(Some(Arc::clone(seed)));
         }
         if self.lineage_first_ordinal == 0 {
+            return Ok(None);
+        }
+        if let Some(parent) = self.setup.descends_from.as_ref().filter(|parent| {
+            parent.through_ordinal.checked_add(1) == Some(self.lineage_first_ordinal)
+        }) {
+            return self
+                .selected_cut_seed(store, self.lineage_first_ordinal, &parent.lineage_id)
+                .map(|selected| {
+                    selected
+                        .filter(|(cut, seed)| {
+                            cut.lineage == parent.lineage_id && seed.boundary_safe()
+                        })
+                        .map(|(_, seed)| Arc::new(seed))
+                });
+        }
+        // Numeric payload slots predate lineage-qualified targets. They are
+        // usable only when no modern candidates exist for this ordinal.
+        if !store
+            .load_async_cut_candidates(&self.reference(), self.lineage_first_ordinal)
+            .map_err(transient)?
+            .is_empty()
+        {
             return Ok(None);
         }
         store
@@ -415,8 +699,10 @@ impl AsyncRecord {
         if CRASH_AFTER_STAGE.with(|flag| flag.get()) {
             std::process::abort();
         }
-        let superseded = self.published_cut(store, first)?;
+        let key = cut_key(first, &view.lineage_id);
+        let superseded = self.published_cut_for(store, first, &view.lineage_id)?;
         let published = PublishedCut {
+            first_ordinal: first,
             lineage: view.lineage_id.clone(),
             version: view.view_version,
             covered_through: seed.summary_end(),
@@ -430,11 +716,25 @@ impl AsyncRecord {
                 .tag_cache_summary(&self.namespace())
                 .map_err(transient)?
                 .max_tag_number,
+            cut_mid: seed.cut_mid.clone(),
+            cut_digest: seed.cut_digest.clone(),
+            history_identity: seed
+                .recovery_history_ref
+                .as_ref()
+                .and_then(|history| history.identity.clone()),
+            seed_suffix: None,
         };
-        self.pending_cut_metadata.insert(first, published.clone());
-        self.published_cuts.insert(first, published);
+        self.pending_cut_metadata
+            .insert(key.clone(), published.clone());
+        self.published_cuts.insert(key.clone(), published);
         if let Some(old) = superseded {
             self.cut_history_gc_pending = true;
+            if let Some(suffix) = old.seed_suffix {
+                for prefix in ["published-cut", "published-cut-meta", "published-cut-root"] {
+                    self.retired_cut_baselines
+                        .push(format!("{prefix}:{suffix}"));
+                }
+            }
             self.retired_cut_stages.push(format!(
                 "{}:async:{}",
                 self.key.engine_key(),
@@ -442,7 +742,7 @@ impl AsyncRecord {
             ));
         }
         self.trim_published_cut_cache();
-        self.pending_cut_seeds.insert(first, seed);
+        self.pending_cut_seeds.insert(key, seed);
         #[cfg(test)]
         measurements::staged(store);
         Ok(())
@@ -572,31 +872,16 @@ impl McHandler {
         let Some(first) = descends.through_ordinal.checked_add(1) else {
             return unknown();
         };
-        let Some(bundle) = store
-            .load_async_cut_bundle(&state.reference(), first)
-            .map_err(transient)?
+        let Some((cut, mut seed)) = state.selected_cut_seed(store, first, &descends.lineage_id)?
         else {
             return unknown();
         };
-        let mut seed: cut_seed::CutSeed = serde_json::from_str(&bundle.seed).map_err(transient)?;
-        // Legacy seeds kept descriptors inline. Archived seeds require their
-        // descriptor and payload to come from the same reader snapshot.
-        let cut = bundle
-            .metadata
-            .as_ref()
-            .map(|raw| serde_json::from_str::<PublishedCut>(raw).map_err(transient))
-            .transpose()?
-            .or_else(|| {
-                if seed.recovery_history_ref.is_none() {
-                    state.published_cuts.get(&first).cloned()
-                } else {
-                    None
-                }
-            });
-        let Some(cut) = cut.filter(|cut| cut.lineage == descends.lineage_id) else {
+        if cut.lineage != descends.lineage_id {
             return unknown();
-        };
-        seed.pending_history_objects.extend(bundle.history_objects);
+        }
+        if cut.seed_suffix.is_some() {
+            state.pending_cut_metadata.insert(cut.key(), cut.clone());
+        }
         if !seed.boundary_safe() {
             return bytes(&compact::setup::SetupAnswer::refuse(
                 &request.request_id,
@@ -670,6 +955,7 @@ impl McHandler {
             .recovery_history_ref
             .as_ref()
             .and_then(|history| history.identity.as_ref())
+            .or(cut.history_identity.as_ref())
         {
             store
                 .set_compartment_history_identity(&namespace, identity)
@@ -901,7 +1187,12 @@ impl McHandler {
             // cut the runner still holds. Only a matching published cut can
             // certify the unreadable prefix in the new namespace.
             let retained = store
-                .load_async_cut_bundle(&state.reference(), first)
+                .load_async_cut_bundle_for_head(
+                    &state.reference(),
+                    first,
+                    &seed.cut_mid,
+                    &seed.cut_digest,
+                )
                 .map_err(transient)?
                 .map(|bundle| {
                     let mut seed = serde_json::from_str::<cut_seed::CutSeed>(&bundle.seed)
@@ -918,7 +1209,7 @@ impl McHandler {
                 });
             let Some(mut retained) = retained else {
                 return Err(error("cut_rebootstrap_required",
-                    "the runner's cut is not retained; start a full lineage or restore a published cut"));
+                    "the runner's cut is not uniquely retained; set up with its publishing lineage or start a full lineage"));
             };
             compartments = retained
                 .recovery_compartments(store, &state.reference())?

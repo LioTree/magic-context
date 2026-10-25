@@ -353,14 +353,20 @@ pub(crate) struct AsyncRecord {
     lineage_first_ordinal: u64,
     /// Recent descriptors only. Older cut seeds remain in dedicated baseline
     /// rows and are point-loaded when a lineage selects their cut.
-    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
-    published_cuts: BTreeMap<u64, cut_runtime::PublishedCut>,
+    #[serde(
+        default,
+        skip_serializing_if = "BTreeMap::is_empty",
+        deserialize_with = "cut_runtime::deserialize_cut_cache"
+    )]
+    published_cuts: BTreeMap<String, cut_runtime::PublishedCut>,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     retired_cut_stages: Vec<String>,
     #[serde(skip)]
-    pending_cut_seeds: BTreeMap<u64, cut_seed::CutSeed>,
+    pending_cut_seeds: BTreeMap<String, cut_seed::CutSeed>,
     #[serde(skip)]
-    pending_cut_metadata: BTreeMap<u64, cut_runtime::PublishedCut>,
+    pending_cut_metadata: BTreeMap<String, cut_runtime::PublishedCut>,
+    #[serde(skip)]
+    retired_cut_baselines: Vec<String>,
     /// Reclamation follows the replacement commit and can retry after a crash.
     /// Ordinary record loads never traverse the archive graph.
     #[serde(default)]
@@ -915,6 +921,7 @@ impl State {
             ));
         }
         let namespace = self.namespace();
+        self.prepare_cut_metadata(store)?;
         if self.journal.cut_seed_dirty {
             self.cut_history_gc_pending = true;
             if let Some(seed) = self.cut_seed.as_mut() {
@@ -972,6 +979,13 @@ impl State {
                 format!("published-cut-meta:{first}"),
                 Some(serde_json::to_string(cut).map_err(transient)?),
             );
+            save.baseline(
+                format!("published-cut-candidate:{first}"),
+                Some(cut.candidate_json()?),
+            );
+        }
+        for slot in &self.retired_cut_baselines {
+            save.baseline(slot, None);
         }
         if !self.pending_cut_seeds.is_empty() {
             save.baseline("pending-cut-stage", None);
@@ -1013,6 +1027,7 @@ impl State {
         self.journal.cut_seed_dirty = false;
         self.pending_cut_seeds.clear();
         self.pending_cut_metadata.clear();
+        self.retired_cut_baselines.clear();
         if let Some(seed) = &mut self.cut_seed {
             Arc::make_mut(seed).pending_history_objects.clear();
         }
@@ -1955,6 +1970,11 @@ impl McHandler {
             let mut state =
                 self.new_async_record(channel, binding, &request, key, None, generation)?;
             state.cache_policy = old.cache_policy.clone();
+            state.published_cuts = old.published_cuts.clone();
+            state.retired_cut_stages = old.retired_cut_stages.clone();
+            state.cut_history_gc_pending =
+                old.cut_history_gc_pending || old.cut_first_ordinal.is_some();
+            state.trim_published_cut_cache();
             store
                 .replace_compartments(&state.namespace(), &history)
                 .map_err(transient)?;
@@ -2244,6 +2264,7 @@ impl McHandler {
             retired_cut_stages: Vec::new(),
             pending_cut_seeds: BTreeMap::new(),
             pending_cut_metadata: BTreeMap::new(),
+            retired_cut_baselines: Vec::new(),
             cut_history_gc_pending: false,
             pending_parent_history: None,
             pending_undo_edits: false,
@@ -3540,22 +3561,26 @@ impl McHandler {
             store.pending_async_compaction_views().map_err(transient)?
         {
             let view: view::CompactionView = serde_json::from_str(&raw).map_err(transient)?;
-            if load_head(store, &reference)?.is_none_or(|state| {
-                state.resync
-                    || state.offline_first_pass.is_some()
-                    || state.lineage.as_deref() != Some(&view.lineage_id)
-                    || view.cut.as_ref().is_some_and(|cut| {
-                        state
-                            .published_cuts
-                            .get(&(cut.through_ordinal + 1))
-                            .is_none_or(|held| {
-                                held.version != version
-                                    || held
-                                        .covered_through
-                                        .is_none_or(|end| end > cut.through_ordinal)
-                            })
+            let Some(state) = load_head(store, &reference)? else {
+                continue;
+            };
+            let invalid_cut = if let Some(cut) = &view.cut {
+                state
+                    .published_cut_for(store, cut.through_ordinal + 1, &view.lineage_id)?
+                    .is_none_or(|held| {
+                        held.version != version
+                            || held
+                                .covered_through
+                                .is_none_or(|end| end > cut.through_ordinal)
                     })
-            }) {
+            } else {
+                false
+            };
+            if state.resync
+                || state.offline_first_pass.is_some()
+                || state.lineage.as_deref() != Some(&view.lineage_id)
+                || invalid_cut
+            {
                 continue;
             }
             publisher
@@ -4752,7 +4777,7 @@ impl McHandler {
             state.keep_published_cut(store, codec, first, &view)?;
             if state
                 .published_cuts
-                .get(&first)
+                .get(&cut_runtime::cut_key(first, &view.lineage_id))
                 .is_none_or(|cut| cut.version != version)
             {
                 // A bounded prelude or another cut guard may defer the marker.

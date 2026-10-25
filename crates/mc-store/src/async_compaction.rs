@@ -113,6 +113,37 @@ struct CutArchiveRootId {
     root: Option<String>,
 }
 
+#[derive(serde::Deserialize)]
+struct CutSeedAlias {
+    #[serde(default)]
+    seed_suffix: Option<String>,
+}
+
+#[derive(serde::Deserialize)]
+struct CutCandidateLookup {
+    key: String,
+    first_ordinal: u64,
+    mid: String,
+    digest: String,
+    #[serde(default)]
+    legacy_seed_suffix: Option<String>,
+}
+
+fn cut_candidates(
+    conn: &rusqlite::Connection,
+    reference: &str,
+    first: u64,
+) -> rusqlite::Result<Vec<String>> {
+    conn.prepare(
+        "SELECT view_json FROM mc_async_compaction_baselines WHERE session_ref=?1 AND slot GLOB ?2",
+    )?
+    .query_map(
+        params![reference, format!("published-cut-candidate:{first:020}:*")],
+        |row| row.get(0),
+    )?
+    .collect()
+}
+
 fn cut_history_objects(
     conn: &rusqlite::Connection,
     reference: &str,
@@ -144,27 +175,118 @@ fn cut_history_objects(
     Ok(Some(objects))
 }
 
+fn cut_bundle(
+    conn: &rusqlite::Connection,
+    reference: &str,
+    key: &str,
+) -> rusqlite::Result<Option<AsyncCutBundle>> {
+    let metadata = conn
+        .query_row(
+            "SELECT view_json FROM mc_async_compaction_baselines WHERE session_ref=?1 AND slot=?2",
+            params![reference, format!("published-cut-meta:{key}")],
+            |row| row.get::<_, String>(0),
+        )
+        .optional()?;
+    let suffix = metadata
+        .as_ref()
+        .and_then(|raw| serde_json::from_str::<CutSeedAlias>(raw).ok())
+        .and_then(|alias| alias.seed_suffix)
+        .unwrap_or_else(|| key.to_owned());
+    let seed = conn
+        .query_row(
+            "SELECT view_json FROM mc_async_compaction_baselines WHERE session_ref=?1 AND slot=?2",
+            params![reference, format!("published-cut:{suffix}")],
+            |row| row.get::<_, String>(0),
+        )
+        .optional()?;
+    let Some(seed) = seed else { return Ok(None) };
+    let root = serde_json::from_str::<CutArchiveRoot>(&seed)
+        .ok()
+        .and_then(|value| value.recovery_history_ref)
+        .and_then(|value| value.root);
+    let Some(history_objects) = cut_history_objects(conn, reference, root.as_deref())? else {
+        return Ok(None);
+    };
+    Ok(Some(AsyncCutBundle {
+        metadata,
+        seed,
+        history_objects,
+    }))
+}
+
 impl McStore {
-    /// Read a selected target and its immutable history in one snapshot. A
-    /// concurrent supersession cannot reclaim nodes between these reads.
-    pub fn load_async_cut_bundle(
+    /// Thin candidate identities, never full seeds or rendered heads.
+    pub fn load_async_cut_candidates(
         &self,
         reference: &str,
         first: u64,
+    ) -> Result<Vec<String>, McStoreError> {
+        self.inner
+            .with_read(|conn| cut_candidates(conn, reference, first))
+            .map_err(Into::into)
+    }
+
+    /// A head without a publishing lineage is usable only when exactly one
+    /// retained target matches its ordinal, message id and digest.
+    pub fn load_async_cut_bundle_for_head(
+        &self,
+        reference: &str,
+        first: u64,
+        mid: &str,
+        digest: &str,
     ) -> Result<Option<AsyncCutBundle>, McStoreError> {
         self.inner.with_read(|conn| {
             let snapshot = if conn.is_autocommit() { Some(conn.unchecked_transaction()?) } else { None };
-            let seed = conn.query_row("SELECT view_json FROM mc_async_compaction_baselines WHERE session_ref=?1 AND slot=?2",
-                params![reference,format!("published-cut:{first}")], |row| row.get::<_, String>(0)).optional()?;
-            let Some(seed) = seed else { return Ok(None) };
-            let metadata = conn.query_row("SELECT view_json FROM mc_async_compaction_baselines WHERE session_ref=?1 AND slot=?2",
-                params![reference,format!("published-cut-meta:{first}")], |row| row.get(0)).optional()?;
-            let root = serde_json::from_str::<CutArchiveRoot>(&seed).ok()
-                .and_then(|value| value.recovery_history_ref).and_then(|value| value.root);
-            let Some(history_objects) = cut_history_objects(conn, reference, root.as_deref())? else { return Ok(None) };
+            let mut selected = Vec::new();
+            let mut legacy_covered = false;
+            let legacy_suffix = first.to_string();
+            for raw in cut_candidates(conn, reference, first)? {
+                let Ok(candidate) = serde_json::from_str::<CutCandidateLookup>(&raw) else { return Ok(None) };
+                legacy_covered |= candidate.legacy_seed_suffix.as_deref() == Some(legacy_suffix.as_str());
+                if candidate.first_ordinal == first && candidate.mid == mid && candidate.digest == digest {
+                    selected.push(candidate.key);
+                }
+            }
+            if !legacy_covered {
+                #[derive(serde::Deserialize)]
+                struct Identity { first_ordinal: u64, cut_mid: String, cut_digest: String }
+                let raw = conn.query_row("SELECT view_json FROM mc_async_compaction_baselines WHERE session_ref=?1 AND slot=?2",
+                    params![reference,format!("published-cut:{first}")], |row| row.get::<_, String>(0)).optional()?;
+                if let Some(raw) = raw {
+                    let Ok(identity) = serde_json::from_str::<Identity>(&raw) else { return Ok(None) };
+                    if identity.first_ordinal == first && identity.cut_mid == mid && identity.cut_digest == digest {
+                        selected.push(first.to_string());
+                    }
+                }
+            }
+            if selected.len() != 1 { return Ok(None); }
+            let bundle = cut_bundle(conn, reference, &selected[0])?;
             if let Some(snapshot) = snapshot { snapshot.commit()?; }
-            Ok(Some(AsyncCutBundle { metadata, seed, history_objects }))
+            Ok(bundle)
         }).map_err(Into::into)
+    }
+
+    /// Read a selected lineage/ordinal target and its immutable history in one
+    /// snapshot, including legacy numeric payloads referenced by its descriptor.
+    pub fn load_async_cut_bundle(
+        &self,
+        reference: &str,
+        key: &str,
+    ) -> Result<Option<AsyncCutBundle>, McStoreError> {
+        self.inner
+            .with_read(|conn| {
+                let snapshot = if conn.is_autocommit() {
+                    Some(conn.unchecked_transaction()?)
+                } else {
+                    None
+                };
+                let bundle = cut_bundle(conn, reference, key)?;
+                if let Some(snapshot) = snapshot {
+                    snapshot.commit()?;
+                }
+                Ok(bundle)
+            })
+            .map_err(Into::into)
     }
 
     /// Recovery of active cut facts needs only the selected immutable graph,
@@ -474,7 +596,7 @@ impl McStore {
                     .query_map([session_ref], |row| Ok((row.get(0)?, row.get(1)?)))?
                     .collect::<rusqlite::Result<_>>()?;
                 let baselines = conn
-                    .prepare("SELECT slot,view_json FROM mc_async_compaction_baselines WHERE session_ref=?1 AND slot NOT GLOB 'undo-native-edits:*' AND slot NOT GLOB 'published-cut:*' AND slot NOT GLOB 'published-cut-meta:*' AND slot NOT GLOB 'published-cut-root:*' AND slot NOT GLOB 'cut-history:*' AND slot NOT GLOB 'cut:*'")?
+                    .prepare("SELECT slot,view_json FROM mc_async_compaction_baselines WHERE session_ref=?1 AND slot NOT GLOB 'undo-native-edits:*' AND slot NOT GLOB 'published-cut:*' AND slot NOT GLOB 'published-cut-meta:*' AND slot NOT GLOB 'published-cut-candidate:*' AND slot NOT GLOB 'published-cut-root:*' AND slot NOT GLOB 'cut-history:*' AND slot NOT GLOB 'cut:*'")?
                     .query_map([session_ref], |row| Ok((row.get(0)?, row.get(1)?)))?
                     .collect::<rusqlite::Result<_>>()?;
                 Ok(Some(AsyncCompactionRows {
@@ -1035,7 +1157,7 @@ mod tests {
             r#"{"Compartment":{"content":"old"}}"#.into(),
         );
         save.commit().unwrap();
-        let selected = store.load_async_cut_bundle("ref", 100).unwrap().unwrap();
+        let selected = store.load_async_cut_bundle("ref", "100").unwrap().unwrap();
         assert_eq!(selected.metadata.as_deref(), Some(r#"{"version":1}"#));
         assert_eq!(selected.history_objects.len(), 1);
         let (roots, objects) = store.async_cut_history_index("ref").unwrap();
@@ -1073,7 +1195,7 @@ mod tests {
             selected.history_objects[0].1,
             r#"{"Compartment":{"content":"old"}}"#
         );
-        let latest = store.load_async_cut_bundle("ref", 100).unwrap().unwrap();
+        let latest = store.load_async_cut_bundle("ref", "100").unwrap().unwrap();
         assert_eq!(latest.metadata.as_deref(), Some(r#"{"version":2}"#));
         assert_eq!(latest.history_objects[0].0, "cut-history:c:new");
     }

@@ -137,10 +137,8 @@ async fn registry_growth(profile: Profile, rounds: u64) -> Vec<(usize, usize, us
             .unwrap();
         if oldest_cut.is_none() {
             oldest_cut = state
-                .published_cuts
-                .iter()
-                .next()
-                .map(|(first, cut)| (*first, cut.lineage.clone()));
+                .newest_published_cut()
+                .map(|cut| (cut.first_ordinal, cut.lineage.clone()));
         }
         let staged = state
             .published_cuts
@@ -187,6 +185,7 @@ async fn registry_growth(profile: Profile, rounds: u64) -> Vec<(usize, usize, us
             ordinary.baselines.iter().all(|(slot, _)| {
                 !slot.starts_with("published-cut:")
                     && !slot.starts_with("published-cut-meta:")
+                    && !slot.starts_with("published-cut-candidate:")
                     && !slot.starts_with("published-cut-root:")
                     && !slot.starts_with("cut-history:")
                     && !slot.starts_with("cut:")
@@ -219,7 +218,7 @@ async fn registry_growth(profile: Profile, rounds: u64) -> Vec<(usize, usize, us
         .unwrap()
         .unwrap();
     assert!(
-        !state.published_cuts.contains_key(&first),
+        state.cached_cut(first).is_none(),
         "fixture must reach beyond the in-record cache"
     );
     let answer = pair
@@ -496,12 +495,8 @@ async fn r02_deep_revert_matches_full_processing_after_its_stage_is_retired() {
             let state = load(pair.resident.store(), &pair.reference)
                 .unwrap()
                 .unwrap();
-            let (first, cut) = state
-                .published_cuts
-                .iter()
-                .max_by_key(|(_, cut)| cut.version)
-                .unwrap();
-            cuts.push((*first, cut.clone()));
+            let cut = state.newest_published_cut().unwrap();
+            cuts.push((cut.first_ordinal, cut.clone()));
         }
         let (first, cut) = &cuts[1];
         let through = first + 3;
@@ -509,7 +504,7 @@ async fn r02_deep_revert_matches_full_processing_after_its_stage_is_retired() {
         let before = load(pair.resident.store(), &pair.reference)
             .unwrap()
             .unwrap();
-        assert!(!before.published_cuts.contains_key(first));
+        assert!(before.cached_cut(*first).is_none());
         assert!(pair
             .resident
             .store()
@@ -556,5 +551,231 @@ async fn r02_deep_revert_matches_full_processing_after_its_stage_is_retired() {
             .lock()
             .unwrap()
             .is_empty());
+    }
+}
+
+async fn branch_summary(pair: &mut Pair, marker: &str, end: u64) {
+    review_history(pair, end).await;
+    for side in [&pair.resident, &pair.oracle] {
+        let state = load_head(side.store(), &pair.reference).unwrap().unwrap();
+        let mut rows = side.store().load_compartments(&state.namespace()).unwrap();
+        rows[0].content = format!("{marker}: summary through {end}");
+        rows[0].p1 = Some(rows[0].content.clone());
+        side.store()
+            .replace_compartments(&state.namespace(), &rows)
+            .unwrap();
+    }
+}
+
+async fn same_ordinal_branches(
+    profile: Profile,
+    branches: usize,
+    preserve_anchor: bool,
+) -> (Pair, State, Vec<ReadMessage>, u64) {
+    let mut pair = Pair::open_with(profile, false, Some("lineage-A"), false, false).await;
+    *pair.transcript.lineage.lock().unwrap() = "lineage-A".into();
+    pair.append(120);
+    let mut rng = Rng(0xABAB_100);
+    branch_summary(&mut pair, "branch-A-only-summary", 99).await;
+    pair.notice(&mut rng, None).await;
+    let saved_a = pair.transcript.entries.lock().unwrap().clone();
+    let full_a = load(pair.oracle.store(), &pair.reference).unwrap().unwrap();
+    let first = load_head(pair.resident.store(), &pair.reference)
+        .unwrap()
+        .unwrap()
+        .newest_published_cut()
+        .unwrap()
+        .first_ordinal;
+    assert_eq!(first, 100);
+    descend_pair(&mut pair, first, "A-cut").await;
+    for branch in 1..branches {
+        *pair.transcript.entries.lock().unwrap() = saved_a[..20].to_vec();
+        pair.append_salted(100, 80_000 + branch as u64);
+        if preserve_anchor {
+            pair.transcript.entries.lock().unwrap()[first as usize - 1] =
+                saved_a[first as usize - 1].clone();
+        }
+        let lineage = format!("lineage-{}", (b'A' + branch as u8) as char);
+        *pair.transcript.lineage.lock().unwrap() = lineage.clone();
+        *pair.resident.runner.floor.lock().unwrap() = None;
+        *pair.resident.runner.head.lock().unwrap() = None;
+        *pair.oracle.runner.floor.lock().unwrap() = None;
+        *pair.oracle.runner.head.lock().unwrap() = None;
+        pair.cut_checkpoints.clear();
+        pair.cut_checkpoint_lineages.clear();
+        let request = setup_request(&pair, &lineage, None, &format!("setup-{lineage}"));
+        let answer = pair
+            .both("new branch below every cut", |side| {
+                Box::pin(side.dispatch(request.clone()))
+            })
+            .await;
+        assert_eq!(
+            serde_json::from_str::<Value>(&answer).unwrap()["answer"],
+            "ready"
+        );
+        pair.notice(&mut rng, None).await;
+        branch_summary(
+            &mut pair,
+            &format!("branch-{}-only-summary", (b'A' + branch as u8) as char),
+            first - 1,
+        )
+        .await;
+        pair.notice(&mut rng, None).await;
+        let state = load_head(pair.resident.store(), &pair.reference)
+            .unwrap()
+            .unwrap();
+        assert_eq!(state.newest_published_cut().unwrap().first_ordinal, first);
+        assert_eq!(state.newest_published_cut().unwrap().lineage, lineage);
+    }
+    (pair, full_a, saved_a, first)
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn r02_same_ordinal_branches_restore_their_own_exact_cut_after_eviction() {
+    for profile in PROFILES {
+        let (mut pair, full_a, saved_a, first) = same_ordinal_branches(profile, 6, false).await;
+        let state = load_head(pair.resident.store(), &pair.reference)
+            .unwrap()
+            .unwrap();
+        assert_eq!(
+            state.published_cuts.len(),
+            4,
+            "lineage variants must count toward the cache bound"
+        );
+        assert!(!state
+            .published_cuts
+            .contains_key(&cut_runtime::cut_key(first, "lineage-A")));
+        assert_eq!(
+            pair.resident
+                .store()
+                .load_async_cut_candidates(&pair.reference, first)
+                .unwrap()
+                .len(),
+            6
+        );
+        let ancestor = state
+            .published_cut_for(pair.resident.store(), first, "lineage-A")
+            .unwrap()
+            .unwrap();
+        assert!(pair
+            .resident
+            .store()
+            .load_namespace_head(&format!(
+                "{}:async:{}",
+                state.key.engine_key(),
+                ancestor.generation
+            ))
+            .unwrap()
+            .is_none());
+        *pair.transcript.entries.lock().unwrap() = saved_a[..first as usize + 8].to_vec();
+        let request = setup_request(
+            &pair,
+            "A-return",
+            Some(json!({"lineage_id":"lineage-A","through_ordinal":first-1})),
+            "switch-to-A",
+        );
+        let answer = pair
+            .both("switch to older branch A cut", |side| {
+                Box::pin(side.dispatch(request.clone()))
+            })
+            .await;
+        assert_eq!(
+            serde_json::from_str::<Value>(&answer).unwrap()["answer"],
+            "ready",
+            "{answer}"
+        );
+        assert!(
+            answer.contains("branch-A-only-summary"),
+            "{profile:?}: {answer}"
+        );
+        assert!(
+            !answer.contains("branch-B-only-summary"),
+            "{profile:?}: {answer}"
+        );
+        *pair.transcript.lineage.lock().unwrap() = "A-return".into();
+        *pair.resident.runner.floor.lock().unwrap() = Some(first);
+        *pair.resident.runner.head.lock().unwrap() = Some(cut_head(&pair, "A-return", first));
+        pair.cut_checkpoints.push(first);
+        pair.cut_checkpoint_lineages
+            .insert(first, "lineage-A".into());
+        restore_oracle_prefix(&pair, full_a, first);
+        let mut rng = Rng(0xABAB_101);
+        for index in 0..3 {
+            pair.append_salted(4, 91_000 + index);
+            review_complete_turn(&pair);
+            pair.notice(&mut rng, None).await;
+        }
+        let (_, view, model, coverage) = newest_view(&pair).unwrap();
+        assert!(
+            model.contains("branch-A-only-summary"),
+            "{profile:?}: {model}"
+        );
+        assert!(
+            !model.contains("branch-B-only-summary"),
+            "{profile:?}: {model}"
+        );
+        assert!(summaries_in(&model).iter().all(|end| *end < first));
+        assert!(missing_user_text(&pair, &model, &view, coverage).is_empty());
+        assert!(pair
+            .resident
+            .runner
+            .reads_below_floor
+            .lock()
+            .unwrap()
+            .is_empty());
+    }
+}
+
+async fn same_ordinal_head_refusal(profile: Profile, ambiguous: bool) {
+    let (mut pair, _, _, first) = same_ordinal_branches(profile, 2, ambiguous).await;
+    descend_pair(&mut pair, first, "B-cut").await;
+    *pair.transcript.lineage.lock().unwrap() = "unverifiable-head".into();
+    let mut head = cut_head(&pair, "unverifiable-head", first);
+    if !ambiguous {
+        head["cut"]["digest"] = json!("0".repeat(64));
+    }
+    *pair.resident.runner.head.lock().unwrap() = Some(head);
+    let before = newest_version(&pair);
+    let mut rng = Rng(0xABAB_102);
+    for _ in 0..2 {
+        let outcome = resident_notice(&mut pair, &mut rng, None).await;
+        assert!(
+            outcome.contains("cut_rebootstrap_required"),
+            "{profile:?}: {outcome}"
+        );
+        assert!(!outcome.contains("unknown_cut"), "{profile:?}: {outcome}");
+        let state = load(pair.resident.store(), &pair.reference)
+            .unwrap()
+            .unwrap();
+        assert!(!state.failed());
+        assert!(
+            state.cut_seed.is_none() && state.produced_view.is_none(),
+            "an unresolvable head must not adopt another branch's summary"
+        );
+        assert!(newest_version(&pair)
+            .is_none_or(|version| before.is_some_and(|before| version <= before)));
+        assert!(pair
+            .resident
+            .runner
+            .reads_below_floor
+            .lock()
+            .unwrap()
+            .is_empty());
+        pair.append(4);
+        review_complete_turn(&pair);
+    }
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn r01_no_same_ordinal_candidate_matches_the_head_refuses_by_name() {
+    for profile in PROFILES {
+        same_ordinal_head_refusal(profile, false).await;
+    }
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn r01_ambiguous_same_ordinal_head_refuses_instead_of_choosing_a_branch() {
+    for profile in PROFILES {
+        same_ordinal_head_refusal(profile, true).await;
     }
 }

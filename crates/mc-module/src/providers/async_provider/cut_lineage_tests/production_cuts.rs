@@ -74,6 +74,8 @@ async fn descend_pair(pair: &mut Pair, first: u64, child: &str) {
     if !pair.cut_checkpoints.contains(&first) {
         pair.cut_checkpoints.push(first);
     }
+    pair.cut_checkpoint_lineages
+        .insert(first, full.lineage.clone().unwrap());
 
     restore_oracle_prefix(pair, full, first);
 }
@@ -205,10 +207,13 @@ async fn session(profile: Profile, number: u64, steps: u64) -> (usize, usize) {
                 .unwrap();
             first = held
                 .published_cuts
-                .keys()
-                .next_back()
-                .copied()
-                .filter(|first| *first > previous);
+                .values()
+                .filter(|cut| {
+                    cut.first_ordinal > previous
+                        && held.lineage.as_deref() == Some(cut.lineage.as_str())
+                })
+                .map(|cut| cut.first_ordinal)
+                .max();
             if first.is_some() {
                 break;
             }

@@ -113,14 +113,18 @@ async fn review_next_cut(
     pair.notice(rng, None).await;
     let mut first = None;
     for _ in 0..8 {
-        first = load(pair.resident.store(), &pair.reference)
+        let held = load(pair.resident.store(), &pair.reference)
             .unwrap()
-            .unwrap()
+            .unwrap();
+        first = held
             .published_cuts
-            .keys()
-            .next_back()
-            .copied()
-            .filter(|n| *n > previous);
+            .values()
+            .filter(|cut| {
+                cut.first_ordinal > previous
+                    && held.lineage.as_deref() == Some(cut.lineage.as_str())
+            })
+            .map(|cut| cut.first_ordinal)
+            .max();
         if first.is_some() {
             break;
         }
@@ -1396,8 +1400,8 @@ async fn s4_08_same_cut_supersession_reclaims_the_old_stage() {
     pair.notice(&mut Rng(0xA908), None).await;
     let store = pair.resident.store();
     let state = load(store, &pair.reference).unwrap().unwrap();
-    let first = *state.published_cuts.keys().next_back().unwrap();
-    let old = state.published_cuts[&first].clone();
+    let first = state.newest_published_cut().unwrap().first_ordinal;
+    let old = state.cached_cut(first).unwrap().clone();
     let old_namespace = format!("{}:async:{}", state.key.engine_key(), old.generation);
     assert!(store.load_namespace_head(&old_namespace).unwrap().is_some());
     store.arm_soft_refresh(&state.namespace()).unwrap();
@@ -1405,7 +1409,7 @@ async fn s4_08_same_cut_supersession_reclaims_the_old_stage() {
     let state = load(pair.resident.store(), &pair.reference)
         .unwrap()
         .unwrap();
-    assert!(state.published_cuts[&first].version > old.version);
+    assert!(state.cached_cut(first).unwrap().version > old.version);
     assert!(pair
         .resident
         .store()

@@ -43,7 +43,13 @@ fn host_floor(
         (
             *first,
             state
-                .published_cut(pair.resident.store(), *first)
+                .published_cut_for(
+                    pair.resident.store(),
+                    *first,
+                    pair.cut_checkpoint_lineages
+                        .get(first)
+                        .expect("applied cut publishing lineage"),
+                )
                 .unwrap()
                 .unwrap(),
         )
@@ -82,11 +88,17 @@ pub(super) async fn campaign_host_rewind(pair: &mut Pair, seed: u64, cut: u64) {
     review_history(pair, end).await;
     pair.notice(&mut rng, None).await;
     let next = end + 1;
-    if !load(pair.resident.store(), &pair.reference)
+    let held = load(pair.resident.store(), &pair.reference)
         .unwrap()
+        .unwrap();
+    if held
+        .published_cut_for(
+            pair.resident.store(),
+            next,
+            held.lineage.as_deref().unwrap(),
+        )
         .unwrap()
-        .published_cuts
-        .contains_key(&next)
+        .is_none()
     {
         review_ride(pair, "surface_change").await;
     }
@@ -158,7 +170,7 @@ async fn boundary_rewind(profile: Profile, fresh_ids: bool, setup: bool) {
     let staged = load(pair.resident.store(), &pair.reference)
         .unwrap()
         .unwrap();
-    let first = *staged.published_cuts.keys().next_back().unwrap();
+    let first = staged.newest_published_cut().unwrap().first_ordinal;
     descend_pair(&mut pair, first, "child").await;
     let parent = pair.transcript.lineage.lock().unwrap().clone();
     let digest = {
@@ -506,14 +518,18 @@ async fn legacy_seed_crossing_its_wire_cut_is_refused_then_restarts_fresh() {
     let mut state = load(store, &pair.reference).unwrap().unwrap();
     let mut legacy = state.cut_seed.as_ref().unwrap().as_ref().clone();
     legacy.first_ordinal = 154;
-    let mut cut = state.published_cuts.remove(&first).unwrap();
+    let key = state.cached_cut(first).unwrap().key();
+    let mut cut = state.published_cuts.remove(&key).unwrap();
     cut.covered_through = None;
-    state.published_cuts.insert(154, cut);
+    cut.first_ordinal = 154;
+    cut.seed_suffix = Some("154".into());
+    state.pending_cut_metadata.insert(cut.key(), cut.clone());
+    state.published_cuts.insert(cut.key(), cut);
     state.setup.descends_from = Some(compact::lineage::DescendsFrom::new("L", 153));
     state.cut_first_ordinal = Some(154);
     state.cut_seed = Some(Arc::new(legacy.clone()));
     state.journal.cut_seed_dirty = true;
-    state.pending_cut_seeds.insert(154, legacy);
+    state.pending_cut_seeds.insert("154".into(), legacy);
     state.save(store, &[]).unwrap();
     review_restart(&pair);
     let answer = pair
@@ -559,7 +575,7 @@ async fn oversized_prelude_defers_only_the_cut_until_a_normal_restart() {
         .checkout(&store, &pair.reference)
         .unwrap()
         .unwrap();
-    let old_cut = state.published_cuts[&100].version;
+    let old_cut = state.cached_cut(100).unwrap().version;
     let original = Arc::clone(&state.entries[&99]);
     let mut large = original.read().unwrap();
     // This opaque field stays embedded in the native message JSON rather than
@@ -579,7 +595,7 @@ async fn oversized_prelude_defers_only_the_cut_until_a_normal_restart() {
         .unwrap()
         .expect("view still publishes");
     assert!(view.cut.is_none());
-    assert_eq!(state.published_cuts[&100].version, old_cut);
+    assert_eq!(state.cached_cut(100).unwrap().version, old_cut);
     state.save(&store, &[]).unwrap();
     assert!(store
         .load_async_compaction_view(&pair.reference, view.view_version)
@@ -598,7 +614,7 @@ async fn oversized_prelude_defers_only_the_cut_until_a_normal_restart() {
         "ok"
     );
     let state = load(&store, &pair.reference).unwrap().unwrap();
-    assert!(state.published_cuts.contains_key(&104));
+    assert!(state.cached_cut(104).is_some());
     let stats = cut_runtime::measurements::take(&store);
     assert!(stats.deferred_cuts >= 1, "{stats:?}");
     assert!(stats.largest_deferred_bytes > cut_seed::MAX_HISTORIAN_PRELUDE_BYTES);
@@ -614,7 +630,8 @@ async fn a_matching_version_cannot_announce_summary_dependencies_beyond_the_cut(
     pair.notice(&mut rng, None).await;
     let store = pair.resident.store();
     let mut state = load(store, &pair.reference).unwrap().unwrap();
-    let mut kept = state.published_cuts.remove(&100).unwrap();
+    let key = state.cached_cut(100).unwrap().key();
+    let mut kept = state.published_cuts.remove(&key).unwrap();
     let raw = store
         .load_async_compaction_view(&pair.reference, kept.version)
         .unwrap()
@@ -628,7 +645,8 @@ async fn a_matching_version_cannot_announce_summary_dependencies_beyond_the_cut(
     view.digest = view.compute_digest();
     kept.version = version;
     kept.covered_through = Some(99);
-    state.published_cuts.insert(99, kept);
+    kept.first_ordinal = 99;
+    state.published_cuts.insert(kept.key(), kept);
     state.save(store, &[]).unwrap();
     store
         .save_async_compaction_view(

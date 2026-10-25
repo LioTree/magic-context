@@ -645,6 +645,7 @@ struct Pair {
     /// Only cuts the fake host actually applied, in active-branch order.
     /// Merely publishing a view does not make its marker survive a rewind.
     cut_checkpoints: Vec<u64>,
+    cut_checkpoint_lineages: BTreeMap<u64, String>,
     /// Where the two providers' engine cache states first differed (a
     /// skipped engine pass leaves its writes out), for a failure message.
     /// It is a diagnostic, not part of the comparison.
@@ -723,6 +724,7 @@ impl Pair {
             model: "fixture".into(),
             log: Vec::new(),
             cut_checkpoints: Vec::new(),
+            cut_checkpoint_lineages: BTreeMap::new(),
             engine_drift: None,
             record_only: false,
             mismatches: Vec::new(),

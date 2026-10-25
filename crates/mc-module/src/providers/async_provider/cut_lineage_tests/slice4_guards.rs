@@ -9,7 +9,7 @@ async fn uncut() -> (Pair, u64) {
     let state = load(pair.resident.store(), &pair.reference)
         .unwrap()
         .unwrap();
-    let first = *state.published_cuts.keys().next_back().unwrap();
+    let first = state.newest_published_cut().unwrap().first_ordinal;
     (pair, first)
 }
 
@@ -26,6 +26,25 @@ fn codec_of(state: &State) -> codec::Codec {
 #[tokio::test]
 async fn m01_cut_requires_its_publishing_lineage() {
     let (pair, first) = uncut().await;
+    let state = held(&pair);
+    let cut = state.cached_cut(first).unwrap();
+    let store = pair.resident.store();
+    let seed = store
+        .load_async_compaction_baseline(&pair.reference, &format!("published-cut:{}", cut.key()))
+        .unwrap()
+        .unwrap();
+    let wrong_key = cut_runtime::cut_key(first, "not-L");
+    // A stale cache alias must not make another lineage's payload a valid
+    // descendant, even when its lookup key names the requested parent.
+    let record = serde_json::to_string(&state).unwrap();
+    let key = state.key.store_key().conversation_key();
+    let mut save = store.async_compaction_save(&pair.reference, &key, &state.key.session, &record);
+    save.baseline(format!("published-cut:{wrong_key}"), Some(seed));
+    save.baseline(
+        format!("published-cut-meta:{wrong_key}"),
+        Some(serde_json::to_string(cut).unwrap()),
+    );
+    save.commit().unwrap();
     let answer = pair
         .resident
         .dispatch(setup_request(
@@ -47,7 +66,7 @@ async fn m02_rendered_source_below_cut_is_not_staged() {
     let store = pair.resident.store();
     let mut state = held(&pair);
     let codec = codec_of(&state);
-    let version = state.published_cuts[&first].version;
+    let version = state.cached_cut(first).unwrap().version;
     let view: view::CompactionView = serde_json::from_str(
         &store
             .load_async_compaction_view(&pair.reference, version)
@@ -136,7 +155,7 @@ async fn m05_unkept_cut_is_not_announced() {
     let (pair, _) = uncut().await;
     let store = pair.resident.store();
     let mut state = held(&pair);
-    let version = state.published_cuts.values().next_back().unwrap().version;
+    let version = state.newest_published_cut().unwrap().version;
     let raw = store
         .load_async_compaction_view(&pair.reference, version)
         .unwrap()
@@ -248,7 +267,7 @@ async fn m10_descent_applies_the_selected_cut_version() {
     let (pair, first) = uncut().await;
     let store = pair.resident.store();
     let state = held(&pair);
-    let slot = format!("published-cut:{first}");
+    let slot = format!("published-cut:{}", state.cached_cut(first).unwrap().key());
     let mut seed: cut_seed::CutSeed = serde_json::from_str(
         &store
             .load_async_compaction_baseline(&pair.reference, &slot)
@@ -278,7 +297,7 @@ async fn m10_descent_applies_the_selected_cut_version() {
     assert!(answer.contains("ready"), "{answer}");
     assert_eq!(
         held(&pair).applied,
-        Some(state.published_cuts[&first].version)
+        Some(state.cached_cut(first).unwrap().version)
     );
 }
 

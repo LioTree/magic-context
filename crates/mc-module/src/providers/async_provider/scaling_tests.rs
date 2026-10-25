@@ -1578,15 +1578,13 @@ async fn covered_tail_latency_benchmark() {
                 .await
                 .2
                 .unwrap();
-            let first = *rig
-                .state()
-                .published_cuts
-                .keys()
-                .next_back()
-                .expect("saved cut");
+            let staged = rig.state();
+            let cut = staged.newest_published_cut().expect("saved cut");
+            let first = cut.first_ordinal;
             let mut request = serde_json::to_value(&rig.state().setup).unwrap();
             request["lineage_id"] = json!("L2");
-            request["descends_from"] = json!({"lineage_id":"L","through_ordinal":first - 1});
+            request["descends_from"] =
+                json!({"lineage_id":cut.lineage,"through_ordinal":first - 1});
             let setup = rig.op("compaction.setup", request).await;
             assert_eq!(setup["answer"], "ready", "{setup}");
             *rig.runner.cut.lock().unwrap() = Some(("L2".into(), first));
@@ -1867,8 +1865,8 @@ async fn covered_tail_latency_benchmark() {
         // the state kept, with no runner call and nothing that grows with the
         // session. Measured last, so the conversation is not moved before the
         // other operations.
-        let first = *rig.state().published_cuts.keys().next_back().unwrap();
-        let parent = rig.state().published_cuts[&first].lineage.clone();
+        let first = rig.state().newest_published_cut().unwrap().first_ordinal;
+        let parent = rig.state().cached_cut(first).unwrap().lineage.clone();
         let calls_before = rig.runner.calls.load(std::sync::atomic::Ordering::Relaxed);
         let mut setups = Vec::new();
         for attempt in 0..5 {
