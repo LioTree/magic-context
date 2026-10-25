@@ -89,19 +89,29 @@ format or infer raw-history preservation from retention flags.
 
 The direct opener starts an isolated Anthropic worker. It retains exactly two
 turns, preserves the actual first reply in assistant history, uses identical
-first-turn cache breakpoints, performs one HTTP attempt per send, and reports
+first-turn cache breakpoints, serializes requests, and reports
 observed input/output/cache counters. The default endpoint is the first-party
 Messages API; the only override accepted is HTTP on `127.0.0.1` for a mock.
 `runCacheMeasurement` owns the shared meter and reserves before calling `send`.
 Byte-prefix extension and a mock cache counter are not proof of real cache reuse.
+The named Anthropic key is shared with routing. Each send allows at most two
+429 retries, honors `retry-after` seconds or HTTP dates, and stops instead of
+shortening a wait longer than 30 seconds. Exhaustion is `credential_rate_limited`.
+Credit/billing refusals take precedence over 429, stop immediately as
+`credential_no_credit`, and latch the client closed to further sends. No alternate
+key is selected. Meter reservations include the three-attempt ceiling; request
+attempt evidence records the provider host even for refusals. Serialization is
+within this launcher and its client processes, not a cross-application lock on
+routing's independently running jobs.
 
 `scopedCredentials` accepts a lazy broker-client constructor and an in-memory
 enrollment token. It rejects non-Darwin construction before calling that
 constructor. The existing `withCredential` Darwin-only fetch boundary is
 unchanged. No enrollment files, host configs, or environment-key fallbacks are
 read by this adapter. The trusted Mac orchestrator uses the CortexKit credential vault (CKCRED) and supplies exact grants named
-`apikey:anthropic` for the direct measurement and `apikey:cline-pass` for that
-OMP provider, and supplies the run-ended callback.
+the exact configured Anthropic label for direct measurement and `apikey:cline-pass`
+for that OMP provider, and supplies the run-ended callback. Direct measurement
+requires an explicit `anthropicGrant`; it has no grant-name default.
 
 Linux workers accept **already-fetched** material only through the host start or
 direct-client child-environment seam. Those seams consume the supplied API-key
@@ -111,14 +121,91 @@ nor a credential-broker connection. Tests use mock material and verify the child
 receives it, it is absent from argv and persisted client files, input slots are
 cleared, and Linux cannot construct a broker client.
 
-The separately authorized run still needs an attested Mac-to-container bridge.
-The Mac-side orchestrator must fetch the exact CKCRED grant and hand material to
-the child without `docker inspect` exposure: never `docker -e`, a command-line
-argument, or a retained disk file. Use a bounded stdin handoff or child-only
-tmpfs file removed after startup, erase receive buffers, redact outputs before
-persisting, and notify the trusted orchestrator at run end. That bridge is not
-implemented or authorized by these mock proofs. No script fetches a real grant
-on import or starts an enrollment ceremony.
+### Mac-to-container stdin bridge
+
+`container-launcher.ts` is the trusted Mac entrypoint. Live mode alone opens the
+normal `ClaustrumClient.getScoped` API using an explicitly supplied enrollment
+file. It requests the exact configured name with `minTtlMs = runMs + 5000`
+(`min_ttl_ms` on the vault wire), validates an optional returned identity, and
+stops on any vault refusal without reporting auth failure. Refresh-bearing
+responses, including structured refresh/access bundles, are refused by name as
+`credential_refresh_token_refused`. Only opaque API keys or expiring access
+tokens are admitted; access tokens must cover that TTL. No source is opened on
+import, in mock mode, or on Linux.
+
+Each job starts one `--rm --init --cpus 4 --memory 8g --pids-limit 1024` container
+with no mounts, read-only image/root, dropped capabilities and owner-only auth
+tmpfs. One bounded stdin payload carries one grant to `container-child.ts`; EOF
+ends the handoff and stdin is destroyed before model dispatch. No enrollment,
+broker socket, key argument, Docker environment entry, or credential file crosses
+the boundary. The reader supplies only its host child's `TWO_PASS_PROVIDER_API_KEY`
+(or the direct worker's `ANTHROPIC_API_KEY`), not its own environment or init's.
+OpenCode config uses `{env:TWO_PASS_PROVIDER_API_KEY}`; OMP uses the variable name.
+OMP auth mode is explicitly `apiKey` for API-key grants (not its custom-provider
+OAuth default). OMP's non-official Anthropic-compatible endpoint uses Bearer
+authorization even with a static API key; the direct first-party client uses
+`x-api-key`.
+The authorized credential boundary is the **host process tree**: the host may
+pass that variable to its own model-calling descendants, in their environment
+only. The evidence lists observed processes, parents, and whether each inherited
+the variable. Docker init, the stdin reader, version probe, and unrelated
+processes do not receive a credential environment. The reader necessarily holds
+transient handoff/redaction material in memory, never in its environment or files.
+
+Immediately before Docker spawn, the launcher rejects raw, base64 or hex key
+forms in argv or the restricted spawn environment. Mac attestation is validation
+of these exact spawn inputs, **not observation of a Mac process listing**; the
+paid path does not require native Mac `ps`. Inside Linux it inspects live Docker
+metadata, init `/proc/1/{cmdline,environ}` and `ps -eo args=` before acknowledging
+dispatch. It retains clean metadata, checks `--rm` removal, and redacts
+stdout/stderr across chunk boundaries before writing logs/evidence. The child
+checks host-tree argv and environment slots, provider headers in mock mode, and
+the entire writable auth/session tree after host exit, including SQLite files
+and SDK dependencies. Symlinks may resolve only within that tree or to the
+read-only, credential-free installation image. Any material in an auth, session,
+log or other scanned file refuses the adapter. Files are not exported; the report
+retains nondependency file names plus the full scanned-file count and path-manifest
+hash, rather than dumping dependency trees into oversized log lines. All inherited key copies disappear with the `--rm`
+container. The trusted Mac emits `credentialRunEnded` after each job.
+Receive/send buffers are zero-filled, environment slots consumed after spawn,
+and string references dropped at shutdown. JavaScript cannot guarantee physical
+erasure of immutable strings or runtime/OS copies; process exit and tmpfs
+destruction are the final lifetime boundary, not a claim of forensic RAM erasure.
+
+Prepare the pinned, credential-free images (registry/OS access only while installing):
+
+```sh
+for lane in opencode-1 opencode-2 omp; do
+  bash packages/plugin/scripts/two-pass-activation-runs/prepare-container-image.sh "$lane" "two-pass-credential-$lane:mock"
+done
+```
+
+One command from the Mac runs all three real hosts and the direct cache client
+against loopback mocks, with randomized synthetic material and `--network none`:
+
+```sh
+bun packages/plugin/scripts/two-pass-activation-runs/container-launcher.ts \
+  packages/plugin/scripts/two-pass-activation-runs/mock-credential-run.json \
+  .cortexkit/internal-docs/investigations/two-pass-credential-bridge/evidence
+```
+
+`paid-credential-run.json` names `apikey:anthropic:ufukaltinokgmail` and
+`apikey:cline-pass`, not code defaults. Its jobs are deliberately empty until
+approved route/catalog, tariff, prompts, container image and model inputs are
+provided. A filled config uses the same command with its path plus an explicit
+enrollment-file path as the third argument. Paid configs **must** specify
+`network: "bridge"` and a nonempty exact grant list; missing network or grants
+refuse with `paid_network_bridge_required` or `real_grant_list_required`.
+Mock configs can never select bridge networking. The launcher
+logs the selected network once per job. The proxy records each upstream host
+with every metered host dispatch; the cache worker emits each HTTP attempt's host.
+No paid command was executed in the bridge proof.
+
+The six free Zen rows in `../two-pass-candidate-matrix.json`
+(three models across two OpenCode versions) use
+provider `opencode`, `priceClass: "free"`, and name no vault grant. They therefore
+need no grant handoff through this launcher. Historical zero tariffs are not
+proof of current billing or origin availability; the preflight below still applies.
 
 ## Before an authorized campaign
 

@@ -3,6 +3,7 @@ import { execFile, spawn } from "node:child_process";
 import { isAbsolute, join, relative, resolve, sep } from "node:path";
 import { promisify } from "node:util";
 import type { Readable, Writable } from "node:stream";
+import { secretForms } from "./credential-protocol";
 import { Database } from "../../src/shared/sqlite";
 import type { TurnTwoEntry } from "../../src/features/magic-context/memory/turn-two-allowlist";
 import {
@@ -43,7 +44,7 @@ export function underRoot(root: string, path: string): string {
 export function redact(value: unknown, secrets: readonly string[] = []): unknown {
     if (typeof value === "string")
         return secrets
-            .filter(Boolean)
+            .flatMap(secretForms)
             .reduce((text, secret) => text.split(secret).join("[REDACTED]"), value)
             .replace(/Bearer\s+[^\s"']+/gi, "Bearer [REDACTED]");
     if (Array.isArray(value)) return value.map((item) => redact(item, secrets));
@@ -61,15 +62,16 @@ export function redact(value: unknown, secrets: readonly string[] = []): unknown
     return value;
 }
 
+export type CredentialId = `apikey:${string}`;
 export interface ScopedCredentials {
     /** Wrap credential.get_scoped from the credential broker; never read keys from config files. */
-    getScoped(id: "apikey:cline-pass" | "apikey:anthropic"): Promise<string>;
-    notifyRunEnded(id: "apikey:cline-pass" | "apikey:anthropic"): Promise<void>;
+    getScoped(id: CredentialId): Promise<string>;
+    notifyRunEnded(id: CredentialId): Promise<void>;
 }
 
 export async function withCredential<T>(
     credentials: ScopedCredentials | undefined,
-    id: "apikey:cline-pass" | "apikey:anthropic" | undefined,
+    id: CredentialId | undefined,
     fake: boolean,
     run: (env: Record<string, string>, secrets: string[]) => Promise<T>,
 ): Promise<T> {
@@ -85,10 +87,13 @@ export async function withCredential<T>(
     if (!secret) throw new Error("empty_scoped_credential");
     const key = id === "apikey:cline-pass" ? "CLINE_API_KEY" : "ANTHROPIC_API_KEY";
     const env = { [key]: secret };
+    let credentialStop = false;
     try {
         return await run(env, [secret]);
     } catch (error) {
-        if (error instanceof PostGateBudgetStop) throw error;
+        credentialStop = error instanceof Error && ["credential_no_credit", "credential_rate_limited"].includes(error.message);
+        if (error instanceof PostGateBudgetStop || (error instanceof Error &&
+            ["credential_no_credit", "credential_rate_limited"].includes(error.message))) throw error;
         throw new Error("scoped_run_failed");
     } finally {
         delete env[key];
@@ -96,7 +101,7 @@ export async function withCredential<T>(
         try {
             await credentials.notifyRunEnded(id);
         } catch {
-            throw new Error("credential_revoke_notification_failed");
+            if (!credentialStop) throw new Error("credential_revoke_notification_failed");
         }
     }
 }
@@ -237,6 +242,7 @@ export function processActivationTransport(plan: {
             }); } catch { await cleanup(); throw new Error("host_spawn_failed"); }
             // The child has its own environment copy; keep no material in the caller's map.
             forgetInput();
+            const streamsClosed = new Promise<void>((resolve) => child.once("close", () => resolve()));
             try {
                 await new Promise<void>((resolve, reject) => {
                     child.once("spawn", resolve);
@@ -253,7 +259,7 @@ export function processActivationTransport(plan: {
             const stop = async () => {
                 if (stopped) return;
                 stopped = true;
-                if (child.exitCode !== null || child.signalCode !== null) { signal("SIGKILL"); await cleanup(); return; }
+                if (child.exitCode !== null || child.signalCode !== null) { signal("SIGKILL"); await streamsClosed; await cleanup(); return; }
                 const exited = new Promise<void>((resolve) => child.once("exit", () => resolve()));
                 signal("SIGTERM");
                 const timer = setTimeout(() => signal("SIGKILL"), 5000);
@@ -262,6 +268,8 @@ export function processActivationTransport(plan: {
                 } finally {
                     clearTimeout(timer);
                     signal("SIGKILL");
+                    // Drain final log chunks before dropping their redaction material.
+                    await streamsClosed;
                     await cleanup();
                 }
             };

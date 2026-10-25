@@ -8,6 +8,7 @@ import { attestHost, attestProcessTree, type Isolation } from "../two-pass-live-
 import { assertObservedPluginStore, processActivationTransport, redact, type ActivationHost, type ActivationTransport, type CallBound } from "./activation-driver";
 import { mockMeteringProxy } from "./provider-meter";
 import { readHostEvents, stageEventObserver } from "./event-observer";
+import { redactedLines } from "./credential-protocol";
 
 export type HostLane = "opencode-1" | "opencode-2" | "omp";
 export interface HostAdapterOptions {
@@ -17,6 +18,7 @@ export interface HostAdapterOptions {
     providerId?: string;
     providerPackage?: string;
     piApi?: string;
+    piAuth?: "apiKey" | "oauth";
     classify?(path: string, body: string): CallBound["kind"];
     magicContext: Record<string, unknown>;
     outputCeiling: number;
@@ -25,6 +27,13 @@ export interface HostAdapterOptions {
     expectTurnTwo?: boolean;
     /** Synthetic probes can add a second foreground turn and explicitly request wrapup. */
     forceWrapup?: boolean;
+    /** Reference a variable only in the host child, never serialize its value into config. */
+    providerKeyEnv?: `${string}_API_KEY`;
+    /** Credential probes return provider requests and host events, but skip persisted activation-stage checks. */
+    foregroundOnly?: boolean;
+    paidProvider?: boolean;
+    onProviderAttempt?(providerHost: string): void;
+    onProcessObserved?(pid: number): void;
 }
 
 /** Install pinned hosts under the isolated root; never use a host already installed on the machine. */
@@ -40,6 +49,7 @@ export function hostAdapter(lane: HostLane, options: HostAdapterOptions): Activa
     let secrets: string[] = [];
     let hostPid: number | undefined;
     const processProofs = new Map<number, Isolation>();
+    const logFilters: ReturnType<typeof redactedLines>[] = [];
     const binary = (root: string) => join(root, "host-dist/node_modules/.bin", lane === "omp" ? "omp" : "opencode");
     const entrypoint = (root: string) => join(root, lane === "omp" ? "packages/pi-plugin/dist/index.js" : lane === "opencode-2" ? "packages/plugin/dist/v2/server.js" : "packages/plugin/dist/index.js");
     return processActivationTransport({
@@ -49,6 +59,7 @@ export function hostAdapter(lane: HostLane, options: HostAdapterOptions): Activa
         async launch(input) {
             if (process.platform === "darwin") throw new Error("mac_native_host_not_authorized");
             secrets = Object.entries(input.env).filter(([key]) => key.endsWith("_API_KEY")).map(([, value]) => value);
+            if (options.providerKeyEnv && !input.env[options.providerKeyEnv]) throw new Error("host_provider_credential_required");
             const root = resolve(input.env.OPENCODE_DB, "../..");
             work = join(root, "work");
             for (const path of [work, ...["XDG_DATA_HOME", "XDG_CONFIG_HOME", "XDG_STATE_HOME", "XDG_RUNTIME_DIR", "MAGIC_CONTEXT_STORAGE_DIR"].map((key) => input.env[key]), join(root, "host"), join(root, "tmp")])
@@ -68,13 +79,17 @@ export function hostAdapter(lane: HostLane, options: HostAdapterOptions): Activa
             if (result.status !== 0 || (lane === "opencode-1" ? !/^1\.18\.(3[1-9]|[4-9]\d|\d{3,})$/.test(version) : lane === "opencode-2" ? version !== "2.0.22" : !/18\.12\.\d+/.test(version)))
                 throw new Error("host_version_not_pinned");
             proxy = await mockMeteringProxy({ upstream: options.mockProviderURL, meter: input.meter,
+                secrets, forwardCredentials: !!options.providerKeyEnv, paidProvider: options.paidProvider,
+                onProviderAttempt: options.onProviderAttempt,
                 outputCeiling: options.outputCeiling,
                 // Prompt text can mention another stage; it is not evidence of this dispatch's purpose.
                 classify: options.classify ?? (() => "unclassified"),
                 async beforeDispatch() {
                     if (!hostPid) throw new Error("provider_process_unobserved");
-                    for (const proof of await attestProcessTree(root, hostEnv, hostPid))
+                    for (const proof of await attestProcessTree(root, hostEnv, hostPid)) {
+                        options.onProcessObserved?.(proof.proof.pid);
                         if (!processProofs.has(proof.proof.pid)) processProofs.set(proof.proof.pid, proof);
+                    }
                 },
             });
             observer = stageEventObserver(root, lane);
@@ -86,7 +101,11 @@ export function hostAdapter(lane: HostLane, options: HostAdapterOptions): Activa
         async connect(input) {
             hostPid = input.pid;
             const root = resolve(input.env.OPENCODE_DB, "../..");
-            for (const stream of [input.stdout, input.stderr]) stream.on("data", (chunk) => appendFileSync(join(root, "mock-host.log"), redact(chunk.toString(), secrets) as string));
+            for (const stream of [input.stdout, input.stderr]) {
+                const filter = redactedLines(secrets, (line) => appendFileSync(join(root, "mock-host.log"), line));
+                logFilters.push(filter);
+                stream.on("data", (chunk) => filter.write(chunk));
+            }
             const storePath = join(hostEnv.MAGIC_CONTEXT_STORAGE_DIR, "context.db");
             const events: unknown[] = [];
             let observedCarrier: ActivationHost["carrier"] = "unobservable";
@@ -211,6 +230,8 @@ export function hostAdapter(lane: HostLane, options: HostAdapterOptions): Activa
                     try { foreground = await prompt(text); }
                     catch (error) { if (proxy?.budgetStop) throw proxy.budgetStop; throw error; }
                     if (proxy?.budgetStop) throw proxy.budgetStop;
+                    if (options.foregroundOnly) return redact({ version, versionOutput, foreground,
+                        requests: proxy!.receipts.slice(requestStart), hostEvents: readHostEvents(observer.eventsPath).slice(eventStart) }, secrets);
                     let stages: any[] = [];
                     await waitFor(() => {
                         if (proxy?.budgetStop) throw proxy.budgetStop;
@@ -256,7 +277,7 @@ export function hostAdapter(lane: HostLane, options: HostAdapterOptions): Activa
         },
         async stopped() {
             try { if (proxy) { await proxy.close(); proxy = undefined; } }
-            finally { secrets.fill(""); secrets = []; }
+            finally { for (const filter of logFilters.splice(0)) filter.end(); secrets.fill(""); secrets = []; }
         },
     });
 }
@@ -288,18 +309,20 @@ function writeConfigs(lane: HostLane, install: string, work: string, env: Record
     const model = `${providerId}/${options.modelId}`;
     const plugin = lane === "opencode-2" ? join(install, "packages/plugin") : pathToFileURL(join(install, "packages/plugin/dist/index.js")).href;
     const limits = { context: 200_000, output: options.outputCeiling };
+    const apiKey = options.providerKeyEnv ? (lane === "omp" ? options.providerKeyEnv : `{env:${options.providerKeyEnv}}`) : "mock-only-key";
     const config = lane === "opencode-2" ? { plugins: [plugin, observer.directory], model,
-        providers: { [providerId]: { package: options.providerPackage ?? "@ai-sdk/openai-compatible", settings: { baseURL: `${endpoint}/v1`, apiKey: "mock-only-key" }, models: { [options.modelId]: { name: options.modelId, limit: limits } } } },
+        providers: { [providerId]: { package: options.providerPackage ?? "@ai-sdk/openai-compatible", settings: { baseURL: `${endpoint}/v1`, apiKey }, models: { [options.modelId]: { name: options.modelId, limit: limits } } } },
         compaction: { auto: false },
     } : { plugin: [plugin, pathToFileURL(observer.entrypoint).href], model, small_model: model, enabled_providers: [providerId], autoupdate: false,
-        provider: { [providerId]: { npm: options.providerPackage ?? "@ai-sdk/openai-compatible", options: { baseURL: `${endpoint}/v1`, apiKey: "mock-only-key" }, models: { [options.modelId]: { name: options.modelId, limit: limits } } } },
+        provider: { [providerId]: { npm: options.providerPackage ?? "@ai-sdk/openai-compatible", options: { baseURL: `${endpoint}/v1`, apiKey }, models: { [options.modelId]: { name: options.modelId, limit: limits } } } },
         compaction: { auto: false, prune: false }, agent: { title: { disable: true }, summary: { disable: true } },
     };
     if (lane === "omp") {
         mkdirSync(env.PI_CODING_AGENT_DIR, { recursive: true });
         writeFileSync(join(env.PI_CODING_AGENT_DIR, "config.yml"), JSON.stringify({ defaultProvider: providerId, defaultModel: options.modelId,
             enabledModels: [model], retry: { enabled: false }, compaction: { enabled: false }, quietStartup: true, enableInstallTelemetry: false, tools: { xdev: false, intentTracing: false } }));
-        const models = JSON.stringify({ providers: { [providerId]: { api: options.piApi ?? "anthropic-messages", baseUrl: endpoint, apiKey: "mock-only-key",
+        const models = JSON.stringify({ providers: { [providerId]: { api: options.piApi ?? "anthropic-messages", baseUrl: endpoint, apiKey,
+            ...(options.piAuth ? { auth: options.piAuth } : {}),
             models: [{ id: options.modelId, name: options.modelId, input: ["text"], contextWindow: 200_000, maxTokens: options.outputCeiling, reasoning: false, cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0 } }] } } });
         // OMP 18.12 reads YAML first; updating only JSON leaves a previously imported endpoint active.
         writeFileSync(join(env.PI_CODING_AGENT_DIR, "models.yml"), models);

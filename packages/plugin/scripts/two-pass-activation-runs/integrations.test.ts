@@ -89,13 +89,15 @@ test("isolation rejects every non-throwaway database, not only known live names"
 
 test("mock proxy captures every send and meters host retries separately", async () => {
     const requests: string[] = [];
+    const attemptedHosts: string[] = [];
     const mock = Bun.serve({ hostname: "127.0.0.1", port: 0, async fetch(request) {
         requests.push(await request.text());
         return Response.json({ usage: { prompt_tokens: 13, completion_tokens: 7 }, choices: [] });
     } });
     let reservations = 0;
     const settlements: unknown[] = [];
-    const proxy = await mockMeteringProxy({ upstream: mock.url.href, outputCeiling: 20, classify: () => "check", meter: {
+    const proxy = await mockMeteringProxy({ upstream: mock.url.href, outputCeiling: 20, classify: () => "check",
+        onProviderAttempt: (host) => attemptedHosts.push(host), meter: {
         beforeSend() { reservations++; return reservations; }, settle(id, steps) { settlements.push({ id, steps }); },
     } });
     try {
@@ -108,6 +110,8 @@ test("mock proxy captures every send and meters host retries separately", async 
         expect(reservations).toBe(3);
         expect(settlements).toHaveLength(3);
         expect(proxy.receipts).toHaveLength(requests.length);
+        expect(attemptedHosts).toEqual([mock.url.host, mock.url.host, mock.url.host]);
+        expect(proxy.receipts.map((receipt) => receipt.request.providerHost)).toEqual(attemptedHosts);
         expect(proxy.failures).toEqual([]);
     } finally { await proxy.close(); mock.stop(true); }
 });

@@ -1,9 +1,11 @@
 import { createHash } from "node:crypto";
 
 /** Synthetic usage is deliberately different on every request to expose last-step accounting. */
-export function mockProvider(replyText: (request: Record<string, any>) => string, captured?: (requests: unknown[]) => void) {
+export function mockProvider(replyText: (request: Record<string, any>) => string, captured?: (requests: unknown[]) => void,
+    observeHeaders?: (headers: Headers) => void) {
     const requests: Array<{ path: string; method: string; rawBodyHash: string; body: Record<string, any>; inputTokens: number; outputTokens: number }> = [];
     const server = Bun.serve({ hostname: "127.0.0.1", port: 0, async fetch(request) {
+        observeHeaders?.(request.headers);
         const rawBody = await request.text();
         let body: Record<string, any>;
         try {
