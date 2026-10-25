@@ -1,6 +1,6 @@
 {
   "version": 1,
-  "description": "Reviewed activation profiles for best_effort historian turn two. An empty entries array authorizes nothing. Unknown versions match nothing. This file is not a user or project configuration flag, and ck-mc never reads it.",
+  "description": "Reviewed activation profiles for best_effort historian turn two. No profiles are activated: live validation and activation remain unproven. An empty entries array authorizes nothing. Unknown versions match nothing. This file is not a user or project configuration flag, and ck-mc never reads it.",
   "matching": {
     "required": "Every field in fieldTable must be present in an entry and in the corresponding requested or actual identity. Missing, empty or unknown lane, carrier or hash values match nothing.",
     "nullable": "variant, temperature and thinkingLevel must be present; explicit null matches only null. Configured temperature and thinking level are recorded but are not evidence of effective values.",
