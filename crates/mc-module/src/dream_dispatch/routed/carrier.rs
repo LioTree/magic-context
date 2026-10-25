@@ -21,7 +21,7 @@ use std::time::Duration;
 use cortexkit_role_routing::{
     errors::{Refusal, RefusalCode},
     report::{Outcome, ReportAnswer, ReportRequest, Usage as RouteUsage},
-    select::{Requirements, SelectRequest, ToolsRequirement},
+    select::{Requirements, ToolsRequirement},
 };
 use mc_store::dream_scheduler::SqliteDreamScheduler;
 use serde_json::{json, Value};
@@ -36,8 +36,8 @@ use crate::dream_dispatch::broca_carrier::{
 use crate::dream_dispatch::context::{ChildObserver, TaskContext, TaskToolRouter};
 use crate::dream_runner::{CarrierError, ChildRequest, Completion, DreamCarrier, ModelEntry};
 use crate::model_work::{
-    Clock as _, Engine, RoutingCatalog, RunResult, Runner, ScopeRoute, WallClock, WorkError,
-    WorkOrder,
+    Clock as _, Engine, RoutingCatalog, RunResult, Runner, ScopeRoute, SelectParams, WallClock,
+    WorkError, WorkOrder,
 };
 use crate::runner_choices::RoutedChoice;
 
@@ -219,15 +219,23 @@ impl ScopeRoute for RunScope {
     async fn select(
         &self,
         provider: &str,
-        request: &SelectRequest,
+        request: &SelectParams,
     ) -> Result<RoutedChoice, Refusal> {
         // Retrying a report for the same decision must not count as another
         // runner admission refusal. Stop before a third selection.
         if self.tool_refusals.lock().expect("tool refusals").len() >= 2 {
             return Err(Refusal::new(RefusalCode::NoRoute, "tool_unavailable twice"));
         }
+        // The dream wire sends the published request only. Refuse rather than
+        // drop `hold_ok` silently if a dream order ever starts setting it.
+        if request.hold_ok.is_some() {
+            return Err(Refusal::new(
+                RefusalCode::InvalidRequest,
+                "hold_ok is not supported on the dream wire",
+            ));
+        }
         let scope = self.current();
-        let answer = self.wire.select(&scope, provider, request).await?;
+        let answer = self.wire.select(&scope, provider, &request.request).await?;
         let choice: RoutedChoice = serde_json::from_value(answer.clone()).map_err(|e| {
             Refusal::new(
                 RefusalCode::InvalidRequest,
@@ -602,6 +610,9 @@ impl DreamCarrier for RoutedCarrier {
             concurrency_slots: None,
             deadline_ms: now_ms().saturating_add(request.timeout.as_millis() as u64),
             max_decisions: MAX_DECISIONS,
+            // Dream runs are background work with no context pressure, so they
+            // may wait out a quota reset; the dream wire cannot carry the flag.
+            hold_ok: None,
         };
         let result = Engine::new(WallClock).run(&catalog, &order, &runner).await;
         // Keep the carriers the last send registered, so close ends that scope.
