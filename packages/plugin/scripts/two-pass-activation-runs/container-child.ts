@@ -2,7 +2,7 @@ import { cpSync, existsSync, lstatSync, mkdirSync, readdirSync, readFileSync, re
 import { join } from "node:path";
 import { networkInterfaces } from "node:os";
 import { createHash } from "node:crypto";
-import { readHandoff, assertNoMaterial, secretForms, type Handoff } from "./credential-protocol";
+import { readJobHandoff, assertNoMaterial, secretForms, type Handoff } from "./credential-protocol";
 import type { ContainerJob } from "./container-config";
 import { callMeter, redact } from "./activation-driver";
 import { hostAdapter } from "./host-adapters";
@@ -69,15 +69,15 @@ export async function runContainerChild(job: ContainerJob, mock: boolean) {
         } finally { environ.fill(0); }
     };
     const profile: Profile = { id: "credential-transport", family: "credential-transport", modelRoute: `${job.providerId ?? "mock"}/${job.modelId}`,
-        priceClass: "paid", tariff: job.tariff ?? { inputUSDPerMillion: 1, outputUSDPerMillion: 1, source: "Synthetic mock tariff, not provider pricing" },
+        priceClass: job.priceClass ?? "paid", tariff: job.tariff ?? { inputUSDPerMillion: 1, outputUSDPerMillion: 1, source: "Synthetic mock tariff, not provider pricing" },
         configurationSource: "explicit container job", variantSource: "explicit container job",
         entry: buildTurnOneAuthorizationRequest({ lane: job.lane === "anthropic-cache" ? "omp" : job.lane,
             carrier: job.lane === "omp" ? "pi-historian-rpc" : "hidden-completion", provider: job.providerId ?? "mock", modelId: job.modelId,
             variant: null, temperature: null, thinkingLevel: null }, { system: "credential-transport", formatInstruction: "credential-transport", toolSurface: [], checkToolSurface: [] }).requestedIdentity };
     try {
-        handoff = await readHandoff(process.stdin, job.grant);
-        process.stdin.destroy();
-        key = handoff.material; handoff.material = "";
+        try { handoff = await readJobHandoff(process.stdin, job.grant); }
+        finally { process.stdin.destroy(); }
+        if (handoff) { key = handoff.material; handoff.material = ""; }
         assertNoMaterial("reader_environ", readFileSync(`/proc/${process.pid}/environ`), key);
         for (const [name, path] of Object.entries(env)) mkdirSync(name === "OPENCODE_DB" ? join(path, "..") : path, { recursive: true, mode: 0o700 });
         if (existsSync(join(install, "host-sdk"))) cpSync(join(install, "host-sdk"), env.XDG_CONFIG_HOME, { recursive: true });
@@ -85,7 +85,8 @@ export async function runContainerChild(job: ContainerJob, mock: boolean) {
         if (mock) {
             provider = mockProvider(() => "Mock credential transport acknowledged.", undefined, (observed) => {
                 const expectedHeader = job.lane === "anthropic-cache" ? "x-api-key" : "authorization";
-                headers.push({ expectedHeader, matched: observed.get(expectedHeader) === (expectedHeader === "authorization" ? `Bearer ${key}` : key),
+                headers.push({ expectedHeader, matched: job.grant ? observed.get(expectedHeader) === (expectedHeader === "authorization" ? `Bearer ${key}` : key)
+                    : observed.get("authorization") === "Bearer public" && !observed.has("x-api-key"),
                     authorizationMatched: observed.get("authorization") === `Bearer ${key}`, apiKeyMatched: observed.get("x-api-key") === key,
                     presentHeaders: ["authorization", "x-api-key"].filter((name) => observed.has(name)) });
             });
@@ -133,17 +134,18 @@ export async function runContainerChild(job: ContainerJob, mock: boolean) {
         } else {
             const adapter = hostAdapter(job.lane, { sourceRoot: install, mockProviderURL: endpoint,
                 modelId: job.modelId, providerId: job.providerId ?? "mock", providerPackage: job.providerPackage,
-                piApi: job.piApi, piAuth: job.grant.kind === "api_key" ? "apiKey" : "oauth",
-                outputCeiling: job.outputCeiling, providerKeyEnv: "TWO_PASS_PROVIDER_API_KEY",
+                piApi: job.piApi, piAuth: job.grant?.kind === "api_key" ? "apiKey" : "oauth",
+                outputCeiling: job.outputCeiling, providerKeyEnv: job.grant ? "TWO_PASS_PROVIDER_API_KEY" : undefined,
+                grantFree: !job.grant,
                 paidProvider: !mock, foregroundOnly: mock, timeoutMs: 120_000,
                 onProviderAttempt(providerHost) { console.log(JSON.stringify({ providerAttempt: { providerHost } })); },
                 onProcessObserved: (pid) => observeProcess(pid),
                 magicContext: mock ? { enabled: false } : job.magicContext ?? {} });
             const entry = join(install, job.lane === "omp" ? "packages/pi-plugin/dist/index.js" : job.lane === "opencode-2" ? "packages/plugin/dist/v2/server.js" : "packages/plugin/dist/index.js");
-            const childEnv = { ...env, TWO_PASS_PROVIDER_API_KEY: key };
+            const childEnv = { ...env, ...(job.grant ? { TWO_PASS_PROVIDER_API_KEY: key } : {}) };
             host = await adapter.start({ installRoot: install, pluginEntrypoint: entry, env: childEnv, meter: callMeter(ledger, profile) });
-            observeProcess(host.pid, "TWO_PASS_PROVIDER_API_KEY", true);
-            childEnvironment = { pid: host.pid, allowedVariable: "TWO_PASS_PROVIDER_API_KEY", environContainsKey: true, argvClean: true };
+            observeProcess(host.pid, "TWO_PASS_PROVIDER_API_KEY", !!job.grant);
+            childEnvironment = { pid: host.pid, allowedVariable: job.grant ? "TWO_PASS_PROVIDER_API_KEY" : null, environContainsKey: !!job.grant, argvClean: true };
             result = await host.runSession(job.prompt);
         }
         if (mock && (!headers.length || headers.some((entry) => !entry.matched))) throw new Error("credential_provider_header_mismatch");

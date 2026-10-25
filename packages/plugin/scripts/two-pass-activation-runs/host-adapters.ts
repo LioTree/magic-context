@@ -29,6 +29,7 @@ export interface HostAdapterOptions {
     forceWrapup?: boolean;
     /** Reference a variable only in the host child, never serialize its value into config. */
     providerKeyEnv?: `${string}_API_KEY`;
+    grantFree?: boolean;
     /** Credential probes return provider requests and host events, but skip persisted activation-stage checks. */
     foregroundOnly?: boolean;
     paidProvider?: boolean;
@@ -79,7 +80,7 @@ export function hostAdapter(lane: HostLane, options: HostAdapterOptions): Activa
             if (result.status !== 0 || (lane === "opencode-1" ? !/^1\.18\.(3[1-9]|[4-9]\d|\d{3,})$/.test(version) : lane === "opencode-2" ? version !== "2.0.22" : !/18\.12\.\d+/.test(version)))
                 throw new Error("host_version_not_pinned");
             proxy = await mockMeteringProxy({ upstream: options.mockProviderURL, meter: input.meter,
-                secrets, forwardCredentials: !!options.providerKeyEnv, paidProvider: options.paidProvider,
+                secrets, forwardCredentials: !!options.providerKeyEnv || !!options.grantFree, paidProvider: options.paidProvider,
                 onProviderAttempt: options.onProviderAttempt,
                 outputCeiling: options.outputCeiling,
                 // Prompt text can mention another stage; it is not evidence of this dispatch's purpose.
@@ -309,7 +310,8 @@ function writeConfigs(lane: HostLane, install: string, work: string, env: Record
     const model = `${providerId}/${options.modelId}`;
     const plugin = lane === "opencode-2" ? join(install, "packages/plugin") : pathToFileURL(join(install, "packages/plugin/dist/index.js")).href;
     const limits = { context: 200_000, output: options.outputCeiling };
-    const apiKey = options.providerKeyEnv ? (lane === "omp" ? options.providerKeyEnv : `{env:${options.providerKeyEnv}}`) : "mock-only-key";
+    // OpenCode's grant-free Zen path uses the public marker, not an account credential.
+    const apiKey = options.grantFree ? "public" : options.providerKeyEnv ? (lane === "omp" ? options.providerKeyEnv : `{env:${options.providerKeyEnv}}`) : "mock-only-key";
     const config = lane === "opencode-2" ? { plugins: [plugin, observer.directory], model,
         providers: { [providerId]: { package: options.providerPackage ?? "@ai-sdk/openai-compatible", settings: { baseURL: `${endpoint}/v1`, apiKey }, models: { [options.modelId]: { name: options.modelId, limit: limits } } } },
         compaction: { auto: false },
