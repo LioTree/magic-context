@@ -5473,6 +5473,32 @@ pub struct ModuleMeta {
     /// consistent state.
     #[serde(default)]
     pub shadow_acked_watermarks: Value,
+    /// The summarizer's system prompt, rendered once per conversation and sent
+    /// verbatim on every later summary so the provider's cached prefix stays the
+    /// same even if a persona file changes. A native recomp resets this meta to its
+    /// default, which re-renders it. Never read by the m0/m1 renderers. Boxed so
+    /// the absent common case adds one pointer to every in-memory meta copy.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub summary_persona: Option<Box<FrozenSummaryPersona>>,
+}
+
+/// A rendered summary persona and the generation and routing settings frozen
+/// with it.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct FrozenSummaryPersona {
+    /// SHA-256 over the rendered bytes, as `persona/v1` defines a persona digest.
+    pub render_digest: String,
+    /// SHA-256 over the render digest and every frozen setting below, so two
+    /// freezes with equal bytes but a different temperature or demand differ.
+    pub identity: String,
+    /// The exact system text sent on every summary of this conversation.
+    pub bytes: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub temperature: Option<f64>,
+    pub consumer: String,
+    pub iq: u8,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub eq: Option<u8>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]

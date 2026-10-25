@@ -3,7 +3,7 @@ name: mc_summary
 version: 1
 display_name: Historian
 routing:
-  consumer: mc_summary
+  consumer: mc.summary
   iq: 50
 generation:
   temperature: null

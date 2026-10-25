@@ -1125,6 +1125,7 @@ pub fn assemble_historian_firing(
         config,
         now_ms,
         false,
+        false,
     )
 }
 
@@ -1144,9 +1145,56 @@ pub(crate) fn assemble_provider_historian_firing(
         config,
         now_ms,
         true,
+        false,
     )
 }
 
+/// Assemble a summary that routing will place. It has no model chain: the
+/// chunk is sized from the configured historian window with the default
+/// calibration, and the select that follows asks routing for a route whose
+/// window fits the assembled prompt.
+pub(crate) fn assemble_routed_historian_firing(
+    store: &McStore,
+    messages: &[CkIngressMessage],
+    live: &[FlatBlock],
+    block_identities_by_mid: &BTreeMap<String, Vec<BlockIdentity>>,
+    config: HistorianAssemblerConfig,
+    now_ms: i64,
+) -> Result<AssembleHistorianFiringOutcome, mc_store::McStoreError> {
+    assemble_historian_firing_inner(
+        store,
+        messages,
+        live,
+        block_identities_by_mid,
+        config,
+        now_ms,
+        false,
+        true,
+    )
+}
+
+/// The provider-bounded form of [`assemble_routed_historian_firing`].
+pub(crate) fn assemble_routed_provider_historian_firing(
+    store: &McStore,
+    messages: &[CkIngressMessage],
+    live: &[FlatBlock],
+    block_identities_by_mid: &BTreeMap<String, Vec<BlockIdentity>>,
+    config: HistorianAssemblerConfig,
+    now_ms: i64,
+) -> Result<AssembleHistorianFiringOutcome, mc_store::McStoreError> {
+    assemble_historian_firing_inner(
+        store,
+        messages,
+        live,
+        block_identities_by_mid,
+        config,
+        now_ms,
+        true,
+        true,
+    )
+}
+
+#[allow(clippy::too_many_arguments)] // Each flag selects a distinct caller's sizing rule.
 fn assemble_historian_firing_inner(
     store: &McStore,
     messages: &[CkIngressMessage],
@@ -1155,12 +1203,13 @@ fn assemble_historian_firing_inner(
     config: HistorianAssemblerConfig,
     now_ms: i64,
     bounded_context: bool,
+    routed: bool,
 ) -> Result<AssembleHistorianFiringOutcome, mc_store::McStoreError> {
     let producer_key = config.model_chain.first().map(String::as_str);
     let seed = crate::decision_calibration::DecisionCalibration::for_model(producer_key);
     let source_ratio = seed.prose_ratio.max(seed.tools_ratio);
     let source_budget = producer_source_local_budget(config.token_budget, producer_key);
-    if config.model_chain.is_empty() {
+    if config.model_chain.is_empty() && !routed {
         return Ok(AssembleHistorianFiringOutcome::NoFire(
             HistorianNoFireReason::NoModels,
         ));

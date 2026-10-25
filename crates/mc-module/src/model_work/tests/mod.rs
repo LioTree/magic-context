@@ -1,5 +1,5 @@
 #[rustfmt::skip]
-mod kit_fake;
+pub(crate) mod kit_fake;
 
 use std::collections::VecDeque;
 use std::sync::{Arc, Mutex};
@@ -114,7 +114,7 @@ impl ScopeRoute for TestRoute {
     async fn select(
         &self,
         provider: &str,
-        request: &SelectRequest,
+        request: &SelectParams,
     ) -> Result<RoutedChoice, Refusal> {
         assert_eq!(provider, PROVIDER);
         let params = serde_json::to_value(request).unwrap();
@@ -259,6 +259,7 @@ impl Rig {
             concurrency_slots: None,
             deadline_ms: self.clock.now_ms() + 600_000,
             max_decisions: 3,
+            hold_ok: None,
         }
     }
 

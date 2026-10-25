@@ -17,6 +17,9 @@ pub mod dream;
 
 pub const MODULE: &str = "magic-context";
 pub const SUMMARY_ROLE: &str = "mc_summary";
+/// The routing consumer summaries select under. Dotted so routing configuration
+/// for `mc` applies to every ck-mc consumer unless `mc.summary` overrides it.
+pub const SUMMARY_CONSUMER: &str = "mc.summary";
 pub const SUMMARY_CONTRACT: &str = "mc.summary.xml/v1";
 
 /// One live source for the legacy historian guidance and its combined XML contract.
@@ -40,7 +43,7 @@ pub struct Routing {
 impl Default for Routing {
     fn default() -> Self {
         Self {
-            consumer: SUMMARY_ROLE.into(),
+            consumer: SUMMARY_CONSUMER.into(),
             iq: 50,
             eq: None,
         }

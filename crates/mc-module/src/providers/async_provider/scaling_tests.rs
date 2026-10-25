@@ -997,6 +997,14 @@ async fn view_answer(rig: &Rig, version: u64) -> String {
 /// `view.get` of an evicted version answers `unknown_version`.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn acknowledgement_evicts_only_superseded_views() {
+    // The test's state machine is large in debug builds and the test macro
+    // keeps it on the test thread's stack, which it filled to within a few
+    // kilobytes; on the heap, unrelated growth in stored session state cannot
+    // overflow that stack.
+    Box::pin(acknowledgement_evicts_only_superseded_views_body()).await;
+}
+
+async fn acknowledgement_evicts_only_superseded_views_body() {
     let dir = tempfile::tempdir().unwrap();
     let (mut rig, first) = conversation(dir.path(), 40).await;
     rig.history(22, "a second historian summary");

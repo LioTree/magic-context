@@ -48,6 +48,7 @@ pub mod config;
 mod dream_claim;
 pub mod dream_dispatch;
 pub mod dream_tasks;
+pub mod historian_routed;
 mod memory_actions;
 mod model_work;
 pub mod persona_host;
@@ -4163,6 +4164,9 @@ pub struct McHandler {
     retrieval_reranker: Option<Arc<dyn retrieval::hybrid::RerankClient>>,
     config: Arc<Mutex<ConfigCache>>,
     historian_runner_refusals: Arc<HistorianRunnerRefusalCache>,
+    /// Routing engines for routed summaries, one per session, kept for the
+    /// module's lifetime so unacknowledged reports survive their firing.
+    summary_engines: Arc<historian_routed::SummaryEngines>,
     /// Runs queued for a claimant that a firing task in this process is still
     /// waiting on. Empty under the in-module runner.
     host_runs: Arc<HostRunLedger>,
@@ -4328,6 +4332,13 @@ pub trait HistorianProducerFactory: Send + Sync {
             ),
         ))
     }
+
+    /// Routing for summaries. A factory that returns one places every summary
+    /// through routing and never reads a model chain or runner setting; `None`
+    /// keeps the chain-walking drive for factories that predate routing.
+    fn summary_routing(&self) -> Option<Arc<dyn historian_routed::SummaryRouting>> {
+        None
+    }
 }
 
 /// The route a runner-lane conversation's background model calls take, or `None`
@@ -4344,6 +4355,7 @@ pub(crate) fn session_runner_route(
 struct RealHistorianProducerFactory {
     connection_file: PathBuf,
     route_targets: RouteTargetConfig,
+    summary_routing: Arc<historian_routed::SubcSummaryRouting>,
 }
 
 fn session_runner_historian_config(
@@ -4398,6 +4410,10 @@ impl HistorianProducerFactory for RealHistorianProducerFactory {
             )
             .await?,
         ))
+    }
+
+    fn summary_routing(&self) -> Option<Arc<dyn historian_routed::SummaryRouting>> {
+        Some(self.summary_routing.clone())
     }
 }
 
@@ -5013,8 +5029,16 @@ struct HistorianFiringTask {
     /// never on the configured runner, whatever `runner` says.
     session_runner: Option<SessionRunnerRoute>,
     runner_identity: session_resolver::RunnerBindIdentity,
+    /// The conversation's daemon scope stamp; routed summaries select and send
+    /// under it.
+    /// Boxed so the absent case keeps the task small.
+    scope: Option<Box<subc_protocol::scope::ScopeStamp>>,
+    /// Context pressure drove this firing, so a routed summary must not wait on
+    /// a quota reset.
+    pressure: bool,
     model_chain_generation: u64,
     runner_refusal_cache: Arc<HistorianRunnerRefusalCache>,
+    summary_engines: Arc<historian_routed::SummaryEngines>,
     live_guard: SessionSetGuard,
     connect_failure_commit_hook: ConnectFailureCommitHook,
     publication_fence: Option<Arc<dyn historian::HistorianPublicationFence>>,
@@ -5194,6 +5218,10 @@ impl McHandler {
         });
         let producer_factory: Arc<dyn HistorianProducerFactory> = match connection_file.clone() {
             Some(path) => Arc::new(RealHistorianProducerFactory {
+                summary_routing: Arc::new(historian_routed::SubcSummaryRouting {
+                    connection_file: path.clone(),
+                    route_targets: route_targets.clone(),
+                }),
                 connection_file: path,
                 route_targets: route_targets.clone(),
             }),
@@ -5245,6 +5273,7 @@ impl McHandler {
             retrieval_reranker,
             config: Arc::new(Mutex::new(ConfigCache::default())),
             historian_runner_refusals: Arc::new(HistorianRunnerRefusalCache::default()),
+            summary_engines: Arc::default(),
             host_runs: Arc::new(HostRunLedger::new()),
             dream_children: Arc::new(dream_dispatch::host_carrier::DreamQueue::default()),
             broca_dream_tools: Arc::new(dream_dispatch::broca_carrier::BrocaToolRoute::default()),
@@ -5702,6 +5731,7 @@ impl McHandler {
             retrieval_reranker: None,
             config: Arc::new(Mutex::new(ConfigCache::default())),
             historian_runner_refusals: Arc::new(HistorianRunnerRefusalCache::default()),
+            summary_engines: Arc::default(),
             host_runs: Arc::new(HostRunLedger::new()),
             dream_children: Arc::new(dream_dispatch::host_carrier::DreamQueue::default()),
             broca_dream_tools: Arc::new(dream_dispatch::broca_carrier::BrocaToolRoute::default()),
@@ -7609,10 +7639,18 @@ impl McHandler {
             .reason
             .expect("a true historian trigger carries its firing rule");
         let trigger_reason = Some(trigger_rule.as_str().to_string());
+        // A routed summary asks routing where to run; it never reads the host's chain.
+        let routed =
+            historian_routed::active_routing(self.producer_factory.summary_routing()).is_some();
+        let model_chain = if routed {
+            Some(&[][..])
+        } else {
+            parsed.historian_model_chain.as_deref()
+        };
         // The host is the only resolver of the historian's model chain and sends it with
         // every transform. A request without one is refused by name rather than filled
         // in from this module's own reading of the config file.
-        let Some(model_chain) = parsed.historian_model_chain.as_deref() else {
+        let Some(model_chain) = model_chain else {
             tracing::warn!(
                 "mc-module: historian for {} not fired: the transform request carried no historian_model_chain",
                 parsed.session_id
@@ -7636,8 +7674,12 @@ impl McHandler {
             );
             return PreparedHistorianAction::Complete(diagnostics);
         };
-        let model_chain_generation = self.historian_runner_refusals.activate_chain(model_chain);
-        if model_chain.is_empty() {
+        let model_chain_generation = if routed {
+            0
+        } else {
+            self.historian_runner_refusals.activate_chain(model_chain)
+        };
+        if model_chain.is_empty() && !routed {
             let diagnostics = historian_no_fire_diagnostics(NoFireDiagnosticsInput {
                 no_fire: "no_models".into(),
                 detail_kind: "no_models",
@@ -7657,9 +7699,10 @@ impl McHandler {
             );
             return PreparedHistorianAction::Complete(diagnostics);
         }
-        if self
-            .historian_runner_refusals
-            .all_models_durably_refused(model_chain_generation, model_chain)
+        if !routed
+            && self
+                .historian_runner_refusals
+                .all_models_durably_refused(model_chain_generation, model_chain)
         {
             let failures = self
                 .historian_runner_refusals
@@ -7766,10 +7809,11 @@ impl McHandler {
             .cloned()
             .collect();
         let project_slug = project_slug(&binding.project_root);
-        let assembler = if publication_fence.is_some() {
-            historian_chunk::assemble_provider_historian_firing
-        } else {
-            assemble_historian_firing
+        let assembler = match (publication_fence.is_some(), routed) {
+            (true, false) => historian_chunk::assemble_provider_historian_firing,
+            (false, false) => assemble_historian_firing,
+            (true, true) => historian_chunk::assemble_routed_provider_historian_firing,
+            (false, true) => historian_chunk::assemble_routed_historian_firing,
         };
         let assembler_config = HistorianAssemblerConfig {
             expand_tools: cfg.historian_expand_tools.clone(),
@@ -7943,8 +7987,14 @@ impl McHandler {
                 host_runs: Arc::clone(&self.host_runs),
                 session_runner,
                 runner_identity: runner_bind_identity(binding),
+                scope: binding.scope.clone().map(Box::new),
+                // The force band is context pressure; an armed emergency recovery
+                // means the provider is refusing turns for size.
+                pressure: trigger_rule == boundary::TriggerReason::ForceBand
+                    || parsed.emergency_recovery_armed,
                 model_chain_generation,
                 runner_refusal_cache: Arc::clone(&self.historian_runner_refusals),
+                summary_engines: Arc::clone(&self.summary_engines),
                 live_guard,
                 connect_failure_commit_hook: Arc::clone(&self.connect_failure_commit_hook),
                 // Organic pressure firings assemble and publish in one continuous drive
@@ -8003,20 +8053,33 @@ impl McHandler {
         let cfg = self.effective_config(&binding.project_root);
         // Wrapup runs on the host's chain from the session's last transform, the same
         // chain the autonomous historian uses; the module has no chain of its own.
-        let Some(model_chain) = parsed.historian_model_chain.clone() else {
+        // A routed wrapup asks routing where to run, like any other summary.
+        let routed =
+            historian_routed::active_routing(self.producer_factory.summary_routing()).is_some();
+        let model_chain = if routed {
+            Some(Vec::new())
+        } else {
+            parsed.historian_model_chain.clone()
+        };
+        let Some(model_chain) = model_chain else {
             tracing::warn!(
                 "mc-module: wrapup for {} refused: the session's transform carried no historian_model_chain",
                 parsed.session_id
             );
             return PreparedWrapupAction::Failed(WRAPUP_MODEL_CHAIN_MISSING.to_string());
         };
-        let model_chain_generation = self.historian_runner_refusals.activate_chain(&model_chain);
-        if model_chain.is_empty() {
+        let model_chain_generation = if routed {
+            0
+        } else {
+            self.historian_runner_refusals.activate_chain(&model_chain)
+        };
+        if model_chain.is_empty() && !routed {
             return PreparedWrapupAction::Failed("no historian models are configured".to_string());
         }
-        if self
-            .historian_runner_refusals
-            .all_models_durably_refused(model_chain_generation, &model_chain)
+        if !routed
+            && self
+                .historian_runner_refusals
+                .all_models_durably_refused(model_chain_generation, &model_chain)
         {
             let failures = self
                 .historian_runner_refusals
@@ -8076,10 +8139,11 @@ impl McHandler {
                     true,
                 )
             });
-        let assembler = if publication_fence.is_some() {
-            historian_chunk::assemble_provider_historian_firing
-        } else {
-            assemble_historian_firing
+        let assembler = match (publication_fence.is_some(), routed) {
+            (true, false) => historian_chunk::assemble_provider_historian_firing,
+            (false, false) => assemble_historian_firing,
+            (true, true) => historian_chunk::assemble_routed_provider_historian_firing,
+            (false, true) => historian_chunk::assemble_routed_historian_firing,
         };
         let assemble = assembler(
             &store,
@@ -8140,8 +8204,12 @@ impl McHandler {
             // harness, and session when binding child routes.
             session_runner,
             runner_identity: runner_bind_identity(binding),
+            scope: binding.scope.clone().map(Box::new),
+            // A wrapup is requested by the user, not forced by context pressure.
+            pressure: false,
             model_chain_generation,
             runner_refusal_cache: Arc::clone(&self.historian_runner_refusals),
+            summary_engines: Arc::clone(&self.summary_engines),
             live_guard,
             connect_failure_commit_hook: Arc::clone(&self.connect_failure_commit_hook),
             publication_fence,
@@ -8225,10 +8293,85 @@ impl McHandler {
         }
     }
 
+    /// Run a firing that routing places. Returned boxed: the routed drive nests
+    /// the whole firing drive inside the routing engine, and kept inline in the
+    /// executor that state would enlarge every firing's poll frame, routed or not.
+    fn execute_routed_firing_task(
+        routing: Arc<dyn historian_routed::SummaryRouting>,
+        task: HistorianFiringTask,
+    ) -> std::pin::Pin<
+        Box<
+            dyn std::future::Future<
+                    Output = Result<
+                        historian::HistorianDriveOutcome,
+                        historian::HistorianDriveError,
+                    >,
+                > + Send,
+        >,
+    > {
+        Box::pin(async move {
+            let HistorianFiringTask {
+                rust_background_enabled,
+                store,
+                session_id,
+                harness,
+                language,
+                historian_temperature,
+                historian_await_timeout,
+                project_path,
+                project_slug,
+                project_root,
+                firing,
+                runner_identity,
+                scope,
+                pressure,
+                summary_engines,
+                live_guard,
+                publication_fence,
+                provider_completion,
+                ..
+            } = task;
+            let _guard = live_guard;
+            let result = historian_routed::run_routed_summary(historian_routed::RoutedSummary {
+                routing: routing.as_ref(),
+                engines: &summary_engines,
+                scope: scope.as_deref(),
+                identity: &runner_identity,
+                store: &store,
+                session_id: &session_id,
+                project_path: &project_path,
+                project_root: &project_root,
+                harness: &harness,
+                project_slug: &project_slug,
+                language: language.as_deref(),
+                firing: &firing,
+                fallback_temperature: historian_temperature,
+                await_timeout: historian_await_timeout,
+                rust_background_enabled,
+                publication_fence: publication_fence.as_deref(),
+                pressure,
+            })
+            .await;
+            if let Ok(loaded) = store.load(&session_id) {
+                DISPATCH_HEALTH.record_historian_outcome(
+                    historian_status_summary(&loaded.meta.historian),
+                    loaded.meta.historian.recent_decisions.len(),
+                );
+            }
+            if let Some(completion) = provider_completion {
+                completion.record(&store, &session_id, &result);
+            }
+            result
+        })
+    }
+
     async fn execute_historian_firing_task(
         factory: Arc<dyn HistorianProducerFactory>,
         task: HistorianFiringTask,
     ) -> Result<historian::HistorianDriveOutcome, historian::HistorianDriveError> {
+        if let Some(routing) = historian_routed::active_routing(factory.summary_routing()) {
+            return Self::execute_routed_firing_task(routing, task).await;
+        }
         let HistorianFiringTask {
             rust_background_enabled,
             store,
@@ -8246,8 +8389,11 @@ impl McHandler {
             host_runs,
             session_runner,
             runner_identity,
+            scope: _,
+            pressure: _,
             model_chain_generation,
             runner_refusal_cache,
+            summary_engines: _,
             live_guard,
             connect_failure_commit_hook,
             publication_fence,
@@ -25955,6 +26101,8 @@ mod tests {
 
     #[path = "background_run_limits.rs"]
     mod background_run_limits;
+    #[path = "summary_routing.rs"]
+    mod summary_routing;
 
     #[derive(Default)]
     struct ProducerState {
