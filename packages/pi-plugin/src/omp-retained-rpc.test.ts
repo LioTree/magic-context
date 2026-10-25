@@ -1,19 +1,20 @@
 import { afterEach, beforeEach, expect, spyOn, test } from "bun:test";
 import { EventEmitter } from "node:events";
-import { mkdtempSync, rmSync } from "node:fs";
+import { rmSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { PassThrough } from "node:stream";
 import { closeDatabase } from "@magic-context/core/features/magic-context/storage";
 import { __resetSchemaFenceStateForTests } from "@magic-context/core/features/magic-context/storage-db";
 import * as logger from "@magic-context/core/shared/logger";
+import { createTestTempDirFromPath } from "../../plugin/src/shared/test-temp-dir";
 import { OmpRetainedRpc } from "./omp-retained-rpc";
 import { PiSubagentRunner } from "./subagent-runner";
 
 let root: string;
 let oldStorage: string | undefined;
 beforeEach(() => {
-	root = mkdtempSync(join(tmpdir(), "omp-rpc-unit-"));
+	root = createTestTempDirFromPath(join(tmpdir(), "omp-rpc-unit-"));
 	oldStorage = process.env.MAGIC_CONTEXT_STORAGE_DIR;
 	process.env.MAGIC_CONTEXT_STORAGE_DIR = root;
 	closeDatabase();
