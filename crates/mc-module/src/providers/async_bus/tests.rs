@@ -6,6 +6,66 @@ use std::collections::VecDeque;
 
 const MODULE: &str = "ckmc-fixture";
 
+fn health_handler() -> (McHandler, tempfile::TempDir) {
+    let dir = tempfile::tempdir().unwrap();
+    let store = McStore::open_for_test(&dev_descriptor_at(dir.path().to_str().unwrap())).unwrap();
+    let handler = McHandler::new();
+    handler.store.set(Arc::new(store)).ok().unwrap();
+    (handler, dir)
+}
+
+async fn assert_bus_health(handler: &McHandler, expected: Value) {
+    let report = <McHandler as ModuleHandler>::health(handler).await;
+    assert_eq!(
+        report.metrics.unwrap().get("async_bus"),
+        Some(&expected),
+        "SDK health"
+    );
+    for method in ["health", "status", "diagnostics"] {
+        for session_id in [None, Some("health-session")] {
+            let mut request = json!({"method": method});
+            if let Some(session_id) = session_id {
+                request["session_id"] = json!(session_id);
+            }
+            let outcome = handler.dispatch_value(7, request).await;
+            let HandlerOutcome::Response(bytes) = outcome else {
+                panic!("expected {method} response, got {outcome:?}");
+            };
+            let answer: Value = serde_json::from_slice(&bytes).unwrap();
+            assert_eq!(answer.get("async_bus"), Some(&expected), "{method}");
+        }
+    }
+}
+
+#[tokio::test]
+async fn health_reports_attaching_then_connected_as_the_bus_link_changes() {
+    let (handler, _dir) = health_handler();
+    let runtime = &handler.provider_store.async_runtime;
+    *runtime.connection_file.lock().unwrap() = Some(PathBuf::from("unused-test-connection"));
+
+    runtime
+        .bus_link
+        .set(LinkState::Attaching, 3, Some("connection refused".into()));
+    assert_bus_health(
+        &handler,
+        json!({"state": "attaching", "attempts": 3, "last_error": "connection refused"}),
+    )
+    .await;
+
+    runtime.bus_link.set(LinkState::Connected, 0, None);
+    assert_bus_health(
+        &handler,
+        json!({"state": "connected", "attempts": 0, "last_error": null}),
+    )
+    .await;
+}
+
+#[tokio::test]
+async fn health_reports_null_without_a_bus_runtime() {
+    let (handler, _dir) = health_handler();
+    assert_bus_health(&handler, Value::Null).await;
+}
+
 fn unix_now() -> i64 {
     std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)

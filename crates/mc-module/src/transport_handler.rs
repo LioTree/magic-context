@@ -173,7 +173,10 @@ mod tests {
 
     #[tokio::test]
     async fn ordinary_health_remains_byte_identical_through_transport() {
-        let original = HealthReport::ok();
+        let original = HealthReport {
+            metrics: Some(serde_json::json!({"async_bus": null})),
+            ..HealthReport::ok()
+        };
         let report = McTransportHandler::new(HealthFixture(original.clone()))
             .health()
             .await;
