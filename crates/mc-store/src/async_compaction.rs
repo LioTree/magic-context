@@ -1028,6 +1028,83 @@ mod tests {
     use std::time::Instant;
 
     #[test]
+    #[ignore = "independent final review; requires MC_REVIEW_S4FINAL=1"]
+    fn final_ordinary_load_work_is_independent_of_retained_cut_count() {
+        if std::env::var("MC_REVIEW_S4FINAL").as_deref() != Ok("1") {
+            return;
+        }
+        let dir = tempfile::tempdir().unwrap();
+        let store = McStore::open(&StorageDescriptor {
+            module_id: "magic-context".into(),
+            storage_namespace: "mc_cache".into(),
+            isolation: Isolation::Module,
+            backend: StorageBackend::Sqlite {
+                path: dir.path().join("store.db").to_string_lossy().into_owned(),
+            },
+        })
+        .unwrap();
+        // Extract the actual loader statement so a query fix cannot leave a
+        // copied, obsolete SQL string masquerading as a production witness.
+        let source = include_str!("async_compaction.rs");
+        let loader = source
+            .split_once("pub fn load_async_compaction_rows(")
+            .unwrap()
+            .1;
+        let query = loader
+            .lines()
+            .find_map(|line| {
+                line.trim()
+                    .strip_prefix(".prepare(\"SELECT slot,view_json")
+                    .and_then(|rest| rest.strip_suffix("\")?"))
+                    .map(|rest| format!("SELECT slot,view_json{rest}"))
+            })
+            .unwrap();
+        let mut measurements = Vec::new();
+        for cuts in [8, 128, 512] {
+            let mut save = store.async_compaction_save("ref", "key", "session", "{}");
+            save.baseline("frozen_edits", Some("live".into()));
+            for first in 0..cuts {
+                for prefix in [
+                    "published-cut",
+                    "published-cut-meta",
+                    "published-cut-candidate",
+                    "published-cut-root",
+                    "cut-history",
+                ] {
+                    save.baseline(
+                        format!("{prefix}:{first:020}:branch"),
+                        Some("archive".repeat(128)),
+                    );
+                }
+            }
+            save.commit().unwrap();
+            assert_eq!(
+                store
+                    .load_async_compaction_rows("ref")
+                    .unwrap()
+                    .unwrap()
+                    .baselines,
+                vec![("frozen_edits".into(), "live".into())]
+            );
+            let steps = store.inner.with_read(|conn| {
+                let plan = conn.prepare(&format!("EXPLAIN QUERY PLAN {query}"))?
+                    .query_map(["ref"], |row| row.get::<_, String>(3))?
+                    .collect::<rusqlite::Result<Vec<_>>>()?;
+                let mut stmt = conn.prepare(&query)?;
+                let rows = stmt.query_map(["ref"], |row| row.get::<_, String>(0))?
+                    .collect::<rusqlite::Result<Vec<_>>>()?;
+                assert_eq!(rows, vec!["frozen_edits"]);
+                let steps = stmt.get_status(rusqlite::StatementStatus::VmStep);
+                eprintln!("FINAL ordinary-load cuts={cuts} archive_rows={} hot_rows={} vm_steps={steps} plan={plan:?}", cuts * 5, rows.len());
+                Ok(steps)
+            }).unwrap();
+            measurements.push(steps);
+        }
+        assert!(measurements[2] <= measurements[0] * 2 + 100,
+            "ordinary load still walks retained cuts: VM steps {measurements:?} for 8/128/512 cuts with identical returned hot rows");
+    }
+
+    #[test]
     fn undo_edit_archives_are_not_hydrated_on_ordinary_loads() {
         let dir = tempfile::tempdir().unwrap();
         let store = McStore::open(&StorageDescriptor {

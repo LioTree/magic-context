@@ -3,6 +3,9 @@
 //! mode3-slice4-fix-rereview.md` and is ignored with that finding's id.
 use super::*;
 
+#[path = "slice4_final_review.rs"]
+mod slice4_final_review;
+
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn r03_unseen_descent_is_attempted_on_the_notice_path() {
     review_session_inner(Profile::Pi, 3_144_134_339, 12, false, None, true).await;
