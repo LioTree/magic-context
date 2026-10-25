@@ -5,7 +5,7 @@ import { join } from "node:path";
 import { initializeDatabase } from "../../src/features/magic-context/storage-db";
 import { Database } from "../../src/shared/sqlite";
 import { disposableEnvironment, verifyIsolation, type Isolation } from "../two-pass-live-replay/host-drivers";
-import { assertObservedPluginStore, type CallMeter } from "./activation-driver";
+import { assertObservedPluginStore, PostGateBudgetStop, type CallMeter } from "./activation-driver";
 import { meteredDispatch, mockMeteringProxy, providerUsage, sumProviderSteps } from "./provider-meter";
 
 const roots: string[] = [];
@@ -109,5 +109,44 @@ test("mock proxy captures every send and meters host retries separately", async 
         expect(settlements).toHaveLength(3);
         expect(proxy.receipts).toHaveLength(requests.length);
         expect(proxy.failures).toEqual([]);
+    } finally { await proxy.close(); mock.stop(true); }
+});
+
+test("proxy reserves the wire output ceiling and never changes the request", async () => {
+    const bodies: string[] = [];
+    const mock = Bun.serve({ hostname: "127.0.0.1", port: 0, async fetch(request) {
+        bodies.push(await request.text());
+        return Response.json({ usage: { prompt_tokens: 3, completion_tokens: 2 } });
+    } });
+    const ceilings: number[] = [];
+    const proxy = await mockMeteringProxy({ upstream: mock.url.href, outputCeiling: 20, classify: () => "grader", meter: {
+        beforeSend(bound) { ceilings.push(bound.outputCeiling); return 1; }, settle() {},
+    } });
+    const body = JSON.stringify({ model: "mock", max_tokens: 70, messages: [] });
+    try {
+        const response = await fetch(proxy.url, { method: "POST", body });
+        expect(response.status).toBe(200);
+        await response.text();
+        expect(ceilings).toEqual([70]);
+        expect(bodies).toEqual([body]);
+    } finally { await proxy.close(); mock.stop(true); }
+});
+
+test("proxy latches a budget stop before any dispatch or host retry", async () => {
+    let dispatches = 0;
+    let reservations = 0;
+    const mock = Bun.serve({ hostname: "127.0.0.1", port: 0, fetch() { dispatches++; return Response.json({}); } });
+    const proxy = await mockMeteringProxy({ upstream: mock.url.href, outputCeiling: 20, classify: () => "check", meter: {
+        beforeSend() { reservations++; throw new PostGateBudgetStop("cost_cap"); }, settle() { throw new Error("no_dispatch"); },
+    } });
+    try {
+        for (let i = 0; i < 2; i++) {
+            const response = await fetch(proxy.url, { method: "POST", body: "{}" });
+            expect(response.status).toBe(402);
+            await response.text();
+        }
+        expect(reservations).toBe(1);
+        expect(dispatches).toBe(0);
+        expect(proxy.budgetStop?.requiresOwnerDecision).toBe(true);
     } finally { await proxy.close(); mock.stop(true); }
 });

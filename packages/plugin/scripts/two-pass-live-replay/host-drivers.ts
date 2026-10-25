@@ -1,5 +1,5 @@
 import { execFile } from "node:child_process";
-import { existsSync, readdirSync, readlinkSync, realpathSync } from "node:fs";
+import { existsSync, readdirSync, readFileSync, readlinkSync, realpathSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { dirname, isAbsolute, join, relative, resolve, sep } from "node:path";
 import { promisify } from "node:util";
@@ -91,7 +91,7 @@ export function verifyIsolation(isolation: Isolation): void {
         )
     )
         throw new Error("live_store_handle");
-    if (proof.paths.some((path) => /\.db(?:-(?:wal|shm|journal))?$/.test(path) && !within(isolation.root, path)))
+    if (proof.paths.some((path) => /\.db(?:-(?:wal|shm|journal))?(?: \(deleted\))?$/.test(path) && !within(isolation.root, path)))
         throw new Error("database_outside_disposable_root");
 }
 /** Inspect the host, not the runner: provider traffic must originate in the isolated host. */
@@ -127,6 +127,31 @@ export async function attestHost(
     const isolation = { root, env, proof };
     verifyIsolation(isolation);
     return isolation;
+}
+
+/** Inspect live Linux descendants while a provider request keeps its originating child alive. */
+export async function attestProcessTree(root: string, env: Record<string, string>, pid: number): Promise<Isolation[]> {
+    const pending = [pid];
+    const seen = new Set<number>();
+    const proofs: Isolation[] = [];
+    while (pending.length) {
+        const current = pending.shift()!;
+        if (seen.has(current)) continue;
+        seen.add(current);
+        try { proofs.push(await attestHost(root, env, current)); }
+        catch (error) { if (current === pid || existsSync(`/proc/${current}`)) throw error; else continue; }
+        if (process.platform !== "linux") continue;
+        let tids: string[];
+        try { tids = readdirSync(`/proc/${current}/task`); }
+        catch (error) { if ((error as NodeJS.ErrnoException).code === "ENOENT" && current !== pid) continue; throw error; }
+        for (const tid of tids) {
+            try {
+                pending.push(...readFileSync(`/proc/${current}/task/${tid}/children`, "utf8").trim().split(/\s+/)
+                    .filter(Boolean).map(Number).filter((child) => Number.isSafeInteger(child) && child > 0));
+            } catch (error) { if ((error as NodeJS.ErrnoException).code !== "ENOENT") throw error; }
+        }
+    }
+    return proofs;
 }
 export interface HostReply {
     text: string;

@@ -159,7 +159,7 @@
             "configurationUnresolvedReason": "No sanitized runtime settings capture was supplied. Temperature is optional (packages/plugin/src/config/schema/agent-overrides.ts:17-20); OpenCode variant and Pi/OMP thinking_level are distinct (packages/plugin/src/config/schema/magic-context.ts:175-203). Configured nulls must not be substituted for reported nulls.",
             "priceClass": null,
             "tariffSource": "unknown",
-            "tariffUnresolvedReason": "No catalog tariff for this exact route is available. Native Gemini/Anthropic API prices or another provider's Muse id do not price an Antigravity/cline-pass route. Missing route ids remain dropped; an authorized run must supply exact catalog identity and input/output tariff provenance.",
+            "tariffUnresolvedReason": "No per-request tariff for this exact Antigravity route was supplied. https://antigravity.google/docs/models.md documents model availability, not this OpenCode route's billing. Native Gemini API prices are not a substitute; price class and both USD rates remain unresolved pending an authorized route-specific billing/catalog capture.",
             "pin_at": "V4 preflight",
             "modelEvidence": {
                 "kind": "configured-route",
@@ -187,7 +187,7 @@
             "configurationUnresolvedReason": "No sanitized runtime settings capture was supplied. Temperature is optional (packages/plugin/src/config/schema/agent-overrides.ts:17-20); OpenCode variant and Pi/OMP thinking_level are distinct (packages/plugin/src/config/schema/magic-context.ts:175-203). Configured nulls must not be substituted for reported nulls.",
             "priceClass": null,
             "tariffSource": "unknown",
-            "tariffUnresolvedReason": "No catalog tariff for this exact route is available. Native Gemini/Anthropic API prices or another provider's Muse id do not price an Antigravity/cline-pass route. Missing route ids remain dropped; an authorized run must supply exact catalog identity and input/output tariff provenance.",
+            "tariffUnresolvedReason": "The provider and exact model route are missing for this display name. A first-party Anthropic or Broca model ID and tariff cannot price an OpenCode fallback. Keep this row dropped until its own provider catalog pins both identity and USD rates.",
             "pin_at": "V4 preflight",
             "dropReason": "Only a display name is available for the OpenCode fallback; no exact route is pinned. The separate Broca cache-measurement id is not an OpenCode candidate route.",
             "dropReasonSource": {
@@ -346,7 +346,7 @@
             "configurationUnresolvedReason": "No sanitized runtime settings capture was supplied. Temperature is optional (packages/plugin/src/config/schema/agent-overrides.ts:17-20); OpenCode variant and Pi/OMP thinking_level are distinct (packages/plugin/src/config/schema/magic-context.ts:175-203). Configured nulls must not be substituted for reported nulls.",
             "priceClass": null,
             "tariffSource": "unknown",
-            "tariffUnresolvedReason": "No catalog tariff for this exact route is available. Native Gemini/Anthropic API prices or another provider's Muse id do not price an Antigravity/cline-pass route. Missing route ids remain dropped; an authorized run must supply exact catalog identity and input/output tariff provenance.",
+            "tariffUnresolvedReason": "No per-request tariff for this exact Antigravity route was supplied. https://antigravity.google/docs/models.md documents model availability, not this OpenCode route's billing. Native Gemini API prices are not a substitute; price class and both USD rates remain unresolved pending an authorized route-specific billing/catalog capture.",
             "pin_at": "V4 preflight",
             "modelEvidence": {
                 "kind": "configured-route",
@@ -374,7 +374,7 @@
             "configurationUnresolvedReason": "No sanitized runtime settings capture was supplied. Temperature is optional (packages/plugin/src/config/schema/agent-overrides.ts:17-20); OpenCode variant and Pi/OMP thinking_level are distinct (packages/plugin/src/config/schema/magic-context.ts:175-203). Configured nulls must not be substituted for reported nulls.",
             "priceClass": null,
             "tariffSource": "unknown",
-            "tariffUnresolvedReason": "No catalog tariff for this exact route is available. Native Gemini/Anthropic API prices or another provider's Muse id do not price an Antigravity/cline-pass route. Missing route ids remain dropped; an authorized run must supply exact catalog identity and input/output tariff provenance.",
+            "tariffUnresolvedReason": "The provider and exact model route are missing for this display name. A first-party Anthropic or Broca model ID and tariff cannot price an OpenCode fallback. Keep this row dropped until its own provider catalog pins both identity and USD rates.",
             "pin_at": "V4 preflight",
             "dropReason": "Only a display name is available for the OpenCode fallback; no exact route is pinned. The separate Broca cache-measurement id is not an OpenCode candidate route.",
             "dropReasonSource": {
@@ -402,7 +402,7 @@
             "configurationUnresolvedReason": "No sanitized runtime settings capture was supplied. Temperature is optional (packages/plugin/src/config/schema/agent-overrides.ts:17-20); OpenCode variant and Pi/OMP thinking_level are distinct (packages/plugin/src/config/schema/magic-context.ts:175-203). Configured nulls must not be substituted for reported nulls.",
             "priceClass": null,
             "tariffSource": "unknown",
-            "tariffUnresolvedReason": "No catalog tariff for this exact route is available. Native Gemini/Anthropic API prices or another provider's Muse id do not price an Antigravity/cline-pass route. Missing route ids remain dropped; an authorized run must supply exact catalog identity and input/output tariff provenance.",
+            "tariffUnresolvedReason": "The exact cline-pass catalog ID, route, and tariff are unavailable. The historical Cline grant was revoked; a fresh authorized apikey:cline-pass catalog capture is required. Keep this row dropped rather than substituting a Zen or OpenRouter Muse identity or price.",
             "pin_at": "V4 preflight",
             "dropReason": "The OMP cline-pass model catalog is unavailable and its key grant was revoked. Pin the exact catalog id at V4 preflight or leave this row dropped; another provider's Muse route is not evidence for cline-pass.",
             "dropReasonSource": "unknown"

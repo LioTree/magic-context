@@ -1,12 +1,20 @@
+import { createHash } from "node:crypto";
+
 /** Synthetic usage is deliberately different on every request to expose last-step accounting. */
 export function mockProvider(replyText: (request: Record<string, any>) => string, captured?: (requests: unknown[]) => void) {
-    const requests: Array<{ path: string; body: Record<string, any>; inputTokens: number; outputTokens: number }> = [];
+    const requests: Array<{ path: string; method: string; rawBodyHash: string; body: Record<string, any>; inputTokens: number; outputTokens: number }> = [];
     const server = Bun.serve({ hostname: "127.0.0.1", port: 0, async fetch(request) {
-        const body = await request.json() as Record<string, any>;
+        const rawBody = await request.text();
+        let body: Record<string, any>;
+        try {
+            const value = JSON.parse(rawBody);
+            body = value && typeof value === "object" && !Array.isArray(value) ? value : { unparsed: rawBody };
+        } catch { body = { unparsed: rawBody }; }
         const index = requests.length;
         const inputTokens = 101 + index * 103;
         const outputTokens = 11 + index * 7;
-        requests.push({ path: new URL(request.url).pathname, body, inputTokens, outputTokens });
+        requests.push({ path: new URL(request.url).pathname, method: request.method,
+            rawBodyHash: createHash("sha256").update(rawBody).digest("hex"), body, inputTokens, outputTokens });
         captured?.(requests);
         const text = replyText(body);
         const anthropic = new URL(request.url).pathname.endsWith("/messages");

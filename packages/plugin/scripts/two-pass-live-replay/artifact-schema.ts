@@ -107,7 +107,7 @@ export function admissibleGrade(
     return { binding, verdict, actual, attestation, void: !valid };
 }
 export interface SendRecord {
-    kind: "turn_one" | "turn_two" | "check" | "stripped" | "grader" | "regrade" | "calibration";
+    kind: "turn_one" | "turn_two" | "check" | "stripped" | "grader" | "regrade" | "calibration" | "unclassified";
     childId: string;
     request: {
         system: string;

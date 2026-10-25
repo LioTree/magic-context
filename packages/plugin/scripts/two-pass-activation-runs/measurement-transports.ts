@@ -26,8 +26,10 @@ export function measurementTransport(options: {
         kind: "real-host",
         openBroca: async (input) => options.broca ? options.broca.open(input) : null,
         async openAnthropic(input) {
+            let material = input.env.ANTHROPIC_API_KEY;
+            delete input.env.ANTHROPIC_API_KEY;
             const env = disposableEnvironment(input.root);
-            if (input.model !== "claude-sonnet-5-5" || !input.env.ANTHROPIC_API_KEY)
+            if (input.model !== "claude-sonnet-5-5" || !material)
                 throw new Error("measurement_client_binding");
             for (const [key, value] of Object.entries(env))
                 if (input.env[key] !== value) throw new Error("measurement_environment_binding");
@@ -35,14 +37,16 @@ export function measurementTransport(options: {
             mkdirSync(clientRoot, { recursive: true, mode: 0o700 });
             const entry = join(clientRoot, "anthropic-worker.ts");
             copyFileSync(join(import.meta.dir, "anthropic-worker.ts"), entry);
-            const child = spawn(process.execPath, [entry], {
+            let child: ReturnType<typeof spawn>;
+            try { child = spawn(process.execPath, [entry], {
                 cwd: clientRoot, stdio: ["pipe", "pipe", "ignore"],
                 env: { PATH: process.env.PATH, HOME: clientRoot, ...env,
-                    ANTHROPIC_API_KEY: input.env.ANTHROPIC_API_KEY,
+                    ANTHROPIC_API_KEY: material,
                     TWO_PASS_WITNESS: join(clientRoot, "client-witness.jsonl"),
                     ...(options.mockAnthropicEndpoint ? { TWO_PASS_MOCK_ANTHROPIC_ENDPOINT: options.mockAnthropicEndpoint } : {}),
                 },
-            });
+            }); } catch { material = ""; throw new Error("measurement_client_spawn_failed"); }
+            material = "";
             let nextId = 0;
             let closed = false;
             let busy = false;
@@ -58,7 +62,7 @@ export function measurementTransport(options: {
             };
             child.once("error", fail);
             child.once("exit", fail);
-            const lines = createInterface({ input: child.stdout });
+            const lines = createInterface({ input: child.stdout! });
             lines.on("line", (line) => {
                 try {
                     const value = JSON.parse(line);
@@ -76,7 +80,7 @@ export function measurementTransport(options: {
                 lines.close();
                 if (child.exitCode !== null || child.signalCode !== null) return;
                 const exited = new Promise<void>((resolve) => child.once("exit", () => resolve()));
-                child.stdin.end();
+                child.stdin!.end();
                 const timer = setTimeout(() => child.kill("SIGKILL"), 2000);
                 try { await exited; } finally { clearTimeout(timer); }
             };
@@ -92,6 +96,7 @@ export function measurementTransport(options: {
                         if (closed || busy || nextId >= 2) throw new Error("measurement_session_bounds");
                         if (first && (request.system !== first.system || request.model !== first.model ||
                             request.messages.length !== 3 || request.messages[0].content !== first.messages[0].content ||
+                            request.messages[0].role !== "user" || request.messages[2].role !== "user" ||
                             request.messages[1].role !== "assistant" || request.messages[1].content !== firstText))
                             throw new Error("measurement_history_not_retained");
                         if (!first && (request.messages.length !== 1 || request.messages[0].role !== "user"))
@@ -100,7 +105,7 @@ export function measurementTransport(options: {
                         const id = ++nextId;
                         const result = new Promise<MeasurementReply>((resolve, reject) => pending.set(id, { resolve, reject }));
                         const timer = setTimeout(() => { pending.get(id)?.reject(new Error("measurement_send_timeout")); void close(); }, 125_000);
-                        child.stdin.write(`${JSON.stringify({ id, request })}\n`);
+                        child.stdin!.write(`${JSON.stringify({ id, request })}\n`);
                         try {
                             const reply = await result;
                             if (!first) { first = structuredClone(request); firstText = reply.text; }

@@ -209,13 +209,22 @@ export function processActivationTransport(plan: {
             return plan.entrypoint(root);
         },
         async start(input) {
-            const command = await plan.launch(input);
-            const secrets = Object.entries(input.env)
-                .filter(([key]) => key.endsWith("_API_KEY"))
-                .map(([, value]) => value);
-            if (secrets.some((secret) => command.argv.some((arg) => arg.includes(secret))))
-                throw new Error("credential_in_argv");
-            const child = spawn(command.argv[0], command.argv.slice(1), {
+            const credentialKeys = Object.keys(input.env).filter((key) => key.endsWith("_API_KEY"));
+            const secrets = credentialKeys.map((key) => input.env[key]);
+            const forgetInput = () => { for (const key of credentialKeys) delete input.env[key]; };
+            const cleanup = async () => {
+                forgetInput();
+                try { await plan.stopped?.(); } finally { secrets.fill(""); }
+            };
+            let command: Command;
+            try {
+                command = await plan.launch(input);
+                if (secrets.some((secret) => !secret)) throw new Error("empty_prefetched_credential");
+                if (secrets.some((secret) => command.argv.some((arg) => arg.includes(secret))))
+                    throw new Error("credential_in_argv");
+            } catch (error) { await cleanup(); throw error; }
+            let child: ReturnType<typeof spawn>;
+            try { child = spawn(command.argv[0], command.argv.slice(1), {
                 cwd: command.cwd,
                 env: {
                     PATH: process.env.PATH,
@@ -225,21 +234,26 @@ export function processActivationTransport(plan: {
                 // Connection code consumes the endpoint handoff. The mock adapter saves raw logs privately, not in returned evidence.
                 stdio: ["pipe", "pipe", "pipe"],
                 detached: process.platform !== "win32",
-            });
+            }); } catch { await cleanup(); throw new Error("host_spawn_failed"); }
+            // The child has its own environment copy; keep no material in the caller's map.
+            forgetInput();
             try {
                 await new Promise<void>((resolve, reject) => {
                     child.once("spawn", resolve);
                     child.once("error", reject);
                 });
-            } catch { await plan.stopped?.(); throw new Error("host_spawn_failed"); }
+            } catch { await cleanup(); throw new Error("host_spawn_failed"); }
             const signal = (value: NodeJS.Signals) => {
                 try {
                     if (process.platform === "win32") child.kill(value);
                     else process.kill(-child.pid!, value);
                 } catch (error) { if ((error as NodeJS.ErrnoException).code !== "ESRCH") throw error; }
             };
+            let stopped = false;
             const stop = async () => {
-                if (child.exitCode !== null || child.signalCode !== null) { signal("SIGKILL"); await plan.stopped?.(); return; }
+                if (stopped) return;
+                stopped = true;
+                if (child.exitCode !== null || child.signalCode !== null) { signal("SIGKILL"); await cleanup(); return; }
                 const exited = new Promise<void>((resolve) => child.once("exit", () => resolve()));
                 signal("SIGTERM");
                 const timer = setTimeout(() => signal("SIGKILL"), 5000);
@@ -248,7 +262,7 @@ export function processActivationTransport(plan: {
                 } finally {
                     clearTimeout(timer);
                     signal("SIGKILL");
-                    await plan.stopped?.();
+                    await cleanup();
                 }
             };
             try {
@@ -288,7 +302,7 @@ export function readPluginStore(root: string, storePath: string) {
                 .prepare("SELECT * FROM memory_applied_snapshots ORDER BY session_id")
                 .all(),
             memories: db
-                .prepare("SELECT id,content,status,revision FROM memories ORDER BY id")
+                .prepare("SELECT id,project_path,content,status,revision FROM memories ORDER BY id")
                 .all(),
         };
     } finally {

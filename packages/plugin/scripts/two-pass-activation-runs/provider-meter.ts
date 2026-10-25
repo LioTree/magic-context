@@ -1,7 +1,7 @@
 import { createServer, type IncomingHttpHeaders } from "node:http";
 import type { AddressInfo } from "node:net";
-import type { UsageStep } from "../two-pass-live-replay/artifact-schema";
-import type { CallBound, CallMeter } from "./activation-driver";
+import { CostStop, type UsageStep } from "../two-pass-live-replay/artifact-schema";
+import { PostGateBudgetStop, type CallBound, type CallMeter } from "./activation-driver";
 
 type Json = Record<string, unknown>;
 const object = (value: unknown): Json =>
@@ -88,14 +88,17 @@ export async function mockMeteringProxy(input: {
     meter: CallMeter;
     outputCeiling: number;
     classify(path: string, body: string): CallBound["kind"];
+    beforeDispatch?(): Promise<void>;
 }) {
     const upstream = new URL(input.upstream);
     if (upstream.protocol !== "http:" || upstream.hostname !== "127.0.0.1" || upstream.username || upstream.password)
         throw new Error("mock_upstream_must_be_loopback");
     const receipts: DispatchReceipt[] = [];
     const failures: string[] = [];
+    let budgetStop: PostGateBudgetStop | undefined;
     const server = createServer(async (request, response) => {
         try {
+            if (budgetStop) throw budgetStop;
             const chunks: Buffer[] = [];
             let size = 0;
             for await (const chunk of request) {
@@ -111,11 +114,12 @@ export async function mockMeteringProxy(input: {
             target.search = new URL(path, upstream).search;
             const bound: CallBound = {
                 kind: input.classify(path, body), inputTokens: Buffer.byteLength(body),
-                outputCeiling: input.outputCeiling, maxSteps: 1, hostRetries: 0,
+                outputCeiling: requestOutputCeiling(body, input.outputCeiling), maxSteps: 1, hostRetries: 0,
             };
             const result = await meteredDispatch({
                 meter: input.meter, bound,
                 async dispatch() {
+                    await input.beforeDispatch?.();
                     const reply = await fetch(target, {
                         method: request.method, headers: forwardHeaders(request.headers), body,
                         redirect: "error", signal: AbortSignal.timeout(120_000),
@@ -126,9 +130,10 @@ export async function mockMeteringProxy(input: {
             receipts.push({ ...result, request: { path, body } });
             response.writeHead(result.response.status, { "content-type": result.response.contentType });
             response.end(result.response.body);
-        } catch {
+        } catch (error) {
+            if (error instanceof CostStop) budgetStop = error instanceof PostGateBudgetStop ? error : new PostGateBudgetStop(error.message);
             failures.push("provider_dispatch_failed");
-            response.writeHead(502).end("provider_dispatch_failed");
+            response.writeHead(budgetStop ? 402 : 502).end("provider_dispatch_failed");
         }
     });
     await new Promise<void>((resolve, reject) => {
@@ -138,11 +143,19 @@ export async function mockMeteringProxy(input: {
     return {
         url: `http://127.0.0.1:${(server.address() as AddressInfo).port}`,
         receipts, failures,
+        get budgetStop() { return budgetStop; },
         close: () => new Promise<void>((resolve, reject) => {
             server.close((error) => error ? reject(error) : resolve());
             server.closeAllConnections();
         }),
     };
+}
+
+function requestOutputCeiling(body: string, configured: number): number {
+    let request: Json;
+    try { request = object(JSON.parse(body)); } catch { return configured; }
+    return Math.max(configured, ...[request.max_tokens, request.max_completion_tokens, request.max_output_tokens]
+        .filter((value) => value !== undefined && value !== null).map(tokens));
 }
 
 function forwardHeaders(headers: IncomingHttpHeaders): Record<string, string> {
