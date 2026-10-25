@@ -1,0 +1,212 @@
+ck motor run: job_id=01a1731e-5567-7651-90e2-34d8e077b3d9 secret-file=/Users/ufukaltinok/.local/share/cortexkit/ck-motor/direct-secrets/01a1731e-5567-7651-90e2-34d8e077b3d9
+cargo 1.99.0 (5f94df478 2026-08-27)
+rustc 1.99.0 (b940084d7 2026-09-28)
+Python 3.14.4
+=== REREVIEW GATE A1
+    Finished `test` profile [unoptimized + debuginfo] target(s) in 0.22s
+     Running unittests src/lib.rs (/run/motor/target/debug/deps/mc_module-a100b82d7b7ce97d)
+
+running 1 test
+test providers::async_provider::differential_tests::cut_lineage_tests::production_cuts::slice4_review::s4_independent_campaign ... S4 progress=4/300 failed=0 decisions=74 full_passes=83
+S4 progress=8/300 failed=0 decisions=146 full_passes=175
+S4 progress=12/300 failed=0 decisions=217 full_passes=266
+S4 progress=16/300 failed=0 decisions=289 full_passes=355
+S4 progress=20/300 failed=0 decisions=361 full_passes=446
+S4 progress=24/300 failed=0 decisions=431 full_passes=527
+S4 progress=28/300 failed=0 decisions=502 full_passes=609
+S4 progress=32/300 failed=0 decisions=571 full_passes=691
+S4 progress=36/300 failed=0 decisions=654 full_passes=783
+S4 progress=40/300 failed=0 decisions=733 full_passes=867
+S4 progress=44/300 failed=0 decisions=798 full_passes=949
+S4 progress=48/300 failed=0 decisions=870 full_passes=1029
+S4 progress=52/300 failed=0 decisions=934 full_passes=1103
+S4 progress=56/300 failed=0 decisions=997 full_passes=1183
+S4 progress=60/300 failed=0 decisions=1070 full_passes=1272
+S4 progress=64/300 failed=0 decisions=1144 full_passes=1365
+S4 progress=68/300 failed=0 decisions=1221 full_passes=1454
+S4 progress=72/300 failed=0 decisions=1287 full_passes=1538
+S4 progress=76/300 failed=0 decisions=1368 full_passes=1630
+S4 progress=80/300 failed=0 decisions=1435 full_passes=1712
+S4 progress=84/300 failed=0 decisions=1501 full_passes=1796
+S4 progress=88/300 failed=0 decisions=1572 full_passes=1880
+S4 progress=92/300 failed=0 decisions=1638 full_passes=1966
+S4 progress=96/300 failed=0 decisions=1709 full_passes=2052
+S4 progress=100/300 failed=0 decisions=1777 full_passes=2133
+S4 progress=104/300 failed=0 decisions=1850 full_passes=2219
+S4 progress=108/300 failed=0 decisions=1922 full_passes=2300
+S4 progress=112/300 failed=0 decisions=1998 full_passes=2388
+S4 progress=116/300 failed=0 decisions=2064 full_passes=2474
+S4 progress=120/300 failed=0 decisions=2135 full_passes=2558
+S4 progress=124/300 failed=0 decisions=2200 full_passes=2634
+S4 progress=128/300 failed=0 decisions=2277 full_passes=2719
+S4 progress=132/300 failed=0 decisions=2352 full_passes=2809
+S4 progress=136/300 failed=0 decisions=2413 full_passes=2894
+S4 progress=140/300 failed=0 decisions=2488 full_passes=2986
+S4 progress=144/300 failed=0 decisions=2561 full_passes=3063
+S4 progress=148/300 failed=0 decisions=2630 full_passes=3144
+S4 progress=152/300 failed=0 decisions=2711 full_passes=3232
+S4 progress=156/300 failed=0 decisions=2779 full_passes=3317
+S4 progress=160/300 failed=0 decisions=2856 full_passes=3405
+S4 progress=164/300 failed=0 decisions=2935 full_passes=3491
+S4 progress=168/300 failed=0 decisions=3009 full_passes=3576
+S4 progress=172/300 failed=0 decisions=3091 full_passes=3660
+S4 progress=176/300 failed=0 decisions=3165 full_passes=3745
+S4 progress=180/300 failed=0 decisions=3234 full_passes=3828
+S4 progress=184/300 failed=0 decisions=3301 full_passes=3908
+S4 progress=188/300 failed=0 decisions=3372 full_passes=3988
+S4 progress=192/300 failed=0 decisions=3441 full_passes=4069
+S4 progress=196/300 failed=0 decisions=3516 full_passes=4160
+S4 progress=200/300 failed=0 decisions=3591 full_passes=4246
+S4 progress=204/300 failed=0 decisions=3675 full_passes=4342
+S4 progress=208/300 failed=0 decisions=3742 full_passes=4428
+S4 progress=212/300 failed=0 decisions=3809 full_passes=4507
+S4 progress=216/300 failed=0 decisions=3879 full_passes=4591
+S4 progress=220/300 failed=0 decisions=3948 full_passes=4681
+S4 progress=224/300 failed=0 decisions=4015 full_passes=4767
+S4 progress=228/300 failed=0 decisions=4080 full_passes=4849
+S4 progress=232/300 failed=0 decisions=4148 full_passes=4943
+S4 progress=236/300 failed=0 decisions=4225 full_passes=5034
+S4 progress=240/300 failed=0 decisions=4294 full_passes=5121
+S4 progress=244/300 failed=0 decisions=4366 full_passes=5213
+S4 progress=248/300 failed=0 decisions=4440 full_passes=5298
+S4 progress=252/300 failed=0 decisions=4513 full_passes=5383
+S4 progress=256/300 failed=0 decisions=4580 full_passes=5471
+S4 progress=260/300 failed=0 decisions=4639 full_passes=5548
+S4 progress=264/300 failed=0 decisions=4712 full_passes=5635
+S4 progress=268/300 failed=0 decisions=4785 full_passes=5720
+S4 progress=272/300 failed=0 decisions=4862 full_passes=5807
+S4 progress=276/300 failed=0 decisions=4927 full_passes=5895
+S4 progress=280/300 failed=0 decisions=4997 full_passes=5974
+S4 progress=284/300 failed=0 decisions=5063 full_passes=6058
+S4 progress=288/300 failed=0 decisions=5133 full_passes=6148
+S4 progress=292/300 failed=0 decisions=5212 full_passes=6231
+S4 progress=296/300 failed=0 decisions=5285 full_passes=6310
+S4 progress=300/300 failed=0 decisions=5362 full_passes=6394
+S4 SUMMARY sessions=300 seeds=1779033703..=1779034002 steps_per_cut=12 step_kinds=Some([0, 1, 2, 3, 4, 5, 6, 9, 10, 11]) codecs=4 failed=0 matched_decisions=5362 proved_full_passes=6394 revert=true max_prelude_bytes=14853 prelude_deferrals=0 largest_deferred_bytes=0 staged_cuts=3084 opencode_reverts=150 pi_tree_switches=150 cut_deferrals={"cut_seed_unheld": 3}
+ok
+
+test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 3012 filtered out; finished in 1871.09s
+
+=== REREVIEW RESULT A1 0
+=== REREVIEW GATE A2
+    Finished `test` profile [unoptimized + debuginfo] target(s) in 0.20s
+
+running 1 test
+test providers::async_provider::differential_tests::cut_lineage_tests::production_cuts::slice4_review::s4_independent_campaign ...      Running unittests src/lib.rs (/run/motor/target/debug/deps/mc_module-a100b82d7b7ce97d)
+S4 progress=4/300 failed=0 decisions=63 full_passes=87
+S4 progress=8/300 failed=0 decisions=133 full_passes=168
+S4 progress=12/300 failed=0 decisions=209 full_passes=248
+S4 progress=16/300 failed=0 decisions=270 full_passes=332
+S4 progress=20/300 failed=0 decisions=337 full_passes=419
+S4 progress=24/300 failed=0 decisions=407 full_passes=499
+S4 progress=28/300 failed=0 decisions=480 full_passes=584
+S4 progress=32/300 failed=0 decisions=550 full_passes=669
+S4 progress=36/300 failed=0 decisions=623 full_passes=751
+S4 progress=40/300 failed=0 decisions=695 full_passes=838
+S4 progress=44/300 failed=0 decisions=768 full_passes=925
+S4 progress=48/300 failed=0 decisions=839 full_passes=1014
+S4 progress=52/300 failed=0 decisions=915 full_passes=1100
+S4 progress=56/300 failed=0 decisions=988 full_passes=1190
+S4 progress=60/300 failed=0 decisions=1064 full_passes=1276
+S4 progress=64/300 failed=0 decisions=1134 full_passes=1371
+S4 progress=68/300 failed=0 decisions=1207 full_passes=1451
+S4 progress=72/300 failed=0 decisions=1286 full_passes=1542
+S4 progress=76/300 failed=0 decisions=1364 full_passes=1630
+S4 progress=80/300 failed=0 decisions=1439 full_passes=1717
+S4 progress=84/300 failed=0 decisions=1509 full_passes=1811
+S4 progress=88/300 failed=0 decisions=1572 full_passes=1897
+S4 progress=92/300 failed=0 decisions=1644 full_passes=1979
+S4 progress=96/300 failed=0 decisions=1718 full_passes=2061
+S4 progress=100/300 failed=0 decisions=1785 full_passes=2137
+S4 progress=104/300 failed=0 decisions=1864 full_passes=2229
+S4 progress=108/300 failed=0 decisions=1943 full_passes=2314
+S4 progress=112/300 failed=0 decisions=2016 full_passes=2410
+S4 progress=116/300 failed=0 decisions=2086 full_passes=2499
+S4 progress=120/300 failed=0 decisions=2155 full_passes=2590
+S4 progress=124/300 failed=0 decisions=2235 full_passes=2680
+S4 progress=128/300 failed=0 decisions=2306 full_passes=2765
+S4 progress=132/300 failed=0 decisions=2379 full_passes=2855
+S4 progress=136/300 failed=0 decisions=2465 full_passes=2947
+S4 progress=140/300 failed=0 decisions=2532 full_passes=3032
+S4 progress=144/300 failed=0 decisions=2605 full_passes=3120
+S4 progress=148/300 failed=0 decisions=2678 full_passes=3206
+S4 progress=152/300 failed=0 decisions=2749 full_passes=3294
+S4 progress=156/300 failed=0 decisions=2819 full_passes=3379
+S4 progress=160/300 failed=0 decisions=2889 full_passes=3459
+S4 progress=164/300 failed=0 decisions=2959 full_passes=3539
+S4 progress=168/300 failed=0 decisions=3030 full_passes=3622
+S4 progress=172/300 failed=0 decisions=3090 full_passes=3703
+S4 progress=176/300 failed=0 decisions=3168 full_passes=3790
+S4 progress=180/300 failed=0 decisions=3236 full_passes=3878
+S4 progress=184/300 failed=0 decisions=3311 full_passes=3967
+S4 progress=188/300 failed=0 decisions=3379 full_passes=4051
+S4 progress=192/300 failed=0 decisions=3451 full_passes=4137
+S4 progress=196/300 failed=0 decisions=3525 full_passes=4223
+S4 progress=200/300 failed=0 decisions=3600 full_passes=4303
+S4 progress=204/300 failed=0 decisions=3674 full_passes=4390
+S4 progress=208/300 failed=0 decisions=3750 full_passes=4471
+S4 progress=212/300 failed=0 decisions=3822 full_passes=4555
+S4 progress=216/300 failed=0 decisions=3895 full_passes=4637
+S4 progress=220/300 failed=0 decisions=3961 full_passes=4725
+S4 progress=224/300 failed=0 decisions=4033 full_passes=4810
+S4 progress=228/300 failed=0 decisions=4102 full_passes=4894
+S4 progress=232/300 failed=0 decisions=4171 full_passes=4977
+S4 progress=236/300 failed=0 decisions=4245 full_passes=5061
+S4 progress=240/300 failed=0 decisions=4318 full_passes=5151
+S4 progress=244/300 failed=0 decisions=4394 full_passes=5244
+S4 progress=248/300 failed=0 decisions=4467 full_passes=5334
+S4 progress=252/300 failed=0 decisions=4533 full_passes=5416
+S4 progress=256/300 failed=0 decisions=4605 full_passes=5498
+S4 progress=260/300 failed=0 decisions=4675 full_passes=5586
+S4 progress=264/300 failed=0 decisions=4743 full_passes=5666
+S4 progress=268/300 failed=0 decisions=4820 full_passes=5751
+S4 progress=272/300 failed=0 decisions=4887 full_passes=5840
+S4 progress=276/300 failed=0 decisions=4956 full_passes=5922
+S4 progress=280/300 failed=0 decisions=5033 full_passes=6011
+S4 progress=284/300 failed=0 decisions=5114 full_passes=6093
+S4 progress=288/300 failed=0 decisions=5183 full_passes=6177
+S4 progress=292/300 failed=0 decisions=5257 full_passes=6261
+S4 progress=296/300 failed=0 decisions=5331 full_passes=6349
+S4 progress=300/300 failed=0 decisions=5406 full_passes=6437
+S4 SUMMARY sessions=300 seeds=1779034003..=1779034302 steps_per_cut=12 step_kinds=Some([0, 1, 2, 3, 4, 5, 6, 9, 10, 11]) codecs=4 failed=0 matched_decisions=5406 proved_full_passes=6437 revert=true max_prelude_bytes=14853 prelude_deferrals=0 largest_deferred_bytes=0 staged_cuts=3073 opencode_reverts=150 pi_tree_switches=150 cut_deferrals={}
+ok
+
+test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 3012 filtered out; finished in 1857.21s
+
+=== REREVIEW RESULT A2 0
+=== REREVIEW GATE B
+
+running 1 test
+test providers::async_provider::differential_tests::cut_lineage_tests::production_cuts::slice4_review::s4_independent_campaign ...     Finished `test` profile [unoptimized + debuginfo] target(s) in 0.14s
+     Running unittests src/lib.rs (/run/motor/target/debug/deps/mc_module-a100b82d7b7ce97d)
+S4 progress=4/100 failed=0 decisions=64 full_passes=86
+S4 progress=8/100 failed=0 decisions=138 full_passes=174
+S4 progress=12/100 failed=0 decisions=213 full_passes=268
+S4 progress=16/100 failed=0 decisions=277 full_passes=355
+S4 progress=20/100 failed=0 decisions=344 full_passes=437
+S4 progress=24/100 failed=0 decisions=410 full_passes=527
+S4 progress=28/100 failed=0 decisions=477 full_passes=613
+S4 progress=32/100 failed=0 decisions=542 full_passes=696
+S4 progress=36/100 failed=0 decisions=613 full_passes=787
+S4 progress=40/100 failed=0 decisions=680 full_passes=878
+S4 progress=44/100 failed=0 decisions=743 full_passes=969
+S4 progress=48/100 failed=0 decisions=797 full_passes=1054
+S4 progress=52/100 failed=0 decisions=862 full_passes=1128
+S4 progress=56/100 failed=0 decisions=924 full_passes=1211
+S4 progress=60/100 failed=0 decisions=987 full_passes=1296
+S4 progress=64/100 failed=0 decisions=1053 full_passes=1383
+S4 progress=68/100 failed=0 decisions=1118 full_passes=1462
+S4 progress=72/100 failed=0 decisions=1185 full_passes=1551
+S4 progress=76/100 failed=0 decisions=1262 full_passes=1644
+S4 progress=80/100 failed=0 decisions=1335 full_passes=1742
+S4 progress=84/100 failed=0 decisions=1395 full_passes=1826
+S4 progress=88/100 failed=0 decisions=1458 full_passes=1910
+S4 progress=92/100 failed=0 decisions=1512 full_passes=1991
+S4 progress=96/100 failed=0 decisions=1572 full_passes=2072
+ok
+
+test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 3012 filtered out; finished in 460.65s
+
+S4 progress=100/100 failed=0 decisions=1637 full_passes=2157
+S4 SUMMARY sessions=100 seeds=3144134277..=3144134376 steps_per_cut=12 step_kinds=None codecs=4 failed=0 matched_decisions=1637 proved_full_passes=2157 revert=false max_prelude_bytes=14853 prelude_deferrals=0 largest_deferred_bytes=0 staged_cuts=995 opencode_reverts=50 pi_tree_switches=50 cut_deferrals={}
+=== REREVIEW RESULT B 0

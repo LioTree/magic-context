@@ -1,0 +1,2 @@
+ck motor run: job_id=01a1731b-9782-746e-9dcf-fcdeb2f750dd secret-file=/Users/ufukaltinok/.local/share/cortexkit/ck-motor/direct-secrets/01a1731b-9782-746e-9dcf-fcdeb2f750dd
+ck motor run: refused before start: runner_draining: runner draining before queued command started (job_id=01a1731b-9782-746e-9dcf-fcdeb2f750dd)
