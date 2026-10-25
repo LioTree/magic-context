@@ -1048,6 +1048,7 @@ mod tests {
     /// A fixed repository (fixed author, dates and content) has a fixed root commit, so the
     /// host's answer for it is a golden value too. Every spelling of a place inside the
     /// checkout (a worktree, a subdirectory, a trailing slash, a symlink) resolves to it.
+    #[cfg(unix)]
     #[test]
     fn a_checkout_resolves_to_the_hosts_root_commit_identity_from_every_spelling() {
         let dir = tempfile::tempdir().unwrap();
@@ -1742,6 +1743,7 @@ mod pin_tests {
         }
     }
 
+    #[cfg(unix)]
     #[test]
     fn common_dir_follows_symlinks_without_git_probes() {
         let temp = tempfile::tempdir().unwrap();
@@ -1761,6 +1763,7 @@ mod pin_tests {
         assert_eq!(GIT_PROBES.with(|probes| probes.get()), 0);
     }
 
+    #[cfg(unix)]
     #[test]
     fn root_pin_requires_equal_canonical_spellings_and_preserves_existing_pins() {
         let temp = tempfile::tempdir().unwrap();

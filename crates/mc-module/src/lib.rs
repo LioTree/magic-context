@@ -50,6 +50,7 @@ pub mod dream_dispatch;
 pub mod dream_tasks;
 pub mod historian_routed;
 mod memory_actions;
+mod memory_context;
 mod model_work;
 pub mod persona_host;
 
@@ -39117,6 +39118,7 @@ mod tests {
     }
 
     /// Scratch-only socket adapter: isolates handler costs from daemon admission and framing.
+    #[cfg(unix)]
     #[tokio::test(flavor = "current_thread")]
     #[ignore = "run with packages/plugin/scripts/cereb-full-sync-probe.ts and MC_SYNC_PROBE_SOCKET"]
     async fn cereb_full_sync_socket_probe() {
