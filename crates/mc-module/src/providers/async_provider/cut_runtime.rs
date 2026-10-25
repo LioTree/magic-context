@@ -531,7 +531,7 @@ impl AsyncRecord {
                 .any(|cut| namespace == format!("{prefix}{}", cut.generation));
         if !referenced {
             store
-                .discard_staged_namespace(&namespace, &self.key.project.to_string_lossy())
+                .discard_staged_namespace(&namespace, &self.project().to_string_lossy())
                 .map_err(transient)?;
             store
                 .retire_unannounced_async_view(&self.reference(), pending.version)

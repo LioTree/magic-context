@@ -386,25 +386,29 @@ async fn async_wrapup_refuses_another_runner() {
     assert!(rig.h.wrapup_sessions.lock().unwrap().is_empty());
 }
 
+/// The conversation is the attested runner's, keyed without the folder
+/// (compaction-provider contract §1): its owner reaches it through any
+/// spelling of the project folder. Another runner stays refused (above).
 #[tokio::test]
-async fn async_wrapup_refuses_another_project() {
+async fn async_wrapup_admits_the_owner_runner_from_another_folder_spelling() {
     let dir = tempfile::tempdir().unwrap();
-    let (rig, child) = fixture(dir.path()).await;
+    let (rig, _child) = fixture(dir.path()).await;
     let mut binding = rig.h.facade_binding(7).unwrap();
     binding.project_root = dir.path().join("other");
-    assert!(rig
-        .h
-        .request_async_wrapup(
-            &binding,
-            &AsyncWrapupTarget {
-                reference: rig.reference.clone(),
-                lineage: "L".into()
-            },
-            20
-        )
-        .await
-        .is_err());
-    assert!(child.sends().is_empty());
+    assert_eq!(
+        rig.h
+            .request_async_wrapup(
+                &binding,
+                &AsyncWrapupTarget {
+                    reference: rig.reference.clone(),
+                    lineage: "L".into()
+                },
+                20
+            )
+            .await
+            .unwrap(),
+        AsyncWrapupAdmission::Accepted
+    );
 }
 
 #[tokio::test]

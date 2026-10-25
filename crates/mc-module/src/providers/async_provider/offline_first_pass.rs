@@ -103,6 +103,7 @@ impl EntryInputProof {
         entries: &held_entries::HeldEntries,
         lineage: &str,
         count: Option<u64>,
+        codec: codec::Codec,
     ) -> Result<Option<Self>, HandlerOutcome> {
         let count = match count {
             Some(count) => count,
@@ -118,7 +119,7 @@ impl EntryInputProof {
             let entry = held.read()?;
             // Strict: an entry held from an inline read has no served digest,
             // and the proof never hashes one in the runner's place.
-            check_served_identity(&entry)?;
+            check_served_identity(&entry, codec)?;
             hash.update(ordinal.to_le_bytes());
             framed(&mut hash, entry.mid.as_bytes());
             framed(&mut hash, served_digest(&entry)?.as_bytes());
@@ -144,14 +145,15 @@ fn hex(bytes: &[u8]) -> String {
     bytes.iter().map(|byte| format!("{byte:02x}")).collect()
 }
 
-/// Digest of a Setup request and the route identity it arrives on. The
+/// Digest of a Setup request and the attested runner it arrives from. The
 /// request is compared as canonical JSON (RFC 8785) without `request_id` and
 /// `now`, which differ on every call; everything else, including `params`,
 /// `composition`, `preset`, `model`, `context_window` and `lineage_id`, must
-/// be equal.
+/// be equal. The route's project folder is left out: it is route metadata,
+/// and a live Setup that arrives on another spelling of the same folder is
+/// the same conversation.
 pub(crate) fn setup_identity_digest(
     request: &compact::setup::SetupRequest,
-    project_root: &Path,
     runner_module: &str,
 ) -> Result<String, HandlerOutcome> {
     let mut value = serde_json::to_value(request).map_err(transient)?;
@@ -162,7 +164,6 @@ pub(crate) fn setup_identity_digest(
     let canonical = serde_jcs::to_string(&value).map_err(transient)?;
     let mut hash = Sha256::new();
     framed(&mut hash, b"mc-offline-setup/v1");
-    framed(&mut hash, project_root.to_string_lossy().as_bytes());
     framed(&mut hash, runner_module.as_bytes());
     framed(&mut hash, canonical.as_bytes());
     Ok(hex(&hash.finalize()))
@@ -202,11 +203,10 @@ pub(super) fn setup_mismatch(
     if offline.version != MARKER_VERSION {
         return Some("marker_version_differs");
     }
-    let module = match &binding.principal {
-        Some(subc_protocol::Principal::Reserved { module_id }) => module_id.as_str(),
-        _ => return Some("setup_differs"),
+    let Some(module) = super::records::attested_runner(binding) else {
+        return Some("setup_differs");
     };
-    match setup_identity_digest(request, &binding.project_root, module) {
+    match setup_identity_digest(request, module) {
         Ok(digest) if digest == offline.setup => None,
         _ => Some("setup_differs"),
     }
@@ -530,7 +530,8 @@ impl McHandler {
         state.reminder_cadence = cadence;
         state.lineage = held_lineage;
         read?;
-        EntryInputProof::of(&served, lineage, Some(count))
+        let codec = codec::Codec::from_params(&Value::Object(state.setup.params.clone()))?;
+        EntryInputProof::of(&served, lineage, Some(count), codec)
     }
 
     /// Adopt or discard an offline-prepared record on its first live notice;
@@ -665,10 +666,9 @@ impl McHandler {
         };
         self.bind_route(OFFLINE_CHANNEL, binding.clone());
         let key = Key::new(&binding, &request.session, &request.harness).map_err(interrupted)?;
-        let reference = session_ref(&key.harness, &key.project.to_string_lossy(), &key.session);
+        let reference = key.reference();
         let setup_digest =
-            setup_identity_digest(request, &setup.project_root, &setup.runner_module)
-                .map_err(interrupted)?;
+            setup_identity_digest(request, &setup.runner_module).map_err(interrupted)?;
         let describe_digest =
             runner_describe_digest(&setup.runner_describe).map_err(interrupted)?;
         if load_head(store, &reference).map_err(interrupted)?.is_some() {
@@ -772,7 +772,7 @@ impl McHandler {
         self.publish_async(0, &mut state, codec, false)
             .map_err(interrupted)?;
         state.engine_failed = false;
-        let proof = EntryInputProof::of(&state.entries, &lineage, None)
+        let proof = EntryInputProof::of(&state.entries, &lineage, None, codec)
             .map_err(interrupted)?
             .ok_or_else(|| {
                 OfflineError::Refused(

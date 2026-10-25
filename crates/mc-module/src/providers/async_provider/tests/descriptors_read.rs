@@ -3,6 +3,79 @@
 //! refs, and tag numbers are only ever the ones the current read shows.
 use super::*;
 
+/// Read Broca's message 14 (a lone tool call with an unnumbered tag row, as
+/// a Broca runner served it) through the ordinary descriptors-mode read, with
+/// its tag rows served as captured or cleared.
+async fn read_broca_m14(
+    clear_tags: bool,
+) -> (
+    tempfile::TempDir,
+    Rig,
+    State,
+    ReadMessage,
+    Result<(), String>,
+) {
+    let dir = tempfile::tempdir().unwrap();
+    let rig = Rig::open(
+        dir.path(),
+        "broca",
+        "broca",
+        json!({"serializer_profile":"owned-broca"}),
+    )
+    .await;
+    let mut entry: ReadMessage = serde_json::from_str(include_str!(
+        "../../../../testdata/broca-m14-read-message.json"
+    ))
+    .unwrap();
+    if clear_tags {
+        entry.tags.clear();
+    }
+    *rig.runner.page_override.lock().unwrap() =
+        Some(json!({"lineage_id":"L","messages":[entry.clone()]}));
+    let mut state = rig.state();
+    let read = rig
+        .h
+        .read_async_resumable(&mut state, 14, Duration::from_secs(5))
+        .await
+        .map(|_| ())
+        .map_err(|error| format!("{error:?}"));
+    assert!(rig
+        .runner
+        .reads
+        .lock()
+        .unwrap()
+        .iter()
+        .any(|params| params["media"] == "descriptors"));
+    (dir, rig, state, entry, read)
+}
+
+/// The served entry lists its one part in both `part_digests` and its tag
+/// rows (with no tag number), so the read accepts it unchanged and indexes
+/// no number for it.
+#[tokio::test]
+async fn broca_m14_descriptors_with_an_unnumbered_tag_row_are_accepted() {
+    let (_dir, _rig, mut state, entry, read) = read_broca_m14(false).await;
+    read.unwrap();
+    state.reindex().unwrap();
+    assert_eq!(state.entries[&14].read().unwrap(), entry);
+    assert!(state.tag_index.is_empty());
+}
+
+/// The same entry with its tag rows dropped: a descriptors read must list
+/// every `part_digests` key among the entry's tag rows, so the read is
+/// refused by name and nothing is held.
+#[tokio::test]
+async fn broca_m14_descriptors_without_tag_rows_are_refused_by_name() {
+    let (_dir, _rig, state, _entry, read) = read_broca_m14(true).await;
+    let error = read.unwrap_err();
+    assert!(
+        error.contains("served_digest_missing: message m14 at ordinal 14")
+            && error.contains("descriptors read missing tags rows"),
+        "{error}"
+    );
+    assert!(!state.entries.contains_key(&14));
+}
+
 /// The base64 of a 1920x1080 PNG from the shared image-token fixture.
 fn png_1920x1080() -> String {
     let cases: Vec<Value> =

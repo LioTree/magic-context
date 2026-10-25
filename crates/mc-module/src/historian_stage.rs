@@ -209,7 +209,7 @@ pub(crate) fn recover_broca_stage(
         crate::historian_producer::HISTORIAN_MAX_OUTPUT_TOKENS,
         request["temperature"].as_f64(),
         // Stage sends are dispatched without retention; see `start_stage_with_generation`.
-        None,
+        crate::child_retention::ChildRetention::Nothing,
     )
     .map_err(|e| HostStoreError::OpenFailed {
         path: session.into(),

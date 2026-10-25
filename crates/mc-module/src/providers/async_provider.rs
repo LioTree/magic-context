@@ -3,7 +3,7 @@ use super::codec::{InboundMessage, OutboundMessage};
 use super::*;
 use compact::{self as contract, ceiling::CeilingPolicy, notice, ride, view};
 use cortexkit_bus_trait::{ContentDigest, DurableOwner, Stream, StreamCursor};
-use cortexkit_role_llm_runner::{read::ReadMessage, session_ref, tags};
+use cortexkit_role_llm_runner::{read::ReadMessage, tags};
 use serde::Deserialize;
 mod contract_policy;
 mod cut_runtime;
@@ -31,6 +31,19 @@ use moved_session::CheckpointSource;
 use resident::{EngineView, HeldEntry};
 #[cfg(test)]
 use scaling_tests::reminder_work;
+
+/// The shared session reference for a bare runner module id, harness and
+/// session, derived without `Key` so tests check the provider's keys against
+/// the shared function. Named apart from the crate's `session_ref` so a call
+/// still passing the old `(harness, folder, session)` strings cannot compile.
+#[cfg(test)]
+fn runner_session_ref(runner: &str, harness: &str, session: &str) -> String {
+    cortexkit_role_llm_runner::session_ref(&cortexkit_role_llm_runner::SessionIdentity {
+        runner,
+        harness,
+        session,
+    })
+}
 
 /// Bound Setup's wait to the existing five-second issuer-call or NATS-connect
 /// timeout; the retrying attach continues in the background, and no global lock
@@ -270,8 +283,10 @@ pub(crate) struct AsyncRecord {
     #[serde(default)]
     reminder_baseline_generation: Option<u64>,
     key: Key,
-    #[serde(default)]
-    runner_identity: Option<session_resolver::RunnerBindIdentity>,
+    /// The reverse-call identity recorded at Setup. Its `project_root` is the
+    /// folder of the route that delivered Setup: route metadata for config,
+    /// docs and project memories, never part of the conversation's key.
+    runner_identity: session_resolver::RunnerBindIdentity,
     runner_module: String,
     setup: compact::setup::SetupRequest,
     initial: Value,
@@ -743,17 +758,15 @@ fn missing_served_digest(entry: &ReadMessage, reason: impl std::fmt::Display) ->
 }
 
 /// Check a newly read message carries the runner's content identity:
-/// a message `digest` and one `part_digests` row per exposed part, keyed as
-/// its tag rows are. A runner that serves none in descriptors mode is
-/// refused by name; ck-mc never hashes a descriptor in its place.
-fn check_served_identity(entry: &ReadMessage) -> Result<(), HandlerOutcome> {
-    let keys = entry
-        .tags
-        .iter()
-        .map(|row| row.part.clone())
-        .collect::<Vec<_>>();
+/// a message `digest` and one `part_digests` row per top-level part of the
+/// message under the session's serializer profile, keyed exactly as its tag
+/// rows are and in the same order. The rule is llm-runner's own
+/// provider-side check, `ReadMessage::check_descriptor_rows`. A runner that
+/// serves none in descriptors mode is refused by name; ck-mc never hashes a
+/// descriptor in its place.
+fn check_served_identity(entry: &ReadMessage, codec: codec::Codec) -> Result<(), HandlerOutcome> {
     entry
-        .check_descriptors(&keys)
+        .check_descriptor_rows(codec.wire_id())
         .map_err(|reason| missing_served_digest(entry, reason))
 }
 
@@ -803,17 +816,51 @@ fn inline_digest(entry: &ReadMessage, body: &Value) -> Result<String, HandlerOut
     Ok(contract::digest::content_digest(body))
 }
 
+/// The stored records of the conversations a tool or flush call's route names.
+///
+/// A route attested to a session runner names its conversations by that
+/// runner and the bound session, whatever folder spelling the route carries.
+/// A route with no attested runner, such as a Claude Code MCP facade, names
+/// a conversation by its session, admitted only when the route's folder is
+/// exactly the folder of the route that delivered Setup. That folder filters
+/// such routes; it is never part of the conversation's key.
+pub(super) fn route_records(
+    store: &McStore,
+    binding: &SessionBinding,
+) -> Result<Vec<String>, HandlerOutcome> {
+    if let Some(runner) = records::attested_runner(binding)
+        .filter(|module| crate::route_targets::SESSION_RUNNER_MODULE_IDS.contains(module))
+    {
+        return store
+            .async_compaction_for_session(runner, &binding.session)
+            .map_err(transient);
+    }
+    #[derive(Deserialize)]
+    struct SetupRoute {
+        runner_identity: session_resolver::RunnerBindIdentity,
+    }
+    let mut admitted = Vec::new();
+    for raw in store
+        .async_compaction_records_for_session(&binding.session)
+        .map_err(transient)?
+    {
+        let route: SetupRoute = serde_json::from_str(&raw).map_err(transient)?;
+        if route.runner_identity.project_root.as_os_str() == binding.project_root.as_os_str() {
+            admitted.push(raw);
+        }
+    }
+    Ok(admitted)
+}
+
 impl State {
     fn runner_identity(&self) -> session_resolver::RunnerBindIdentity {
-        self.runner_identity.clone().unwrap_or_else(|| {
-            // For older records without a stored identity, rebuild it from the
-            // project key and the harness and session retained in Setup.
-            session_resolver::RunnerBindIdentity {
-                project_root: self.key.project.clone(),
-                harness: self.setup.harness.clone(),
-                session: self.setup.session.clone(),
-            }
-        })
+        self.runner_identity.clone()
+    }
+
+    /// The project folder of the route that delivered Setup, for config, docs
+    /// and project memories. Never part of the conversation's key.
+    fn project(&self) -> &Path {
+        &self.runner_identity.project_root
     }
 
     fn runner(&self) -> Result<crate::route_targets::SessionRunnerRoute, HandlerOutcome> {
@@ -826,11 +873,7 @@ impl State {
         .ok_or_else(|| invalid_field("runner", "unsupported session runner principal"))
     }
     fn reference(&self) -> String {
-        session_ref(
-            &self.key.harness,
-            &self.key.project.to_string_lossy(),
-            &self.key.session,
-        )
+        self.key.reference()
     }
     fn namespace(&self) -> String {
         format!("{}:async:{}", self.key.engine_key(), self.generation)
@@ -1946,7 +1989,7 @@ impl McHandler {
             moved_session::Fence::Moved(record) => Some(record),
             moved_session::Fence::Refuse(answer) => return bytes(&answer),
         };
-        let reference = session_ref(&key.harness, &key.project.to_string_lossy(), &key.session);
+        let reference = key.reference();
         let existing = load_head(store, &reference)?;
         let unsafe_existing = existing
             .as_ref()
@@ -2038,7 +2081,7 @@ impl McHandler {
             let project = self.historian_lane_project(channel, binding, store)?;
             self.record_session_runner_dream_target(
                 &project,
-                &state.key.project,
+                state.project(),
                 &state.key.harness,
                 state.runner()?,
             );
@@ -2182,7 +2225,8 @@ impl McHandler {
             .store
             .get()
             .ok_or_else(|| transient("store unavailable"))?;
-        let reference = session_ref(&key.harness, &key.project.to_string_lossy(), &key.session);
+        let reference = key.reference();
+        let runner_module = key.runner.clone();
         let codec = codec::Codec::from_params(&Value::Object(request.params.clone()))?;
         let chosen = preset(request.preset.as_deref())?;
         let mut engine = transform::compaction::State::new(reference.clone(), chosen);
@@ -2218,20 +2262,12 @@ impl McHandler {
             retired_frozen: Default::default(),
             reminder_baseline_generation: None,
             key,
-            runner_identity: Some(session_resolver::RunnerBindIdentity {
+            runner_identity: session_resolver::RunnerBindIdentity {
                 project_root: binding.project_root.clone(),
                 harness: request.harness.clone(),
                 session: request.session.clone(),
-            }),
-            runner_module: match &binding.principal {
-                Some(subc_protocol::Principal::Reserved { module_id }) => module_id.clone(),
-                _ => {
-                    return Err(invalid_field(
-                        "compaction_mode",
-                        "async requires an attested runner",
-                    ))
-                }
             },
+            runner_module,
             setup: request.clone(),
             initial: Value::Null,
             cache_policy: contract_policy::CachePolicy::freeze(
@@ -2275,11 +2311,11 @@ impl McHandler {
             Some(json!({"module_id":route.module_id(),"parent_session":route.parent_session()}));
         let project = self.historian_lane_project(channel, binding, store)?;
         state.dream_target = Some(
-            json!({"project":project,"directory":state.key.project,"harness":state.key.harness,"route":state.runner_route}),
+            json!({"project":project,"directory":state.project(),"harness":state.key.harness,"route":state.runner_route}),
         );
         self.record_session_runner_dream_target(
             &project,
-            &state.key.project,
+            state.project(),
             &state.key.harness,
             route,
         );
@@ -4113,11 +4149,13 @@ impl McHandler {
                         return Err(transient("async entry changed on re-read"));
                     }
                 } else {
-                    check_served_identity(&entry)?;
+                    let codec =
+                        codec::Codec::from_params(&Value::Object(state.setup.params.clone()))?;
+                    check_served_identity(&entry, codec)?;
                     if let Some(cadence) = &mut state.reminder_cadence {
                         state.reminder_echoes.ingest(
                             &entry,
-                            codec::Codec::from_params(&Value::Object(state.setup.params.clone()))?,
+                            codec,
                             &mut cadence.ledger,
                             now_ms().max(0) as u64,
                         )?;
@@ -4163,7 +4201,7 @@ impl McHandler {
         drop(meter);
         #[cfg(test)]
         let meter = scaling_tests::save_meter::start_kind(&notice.session_ref, "rem:last");
-        let config = self.effective_config(&state.key.project);
+        let config = self.effective_config(state.project());
         // Only the newest one or two entries are read here. The running
         // totals cover the rest; the tag hints, which need the uncovered tail,
         // are computed only if a reminder is actually sent.
@@ -4836,9 +4874,9 @@ impl McHandler {
         binding: &SessionBinding,
         state: &State,
     ) -> Result<(), HandlerOutcome> {
-        if binding.project_root.as_os_str() != state.key.project.as_os_str()
-            || !matches!(&binding.principal,Some(subc_protocol::Principal::Reserved{module_id}) if module_id==&state.runner_module)
-        {
+        // Only the attested runner owns the conversation; the route's folder
+        // spelling is metadata and may differ from the one Setup arrived on.
+        if records::attested_runner(binding) != Some(state.key.runner.as_str()) {
             return Err(invalid_field(
                 "session_ref",
                 "async conversation is owned by another runner",
@@ -4970,9 +5008,7 @@ impl McHandler {
             .store
             .get()
             .ok_or_else(|| transient("store unavailable"))?;
-        let rows = store
-            .async_compaction_for_session(&binding.project_root.to_string_lossy(), &binding.session)
-            .map_err(transient)?;
+        let rows = route_records(store, binding)?;
         if rows.len() != 1 {
             return Err(session_unresolved_error());
         }
@@ -5229,7 +5265,7 @@ impl McHandler {
         let session_model = state.setup.model.clone();
         let generation = state.generation;
         let cadence = state.historian_cadence.clone();
-        let settings = self.historian_settings_loader()(&state.key.project);
+        let settings = self.historian_settings_loader()(state.project());
         let harness = state.key.harness.clone();
         let reminder_echoes = state.reminder_echoes.clone();
         let historian_seed = state.cut_seed.clone();
@@ -5369,7 +5405,7 @@ impl McHandler {
     }
 
     fn async_historian_fields(&self, state: &State) -> Value {
-        let settings = self.historian_settings_loader()(&state.key.project);
+        let settings = self.historian_settings_loader()(state.project());
         Value::Object(
             super::historian_config::resolve_for_session(
                 &settings,
@@ -5798,11 +5834,9 @@ impl McHandler {
             return None;
         }
         let store = self.store.get()?;
-        let rows = match store
-            .async_compaction_for_session(&binding.project_root.to_string_lossy(), &binding.session)
-        {
+        let rows = match route_records(store, binding) {
             Ok(rows) => rows,
-            Err(error) => return Some(transient(error)),
+            Err(error) => return Some(error),
         };
         if rows.is_empty() {
             return None;
@@ -5840,9 +5874,7 @@ impl McHandler {
             .store
             .get()
             .ok_or_else(|| transient("store unavailable"))?;
-        let rows = store
-            .async_compaction_for_session(&binding.project_root.to_string_lossy(), &binding.session)
-            .map_err(transient)?;
+        let rows = route_records(store, binding)?;
         match rows.as_slice() {
             [] => Ok(None),
             [raw] => {

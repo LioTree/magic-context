@@ -168,12 +168,12 @@ impl McHandler {
         let deadline = Instant::now()
             .checked_add(self.wrapup_operation_budget())
             .unwrap_or_else(Instant::now);
-        let settings = self.historian_settings_loader()(&drive.key.project);
+        let settings = self.historian_settings_loader()(&drive.binding.project_root);
         let configured = super::super::historian_config::resolve_with_model_catalog(
             &settings,
             &drive.key.harness,
             drive.parsed.model_key.as_deref(),
-            &drive.key.project,
+            &drive.binding.project_root,
             &self.historian_model_catalog,
         )
         .await;

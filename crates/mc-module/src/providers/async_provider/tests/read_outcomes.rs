@@ -114,7 +114,20 @@ async fn any_other_page_without_a_lineage_is_refused_by_name() {
 #[tokio::test]
 async fn the_read_identity_and_a_lineageless_page_are_logged_once() {
     let dir = tempfile::tempdir().unwrap();
-    let rig = Rig::new(dir.path()).await;
+    // The once-per-conversation log is keyed by the session reference across
+    // the process, and the reference no longer depends on the folder, so this
+    // conversation needs a session no other test sets up.
+    let session = "read-identity-logged-once";
+    let rig = Rig::setup_with_model(
+        dir.path(),
+        "thalamus-harness",
+        ("runner", session),
+        ("opencode", session),
+        "fixture",
+        json!({"serializer_profile":"opencode-aisdk"}),
+        |_| {},
+    )
+    .await;
     let reference = rig.reference.clone();
     let mine = || {
         READ_LOG.with(|log| {

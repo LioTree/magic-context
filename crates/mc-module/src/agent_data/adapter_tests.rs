@@ -17,6 +17,10 @@ mod review_witnesses;
 const CUT: &str = "0123456789abcdef0123456789abcdef";
 const ROOT: &str = "/portable/project";
 const SESSION: &str = "native-old";
+/// The attested runner the observed sessions are bound through.
+const RUNNER: &str = "broca";
+/// The route an observed session's runner binds it on.
+const RUNNER_CHANNEL: u16 = 41;
 const CHANNEL: u16 = 44;
 #[derive(Default)]
 struct FakeState {
@@ -147,10 +151,7 @@ impl SessionLookup for FakeDoor {
     }
 }
 fn reference(session: &str) -> Ref {
-    Ref::new(
-        REF_KINDS[0],
-        cortexkit_role_llm_runner::session_ref("opencode", ROOT, session),
-    )
+    Ref::new(REF_KINDS[0], session_ref(RUNNER, "opencode", session))
 }
 fn params(refs: &[Ref]) -> Value {
     json!({"refs":refs,"cutId":CUT})
@@ -231,8 +232,21 @@ async fn make(dir: &Path, door: Arc<FakeDoor>) -> McHandler {
     .await;
     handler
 }
+/// Bind `session` on the harness route (channel 1) and through its attested
+/// runner (channel `RUNNER_CHANNEL`). Only the runner's route names the
+/// session's reference, so only that bind makes the ref one this module holds.
 async fn observe(h: &McHandler, session: &str) {
     bind(h, 1, "opencode", session, Principal::Direct).await;
+    bind(
+        h,
+        RUNNER_CHANNEL,
+        "opencode",
+        session,
+        Principal::Reserved {
+            module_id: RUNNER.into(),
+        },
+    )
+    .await;
 }
 fn seed(h: &McHandler, session: &str) {
     h.store
@@ -321,6 +335,7 @@ async fn unknown_ref_requires_an_observed_tuple_or_registry_lookup() {
         harness: "opencode".into(),
         session_id: SESSION.into(),
         project_root: ROOT.into(),
+        runner: Some(RUNNER.into()),
     });
     assert_eq!(
         reply(call(&h, role::ops::BUSY, p.clone()).await)["refs"][0]["state"],
@@ -333,23 +348,44 @@ async fn unknown_ref_requires_an_observed_tuple_or_registry_lookup() {
         harness: "opencode".into(),
         session_id: "not-held".into(),
         project_root: ROOT.into(),
+        runner: Some(RUNNER.into()),
     });
     assert_eq!(
         refusal(call(&h, role::ops::BUSY, json!({"refs":[reference("not-held")]})).await),
         "unknown_ref"
     );
+    // Another spelling of the folder is metadata: the same runner, harness
+    // and session still name the held session.
     door.state.lock().unwrap().lookup = Some(LookupSession {
         agent_id: "agent".into(),
         ref_kind: REF_KINDS[0].into(),
         reference: reference(SESSION).r#ref,
         harness: "opencode".into(),
         session_id: SESSION.into(),
-        project_root: "/wrong/root".into(),
+        project_root: format!("{ROOT}/"),
+        runner: Some(RUNNER.into()),
     });
     assert_eq!(
-        refusal(call(&h, role::ops::BUSY, p.clone()).await),
-        "unknown_ref"
+        reply(call(&h, role::ops::BUSY, p.clone()).await)["refs"][0]["state"],
+        "idle"
     );
+    // Another runner's session is not this ref, and an answer that names no
+    // runner cannot be checked, so both stay refused.
+    for runner in [Some("other-runner".to_string()), None] {
+        door.state.lock().unwrap().lookup = Some(LookupSession {
+            agent_id: "agent".into(),
+            ref_kind: REF_KINDS[0].into(),
+            reference: reference(SESSION).r#ref,
+            harness: "opencode".into(),
+            session_id: SESSION.into(),
+            project_root: ROOT.into(),
+            runner,
+        });
+        assert_eq!(
+            refusal(call(&h, role::ops::BUSY, p.clone()).await),
+            "unknown_ref"
+        );
+    }
     door.state.lock().unwrap().lookup = None;
     observe(&h, SESSION).await;
     assert_eq!(
@@ -962,6 +998,9 @@ async fn durable_provider_launch_intent_is_busy_without_a_live_handler() {
     let door = Arc::new(FakeDoor::default());
     let h = make(dir.path(), door).await;
     seed(&h, SESSION);
+    // A provider row names no runner, so the ref is held through the runner's
+    // observed bind; the row still supplies the durable launch intent.
+    observe(&h, SESSION).await;
     let store = h.store.get().unwrap();
     let conn = rusqlite::Connection::open(store.move_storage_path().unwrap()).unwrap();
     let key = serde_json::to_string(&(ROOT, SESSION, "opencode")).unwrap();

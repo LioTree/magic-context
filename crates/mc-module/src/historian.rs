@@ -1490,6 +1490,11 @@ pub trait HistorianProducerDriver: Send {
     async fn status(&mut self, run_id: &str) -> Result<RunState, HistorianProducerError>;
     async fn cancel(&mut self, run_id: &str) -> Result<(), HistorianProducerError>;
     async fn close(&mut self);
+    /// Release the bound child session once its result has been consumed
+    /// (see `child_retention`). `kind` and `parent` (the conversation the
+    /// child served) only label the log line. Transports without runner
+    /// sessions do nothing.
+    async fn release_child(&mut self, _kind: &str, _parent: &str) {}
     /// Release the provider session on every terminal path. The default closes
     /// test/host transports; module runners report unsupported deletion rather
     /// than claiming that closing routes removed their retained snapshots.
@@ -1630,6 +1635,10 @@ impl HistorianProducerDriver for HistorianProducer {
 
     async fn close(&mut self) {
         HistorianProducer::close(self).await;
+    }
+
+    async fn release_child(&mut self, kind: &str, parent: &str) {
+        HistorianProducer::release_child(self, kind, parent).await;
     }
 
     async fn purge_session(&mut self, session_id: &str) -> Result<(), HistorianProducerError> {
@@ -3362,6 +3371,10 @@ where
             publication_fence: AdmittedFence::as_fence(&admitted),
         });
         drop(admitted);
+        // The child's output is consumed whatever publication made of it.
+        producer
+            .release_child("historian", request.session_id)
+            .await;
         producer.close().await;
         let row_version = match publish_result {
             Ok(row_version) => row_version,
@@ -4270,6 +4283,10 @@ where
         publication_fence: AdmittedFence::as_fence(&admitted),
     });
     drop(admitted);
+    // The reattached child's output is consumed whatever publication made of it.
+    producer
+        .release_child("historian", request.session_id)
+        .await;
     producer.close().await;
     let row_version = publish_result?;
     Ok(HistorianReattachOutcome::Published(HistorianRunSuccess {
@@ -9855,6 +9872,60 @@ mod tests {
             published.push(serde_json::to_vec(&store.load_compartments("ses").unwrap()).unwrap());
         }
         assert_eq!(published[0], published[1]);
+    }
+
+    /// A published firing on a runner declaring `session_retention` releases
+    /// its child once, after the run's result was read; a runner with only the
+    /// older `retention` group gets no release.
+    #[tokio::test]
+    async fn a_published_firing_releases_its_child_once_after_reading_its_result() {
+        let output = historian_xml("released after publication");
+        let chunk = historian_chunk();
+        let prior = prior_ranges();
+        let models = vec!["prov/model-a".to_string()];
+        for session_retention in [true, false] {
+            let dir = tempfile::tempdir().unwrap();
+            let store = store(dir.path());
+            seed_prior_compartment(&store);
+            let describe = if session_retention {
+                crate::historian_producer::tests::session_retention_describe(false)
+            } else {
+                serde_json::json!({"capabilities":["no_tools","max_steps","retention"],"retention":{"max_seconds":2_592_000,"delete_within_ms":3_600_000}})
+            };
+            let (mut producer, server) =
+                crate::historian_producer::tests::publication_follower_described(
+                    &output, false, describe,
+                )
+                .await;
+            let mut request = fire_request(&store, "prompt", &models, &chunk, &prior);
+            request.model_limits.insert(
+                "prov/model-a".into(),
+                HistorianModelLimits {
+                    context: Some(200_000),
+                    input: None,
+                    output: Some(128_000),
+                },
+            );
+            request.await_timeout = Duration::from_secs(2);
+            let outcome = run_historian_firing(&mut producer, request).await.unwrap();
+            let HistorianDriveOutcome::Completed(success) = outcome else {
+                panic!("the firing publishes");
+            };
+            let released = server.released_sessions().await;
+            let methods = server.methods().await;
+            if session_retention {
+                assert_eq!(released, vec![success.producer_session_id.clone()]);
+                let result = methods.iter().rposition(|m| m == "run.result").unwrap();
+                let release = methods.iter().position(|m| m == "session.release").unwrap();
+                assert!(result < release, "{methods:?}");
+                assert_eq!(
+                    crate::child_retention::release_lines(&success.producer_session_id).len(),
+                    1
+                );
+            } else {
+                assert!(released.is_empty(), "{methods:?}");
+            }
+        }
     }
 
     #[tokio::test(flavor = "current_thread")]

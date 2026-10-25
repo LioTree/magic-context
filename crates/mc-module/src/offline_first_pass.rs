@@ -54,6 +54,7 @@
 use crate::offline_move::{
     self, check_holders, HolderCheck, Lsof, MoveRecord, Refusal, StorePaths,
 };
+use crate::providers::codec::Codec;
 use crate::providers::offline_first_pass_engine::{
     OfflineError, OfflineOutcome, OfflineReport, OfflineSetup, PagesRunner, ServedPage,
 };
@@ -104,14 +105,15 @@ fn refusal(code: &'static str, detail: impl Into<String>) -> Refusal {
 /// Parse and check the export. Each line must be a bare `ReadPage`: a line
 /// that holds its page inside another object (a reply envelope) is refused as
 /// `pages_bare_wrapped_mismatch`. Every message must carry the runner's
-/// content digests, one `part_digests` row per tag row in the same order, as
-/// a live descriptors-mode read requires; a message without them is refused
-/// as `served_digest_missing`, because ck-mc never computes them in the
-/// runner's place. The pages must chain: the first starts at
+/// content digests, one `part_digests` row per top-level part of the message
+/// under `codec`'s serializer profile, keyed exactly as its tag rows are and
+/// in the same order, as a live descriptors-mode read requires; a message
+/// without them is refused as `served_digest_missing`, because ck-mc never
+/// computes them in the runner's place. The pages must chain: the first starts at
 /// ordinal 0, ordinals are contiguous inside and across pages, every page but
 /// the last names the next page's first ordinal in `next_from_ordinal`, the
 /// last names none, and every page carries the same lineage.
-pub(crate) fn parse_pages(reader: impl BufRead) -> Result<Pages, Refusal> {
+pub(crate) fn parse_pages(reader: impl BufRead, codec: Codec) -> Result<Pages, Refusal> {
     let mut served: Vec<ServedPage> = Vec::new();
     let mut lineage: Option<String> = None;
     let mut expected = 0u64;
@@ -196,20 +198,17 @@ pub(crate) fn parse_pages(reader: impl BufRead) -> Result<Pages, Refusal> {
                 )));
             }
             expected += 1;
-            let keys = message
-                .tags
-                .iter()
-                .map(|row| row.part.clone())
-                .collect::<Vec<_>>();
-            message.check_descriptors(&keys).map_err(|reason| {
-                refusal(
-                    "served_digest_missing",
-                    format!(
-                        "line {number}: message {} at ordinal {}: {reason}",
-                        message.mid, message.ordinal
-                    ),
-                )
-            })?;
+            message
+                .check_descriptor_rows(codec.wire_id())
+                .map_err(|reason| {
+                    refusal(
+                        "served_digest_missing",
+                        format!(
+                            "line {number}: message {} at ordinal {}: {reason}",
+                            message.mid, message.ordinal
+                        ),
+                    )
+                })?;
             for row in &message.tags {
                 if let Some(tag) = &row.tag {
                     let number = tags::parse_tag(tag).ok_or_else(|| {
@@ -341,13 +340,22 @@ pub(crate) fn check(args: &Args, holders: &dyn HolderCheck) -> Result<Checked, R
         }
     };
     let setup = read_setup(&args.setup, &args.session)?;
+    // The pages' part counts depend on the serializer profile the Setup
+    // names, which selects the codec exactly as a live Setup does.
+    let codec =
+        Codec::from_params(&Value::Object(setup.request.params.clone())).map_err(|error| {
+            refusal(
+                "setup_unreadable",
+                format!("request.params.serializer_profile: {error:?}"),
+            )
+        })?;
     let file = std::fs::File::open(&args.pages).map_err(|error| {
         refusal(
             "pages_unreadable",
             format!("{}: {error}", args.pages.display()),
         )
     })?;
-    let pages = parse_pages(std::io::BufReader::new(file))?;
+    let pages = parse_pages(std::io::BufReader::new(file), codec)?;
     check_checkpoint(&record, &pages)?;
     Ok(Checked {
         record,

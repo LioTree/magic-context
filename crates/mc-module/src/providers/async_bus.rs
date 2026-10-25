@@ -373,6 +373,13 @@ struct LinkReport {
     last_error: Option<String>,
 }
 
+#[derive(Serialize)]
+pub(crate) struct LinkSnapshot {
+    state: &'static str,
+    attempts: u32,
+    last_error: Option<String>,
+}
+
 /// The bus link's current [`LinkState`], how long it has held, how many
 /// attempts it has seen, and the last error.
 pub(crate) struct LinkStatus {
@@ -428,6 +435,15 @@ impl LinkStatus {
     #[cfg(test)]
     pub(crate) fn state(&self) -> LinkState {
         self.report.lock().expect("bus link status").state
+    }
+
+    pub(crate) fn snapshot(&self) -> LinkSnapshot {
+        let report = self.report.lock().expect("bus link status");
+        LinkSnapshot {
+            state: report.state.name(),
+            attempts: report.attempts,
+            last_error: report.last_error.clone(),
+        }
     }
 
     /// One readable line, e.g. `ckbus_unreachable for 95s after 6 attempts:
@@ -729,6 +745,20 @@ where
 }
 
 impl McHandler {
+    pub(crate) fn async_bus_health(&self) -> Value {
+        let runtime = &self.provider_store.async_runtime;
+        if runtime
+            .connection_file
+            .lock()
+            .expect("bus connection file")
+            .is_none()
+        {
+            Value::Null
+        } else {
+            json!(runtime.bus_link.snapshot())
+        }
+    }
+
     pub(crate) fn start_async_compaction_background(&self) {
         let runtime = &self.provider_store.async_runtime;
         let Some(connection) = runtime
@@ -761,7 +791,9 @@ impl McHandler {
                 let task = handler
                     .start_compaction_bus(stream, link.account.clone())
                     .await?;
+                let attempt = status.snapshot().attempts;
                 status.set(LinkState::Connected, 0, None);
+                tracing::info!(attempt, "async compaction bus link connected");
                 let started = Clock::now();
                 let renewal = tokio::spawn(renew_until_retired(
                     link.credential.clone(),

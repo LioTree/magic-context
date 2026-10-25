@@ -1498,7 +1498,7 @@ impl AsyncRecord {
                 .apply_authority_state_sync(mc_store::ModuleStateSyncRequest {
                     resolved_compartment_boundaries: &[],
                     session_id: &self.namespace(),
-                    project_path: &self.key.project.to_string_lossy(),
+                    project_path: &self.project().to_string_lossy(),
                     shadow_generation: 0,
                     expected_shadow_seq: 0,
                     seed_boundary_id: Some(&seed.boundary_id),

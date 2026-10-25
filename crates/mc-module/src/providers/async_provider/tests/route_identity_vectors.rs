@@ -3,7 +3,7 @@ use super::*;
 const ROUTE_IDENTITY_VECTORS: &[u8] =
     include_bytes!("../../../../testdata/compaction-provider-v1/route-identity.json");
 const ROUTE_IDENTITY_VECTORS_SHA256: &str =
-    "edbdc38f28373431f07b8e2e72c5f5c781d6b7fd48d6b2b6d8e20a8f5cea577a";
+    "a9a11e290293c8789a4472067dfe373ad68a2b625d53e579bf9bf7bf6d7d18d4";
 
 fn vectors() -> Value {
     assert_eq!(
