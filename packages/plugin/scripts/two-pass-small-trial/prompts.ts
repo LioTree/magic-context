@@ -72,6 +72,9 @@ export function turnOne(
         { role: "user", content: `${user}\n\n${HISTORIAN_FORMAT_INSTRUCTION}` },
     ]);
     first.thinking = { type: thinking };
+    // Thinking can spend over 23k tokens reasoning on a large chunk, so a thinking
+    // request gets room for its reasoning on top of the reply.
+    if (thinking === "enabled") first.max_tokens = 64000;
     return first;
 }
 
@@ -209,6 +212,7 @@ export async function turnTwo(
             { role: "user", content: second },
         ]);
         secondRequest.thinking = { type: thinking };
+        if (thinking === "enabled") secondRequest.max_tokens = 64000;
         return {
             request: secondRequest,
             facts: selected,

@@ -115,13 +115,18 @@ describe("direct DeepSeek small trial", () => {
         expect(first).toEqual(turnOne(c, "disabled"));
         expect(JSON.stringify(first)).toBe(JSON.stringify(request(first.messages)));
         expect(firstEnabled.thinking).toEqual({ type: "enabled" });
-        expect({ ...firstEnabled, thinking: first.thinking }).toEqual(first);
+        expect(firstEnabled.max_tokens).toBe(64000);
+        expect({ ...firstEnabled, thinking: first.thinking, max_tokens: first.max_tokens }).toEqual(
+            first,
+        );
         const reply = mockReply(first).choices[0].message.content;
         const production = await turnTwo(c, first, reply);
         const thinking = await turnTwo(c, first, reply, "enabled");
         expect(first.thinking).toEqual({ type: "disabled" });
         expect(production.request.thinking).toEqual({ type: "disabled" });
         expect(thinking.request.thinking).toEqual({ type: "enabled" });
+        expect(thinking.request.max_tokens).toBe(64000);
+        expect(production.request.max_tokens).toBe(32000);
         expect(thinking.request.messages).toEqual(production.request.messages);
         const both = await turnTwo(c, firstEnabled, reply, "enabled");
         expect(both.request.thinking).toEqual({ type: "enabled" });
@@ -314,8 +319,11 @@ describe("direct DeepSeek small trial", () => {
     });
     test("grant, endpoint, budget and real-case fence cannot be widened by config", () => {
         validateConfig(config);
+        validateConfig({ ...config, caseIds: [0, 1, 2, 3, 8, 10, 12, 20, 30, 35] });
         for (const bad of [
             { maxSpendUSD: 2.01 },
+            { caseIds: [0, 8, 10, 12] },
+            { caseIds: [0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10] },
             { endpoint: "https://opencode.ai/zen" },
             { caseIds: [0, 2, 27, 12, 35] },
             { caseIds: [0, 2, 8, 8, 35] },

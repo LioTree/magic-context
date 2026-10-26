@@ -37,11 +37,13 @@ export function validateConfig(c: Config) {
         (c.turnOneThinking !== undefined && !["disabled", "enabled"].includes(c.turnOneThinking)) ||
         (c.turnTwoThinking !== undefined && !["disabled", "enabled"].includes(c.turnTwoThinking)) ||
         c.repeats !== 1 ||
-        c.caseIds?.length !== 5 ||
-        new Set(c.caseIds).size !== 5 ||
+        // Five to ten distinct corpus cases. Case 27 is the known-bad calibration
+        // output and is never sent to a provider.
+        !Array.isArray(c.caseIds) ||
+        c.caseIds.length < 5 ||
+        c.caseIds.length > 10 ||
+        new Set(c.caseIds).size !== c.caseIds.length ||
         c.caseIds.some((id) => !Number.isInteger(id) || id < 0 || id >= 40 || id === 27) ||
-        !c.caseIds.includes(12) ||
-        !c.caseIds.includes(35) ||
         c.grant?.name !== "apikey:deepseek" ||
         c.grant.kind !== "api_key" ||
         c.endpoint !== "https://api.deepseek.com/chat/completions" ||
@@ -234,7 +236,7 @@ export async function runTrial(input: {
                     ? message
                     : "case_processing_failure";
                 if (
-                    /^(credential_|client_stopped|spend_cap|transport_|usage_|invalid_usage|incomplete_response|provider_)/.test(
+                    /^(credential_|client_stopped|spend_cap|transport_|usage_|invalid_usage|provider_)/.test(
                         record.failure,
                     )
                 ) {

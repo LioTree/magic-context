@@ -20,7 +20,7 @@ export interface Request {
     model: "deepseek-flash";
     messages: Message[];
     temperature: 0.1;
-    max_tokens: 32000;
+    max_tokens: 32000 | 64000;
     thinking: { type: "disabled" | "enabled" };
     stream: false;
 }
@@ -207,7 +207,10 @@ export class DeepSeek {
             }
             throw new Error("credential_rate_limited");
         } catch (error) {
-            this.stopped = true;
+            // A reply cut off at the output cap is one case's result, not a reason to
+            // stop the run. Credential, spend and transport failures still stop it.
+            if (!(error instanceof Error && error.message === "incomplete_response"))
+                this.stopped = true;
             throw error;
         } finally {
             this.busy = false;
