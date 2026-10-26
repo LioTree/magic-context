@@ -9488,6 +9488,28 @@ impl McStore {
         expected: u64,
         identities: &BTreeMap<String, Vec<BlockIdentity>>,
     ) -> Result<u64, McStoreError> {
+        self.commit_block_identities_inner(session_id, expected, identities, true)
+    }
+
+    /// Fill absent identity rows without changing or comparing existing vectors.
+    /// A historian may refit its selected range after discovering runner limits;
+    /// record its whole source window while leaving freshness checks to publication.
+    pub fn commit_missing_block_identities(
+        &self,
+        session_id: &str,
+        expected: u64,
+        identities: &BTreeMap<String, Vec<BlockIdentity>>,
+    ) -> Result<u64, McStoreError> {
+        self.commit_block_identities_inner(session_id, expected, identities, false)
+    }
+
+    fn commit_block_identities_inner(
+        &self,
+        session_id: &str,
+        expected: u64,
+        identities: &BTreeMap<String, Vec<BlockIdentity>>,
+        verify_existing: bool,
+    ) -> Result<u64, McStoreError> {
         self.inner.with_conn_fenced(|tx| {
             move_store::check_writer(tx, session_id)?;
             let current: Option<i64> = tx
@@ -9512,6 +9534,17 @@ impl McStore {
             // Check the whole batch before writing, so a conflict leaves no row behind.
             let mut missing = Vec::new();
             for (mid, vector) in identities {
+                if !verify_existing {
+                    let exists: bool = tx.query_row(
+                        "SELECT EXISTS(SELECT 1 FROM mc_block_identities WHERE session_id=?1 AND mid=?2)",
+                        params![session_id, mid],
+                        |row| row.get(0),
+                    )?;
+                    if !exists {
+                        missing.push((mid, serde_json::to_string(vector).map_err(serde_to_sql_error)?));
+                    }
+                    continue;
+                }
                 match block_identities_for_mid_tx(tx, session_id, mid)? {
                     Some(held) if &held != vector => {
                         return Ok(Err(McStoreError::BlockIdentityConflict {

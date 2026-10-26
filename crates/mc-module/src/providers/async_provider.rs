@@ -4857,6 +4857,43 @@ struct AsyncHistoryFence {
     key: Key,
     serial: Arc<ProviderSerial>,
 }
+
+impl AsyncHistoryFence {
+    /// The caller holds the conversation serial through source preparation.
+    fn prepare_input(
+        &self,
+        store: &McStore,
+        window: historian_tail::InputWindow,
+        codec: codec::Codec,
+        parsed: &mut TransformRequest,
+        echoes: &reminder_echoes::ReminderEchoes,
+    ) -> Result<ck_wire::FlatProjection, HandlerOutcome> {
+        let head = load_head(store, &self.reference)?
+            .ok_or_else(|| transient("async conversation disappeared"))?;
+        if head.generation != self.generation || head.resync {
+            return Err(transient("async historian lineage changed"));
+        }
+        let projection =
+            historian_tail::prepare_input(store, &self.reference, window, codec, parsed, echoes)?;
+        let version = store
+            .load_meta(&parsed.session_id)
+            .map_err(transient)?
+            .row_version
+            .ok_or_else(|| transient("async historian cache state missing"))?;
+        // Notices can skip the transform that normally records identities.
+        // Fill the whole held window before preparation: runner-limit refitting
+        // can expand selection. Existing vectors belong to the publication fence.
+        store
+            .commit_missing_block_identities(
+                &parsed.session_id,
+                version,
+                &projection.identity_by_mid,
+            )
+            .map_err(transient)?;
+        Ok(projection)
+    }
+}
+
 /// How long a history publication waits for the conversation lock. Notices,
 /// `late_results` polls and `ctx_reduce` hold that lock briefly; a summary that
 /// took minutes to produce must not be thrown away because one of them was
@@ -4995,9 +5032,9 @@ impl McHandler {
             serial: Arc::clone(&self.provider_serial),
         });
         let reference = state.reference();
-        let reference_for_rows = reference.clone();
         let namespace = state.namespace();
         let session_model = state.setup.model.clone();
+        let key = state.key.clone();
         let generation = state.generation;
         let cadence = state.historian_cadence.clone();
         let settings = self.historian_settings_loader()(state.project());
@@ -5029,10 +5066,11 @@ impl McHandler {
             log_session_model_fallback(&namespace, &configured);
             parsed.historian_model_limits = configured.model_limits;
             let prepare = worker.clone();
+            let serial = worker.provider_serial.lock_for(&key).await;
             let result = tokio::task::spawn_blocking(move || {
-                let projection = historian_tail::prepare_input(
+                let _serial = serial;
+                let projection = fence.prepare_input(
                     &store,
-                    &reference_for_rows,
                     from.through(through),
                     codec,
                     &mut parsed,
