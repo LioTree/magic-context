@@ -2,6 +2,7 @@ import {
 	piAgentHistory,
 	piIsDeveloperHistory,
 } from "./pi-dispatch-agent-history";
+import { piOmitsTruncatedAssistant } from "./pi-dispatch-assistant-history";
 import {
 	type PiChatHistoryModel,
 	piChatHistoryPlan,
@@ -52,6 +53,7 @@ export interface PiPreparedStructure {
 	messages: readonly MessageStructure[];
 	chatMessages?: readonly MessageStructure[];
 	responsesMessages?: readonly MessageStructure[];
+	responsesAlternatives?: readonly (readonly MessageStructure[])[];
 	api?: string;
 	googleFunctionIds?: boolean;
 	structuralSkipReason?: string;
@@ -61,24 +63,25 @@ export interface PiPreparedStructure {
 const MAX_MESSAGES = 100_000;
 const ORPHAN_NOTE = Symbol("prepared orphan tool result");
 // APIs whose Oh My Pi provider runs transformMessages, so the host's tool-call
-// window rules are known for them. Checked against @oh-my-pi/pi-ai 18.12.3 and
-// 18.12.5 (stream.ts streamDispatch is identical in both), src/:
-// - openai-completions: providers/openai-completions.ts:2372 (convertMessages).
-// - openrouter: stream.ts routes it to openai-responses, or to
+// windows and interrupted-assistant omissions are known for them. Source lines
+// below are @oh-my-pi/pi-ai src/providers/, in version order 18.8.9 / 18.11.3 /
+// 18.12.3 (the pinned package versions):
+// - openai-completions: openai-completions.ts:2310/2371/2372 (convertMessages).
+// - openrouter: src/stream.ts:991/975/925 routes it to openai-responses, or to
 //   openai-completions when PI_OPENROUTER_RESPONSES=0.
-// - openai-responses, azure-openai-responses: openai-responses.ts:1612 and
-//   azure-openai-responses.ts:373 call buildResponsesInput, which runs it at
-//   openai-shared.ts:2162.
-// - openai-codex-responses: openai-codex-responses.ts:4977.
-// - anthropic-messages: anthropic.ts:5835.
-// - bedrock-converse-stream: amazon-bedrock.ts:1093.
-// - google-generative-ai, google-vertex, google-gemini-cli: google.ts:35,
-//   google-vertex.ts:32 and google-gemini-cli.ts:1266 reach google-shared.ts
-//   convertMessages, which runs it at google-shared.ts:213.
-// - ollama-chat: ollama.ts:269. devin-agent: devin.ts:248.
+// - openai-responses: openai-responses.ts:1568/1611/1612, and
+//   azure-openai-responses: azure-openai-responses.ts:373 (all three), call
+//   buildResponsesInput, which runs it at openai-shared.ts:2121/2162/2162.
+// - openai-codex-responses: openai-codex-responses.ts:4973/5013/4977.
+// - anthropic-messages: anthropic.ts:5210/5818/5835.
+// - bedrock-converse-stream: amazon-bedrock.ts:1089/1090/1093.
+// - google-generative-ai, google-vertex, google-gemini-cli: google.ts:35 (all),
+//   google-vertex.ts:33/32/32 and google-gemini-cli.ts:1256/1266/1266 reach
+//   google-shared.ts convertMessages, which runs it at :169/165/213.
+// - ollama-chat: ollama.ts:257/260/269. devin-agent: devin.ts:234/248/248.
 // - factory-droid-agent: factory-droid.ts streamWire sends every route through
-//   factory-droid/gemini.ts:190 or the Anthropic, Responses or Chat streams.
-// - apple-foundation-models: apple-foundation-models.ts:194.
+//   factory-droid/gemini.ts:175/179/190 or the Anthropic, Responses or Chat streams.
+// - apple-foundation-models: apple-foundation-models.ts:194 (all three).
 // cursor-agent (providers/cursor.ts) and gitlab-duo-agent
 // (gitlab-duo-workflow.ts:2581, "bypasses transformMessages") do not, and an
 // extension's custom API is unknown. Those use projectUnmodeledToolResults,
@@ -393,22 +396,10 @@ function projectMissingToolResults(
 		const message = object(value);
 		if (message?.role === "assistant") {
 			flush(message.timestamp);
+			// The host closes the preceding window before omitting this turn.
+			if (piOmitsTruncatedAssistant(message)) continue;
 			projected.push(value);
 			const calls = windowCalls(message);
-			// The host does not replay a truncated turn with neither text nor a tool
-			// call, so it opens no window. Its row stays here for the lane-specific
-			// omissions later in this file.
-			const truncated = ["length", "error", "aborted"].includes(
-				String(message.stopReason),
-			);
-			if (
-				truncated &&
-				Array.isArray(message.content) &&
-				!message.content.some((part) =>
-					["toolCall", "text"].includes(String(object(part)?.type)),
-				)
-			)
-				continue;
 			if (message.stopReason === "aborted" || message.stopReason === "error") {
 				aborted = new Map(calls.map((call) => [pairingId(call.id), call]));
 				abortedTimestamp = message.timestamp;
@@ -834,33 +825,57 @@ function buildPiPreparedStructure(
 	let responsesMessages: MessageStructure[] | undefined = responsesApi
 		? []
 		: undefined;
+	const fallbackMessages: MessageStructure[] = [];
+	const coldMessages: MessageStructure[] = [];
+	let unsignedAlternatives = false;
+	const appendResponse = (
+		output: MessageStructure[],
+		row: MessageStructure,
+		texts: readonly string[],
+	) => {
+		if (!texts.length && !row.calls.length) return;
+		const previous = output.at(-1);
+		if (previous?.role === "assistant") {
+			previous.calls.push(...row.calls);
+			previous.wireCalls?.push(...(row.wireCalls ?? []));
+			previous.responseTexts?.push(...texts);
+		} else
+			output.push({
+				...row,
+				calls: [...row.calls],
+				...(row.wireCalls ? { wireCalls: [...row.wireCalls] } : {}),
+				responseTexts: [...texts],
+			});
+	};
 	if (responsesMessages) {
 		for (const [index, row] of byIndex) {
 			if (row.role !== "assistant") {
 				responsesMessages.push(row);
+				fallbackMessages.push(row);
+				coldMessages.push(row);
 				continue;
 			}
-			const texts = piResponsesAssistantTexts(projectedMessages[index], model);
+			const alternatives: {
+				fallback?: readonly string[];
+				cold?: readonly string[];
+			} = {};
+			const texts = piResponsesAssistantTexts(
+				projectedMessages[index],
+				model,
+				host,
+				alternatives,
+			);
 			if (!texts) {
 				responsesMessages = undefined;
 				break;
 			}
-			if (!texts.length && !row.calls.length) continue;
 			// OpenAI Responses encodes assistant text and calls as separate input
 			// items. Its normalized role rows combine adjacent assistant messages;
 			// mirror that on prepared history without discarding any text or call ID.
-			const previous = responsesMessages.at(-1);
-			if (previous?.role === "assistant") {
-				previous.calls.push(...row.calls);
-				previous.wireCalls?.push(...(row.wireCalls ?? []));
-				previous.responseTexts?.push(...texts);
-			} else
-				responsesMessages.push({
-					...row,
-					calls: [...row.calls],
-					...(row.wireCalls ? { wireCalls: [...row.wireCalls] } : {}),
-					responseTexts: [...texts],
-				});
+			unsignedAlternatives ||= alternatives.fallback !== undefined;
+			appendResponse(responsesMessages, row, texts);
+			appendResponse(fallbackMessages, row, alternatives.fallback ?? texts);
+			appendResponse(coldMessages, row, alternatives.cold ?? texts);
 		}
 	}
 	const plan = piChatHistoryPlan(projectedMessages, model);
@@ -900,6 +915,13 @@ function buildPiPreparedStructure(
 				: {}),
 		...(chatMessages ? { chatMessages } : {}),
 		...(responsesMessages ? { responsesMessages } : {}),
+		// OMP 17.1.7 openai-shared.ts:1691-1719 chooses replay per request.
+		// 18.12.x :2267-2271 additionally replays cold-safe turns (:2098-2107).
+		// Each alternative is a complete fallback or cold message list for the
+		// whole request; individual rows cannot choose different alternatives.
+		...(responsesMessages && unsignedAlternatives
+			? { responsesAlternatives: [fallbackMessages, coldMessages] }
+			: {}),
 		...(model?.api ? { api: model.api } : {}),
 		...(model?.api?.startsWith("google-")
 			? {
@@ -947,6 +969,22 @@ function payloadStructure(
 		if (
 			rows.length === 0 &&
 			(message.role === "system" || message.role === "developer")
+		)
+			continue;
+		// Oh My Pi's Anthropic provider inserts request-control system messages while
+		// building the request, after the context pass, so they are never prepared
+		// turns. Their content holds only tool_addition/tool_removal blocks; an
+		// effort-only control has empty content and carries its effort in
+		// output_config. A control can sit at the end of the request, before an
+		// earlier response it was recorded with, or before the turn's user message,
+		// so it is skipped wherever it appears. @oh-my-pi/pi-ai
+		// src/providers/anthropic.ts insertAnthropicControlMarkers (18.12.6).
+		if (
+			message.role === "system" &&
+			Array.isArray(message.content) &&
+			message.content.every((block) =>
+				["tool_addition", "tool_removal"].includes(String(object(block)?.type)),
+			)
 		)
 			continue;
 		// Responses emits reasoning/text/calls as separate items for one assistant
@@ -1361,6 +1399,19 @@ export function piPreparedStructureMismatch(
 				: chat && prepared?.chatMessages
 					? prepared.chatMessages
 					: prepared?.messages;
+		if (responses && rows && prepared?.responsesAlternatives) {
+			const actual = rows;
+			expectedRows =
+				[prepared.responsesMessages, ...prepared.responsesAlternatives].find(
+					(candidate) =>
+						candidate?.length === actual.length &&
+						candidate.every(
+							(expected, index) =>
+								JSON.stringify(expected.responseTexts) ===
+								JSON.stringify(actual[index].responseTexts),
+						),
+				) ?? expectedRows;
+		}
 		if (expectedRows && imageProjection && imageBudget)
 			expectedRows = trimPreparedImageRows(expectedRows, imageBudget, trimmed);
 		if (!rows || !expectedRows)

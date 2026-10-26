@@ -471,6 +471,8 @@ function recordInvocation(
         startedAt,
         status: params.status,
         messages: params.messages,
+        attemptedModel: args.model,
+        configuredModels: args.fallbackModels,
         ...(params.completion && !params.completion.messages
             ? {
                   tokens: params.completion.usage,

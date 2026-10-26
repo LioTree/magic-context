@@ -17,6 +17,7 @@ import * as search from "../../hooks/magic-context/auto-search-worker-client";
 import { resetLkgSlotsForTest } from "../../hooks/magic-context/lkg-slot";
 import { createTransform, type TransformDeps } from "../../hooks/magic-context/transform";
 import type { MessageLike } from "../../hooks/magic-context/transform-operations";
+import { scaleTest } from "../../shared/slow-test";
 import { cleanupTestTempDir, createTestTempDir } from "../../shared/test-temp-dir";
 import { createV2AutoEmbedSession, createV2TransformFeatureDeps } from "./transform-features";
 
@@ -105,23 +106,20 @@ function messages(session: string, turns: number, salt = 0): MessageLike[] {
     }));
 }
 
-for (const firstPass of [0, 60, 120, 180]) {
-    test(`v2 disabled features preserve baseline bytes over randomized passes ${firstPass + 1}-${firstPass + 60} of 240`, async () => {
+const disabledParity = "v2 disabled features preserve baseline bytes over randomized passes";
+scaleTest(
+    disabledParity,
+    async (slow) => {
         let random = 709;
         const next = () => {
             random = (Math.imul(random, 1664525) + 1013904223) >>> 0;
             return random;
         };
-        for (let pass = 0; pass < firstPass + 60; pass++) {
+        for (let pass = 0; pass < (slow ? 240 : 48); pass++) {
             const session = `ses709diff-${pass}`;
             const decision = next() % 3 ? "defer" : "execute";
-            const turns = 1 + (next() % 12);
-            const salt = next() % 200;
-            const omitTail = next() % 2;
-            // Advance the original random stream so batching keeps all 240 inputs unchanged.
-            if (pass < firstPass) continue;
-            const source = messages(session, turns, salt);
-            if (omitTail) source.pop();
+            const source = messages(session, 1 + (next() % 12), next() % 200);
+            if (next() % 2) source.pop();
             const oldOutput = { messages: structuredClone(source) };
             const newOutput = { messages: structuredClone(source) };
             resetLkgSlotsForTest();
@@ -144,8 +142,9 @@ for (const firstPass of [0, 60, 120, 180]) {
             );
         }
         await new Promise((resolve) => setTimeout(resolve, 0));
-    }, 60000);
-}
+    },
+    60000,
+);
 
 test("enabling caveman and autoSearch cannot first-edit a same-turn defer prefix", async () => {
     const session = "ses709toggle";

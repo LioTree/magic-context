@@ -53,7 +53,7 @@ function createCtxReduceTool(deps: CtxReduceToolDeps): ToolDefinition {
             const sessionId = toolContext.sessionID;
 
             if (!args.drop) {
-                return "Error: 'drop' must be provided.";
+                return `Error: 'drop' must be provided as a string of tag numbers, for example {"drop": "3-5,8"}.`;
             }
 
             let dropIds: number[] = [];

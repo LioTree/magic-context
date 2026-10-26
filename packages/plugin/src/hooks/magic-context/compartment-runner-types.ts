@@ -101,6 +101,8 @@ export interface HiddenRunIdentity {
 export interface HiddenRunHandle {
     id: string;
     childSessionId?: string;
+    attemptedModel?: string;
+    modelConfigKey?: string;
 }
 
 export interface HiddenCompletion {
@@ -114,6 +116,9 @@ export interface HiddenCompletion {
     messages?: unknown[];
     providerId?: string;
     modelId?: string;
+    attemptedModel?: string;
+    modelConfigKey?: string;
+    hostError?: unknown;
 }
 
 export interface HiddenCompletionExecutor {

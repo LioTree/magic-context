@@ -48,6 +48,41 @@ test("a quota failure recovered by a completed fallback raises no alert", async 
     expect((await run()).alerts).toHaveLength(0);
 });
 
+test("two quota failures in a row recovered by a later completed fallback raise no alert", async () => {
+    // Two models on one exhausted account pool both fail before the third model
+    // in the chain completes.
+    for (let i = 0; i < 8; i++) {
+        const primary = attempt({ session: `q-${i}`, status: "failed", time: NOW - 60_000 + i * 1_000, error: QUOTA });
+        const second = attempt({ session: `q-${i}`, status: "failed", time: NOW - 59_000 + i * 1_000, task: "fallback", parent: primary, error: QUOTA });
+        attempt({ session: `q-${i}`, status: "completed", time: NOW - 30_000 + i * 1_000, task: "fallback", parent: second });
+    }
+    expect((await run()).alerts).toHaveLength(0);
+});
+
+test("a non-routine step in a completed chain stays eligible while the quota failure before it is excused", async () => {
+    for (let i = 0; i < 8; i++) {
+        const primary = attempt({ session: `r-${i}`, status: "failed", time: NOW - 60_000 + i * 1_000, error: QUOTA });
+        const second = attempt({ session: `r-${i}`, status: "failed", time: NOW - 59_000 + i * 1_000, task: "fallback", parent: primary, error: "missing complete root element" });
+        attempt({ session: `r-${i}`, status: "completed", time: NOW - 30_000 + i * 1_000, task: "fallback", parent: second });
+    }
+    const alerts = (await run()).alerts;
+    expect(alerts.map((alert) => alert.rule)).toContain("failure_share");
+    expect(alerts.some((alert) => alert.example_error.includes("missing complete root element"))).toBe(true);
+    expect(alerts.some((alert) => alert.example_error.includes("account pool"))).toBe(false);
+});
+
+test("a quota failure whose chain completes after an empty fallback reply raises no quota alert", async () => {
+    // Live shape 2026-10-26: the primary's account pool was exhausted, the first
+    // fallback returned no output, and the next fallback completed the summary.
+    for (let i = 0; i < 8; i++) {
+        const primary = attempt({ session: `e-${i}`, status: "failed", time: NOW - 60_000 + i * 1_000, error: QUOTA });
+        const empty = attempt({ session: `e-${i}`, status: "empty", time: NOW - 59_000 + i * 1_000, task: "fallback", parent: primary, error: "historian host completion returned no output" });
+        attempt({ session: `e-${i}`, status: "completed", time: NOW - 30_000 + i * 1_000, task: "fallback", parent: empty });
+    }
+    const alerts = (await run()).alerts;
+    expect(alerts.some((alert) => alert.example_error.includes("account pool"))).toBe(false);
+});
+
 test("a pre-send window refusal recovered by a completed fallback raises no alert", async () => {
     const WINDOW = "opencode/deepseek-v4.1-flash-free: producer_prompt_exceeds_window calibrated_tokens=287038 limit=162960 estimator_margin=0.03";
     for (let i = 0; i < 8; i++) {

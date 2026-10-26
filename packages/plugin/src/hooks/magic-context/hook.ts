@@ -586,7 +586,9 @@ export function createMagicContextHook(deps: MagicContextDeps) {
                 db,
                 projectIdentity: identity,
                 ensureRegistered: async () => {
-                    await ensureProjectRegisteredFromOpenCodeDirectory(directory, db);
+                    await ensureProjectRegisteredFromOpenCodeDirectory(directory, db, {
+                        preflightLocalPooling: true,
+                    });
                     maybeSendProjectIdentitySessionWarning(sessionId, directory);
                 },
             },
@@ -1042,7 +1044,9 @@ export function createMagicContextHook(deps: MagicContextDeps) {
     const hooks = {
         "experimental.chat.messages.transform": transform,
         "experimental.chat.system.transform": systemPromptHashHandler,
-        "experimental.text.complete": createTextCompleteHandler(),
+        "experimental.text.complete": createTextCompleteHandler(
+            (sessionID) => liveModelBySession.get(sessionID)?.providerID,
+        ),
         "chat.message": createChatMessageHook({
             db,
             liveModelBySession,

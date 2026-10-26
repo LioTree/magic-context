@@ -207,6 +207,13 @@ import {
 	historyBudgetPolicyIdentity,
 	resolveExecuteThreshold,
 } from "@magic-context/core/hooks/magic-context/event-resolvers";
+import {
+	clearExecuteReclaimState,
+	estimateExecuteReclaimTokens,
+	maintainExecuteFloorMark,
+	originateExecuteReclaim,
+	readExecuteReclaimState,
+} from "@magic-context/core/hooks/magic-context/execute-reclaim";
 import { foldExecutesThisPass } from "@magic-context/core/hooks/magic-context/fold-execution-gate";
 import { isHistorianDrainBudgetSpent } from "@magic-context/core/hooks/magic-context/historian-drain-gate";
 import { getVisibleMemoryIds } from "@magic-context/core/hooks/magic-context/inject-compartments";
@@ -248,7 +255,10 @@ import {
 	readRawSessionMessages,
 	setRawMessageProvider,
 } from "@magic-context/core/hooks/magic-context/read-session-chunk";
-import { estimateTokens } from "@magic-context/core/hooks/magic-context/read-session-formatting";
+import {
+	estimateTokens,
+	hasMeaningfulUserText,
+} from "@magic-context/core/hooks/magic-context/read-session-formatting";
 import { invalidateTrueRawTokenCache } from "@magic-context/core/hooks/magic-context/read-session-true-raw-tokens";
 import {
 	DEFAULT_KEEP_REASONING_TOKENS,
@@ -404,6 +414,10 @@ import {
 	shouldReclaimPiUpperEstimate,
 } from "./pi-fit-reclaim";
 import { type PiHistorianDeps, runPiHistorian } from "./pi-historian-runner";
+import {
+	inPiHistorianRootContext,
+	waitForPiHistorianInTurn,
+} from "./pi-historian-turn-wait";
 import { readPiHistoryRetirement } from "./pi-history-retirement";
 import {
 	clearPiLkgSessionState,
@@ -1568,6 +1582,8 @@ export interface PiHistorianOptions {
 	runner: SubagentRunner;
 	/** Historian provider/model id (e.g. `anthropic/claude-haiku-4-5`). */
 	model: string;
+	/** Config key that selected the historian model for host refusal diagnostics. */
+	modelConfigKey?: string;
 	/** Optional ordered fallback chain, retaining each entry's Pi thinking level. */
 	fallbackModels?: readonly ModelInput[];
 	/** Historian chunk budget derived from its context window. */
@@ -5637,6 +5653,26 @@ export function registerPiContextHandler(
 					elapsedMs: performance.now() - fitInputStart,
 					extra: inputForFitReclaim ? "snapshot" : "no-snapshot",
 				});
+			if (!options.compactionOff && !sessionMeta.isSubagent) {
+				let promptId: string | null = null;
+				for (let i = event.messages.length - 1; i >= 0; i--) {
+					const message = event.messages[i];
+					if (message?.role !== "user") continue;
+					const parts =
+						typeof message.content === "string"
+							? [{ type: "text", text: message.content }]
+							: message.content;
+					if (!hasMeaningfulUserText(parts)) continue;
+					promptId = entryIds?.[i] ?? null;
+					break;
+				}
+				maintainExecuteFloorMark(
+					options.db,
+					sessionId,
+					promptId,
+					usagePercentage < effectiveExecuteThresholdPercentage,
+				);
+			}
 			const pipelineArgs: RunPipelineArgs = {
 				recoveryPrefix: recovery.prefix,
 				recoveryRebuildReason: recovery.rebuildReason,
@@ -5812,6 +5848,79 @@ export function registerPiContextHandler(
 				assertPiTagSnapshotReady(options.db, sessionId);
 				getPiTagSnapshotView(options.db, sessionId);
 			}
+			let historianEvaluatedThisPass = false;
+			const historian = options.historian;
+			const scheduleHistorian = (
+				result: Pick<
+					RunPipelineResult,
+					"activeTags" | "eligiblePendingDropTagIds" | "strictThinkingKept"
+				>,
+				publishedHistoryRide = isCacheBusting,
+			) => {
+				if (historianEvaluatedThisPass) return;
+				historianEvaluatedThisPass = true;
+				const tHistorianScheduling = performance.now();
+				budget.stage = "historian scheduling";
+				if (historian && !options.compactionOff && budget.remainingWork() > 0) {
+					guardSqliteTransformPass({
+						assert: budget.assert,
+						remainingMs: budget.remainingWork,
+					});
+					try {
+						budget.assert();
+						maybeFireHistorian({
+							startGuard: () => {
+								// A completed pass has already admitted the background run;
+								// a following context pass must not cancel that admission.
+								if (!budget.completed) budget.assertOwner();
+								if (budget.abandoned || budget.remainingWork() === 0)
+									throw new PiContextDeadlineError(budget.diagnostic());
+							},
+							pi,
+							ctx,
+							sessionId,
+							db: options.db,
+							historian,
+							isFirstContextPassForSession,
+							activeTags: result.activeTags,
+							eligiblePendingDropTagIds: result.eligiblePendingDropTagIds,
+							rawMessageProvider,
+							ordinalAlignment: ordinalAlignment(),
+							taggerFloor,
+							sessionMeta,
+							piUsage,
+							pressureSnapshot: {
+								percentage: usagePercentage,
+								inputTokens: usageInputTokens,
+							},
+							minimumPercentage: usagePercentage,
+							liveIsRawBranchEstimate: piLiveUsageIsRawBranchEstimate,
+							historianStateSnapshot: historianStateForPass,
+							publishedHistoryRide,
+							primaryExecute:
+								schedulerDecision === "execute" && !sessionMeta.isSubagent,
+							signedThinkingHeld: result.strictThinkingKept,
+						});
+					} catch (error) {
+						budget.assertOutcome();
+						sessionLog(
+							sessionId,
+							`historian scheduling skipped: ${String(error)}`,
+						);
+					} finally {
+						guardSqliteTransformPass({
+							assert: budget.assertOutcome,
+							remainingMs: budget.remainingOutcome,
+						});
+					}
+				}
+				logTransformTiming(
+					sessionId,
+					"historianScheduling",
+					tHistorianScheduling,
+				);
+			};
+			pipelineArgs.evaluateHistorianBeforeReclaim = scheduleHistorian;
 			let result = await budget.waitMandatory(runPipeline(pipelineArgs));
 			const historyRefreshThisPass = result.historyRefreshPermitted;
 			observePipelineResultForTests(sessionId, result);
@@ -5879,68 +5988,7 @@ export function registerPiContextHandler(
 				tTransformDecision,
 			);
 
-			// After tagging and drops commit, an optional historian can start in
-			// the background. A headless request proven too large joins it below
-			// before deciding whether the rebuilt request can be sent.
-			const tHistorianScheduling = performance.now();
-			const historian = options.historian;
-			budget.stage = "historian scheduling";
-			if (historian && !options.compactionOff && budget.remainingWork() > 0) {
-				guardSqliteTransformPass({
-					assert: budget.assert,
-					remainingMs: budget.remainingWork,
-				});
-				try {
-					budget.assert();
-					maybeFireHistorian({
-						startGuard: () => {
-							// A completed pass has already admitted the background run;
-							// a following context pass must not cancel that admission.
-							if (!budget.completed) budget.assertOwner();
-							if (budget.abandoned || budget.remainingWork() === 0)
-								throw new PiContextDeadlineError(budget.diagnostic());
-						},
-						pi,
-						ctx,
-						sessionId,
-						db: options.db,
-						historian,
-						isFirstContextPassForSession,
-						activeTags: result.activeTags,
-						eligiblePendingDropTagIds: result.eligiblePendingDropTagIds,
-						rawMessageProvider,
-						ordinalAlignment: ordinalAlignment(),
-						taggerFloor,
-						sessionMeta,
-						piUsage,
-						pressureSnapshot: {
-							percentage: usagePercentage,
-							inputTokens: usageInputTokens,
-						},
-						minimumPercentage: usagePercentage,
-						liveIsRawBranchEstimate: piLiveUsageIsRawBranchEstimate,
-						historianStateSnapshot: historianStateForPass,
-						publishedHistoryRide: historyRefreshThisPass,
-						signedThinkingHeld: result.strictThinkingKept,
-					});
-				} catch (error) {
-					budget.assertOutcome();
-					sessionLog(
-						sessionId,
-						`historian scheduling skipped: ${String(error)}`,
-					);
-				} finally {
-					guardSqliteTransformPass({
-						assert: budget.assertOutcome,
-						remainingMs: budget.remainingOutcome,
-					});
-				}
-			}
-			logTransformTiming(
-				sessionId,
-				"historianScheduling",
-				tHistorianScheduling,
-			);
+			scheduleHistorian(result, historyRefreshThisPass);
 
 			// Step 4b.4: nudge + note-nudge + auto-search hint. All three
 			// run AFTER tagging/drops finish so they see the post-mutation
@@ -6670,7 +6718,16 @@ export function registerPiContextHandler(
 									const pending = inFlightHistorian.get(sessionId);
 									if (pending) {
 										budget.stage = "headless fit historian";
-										await budget.wait(pending);
+										await waitForPiHistorianInTurn(
+											sessionId,
+											() =>
+												Math.max(
+													0,
+													budget.remainingOutcome() -
+														PI_CONTEXT_BUDGET.completionReserveMs,
+												),
+											() => budget.wait(pending),
+										);
 									}
 								}
 								budget.stage = "outgoing fit reclaim";
@@ -6740,12 +6797,10 @@ export function registerPiContextHandler(
 								if (!reclaimCompleted && upperCursor && reservation)
 									// Releasing this owner's claim is safe after cancellation or
 									// deadline expiry; it cannot publish a superseded request.
-									withoutSqliteTransformPass(() =>
-										releasePiUpperEstimateReclaim(
-											options.db,
-											upperCursor,
-											reservation,
-										),
+									releasePiUpperEstimateReclaim(
+										options.db,
+										upperCursor,
+										reservation,
 									);
 							}
 						}
@@ -7615,14 +7670,15 @@ function spawnPiHistorianRun(args: {
 	const holderId = crypto.randomUUID();
 	const controller = new AbortController();
 	historianAbortControllers.set(sessionId, controller);
-	const runPromise = inRootAsyncContext(() =>
+	const runPromise = inPiHistorianRootContext(sessionId, () =>
 		(async () => {
-			// Defer the runner's synchronous prefix until the context handler has returned.
+			// Yield before starting detached work. A headless context pass may
+			// await this run instead of returning first.
 			await new Promise<void>((resolve) => setTimeout(resolve, 0));
 			if (controller.signal.aborted) return;
 			// Do not start a historian after the pass's 21s optional cutoff.
-			// Once started, its lease protects history-summary publication without
-			// borrowing the foreground context deadline.
+			// Background publication keeps its own lease and budget. Native lock
+			// waits borrow a turn's allowance only while that turn awaits this run.
 			args.startGuard?.();
 			const lease = acquireCompartmentLease(db, sessionId, holderId);
 			if (!lease) {
@@ -7657,6 +7713,7 @@ function spawnPiHistorianRun(args: {
 					runner: historian.runner,
 					signal: controller.signal,
 					historianModel: historian.model,
+					modelConfigKey: historian.modelConfigKey,
 					fallbackModels: historian.fallbackModels,
 					fallbackModelId,
 					historianChunkTokens: historian.historianChunkTokens,
@@ -7857,6 +7914,7 @@ function maybeFireHistorian(args: {
 	minimumPercentage: number;
 	historianStateSnapshot: PiHistorianStateSnapshot;
 	publishedHistoryRide: boolean;
+	primaryExecute?: boolean;
 	/** The pass kept the current turn's signed thinking under the bounded hold. */
 	signedThinkingHeld?: boolean;
 }): void {
@@ -8240,6 +8298,7 @@ function maybeFireHistorian(args: {
 				},
 			},
 			args.eligiblePendingDropTagIds,
+			args.primaryExecute === true,
 		);
 
 		if (!trigger.shouldFire) {
@@ -8336,6 +8395,12 @@ function maybeFireHistorian(args: {
 	}
 }
 interface RunPipelineArgs {
+	evaluateHistorianBeforeReclaim?: (
+		result: Pick<
+			RunPipelineResult,
+			"activeTags" | "eligiblePendingDropTagIds" | "strictThinkingKept"
+		>,
+	) => void;
 	/** Metadata estimates alone cannot rewrite messages bound to an active thinking signature. */
 	upperEstimateOnly?: boolean;
 	recoveryPrefix?: import("./pi-lkg").PiLkgRecoveryPrefix;
@@ -8707,7 +8772,7 @@ async function runCompactionOffPipeline(
 	// The transcript before any head is injected: the thinking strip below
 	// addresses its entries by their index in this array.
 	const transcript = [...(args.messages as unknown[])];
-	let headChangedUnderSignedTurn = false;
+	let headChangedUnderSignedThinking = false;
 	if (args.injection) {
 		const state: PiM0M1State = {
 			sessionId: args.sessionId,
@@ -8779,16 +8844,39 @@ async function runCompactionOffPipeline(
 			const head = JSON.stringify(
 				(args.messages as unknown[]).slice(0, headCount),
 			);
-			headChangedUnderSignedTurn =
+			headChangedUnderSignedThinking =
 				servedBeforeFirstRender === null ||
 				JSON.stringify(servedBeforeFirstRender.slice(0, headCount)) !== head;
+		} else if (
+			!signedTurnHoldsHead &&
+			args.reasoningClearing?.prefixBound === true &&
+			(injectionResult?.m0Materialized === true ||
+				injectionResult?.m1RenderedCoverage != null)
+		) {
+			// Nothing held the head on this pass (no open signed turn), so a fold
+			// could re-render it. The earlier turns' signed thinking is bound to
+			// the head it was served behind as well: when the new head differs from
+			// the one last served (or that one is unknown), those blocks are
+			// stripped below, on the same pass as the re-render.
+			const served = args.readLastServedMessages?.() ?? null;
+			const headCount = injectionResult?.syntheticLeadingCount ?? 0;
+			headChangedUnderSignedThinking =
+				served === null ||
+				JSON.stringify(served.slice(0, headCount)) !==
+					JSON.stringify((args.messages as unknown[]).slice(0, headCount));
+			if (headChangedUnderSignedThinking)
+				sessionLog(
+					args.sessionId,
+					"compaction-off fold changed the head: stripping signed thinking",
+				);
 		}
 	}
-	// The head changed in front of an open signed turn: strip every signed block
-	// on the wire, the turn's included (removing every block is always
-	// accepted). The entries are persisted first; the binding-mismatch replay at
-	// the end of every pass, compaction-off included, keeps them stripped.
-	if (headChangedUnderSignedTurn)
+	// The head changed in front of signed thinking (an open signed turn's, or
+	// an earlier turn's): strip every signed block on the wire, the open turn's
+	// included (removing every block is always accepted). The entries are
+	// persisted first; the binding-mismatch replay at the end of every pass,
+	// compaction-off included, keeps them stripped.
+	if (headChangedUnderSignedThinking)
 		applyPiProactiveThinkingStrip({
 			db: args.db,
 			sessionId: args.sessionId,
@@ -10147,6 +10235,7 @@ function runSynchronousPipeline(
 	// orphaning tags/source_contents/caveman/drop-state. Positional entryIds is
 	// exactly aligned here: tagging runs at transcript-build time, before any splice.
 	let nativeRemovalInputs: Map<string, string> | undefined;
+	let probingExecuteRemoval = false;
 	try {
 		nativeRemovalInputs = getNativeReplayState(
 			args.db,
@@ -10174,7 +10263,7 @@ function runSynchronousPipeline(
 					sessionId: args.sessionId,
 					callId,
 					saved: nativeRemovalInputs,
-					canApply: isCacheBustingPass,
+					canApply: isCacheBustingPass || probingExecuteRemoval,
 				}),
 			authorizeToolRemovals: (callIds) =>
 				preparePiToolRemovalMeasurements({
@@ -10290,9 +10379,10 @@ function runSynchronousPipeline(
 			"user_flush",
 		);
 	// Deferred render requests and native marker retries do not prove that the
-	// served system/m[0]/m[1] prefix changed. Only a user flush may deliberately
-	// admit drops when that prefix is unchanged.
+	// served system/m[0]/m[1] prefix changed. A user flush is explicit permission;
+	// bounded execute reclaim is admitted separately after target checks below.
 	const rideSignals = {
+		executeReclaim: false,
 		subagentExecute:
 			args.sessionMeta.isSubagent && args.schedulerDecision === "execute",
 		hardFold:
@@ -10520,6 +10610,24 @@ function runSynchronousPipeline(
 			}
 		}
 	}
+	const applyTemporalOnRide = () => {
+		if (!args.temporalAwareness || !isCacheBustingPass || protectedSignedPrefix)
+			return;
+		temporalDecisions = freezeTemporalDecisions(
+			args.db,
+			args.sessionId,
+			temporalCandidates,
+		);
+		if (
+			injectPiTemporalMarkers(
+				args.messages,
+				temporalDecisions,
+				stableIdResolver,
+			) > 0
+		)
+			recordFirstApplicationWireEdit(true);
+	};
+	applyTemporalOnRide();
 	logPiUnresolvedIdentities(args.sessionId, [
 		...guardPiToolAllocations(
 			args.db,
@@ -10658,6 +10766,8 @@ function runSynchronousPipeline(
 				args.db,
 				{
 					skipPrefixInjection: !ctxReduceCallable,
+					// A tag-only literal retained at save time stays inert after a provider switch.
+					preserveTagOnlyAssistantText: true,
 					entryFingerprintByMessageId,
 					reuseMessageIds: textIdentityPlan.reusableMessageIds,
 					textIdentityDriftMessageIds: textIdentityPlan.driftedMessageIds,
@@ -11143,6 +11253,77 @@ function runSynchronousPipeline(
 					RECENT_TOOL_SKELETON_WINDOW,
 				)
 			: [];
+	if (!args.sessionMeta.isSubagent && args.schedulerDecision === "execute") {
+		args.evaluateHistorianBeforeReclaim?.({
+			activeTags: getActiveTagsBySession(args.db, args.sessionId),
+			eligiblePendingDropTagIds,
+			strictThinkingKept: protectedSignedPrefix,
+		});
+	}
+	rideSignals.executeReclaim = originateExecuteReclaim({
+		db: args.db,
+		sessionId: args.sessionId,
+		primaryExecute:
+			!args.sessionMeta.isSubagent &&
+			args.schedulerDecision === "execute" &&
+			args.contextUsage.percentage < forceMaterializationPercentage,
+		alreadyBusting: isCacheBustingPass || identityRebuild,
+		summaryCanCome:
+			args.sessionMeta.compartmentInProgress ||
+			inFlightHistorian.has(args.sessionId) ||
+			((prefixPreflightContended || protectedSignedPrefix) &&
+				(deferredHistoryRefreshSessions.has(args.sessionId) ||
+					deferredMaterializationSessions.has(args.sessionId) ||
+					historyRefreshSessions.has(args.sessionId))) ||
+			readExecuteReclaimState(args.db, args.sessionId).floorOrdinal !== null,
+		reclaimableTokens: estimateExecuteReclaimTokens({
+			db: args.db,
+			sessionId: args.sessionId,
+			pendingOps,
+			tags: pendingOperationTags,
+			targets: newTargets,
+			protectedTagIds: new Set([
+				...protectedTagNumbersForPass,
+				...protectedToolTags,
+			]),
+			probePreparation: (targets) => {
+				const saved = nativeRemovalInputs;
+				const rollback = Symbol("execute removal probe");
+				const allowed = new Set<number>();
+				try {
+					// Exercise every candidate's marker write under one writer lock,
+					// then roll back the document write and restore nativeRemovalInputs.
+					nativeRemovalInputs = saved && new Map(saved);
+					probingExecuteRemoval = true;
+					args.db
+						.transaction(() => {
+							for (const [number, target] of targets) {
+								if (target.prepareDrop?.() !== false) allowed.add(number);
+							}
+							throw rollback;
+						})
+						.immediate();
+				} catch (error) {
+					if (error !== rollback) allowed.clear();
+				} finally {
+					nativeRemovalInputs = saved;
+					probingExecuteRemoval = false;
+				}
+				return allowed;
+			},
+		}),
+		usableWindow:
+			args.usableSoft ??
+			args.contextUsage.inputTokens / (args.contextUsage.percentage / 100),
+	});
+	if (rideSignals.executeReclaim) {
+		isCacheBustingPass = reclaimRidePermitted(rideSignals, ridePermissionGate);
+		publishedWorkDrainAllowed = isCacheBustingPass;
+		shouldRunHeuristics ||= isCacheBustingPass && args.heuristics !== undefined;
+		stripUnheldSignedTurnOnBust();
+		applyTemporalOnRide();
+	}
+
 	const deferredMaterialize =
 		canConsumeDeferredLate && deferredMaterializationWasPending;
 	const deferredHistoryRefresh =
@@ -12834,6 +13015,7 @@ function runSynchronousPipeline(
 	if (!parkedTriggers?.pending)
 		parkedBustTriggersBySession.delete(args.sessionId);
 	if (prefixPass) prefixPass.boundary = protectedSignedPrefix;
+	if (bustedThisPass) clearExecuteReclaimState(args.db, args.sessionId);
 	return {
 		prefixPass,
 		prefixStableIds: postCommitStableIdByRef,

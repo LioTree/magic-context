@@ -170,6 +170,7 @@ export function createToolRegistry(args: {
         ...createCtxSearchTools({
             db,
             rerankConnectionFile: pluginConfig.subc?.connection_file,
+            rerankConfig: pluginConfig.rerank,
             resolveProjectPath,
             ensureProjectRegistered: ensureProjectRegisteredFromOpenCodeDirectory,
         }),

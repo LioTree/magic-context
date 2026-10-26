@@ -109,6 +109,8 @@ export interface SubagentRunOptions {
 
     /** Optional token accounting metadata. When present, harness runners persist subagent_invocations. */
     accountingSessionId?: string | undefined;
+    /** Config key supplying the selected model, for host refusal diagnostics. */
+    accountingModelConfigKey?: string | undefined;
     accountingSubagent?:
         | "rescore"
         | "historian"

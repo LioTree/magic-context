@@ -95,6 +95,7 @@ import {
     applyFlushedStatuses,
     type ConvertedToolDropMode,
     foldBustsServedPrefix,
+    foldChangesServedPrefix,
     foldInvalidatesThinking,
     prepareLegacyToolSkeletonConversions,
     renderConvertedToolSkeletons,
@@ -124,6 +125,7 @@ import {
 } from "./ctx-reduce-availability";
 import type { Channel1State } from "./ctx-reduce-nudge";
 import { degradedPassError } from "./degraded-pass-refusal";
+import { diagnosticStateChanged } from "./diagnostic-log-state";
 import { dropStaleReduceCalls, gateStaleReduceAdmission } from "./drop-stale-reduce-calls";
 import {
     type DroppedTokenReduction,
@@ -137,6 +139,12 @@ import {
     thinkingAnchor,
 } from "./edit-admission";
 import { EmergencyFailClosedError, outgoingContextRefusal } from "./emergency-fail-closed";
+import {
+    clearExecuteReclaimState,
+    estimateExecuteReclaimTokens,
+    originateExecuteReclaim,
+    readExecuteReclaimState,
+} from "./execute-reclaim";
 import { foldExecutesThisPass } from "./fold-execution-gate";
 import { applyHeuristicCleanup } from "./heuristic-cleanup";
 import {
@@ -158,7 +166,11 @@ import {
     prepareCachedM0M1Replay,
     renderCompartmentInjection,
 } from "./inject-compartments";
-import { protectNewTagMutations, retainedActiveThinkingParts } from "./latest-assistant-turn";
+import {
+    isAnthropicThinkingPart,
+    protectNewTagMutations,
+    retainedActiveThinkingParts,
+} from "./latest-assistant-turn";
 import { markNoteNudgeDelivered, observeNoteNudgeServe, peekNoteNudgeText } from "./note-nudger";
 import { hasVisibleNoteReadCall } from "./note-visibility";
 import {
@@ -185,6 +197,7 @@ import {
     settleDroppedReasoningParts,
 } from "./reasoning-removal";
 import {
+    isAnthropicFamilyRoute,
     isNeutralizedReasoningPart,
     modelAcceptsEmptyContent,
     replaySentinelByMessageIds,
@@ -199,10 +212,12 @@ import {
     validateServedPrefix,
     writeServedPrefix,
 } from "./served-prefix";
+import { prepareServedShapeRepair } from "./served-shape-repair";
 import { resolveSignedThinkingHoldPolicy } from "./signed-thinking-hold";
 import { servedPrefixMatches } from "./strict-thinking-prefix";
 import {
     applyFrozenTrailingBlankDecisions,
+    captureInlineThinkingRepairs,
     clearOldReasoning,
     findLatestAssistantReasoningMutationExemptMessage,
     findMergedReasoningStripDecisions,
@@ -771,6 +786,39 @@ function proactiveStripStartIndex(args: {
     });
     if (lastServed.proven) return divergence;
     return divergence ?? lastServed.messages.length;
+}
+
+/**
+ * True when the array about to be served still carries a thinking part that
+ * may be signed (its signature is not inspected). A part counts by the same route rule that finds an open signed turn
+ * (`isAnthropicThinkingPart`): on an Anthropic-family route (Anthropic,
+ * Bedrock, Vertex, Copilot) every thinking part counts, whichever metadata key
+ * holds its signature. Parts that never reach the provider do not count: an
+ * ignored part, or an empty one that carries no redacted payload. On a
+ * prefix-bound model such a block is bound to every byte in front of it, the
+ * system prompt included, so this is the fact that decides whether the system
+ * date may move. It reads the outcome of every strip the pass made instead of
+ * predicting it, so it also covers blocks of a turn whose opening user message
+ * was trimmed away.
+ */
+export function servesThinkingBlock(
+    messages: readonly MessageLike[],
+    providerID: string | undefined,
+    modelID: string | undefined,
+): boolean {
+    const familyRoute = isAnthropicFamilyRoute(providerID, modelID);
+    for (const message of messages) {
+        if (message.info.role !== "assistant") continue;
+        for (const part of message.parts) {
+            if (!isAnthropicThinkingPart(part, familyRoute) || part.ignored === true) continue;
+            if (part.type === "redacted_thinking") return true;
+            if (typeof part.text === "string" && part.text !== "") return true;
+            const records = isRecord(part.metadata) ? Object.values(part.metadata) : [];
+            if (records.some((record) => isRecord(record) && record.redactedData !== undefined))
+                return true;
+        }
+    }
+    return false;
 }
 
 /**
@@ -1763,6 +1811,13 @@ interface RunPostTransformPhaseArgs {
     activeThinkingPrefixHold?: boolean;
     directoryPrefixHold?: boolean;
     forceSignedRebuildForFit?: boolean;
+    /**
+     * The session's compaction mode changed (managed <-> compaction-off) and no
+     * pass has completed in the new mode yet. The new mode serves the message
+     * bytes differently (compaction-off writes no tags), so every signed
+     * thinking block on the wire sits behind changed bytes.
+     */
+    compactionModeTransition?: boolean;
     readLastServedMessages?: () => readonly unknown[] | null;
     deferredHistoryWasPendingAtPassStart: boolean;
     compartmentInjectionRebuiltFromDb: boolean;
@@ -1896,12 +1951,6 @@ export interface PostTransformPhaseResult {
     finalizeServedPrefix?: (publish?: boolean) => boolean;
     prefixRecordWritable?: boolean;
     thinkingReleasedForFit?: boolean;
-    /**
-     * A prefix-bound model's open turn still serves signed thinking after this
-     * pass (it was neither stripped nor absent). Anything in front of it, the
-     * system prompt included, must not change on this pass.
-     */
-    openTurnSignedThinkingKept?: boolean;
     explicitMaterializedSuccessfully: boolean;
     deferredMaterializedSuccessfully: boolean;
     materialized: boolean;
@@ -2181,6 +2230,19 @@ export async function runPostTransformPhase(
     };
     const trailingBlankSourceDecisions =
         args.trailingBlankSourceDecisions ?? snapshotTrailingBlankSourceDecisions(args.messages);
+    if (!modelAcceptsEmptyContent(args.resolvedProviderID) && !compactionOff)
+        captureInlineThinkingRepairs(
+            args.messages,
+            args.messageTagNumbers,
+            args.sessionMeta?.clearedReasoningThroughTag ?? 0,
+        );
+    const servedShapeRepair = prepareServedShapeRepair(
+        args.db,
+        args.sessionId,
+        args.messages,
+        args.readLastServedMessages,
+        compactionOff ? undefined : postprocessReplaySnapshot(args.db, args.sessionId),
+    );
     // Capture before todo/history synthesis can add assistant messages. Reasoning replay skips a
     // metadata-only OpenCode request shell, while trailing-blank freezing still tracks that newest
     // host message because its shape can change before the next pass.
@@ -2256,8 +2318,11 @@ export async function runPostTransformPhase(
         args.canRunCompartments &&
         !args.awaitedCompartmentRun &&
         activeCompartmentRun !== undefined;
-    let deferredMaterialize = args.canConsumeDeferredLate && deferredMaterializationWasPending;
-    let materializationRequested = isExplicitFlush || deferredMaterialize;
+    let deferredMaterialize =
+        (args.canConsumeDeferredLate || servedShapeRepair.needsRebuild) &&
+        deferredMaterializationWasPending;
+    let materializationRequested =
+        isExplicitFlush || deferredMaterialize || servedShapeRepair.needsRebuild;
     // Persist eligible prefix work off-wire before authorizing automatic cleanup.
     // Execute may refresh m[1] without changing it: only changed bytes supply a ride.
     // A failed or contended advisory alone must never open the reduction lanes.
@@ -2515,6 +2580,8 @@ export async function runPostTransformPhase(
             throw new Error("Cannot persist signed thinking omission before prefix rewrite");
         if (stripOffWire)
             for (const id of stripped.strip?.messageIds ?? []) compactionOffFrozenThinking.add(id);
+        // A later release on the same pass then has nothing left to record.
+        for (const id of stripped.strip?.messageIds ?? []) bindingThinking.add(id);
         retainedThinking.clear();
         protectedThinkingMessages.clear();
         activeThinkingTurn = false;
@@ -2526,6 +2593,10 @@ export async function runPostTransformPhase(
         // The rewrite omitted every signed block, so no retained boundary can veto its work.
         editAdmission = makeEditAdmission();
     };
+    // Replacing a previously served empty text slot cannot wait for the signed-prefix hold. Reuse
+    // the normal rewrite release so no signature remains bound to old bytes.
+    if (servedShapeRepair.needsRebuild && activeThinkingTurn)
+        releaseThinkingForRewrite(false, true);
     // Fit proof authorizes rebuilding the signed prefix, independently of
     // pressure. Release before prefix preparation so it can refresh history
     // without pretending the protected tool window has reached 95% usage.
@@ -2536,6 +2607,18 @@ export async function runPostTransformPhase(
             (activeThinkingTurn && args.thinkingBindingRecoveryEnabledForModel === true))
     ) {
         releaseThinkingForRewrite(true);
+    }
+    // A compaction mode switch adds or removes the tags in front of every
+    // signed block, whatever the head does, and the switch pass rebuilds the
+    // head anyway (the switch clears the cached m[0]/m[1]). Strip every signed
+    // block on that pass, before the head is prepared, so the rebuild carries
+    // no thinking bound to the other mode's bytes.
+    if (
+        args.compactionModeTransition === true &&
+        args.thinkingBindingRecoveryEnabledForModel === true
+    ) {
+        sessionLog(args.sessionId, "compaction mode switch: stripping signed thinking");
+        releaseThinkingForRewrite(false, true);
     }
     const foldDueDecision =
         m0M1EnabledForFold && args.m0M1 && !freezeM0M1
@@ -2585,7 +2668,10 @@ export async function runPostTransformPhase(
     let publishedM1RefreshedThisPass = false;
     let prefixPreflightFailed = false;
     const softRefreshOpportunity =
-        !freezeM0M1 && (args.schedulerDecision === "execute" || deferredMaterialize);
+        !freezeM0M1 &&
+        (args.schedulerDecision === "execute" ||
+            deferredMaterialize ||
+            servedShapeRepair.needsRebuild);
     let m0RematerializedThisPass = false;
     const m0CoverageBeforeFold =
         args.sessionMeta.cachedM0Bytes === null ? -1 : args.sessionMeta.cachedM0MaxCompartmentSeq;
@@ -2619,6 +2705,11 @@ export async function runPostTransformPhase(
         args.m0M1
     ) {
         let committedFoldBustsServedPrefix: boolean | undefined;
+        // Whether the committed fold serves m[0]/m[1]/mural bytes that differ
+        // from the head the session last served. Unlike the bust permission it
+        // ignores reasons that only lose the provider cache: signed thinking is
+        // bound to bytes, so only a byte change invalidates it.
+        let committedFoldChangesHead: boolean | undefined;
         try {
             const previousM1 = args.sessionMeta.cachedM1Bytes?.toString("utf8");
             // Omitting messages keeps prefix preparation off-wire. The final
@@ -2661,6 +2752,14 @@ export async function runPostTransformPhase(
                                   servedPrefixBeforeFold,
                                   rendered,
                               );
+                        committedFoldChangesHead = firstRenderBust
+                            ? !servedPrefixMatches({
+                                  messages: servedBeforeFirstRender,
+                                  m0Text: rendered.m0Bytes.toString(),
+                                  m1Text: rendered.m1Bytes.toString(),
+                                  muralDataUrl: rendered.muralDataUrl,
+                              })
+                            : foldChangesServedPrefix(servedPrefixBeforeFold, rendered);
                         if (bustsPrefix) {
                             if (!conversions.isCurrent(db)) {
                                 throw new MaterializeContentionError({
@@ -2707,6 +2806,24 @@ export async function runPostTransformPhase(
                 // Compaction-off holds every open signed turn, but a first render
                 // has no cached head to replay: the new head goes out, so the
                 // turn's thinking must leave the wire with it.
+                releaseThinkingForRewrite(false, true);
+            } else if (
+                compactionOff &&
+                !activeThinkingPrefixHold &&
+                args.thinkingBindingRecoveryEnabledForModel === true &&
+                committedFoldChangesHead
+            ) {
+                // Compaction-off holds the head only while the open turn has
+                // signed thinking. A fold on any other pass (the first request of
+                // a new turn after a memory edit, for example) re-renders the
+                // head in front of the earlier turns' signed thinking, which a
+                // prefix-bound model invalidates as well. That fold is the
+                // rewrite, so the blocks leave the wire on the same pass and
+                // stay stripped on every later one.
+                sessionLog(
+                    args.sessionId,
+                    "compaction-off fold changed the head: stripping signed thinking",
+                );
                 releaseThinkingForRewrite(false, true);
             }
             prefixPreflightFailed = foldResult.materializationContentionRetryExhausted === true;
@@ -2862,6 +2979,8 @@ export async function runPostTransformPhase(
     const idleExpiryRebuild =
         (!freezeM0M1 || activeThinkingPrefixHold) && args.m0M1?.hardSignals?.cacheExpired === true;
     const rideSignals = {
+        servedShapeRepair: servedShapeRepair.needsRebuild,
+        executeReclaim: false,
         subagentExecute: !args.fullFeatureMode && args.schedulerDecision === "execute",
         hardFold:
             rewritingSignedPrefix ||
@@ -2893,23 +3012,55 @@ export async function runPostTransformPhase(
                     (args.pendingCompartmentInjection?.compartmentCount ?? 0) > 0 &&
                     legacyPublishedHeadChanged(args))),
     };
+    const protectedToolTags = protectedToolTagNumbers(args.tags, args.protectedTools);
+    rideSignals.executeReclaim =
+        !compactionOff &&
+        originateExecuteReclaim({
+            db: args.db,
+            sessionId: args.sessionId,
+            primaryExecute:
+                args.fullFeatureMode &&
+                args.schedulerDecision === "execute" &&
+                args.contextUsage.percentage < args.forceMaterializationPercentage,
+            alreadyBusting: Object.values(rideSignals).some(Boolean) || args.historyRebuiltThisPass,
+            summaryCanCome:
+                compartmentRunning ||
+                args.sessionMeta.compartmentInProgress ||
+                ((prefixPreflightFailed || freezeM0M1 || activeThinkingPrefixHold) &&
+                    (args.deferredHistoryRefreshSessions.has(args.sessionId) ||
+                        args.deferredMaterializationSessions.has(args.sessionId) ||
+                        args.historyRefreshSessions?.has(args.sessionId) === true)) ||
+                readExecuteReclaimState(args.db, args.sessionId).floorOrdinal !== null,
+            reclaimableTokens: estimateExecuteReclaimTokens({
+                db: args.db,
+                sessionId: args.sessionId,
+                pendingOps,
+                tags: args.tags,
+                targets: newTargets,
+                protectedTagIds: new Set([...args.protectedTagIds, ...protectedToolTags]),
+            }),
+            usableWindow: args.usableWindow,
+        });
     // Warm-cache thinking holds defer every new prefix edit. First render, idle
     // expiry and pressure relief can admit work, but the target guards still
     // forbid changes before any retained signature. A genuine prefix rewrite
     // first omits every signed block. The directory veto freezes injection only.
     // The historian's redundancy skip applies the same predicate.
     const publishedWorkDrainAllowed =
-        !compactionOff &&
+        (!compactionOff || servedShapeRepair.needsRebuild) &&
         reclaimRidePermitted(rideSignals, {
             signedThinkingHold: activeThinkingPrefixHold,
             firstRender: firstRenderBust,
             idleExpiry: idleExpiryRebuild,
             emergency: emergencyDropEligible,
         });
-    const shouldApplyPendingOps = publishedWorkDrainAllowed;
+    const shouldApplyPendingOps = !compactionOff && publishedWorkDrainAllowed;
     const shouldRunHeuristics =
+        !compactionOff &&
         publishedWorkDrainAllowed &&
         (rideSignals.publishedHistory ||
+            rideSignals.executeReclaim ||
+            rideSignals.servedShapeRepair ||
             materializationRequested ||
             forceMaterialization ||
             // The off-wire fold changed the served prefix, so the prefix already
@@ -2928,6 +3079,9 @@ export async function runPostTransformPhase(
     // Every first-application lane and m[1] refresh uses this same permission.
     // It authorizes mutation; individual lanes may still find no eligible work.
     const isCacheBustingPass = publishedWorkDrainAllowed;
+    if (servedShapeRepair.needsRebuild && !isCacheBustingPass)
+        throw new Error("Served-shape repair requires a rebuilding pass");
+    servedShapeRepair.apply(isCacheBustingPass);
     // An unheld bust of a prefix-bound model whose turn still keeps signed
     // thinking lands like a bust on any other model: latest-turn protection is
     // lifted so queued drops and cleanup in the turn apply on it. A bust that
@@ -3183,6 +3337,25 @@ export async function runPostTransformPhase(
             );
         }
     }
+    const heuristicsLogChanged = diagnosticStateChanged(
+        args.sessionId,
+        "heuristics",
+        JSON.stringify([
+            args.currentTurnId,
+            shouldRunHeuristics,
+            shouldRunHeuristics ? null : args.schedulerDeferReason,
+        ]),
+    );
+    const pendingLogChanged = diagnosticStateChanged(
+        args.sessionId,
+        "pending-ops",
+        JSON.stringify([
+            args.currentTurnId,
+            shouldApplyPendingOps,
+            shouldApplyPendingOps ? null : args.schedulerDeferReason,
+            shouldApplyPendingOps ? null : (getPendingOpsCount(args.db, args.sessionId) ?? 0) > 0,
+        ]),
+    );
     if (shouldRunHeuristics) {
         const subagentRerun =
             !args.fullFeatureMode &&
@@ -3205,7 +3378,11 @@ export async function runPostTransformPhase(
             args.sessionId,
             `heuristics WILL RUN — reason=${reason}, context=${args.contextUsage.percentage.toFixed(1)}%, turn=${args.currentTurnId}`,
         );
-    } else if (args.schedulerDeferReason !== undefined && args.schedulerDeferReason !== null) {
+    } else if (
+        heuristicsLogChanged &&
+        args.schedulerDeferReason !== undefined &&
+        args.schedulerDeferReason !== null
+    ) {
         sessionLog(args.sessionId, `heuristics WILL NOT RUN — reason=${args.schedulerDeferReason}`);
     }
     // Only show "skipping" log for primary sessions — subagents bypass the
@@ -3223,6 +3400,7 @@ export async function runPostTransformPhase(
     }
     if (
         !shouldApplyPendingOps &&
+        pendingLogChanged &&
         args.schedulerDeferReason !== undefined &&
         args.schedulerDeferReason !== null
     ) {
@@ -3240,7 +3418,6 @@ export async function runPostTransformPhase(
     let explicitMaterializedSuccessfully = false;
     let deferredMaterializedSuccessfully = false;
     let pendingOpsDidMutate = false;
-    const protectedToolTags = protectedToolTagNumbers(args.tags, args.protectedTools);
     // First application is an edit; restoring the same frozen choice from raw
     // history is replay. Telemetry and signed-thinking invalidation consume the
     // same edit record so a strip cannot silently escape either accounting lane.
@@ -3249,6 +3426,7 @@ export async function runPostTransformPhase(
         firstApplicationEdits.any = true;
         firstApplicationEdits.beforeNewerThinking ||= beforeNewerThinking;
     };
+    if (servedShapeRepair.needsRebuild) recordFirstApplicationWireEdit(true);
     const firstApplicationLocations = new Map<MessageLike, number>();
     const recordFirstApplicationAt = (message: MessageLike, partIndex: number): void => {
         recordFirstApplicationWireEdit(false);
@@ -3675,7 +3853,12 @@ export async function runPostTransformPhase(
                 // models it stays off too (Pi caps both lanes with one cutoff).
                 const strippedInline =
                     routineCleanupApplied && ageLaneAllowed
-                        ? stripInlineThinking(args.messages, args.messageTagNumbers, budgetCutoff)
+                        ? stripInlineThinking(
+                              args.messages,
+                              args.messageTagNumbers,
+                              budgetCutoff,
+                              !canUseEmptySentinels,
+                          )
                         : 0;
                 // Fresh caveman compression above rebuilds text from its original source,
                 // which brings back inline thinking that the replay at the start of this
@@ -3690,8 +3873,10 @@ export async function runPostTransformPhase(
                         args.messages,
                         args.messageTagNumbers,
                         persistedInlineWatermark,
+                        !canUseEmptySentinels,
                     );
                 }
+                servedShapeRepair.apply(isCacheBustingPass);
                 // Every other provider removes whole reasoning parts instead. New ids
                 // are chosen only here, on the same rebuilding pass as the lane above,
                 // and persisted before final representation applies them; a failed
@@ -4444,11 +4629,14 @@ export async function runPostTransformPhase(
         // and persist their IDs so future defer passes can replay.
         if (isCacheBustingPass) {
             pair(() => {
+                const admitDroppedPlaceholder = admitWholeMessage("placeholder");
                 const droppedResult = stripDroppedPlaceholderMessages(
                     args.messages,
                     args.resolvedProviderID,
                     recordFirstApplicationAt,
-                    admitWholeMessage("placeholder"),
+                    (message) =>
+                        !servedShapeRepair.messageIDs.has(message.info.id ?? "") &&
+                        admitDroppedPlaceholder(message),
                 );
                 const protectedTailStart = Math.max(
                     0,
@@ -5782,6 +5970,7 @@ export async function runPostTransformPhase(
             }
             return lateStrip;
         };
+        if (bustedThisPass) clearExecuteReclaimState(args.db, args.sessionId);
         parkedTriggers?.persist(args.db, args.sessionId);
         if (!parkedTriggers?.pending) parkedBustTriggersBySession.delete(args.sessionId);
         return {
@@ -5815,10 +6004,6 @@ export async function runPostTransformPhase(
             thinkingBindingRecovery,
             proactiveThinkingStrip,
             thinkingReleasedForFit,
-            openTurnSignedThinkingKept:
-                args.thinkingBindingRecoveryEnabledForModel === true &&
-                activeThinkingTurn &&
-                !rewritingSignedPrefix,
         };
     });
 }

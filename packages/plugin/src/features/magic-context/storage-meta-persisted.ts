@@ -19,6 +19,7 @@ import { ensureSessionMetaRow } from "./storage-meta-shared";
 import {
     isPersistedTrailingBlankDecision,
     type PersistedTrailingBlankDecision,
+    parseReplayDocument,
     ReplayDocumentError,
     readAllTrailingBlankDecisions,
     readReplayDocument,
@@ -3243,6 +3244,8 @@ export function getCompactionMarkerHealth(
 
 /** Frozen rendering decisions consumed by one postprocess pass. */
 export interface PostprocessReplaySnapshot {
+    servedShapeRepair?: unknown;
+    executeReclaim?: unknown;
     staleReduceStrippedIds: Set<string>;
     processedImageStrippedIds: Set<string>;
     processedImageMarkers: Map<string, ProcessedImageMarker>;
@@ -3257,6 +3260,17 @@ export interface PostprocessReplaySnapshot {
     mergedReasoningStrippedIds: Set<string>;
     thinkingBindingRecoveryTarget: string | null;
     trailingBlankDecisions: Map<string, PersistedTrailingBlankDecision>;
+}
+
+function executeReclaimFromReplay(raw: string | null | undefined): unknown {
+    try {
+        return parseReplayDocument(raw).executeReclaim;
+    } catch {
+        // An unsupported replay document must remain untouched. Existing cleanup
+        // can still ride a fold; originating execute-reclaim requires persisting
+        // its consecutive held-execute counter first.
+        return undefined;
+    }
 }
 
 /**
@@ -3320,6 +3334,14 @@ export function loadPostprocessReplaySnapshot(
         row?.todo_permission_denied === 1 ? true : row?.todo_permission_denied === 0 ? false : null;
     const thinkingBindingRecoveryTarget = row?.thinking_binding_recovery_target;
     return {
+        servedShapeRepair: (() => {
+            try {
+                return parseReplayDocument(row?.trailing_blank_decisions).servedShapeRepair;
+            } catch {
+                return undefined;
+            }
+        })(),
+        executeReclaim: executeReclaimFromReplay(row?.trailing_blank_decisions),
         staleReduceStrippedIds: new Set(parseStrippedBlob(row?.stale_reduce_stripped_ids)),
         processedImageStrippedIds: new Set(
             parseProcessedImageMarkers(row?.processed_image_stripped_ids).keys(),

@@ -357,7 +357,7 @@ async function promptWithTimeout(
                   // Only a transport that watches the child can say the model is silent.
                   if (!activity.monitored || activity.received) return;
                   silent = true;
-                  controller.abort();
+                  controller.abort(new ModelProducedNoOutputError(firstOutputTimeoutMs));
               }, firstOutputTimeoutMs)
             : undefined;
     const timeoutError = () =>
@@ -996,7 +996,7 @@ export async function promptSyncWithValidatedOutputRetry<TOutput, TValidated = T
 
         if (!cooledPrimary && !quota)
             log(
-                `[${callContext}] primary (${explicitPrimaryLabel}) failed validation/prompt: ${shortErr(failure.error)}; trying ${fallbacks.length} fallback(s)`,
+                `[${callContext}] primary (${explicitPrimaryLabel}) failed validation/prompt: ${shortErr(failure.error)}; ${fallbacks.length} fallback(s) configured, subject to remaining budget`,
             );
     }
 

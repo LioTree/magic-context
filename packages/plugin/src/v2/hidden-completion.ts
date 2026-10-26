@@ -2,6 +2,10 @@ import {
     createDreamTokenBudget,
     DreamTokenBudgetExceeded,
 } from "../features/magic-context/dreamer/token-budget";
+import {
+    annotateSubagentInvocationError,
+    recordChildInvocation,
+} from "../features/magic-context/subagent-token-capture";
 import type {
     HiddenCompletion,
     HiddenCompletionExecutor,
@@ -14,6 +18,11 @@ import { recordHiddenVariantWarning } from "../shared/hidden-variant-warnings";
 import { needsBlockedRead } from "../shared/hidden-zen-read";
 import { log } from "../shared/logger";
 import type { PromptArgs } from "../shared/model-suggestion-retry";
+import {
+    ModelProducedNoOutputError,
+    noteModelActivityMonitored,
+    noteModelOutputReceived,
+} from "../shared/model-suggestion-retry";
 import { parseProviderModel, toModelEntry } from "../shared/resolve-fallbacks";
 import { runTokenLog } from "../shared/run-token-log";
 import type { Database } from "../shared/sqlite";
@@ -337,11 +346,13 @@ function assistantText(row: StoreRow<"assistant">): string | null {
  */
 export class HiddenProviderError extends Error {
     readonly settled: boolean;
+    readonly hostError?: unknown;
 
-    constructor(detail: string, options: { settled?: boolean } = {}) {
+    constructor(detail: string, options: { settled?: boolean; hostError?: unknown } = {}) {
         super(`Hidden completion provider error: ${detail}`);
         this.name = "HiddenProviderError";
         this.settled = options.settled ?? true;
+        this.hostError = options.hostError;
     }
 }
 
@@ -420,8 +431,10 @@ async function awaitAssistantRow(
                     `session_error=${sessionError === undefined ? "unavailable" : errorText(sessionError)}`,
                 ];
                 throw sessionError === undefined || !isProviderFailure(sessionError)
-                    ? new Error(`Hidden completion failed: ${details.join("; ")}`)
-                    : new HiddenProviderError(details.join("; "));
+                    ? new Error(`Hidden completion failed: ${details.join("; ")}`, {
+                          cause: sessionError,
+                      })
+                    : new HiddenProviderError(details.join("; "), { hostError: sessionError });
             }
             if (outcome === "succeeded" && newAssistant) return newAssistant;
         }
@@ -435,8 +448,10 @@ async function awaitAssistantRow(
                     `session_error=${sessionError === undefined ? "unavailable" : errorText(sessionError)}`,
                 ];
                 throw sessionError === undefined || !isProviderFailure(sessionError)
-                    ? new Error(`Hidden completion failed: ${details.join("; ")}`)
-                    : new HiddenProviderError(details.join("; "));
+                    ? new Error(`Hidden completion failed: ${details.join("; ")}`, {
+                          cause: sessionError,
+                      })
+                    : new HiddenProviderError(details.join("; "), { hostError: sessionError });
             }
             if (newAssistant.data.error !== undefined) {
                 throw new HiddenProviderError(errorText(newAssistant.data.error), {
@@ -651,7 +666,15 @@ export async function createV2HiddenCompletionExecutor(
                 const head = await resolveHead(identity);
                 const active = await lifecycle.open(identity, role, head);
                 openedChild = active;
-                const handle = { id: active.id, childSessionId: active.id };
+                const configuredModel = toModelEntry(identity.model);
+                const handle: HiddenRunHandle = {
+                    id: active.id,
+                    childSessionId: active.id,
+                    attemptedModel: modelKey(head),
+                    ...(configuredModel?.sourceConfigKey
+                        ? { modelConfigKey: configuredModel.sourceConfigKey }
+                        : {}),
+                };
                 const tokenBudget = identity.metadata?.tokenBudget;
                 const run: RunState = {
                     identity,
@@ -682,6 +705,7 @@ export async function createV2HiddenCompletionExecutor(
             }
         },
         async attempt(handle, request) {
+            const startedAt = Date.now();
             const run = runs.get(handle);
             if (!run) throw new Error("Unknown hidden completion run");
             const refuseDisposed = (): void => {
@@ -701,6 +725,12 @@ export async function createV2HiddenCompletionExecutor(
                 requestModel(request, run.child.model),
                 run.identity.kind === "rescore",
             );
+            const requestedRef = modelKey(requested);
+            const configuredModel = [run.identity.model, ...(run.identity.configuredModels ?? [])]
+                .map(toModelEntry)
+                .find((entry) => entry?.model === requestedRef);
+            handle.attemptedModel = requestedRef;
+            handle.modelConfigKey = configuredModel?.sourceConfigKey ?? handle.modelConfigKey;
             // A rescore sends the temperature fixed in its rescore profile (set when the
             // job was confirmed), so the configured historian temperature is not added to it.
             if (
@@ -847,6 +877,27 @@ export async function createV2HiddenCompletionExecutor(
                 abortReject = reject;
             });
             const onAbort = () => {
+                const reason = request.signal?.reason;
+                if (
+                    reason instanceof ModelProducedNoOutputError &&
+                    run.identity.kind === "dreamer-task"
+                ) {
+                    // The outer task records its result after fallback, not the first model's
+                    // no-output timeout. Keep that failed attempt separately so it is not lost.
+                    recordChildInvocation({
+                        db: options.db,
+                        parentSessionId: run.identity.parentSessionId ?? options.projectIdentity,
+                        parentInvocationId: run.identity.parentInvocationId,
+                        harness: "opencode2",
+                        subagent: "dreamer",
+                        task: run.identity.title.replace(/^magic-context-dream-/, ""),
+                        startedAt,
+                        status: "timed_out",
+                        error: reason,
+                        providerId: requested.providerID,
+                        modelId: requested.modelID,
+                    });
+                }
                 void interruptAndRetire(run, "prompt-aborted").finally(() =>
                     abortReject(new Error("Hidden completion prompt aborted")),
                 );
@@ -886,6 +937,10 @@ export async function createV2HiddenCompletionExecutor(
                 }),
             };
             inFlight.add(entry);
+            const stopWatching = host.watchModelActivity?.(run.child.id, () =>
+                noteModelOutputReceived(request.signal),
+            );
+            if (stopWatching) noteModelActivityMonitored(request.signal);
             try {
                 await Promise.race([
                     host.prompt({ sessionID: run.child.id, text: marker }),
@@ -982,6 +1037,8 @@ export async function createV2HiddenCompletionExecutor(
                     lengthCapped: ["length", "max_tokens"].includes(row.data.finish ?? ""),
                     providerId: row.data.model?.providerID ?? requested.providerID,
                     modelId: row.data.model?.id ?? requested.modelID,
+                    attemptedModel: requestedRef,
+                    modelConfigKey: handle.modelConfigKey,
                 };
                 if (text) run.turns.push({ prompt: promptText(request), reply: text });
                 // Recorded for `keep_subagents` retention: this child now holds a settled run.
@@ -989,6 +1046,18 @@ export async function createV2HiddenCompletionExecutor(
             } catch (caught) {
                 const error =
                     attempt.budgetExceeded ?? attempt.stepLimit ?? attempt.refusal ?? caught;
+                const hostError =
+                    error instanceof HiddenProviderError
+                        ? error.hostError
+                        : error instanceof Error &&
+                            error.message.startsWith("Hidden completion failed:")
+                          ? error.cause
+                          : undefined;
+                annotateSubagentInvocationError(error, {
+                    attemptedModel: handle.attemptedModel,
+                    modelConfigKey: handle.modelConfigKey,
+                    ...(hostError === undefined ? {} : { hostError }),
+                });
                 run.failed = true;
                 if (!(error instanceof HiddenProviderError)) {
                     run.unsettledFailure = true;
@@ -1019,6 +1088,7 @@ export async function createV2HiddenCompletionExecutor(
                 }
                 throw error;
             } finally {
+                stopWatching?.();
                 clearTimeout(deadlineTimer);
                 if (budgetPoll) clearInterval(budgetPoll);
                 request.signal?.removeEventListener("abort", onAbort);

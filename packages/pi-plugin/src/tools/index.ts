@@ -25,6 +25,8 @@ import { createPromptSurfaceRuntime } from "@magic-context/core/shared/prompt-su
 import { withoutSmartNoteText } from "@magic-context/core/tools/ctx-note/constants";
 import { CTX_NOTE_LIGHT_DESCRIPTION } from "@magic-context/core/tools/light-descriptions";
 import { applyJsonSchemaParameterDescriptions } from "@magic-context/core/tools/parameter-descriptions";
+import { restoreOmpMentions } from "../omp-mentions";
+import { resolvePiHarnessKind } from "../pi-harness-kind";
 import { createCtxExpandTool } from "./ctx-expand";
 import { createCtxMemoryListTool, createCtxMemoryTool } from "./ctx-memory";
 import { createCtxNoteTool } from "./ctx-note";
@@ -35,6 +37,16 @@ import { registerTodosCommand } from "./todo-view-pi";
 import { createTodowriteTool } from "./todowrite";
 
 const CTX_MEMORY_TOOL_NAME = "ctx_memory";
+
+type OmpEssentialTool = { loadMode?: "essential" };
+
+/** Keep OMP context tool schemas in the model's top-level list, not its tool catalog. */
+function setOmpEssentialLoadMode<T extends ToolDefinition>(
+	definition: T,
+): T & OmpEssentialTool {
+	if (resolvePiHarnessKind() !== "omp") return definition;
+	return Object.assign(definition, { loadMode: "essential" as const });
+}
 
 /**
  * Keep Pi's active tool set aligned with the current project's memory policy.
@@ -66,6 +78,7 @@ export interface RegisterToolsOptions {
 	embeddingEnabled?: boolean;
 	gitCommitsEnabled?: boolean;
 	rerankConnectionFile?: string;
+	rerankConfig?: import("@magic-context/core/config/schema/magic-context").RerankConfig;
 	/** Resolve the current directory's project identity using the user-level home-project setting. */
 	resolveProjectIdentity?: (
 		ctx: Pick<ExtensionContext, "cwd" | "sessionManager">,
@@ -133,7 +146,12 @@ export function registerMagicContextTools(
 	// omitted flag (as in subagent entries) counts as on.
 	const smartNotesAvailable =
 		opts.smartNotesEnabled !== false && opts.dreamerEnabled !== false;
-	const surfaceTool = <T extends ToolDefinition>(definition: T): T => {
+	const restoreChildMentions =
+		process.env.MAGIC_CONTEXT_PI_SUBAGENT === "1" &&
+		resolvePiHarnessKind() === "omp";
+	const surfaceTool = <T extends ToolDefinition>(
+		definition: T,
+	): T & OmpEssentialTool => {
 		const parameters = structuredClone(definition.parameters);
 		applyJsonSchemaParameterDescriptions(
 			definition.name,
@@ -141,21 +159,30 @@ export function registerMagicContextTools(
 			registration.preset,
 			smartNotesAvailable ? opts.smartNotesEnabled : false,
 		);
-		return throwReturnedToolErrors({
-			...definition,
-			parameters,
-			description:
-				definition.name === "ctx_note" && !smartNotesAvailable
-					? withoutSmartNoteText(
-							registration.preset === "light"
-								? CTX_NOTE_LIGHT_DESCRIPTION
-								: definition.description,
-						)
-					: registration.descriptionFor(
-							definition.name,
-							definition.description,
-						),
-		});
+		return setOmpEssentialLoadMode(
+			throwReturnedToolErrors({
+				...definition,
+				parameters,
+				// Dreamer tools write memory inside the child, before the parent
+				// restores its event stream. Drop a WORD JOINER that was inserted
+				// only to keep an @ mention literal.
+				execute: (...args: Parameters<ToolDefinition["execute"]>) => {
+					if (restoreChildMentions) args[1] = restoreOmpMentions(args[1]);
+					return definition.execute(...args);
+				},
+				description:
+					definition.name === "ctx_note" && !smartNotesAvailable
+						? withoutSmartNoteText(
+								registration.preset === "light"
+									? CTX_NOTE_LIGHT_DESCRIPTION
+									: definition.description,
+							)
+						: registration.descriptionFor(
+								definition.name,
+								definition.description,
+							),
+			}),
+		);
 	};
 
 	pi.registerTool(
@@ -167,6 +194,7 @@ export function registerMagicContextTools(
 				embeddingEnabled: opts.embeddingEnabled,
 				gitCommitsEnabled: opts.gitCommitsEnabled,
 				rerankConnectionFile: opts.rerankConnectionFile,
+				rerankConfig: opts.rerankConfig,
 				resolveProjectIdentity,
 			}),
 		),
@@ -184,7 +212,9 @@ export function registerMagicContextTools(
 		pi.registerTool(surfaceTool(createCtxMemoryTool(memoryDeps)));
 		if (opts.allowDreamerActions === true) {
 			pi.registerTool(
-				throwReturnedToolErrors(createCtxMemoryListTool(memoryDeps)),
+				setOmpEssentialLoadMode(
+					throwReturnedToolErrors(createCtxMemoryListTool(memoryDeps)),
+				),
 			);
 		}
 	}

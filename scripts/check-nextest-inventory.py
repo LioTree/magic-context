@@ -64,7 +64,7 @@ def check(directory):
     for label in ["lib-1", "lib-2", "lib-3", "lib-4", "parity"]:
         document = json.loads((directory / (label + ".json")).read_text())
         names = nextest_names(document, selected_only=True)
-        if label != "parity" and not names:
+        if not names:
             raise ValueError("empty lib partition: " + label)
         partitions.append(names)
         (directory / (label + "-names.txt")).write_text("".join(name + "\n" for name in names))
@@ -78,6 +78,7 @@ def check(directory):
 
 class InventoryTests(unittest.TestCase):
     def test_exact_union(self):
+        self.assertEqual(assert_union(["a", "b", "c", "d"], [["b"], ["d"], ["a"], ["c"]]), ["a", "b", "c", "d"])
         self.assertEqual(assert_union(["a", "b"], [["b"], ["a"], []]), ["a", "b"])
 
     def test_missing_duplicate_and_empty_are_rejected(self):

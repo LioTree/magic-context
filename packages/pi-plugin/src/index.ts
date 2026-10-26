@@ -1094,6 +1094,7 @@ export function resolveHistorianFromConfig(
 	return {
 		runner: new PiSubagentRunner(),
 		model,
+		modelConfigKey: resolved.primary?.sourceConfigKey,
 		fallbackModels,
 		historianChunkTokens,
 		historianContextLimit: resolveKnownHistorianContextLimit(model),
@@ -1222,7 +1223,7 @@ export default async function (pi: ExtensionAPI): Promise<void> {
 	let openFailureCause: string | null = null;
 	const openStorage = async (): Promise<ContextDatabase | null> => {
 		try {
-			return await openDatabaseAsync();
+			return await openDatabaseAsync({ nativeTurnDeadlines: true });
 		} catch (error) {
 			openFailureCause = error instanceof Error ? error.message : String(error);
 			return null;
@@ -1921,6 +1922,7 @@ async function startPiMagicContextRuntime(
 	// tool/command/overlay surface to change, matching Pi's registration lifecycle.
 	registerMagicContextTools(pi, {
 		rerankConnectionFile: config.subc?.connection_file,
+		rerankConfig: config.rerank,
 		expandTools: config.historian?.expand_tools,
 		db,
 		ensureProjectRegistered: ensureProjectRegisteredFromPiDirectory,
