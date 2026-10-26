@@ -70,7 +70,7 @@ import {
     type TurnTwoTrialAuthorization,
 } from "./turn-two-allowlist";
 import {
-    buildTurnTwoPrompt,
+    fitTurnTwoPrompt,
     parseTurnTwoEnvelope,
     type TurnTwoDecision,
     type TurnTwoPromptFact,
@@ -651,36 +651,15 @@ function reserveTurnTwo(
             for (const fact of facts)
                 if (reserve.run(stageKey, fact.id).changes === 1) available.push(fact);
             const availableItems = promptItems(db, items);
-            // Fit the batch to `TURN_TWO_PROMPT_MAX`: facts first (this publication's,
-            // then backlog), then items, each taken only while the prompt still fits.
-            // The first fact in that order is sent even when it alone exceeds the
-            // bound: nothing in a fact's rendering may be cut, so there is no smaller
-            // form to send. What is
-            // left out is released unreserved, consumes no attempt, and is named in the
-            // prompt's coverage notice.
-            const reserved: FactRow[] = [];
-            const itemViews: typeof availableItems = [];
-            const render = (deferred?: { facts: number; items: number }) =>
-                buildTurnTwoPrompt({
-                    facts: reserved.map((fact) => promptFacts.get(fact.id)!),
-                    items: itemViews,
-                    lexicalOnly,
-                    deferred,
-                });
-            const worstCase = { facts: available.length, items: availableItems.length };
-            for (const fact of available) {
-                reserved.push(fact);
-                if (reserved.length > 1 && render(worstCase).length > TURN_TWO_PROMPT_MAX)
-                    reserved.pop();
-            }
-            for (const item of availableItems) {
-                itemViews.push(item);
-                if (
-                    (reserved.length > 0 || itemViews.length > 1) &&
-                    render(worstCase).length > TURN_TWO_PROMPT_MAX
-                )
-                    itemViews.pop();
-            }
+            const fitted = fitTurnTwoPrompt({
+                facts: available.map((fact) => promptFacts.get(fact.id)!),
+                items: availableItems,
+                lexicalOnly,
+                maxLength: TURN_TWO_PROMPT_MAX,
+            });
+            const selectedIds = new Set(fitted.facts.map((fact) => fact.factId));
+            const reserved = available.filter((fact) => selectedIds.has(fact.id));
+            const itemViews = fitted.items;
             const release = db.prepare(
                 "UPDATE memory_pending_facts SET state='retryable',reserved_stage_key=NULL WHERE id=? AND reserved_stage_key=?",
             );
@@ -690,10 +669,7 @@ function reserveTurnTwo(
                 db.prepare("DELETE FROM memory_stage_attempts WHERE stage_key=?").run(stageKey);
                 return null;
             }
-            const deferred = {
-                facts: available.length - reserved.length,
-                items: availableItems.length - itemViews.length,
-            };
+            const deferred = fitted.deferred;
             const request: StageRequest = {
                 ...(input.carrier.baseline !== undefined
                     ? { baseline: input.carrier.baseline }
@@ -707,11 +683,11 @@ function reserveTurnTwo(
                 ),
                 items: itemViews.map((item) => item.item),
                 lexicalOnly,
-                prompt: render(deferred),
+                prompt: fitted.prompt,
             };
             if (deferred.facts > 0 || deferred.items > 0)
                 input.log?.(
-                    `turn two: prompt size bound left out ${deferred.facts} fact(s) and ${deferred.items} item(s) for a later request`,
+                    `turn two: prompt size bound left out ${deferred.facts} fact(s) and ${deferred.items} item(s); eligible for later runs, with no scheduled retry`,
                 );
             db.prepare("UPDATE memory_stage_attempts SET request_json=? WHERE stage_key=?").run(
                 JSON.stringify(request),
@@ -782,11 +758,12 @@ export function parseTurnTwoStageEnvelope(
     reply: Pick<TurnTwoStageReply, "text" | "lengthCapped" | "toolActivity">,
     factIds: readonly number[],
     items: readonly number[],
-): ReturnType<typeof parseTurnTwoEnvelope> {
+) {
     const envelope = parseTurnTwoEnvelope(reply.text, reply.lengthCapped, reply.toolActivity);
     if (!envelope.ok) return envelope;
     return {
         ...envelope,
+        extraFactIds: [...envelope.decisions.keys()].filter((id) => !factIds.includes(id)),
         schemaValid:
             envelope.schemaValid &&
             factIds.every((id) => envelope.decisions.has(id)) &&
@@ -844,6 +821,7 @@ async function resolveStage(
             ...reply,
             envelopeValid: envelope.ok,
             schemaValid: envelope.ok && envelope.schemaValid,
+            extraFactIds: envelope.ok ? envelope.extraFactIds : [],
         }),
         stageKey,
     );
@@ -851,6 +829,8 @@ async function resolveStage(
         consumeStageAttempts(db, stageKey, `envelope_${envelope.reason}`, "envelope_failed");
         return true;
     }
+    if (envelope.extraFactIds.length > 0)
+        context.log?.(`turn two: ignored extra fact ids: ${envelope.extraFactIds.join(", ")}`);
     const facts = db
         .prepare(
             "SELECT id,project_path,publication_id,category,content,anchor_known,fact_attempts,reserved_stage_key AS stageKey FROM memory_pending_facts WHERE state='in_flight' AND reserved_stage_key=? ORDER BY id",

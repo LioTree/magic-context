@@ -325,6 +325,37 @@ describe("turn two pre-send skips", () => {
 });
 
 describe("turn two fact selection", () => {
+    test("backlog reservation protects the oldest facts from a full fresh batch", async () => {
+        const db = store();
+        try {
+            const old = publish(
+                db,
+                [0, 1, 2].map((n) => ({ content: `${n} ${"old ".repeat(3750)}` })),
+            );
+            const fresh = publish(
+                db,
+                [0, 1, 2, 3].map((n) => ({ content: `${n} ${"fresh ".repeat(6333)}` })),
+            );
+            const stub = stubCarrier((prompt) =>
+                reply(factIdsIn(prompt).map((id) => ({ fact_id: id, action: "abstain" }))),
+            );
+            await run(db, fresh.publicationId, stub.carrier);
+            expect(factIdsIn(stub.prompts[0]!)).toEqual([
+                ...fresh.factIds.slice(0, 3),
+                ...old.factIds.slice(0, 2),
+            ]);
+            expect(stub.prompts[0]!.length).toBeLessThanOrEqual(TURN_TWO_PROMPT_MAX);
+            for (const id of [old.factIds[2]!, fresh.factIds[3]!])
+                expect(fact(db, id)).toMatchObject({
+                    state: "retryable",
+                    fact_attempts: 0,
+                    reserved_stage_key: null,
+                });
+            expect(stub.prompts[0]).toContain("no later request is guaranteed");
+        } finally {
+            db.close();
+        }
+    });
     test("a 9-fact backlog sends the 8 oldest by (publication commit order, fact id); the ninth consumes nothing", async () => {
         const db = store();
         try {
@@ -381,6 +412,35 @@ describe("turn two fact selection", () => {
 });
 
 describe("turn two envelope outcomes", () => {
+    test("extra fact ids are observable without losing valid decisions", async () => {
+        const db = store();
+        try {
+            const current = publish(db, [{ content: "Use a serial queue." }]);
+            const logs: string[] = [];
+            const stub = stubCarrier(() =>
+                reply([
+                    { fact_id: current.factIds[0], action: "abstain" },
+                    { fact_id: 9999, action: "new" },
+                ]),
+            );
+            await run(db, current.publicationId, stub.carrier, { log: (line) => logs.push(line) });
+            const row = db
+                .prepare("SELECT reply_json FROM memory_stage_attempts WHERE stage='turn_two'")
+                .get() as { reply_json: string };
+            expect(JSON.parse(row.reply_json)).toMatchObject({
+                envelopeValid: true,
+                schemaValid: false,
+                extraFactIds: [9999],
+            });
+            expect(logs).toContain("turn two: ignored extra fact ids: 9999");
+            expect(fact(db, current.factIds[0]!)).toMatchObject({
+                state: "decided_pending",
+                reason: "abstain",
+            });
+        } finally {
+            db.close();
+        }
+    });
     for (const [name, script] of [
         ["unparseable", () => ({ text: "not json", lengthCapped: false, profile: PROFILE })],
         ["length-capped", () => ({ ...reply([]), lengthCapped: true })],
@@ -649,6 +709,62 @@ describe("turn two decision matrix", () => {
 });
 
 describe("turn two gated edits", () => {
+    test("shared evidence renders once while fact-local edit citations stay enforced", async () => {
+        const db = store();
+        try {
+            const memory = insertMemory(db, {
+                projectPath: PROJECT,
+                category: "CONSTRAINTS",
+                content: "Old rule. Keep rule.",
+            });
+            const current = publish(db, [
+                {
+                    content: "New rule replaces the old one",
+                    block: { ordinal: 43, parts: ["Unrelated evidence."] },
+                },
+                {
+                    content: "New rule replaces the old one",
+                    block: { ordinal: 42, parts: ["New rule."] },
+                },
+                {
+                    content: "New rule replaces the old one",
+                    block: { ordinal: 42, parts: ["New rule."] },
+                },
+            ]);
+            const edit = (id: number) => ({
+                fact_id: id,
+                action: "edit",
+                target_id: memory.id,
+                revision: 1,
+                removed: [],
+                replaced: [{ memory_id: memory.id, clause: 1, block: 42, excerpt: "New rule." }],
+                kept: [{ memory_id: memory.id, clause: 2 }],
+                added: [{ text: "New rule. ", block: 42, excerpt: "New rule." }],
+                final_text: "New rule. Keep rule.",
+            });
+            const stub = stubCarrier(() =>
+                reply([
+                    edit(current.factIds[0]!),
+                    edit(current.factIds[1]!),
+                    { fact_id: current.factIds[2], action: "abstain" },
+                ]),
+            );
+            await run(db, current.publicationId, stub.carrier);
+            const prompt = stub.prompts[0]!;
+            expect(prompt.split("[42] user: New rule.")).toHaveLength(2);
+            expect(prompt.split(`- #${memory.id} rev 1`)).toHaveLength(2);
+            expect(prompt.match(/^Source block refs: source:/gm)).toHaveLength(3);
+            expect(prompt).toContain("Cite a source block by its printed start ordinal");
+            expect(fact(db, current.factIds[0]!)).toMatchObject({
+                state: "decided_pending",
+                reason: "evidence_or_window",
+            });
+            expect(fact(db, current.factIds[1]!)).toMatchObject({ state: "applied" });
+            expect(getMemoryById(db, memory.id)?.content).toBe("New rule. Keep rule.");
+        } finally {
+            db.close();
+        }
+    });
     test("a merge that loses a source identifier or number is refused before any check or write", async () => {
         const db = store();
         try {

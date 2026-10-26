@@ -668,6 +668,10 @@ export function commitTurnOnePublication(
         startMessage: row.startMessage,
         endMessage: row.endMessage,
     }));
+    // Published compartments are contiguous; their outer bounds describe the
+    // full published range, including citations that span compartment boundaries.
+    const publishedStart = Math.min(...ranges.map((range) => range.startMessage));
+    const publishedEnd = Math.max(...ranges.map((range) => range.endMessage));
     const insertFact = db.prepare(
         `INSERT OR IGNORE INTO memory_pending_facts(project_path,publication_id,fact_index,compartment_id,category,content,anchor_known,state,fact_attempts,reason)
          VALUES(?,?,?,?,?,?,?,'retryable',0,?)`,
@@ -686,6 +690,17 @@ export function commitTurnOnePublication(
     let blocksStored = 0;
     input.candidateFacts.forEach((fact, position) => {
         if (!isPromotableFact(fact)) return;
+        // A compartment label cannot authorize evidence from an unpublished tail.
+        // Unanchored facts still follow the caller's existing publication policy.
+        const start = fact.anchor?.startOrdinal;
+        const end = fact.anchor?.endOrdinal;
+        if (
+            input.honourAnchors &&
+            start !== undefined &&
+            end !== undefined &&
+            (Math.min(start, end) < publishedStart || Math.max(start, end) > publishedEnd)
+        )
+            return;
         const factIndex = fact.factIndex ?? position;
         const resolved =
             input.honourAnchors && bound

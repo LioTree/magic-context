@@ -108,11 +108,11 @@ no tool surface, and no provider SDK/hidden retries.
 `turnTwo` uses production validation, ordinary non-emergency tail discard,
 `publishedFacts`, and `commitTurnOnePublication` in a disposable **in-memory**
 store. Seeded memories use recorded IDs/revisions. Production selection and
-lexical retrieval feed `buildTurnTwoPrompt`; the facts-only size-fitting loop
-follows the fact-fitting portion of `reserveTurnTwo` in
-`src/features/magic-context/memory/turn-two.ts`: include the coverage notice,
-defer whole facts rather than truncating them, and allow the first fact alone
-to exceed the 160,000 UTF-16-unit prompt limit. The request includes the same system/user
+lexical retrieval feed `fitTurnTwoPrompt`, shared with production reservation:
+include the coverage notice, defer whole facts rather than truncating them,
+and allow an indivisible first fact alone to exceed the 160,000 UTF-16-unit
+prompt limit. Shared source blocks and neighbouring memories render once,
+with fact-local references. The request includes the same system/user
 messages followed by the verbatim assistant reply and new user prompt. No
 seed/reference/transcript block is regenerated from different source data.
 
@@ -129,12 +129,26 @@ no extra grading model, format-repair requests, comparison run with project
 memory removed, clause-safety-check requests, or real memory write.
 The report shows **proposed** `new` fact text and `edit`/`merge`/`replaces`
 final text, category, all reviewed claims, the raw decisions and summary.
+Unknown decision IDs are ignored without discarding known drafts; `extraFactIds`
+in `run.json` and "Ignored extra fact ids" in the review expose them.
 The production decision labels `covered`, `conflict` and `abstain` describe
 existing coverage, conflicts or deferrals, not new writes. Mechanical capture/miss and
 contradiction/invention flags are lexical review leads, explicitly marked for
 people to correct; they are not semantic acceptance grades.
 
 ## Provider-free checks
+
+Replay the recorded replies through the current builders without network access:
+
+```sh
+bun packages/plugin/scripts/two-pass-small-trial/measure-offline.ts
+```
+
+This reads the staged `corpus-readonly/` and `paid-run-001/run.json` locally,
+uses an in-memory store, and prints offered IDs, original bullet mappings,
+deferred counts, prompt sizes, hashes and exact prefix checks. It refuses
+network access and verifies the recorded turn-one request hashes. Keep the
+private corpus on the Mac; Linux tests use synthetic fixtures instead.
 
 Preparation is local because it reads the staged Mac corpus. It writes only
 metrics and hashes, not a corpus copy, and makes zero provider/vault calls:

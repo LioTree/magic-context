@@ -11,6 +11,7 @@ export interface CaseResult {
     secondReply?: string;
     drafts?: MemoryDraft[];
     deferredFacts?: number;
+    extraFactIds?: number[];
     failure?: string;
 }
 export interface RunResult {
@@ -116,6 +117,7 @@ export function report(result: RunResult, cases: ReplayCase[]): string {
             `${Buffer.byteLength(c.userPrompt)} recorded input bytes; ${c.inventory.value.length} reviewed claims; source ${c.source.recording} (${c.source.sha256}).`,
             "",
             `Status: ${item?.failure ?? (item?.secondReply ? "both turns returned" : "not run")}; facts deferred by prompt fit: ${item?.deferredFacts ?? "unknown"}.`,
+            `Ignored extra fact ids: ${item?.extraFactIds?.join(", ") || "none"}.`,
             "",
             "### Turn-one summary (verbatim XML when available; raw reply otherwise)",
             "",

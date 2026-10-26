@@ -190,7 +190,9 @@ export async function runTrial(input: {
                 log(`case=${c.id} turn=2 sending`);
                 record.secondReply = await client.send(second.request, c.id, 2);
                 save();
-                record.drafts = memoryDrafts(record.secondReply, second.facts, c);
+                const diagnostics = { extraFactIds: [] as number[] };
+                record.drafts = memoryDrafts(record.secondReply, second.facts, c, diagnostics);
+                record.extraFactIds = diagnostics.extraFactIds;
             } catch (error) {
                 const message = error instanceof Error ? error.message : "unknown_failure";
                 record.failure = /^[a-z][a-z0-9_]+$/.test(message)

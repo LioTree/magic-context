@@ -8,7 +8,7 @@
  * object of the expected shape is an envelope failure, and every fact of that send
  * is retried (see `turn-two.ts`).
  */
-import { splitMemoryClauses } from "./lifecycle-text";
+import { lifecycleTextHash, splitMemoryClauses } from "./lifecycle-text";
 
 /** Known reply actions, including unsupported actions that are dropped rather than retried. */
 export const TURN_TWO_ACTIONS = [
@@ -313,10 +313,10 @@ export interface TurnTwoPromptItem {
 
 /**
  * Rendered when the prompt size bound left facts or items out: this request does
- * not cover every pending candidate, and the rest are sent in a later request.
+ * not cover every pending candidate. Later eligible runs may retry the rest.
  */
 export function coverageNotice(facts: number, items: number): string {
-    return `Coverage: this request is partial. ${facts} pending fact(s) and ${items} agent memory item(s) were left out to fit the request size and will be sent in a later request; judge only what is listed here.`;
+    return `Coverage: this request is partial. ${facts} pending fact(s) and ${items} agent memory item(s) were left out to fit the request size. They remain eligible for a later run, but no later request is guaranteed; judge only what is listed here.`;
 }
 
 /** Rendered when the semantic lane could not rank neighbours for this send. */
@@ -331,10 +331,9 @@ function renderNeighbour(neighbour: TurnTwoPromptNeighbour): string {
 }
 
 /**
- * The turn-two prompt. Each fact is rendered under its own heading with its own
- * stored blocks and its source session, because ordinals of different sessions
- * collide: a cited block ordinal is resolved only within that fact's blocks.
- * Memories are never truncated.
+ * Shared evidence is printed once, with stable references under each fact.
+ * Citations still use the stored start ordinal and are checked only against that
+ * fact's linked blocks, never another fact's evidence. Memories are not truncated.
  */
 export function buildTurnTwoPrompt(input: {
     facts: readonly TurnTwoPromptFact[];
@@ -345,10 +344,16 @@ export function buildTurnTwoPrompt(input: {
 }): string {
     const lines: string[] = [
         "Turn two: reconcile each candidate fact with existing project memory.",
+        `allowed_fact_ids: ${JSON.stringify(input.facts.map((fact) => fact.factId))}`,
+        "Return exactly one decision for each allowed fact_id and no others. Earlier reply bullets and compartment numbers are not fact ids. Unpublished and deferred facts are out of scope.",
+        "Before choosing new, edit, merge or replaces, check the conversation. If it treats the statement as a proposal, hypothesis, open question, or still to be measured or decided, choose abstain. Example: 'Gemini reasoning resend is tiny' while a reasoning-budget investigation is still measuring resend cost is a hypothesis, not a new memory.",
+        "Source block refs and neighbour refs below point to the shared evidence tables. Cite a source block by its printed start ordinal in the block field, and only if that block is referenced by the fact being decided. Only that fact's neighbour refs are eligible targets.",
     ];
     if (input.lexicalOnly) lines.push(LEXICAL_ONLY_NOTICE);
     if (input.deferred && (input.deferred.facts > 0 || input.deferred.items > 0))
         lines.push(coverageNotice(input.deferred.facts, input.deferred.items));
+    const sources = new Map<string, { session: string; block: TurnTwoPromptBlock }>();
+    const neighbours = new Map<string, TurnTwoPromptNeighbour>();
     for (const fact of input.facts) {
         lines.push(
             "",
@@ -357,13 +362,30 @@ export function buildTurnTwoPrompt(input: {
         );
         if (!fact.anchorKnown)
             lines.push("Source blocks: unknown (this fact cannot evidence an edit).");
-        for (const block of fact.blocks)
-            lines.push(
-                `[${block.startOrdinal === block.endOrdinal ? block.startOrdinal : `${block.startOrdinal}-${block.endOrdinal}`}] ${block.role}: ${block.parts.join(" / ")}`,
-            );
-        lines.push("Neighbours:");
+        const refs = fact.blocks.map((block) => {
+            const ref = `source:${lifecycleTextHash(JSON.stringify([fact.sourceSessionId, block.startOrdinal, block.endOrdinal, block.role, block.parts]))}`;
+            sources.set(ref, { session: fact.sourceSessionId, block });
+            return ref;
+        });
+        if (refs.length > 0) lines.push(`Source block refs: ${refs.join(", ")}`);
+        lines.push("Neighbour refs:");
         if (fact.neighbours.length === 0) lines.push("- none retrieved");
-        for (const neighbour of fact.neighbours) lines.push(renderNeighbour(neighbour));
+        for (const neighbour of fact.neighbours) {
+            const ref = `memory:${neighbour.id}@${neighbour.revision}`;
+            neighbours.set(ref, neighbour);
+            lines.push(ref);
+        }
+    }
+    if (sources.size > 0) lines.push("", "## Shared source blocks");
+    for (const [ref, { session, block }] of sources)
+        lines.push(
+            "",
+            `### ${ref} (session ${session})`,
+            `[${block.startOrdinal === block.endOrdinal ? block.startOrdinal : `${block.startOrdinal}-${block.endOrdinal}`}] ${block.role}: ${block.parts.join(" / ")}`,
+        );
+    if (neighbours.size > 0) lines.push("", "## Shared neighbouring memories");
+    for (const [ref, neighbour] of neighbours) {
+        lines.push("", `### ${ref}`, renderNeighbour(neighbour));
     }
     if (input.items.length > 0) {
         lines.push("", "## Agent memories to score");
@@ -377,4 +399,73 @@ export function buildTurnTwoPrompt(input: {
             );
     }
     return lines.join("\n");
+}
+
+/** Reserve 25% of the prompt cap for backlog when older retryable facts exist. */
+export const TURN_TWO_BACKLOG_SHARE = 0.25;
+
+/** Fit without truncation; backlog is a prefix in oldest-first selection order. */
+export function fitTurnTwoPrompt(input: {
+    facts: readonly TurnTwoPromptFact[];
+    items: readonly TurnTwoPromptItem[];
+    lexicalOnly: boolean;
+    maxLength: number;
+}) {
+    const backlog = input.facts.filter((fact) => fact.backlog);
+    const fresh = input.facts.filter((fact) => !fact.backlog);
+    const old: TurnTwoPromptFact[] = [];
+    const current: TurnTwoPromptFact[] = [];
+    const items: TurnTwoPromptItem[] = [];
+    const worstCase = { facts: input.facts.length, items: input.items.length };
+    const render = (facts: readonly TurnTwoPromptFact[], itemViews = items) =>
+        buildTurnTwoPrompt({
+            facts,
+            items: itemViews,
+            lexicalOnly: input.lexicalOnly,
+            deferred: worstCase,
+        });
+    const backlogLimit = Math.floor(input.maxLength * TURN_TWO_BACKLOG_SHARE);
+    // Keep the oldest backlog fact even when its evidence alone exceeds the
+    // reserved share or total cap: it cannot be split and must not starve.
+    for (const fact of backlog) {
+        old.push(fact);
+        if (old.length > 1 && render(old, []).length > backlogLimit) {
+            old.pop();
+            break;
+        }
+    }
+    const freshLimit = backlog.length > 0 ? input.maxLength - backlogLimit : input.maxLength;
+    for (const fact of fresh) {
+        current.push(fact);
+        if (
+            (backlog.length > 0 || current.length > 1) &&
+            (render(current, []).length > freshLimit ||
+                render([...current, ...old]).length > input.maxLength)
+        )
+            current.pop();
+    }
+    // Unused fresh capacity can serve more backlog, but never skip an older fact.
+    for (const fact of backlog.slice(old.length)) {
+        old.push(fact);
+        if (render([...current, ...old]).length > input.maxLength) {
+            old.pop();
+            break;
+        }
+    }
+    const facts = [...current, ...old];
+    for (const item of input.items) {
+        items.push(item);
+        if ((facts.length > 0 || items.length > 1) && render(facts).length > input.maxLength)
+            items.pop();
+    }
+    const deferred = {
+        facts: input.facts.length - facts.length,
+        items: input.items.length - items.length,
+    };
+    return {
+        facts,
+        items,
+        deferred,
+        prompt: buildTurnTwoPrompt({ facts, items, lexicalOnly: input.lexicalOnly, deferred }),
+    };
 }
