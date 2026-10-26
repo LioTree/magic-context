@@ -297,8 +297,9 @@ impl<C: DreamCarrier> RetrospectiveHost<C> {
         let batch = self
             .model(
                 DreamRole::Reviewer,
-                review_system(),
-                &review_prompt(&snapshot, threshold),
+                review_system().map_err(|error| HostError::Model(Failure::Validation(error)))?,
+                &review_prompt(&snapshot, threshold)
+                    .map_err(|error| HostError::Model(Failure::Validation(error)))?,
                 |c| plan::plan_user_review(&lease, now, threshold, &rows, &c.text),
             )
             .await?;
@@ -436,11 +437,12 @@ Return only XML in this exact shape:
     )
 }
 
-fn review_system() -> &'static str {
+fn review_system() -> Result<&'static str, String> {
     crate::persona_host::dream::system(crate::persona_host::dream::Kind::ReviewUser)
+        .map_err(|error| format!("mc_persona_invalid: {error}"))
 }
 
-fn review_prompt(snapshot: &durable::ReviewSnapshot, threshold: usize) -> String {
+fn review_prompt(snapshot: &durable::ReviewSnapshot, threshold: usize) -> Result<String, String> {
     let candidates = snapshot
         .candidates
         .iter()
@@ -470,6 +472,7 @@ fn review_prompt(snapshot: &durable::ReviewSnapshot, threshold: usize) -> String
             ..Default::default()
         },
     )
+    .map_err(|error| format!("mc_persona_invalid: {error}"))
 }
 
 #[cfg(test)]

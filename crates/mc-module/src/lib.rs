@@ -8440,14 +8440,16 @@ impl McHandler {
         if runner == HistorianRunnerKind::Host && session_runner.is_none() {
             // The host lane never opens a Broca route, so there is no connect step
             // to fail: the run is queued and this task waits for a claimant.
-            let mut request = firing.as_fire_request(
-                &store,
-                &session_id,
-                &project_path,
-                &harness,
-                &project_slug,
-                language.as_deref(),
-            );
+            let mut request = firing
+                .as_fire_request(
+                    &store,
+                    &session_id,
+                    &project_path,
+                    &harness,
+                    &project_slug,
+                    language.as_deref(),
+                )
+                .map_err(historian::HistorianDriveError::Producer)?;
             request.temperature = historian_temperature;
             request.rust_background_enabled = rust_background_enabled;
             request.publication_fence = publication_fence.as_deref();
@@ -8519,14 +8521,16 @@ impl McHandler {
         };
         let result = match connected {
             Ok(mut producer) => {
-                let mut request = firing.as_fire_request(
-                    &store,
-                    &session_id,
-                    &project_path,
-                    &harness,
-                    &project_slug,
-                    language.as_deref(),
-                );
+                let mut request = firing
+                    .as_fire_request(
+                        &store,
+                        &session_id,
+                        &project_path,
+                        &harness,
+                        &project_slug,
+                        language.as_deref(),
+                    )
+                    .map_err(historian::HistorianDriveError::Producer)?;
                 request.temperature = historian_temperature;
                 request.rust_background_enabled = rust_background_enabled;
                 request.await_timeout = historian_await_timeout;

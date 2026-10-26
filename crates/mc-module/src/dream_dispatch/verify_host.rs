@@ -153,7 +153,7 @@ impl<C: DreamCarrier> VerifyHost<C> {
             let request = verify::BatchRequest {
                 batch,
                 slice_ms: verify::batch_slice_ms(remaining, batches.len() - index),
-                system: verify::system_prompt(),
+                system: verify::system_prompt()?,
                 prompt: verify::build_prompt_with_mode(
                     &context.scope.project.0,
                     batch,
@@ -163,7 +163,7 @@ impl<C: DreamCarrier> VerifyHost<C> {
                     } else {
                         "full"
                     },
-                ),
+                )?,
             };
             let completion = self.resolve_completion(request).await?;
             result.batches += 1;

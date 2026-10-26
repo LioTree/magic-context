@@ -208,7 +208,10 @@ pub struct MemoryProfile {
 }
 
 impl MemoryProfile {
-    pub(crate) fn summary(pin: Option<&serde_json::Value>) -> Result<Self, PersonaError> {
+    pub(crate) fn summary(
+        pin: Option<&serde_json::Value>,
+        session: &str,
+    ) -> Result<Self, PersonaError> {
         let Some(pin) = pin else {
             return Ok(Self::default());
         };
@@ -222,6 +225,15 @@ impl MemoryProfile {
             || pin.profile.version.as_deref() != Some(&profile.version)
             || pin.profile.digest.as_deref() != Some(&profile.digest)
         {
+            if first_profile_notice(session, "memory_profile_mismatch") {
+                tracing::warn!(session, pinned_name = ?pin.profile.name,
+                    pinned_version = ?pin.profile.version, pinned_digest = ?pin.profile.digest,
+                    bundled_name = %profile.name, bundled_version = %profile.version,
+                    bundled_digest = %profile.digest,
+                    "pinned memory profile does not match bundled profile");
+            }
+            // The profile resolver/status integration owns recording a degraded
+            // state. The persona layer preserves the existing prompt bytes here.
             return Ok(Self::default());
         }
         Self::capture(&profile, pin.profile.parity, Some("historian/system"), None)
@@ -251,6 +263,29 @@ impl MemoryProfile {
             fragment,
         })
     }
+}
+
+fn first_profile_notice(session: &str, kind: &'static str) -> bool {
+    static NOTICES: OnceLock<std::sync::Mutex<std::collections::HashSet<(String, &'static str)>>> =
+        OnceLock::new();
+    NOTICES
+        .get_or_init(Default::default)
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
+        .insert((session.to_owned(), kind))
+}
+
+pub(crate) fn summary_refusal(
+    session: &str,
+    error: impl std::fmt::Display,
+) -> crate::historian_producer::HistorianProducerError {
+    let detail = error.to_string();
+    if first_profile_notice(session, "mc_persona_invalid") {
+        tracing::warn!(session, error = %detail, "mc_persona_invalid: summary persona refused");
+    }
+    crate::historian_producer::HistorianProducerError::Subc(
+        crate::historian_producer::ProducerErrorBody::untagged("mc_persona_invalid", &detail),
+    )
 }
 
 fn profile_error(error: crate::memory_profile::Refusal) -> PersonaError {
@@ -479,23 +514,38 @@ fn context_for<T>(
     }
 }
 
-fn embedded_summary() -> &'static SummaryPersona {
+/// A failed initialization is not cached, so the next firing can retry it.
+fn cached<T>(
+    cache: &OnceLock<T>,
+    build: impl FnOnce() -> Result<T, PersonaError>,
+) -> Result<&T, PersonaError> {
+    if let Some(value) = cache.get() {
+        return Ok(value);
+    }
+    let value = build()?;
+    let _ = cache.set(value);
+    cache.get().ok_or_else(|| PersonaError::InvalidContext {
+        field: "persona_cache".into(),
+        reason: "successful persona initialization was not retained".into(),
+    })
+}
+
+fn embedded_summary() -> Result<&'static SummaryPersona, PersonaError> {
     static BASE: OnceLock<SummaryPersona> = OnceLock::new();
-    BASE.get_or_init(|| {
+    cached(&BASE, || {
         let tiers = [Tier::embedded(
             "base",
             cortexkit_persona::TrustClass::Operator,
             embedded_base(),
-        )
-        .expect("fixed base tier")];
-        load_summary(&tiers, &ApprovalSet::new(), None).expect("valid compiled summary persona")
+        )?];
+        load_summary(&tiers, &ApprovalSet::new(), None)
     })
 }
 
 /// Legacy callers use the embedded persona until lineage freezing adopts the
 /// caller's loaded ladder. No operator files are read on this compatibility path.
 pub fn render_embedded_summary(context: &SummaryContext) -> Result<Rendered, PersonaError> {
-    render_summary(embedded_summary(), context)
+    render_summary(embedded_summary()?, context)
 }
 
 /// The legacy model-chain summarizer rebuilds its system prompt for each request
@@ -515,7 +565,7 @@ pub(crate) fn render_session_summary(
         })?;
     render_embedded_summary(&SummaryContext {
         language: LanguageContext::new(language, LanguageOptions::default()),
-        memory_profile: MemoryProfile::summary(loaded.meta.memory_context.as_ref())?,
+        memory_profile: MemoryProfile::summary(loaded.meta.memory_context.as_ref(), session)?,
         ..Default::default()
     })
 }
@@ -528,19 +578,15 @@ pub fn render_language_directive(
     options: LanguageOptions,
 ) -> Result<String, PersonaError> {
     static LANGUAGE: OnceLock<LoadedRole> = OnceLock::new();
-    let persona = LANGUAGE.get_or_init(|| {
-        let base = EmbeddedTier::new()
-            .with_file("language", "PERSONA.md", LANGUAGE_PERSONA)
-            .expect("fixed language wrapper path");
-        let tiers = [
-            Tier::embedded("base", cortexkit_persona::TrustClass::Operator, base)
-                .expect("fixed base tier"),
-        ];
-        PersonaEngine::new(MODULE)
-            .expect("fixed module id")
-            .load(LoadRequest::new("language", &tiers, &ApprovalSet::new()))
-            .expect("valid compiled language wrapper")
-    });
+    let persona = cached(&LANGUAGE, || {
+        let base = EmbeddedTier::new().with_file("language", "PERSONA.md", LANGUAGE_PERSONA)?;
+        let tiers = [Tier::embedded(
+            "base",
+            cortexkit_persona::TrustClass::Operator,
+            base,
+        )?];
+        PersonaEngine::new(MODULE)?.load(LoadRequest::new("language", &tiers, &ApprovalSet::new()))
+    })?;
     let context = SummaryContext {
         language: LanguageContext::new(language, options),
         ..Default::default()
@@ -555,6 +601,32 @@ pub fn render_language_directive(
 
 #[cfg(test)]
 mod tests;
+
+#[cfg(test)]
+pub(crate) fn capture_profile_logs(run: impl FnOnce()) -> String {
+    #[derive(Clone)]
+    struct Writer(Arc<std::sync::Mutex<Vec<u8>>>);
+    impl std::io::Write for Writer {
+        fn write(&mut self, bytes: &[u8]) -> std::io::Result<usize> {
+            self.0.lock().unwrap().extend_from_slice(bytes);
+            Ok(bytes.len())
+        }
+        fn flush(&mut self) -> std::io::Result<()> {
+            Ok(())
+        }
+    }
+    let bytes = Arc::new(std::sync::Mutex::new(Vec::new()));
+    let writer = Writer(bytes.clone());
+    let subscriber = tracing_subscriber::fmt()
+        .without_time()
+        .with_ansi(false)
+        .with_max_level(tracing::Level::WARN)
+        .with_writer(move || writer.clone())
+        .finish();
+    tracing::subscriber::with_default(subscriber, run);
+    let output = bytes.lock().unwrap().clone();
+    String::from_utf8(output).unwrap()
+}
 
 #[cfg(test)]
 mod profile_tests {
@@ -573,10 +645,82 @@ mod profile_tests {
     }
 
     #[test]
+    fn unmatched_profile_keeps_bytes_and_logs_identity_once_per_session() {
+        let root = tempfile::tempdir().unwrap();
+        let session = format!("mismatched-{}", root.path().display());
+        let store = mc_store::McStore::open_for_test(&crate::dev_descriptor_at(
+            root.path().to_str().unwrap(),
+        ))
+        .unwrap();
+        let mut value = pin(false);
+        value["profile"]["name"] = json!("@acme/memory-missing");
+        value["profile"]["version"] = json!("9.8.7");
+        value["profile"]["digest"] = json!("missing-profile-digest");
+        set_pin(&store, &session, value);
+        let logs = capture_profile_logs(|| {
+            for _ in 0..2 {
+                let result = render_session_summary(&store, &session, None).unwrap();
+                assert_eq!(
+                    result.text,
+                    include_str!("../testdata/historian-system-prompt.txt")
+                );
+                assert_eq!(
+                    result.digest.hex(),
+                    "590649b1f6b2428940cb925586342be58bdecc3ee4d64153d2f73ec5251532bd"
+                );
+            }
+        });
+        assert_eq!(
+            logs.matches("pinned memory profile does not match bundled profile")
+                .count(),
+            1,
+            "{logs}"
+        );
+        let bundled = documents::bundled_swe().unwrap();
+        for value in [
+            "pinned_name",
+            "pinned_version",
+            "pinned_digest",
+            "bundled_name",
+            "bundled_version",
+            "bundled_digest",
+            "@acme/memory-missing",
+            "9.8.7",
+            "missing-profile-digest",
+            &bundled.name,
+            &bundled.version,
+            &bundled.digest,
+            &session,
+        ] {
+            assert!(logs.contains(value), "missing {value}: {logs}");
+        }
+    }
+
+    #[test]
+    fn failed_persona_initialization_is_not_cached() {
+        let cache = OnceLock::new();
+        let error = cached::<String>(&cache, || {
+            Err(PersonaError::InvalidContext {
+                field: "memory_profile".into(),
+                reason: "temporary profile render failure".into(),
+            })
+        })
+        .unwrap_err();
+        assert!(error
+            .to_string()
+            .contains("temporary profile render failure"));
+        assert!(cache.get().is_none());
+        assert_eq!(
+            cached(&cache, || Ok("recovered".to_owned())).unwrap(),
+            "recovered"
+        );
+    }
+
+    #[test]
     fn pinned_parity_summary_ignores_nonparity_process_mode() {
         documents::with_parity_mode(false, || {
             let context = SummaryContext {
-                memory_profile: MemoryProfile::summary(Some(&pin(true))).unwrap(),
+                memory_profile: MemoryProfile::summary(Some(&pin(true)), "profile-test").unwrap(),
                 ..Default::default()
             };
             assert!(context.memory_profile.present);
@@ -663,7 +807,7 @@ mod profile_tests {
         let (tiers, approvals, key) = repository(root.path(), "---\n---\n{% block instructions %}replacement{% endblock %}{% block memory_profile %}{% endblock %}{% block language %}{% endblock %}");
         let persona = load_summary(&tiers, &approvals, Some(&key)).unwrap();
         let context = SummaryContext {
-            memory_profile: MemoryProfile::summary(Some(&pin(false))).unwrap(),
+            memory_profile: MemoryProfile::summary(Some(&pin(false)), "profile-test").unwrap(),
             ..Default::default()
         };
         let error = render_summary(&persona, &context).unwrap_err();
@@ -687,7 +831,7 @@ mod profile_tests {
         let (tiers, approvals, key) = repository(root.path(), "---\n---\n");
         let persona = load_summary(&tiers, &approvals, Some(&key)).unwrap();
         let context = SummaryContext {
-            memory_profile: MemoryProfile::summary(Some(&pin(false))).unwrap(),
+            memory_profile: MemoryProfile::summary(Some(&pin(false)), "profile-test").unwrap(),
             ..Default::default()
         };
         assert_eq!(
@@ -808,7 +952,7 @@ mod profile_tests {
                 .bytes(),
             unpinned.bytes()
         );
-        let expected = MemoryProfile::summary(Some(&pin(false))).unwrap();
+        let expected = MemoryProfile::summary(Some(&pin(false)), "profile-test").unwrap();
         set_pin(&store, "nonparity", pin(false));
         assert_eq!(
             render_session_summary(&store, "nonparity", None)

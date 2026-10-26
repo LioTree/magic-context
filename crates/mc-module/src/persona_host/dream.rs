@@ -299,7 +299,7 @@ fn memory_profile(persona: &DreamPersona, mode: &str) -> Result<MemoryProfile, P
     )
 }
 
-fn embedded(kind: Kind) -> &'static DreamPersona {
+fn embedded(kind: Kind) -> Result<&'static DreamPersona, PersonaError> {
     static PARITY: OnceLock<Vec<DreamPersona>> = OnceLock::new();
     static RESOLVED: OnceLock<Vec<DreamPersona>> = OnceLock::new();
     let base = if crate::memory_profile::documents::parity_mode() {
@@ -307,32 +307,37 @@ fn embedded(kind: Kind) -> &'static DreamPersona {
     } else {
         &RESOLVED
     };
-    &base.get_or_init(|| {
-        let tiers = [
-            Tier::embedded("base", TrustClass::Operator, embedded_base()).expect("fixed base tier"),
-        ];
+    let personas = cached(base, || {
+        let tiers = [Tier::embedded(
+            "base",
+            TrustClass::Operator,
+            embedded_base(),
+        )?];
         KINDS
             .iter()
-            .map(|kind| {
-                load(*kind, &tiers, &ApprovalSet::new(), None)
-                    .expect("valid compiled dream persona")
-            })
+            .map(|kind| load(*kind, &tiers, &ApprovalSet::new(), None))
             .collect()
-    })[KINDS.iter().position(|k| *k == kind).expect("known kind")]
+    })?;
+    Ok(
+        &personas[KINDS.iter().position(|k| *k == kind).ok_or_else(|| {
+            PersonaError::InvalidContext {
+                field: "dream_kind".into(),
+                reason: "unregistered dream persona".into(),
+            }
+        })?],
+    )
 }
 
-pub fn task(kind: Kind, input: &Input<'_>) -> String {
+pub fn task(kind: Kind, input: &Input<'_>) -> Result<String, PersonaError> {
     task_with_mode(kind, input, "full")
 }
 
-pub fn task_with_mode(kind: Kind, input: &Input<'_>, mode: &str) -> String {
-    render(embedded(kind), input, mode, false)
-        .expect("valid embedded dream task")
-        .text
+pub fn task_with_mode(kind: Kind, input: &Input<'_>, mode: &str) -> Result<String, PersonaError> {
+    Ok(render(embedded(kind)?, input, mode, false)?.text)
 }
 
 /// One immutable system prefix per role; batches never re-render it.
-pub fn system(kind: Kind) -> &'static str {
+pub fn system(kind: Kind) -> Result<&'static str, PersonaError> {
     static PARITY: OnceLock<Vec<String>> = OnceLock::new();
     static RESOLVED: OnceLock<Vec<String>> = OnceLock::new();
     let systems = if crate::memory_profile::documents::parity_mode() {
@@ -340,16 +345,20 @@ pub fn system(kind: Kind) -> &'static str {
     } else {
         &RESOLVED
     };
-    &systems.get_or_init(|| {
+    let systems = cached(systems, || {
         KINDS
             .iter()
-            .map(|kind| {
-                render(embedded(*kind), &Input::default(), "full", true)
-                    .expect("valid embedded dream system")
-                    .text
-            })
+            .map(|kind| Ok(render(embedded(*kind)?, &Input::default(), "full", true)?.text))
             .collect()
-    })[KINDS.iter().position(|k| *k == kind).expect("known kind")]
+    })?;
+    Ok(
+        &systems[KINDS.iter().position(|k| *k == kind).ok_or_else(|| {
+            PersonaError::InvalidContext {
+                field: "dream_kind".into(),
+                reason: "unregistered dream persona".into(),
+            }
+        })?],
+    )
 }
 
 #[cfg(test)]
@@ -369,6 +378,31 @@ mod profile_tests {
             persona.profile = documents::tests::acme();
         }
         persona
+    }
+
+    #[test]
+    fn invalid_dream_profile_document_refuses_without_panicking_and_retries() {
+        let mut persona = forced(Kind::Verify, false);
+        let original = persona.profile.clone();
+        persona.profile.body["prompts"]["dreamer/swe:verify/system"]["sections"] = serde_json::json!([
+            {"id": "broken", "mc": "missing-frame"}
+        ]);
+        let attempt = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            render(&persona, &Input::default(), "full", true)
+        }));
+        let error = attempt
+            .expect("invalid dream documents must refuse, not panic")
+            .unwrap_err();
+        assert!(error.to_string().contains("prompt_invalid"), "{error}");
+        persona.profile = original;
+        assert_eq!(
+            render(&persona, &Input::default(), "full", true)
+                .unwrap()
+                .text,
+            include_str!(
+                "../../testdata/memory_profile/resolved-swe/rendered/dreamer/swe-verify/system.md"
+            )
+        );
     }
 
     #[test]
@@ -429,7 +463,7 @@ mod profile_tests {
             let task = render(&persona, &Input::default(), "full", false).unwrap();
             assert_eq!(
                 task.text,
-                render(embedded(kind), &Input::default(), "full", false)
+                render(embedded(kind).unwrap(), &Input::default(), "full", false)
                     .unwrap()
                     .text
             );

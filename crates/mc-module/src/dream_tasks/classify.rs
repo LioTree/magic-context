@@ -289,7 +289,11 @@ pub fn plan_classify(active: &[Memory]) -> ClassifyPlan {
     }
 }
 
-pub fn build_classify_prompt(project: &str, memories: &[Memory], anchors: &[Memory]) -> String {
+pub fn build_classify_prompt(
+    project: &str,
+    memories: &[Memory],
+    anchors: &[Memory],
+) -> Result<String, String> {
     let anchors = if anchors.is_empty() {
         String::new()
     } else {
@@ -319,6 +323,7 @@ pub fn build_classify_prompt(project: &str, memories: &[Memory], anchors: &[Memo
             ..Default::default()
         },
     )
+    .map_err(|error| format!("mc_persona_invalid: {error}"))
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -370,7 +375,7 @@ pub fn select_map_inputs(active: &[Memory], mut exists: impl FnMut(&str) -> bool
     inputs
 }
 
-pub fn build_map_prompt(project: &str, inputs: &[MapInput]) -> String {
+pub fn build_map_prompt(project: &str, inputs: &[MapInput]) -> Result<String, String> {
     let list = inputs
         .iter()
         .map(|m| {
@@ -394,6 +399,7 @@ pub fn build_map_prompt(project: &str, inputs: &[MapInput]) -> String {
             ..Default::default()
         },
     )
+    .map_err(|error| format!("mc_persona_invalid: {error}"))
 }
 
 pub fn directive_shaped_rule(category: &str, content: &str) -> bool {
@@ -641,13 +647,15 @@ pub async fn run_classify(
         if remaining == 0 {
             break;
         }
-        let prompt = build_classify_prompt(context.project, chunk, &anchors);
+        let prompt = build_classify_prompt(context.project, chunk, &anchors)
+            .map_err(|error| TaskError::Runner(dream_runner::Failure::Validation(error)))?;
         let ids: Vec<_> = chunk.iter().map(|m| m.id).collect();
         let request = request(
             context,
             CLASSIFY_TASK,
             DreamRole::Classifier,
-            classify_system_prompt(),
+            classify_system_prompt()
+                .map_err(|error| TaskError::Runner(dream_runner::Failure::Validation(error)))?,
             &prompt,
             (remaining / (chunks.len() - i) as u64).max(1),
         );
@@ -748,12 +756,14 @@ pub async fn run_map(
         }
         let (batch, retry) = batches[i].clone();
         let ids: Vec<_> = batch.iter().map(|m| m.id).collect();
-        let prompt = build_map_prompt(context.project, &batch);
+        let prompt = build_map_prompt(context.project, &batch)
+            .map_err(|error| TaskError::Runner(dream_runner::Failure::Validation(error)))?;
         let request = request(
             context,
             MAP_TASK,
             DreamRole::MemoryMapper,
-            map_system_prompt(),
+            map_system_prompt()
+                .map_err(|error| TaskError::Runner(dream_runner::Failure::Validation(error)))?,
             &prompt,
             map_batch_slice_ms(remaining, batches.len() - i),
         );
@@ -826,11 +836,13 @@ pub async fn run_map(
 // Hashes identify the full source files; tests separately pin the prompt bytes.
 // Source-file SHA256: classify 2eb7678db84542110e3d607a579bdac499f19472b9a7df8abd610b072783ed50;
 // map 4232865ee46a6811380cc45fbe3764355607e216e9df4910d1b224ec7e4ba01c.
-pub fn classify_system_prompt() -> &'static str {
+pub fn classify_system_prompt() -> Result<&'static str, String> {
     crate::persona_host::dream::system(crate::persona_host::dream::Kind::Classify)
+        .map_err(|error| format!("mc_persona_invalid: {error}"))
 }
-pub fn map_system_prompt() -> &'static str {
+pub fn map_system_prompt() -> Result<&'static str, String> {
     crate::persona_host::dream::system(crate::persona_host::dream::Kind::Map)
+        .map_err(|error| format!("mc_persona_invalid: {error}"))
 }
 
 // Recorded inputs and outputs from the TypeScript functions at the revision
@@ -2889,16 +2901,16 @@ mod tests {
         let memories = memories(&v["memories"]);
         let inputs: Vec<MapInput> = serde_json::from_value(v["inputs"].clone()).unwrap();
         assert_eq!(
-            build_classify_prompt("/repo", &memories, &memories[1..]),
+            build_classify_prompt("/repo", &memories, &memories[1..]).unwrap(),
             v["classify"]
         );
-        assert_eq!(build_map_prompt("/repo", &inputs), v["map"]);
+        assert_eq!(build_map_prompt("/repo", &inputs).unwrap(), v["map"]);
         assert_eq!(
-            format!("{:x}", Sha256::digest(classify_system_prompt())),
+            format!("{:x}", Sha256::digest(classify_system_prompt().unwrap())),
             "b288cfd1baad087ec20f23b44f747fbe1bad93807e91b0b1c6de8f2df0dddadb"
         );
         assert_eq!(
-            format!("{:x}", Sha256::digest(map_system_prompt())),
+            format!("{:x}", Sha256::digest(map_system_prompt().unwrap())),
             "8c8c800f26411aedea708128875967244b8a940f82d8125a3ba15f35e5f817f1"
         );
     }
@@ -3199,9 +3211,9 @@ mod tests {
                 assert_eq!(
                     req.system,
                     if map {
-                        map_system_prompt()
+                        map_system_prompt().unwrap()
                     } else {
-                        classify_system_prompt()
+                        classify_system_prompt().unwrap()
                     }
                 );
             }
