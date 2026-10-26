@@ -15931,6 +15931,22 @@ impl McStore {
         })
     }
 
+    /// Read non-project placements separately, leaving the legacy render snapshot
+    /// and its revision and mutation-cursor watermarks unchanged. Unplaced rows
+    /// retain their project semantics.
+    pub fn load_workspace_memory_rows(
+        &self,
+        now_ms: i64,
+    ) -> Result<Vec<(StoredMemory, memory_levels::Placement)>, McStoreError> {
+        self.context_read(|conn| {
+            single_store_schema::read_workspace_memory_rows(
+                conn,
+                &single_store_schema::CONTEXT_TABLES,
+                now_ms,
+            )
+        })
+    }
+
     /// Load the bounded visible pool used by the in-memory lexical hint scorer.
     pub fn load_visible_memory_candidates(
         &self,

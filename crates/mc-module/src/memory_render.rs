@@ -160,6 +160,19 @@ pub fn render_memory_block(
     lines.join("\n")
 }
 
+/// Workspace ownership belongs on the block, never on a project's source label.
+pub fn render_workspace_memory_block(memories: &[StoredMemory], workspace: &str) -> String {
+    let block = render_memory_block(memories, "workspace-memory", &Default::default());
+    block.replacen(
+        "<workspace-memory>",
+        &format!(
+            "<workspace-memory workspace=\"{}\">",
+            escape_xml_attr(workspace)
+        ),
+        1,
+    )
+}
+
 /// Render the `<user-profile>` baseline block: one `- <content>` line per user memory
 /// (already budget-trimmed by the caller). Empty set → empty string.
 pub fn render_user_profile_block(profile_lines: &[String], wrapper: &str) -> String {

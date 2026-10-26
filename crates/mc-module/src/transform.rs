@@ -11449,6 +11449,37 @@ struct MarkerMemorySource<'a> {
 }
 
 impl crate::m0_compose::M0Source for MarkerMemorySource<'_> {
+    fn load_memory_placements(
+        &self,
+        session_id: &str,
+        now_ms: i64,
+        snapshot: &mc_store::MemoryRenderSnapshot,
+    ) -> Result<crate::m0_compose::selection::PlacementSnapshot, McStoreError> {
+        if let Some(projection) = self.projection.filter(|projection| {
+            projection.project_memory_epoch == snapshot.revision.project_memory_epoch
+        }) {
+            let pin = self.store.load_meta(session_id)?.meta.memory_context;
+            return Ok(crate::m0_compose::selection::PlacementSnapshot {
+                workspace_id: pin
+                    .as_ref()
+                    .and_then(|pin| pin["workspace_id"].as_str())
+                    .map(str::to_owned),
+                pin,
+                replay_owners: Some(
+                    projection
+                        .rows
+                        .iter()
+                        .filter_map(|shown| {
+                            shown.owner.clone().map(|owner| (shown.memory.id, owner))
+                        })
+                        .collect(),
+                ),
+                ..Default::default()
+            });
+        }
+        self.store
+            .load_memory_placements(session_id, now_ms, snapshot)
+    }
     fn load_compartments(
         &self,
         session: &str,
@@ -11497,7 +11528,10 @@ impl crate::m0_compose::M0Source for MarkerMemorySource<'_> {
             .iter()
             .filter(|row| row.representation == "text")
             .filter(|row| {
-                row.memory.project_path == project
+                row.owner
+                    .as_ref()
+                    .is_some_and(|owner| owner.kind == "workspace")
+                    || row.memory.project_path == project
                     || membership.is_some_and(|membership| {
                         membership
                             .union_identities
@@ -11506,7 +11540,10 @@ impl crate::m0_compose::M0Source for MarkerMemorySource<'_> {
                     })
             })
             .filter(|row| {
-                !self.allow_external_repair
+                row.owner
+                    .as_ref()
+                    .is_some_and(|owner| owner.kind == "workspace")
+                    || !self.allow_external_repair
                     || current
                         .revisions
                         .get(&row.memory.id)
