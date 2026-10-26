@@ -8841,6 +8841,7 @@ mod tests {
                     content: "gated fact".into(),
                     origin_compartment_index: None,
                     source_range: None,
+                    source_ranges: Vec::new(),
                 }],
                 events: vec![crate::historian_validate::ParsedEvent {
                     kind: "causal_incident".into(),

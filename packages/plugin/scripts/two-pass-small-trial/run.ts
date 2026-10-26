@@ -9,9 +9,11 @@ import {
     type ReplayCase,
     readCorpus,
 } from "../two-pass-live-replay/artifact-schema";
-import { memoryDrafts, requestHash, turnOne, turnTwo } from "./prompts";
+import { readRawInput } from "./input";
+import { decisionChecks, memoryDrafts, requestHash, turnOne, turnTwo } from "./prompts";
 import { DeepSeek, Ledger, logger, type Prices, sanitizer } from "./provider";
 import { DOCS, type RunResult, report } from "./report";
+import { transcript } from "./transcript";
 
 export interface Config {
     version: 1;
@@ -25,10 +27,12 @@ export interface Config {
     maxSpendUSD: number;
     peakUSDPerMillion: Prices;
     outputDir: string;
+    turnTwoThinking?: "disabled" | "enabled";
 }
 export function validateConfig(c: Config) {
     if (
         c.version !== 1 ||
+        (c.turnTwoThinking !== undefined && !["disabled", "enabled"].includes(c.turnTwoThinking)) ||
         c.repeats !== 1 ||
         c.caseIds?.length !== 5 ||
         new Set(c.caseIds).size !== 5 ||
@@ -61,7 +65,7 @@ export function loadCases(c: Config) {
         selected: c.caseIds.map((id) => {
             const found = corpus.cases.find((item) => item.id === id);
             if (!found) throw new Error("missing_case");
-            return found;
+            return readRawInput(c.corpusRoot, found);
         }),
     };
 }
@@ -137,7 +141,21 @@ export async function runTrial(input: {
         cases: [],
         attempts: [],
     };
-    const save = () =>
+    const save = () => {
+        for (const record of result.cases)
+            write(
+                `transcript-case-${record.caseId}.md`,
+                transcript({
+                    ...record,
+                    providerReplies: result.attempts
+                        .filter((row) => row.caseId === record.caseId && row.raw !== undefined)
+                        .map((row) => ({
+                            turn: row.turn,
+                            attempt: row.attempt,
+                            raw: row.raw ?? "",
+                        })),
+                }),
+            );
         write(
             "run.json",
             JSON.stringify(
@@ -160,6 +178,7 @@ export async function runTrial(input: {
                 2,
             ),
         );
+    };
     const ledger = new Ledger(input.config.maxSpendUSD, input.config.peakUSDPerMillion, save);
     result.attempts = ledger.rows;
     const log = logger(input.material, input.emit ?? ((text) => process.stdout.write(text)));
@@ -182,13 +201,19 @@ export async function runTrial(input: {
                 log(`case=${c.id} turn=1 sending`);
                 record.firstReply = await client.send(record.firstRequest, c.id, 1);
                 save();
-                const second = await turnTwo(c, record.firstRequest, record.firstReply);
+                const second = await turnTwo(
+                    c,
+                    record.firstRequest,
+                    record.firstReply,
+                    input.config.turnTwoThinking,
+                );
                 record.summary = second.summary;
                 record.secondRequest = second.request;
                 record.deferredFacts = second.deferredFacts;
                 save();
                 log(`case=${c.id} turn=2 sending`);
                 record.secondReply = await client.send(second.request, c.id, 2);
+                record.checks = decisionChecks(record.secondReply);
                 save();
                 const diagnostics = { extraFactIds: [] as number[] };
                 record.drafts = memoryDrafts(record.secondReply, second.facts, c, diagnostics);
@@ -227,11 +252,15 @@ async function main() {
     const option = (name: string) => args[args.indexOf(name) + 1];
     if (
         !args.includes("--config") ||
-        ["--prepare", "--mock", "--live"].filter((v) => args.includes(v)).length !== 1
+        ["--prepare", "--render", "--mock", "--live"].filter((v) => args.includes(v)).length !== 1
     )
-        throw new Error("usage_choose_prepare_mock_or_live_and_config");
+        throw new Error("usage_choose_prepare_render_mock_or_live_and_config");
     const config = JSON.parse(readFileSync(option("--config"), "utf8")) as Config;
     validateConfig(config);
+    if (args.includes("--turn-two-thinking")) {
+        config.turnTwoThinking = option("--turn-two-thinking") as Config["turnTwoThinking"];
+        validateConfig(config);
+    }
     if (args.includes("--mock")) {
         const { mockCases, mockServer } = await import("./mock");
         const server = mockServer();
@@ -250,6 +279,18 @@ async function main() {
         return;
     }
     const { corpus, selected } = loadCases(config);
+    if (args.includes("--render")) {
+        const dir = ".cortexkit/internal-docs/investigations/two-pass-small-trial/clean-renders";
+        mkdirSync(dir, { recursive: true, mode: 0o700 });
+        for (const c of selected)
+            writeFileSync(
+                resolve(dir, `transcript-case-${c.id}.md`),
+                transcript({ caseId: c.id, firstRequest: turnOne(c) }),
+                { mode: 0o600 },
+            );
+        console.log(`rendered cases=${selected.map((c) => c.id).join(",")} providerCalls=0`);
+        return;
+    }
     if (args.includes("--prepare")) {
         const dir = ".cortexkit/internal-docs/investigations/two-pass-small-trial";
         mkdirSync(dir, { recursive: true, mode: 0o700 });

@@ -81,7 +81,9 @@ export function openCodeTurnOneAuthorization(input: {
 
 /** Reads a save's excerpt window from the session's raw source. */
 export const readTurnTwoExcerpt: TurnTwoExcerptReader = (sessionId, from, to) => {
-    const chunk = readSessionChunk(sessionId, Number.MAX_SAFE_INTEGER, from, to + 1);
+    const chunk = readSessionChunk(sessionId, Number.MAX_SAFE_INTEGER, from, to + 1, {
+        singleMessageLines: true,
+    });
     const blocks = (chunk.printedBlocks ?? []).filter(
         (block) => block.startOrdinal >= from && block.endOrdinal <= to,
     );

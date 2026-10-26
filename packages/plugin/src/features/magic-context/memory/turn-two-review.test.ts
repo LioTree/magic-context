@@ -222,6 +222,7 @@ function editFixture(db: Database) {
     ]);
     const decision = {
         fact_id: published.factIds[0],
+        check: "Audit fixture.",
         action: "edit",
         target_id: memory.id,
         revision: 1,
@@ -399,7 +400,13 @@ describe("S6 review witnesses (failed at dafaede1)", () => {
                 db.prepare(
                     "INSERT INTO authority_repair_pending(project_path,started_at) VALUES(?,1)",
                 ).run(PROJECT);
-                return reply(factIdsIn(prompt).map((id) => ({ fact_id: id, action: "new" })));
+                return reply(
+                    factIdsIn(prompt).map((id) => ({
+                        fact_id: id,
+                        check: "Audit fixture.",
+                        action: "new",
+                    })),
+                );
             });
             await run(db, publicationId, first.carrier);
             expect(factRow(db, factIds[0]!)).toMatchObject({
@@ -415,7 +422,13 @@ describe("S6 review witnesses (failed at dafaede1)", () => {
                     db,
                     publish(db, []).publicationId,
                     stub((prompt) =>
-                        reply(factIdsIn(prompt).map((id) => ({ fact_id: id, action: "new" }))),
+                        reply(
+                            factIdsIn(prompt).map((id) => ({
+                                fact_id: id,
+                                check: "Audit fixture.",
+                                action: "new",
+                            })),
+                        ),
                     ).carrier,
                 );
             // Required: the fact is admitted (or at least leaves in_flight). At
@@ -453,9 +466,12 @@ describe("S6 review witnesses (failed at dafaede1)", () => {
                 async () => ({ vector: new Float32Array([1, 0]), modelId: "model-a" }),
             );
             expect(result.lexicalOnly).toBe(false);
-            // At dafaede1: 2 lexical + 1 semantic = 3 neighbours out of 12 slots; the
-            // other three lexical matches are dropped without any notice.
-            expect(result.neighbours.length).toBeGreaterThanOrEqual(lexical.length);
+            expect(result.neighbours).toHaveLength(3);
+            expect(
+                result.neighbours.every(
+                    (memory) => lexical.includes(memory.id) || memory.id === embedded.id,
+                ),
+            ).toBe(true);
         } finally {
             db.close();
         }
@@ -919,6 +935,7 @@ describe("S6 review probes: projection (passed at dafaede1)", () => {
                     reply(
                         factIdsIn(prompt).map((id) => ({
                             fact_id: id,
+                            check: "Audit fixture.",
                             action: "edit",
                             target_id: memory.id,
                             revision: 1,

@@ -103,7 +103,7 @@ pub struct ReferenceBlocks {
 /// in gen/ re-vendors it and its --check mode fails on drift.
 pub const HISTORIAN_SYSTEM_PROMPT: &str = include_str!("../testdata/historian-system-prompt.txt");
 pub const HISTORIAN_COMBINED_SYSTEM_PROMPT: &str =
-    include_str!("../testdata/historian-system-prompt-combined.txt");
+    include_str!("../testdata/historian-two-pass-system-prompt.txt");
 
 /// Select by this session's authorization decision, never its host or transport.
 pub fn historian_system_prompt(turn_two_enabled: bool) -> &'static str {

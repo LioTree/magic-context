@@ -13,13 +13,14 @@ import {
 } from "../../features/magic-context/memory/turn-two-envelope";
 import { COMPRESS_CUES_SYSTEM_PROMPT } from "../../features/magic-context/mural/compress-cues-prompt";
 import {
-    COMPARTMENT_AGENT_COMBINED_SYSTEM_PROMPT,
     COMPARTMENT_AGENT_SYSTEM_PROMPT,
     COMPARTMENT_STRUCTURAL_SYSTEM_PROMPT,
     historianSystemPrompt,
 } from "./compartment-prompt";
+import { COMPARTMENT_AGENT_COMBINED_SYSTEM_PROMPT } from "./historian-prompt.generated";
 import { renderHistorianSystemPrompt } from "./historian-prompt-render";
 import { isMagicContextInternalAgent } from "./system-prompt-hash";
+import { TWO_PASS_SYSTEM, TWO_PASS_TURN_TWO } from "./two-pass-prompts/prompts.generated";
 
 const source = readFileSync(new URL("./historian-prompt.source.md", import.meta.url), "utf8");
 const xml = renderHistorianSystemPrompt(source, "xml");
@@ -42,7 +43,7 @@ test("generated XML and combined artifacts are byte-identical across TypeScript 
                 new URL(`../../../../../crates/mc-module/testdata/${artifact}`, import.meta.url),
             ),
         ).toEqual(Buffer.from(generated));
-        expect(historianSystemPrompt(enabled)).toBe(generated);
+        expect(historianSystemPrompt(enabled)).toBe(enabled ? TWO_PASS_SYSTEM : generated);
     }
     expect(hash(COMPARTMENT_AGENT_SYSTEM_PROMPT)).not.toBe(
         hash(COMPARTMENT_AGENT_COMBINED_SYSTEM_PROMPT),
@@ -83,7 +84,7 @@ test("turn-two user content carries notices and data, not a second format schema
     expect(prompt).toContain("## Agent memories to score");
     expect(prompt).toContain("Save first.");
     expect(prompt).toContain("allowed_fact_ids: [4]");
-    expect(prompt).toContain("exactly one decision for each allowed fact_id and no others");
+    expect(prompt).toContain(TWO_PASS_TURN_TWO.replace("{{ALLOWED_FACT_IDS}}", "[4]"));
     for (const format of ["Reply with", "JSON", "target_id", "1-100", "decay class", "final_text"])
         expect(prompt).not.toContain(format);
 });

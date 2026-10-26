@@ -1019,7 +1019,10 @@ export async function runPiHistorian(deps: PiHistorianDeps): Promise<void> {
 				chunkTokens,
 				offset,
 				eligibleEndOrdinal,
-				{ expandTools: deps.expandTools },
+				{
+					expandTools: deps.expandTools,
+					singleMessageLines: turnOneLane === "enabled",
+				},
 			);
 			const forceKeepLastCompartmentForChunk =
 				forceKeepLastCompartment === true && !chunk.hasMore;
@@ -1088,18 +1091,22 @@ export async function runPiHistorian(deps: PiHistorianDeps): Promise<void> {
 			// golden. The prompt fit above rendered these blocks, trimmed if the
 			// producer window needed room for the chunk. Mirrors the OpenCode
 			// incremental runner.
-			const fittedAtomicSource = chunk.oversizeAtomicUnit
-				? fitAtomicHistorianSourceToProducerWindow({
-						text: chunk.text,
-						resultBoundaries: chunk.toolResultBoundaries,
-						contextLimitTokens: historianContextLimit,
-						maxOutputTokens,
-						maxSourceTokens: promptFit.roomTokens,
-					})
-				: null;
-			const chunkText = chunk.oversizeAtomicUnit
-				? (fittedAtomicSource?.text ?? chunk.text)
-				: truncateHistorianInputIfNeeded(chunk.text, chunkTokens);
+			const fittedAtomicSource =
+				chunk.oversizeAtomicUnit && turnOneLane !== "enabled"
+					? fitAtomicHistorianSourceToProducerWindow({
+							text: chunk.text,
+							resultBoundaries: chunk.toolResultBoundaries,
+							contextLimitTokens: historianContextLimit,
+							maxOutputTokens,
+							maxSourceTokens: promptFit.roomTokens,
+						})
+					: null;
+			const chunkText =
+				turnOneLane === "enabled"
+					? chunk.text
+					: chunk.oversizeAtomicUnit
+						? (fittedAtomicSource?.text ?? chunk.text)
+						: truncateHistorianInputIfNeeded(chunk.text, chunkTokens);
 			const producerSourceTokens = estimateTokens(chunkText);
 			if (boundarySnapshot.oversizeAtomicUnit || chunk.oversizeAtomicUnit) {
 				sessionLog(

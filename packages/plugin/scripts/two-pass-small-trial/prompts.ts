@@ -84,7 +84,12 @@ export interface SecondTurn {
     summary: string;
 }
 
-export async function turnTwo(c: ReplayCase, first: Request, reply: string): Promise<SecondTurn> {
+export async function turnTwo(
+    c: ReplayCase,
+    first: Request,
+    reply: string,
+    thinking: Request["thinking"]["type"] = "disabled",
+): Promise<SecondTurn> {
     const xml = parseEnabledTurnOne(reply);
     if (xml === null) throw new Error("turn_one_envelope_invalid");
     const lastBlock = c.blocks.at(-1);
@@ -193,12 +198,14 @@ export async function turnTwo(c: ReplayCase, first: Request, reply: string): Pro
         const selected = fitted.facts;
         const deferredFacts = fitted.deferred.facts;
         const second = fitted.prompt;
+        const secondRequest = request([
+            ...first.messages,
+            { role: "assistant", content: reply },
+            { role: "user", content: second },
+        ]);
+        secondRequest.thinking = { type: thinking };
         return {
-            request: request([
-                ...first.messages,
-                { role: "assistant", content: reply },
-                { role: "user", content: second },
-            ]),
+            request: secondRequest,
             facts: selected,
             deferredFacts,
             summary: xml,
@@ -247,3 +254,11 @@ export function memoryDrafts(
     return drafts;
 }
 export const requestHash = (value: Request) => lifecycleTextHash(JSON.stringify(value));
+
+export function decisionChecks(reply: string): Array<{ factId: number; check: string }> {
+    const parsed = parseTurnTwoEnvelope(reply, false);
+    if (!parsed.ok) return [];
+    return [...parsed.decisions.values()].flatMap((decision) =>
+        decision === "malformed" ? [] : [{ factId: decision.factId, check: decision.check }],
+    );
+}

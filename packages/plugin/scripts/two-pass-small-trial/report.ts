@@ -9,6 +9,7 @@ export interface CaseResult {
     summary?: string;
     secondRequest?: Request;
     secondReply?: string;
+    checks?: Array<{ factId: number; check: string }>;
     drafts?: MemoryDraft[];
     deferredFacts?: number;
     extraFactIds?: number[];

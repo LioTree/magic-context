@@ -8,6 +8,8 @@
  * object of the expected shape is an envelope failure, and every fact of that send
  * is retried (see `turn-two.ts`).
  */
+
+import { TWO_PASS_TURN_TWO } from "../../../hooks/magic-context/two-pass-prompts/prompts.generated";
 import { lifecycleTextHash, splitMemoryClauses } from "./lifecycle-text";
 
 /** Known reply actions, including unsupported actions that are dropped rather than retried. */
@@ -44,6 +46,8 @@ export interface TurnTwoDecision {
     /** Position of the decision in the reply's `decisions` array. */
     ordinal: number;
     action: TurnTwoAction;
+    /** Audit text only; its contents never authorize or refuse an action. */
+    check: string;
     /** `covered`, `conflict`, `edit`, `replaces`, `retire`, `promote_rule`: the existing memory addressed. */
     targetId?: number;
     /** `covered`, `edit`, `replaces`: the revision of `targetId` the decision read. */
@@ -136,7 +140,13 @@ function parseDecision(
     const action = raw.action;
     if (typeof action !== "string" || !TURN_TWO_ACTIONS.includes(action as TurnTwoAction))
         return null;
-    const decision: TurnTwoDecision = { factId, ordinal, action: action as TurnTwoAction };
+    if (typeof raw.check !== "string") return null;
+    const decision: TurnTwoDecision = {
+        factId,
+        ordinal,
+        action: action as TurnTwoAction,
+        check: raw.check,
+    };
     switch (decision.action) {
         case "new":
         case "abstain":
@@ -343,11 +353,9 @@ export function buildTurnTwoPrompt(input: {
     deferred?: { facts: number; items: number };
 }): string {
     const lines: string[] = [
-        "Turn two: reconcile each candidate fact with existing project memory.",
-        `allowed_fact_ids: ${JSON.stringify(input.facts.map((fact) => fact.factId))}`,
-        "Return exactly one decision for each allowed fact_id and no others. Earlier reply bullets and compartment numbers are not fact ids. Unpublished and deferred facts are out of scope.",
-        "Before choosing new, edit, merge or replaces, check the conversation. If it treats the statement as a proposal, hypothesis, open question, or still to be measured or decided, choose abstain. Example: 'Gemini reasoning resend is tiny' while a reasoning-budget investigation is still measuring resend cost is a hypothesis, not a new memory.",
-        "Source block refs and neighbour refs below point to the shared evidence tables. Cite a source block by its printed start ordinal in the block field, and only if that block is referenced by the fact being decided. Only that fact's neighbour refs are eligible targets.",
+        TWO_PASS_TURN_TWO.replace("{{ALLOWED_FACT_IDS}}", () =>
+            JSON.stringify(input.facts.map((fact) => fact.factId)),
+        ),
     ];
     if (input.lexicalOnly) lines.push(LEXICAL_ONLY_NOTICE);
     if (input.deferred && (input.deferred.facts > 0 || input.deferred.items > 0))

@@ -8,6 +8,7 @@ import { memoryDrafts, turnOne, turnTwo } from "./prompts";
 import { cost, DeepSeek, Ledger, logger, parseUsage, retryDelay, sanitizer } from "./provider";
 import { mechanicalClaim } from "./report";
 import { type Config, runTrial, validateConfig } from "./run";
+import { transcript } from "./transcript";
 
 const config = configJSON as Config;
 const prices = config.peakUSDPerMillion;
@@ -72,10 +73,54 @@ describe("direct DeepSeek small trial", () => {
             expect(readFileSync(join(tmp.dir, "run.json"), "utf8") + md).not.toContain(
                 "recorded-input-must-stay-private",
             );
+            for (const record of result.cases) {
+                const saved = readFileSync(
+                    join(tmp.dir, `transcript-case-${record.caseId}.md`),
+                    "utf8",
+                );
+                expect(saved).toBe(
+                    transcript({
+                        ...record,
+                        providerReplies: result.attempts
+                            .filter((row) => row.caseId === record.caseId)
+                            .map((row) => ({
+                                turn: row.turn,
+                                attempt: row.attempt,
+                                raw: row.raw ?? "",
+                            })),
+                    }),
+                );
+                expect(saved).toContain("recorded-input-must-stay-private");
+                expect(saved).toContain(record.secondRequest!.messages[3].content);
+                expect(saved).toContain(record.secondReply!);
+                expect(saved).toContain('"check":"Stated by the user in message 1."');
+                for (const req of [record.firstRequest, record.secondRequest!]) {
+                    for (const message of req.messages) expect(saved).toContain(message.content);
+                }
+                for (const row of result.attempts.filter((row) => row.caseId === record.caseId))
+                    expect(saved).toContain(row.raw!);
+            }
+            expect(
+                JSON.parse(readFileSync(join(tmp.dir, "run.json"), "utf8")).cases[0].checks,
+            ).toEqual([{ factId: 1, check: "Stated by the user in message 1." }]);
         } finally {
             server.stop();
             tmp.close();
         }
+    });
+    test("turn-two thinking is trial-configurable without changing turn one or conversation bytes", async () => {
+        const c = fixtures[0];
+        const first = turnOne(c);
+        const reply = mockReply(first).choices[0].message.content;
+        const production = await turnTwo(c, first, reply);
+        const thinking = await turnTwo(c, first, reply, "enabled");
+        expect(first.thinking).toEqual({ type: "disabled" });
+        expect(production.request.thinking).toEqual({ type: "disabled" });
+        expect(thinking.request.thinking).toEqual({ type: "enabled" });
+        expect(thinking.request.messages).toEqual(production.request.messages);
+        expect(() => validateConfig({ ...config, turnTwoThinking: "other" as "enabled" })).toThrow(
+            "invalid_trial_config",
+        );
     });
     test("cap refusal happens before HTTP dispatch and survives in report", async () => {
         const tmp = scratch(),
@@ -320,9 +365,7 @@ describe("direct DeepSeek small trial", () => {
     });
     test("production builders use recorded transcript and anchor facts; parser rejects malformed decisions", async () => {
         expect(first.messages[1].content).toContain("<fact_anchors>required</fact_anchors>");
-        expect(first.messages[1].content).toContain(
-            "[1] user: Always serialize DeepSeek requests.",
-        );
+        expect(first.messages[1].content).toContain("[1] U: Always serialize DeepSeek requests.");
         const second = await turnTwo(
             fixtures[0],
             first,
@@ -330,7 +373,7 @@ describe("direct DeepSeek small trial", () => {
         );
         expect(second.facts[0].anchorKnown).toBe(true);
         expect(second.facts[0].blocks).toEqual(
-            fixtures[0].blocks.map((b) => ({ ...b, parts: [...b.parts] })),
+            fixtures[0].blocks.slice(0, 1).map((b) => ({ ...b, parts: [...b.parts] })),
         );
         expect(() =>
             memoryDrafts(
@@ -363,6 +406,7 @@ describe("direct DeepSeek small trial", () => {
                 decisions: [
                     {
                         fact_id: 1,
+                        check: "Audit fixture.",
                         action: "edit",
                         target_id: 35,
                         revision: 7,
@@ -388,7 +432,14 @@ describe("direct DeepSeek small trial", () => {
             result: {
                 step: "turn_two",
                 decisions: [
-                    { fact_id: 1, action: "covered", target_id: 35, revision: 7, clauses: [1] },
+                    {
+                        fact_id: 1,
+                        check: "Audit fixture.",
+                        action: "covered",
+                        target_id: 35,
+                        revision: 7,
+                        clauses: [1],
+                    },
                 ],
             },
         });

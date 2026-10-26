@@ -259,6 +259,7 @@ function twoTurnClient(directory: string) {
                                       step: "turn_two",
                                       decisions: factIds.map((factId) => ({
                                           fact_id: factId,
+                                          check: "Audit fixture.",
                                           action: "new",
                                       })),
                                   },

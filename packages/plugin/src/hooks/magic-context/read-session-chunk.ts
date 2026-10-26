@@ -1225,7 +1225,11 @@ export function readSessionChunk(
     tokenBudget: number,
     offset: number = 1,
     eligibleEndOrdinal?: number,
-    options: { expandTools?: ToolExpansionMap; expand?: boolean } = {},
+    options: {
+        expandTools?: ToolExpansionMap;
+        expand?: boolean;
+        singleMessageLines?: boolean;
+    } = {},
 ): SessionChunk {
     // When a tail-only slice is primed, its length is not the absolute count.
     // Otherwise use the provider's SQL count and read only the chunk's eligible range.
@@ -1420,6 +1424,8 @@ export function readSessionChunk(
 
         const meta = { ordinal: msg.ordinal, messageId: msg.id };
         if (isHostUnservedRow(msg)) markHostUnservedRow(meta);
+        // Fact anchors need message boundaries, not a range merging unrelated claims.
+        if (options.singleMessageLines && !flushCurrentBlock()) break;
 
         // Skip user messages that are pure system notifications (background task
         // completions, internal initiator markers, system directives). These carry
@@ -1454,7 +1460,9 @@ export function readSessionChunk(
                 if (!flushCurrentBlock()) break;
                 currentBlock = {
                     role: "A",
-                    startOrdinal: pendingNoiseMeta[0]?.ordinal ?? msg.ordinal,
+                    startOrdinal: options.singleMessageLines
+                        ? msg.ordinal
+                        : (pendingNoiseMeta[0]?.ordinal ?? msg.ordinal),
                     endOrdinal: msg.ordinal,
                     parts: [tcText],
                     partMeta: [
@@ -1540,7 +1548,9 @@ export function readSessionChunk(
 
         currentBlock = {
             role,
-            startOrdinal: pendingNoiseMeta[0]?.ordinal ?? msg.ordinal,
+            startOrdinal: options.singleMessageLines
+                ? msg.ordinal
+                : (pendingNoiseMeta[0]?.ordinal ?? msg.ordinal),
             endOrdinal: msg.ordinal,
             parts: [text],
             partMeta: [

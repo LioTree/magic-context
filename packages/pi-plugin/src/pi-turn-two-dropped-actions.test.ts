@@ -98,7 +98,14 @@ for (const action of ["retire", "promote_rule"] as const) {
 						text: JSON.stringify({
 							result: {
 								step: "turn_two",
-								decisions: [{ fact_id: 1, action, target_id: memory.id }],
+								decisions: [
+									{
+										fact_id: 1,
+										check: "Audit fixture.",
+										action,
+										target_id: memory.id,
+									},
+								],
 							},
 						}),
 						lengthCapped: false,

@@ -276,7 +276,9 @@ describe("Pi historian RPC parity", () => {
 			return JSON.stringify({
 				result: {
 					step: "turn_two",
-					decisions: [{ fact_id: fact.id, action: "new" }],
+					decisions: [
+						{ fact_id: fact.id, check: "Audit fixture.", action: "new" },
+					],
 				},
 			});
 		});
@@ -477,7 +479,7 @@ describe("Pi historian RPC parity", () => {
 			[],
 		);
 		const wrapped =
-			' \n{"result":{"step":"turn_two","decisions":[{"fact_id":1,"action":"new"}]}}\n';
+			' \n{"result":{"step":"turn_two","decisions":[{"fact_id":1,"check":"Audit fixture.","action":"new"}]}}\n';
 		const f = rpcFixture((prompt) =>
 			prompt.id === "turn-one-key" ? "turn one raw reply" : wrapped,
 		);
@@ -657,6 +659,7 @@ describe("Pi historian RPC parity", () => {
 						decisions: [
 							{
 								fact_id: fact.id,
+								check: "Audit fixture.",
 								action: "edit",
 								target_id: memory.id,
 								revision: 1,
@@ -779,7 +782,9 @@ describe("Pi historian RPC parity", () => {
 			return JSON.stringify({
 				result: {
 					step: "turn_two",
-					decisions: [{ fact_id: fact.id, action: "new" }],
+					decisions: [
+						{ fact_id: fact.id, check: "Audit fixture.", action: "new" },
+					],
 				},
 			});
 		});

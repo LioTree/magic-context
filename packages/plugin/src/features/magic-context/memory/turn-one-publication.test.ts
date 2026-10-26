@@ -643,10 +643,13 @@ describe("turn-one publication", () => {
                 {
                     source_session_id: SESSION,
                     start_ordinal: 10,
-                    end_ordinal: 10,
-                    role: "U",
-                    parts_json: JSON.stringify(["cap is 64 KiB"]),
-                    joined_text: "cap is 64 KiB",
+                    end_ordinal: 12,
+                    role: "mixed",
+                    parts_json: JSON.stringify([
+                        "[10] U: cap is 64 KiB",
+                        "[11-12] A: TC: read a / b / kept 64 KiB",
+                    ]),
+                    joined_text: "[10] U: cap is 64 KiB / [11-12] A: TC: read a / b / kept 64 KiB",
                 },
                 {
                     source_session_id: SESSION,
@@ -675,7 +678,6 @@ describe("turn-one publication", () => {
                     .all(),
             ).toEqual([
                 { fact_index: 0, start_ordinal: 10 },
-                { fact_index: 0, start_ordinal: 11 },
                 { fact_index: 1, start_ordinal: 11 },
                 { fact_index: 2, start_ordinal: 13 },
             ]);

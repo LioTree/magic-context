@@ -873,6 +873,7 @@ describe("historian turn two on an enabled lane", () => {
                         step: "turn_two",
                         decisions: [...prompt.matchAll(/^## Fact (\d+)/gm)].map((m) => ({
                             fact_id: Number(m[1]),
+                            check: "Audit fixture.",
                             action: "abstain",
                         })),
                     },
@@ -958,6 +959,7 @@ describe("historian turn two on an enabled lane", () => {
                         step: "turn_two",
                         decisions: [...prompt.matchAll(/^## Fact (\d+)/gm)].map((match) => ({
                             fact_id: Number(match[1]),
+                            check: "Audit fixture.",
                             action: "abstain",
                         })),
                     },
@@ -1003,6 +1005,7 @@ describe("historian turn two on an enabled lane", () => {
                     step: "turn_two",
                     decisions: [...prompt.matchAll(/^## Fact (\d+)/gm)].map((m) => ({
                         fact_id: Number(m[1]),
+                        check: "Audit fixture.",
                         action: "new",
                     })),
                 },
@@ -1127,7 +1130,11 @@ describe("historian turn two on an enabled lane", () => {
             return JSON.stringify({
                 result: {
                     step: "turn_two",
-                    decisions: ids.map((id) => ({ fact_id: id, action: "new" })),
+                    decisions: ids.map((id) => ({
+                        fact_id: id,
+                        check: "Audit fixture.",
+                        action: "new",
+                    })),
                 },
             });
         });
@@ -1180,6 +1187,7 @@ describe("historian turn two on an enabled lane", () => {
                         step: "turn_two",
                         decisions: [...prompt.matchAll(/^## Fact (\d+)/gm)].map((match) => ({
                             fact_id: Number(match[1]),
+                            check: "Audit fixture.",
                             action: "abstain",
                         })),
                     },

@@ -51,7 +51,7 @@ export function historianMockReply(request: Record<string, any>): string {
     if (factIds.length) {
         const target = text.match(/#(\d+) rev \d+/)?.[1];
         return JSON.stringify({ result: { step: "turn_two", decisions: factIds.map((fact_id) => target
-            ? { fact_id, action: "conflict", target_id: Number(target) } : { fact_id, action: "new" }), scores: [] } });
+            ? { fact_id, check: "Audit fixture.", action: "conflict", target_id: Number(target) } : { fact_id, check: "Audit fixture.", action: "new" }), scores: [] } });
     }
     if (/messages_processed|compartments|historian/i.test(text)) {
         const xml = '<output><compartments><compartment start="1" end="1" title="Record the 64 KiB chunk size" episode_type="design" importance="50"><p1>I recorded the user instruction that chunk size is 64 KiB.</p1><p2>I recorded a 64 KiB chunk size.</p2><p3>The chunk size is 64 KiB.</p3><p4>64 KiB chunk size</p4></compartment><compartment start="2" end="2" title="Acknowledge the setting" episode_type="design" importance="20"><p1>I acknowledged the corrected setting.</p1><p2>I acknowledged it.</p2><p3>Setting acknowledged.</p3><p4>Acknowledged</p4></compartment></compartments><facts><CONFIG_VALUES>* [at_compartment=1 messages=1] Chunk size: 64 KiB.</CONFIG_VALUES></facts><meta><messages_processed>1-2</messages_processed><unprocessed_from>3</unprocessed_from></meta></output>';

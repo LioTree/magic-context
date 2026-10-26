@@ -138,6 +138,7 @@ describe("historian resolving ownership", () => {
 									decisions: [
 										{
 											fact_id: 1,
+											check: "Audit fixture.",
 											action: "edit",
 											target_id: memory.id,
 											revision: 1,
@@ -324,6 +325,7 @@ describe("Pi UUID stage lease", () => {
 						decisions: [
 							{
 								fact_id: 1,
+								check: "Audit fixture.",
 								action: "edit",
 								target_id: memory.id,
 								revision: 1,

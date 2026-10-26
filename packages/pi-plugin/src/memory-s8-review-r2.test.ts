@@ -126,6 +126,7 @@ function fixture(db: Db, count = 1) {
 		const rule = `New rule ${i + 1}.`;
 		return {
 			fact_id: i + 1,
+			check: "Audit fixture.",
 			action: "edit",
 			target_id: memory.id,
 			revision: 1,
@@ -378,7 +379,9 @@ async function visitPi(db: Db, publicationId = publication(db, 0)) {
 			assistantText: JSON.stringify({
 				result: {
 					step: "turn_two",
-					decisions: [{ fact_id: 1, action: "abstain" }],
+					decisions: [
+						{ fact_id: 1, check: "Audit fixture.", action: "abstain" },
+					],
 				},
 			}),
 			meta: { reportedProvider: "test", reportedModel: "model" },

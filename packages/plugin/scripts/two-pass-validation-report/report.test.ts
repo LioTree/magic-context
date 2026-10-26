@@ -164,10 +164,7 @@ function fixture() {
     for (const { caseId, repeat } of schedule()) {
         const runId = `run:${caseId}:${repeat}`;
         const stageKey = `stage:${runId}`;
-        const decisions = Array.from({ length: 5 }, (_, i) => ({
-            fact_id: i + 1,
-            action: i === 4 ? "abstain" : "new",
-        }));
+        const decisions = Array.from({ length: 5 }, (_, i) => ({ fact_id: i + 1, check: "Audit fixture.", action: i === 4 ? "abstain" : "new",  }));
         const text = JSON.stringify({ result: { step: "turn_two", decisions, scores: [] } });
         const wrapped = JSON.stringify({ result: { step: "turn_one", xml: "<compartment/>" } });
         const run: RunArtifact = {
@@ -542,33 +539,25 @@ describe("C8 claim projection and accepted-operation safety", () => {
             const envelope = JSON.parse(reply.text);
             envelope.result.decisions[0] =
                 action === "merge"
-                    ? {
-                          fact_id: 1,
-                          action,
-                          sources: [
-                              { id: 1, revision: 1 },
-                              { id: 7, revision: 1 },
-                          ],
-                          survivor_id: 1,
-                          kept: [],
-                          added: [],
-                          final_text: "Keep the rule.",
-                      }
+                    ? { fact_id: 1, check: "Audit fixture.", action, sources: [
+                        { id: 1, revision: 1 },
+                        { id: 7, revision: 1 },
+                    ],
+                    survivor_id: 1,
+                    kept: [],
+                    added: [],
+                    final_text: "Keep the rule.", }
                     : action === "replaces" || action === "edit"
-                      ? {
-                            fact_id: 1,
-                            action,
-                            target_id: 7,
-                            revision: 1,
-                            removed: [],
-                            replaced: [],
-                            kept: [],
-                            added: [],
-                            final_text: "Keep the rule.",
-                        }
+                      ? { fact_id: 1, check: "Audit fixture.", action, target_id: 7,
+                      revision: 1,
+                      removed: [],
+                      replaced: [],
+                      kept: [],
+                      added: [],
+                      final_text: "Keep the rule.", }
                       : action === "conflict"
-                        ? { fact_id: 1, action, target_id: 7 }
-                        : { fact_id: 1, action };
+                        ? { fact_id: 1, check: "Audit fixture.", action, target_id: 7 }
+                         : { fact_id: 1, check: "Audit fixture.", action };
             reply.text = JSON.stringify(envelope);
             stage.reply_json = JSON.stringify(reply);
             const receipt = run.receipts[0] as { receipt_json: string };
@@ -595,7 +584,7 @@ describe("C8 claim projection and accepted-operation safety", () => {
             const stage = run.stages[1] as { reply_json: string };
             const reply = JSON.parse(stage.reply_json);
             const envelope = JSON.parse(reply.text);
-            envelope.result.decisions[0] = { fact_id: 1, action, target_id: 1 };
+            envelope.result.decisions[0] = { fact_id: 1, check: "Audit fixture.", action, target_id: 1 };
             reply.text = JSON.stringify(envelope);
             stage.reply_json = JSON.stringify(reply);
             f.regrade(run);

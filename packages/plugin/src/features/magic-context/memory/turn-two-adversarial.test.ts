@@ -182,6 +182,7 @@ function edit(f: ReturnType<typeof fixture>, factId: number) {
         memory,
         decision: {
             fact_id: factId,
+            check: "Audit fixture.",
             action: "edit",
             target_id: memory.id,
             revision: 1,
@@ -224,7 +225,14 @@ describe("T3 adversarial authorization", () => {
                     await run(
                         f,
                         answer(
-                            [{ fact_id: f.ids[0], action, target_id: scored.memory.id }],
+                            [
+                                {
+                                    fact_id: f.ids[0],
+                                    check: "Audit fixture.",
+                                    action,
+                                    target_id: scored.memory.id,
+                                },
+                            ],
                             [{ item: scored.seq, importance: 1, class: "stable" }],
                             { ...A.profile, [field]: value },
                         ),
@@ -266,7 +274,11 @@ describe("T3 adversarial authorization", () => {
             });
             const closes = await recoverReply(
                 f,
-                answer([null, { fact_id: f.ids[0], action: "invented" }], [], B.profile),
+                answer(
+                    [null, { fact_id: f.ids[0], check: "Audit fixture.", action: "invented" }],
+                    [],
+                    B.profile,
+                ),
             );
             expect(rows(f)).toEqual(
                 f.ids.map(() => ({
@@ -307,9 +319,9 @@ describe("T3 adversarial authorization", () => {
             const closes = await recoverReply(
                 f,
                 answer([
-                    { fact_id: f.ids[0], action: "new" },
+                    { fact_id: f.ids[0], check: "Audit fixture.", action: "new" },
                     e.decision,
-                    { fact_id: f.ids[2], action: "new" },
+                    { fact_id: f.ids[2], check: "Audit fixture.", action: "new" },
                 ]),
                 async (request) => passing(request, B),
             );
@@ -387,18 +399,24 @@ describe("T3 adversarial parser", () => {
         });
     }
     for (const [name, bad] of [
-        ["unknown action", (id: number) => ({ fact_id: id, action: "invented" })],
-        ["unknown ID", () => ({ fact_id: 9999, action: "new" })],
+        [
+            "unknown action",
+            (id: number) => ({ fact_id: id, check: "Audit fixture.", action: "invented" }),
+        ],
+        ["unknown ID", () => ({ fact_id: 9999, check: "Audit fixture.", action: "new" })],
         ["unattributable", () => null],
         [
             "duplicate",
             (id: number) => [
-                { fact_id: id, action: "new" },
-                { fact_id: id, action: "new" },
+                { fact_id: id, check: "Audit fixture.", action: "new" },
+                { fact_id: id, check: "Audit fixture.", action: "new" },
             ],
         ],
-        ["retire", (id: number) => ({ fact_id: id, action: "retire" })],
-        ["promote_rule", (id: number) => ({ fact_id: id, action: "promote_rule" })],
+        ["retire", (id: number) => ({ fact_id: id, check: "Audit fixture.", action: "retire" })],
+        [
+            "promote_rule",
+            (id: number) => ({ fact_id: id, check: "Audit fixture.", action: "promote_rule" }),
+        ],
     ] as const) {
         test(`parser guard: mixed ${name} keeps valid siblings and scores, malformed and missing are terminal`, async () => {
             const f = fixture();
@@ -407,7 +425,7 @@ describe("T3 adversarial parser", () => {
                 const invalid = bad(f.ids[1]!);
                 const reply = answer(
                     [
-                        { fact_id: f.ids[0], action: "new" },
+                        { fact_id: f.ids[0], check: "Audit fixture.", action: "new" },
                         ...(Array.isArray(invalid) ? invalid : [invalid]),
                     ],
                     [{ item: score.seq, importance: 90, class: "stable" }],
@@ -459,7 +477,7 @@ describe("T3 adversarial parser", () => {
                 await run(
                     f,
                     answer(
-                        [{ fact_id: f.ids[0], action: "new" }],
+                        [{ fact_id: f.ids[0], check: "Audit fixture.", action: "new" }],
                         Array.isArray(invalid) ? invalid : [invalid],
                     ),
                 );
@@ -527,7 +545,7 @@ describe("T3 reservation and revision guards", () => {
                             )
                             .run();
                     return answer(
-                        [{ fact_id: f.ids[0], action: "new" }],
+                        [{ fact_id: f.ids[0], check: "Audit fixture.", action: "new" }],
                         [{ item: scored.seq, importance: 90, class: "stable" }],
                     );
                 });
@@ -562,7 +580,9 @@ describe("T3 reservation and revision guards", () => {
                         check: async (r) => passing(r),
                         reattach: async () => ({
                             kind: "reply",
-                            reply: answer([{ fact_id: f.ids[0], action: "new" }]),
+                            reply: answer([
+                                { fact_id: f.ids[0], check: "Audit fixture.", action: "new" },
+                            ]),
                         }),
                         close: async () => {
                             closes++;
@@ -680,10 +700,14 @@ describe("T3 trial root authorization", () => {
                     variant === "different-key"
                         ? { ...A.request.requestedIdentity, thinkingLevel: "high" }
                         : A.request.requestedIdentity;
-                await run(f, answer([{ fact_id: f.ids[0], action: "new" }]), {
-                    validatedProfiles: [],
-                    trialAuthorization: { candidate, attestedRoot },
-                });
+                await run(
+                    f,
+                    answer([{ fact_id: f.ids[0], check: "Audit fixture.", action: "new" }]),
+                    {
+                        validatedProfiles: [],
+                        trialAuthorization: { candidate, attestedRoot },
+                    },
+                );
                 expect(f.db.prepare("SELECT COUNT(*) AS n FROM memories").get()).toEqual({
                     n: variant === "attested" ? 1 : 0,
                 });
@@ -716,9 +740,17 @@ describe("T3 trial root authorization", () => {
             );
             const f = fixture(1, ":memory:", own);
             try {
-                await run(f, answer([{ fact_id: f.ids[0], action: "new" }], [], own.profile), {
-                    validatedProfiles: other.rows,
-                });
+                await run(
+                    f,
+                    answer(
+                        [{ fact_id: f.ids[0], check: "Audit fixture.", action: "new" }],
+                        [],
+                        own.profile,
+                    ),
+                    {
+                        validatedProfiles: other.rows,
+                    },
+                );
                 expect(rows(f)).toMatchObject([
                     { state: "retryable", reason: "identity_mismatch", fact_attempts: 1 },
                 ]);
@@ -734,9 +766,17 @@ describe("T3 persisted identity sources", () => {
     test("identity gate: requested A and frozen allowlisted fallback B applies only B's completion", async () => {
         const f = fixture(1, ":memory:", A, B.profile);
         try {
-            await run(f, answer([{ fact_id: f.ids[0], action: "new" }], [], B.profile), {
-                validatedProfiles: B.rows,
-            });
+            await run(
+                f,
+                answer(
+                    [{ fact_id: f.ids[0], check: "Audit fixture.", action: "new" }],
+                    [],
+                    B.profile,
+                ),
+                {
+                    validatedProfiles: B.rows,
+                },
+            );
             expect(rows(f)).toMatchObject([{ state: "applied", fact_attempts: 0 }]);
         } finally {
             f.db.close();
@@ -745,7 +785,14 @@ describe("T3 persisted identity sources", () => {
     test("identity gate: frozen unallowlisted B is not authorized by requested A", async () => {
         const f = fixture(1, ":memory:", A, B.profile);
         try {
-            await run(f, answer([{ fact_id: f.ids[0], action: "new" }], [], B.profile));
+            await run(
+                f,
+                answer(
+                    [{ fact_id: f.ids[0], check: "Audit fixture.", action: "new" }],
+                    [],
+                    B.profile,
+                ),
+            );
             expect(rows(f)).toMatchObject([
                 { state: "retryable", fact_attempts: 1, reason: "identity_mismatch" },
             ]);
@@ -770,7 +817,10 @@ describe("T3 persisted identity sources", () => {
                 f.db
                     .prepare("UPDATE memory_stage_attempts SET request_json=? WHERE stage_key=?")
                     .run(JSON.stringify(request), f.send.stageKey);
-                await run(f, answer([{ fact_id: f.ids[0], action: "new" }]));
+                await run(
+                    f,
+                    answer([{ fact_id: f.ids[0], check: "Audit fixture.", action: "new" }]),
+                );
                 expect(rows(f)).toMatchObject([
                     { state: "retryable", fact_attempts: 1, reason: "identity_mismatch" },
                 ]);

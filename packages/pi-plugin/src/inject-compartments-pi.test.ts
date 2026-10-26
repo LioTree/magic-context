@@ -445,9 +445,14 @@ it("Pi authorized two-pass publication freezes historian changes through defer a
 							result: {
 								step: "turn_two",
 								decisions: [
-									{ fact_id: facts[0]?.id, action: "new" },
+									{
+										fact_id: facts[0]?.id,
+										check: "Audit fixture.",
+										action: "new",
+									},
 									{
 										fact_id: facts[1]?.id,
+										check: "Audit fixture.",
 										action: "edit",
 										target_id: ids[0],
 										revision: 1,
@@ -471,6 +476,7 @@ it("Pi authorized two-pass publication freezes historian changes through defer a
 									},
 									{
 										fact_id: facts[2]?.id,
+										check: "Audit fixture.",
 										action: "merge",
 										sources: [
 											{ id: ids[1], revision: 1 },
@@ -497,6 +503,7 @@ it("Pi authorized two-pass publication freezes historian changes through defer a
 									},
 									{
 										fact_id: facts[3]?.id,
+										check: "Audit fixture.",
 										action: "replaces",
 										target_id: ids[3],
 										revision: 1,

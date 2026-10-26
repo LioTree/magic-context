@@ -21,7 +21,7 @@ export interface Request {
     messages: Message[];
     temperature: 0.1;
     max_tokens: 32000;
-    thinking: { type: "disabled" };
+    thinking: { type: "disabled" | "enabled" };
     stream: false;
 }
 export interface Attempt {

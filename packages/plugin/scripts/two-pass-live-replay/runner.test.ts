@@ -131,7 +131,7 @@ describe("C8 ledger and provenance", () => {
     });
 });
 
-const xml = `<compartment start="1" end="1" title="Rules"><p1>New rule. Keep rule.</p1><p2>Rules</p2><p3>Rules</p3><p4/></compartment>
+const xml = `<compartment start="1" end="2" title="Rules"><p1>New rule. Keep rule.</p1><p2>Rules</p2><p3>Rules</p3><p4/></compartment>
 <facts><CONSTRAINTS>
 * [at_compartment=1 messages=1-1] New rule.
 * [at_compartment=1 messages=1-1] Keep rule.
@@ -142,7 +142,7 @@ const example: ReplayCase = {
     id: 0,
     source: { recording: "recording.json", sha256: "a".repeat(64), sessionId: "recorded-session" },
     userPrompt:
-        "Prefix\n<project-memory>Old rule. Keep rule.</project-memory>\n<new_messages>[1] user: New rule. Keep rule. Third rule.</new_messages>\nSuffix",
+        "Prefix\n<project-memory>Old rule. Keep rule.</project-memory>\n<new_messages>[1] user: New rule. Keep rule. Third rule.\n[2] assistant: Acknowledged.</new_messages>\nSuffix",
     blocks: [
         {
             role: "user",
@@ -150,8 +150,9 @@ const example: ReplayCase = {
             endOrdinal: 1,
             parts: ["New rule. Keep rule. Third rule."],
         },
+        { role: "assistant", startOrdinal: 2, endOrdinal: 2, parts: ["Acknowledged."] },
     ],
-    lines: [{ ordinal: 1, messageId: "source-message-1" }],
+    lines: [{ ordinal: 1, messageId: "source-message-1" }, { ordinal: 2, messageId: "source-message-2" }],
     memories: [],
     recordedOutput: "recorded",
     inventory: {
@@ -235,8 +236,9 @@ function fixture(
                                       result: {
                                           step: "turn_two",
                                           decisions: factIds.map((fact_id) => ({
-                                              fact_id,
-                                              action: "new",
+                                               fact_id,
+                                               check: "Audit fixture.",
+                                               action: "new",
                                           })),
                                           scores: [],
                                       },
@@ -315,9 +317,9 @@ describe("fresh live replay through fake host transport", () => {
                           result: {
                               step: "turn_two",
                               decisions: [
-                                  { fact_id: 1, action: "new" },
-                                  { fact_id: 2, action: "not-an-action" },
-                                  { fact_id: 3, action: "new" },
+                                  { fact_id: 1, check: "Audit fixture.", action: "new" },
+                                  { fact_id: 2, check: "Audit fixture.", action: "not-an-action" },
+                                  { fact_id: 3, check: "Audit fixture.", action: "new" },
                               ],
                               scores: [],
                           },
@@ -384,25 +386,21 @@ describe("fresh live replay through fake host transport", () => {
                         result: {
                             step: "turn_two",
                             decisions: [
-                                { fact_id: 1, action: "new" },
-                                {
-                                    fact_id: 2,
-                                    action: "edit",
-                                    target_id: 10,
-                                    revision: 1,
-                                    replaced: [
-                                        {
-                                            memory_id: 10,
-                                            clause: 1,
-                                            block: 1,
-                                            excerpt: "New rule.",
-                                        },
-                                    ],
-                                    kept: [{ memory_id: 10, clause: 2 }],
-                                    added: [{ text: "New rule. ", block: 1, excerpt: "New rule." }],
-                                    final_text: "New rule. Keep rule.",
-                                },
-                                { fact_id: 3, action: "new" },
+                                { fact_id: 1, check: "Audit fixture.", action: "new" },
+                                { fact_id: 2, check: "Audit fixture.", action: "edit", target_id: 10,
+                                revision: 1,
+                                replaced: [
+                                    {
+                                        memory_id: 10,
+                                        clause: 1,
+                                        block: 1,
+                                        excerpt: "New rule.",
+                                    },
+                                ],
+                                kept: [{ memory_id: 10, clause: 2 }],
+                                added: [{ text: "New rule. ", block: 1, excerpt: "New rule." }],
+                                final_text: "New rule. Keep rule.", },
+                                { fact_id: 3, check: "Audit fixture.", action: "new" },
                             ],
                             scores: [],
                         },

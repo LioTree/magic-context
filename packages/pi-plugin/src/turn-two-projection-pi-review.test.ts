@@ -156,6 +156,7 @@ test("review probe: an applied turn-two edit is invisible on Pi SOFT and defer p
 								step: "turn_two",
 								decisions: ids.map((id) => ({
 									fact_id: id,
+									check: "Audit fixture.",
 									action: "edit",
 									target_id: memory.id,
 									revision: 1,

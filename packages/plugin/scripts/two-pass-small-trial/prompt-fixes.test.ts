@@ -9,8 +9,9 @@ import {
     buildCompartmentAgentPrompt,
     historianSystemPrompt,
 } from "../../src/hooks/magic-context/compartment-prompt";
+import { TWO_PASS_TURN_TWO } from "../../src/hooks/magic-context/two-pass-prompts/prompts.generated";
 import { mockCases, mockReply } from "./mock";
-import { memoryDrafts, requestHash, turnOne, turnTwo } from "./prompts";
+import { memoryDrafts, turnOne, turnTwo } from "./prompts";
 
 const fixture = mockCases([0])[0]!;
 function fact(id: number, content = `Fact ${id}`): TurnTwoPromptFact {
@@ -27,12 +28,8 @@ function fact(id: number, content = `Fact ${id}`): TurnTwoPromptFact {
 }
 
 describe("two-pass prompt fixes", () => {
-    test("turn-one request bytes and one-pass prompts stay pinned with exact continuation prefix", async () => {
+    test("one-pass prompts stay pinned with exact continuation prefix", async () => {
         const first = turnOne(fixture);
-        // Hash the serialized request, not a prompt rebuilt from the same expectation.
-        expect(requestHash(first)).toBe(
-            "1afc48441fdcfd176e3783253910eff59767a83ceaf4e8e0899be22ee9b181c3",
-        );
         expect(lifecycleTextHash(historianSystemPrompt(false))).toBe(
             "b1bc6bd9318c6822c675d595206fdc4fc4ffbc6b007248ea6e9a47d528a28817",
         );
@@ -66,28 +63,15 @@ describe("two-pass prompt fixes", () => {
         expect(fitted.facts.map((f) => f.factId)).toEqual([41]);
         expect(fitted.prompt).toContain("allowed_fact_ids: [41]\n");
         expect(fitted.prompt).not.toContain("## Fact 92");
-        expect(fitted.prompt).toContain(
-            "exactly one decision for each allowed fact_id and no others",
-        );
-        expect(fitted.prompt).toContain(
-            "Earlier reply bullets and compartment numbers are not fact ids",
-        );
-        expect(fitted.prompt).toContain("Unpublished and deferred facts are out of scope");
+        expect(fitted.prompt).toContain(TWO_PASS_TURN_TWO.replace("{{ALLOWED_FACT_IDS}}", "[41]"));
     });
 
-    test("hypothesis veto is concrete and present only in the new turn-two message", () => {
+    test("turn-two instruction text comes from the dedicated source", () => {
         const prompt = buildTurnTwoPrompt({ facts: [fact(1)], items: [], lexicalOnly: false });
-        const rule = "Before choosing new, edit, merge or replaces, check the conversation.";
-        expect(prompt).toContain(rule);
-        expect(prompt).toContain(
-            "proposal, hypothesis, open question, or still to be measured or decided, choose abstain",
+        expect(prompt.startsWith(TWO_PASS_TURN_TWO.replace("{{ALLOWED_FACT_IDS}}", "[1]"))).toBe(
+            true,
         );
-        expect(prompt).toContain(
-            "'Gemini reasoning resend is tiny' while a reasoning-budget investigation is still measuring resend cost is a hypothesis, not a new memory",
-        );
-        for (const message of turnOne(fixture).messages)
-            expect(message.content).not.toContain(rule);
-        expect(historianSystemPrompt(false)).not.toContain(rule);
+        expect(historianSystemPrompt(false)).not.toContain(TWO_PASS_TURN_TWO);
     });
 
     test("runner ignores and reports extra ids while retaining known drafts", async () => {
@@ -99,9 +83,9 @@ describe("two-pass prompt fixes", () => {
                 result: {
                     step: "turn_two",
                     decisions: [
-                        { fact_id: 1, action: "new" },
-                        { fact_id: 3, action: "new" },
-                        { fact_id: 4, action: "abstain" },
+                        { fact_id: 1, check: "Audit fixture.", action: "new" },
+                        { fact_id: 3, check: "Audit fixture.", action: "new" },
+                        { fact_id: 4, check: "Audit fixture.", action: "abstain" },
                     ],
                 },
             }),

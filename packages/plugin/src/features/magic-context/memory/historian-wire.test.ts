@@ -21,8 +21,8 @@ const historianWireCorpus: HistorianWireCase[] = JSON.parse(
     ),
 );
 
-test("historian wire equivalence corpus contains all 30 shared cases", () => {
-    expect(historianWireCorpus).toHaveLength(30);
+test("historian wire equivalence corpus contains all 33 shared cases", () => {
+    expect(historianWireCorpus).toHaveLength(33);
 });
 
 for (const entry of historianWireCorpus) {

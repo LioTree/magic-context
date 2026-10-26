@@ -321,7 +321,13 @@ function rpcHarness(holdSecond = false) {
 									: JSON.stringify({
 											result: {
 												step: "turn_two",
-												decisions: [{ fact_id: 1, action: "new" }],
+												decisions: [
+													{
+														fact_id: 1,
+														check: "Audit fixture.",
+														action: "new",
+													},
+												],
 											},
 										}),
 							},
@@ -608,7 +614,14 @@ describe.skipIf(!enabled)("S8 independent review", () => {
 					assistantText: JSON.stringify({
 						result: {
 							step: "turn_two",
-							decisions: [{ fact_id: 1, action, target_id: memory.id }],
+							decisions: [
+								{
+									fact_id: 1,
+									check: "Audit fixture.",
+									action,
+									target_id: memory.id,
+								},
+							],
 						},
 					}),
 					meta: { reportedProvider: "test", reportedModel: "model" },
@@ -772,6 +785,7 @@ describe.skipIf(!enabled)("S8 independent review", () => {
 						decisions: [
 							{
 								fact_id: 1,
+								check: "Audit fixture.",
 								action: "edit",
 								target_id: memory.id,
 								revision: 1,

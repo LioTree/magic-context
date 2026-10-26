@@ -258,6 +258,7 @@ function editFixture(db: Database) {
     ]);
     const decision = {
         fact_id: published.factIds[0],
+        check: "Audit fixture.",
         action: "edit",
         target_id: memory.id,
         revision: 1,
@@ -304,7 +305,9 @@ describe("turn two pre-send skips", () => {
                 "INSERT INTO authority_managed(project_path, context_store_uuid, marked_at) VALUES (?, 'module-store', 1)",
             ).run(PROJECT);
             const memories = db.prepare("SELECT * FROM memories").all();
-            const stub = stubCarrier(() => reply([{ fact_id: factIds[0], action: "new" }]));
+            const stub = stubCarrier(() =>
+                reply([{ fact_id: factIds[0], check: "Audit fixture.", action: "new" }]),
+            );
             expect(await run(db, publicationId, stub.carrier)).toMatchObject({
                 status: "skipped",
                 reason: "authority_elsewhere",
@@ -337,7 +340,13 @@ describe("turn two fact selection", () => {
                 [0, 1, 2, 3].map((n) => ({ content: `${n} ${"fresh ".repeat(6333)}` })),
             );
             const stub = stubCarrier((prompt) =>
-                reply(factIdsIn(prompt).map((id) => ({ fact_id: id, action: "abstain" }))),
+                reply(
+                    factIdsIn(prompt).map((id) => ({
+                        fact_id: id,
+                        check: "Audit fixture.",
+                        action: "abstain",
+                    })),
+                ),
             );
             await run(db, fresh.publicationId, stub.carrier);
             expect(factIdsIn(stub.prompts[0]!)).toEqual([
@@ -371,7 +380,13 @@ describe("turn two fact selection", () => {
             backlog.push(...publish(db, [{ content: "Backlog 4a" }]).factIds);
             const current = publish(db, []);
             const stub = stubCarrier((prompt) =>
-                reply(factIdsIn(prompt).map((id) => ({ fact_id: id, action: "abstain" }))),
+                reply(
+                    factIdsIn(prompt).map((id) => ({
+                        fact_id: id,
+                        check: "Audit fixture.",
+                        action: "abstain",
+                    })),
+                ),
             );
             await run(db, current.publicationId, stub.carrier);
             expect(backlog).toHaveLength(RETRY_BACKLOG_PER_RUN + 1);
@@ -419,8 +434,8 @@ describe("turn two envelope outcomes", () => {
             const logs: string[] = [];
             const stub = stubCarrier(() =>
                 reply([
-                    { fact_id: current.factIds[0], action: "abstain" },
-                    { fact_id: 9999, action: "new" },
+                    { fact_id: current.factIds[0], check: "Audit fixture.", action: "abstain" },
+                    { fact_id: 9999, check: "Audit fixture.", action: "new" },
                 ]),
             );
             await run(db, current.publicationId, stub.carrier, { log: (line) => logs.push(line) });
@@ -453,7 +468,13 @@ describe("turn two envelope outcomes", () => {
                 profile: PROFILE,
             }),
         ],
-        ["tool-bearing", () => ({ ...reply([{ fact_id: 1, action: "new" }]), toolActivity: true })],
+        [
+            "tool-bearing",
+            () => ({
+                ...reply([{ fact_id: 1, check: "Audit fixture.", action: "new" }]),
+                toolActivity: true,
+            }),
+        ],
         [
             "schema-invalid",
             () => ({ text: '{"verdict":1}', lengthCapped: false, profile: PROFILE }),
@@ -489,8 +510,8 @@ describe("turn two envelope outcomes", () => {
             ]);
             const stub = stubCarrier(() =>
                 reply([
-                    { fact_id: factIds[0], action: "covered" },
-                    { fact_id: factIds[1], action: "new" },
+                    { fact_id: factIds[0], check: "Audit fixture.", action: "covered" },
+                    { fact_id: factIds[1], check: "Audit fixture.", action: "new" },
                 ]),
             );
             await run(db, publicationId, stub.carrier);
@@ -568,6 +589,7 @@ describe("turn two decision matrix", () => {
             ]);
             const covered = (id: number, extra = {}) => ({
                 fact_id: id,
+                check: "Audit fixture.",
                 action: "covered",
                 target_id: memory.id,
                 revision: 1,
@@ -622,7 +644,12 @@ describe("turn two decision matrix", () => {
                 first.publicationId,
                 stubCarrier(() =>
                     reply([
-                        { fact_id: first.factIds[0], action: "conflict", target_id: target.id },
+                        {
+                            fact_id: first.factIds[0],
+                            check: "Audit fixture.",
+                            action: "conflict",
+                            target_id: target.id,
+                        },
                     ]),
                 ).carrier,
             );
@@ -640,7 +667,12 @@ describe("turn two decision matrix", () => {
                 second.publicationId,
                 stubCarrier(() =>
                     reply([
-                        { fact_id: second.factIds[0], action: "conflict", target_id: target.id },
+                        {
+                            fact_id: second.factIds[0],
+                            check: "Audit fixture.",
+                            action: "conflict",
+                            target_id: target.id,
+                        },
                     ]),
                 ).carrier,
                 { autoPromote: false },
@@ -674,9 +706,19 @@ describe("turn two decision matrix", () => {
             const logs: string[] = [];
             const carrier = stubCarrier(() =>
                 reply([
-                    { fact_id: factIds[0], action: "retire", target_id: target.id },
-                    { fact_id: factIds[1], action: "promote_rule", target_id: target.id },
-                    { fact_id: factIds[2], action: "retire" },
+                    {
+                        fact_id: factIds[0],
+                        check: "Audit fixture.",
+                        action: "retire",
+                        target_id: target.id,
+                    },
+                    {
+                        fact_id: factIds[1],
+                        check: "Audit fixture.",
+                        action: "promote_rule",
+                        target_id: target.id,
+                    },
+                    { fact_id: factIds[2], check: "Audit fixture.", action: "retire" },
                 ]),
             );
             await run(db, publicationId, carrier.carrier, { log: (message) => logs.push(message) });
@@ -733,6 +775,7 @@ describe("turn two gated edits", () => {
             ]);
             const edit = (id: number) => ({
                 fact_id: id,
+                check: "Audit fixture.",
                 action: "edit",
                 target_id: memory.id,
                 revision: 1,
@@ -746,7 +789,7 @@ describe("turn two gated edits", () => {
                 reply([
                     edit(current.factIds[0]!),
                     edit(current.factIds[1]!),
-                    { fact_id: current.factIds[2], action: "abstain" },
+                    { fact_id: current.factIds[2], check: "Audit fixture.", action: "abstain" },
                 ]),
             );
             await run(db, current.publicationId, stub.carrier);
@@ -754,7 +797,7 @@ describe("turn two gated edits", () => {
             expect(prompt.split("[42] user: New rule.")).toHaveLength(2);
             expect(prompt.split(`- #${memory.id} rev 1`)).toHaveLength(2);
             expect(prompt.match(/^Source block refs: source:/gm)).toHaveLength(3);
-            expect(prompt).toContain("Cite a source block by its printed start ordinal");
+            expect(prompt).toContain("Source block refs:");
             expect(fact(db, current.factIds[0]!)).toMatchObject({
                 state: "decided_pending",
                 reason: "evidence_or_window",
@@ -789,6 +832,7 @@ describe("turn two gated edits", () => {
                 reply([
                     {
                         fact_id: published.factIds[0],
+                        check: "Audit fixture.",
                         action: "merge",
                         sources: [
                             { id: survivor.id, revision: 1 },
@@ -856,6 +900,7 @@ describe("turn two gated edits", () => {
                     reply([
                         {
                             fact_id: published.factIds[0],
+                            check: "Audit fixture.",
                             action: "merge",
                             sources: [
                                 { id: survivor.id, revision: 1 },
@@ -1061,7 +1106,7 @@ describe("turn two gated edits", () => {
                         factIdsIn(prompt).map((id) =>
                             id === published.factIds[0]
                                 ? { ...decision, fact_id: id }
-                                : { fact_id: id, action: "new" },
+                                : { fact_id: id, check: "Audit fixture.", action: "new" },
                         ),
                         undefined,
                         profile,
@@ -1132,6 +1177,7 @@ describe("turn two gated edits", () => {
                         id === sessionA.factIds[0]
                             ? {
                                   fact_id: id,
+                                  check: "Audit fixture.",
                                   action: "edit",
                                   target_id: memory.id,
                                   revision: 1,
@@ -1148,7 +1194,7 @@ describe("turn two gated edits", () => {
                                   added: [{ text: "New rule. ", block: 42, excerpt: "New rule." }],
                                   final_text: "New rule. Keep rule.",
                               }
-                            : { fact_id: id, action: "abstain" },
+                            : { fact_id: id, check: "Audit fixture.", action: "abstain" },
                     ),
                 ),
             );
@@ -1184,7 +1230,7 @@ describe("turn two narrow checks", () => {
                     factIdsIn(prompt).map((id) =>
                         id === published.factIds[0]
                             ? { ...decision, fact_id: id }
-                            : { fact_id: id, action: "abstain" },
+                            : { fact_id: id, check: "Audit fixture.", action: "abstain" },
                     ),
                 ),
             );
@@ -1237,6 +1283,7 @@ describe("turn two narrow checks", () => {
             ]);
             const decision = {
                 fact_id: published.factIds[0],
+                check: "Audit fixture.",
                 action: "edit",
                 target_id: memory.id,
                 revision: 1,
@@ -1354,7 +1401,13 @@ describe("turn two crash recovery", () => {
         try {
             const crashed = publish(db, [{ content: "Survives the crash" }]);
             const stub = stubCarrier((prompt) =>
-                reply(factIdsIn(prompt).map((id) => ({ fact_id: id, action: "new" }))),
+                reply(
+                    factIdsIn(prompt).map((id) => ({
+                        fact_id: id,
+                        check: "Audit fixture.",
+                        action: "new",
+                    })),
+                ),
             );
             await run(db, publish(db, []).publicationId, stub.carrier);
             await run(db, publish(db, []).publicationId, stub.carrier);
@@ -1389,7 +1442,10 @@ describe("turn two crash recovery", () => {
             });
             const outcomes: TurnTwoReattach[] = [
                 { kind: "unknown" },
-                { kind: "reply", reply: reply([{ fact_id: factIds[0], action: "new" }]) },
+                {
+                    kind: "reply",
+                    reply: reply([{ fact_id: factIds[0], check: "Audit fixture.", action: "new" }]),
+                },
             ];
             const seen: string[] = [];
             let closed = 0;
@@ -1443,7 +1499,7 @@ describe("turn two crash recovery", () => {
                     factIdsIn(prompt).map((id) =>
                         id === published.factIds[0]
                             ? { ...decision, fact_id: id }
-                            : { fact_id: id, action: "new" },
+                            : { fact_id: id, check: "Audit fixture.", action: "new" },
                     ),
                 ),
             );
@@ -1542,7 +1598,13 @@ describe("turn two crash recovery", () => {
                 fact_attempts: MAX_STAGE2_ATTEMPTS,
             });
             const later = stubCarrier((prompt) =>
-                reply(factIdsIn(prompt).map((id) => ({ fact_id: id, action: "new" }))),
+                reply(
+                    factIdsIn(prompt).map((id) => ({
+                        fact_id: id,
+                        check: "Audit fixture.",
+                        action: "new",
+                    })),
+                ),
             );
             await run(db, publish(db, [], "ses-other").publicationId, later.carrier);
             expect(factIdsIn(later.prompts[0]!)).toEqual([factIds[0]!]);
@@ -1610,7 +1672,7 @@ describe("turn two retrieval", () => {
             }));
             expect(semanticPrompt).toContain(`#${lexical.id} rev 1`);
             expect(semanticPrompt).not.toContain(LEXICAL_ONLY_NOTICE);
-            expect(semanticPrompt.match(/^- #\d+ rev/gm)).toHaveLength(12);
+            expect(semanticPrompt.match(/^- #\d+ rev/gm)).toHaveLength(3);
             const noEmbeddings = await prompts(undefined);
             expect(noEmbeddings).toContain(LEXICAL_ONLY_NOTICE);
             const otherModel = await prompts(async () => ({
@@ -1804,7 +1866,13 @@ describe("turn two bounds and isolation", () => {
                 { content: "Third large fact", block: { ordinal: 3, parts: [half] } },
             ]);
             const stub = stubCarrier((prompt) =>
-                reply(factIdsIn(prompt).map((id) => ({ fact_id: id, action: "abstain" }))),
+                reply(
+                    factIdsIn(prompt).map((id) => ({
+                        fact_id: id,
+                        check: "Audit fixture.",
+                        action: "abstain",
+                    })),
+                ),
             );
             await run(db, publicationId, stub.carrier);
             const sent = factIdsIn(stub.prompts[0]!);
@@ -1831,7 +1899,9 @@ describe("turn two bounds and isolation", () => {
             const resolver: TurnTwoRecoveryResolver = () => ({
                 reattach: async () => ({
                     kind: "reply",
-                    reply: reply([{ fact_id: stuck.factIds[0], action: "abstain" }]),
+                    reply: reply([
+                        { fact_id: stuck.factIds[0], check: "Audit fixture.", action: "abstain" },
+                    ]),
                 }),
                 check: passingVerdicts as never,
             });
@@ -1843,7 +1913,11 @@ describe("turn two bounds and isolation", () => {
                     return reply(
                         factIdsIn(prompt)
                             .filter((id) => id !== stuck.factIds[0])
-                            .map((id) => ({ fact_id: id, action: "abstain" })),
+                            .map((id) => ({
+                                fact_id: id,
+                                check: "Audit fixture.",
+                                action: "abstain",
+                            })),
                     );
                 }).carrier;
                 await run(db, fresh.publicationId, carrier, { recover: resolver });

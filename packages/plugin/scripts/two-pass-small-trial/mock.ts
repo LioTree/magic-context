@@ -10,7 +10,8 @@ export function mockCases(ids: number[]): ReplayCase[] {
             seedExamples: "",
             sessionReferences: "",
             projectMemory: "",
-            inputSource: "Messages 1-1:\n\n[1] user: Always serialize DeepSeek requests.",
+            inputSource:
+                "Messages 1-2:\n\n[1] U: Always serialize DeepSeek requests.\n[2] A: Understood.",
             memoryEnabled: true,
         }),
         blocks: [
@@ -20,8 +21,12 @@ export function mockCases(ids: number[]): ReplayCase[] {
                 endOrdinal: 1,
                 parts: ["Always serialize DeepSeek requests."],
             },
+            { role: "assistant", startOrdinal: 2, endOrdinal: 2, parts: ["Understood."] },
         ],
-        lines: [{ ordinal: 1, messageId: `mock-message-${id}` }],
+        lines: [
+            { ordinal: 1, messageId: `mock-message-${id}` },
+            { ordinal: 2, messageId: `mock-ack-${id}` },
+        ],
         memories: [],
         recordedOutput: "",
         inventory: {
@@ -43,12 +48,22 @@ export function mockReply(body: Request) {
     const second = body.messages.length === 4;
     const content = second
         ? JSON.stringify({
-              result: { step: "turn_two", decisions: [{ fact_id: 1, action: "new" }], scores: [] },
+              result: {
+                  step: "turn_two",
+                  decisions: [
+                      {
+                          fact_id: 1,
+                          action: "new",
+                          check: "Stated by the user in message 1.",
+                      },
+                  ],
+                  scores: [],
+              },
           })
         : JSON.stringify({
               result: {
                   step: "turn_one",
-                  xml: '<compartment start="1" end="1" title="DeepSeek pacing" episode_type="decision" importance="60"><p1>Always serialize DeepSeek requests.</p1><p2>Serialize DeepSeek requests.</p2><p3>Serialize requests.</p3><p4>DeepSeek pacing</p4></compartment>\n<facts><CONSTRAINTS>\n* [at_compartment=1 messages=1] Always serialize DeepSeek requests.\n</CONSTRAINTS></facts>\n<unprocessed_from>2</unprocessed_from>',
+                  xml: '<compartment start="1" end="2" title="DeepSeek pacing" episode_type="decision" importance="60"><p1>Always serialize DeepSeek requests.</p1><p2>Serialize DeepSeek requests.</p2><p3>Serialize requests.</p3><p4>DeepSeek pacing</p4></compartment>\n<facts><CONSTRAINTS>\n* [at_compartment=1 messages=1] Always serialize DeepSeek requests.\n</CONSTRAINTS></facts>\n<unprocessed_from>3</unprocessed_from>',
               },
           });
     return {

@@ -570,16 +570,16 @@ forEachHost(import.meta.url, null, (host) => {
                 const beforeProject = db.prepare("SELECT * FROM project_state").all();
                 const beforeMutations = db.prepare("SELECT * FROM m0_mutation_log").all();
                 const decisions = [
-                    { fact_id: facts[0]!.id, action: "new" },
-                    { fact_id: facts[1]!.id, action: "edit", target_id: ids[0], revision: 1,
+                    { fact_id: facts[0]!.id, check: "Audit fixture.", action: "new" },
+                    { fact_id: facts[1]!.id, check: "Audit fixture.", action: "edit", target_id: ids[0], revision: 1,
                         replaced: [{ memory_id: ids[0], clause: 1, block: 2, excerpt: changed[1] }],
                         kept: [{ memory_id: ids[0], clause: 2 }],
                         added: [{ text: "New edit rule. ", block: 2, excerpt: changed[1] }], final_text: changed[1] },
-                    { fact_id: facts[2]!.id, action: "merge", sources: [{ id: ids[1], revision: 1 }, { id: ids[2], revision: 1 }], survivor_id: ids[1],
+                    { fact_id: facts[2]!.id, check: "Audit fixture.", action: "merge", sources: [{ id: ids[1], revision: 1 }, { id: ids[2], revision: 1 }], survivor_id: ids[1],
                         replaced: [{ memory_id: ids[2], clause: 1, block: 3, excerpt: changed[2] }],
                         kept: [{ memory_id: ids[1], clause: 1 }],
                         added: [{ text: "Updated merge rule.", block: 3, excerpt: changed[2] }], final_text: changed[2] },
-                    { fact_id: facts[3]!.id, action: "replaces", target_id: ids[3], revision: 1,
+                    { fact_id: facts[3]!.id, check: "Audit fixture.", action: "replaces", target_id: ids[3], revision: 1,
                         replaced: [{ memory_id: ids[3], clause: 1, block: 4, excerpt: changed[3] }], kept: [],
                         added: [{ text: changed[3], block: 4, excerpt: changed[3] }], final_text: changed[3] },
                 ];

@@ -35,7 +35,8 @@ fn clauses(raw: Option<&Value>, added: bool) -> Option<Vec<Value>> {
 
 fn decision(raw: &Map<String, Value>, fact_id: i64, ordinal: usize) -> Option<Value> {
     let action = raw.get("action")?.as_str()?;
-    let mut out = json!({"factId":fact_id,"ordinal":ordinal,"action":action});
+    let check = raw.get("check")?.as_str()?;
+    let mut out = json!({"factId":fact_id,"ordinal":ordinal,"action":action,"check":check});
     match action {
         "new" | "abstain" => {}
         "conflict" | "retire" | "promote_rule" => {
@@ -182,7 +183,7 @@ mod tests {
     fn historian_wire_equivalence_corpus() {
         let corpus: Vec<Value> =
             serde_json::from_str(include_str!("../testdata/historian-wire-corpus.json")).unwrap();
-        assert_eq!(corpus.len(), 30);
+        assert_eq!(corpus.len(), 33);
         for entry in corpus {
             let parsed = parse_turn_two_envelope(
                 entry["text"].as_str().unwrap(),

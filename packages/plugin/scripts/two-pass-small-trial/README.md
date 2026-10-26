@@ -2,12 +2,43 @@
 
 Run from the repository root with Bun 1.4.2. **No paid call is made by
 preparation or mock mode.** The real corpus must remain in the read-only,
-locally excluded `corpus-readonly/`; do not commit it or move it into internal
-docs. `deepseek.json` pins its manifest and uses the existing hash-checking
+locally excluded `corpus-readonly/`; do not commit it. `deepseek.json` pins its manifest and uses the existing hash-checking
 corpus loader and structural preflight. The command does not enable the
 two-pass historian in any installed plugin or change its model allowlist.
 
 ## Operator command
+
+The editable two-pass prompt sources are `src/hooks/magic-context/two-pass-prompts/`
+under `packages/plugin`: `system.md`, `turn-one.md` and `turn-two.md`. After editing
+them, regenerate the bundled constants and Rust system artifact before rendering:
+
+```sh
+bun packages/plugin/scripts/build-two-pass-prompts.ts
+# Or check that the generated artifacts already match:
+bun packages/plugin/scripts/build-two-pass-prompts.ts --check
+```
+
+`system.md` uses the existing historian marker renderer's combined form. The other
+two files are included without trimming or rewording. The turn-two builder replaces
+only `{{ALLOWED_FACT_IDS}}` with the selected fact IDs. Layout, shared evidence and
+retrieval notices remain structural code, not additional editable instructions.
+
+Read the exact five turn-one requests offline first (no credential access or provider calls):
+
+```sh
+bun packages/plugin/scripts/two-pass-small-trial/run.ts --render \
+  --config packages/plugin/scripts/two-pass-small-trial/deepseek.json
+```
+
+This writes full Markdown transcripts, including the system, all messages and settings,
+to `.cortexkit/internal-docs/investigations/two-pass-small-trial/clean-renders/`.
+It requires `corpus-readonly/raw-messages/{0,8,10,12,35}.json` and their
+`SHA256SUMS`, in addition to the pinned corpus. Each raw export contains `case` and
+`messages` in the case's `lines` order, with `ordinal`, `messageId`, `sessionId`,
+`timeCreated`, `message` (stored OpenCode message JSON), and `parts` (objects with
+`id`, `timeCreated`, `data`, the stored part JSON). Hashes and ordinal/ID bindings
+are checked before the production chunk formatter renders one message per line.
+Missing raw data fails closed; the old merged/truncated input is never split or used as a fallback.
 
 Set `CKCRED_ENROLLMENT_FILE` to the existing enrollment JSON file for the
 `enrolled:mc-e2e` vault identity that has exact read access to `apikey:deepseek`
@@ -20,6 +51,11 @@ bun packages/plugin/scripts/two-pass-small-trial/run.ts --live \
   --config packages/plugin/scripts/two-pass-small-trial/deepseek.json \
   --enrollment "${CKCRED_ENROLLMENT_FILE:?Set to the existing mc-e2e enrollment JSON path}"
 ```
+
+To compare turn-two thinking, add `--turn-two-thinking enabled` or
+`--turn-two-thinking disabled`. The optional config field `turnTwoThinking` accepts
+the same values. Omission retains the trial/production default, disabled; turn one
+always keeps its existing settings. Choose a fresh `outputDir` for each live run.
 
 Only `--live` opens the Darwin-only `macCredentialSource`, then `fetchForRun`
 fetches that grant once. The key stays in this process: no spawn, child
@@ -35,10 +71,12 @@ The command creates (exclusively, mode 0700):
 .cortexkit/internal-docs/investigations/two-pass-small-trial/paid-run-001/
   run.json       # request hashes/sizes, raw responses, usage, latency, ledger
   review.md      # human-readable side-by-side review, claims, totals, failures
+  transcript-case-{0,8,10,12,35}.md # full requests, replies and settings for both turns
 ```
 
-Raw request bodies stay in memory and are never copied into internal docs;
-only provider responses and reviewed claims may quote private content there.
+Full request bodies and replies are now deliberately exported to private internal docs
+for human review. Transcripts are updated before dispatch and after replies, including
+failures; credential material is redacted through the same artifact writer.
 It refuses an existing run directory instead of accidentally repeating a paid
 run or resetting its ledger. Do not remove an interrupted run to resume it:
 unknown outcomes retain their reservations in its artifact. Any subsequent
@@ -53,7 +91,11 @@ and claim counts span 2–32. Sent request sizes include the production system
 and reconstructed enabled turn-one prompt. The enabled production builder
 omits the recorded project-memory block and adds fact anchors instead.
 
-| Case | Recorded bytes | Sent turn-one request bytes | Claims | Reason |
+Historical preparation sizes, before raw-message expansion and the editable prompt
+sources, are retained below. Current exact request sizes and hashes are in the
+`clean-renders/` transcript headers, not this table.
+
+| Case | Recorded bytes | Historical sent turn-one request bytes | Claims | Reason |
 |---|---:|---:|---:|---|
 | 0 | 449,174 | 127,141 | 2 | Fewest claims; near the lower end of sent input size |
 | 8 | 463,912 | 147,199 | 32 | Joint-highest claim count; denser extraction |
@@ -98,23 +140,35 @@ agent routing).
 
 ## Request fidelity and review limits
 
-`turnOne` unwraps the recorded seed, reference and transcript sections, calls
+`loadCases` verifies and formats the full raw source messages, replacing only the
+recorded `<new_messages>` section and its evidence blocks. `turnOne` unwraps the
+recorded seed/reference sections and newly formatted transcript, calls
 the production `buildCompartmentAgentPrompt` with enabled anchored facts and
 no project memory, and appends production `HISTORIAN_FORMAT_INSTRUCTION`.
 It calls `historianSystemPrompt(true)` rather than copying prompt text.
-Requests use non-thinking mode, temperature 0.1, a 32,000-token output ceiling,
+Turn one uses non-thinking mode; turn two optionally enables thinking. Both use temperature 0.1, a 32,000-token output ceiling,
 no tool surface, and no provider SDK/hidden retries.
 
 `turnTwo` uses production validation, ordinary non-emergency tail discard,
 `publishedFacts`, and `commitTurnOnePublication` in a disposable **in-memory**
 store. Seeded memories use recorded IDs/revisions. Production selection and
-lexical retrieval feed `fitTurnTwoPrompt`, shared with production reservation:
+relevance-ranked retrieval (at most three neighbours, no padding) feed `fitTurnTwoPrompt`, shared with production reservation:
 include the coverage notice, defer whole facts rather than truncating them,
 and allow an indivisible first fact alone to exceed the 160,000 UTF-16-unit
 prompt limit. Shared source blocks and neighbouring memories render once,
 with fact-local references. The request includes the same system/user
 messages followed by the verbatim assistant reply and new user prompt. No
-seed/reference/transcript block is regenerated from different source data.
+seed/reference block is regenerated from different source data. Every turn-two
+decision requires a string `check`, retained as audit text in the raw reply,
+Markdown transcript and `run.json`'s per-case `checks` array. Its content does not
+authorize or refuse an action; a missing/non-string field takes the existing
+malformed-decision path.
+
+An anchor accepts up to three comma-separated message ranges. Each range becomes
+one stored source block, with role labels retained when a range mixes speakers.
+A fourth range, any whole-chunk range, or a range that cannot resolve against the
+printed source boundaries yields an unknown anchor. One-pass publication does not
+honour these anchors.
 
 The corpus has no recovered tool-arc metadata, emergency/force-keep state,
 semantic embeddings, prior retryable backlog, or due agent-memory scores;
@@ -149,9 +203,11 @@ uses an in-memory store, and prints offered IDs, original bullet mappings,
 deferred counts, prompt sizes, hashes and exact prefix checks. It refuses
 network access and verifies the recorded turn-one request hashes. Keep the
 private corpus on the Mac; Linux tests use synthetic fixtures instead.
+This historical replay intentionally refuses when the current prompt differs
+from the saved request hash. Use `--render` above to inspect edited prompt sources.
 
-Preparation is local because it reads the staged Mac corpus. It writes only
-metrics and hashes, not a corpus copy, and makes zero provider/vault calls:
+Preparation is local because it reads the staged Mac corpus. `--prepare` writes only
+metrics and hashes; `--render` intentionally writes the full requests. Neither makes provider/vault calls:
 
 ```sh
 bun packages/plugin/scripts/two-pass-small-trial/run.ts --prepare \

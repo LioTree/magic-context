@@ -426,6 +426,7 @@ export interface TurnOneFactAnchor {
     compartmentIndex: number;
     startOrdinal?: number;
     endOrdinal?: number;
+    ranges?: Array<{ startOrdinal: number; endOrdinal: number }>;
 }
 
 export interface TurnOneFact {
@@ -515,27 +516,42 @@ export function resolveTurnOneFactAnchor(
     anchor: TurnOneFactAnchor | undefined,
     compartments: readonly TurnOneCompartmentRange[],
     blocks: ReadonlyArray<{ startOrdinal: number; endOrdinal: number }>,
+    chunk: { startOrdinal?: number; endOrdinal?: number } = {
+        startOrdinal: compartments[0]?.startMessage,
+        endOrdinal: compartments.at(-1)?.endMessage,
+    },
 ): ResolvedFactAnchor | null {
     if (!anchor || anchor.startOrdinal === undefined || anchor.endOrdinal === undefined) {
         return null;
     }
-    const { compartmentIndex, startOrdinal, endOrdinal } = anchor;
+    const { compartmentIndex } = anchor;
+    const ranges = anchor.ranges ?? [
+        { startOrdinal: anchor.startOrdinal, endOrdinal: anchor.endOrdinal },
+    ];
+    if (ranges.length === 0 || ranges.length > 3) return null;
     if (compartmentIndex < 1 || compartmentIndex > compartments.length) return null;
-    if (startOrdinal > endOrdinal) return null;
     const compartment = compartments[compartmentIndex - 1];
-    if (startOrdinal < compartment.startMessage || endOrdinal > compartment.endMessage) {
-        return null;
-    }
     const blockIndexes: number[] = [];
-    blocks.forEach((block, index) => {
-        if (block.startOrdinal >= startOrdinal && block.endOrdinal <= endOrdinal) {
-            blockIndexes.push(index);
+    for (const { startOrdinal, endOrdinal } of ranges) {
+        // A whole-chunk citation cannot distinguish this fact from unrelated evidence.
+        if (startOrdinal === chunk.startOrdinal && endOrdinal === chunk.endOrdinal) return null;
+        if (startOrdinal > endOrdinal) return null;
+        if (startOrdinal < compartment.startMessage || endOrdinal > compartment.endMessage) {
+            return null;
         }
-    });
-    if (blockIndexes.length === 0) return null;
-    const first = blocks[blockIndexes[0]];
-    const last = blocks[blockIndexes[blockIndexes.length - 1]];
-    if (first.startOrdinal !== startOrdinal || last.endOrdinal !== endOrdinal) return null;
+        const rangeIndexes: number[] = [];
+        blocks.forEach((block, index) => {
+            if (block.startOrdinal >= startOrdinal && block.endOrdinal <= endOrdinal) {
+                rangeIndexes.push(index);
+            }
+        });
+        if (rangeIndexes.length === 0) return null;
+        const first = blocks[rangeIndexes[0]];
+        const last = blocks[rangeIndexes[rangeIndexes.length - 1]];
+        if (first.startOrdinal !== startOrdinal || last.endOrdinal !== endOrdinal) return null;
+        blockIndexes.push(...rangeIndexes);
+    }
+    if (new Set(blockIndexes).size !== blockIndexes.length) return null;
     return { compartmentIndex, blockIndexes };
 }
 
@@ -623,11 +639,19 @@ export function commitTurnOnePublication(
     input: TurnOnePublicationInput,
 ): TurnOnePublicationResult {
     const stage = db
-        .prepare("SELECT state FROM memory_stage_attempts WHERE stage_key=?")
-        .get(input.send.stageKey) as { state: string } | null;
+        .prepare("SELECT state,request_json FROM memory_stage_attempts WHERE stage_key=?")
+        .get(input.send.stageKey) as { state: string; request_json: string } | null;
     if (stage?.state === "revoked" || stage?.state === "expired")
         throw new Error("Turn-one send was released before publication");
     const now = Date.now();
+    const request = JSON.parse(stage?.request_json ?? "{}") as {
+        chunkStart?: number;
+        chunkEnd?: number;
+    };
+    const chunkRange =
+        request.chunkStart !== undefined && request.chunkEnd !== undefined
+            ? { startOrdinal: request.chunkStart, endOrdinal: request.chunkEnd }
+            : undefined;
     const committed = db
         .prepare(
             `UPDATE memory_publications
@@ -692,19 +716,23 @@ export function commitTurnOnePublication(
         if (!isPromotableFact(fact)) return;
         // A compartment label cannot authorize evidence from an unpublished tail.
         // Unanchored facts still follow the caller's existing publication policy.
-        const start = fact.anchor?.startOrdinal;
-        const end = fact.anchor?.endOrdinal;
+        const sourceRanges =
+            fact.anchor?.ranges ??
+            (fact.anchor?.startOrdinal !== undefined && fact.anchor?.endOrdinal !== undefined
+                ? [{ startOrdinal: fact.anchor.startOrdinal, endOrdinal: fact.anchor.endOrdinal }]
+                : []);
         if (
             input.honourAnchors &&
-            start !== undefined &&
-            end !== undefined &&
-            (Math.min(start, end) < publishedStart || Math.max(start, end) > publishedEnd)
+            sourceRanges.some(
+                ({ startOrdinal: start, endOrdinal: end }) =>
+                    Math.min(start, end) < publishedStart || Math.max(start, end) > publishedEnd,
+            )
         )
             return;
         const factIndex = fact.factIndex ?? position;
         const resolved =
             input.honourAnchors && bound
-                ? resolveTurnOneFactAnchor(fact.anchor, ranges, input.blocks)
+                ? resolveTurnOneFactAnchor(fact.anchor, ranges, input.blocks, chunkRange)
                 : null;
         const compartmentId = resolved
             ? input.compartments[resolved.compartmentIndex - 1].id
@@ -724,8 +752,27 @@ export function commitTurnOnePublication(
         if (!resolved) return;
         anchoredCandidates += 1;
         const factId = Number(inserted.lastInsertRowid);
-        for (const blockIndex of resolved.blockIndexes) {
-            const block = input.blocks[blockIndex];
+        const groupedBlocks = sourceRanges.map((range) => {
+            const selected = resolved.blockIndexes
+                .map((index) => input.blocks[index])
+                .filter(
+                    (block) =>
+                        block.startOrdinal >= range.startOrdinal &&
+                        block.endOrdinal <= range.endOrdinal,
+                );
+            const role = selected.every((block) => block.role === selected[0].role)
+                ? selected[0].role
+                : "mixed";
+            const parts =
+                role === "mixed"
+                    ? selected.map(
+                          (block) =>
+                              `[${block.startOrdinal === block.endOrdinal ? block.startOrdinal : `${block.startOrdinal}-${block.endOrdinal}`}] ${block.role}: ${block.parts.join(" / ")}`,
+                      )
+                    : selected.flatMap((block) => block.parts);
+            return { ...range, role, parts };
+        });
+        for (const block of groupedBlocks) {
             blocksStored += insertBlock.run(
                 input.send.publicationId,
                 input.sessionId,
