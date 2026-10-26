@@ -1156,6 +1156,7 @@ dependencies = [
  "quote",
  "regex",
  "rusqlite",
+ "semver",
  "serde",
  "serde_jcs",
  "serde_json",

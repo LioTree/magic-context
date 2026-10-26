@@ -114,6 +114,9 @@ async fn gate_probe_default_runner_request_and_meta_digests() {
     // Idle expiry and result protection are metadata, not prompt text. Pin their
     // additions and the producer's attempt identifier so unrelated changes fail.
     const TTL_POLICY_FIELD: &str = ",\"cache_ttl_policy\":{\"value\":\"5m\",\"source\":\"built-in default, frozen for this session\",\"model_key\":null,\"built_in_default\":\"5m\"}";
+    // memory_context is metadata only; the completion and served-byte digests stay fixed.
+    const MEMORY_CONTEXT_FIELD: &str = r#","memory_context":{"domain":null,"members_digest":null,"profile":{"digest":"5750ce5af0712251e4bf8fe599ed3f9edeb6b8477bc49042b74170991cb6fe8d","name":"@cortexkit/memory-swe","parity":true,"resolution":"bundled_default","state":"entorhinal_not_answering","version":"1.0.0"},"project_id":null,"snapshot_digest":null,"stamp":null,"workspace_id":null}"#;
+    assert!(meta_blob.contains(&MEMORY_CONTEXT_FIELD[1..]));
     assert!(meta_blob.contains(&TTL_POLICY_FIELD[1..]));
     assert_ne!(
         meta_digest, BASELINE_META_DIGEST,
@@ -129,8 +132,8 @@ async fn gate_probe_default_runner_request_and_meta_digests() {
     );
     assert_eq!(
         meta_blob.len(),
-        BASELINE_META_BYTES + ATTEMPT_FIELD.len() + TTL_POLICY_FIELD.len() + PROTECTED_POLICY_FIELD.len(),
-        "the blob must grow by exactly the attempt, TTL and protection policy fields and nothing else"
+        BASELINE_META_BYTES + ATTEMPT_FIELD.len() + TTL_POLICY_FIELD.len() + PROTECTED_POLICY_FIELD.len() + MEMORY_CONTEXT_FIELD.len(),
+        "the blob must grow by exactly the attempt, TTL, protection policy and memory-context fields and nothing else"
     );
 }
 
