@@ -37,7 +37,11 @@ import {
     retainedTurnTwoChild,
 } from "./turn-two-children";
 import { coverageNotice, LEXICAL_ONLY_NOTICE } from "./turn-two-envelope";
-import { authorizationFixture } from "./turn-two-test-fixtures.test";
+import {
+    authorizationFixture,
+    VERIFIER_TEST_QUOTE,
+    verifiedTestDecisions,
+} from "./turn-two-test-fixtures.test";
 
 const PROJECT = "git:turn-two";
 const AUTHORIZATION = authorizationFixture(
@@ -64,7 +68,7 @@ function store(): Database {
 interface SeedFact {
     content: string;
     category?: string;
-    /** The fact's source block; omitted for an unknown anchor. */
+    /** The fact's source block; omitted for a default settled fixture block. */
     block?: { ordinal: number; role?: string; parts: string[] };
 }
 
@@ -76,6 +80,10 @@ function publish(
     sessionId = `ses-${++sessionCounter}`,
     projectPath = PROJECT,
 ): { publicationId: string; factIds: number[]; sessionId: string } {
+    facts = facts.map((fact, index) => ({
+        ...fact,
+        block: fact.block ?? { ordinal: index + 1, parts: [] },
+    }));
     const send = allocateTurnOneSend(db, {
         projectPath,
         sessionId,
@@ -93,7 +101,7 @@ function publish(
                       role: fact.block.role ?? "user",
                       startOrdinal: fact.block.ordinal,
                       endOrdinal: fact.block.ordinal,
-                      parts: fact.block.parts,
+                      parts: [...fact.block.parts, VERIFIER_TEST_QUOTE],
                   },
               ]
             : [],
@@ -197,13 +205,152 @@ function reply(
 ): TurnTwoStageReply {
     return {
         text: JSON.stringify({
-            result: { step: "turn_two", decisions, ...(scores ? { scores } : {}) },
+            result: {
+                step: "turn_two",
+                decisions: verifiedTestDecisions(decisions),
+                ...(scores ? { scores } : {}),
+            },
         }),
         lengthCapped: false,
         profile,
         usage: { tokens: 11 },
     };
 }
+
+test("old-shape writes are abstained, counted and logged once per send without crashing", async () => {
+    const db = store();
+    try {
+        const published = publish(db, [
+            { content: "Fact without a verifier quote" },
+            { content: "Another fact without a verifier quote" },
+        ]);
+        const logs: string[] = [];
+        const stub = stubCarrier(() => ({
+            text: JSON.stringify({
+                result: {
+                    step: "turn_two",
+                    decisions: published.factIds.map((fact_id) => ({ fact_id, action: "new" })),
+                },
+            }),
+            profile: PROFILE,
+            lengthCapped: false,
+        }));
+        const result = await run(db, published.publicationId, stub.carrier, {
+            log: (s) => logs.push(s),
+        });
+        expect(result.status).toBe("resolved");
+        expect(result.verifierRefusalCount).toBe(2);
+        const rows = db.prepare("SELECT state,reason FROM memory_pending_facts ORDER BY id").all();
+        expect(rows).toEqual(
+            published.factIds.map(() => ({
+                state: "decided_pending",
+                reason: "evidence_quote_missing",
+            })),
+        );
+        const stage = db
+            .prepare("SELECT reply_json FROM memory_stage_attempts WHERE stage_key=?")
+            .get(result.stageKey!) as { reply_json: string };
+        expect(JSON.parse(stage.reply_json).verifierRefusalCount).toBe(2);
+        expect(JSON.parse(stage.reply_json).verifierRefusals).toEqual(
+            published.factIds.map((factId) => ({ factId, reason: "evidence_quote_missing" })),
+        );
+        expect(logs.filter((s) => s.includes("verifier abstained"))).toHaveLength(1);
+        await run(db, published.publicationId, stub.carrier, { log: (s) => logs.push(s) });
+        expect(logs.filter((s) => s.includes("verifier abstained"))).toHaveLength(1);
+        expect(count(db, "SELECT COUNT(*) AS n FROM memories")).toBe(0);
+    } finally {
+        db.close();
+    }
+});
+
+test("publication refuses every verifier reason before admitting any write", async () => {
+    const db = store();
+    try {
+        const published = publish(
+            db,
+            Array.from({ length: 5 }, () => ({ content: "Settled test rule" })),
+        );
+        const decisions = [
+            { evidence_quote: undefined },
+            { evidence_quote: "tiny" },
+            { evidence_quote: "A quote that exists only in neighbouring memory." },
+            { status: "snapshot" },
+            { reversed_by: "The later source supersedes this statement." },
+        ].map((fields, i) => ({
+            fact_id: published.factIds[i],
+            action: "new",
+            evidence_quote: VERIFIER_TEST_QUOTE,
+            status: "settled",
+            ...fields,
+        }));
+        const logs: string[] = [];
+        const result = await run(
+            db,
+            published.publicationId,
+            stubCarrier(() => ({
+                text: JSON.stringify({ result: { step: "turn_two", decisions } }),
+                profile: PROFILE,
+                lengthCapped: false,
+            })).carrier,
+            { log: (s) => logs.push(s) },
+        );
+        expect(result.verifierRefusalCount).toBe(5);
+        expect(db.prepare("SELECT reason FROM memory_pending_facts ORDER BY id").all()).toEqual(
+            [
+                "evidence_quote_missing",
+                "evidence_quote_short",
+                "evidence_quote_not_in_fact_blocks",
+                "status_not_settled",
+                "reversed_by_present",
+            ].map((reason) => ({ reason })),
+        );
+        expect(count(db, "SELECT COUNT(*) AS n FROM memories")).toBe(0);
+        expect(logs.filter((s) => s.includes("verifier abstained"))).toHaveLength(1);
+    } finally {
+        db.close();
+    }
+});
+
+test("case 10 memory-only imported fact is refused at publication despite new with a memory quote", async () => {
+    const db = store();
+    try {
+        const imported =
+            "Run long compiles in the background because AFT cuts foreground work at 30 minutes.";
+        insertMemory(db, { projectPath: PROJECT, category: "CONSTRAINTS", content: imported });
+        const published = publish(db, [
+            {
+                content: imported,
+                block: {
+                    ordinal: 42,
+                    parts: [
+                        "Measure the reasoning resend costs in Gemini and Pi before deciding policy.",
+                    ],
+                },
+            },
+        ]);
+        await run(
+            db,
+            published.publicationId,
+            stubCarrier(() =>
+                reply([
+                    {
+                        fact_id: published.factIds[0],
+                        action: "new",
+                        evidence_quote: imported,
+                        status: "settled",
+                    },
+                ]),
+            ).carrier,
+        );
+        expect(fact(db, published.factIds[0]!)).toMatchObject({
+            state: "decided_pending",
+            reason: "evidence_quote_not_in_fact_blocks",
+        });
+        expect(count(db, "SELECT COUNT(*) AS n FROM memories")).toBe(1);
+    } finally {
+        db.close();
+    }
+});
 
 function run(
     db: Database,
@@ -257,6 +404,8 @@ function editFixture(db: Database) {
         { content: "New rule replaces the old one", block: { ordinal: 42, parts: ["New rule."] } },
     ]);
     const decision = {
+        evidence_quote: VERIFIER_TEST_QUOTE,
+        status: "settled",
         fact_id: published.factIds[0],
         action: "edit",
         target_id: memory.id,

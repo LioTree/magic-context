@@ -8,9 +8,10 @@
  * | envelope | result: object | — |
  * | result (turn one) | step: "turn_one", xml: string | — |
  * | result (turn two) | step: "turn_two", decisions: decision[] | scores: score[] (default []) |
- * | every decision | fact_id: integer, action: action literal below | — |
+ * | every decision (turn two only) | fact_id: integer, action: action literal below, status: settled/planned/hypothesis/snapshot/one_off | reversed_by: string |
+ * | new, edit, merge, replaces | evidence_quote: string (25+ normalized characters in this fact's own source block) | — |
  * | new, abstain | — | — |
- * | conflict | target_id: integer | — |
+ * | conflict | target_id: integer, evidence_quote: string (same publication fence) | — |
  * | covered | target_id: integer, revision: integer, clauses: nonempty integer[] | excerpt: string |
  * | edit, replaces | target_id: integer, revision: integer, kept: kept[], final_text: string | removed: cited[], replaced: cited[], added: added[] (each default []) |
  * | merge | sources: source[] (at least two), survivor_id: integer, kept: kept[], final_text: string | removed: cited[], replaced: cited[], added: added[] (each default []) |
@@ -27,6 +28,8 @@
  * by the turn-two resolver, which knows the reserved fact set. Unsent scores are
  * discarded by the score recorder. Item refusals do not consume the fact's retry
  * budget; malformed envelopes consume one attempt for every reserved fact.
+ * Old replies without verification fields still parse, but cannot publish: the
+ * turn-two publication fence records a named abstention instead of crashing the send.
  */
 export const HISTORIAN_WIRE_VERSION = 1;
 

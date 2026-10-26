@@ -180,3 +180,40 @@ billing precedence, and redaction. The test
 `cap refusal happens before HTTP dispatch and survives in report` asserts
 that a too-small budget causes no HTTP request; disabling the spend-cap guard
 must make that test fail.
+
+## Turn-two-only verifier replay
+
+`run.ts --replay` rebuilds cases **0, 8, 10, 12, 35** from run 2. Before opening credentials, it checks every rebuilt turn-one request against run 2's recorded SHA256 and byte count, and checks the frozen control's full turn-two request too. It reuses the saved DeepSeek assistant reply verbatim for **both** models. The four arms are Flash/control, Flash/verifier, Sonnet/control, Sonnet/verifier. All arms apply the production mechanical quote fence. Raw model decisions and post-check outcomes are separate in `replay.json`; `review.md` has per-arm totals and per-case/fact tables.
+
+Inputs remain private and uncommitted: `corpus-readonly/`, `paid-run-002/run.json`, and `answer-key-run-002.json` under `.cortexkit/internal-docs/investigations/two-pass-small-trial/`. Output directories must be new. The answer key includes the 18th XML bullet (NAMING) in case 10, but it was not published to turn two; only the original 50 offered facts are scored.
+
+Provider-free preparation on the Mac with the staged private inputs:
+
+```sh
+bun packages/plugin/scripts/two-pass-small-trial/run.ts --replay --dry-run \
+  --output .cortexkit/internal-docs/investigations/two-pass-small-trial/verifier-plan-001
+```
+
+Paid command (Mac only, run by the operator):
+
+```sh
+mkdir -p target/scratch && \
+TMPDIR="$PWD/target/scratch" bun packages/plugin/scripts/two-pass-small-trial/run.ts \
+  --replay --live --enrollment "${CKCRED_ENROLLMENT_FILE:?set the enrolled mc-e2e file}" \
+  --output .cortexkit/internal-docs/investigations/two-pass-small-trial/verifier-paid-001
+```
+
+The two grants are `apikey:deepseek` and `apikey:anthropic:ufukaltinokgmail`. There is no key fallback. Requests are serial; 429 backs off; no-credit stops the whole matrix immediately. Sonnet uses the existing direct Anthropic worker and credential handoff, continuing the saved DeepSeek reply without a new turn-one request. It retains that client's API defaults (no unsupported temperature/thinking overrides). Both providers have an 8192-token output ceiling for this replay, versus run 2's 32000; the control hash is checked before applying this common replay ceiling.
+
+The **$6 shared cap** reserves input UTF-8 bytes plus framing (not a bytes/4 estimate) at peak Flash or Sonnet's higher 5-minute cache-write tariff, and reserves the full output ceiling before each send. The Anthropic child may retry internally, so all three possible attempts are reserved before handoff. Failed/unknown attempts retain their ceilings; successful usage is settled at the same higher prices, with no cache discount. A run can stop before request 20 if usage or retries exhaust the cap. Dry-run output distinguishes an illustrative cost estimate from the sum of worst-case byte ceilings; the former is never used to authorize spending.
+
+Linux provider-free tests use synthetic fixtures (private data stays on the Mac):
+
+```sh
+mkdir -p target/scratch && TMPDIR="$PWD/target/scratch" bun test \
+  packages/plugin/scripts/two-pass-small-trial/replay.test.ts \
+  packages/plugin/scripts/two-pass-small-trial/turn-one-frozen.test.ts \
+  packages/plugin/src/features/magic-context/memory/turn-two-verifier.test.ts
+```
+
+With private inputs staged, `--replay --mock --output <new-private-output-dir>` exercises the same CLI against loopback providers only; never supply `--live` for a mock run. Mock decisions deliberately mix valid writes and refusals and are not model-quality measurements. Scoring reports publication candidates after the mechanical check, not production database writes or additional paid clause checks. Borderline facts are excluded; valid existing-memory coverage is acceptable for keep. Code-only caught wrong accepts are raw write decisions on abstain-key facts that the mechanical fence refused.

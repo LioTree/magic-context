@@ -17,6 +17,8 @@ export function measurementTransport(options: {
     /** An override must be HTTP on 127.0.0.1 without URL credentials; the caller must supply the mock. */
     mockAnthropicEndpoint?: string;
     onProviderAttempt?(providerHost: string): void;
+    /** A saved turn-one reply may be continued without making a new turn-one call. */
+    replayHistory?: ReadonlyArray<{ role: "user" | "assistant"; content: string }>;
 } = {}): MeasurementTransport {
     if (options.mockAnthropicEndpoint) {
         const url = new URL(options.mockAnthropicEndpoint);
@@ -105,7 +107,12 @@ export function measurementTransport(options: {
                             request.messages[0].role !== "user" || request.messages[2].role !== "user" ||
                             request.messages[1].role !== "assistant" || request.messages[1].content !== firstText))
                             throw new Error("measurement_history_not_retained");
-                        if (!first && (request.messages.length !== 1 || request.messages[0].role !== "user"))
+                        if (!first && options.replayHistory &&
+                            (options.replayHistory.length !== 3 ||
+                            options.replayHistory.map((m) => m.role).join() !== "user,assistant,user" ||
+                            JSON.stringify(request.messages) !== JSON.stringify(options.replayHistory)))
+                            throw new Error("measurement_replay_history");
+                        if (!first && !options.replayHistory && (request.messages.length !== 1 || request.messages[0].role !== "user"))
                             throw new Error("measurement_initial_history");
                         busy = true;
                         const id = ++nextId;

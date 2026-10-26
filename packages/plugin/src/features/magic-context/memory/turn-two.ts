@@ -84,6 +84,7 @@ import {
     storeDueExcerpts,
     type TurnTwoExcerptReader,
 } from "./turn-two-scoring";
+import { turnTwoPublicationRefusal } from "./turn-two-verifier";
 import type { MemoryCategory } from "./types";
 
 export const TURN_TWO_STAGE = "turn_two";
@@ -124,6 +125,9 @@ export interface TurnTwoStageReply {
     usage?: unknown;
     /** Any tool call or result invalidates the send, even beside valid text. */
     toolActivity?: boolean;
+    /** Mechanical abstentions, recorded once for the whole send, including recovery. */
+    verifierRefusals?: Array<{ factId: number; reason: string }>;
+    verifierRefusalCount?: number;
 }
 
 /**
@@ -251,6 +255,7 @@ export interface TurnTwoRunResult {
     status: "skipped" | "nothing_to_send" | "resolved" | "in_flight" | "failed";
     reason?: string;
     stageKey?: string;
+    verifierRefusalCount?: number;
     /**
      * True while a fact reserved by this run's stage is still `in_flight`; the caller
      * must then leave turn one's child session open.
@@ -831,6 +836,24 @@ async function resolveStage(
     }
     if (envelope.extraFactIds.length > 0)
         context.log?.(`turn two: ignored extra fact ids: ${envelope.extraFactIds.join(", ")}`);
+    if (reply.verifierRefusals === undefined) {
+        const refusals: Array<{ factId: number; reason: string }> = [];
+        for (const factId of Object.keys(request.factAttempts).map(Number)) {
+            const decision = envelope.decisions.get(factId);
+            if (!decision || decision === "malformed") continue;
+            const reason = turnTwoPublicationRefusal(decision, factBlocks(db, factId));
+            if (reason) refusals.push({ factId, reason });
+        }
+        // Persist before logging so recovery cannot log a send's refusals twice.
+        db.prepare(
+            "UPDATE memory_stage_attempts SET reply_json=json_set(reply_json,'$.verifierRefusals',json(?),'$.verifierRefusalCount',?) WHERE stage_key=?",
+        ).run(JSON.stringify(refusals), refusals.length, stageKey);
+        if (refusals.length > 0) {
+            const message = `[memory] turn two verifier abstained ${refusals.length}: ${refusals.map((r) => `fact ${r.factId} ${r.reason}`).join(", ")}`;
+            if (context.log) context.log(message);
+            else sessionLog(context.owner.sessionId, message);
+        }
+    }
     const facts = db
         .prepare(
             "SELECT id,project_path,publication_id,category,content,anchor_known,fact_attempts,reserved_stage_key AS stageKey FROM memory_pending_facts WHERE state='in_flight' AND reserved_stage_key=? ORDER BY id",
@@ -949,6 +972,8 @@ async function resolveFact(
             decision === undefined ? "missing_decision" : "malformed_decision",
         );
     const key = turnTwoDecisionKey(fact.project_path, fact.id, attempts, decision, stageKey);
+    const refusal = turnTwoPublicationRefusal(decision, factBlocks(db, fact.id));
+    if (refusal) return pending(db, fact, key, refusal);
     const sourceSessionId = publicationSession(db, fact.publication_id);
     const input = {
         projectPath: fact.project_path,
@@ -1430,9 +1455,15 @@ export async function runTurnTwo(db: Database, input: TurnTwoRunInput): Promise<
         log: input.log,
     });
     const inFlight = !done || stillReserved(db, reserved.stageKey) > 0;
+    const outcome = db
+        .prepare(
+            "SELECT json_extract(reply_json,'$.verifierRefusalCount') AS refused FROM memory_stage_attempts WHERE stage_key=?",
+        )
+        .get(reserved.stageKey) as { refused: number | null };
     return {
         status: inFlight ? "in_flight" : "resolved",
         stageKey: reserved.stageKey,
         childInFlight: inFlight,
+        ...(outcome.refused ? { verifierRefusalCount: outcome.refused } : {}),
     };
 }
