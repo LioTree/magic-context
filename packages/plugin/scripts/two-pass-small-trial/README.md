@@ -40,6 +40,23 @@ It requires `corpus-readonly/raw-messages/{0,8,10,12,35}.json` and their
 are checked before the production chunk formatter renders one message per line.
 Missing raw data fails closed; the old merged/truncated input is never split or used as a fallback.
 
+The two-pass reader keeps one body per displayed message. Filtered ordinals widen
+the nearest preceding displayed range; leading filtered rows widen the first range.
+The header must match the first start and last end. Raw-input preparation checks
+that these displayed ranges cover the expected ordinals from the corpus line metadata
+exactly once, before credentials can be opened or a request sent.
+
+`--render` also exports `ordinal-coverage.json`: expected ordinals from the corpus
+line metadata, ranges/header parsed from the actual requests, and request hashes.
+It contains no conversation text. The same deterministic predicate can check all
+five real cases on Linux without copying their private dialogue there:
+
+```sh
+TWO_PASS_COVERAGE_PROJECTION=path/to/ordinal-coverage.json \
+  bun test packages/plugin/scripts/two-pass-small-trial/ordinal-coverage.test.ts \
+  --test-name-pattern '^all five real rendered inputs have exact ordinal coverage$'
+```
+
 Set `CKCRED_ENROLLMENT_FILE` to the existing enrollment JSON file for the
 `enrolled:mc-e2e` vault identity that has exact read access to `apikey:deepseek`
 (the one containing `token`, not an API-key file). The key's exact grant is
@@ -52,10 +69,12 @@ bun packages/plugin/scripts/two-pass-small-trial/run.ts --live \
   --enrollment "${CKCRED_ENROLLMENT_FILE:?Set to the existing mc-e2e enrollment JSON path}"
 ```
 
-To compare turn-two thinking, add `--turn-two-thinking enabled` or
-`--turn-two-thinking disabled`. The optional config field `turnTwoThinking` accepts
-the same values. Omission retains the trial/production default, disabled; turn one
-always keeps its existing settings. Choose a fresh `outputDir` for each live run.
+Use `--turn-one-thinking enabled|disabled` and `--turn-two-thinking enabled|disabled`
+to control the trial turns independently. Their optional config fields are
+`turnOneThinking` and `turnTwoThinking`. Both default to disabled; omission and an
+explicit disabled setting produce identical requests. To measure thinking on both
+turns, set both switches to enabled. These settings do not change one-pass production
+settings. Choose a fresh `outputDir` for each live run.
 
 Only `--live` opens the Darwin-only `macCredentialSource`, then `fetchForRun`
 fetches that grant once. The key stays in this process: no spawn, child

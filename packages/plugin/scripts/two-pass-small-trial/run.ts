@@ -10,6 +10,7 @@ import {
     readCorpus,
 } from "../two-pass-live-replay/artifact-schema";
 import { readRawInput } from "./input";
+import { projectOrdinalCoverage } from "./ordinal-coverage";
 import { decisionChecks, memoryDrafts, requestHash, turnOne, turnTwo } from "./prompts";
 import { DeepSeek, Ledger, logger, type Prices, sanitizer } from "./provider";
 import { DOCS, type RunResult, report } from "./report";
@@ -27,11 +28,13 @@ export interface Config {
     maxSpendUSD: number;
     peakUSDPerMillion: Prices;
     outputDir: string;
+    turnOneThinking?: "disabled" | "enabled";
     turnTwoThinking?: "disabled" | "enabled";
 }
 export function validateConfig(c: Config) {
     if (
         c.version !== 1 ||
+        (c.turnOneThinking !== undefined && !["disabled", "enabled"].includes(c.turnOneThinking)) ||
         (c.turnTwoThinking !== undefined && !["disabled", "enabled"].includes(c.turnTwoThinking)) ||
         c.repeats !== 1 ||
         c.caseIds?.length !== 5 ||
@@ -69,7 +72,11 @@ export function loadCases(c: Config) {
         }),
     };
 }
-export function selectionReport(cases: ReplayCase[], selected: ReplayCase[]) {
+export function selectionReport(
+    cases: ReplayCase[],
+    selected: ReplayCase[],
+    thinking?: Config["turnOneThinking"],
+) {
     const sizes = cases.map((c) => Buffer.byteLength(c.userPrompt)).sort((a, b) => a - b);
     const claims = cases.map((c) => c.inventory.value.length).sort((a, b) => a - b);
     const reasons: Record<number, string> = {
@@ -89,7 +96,7 @@ export function selectionReport(cases: ReplayCase[], selected: ReplayCase[]) {
         "| Case | Recorded UTF-8 bytes | Sent turn-one request UTF-8 bytes | Reviewed claims | Reason | Request SHA256 |",
         "|---|---|---|---|---|---|",
         ...selected.map((c) => {
-            const request = turnOne(c);
+            const request = turnOne(c, thinking);
             return `| ${c.id} | ${Buffer.byteLength(c.userPrompt)} | ${Buffer.byteLength(JSON.stringify(request))} | ${c.inventory.value.length} | ${reasons[c.id] ?? "Input-size/claim-count spread"} | ${requestHash(request)} |`;
         }),
         "",
@@ -101,7 +108,7 @@ export function selectionReport(cases: ReplayCase[], selected: ReplayCase[]) {
         "|---|---|---|---|",
         ...cases.map(
             (c) =>
-                `| ${c.id} | ${Buffer.byteLength(c.userPrompt)} | ${Buffer.byteLength(JSON.stringify(turnOne(c)))} | ${c.inventory.value.length} |`,
+                `| ${c.id} | ${Buffer.byteLength(c.userPrompt)} | ${Buffer.byteLength(JSON.stringify(turnOne(c, thinking)))} | ${c.inventory.value.length} |`,
         ),
         "",
     ].join("\n");
@@ -194,7 +201,10 @@ export async function runTrial(input: {
     save();
     try {
         for (const c of input.cases) {
-            const record = { caseId: c.id, firstRequest: turnOne(c) } as RunResult["cases"][number];
+            const record = {
+                caseId: c.id,
+                firstRequest: turnOne(c, input.config.turnOneThinking),
+            } as RunResult["cases"][number];
             result.cases.push(record);
             save();
             try {
@@ -257,6 +267,12 @@ async function main() {
         throw new Error("usage_choose_prepare_render_mock_or_live_and_config");
     const config = JSON.parse(readFileSync(option("--config"), "utf8")) as Config;
     validateConfig(config);
+    if (args.includes("--turn-one-thinking")) {
+        const thinking = option("--turn-one-thinking");
+        if (thinking !== "enabled" && thinking !== "disabled")
+            throw new Error("invalid_trial_config");
+        config.turnOneThinking = thinking;
+    }
     if (args.includes("--turn-two-thinking")) {
         config.turnTwoThinking = option("--turn-two-thinking") as Config["turnTwoThinking"];
         validateConfig(config);
@@ -282,21 +298,41 @@ async function main() {
     if (args.includes("--render")) {
         const dir = ".cortexkit/internal-docs/investigations/two-pass-small-trial/clean-renders";
         mkdirSync(dir, { recursive: true, mode: 0o700 });
-        for (const c of selected)
+        const coverage = [];
+        for (const c of selected) {
+            const firstRequest = turnOne(c, config.turnOneThinking);
             writeFileSync(
                 resolve(dir, `transcript-case-${c.id}.md`),
-                transcript({ caseId: c.id, firstRequest: turnOne(c) }),
+                transcript({ caseId: c.id, firstRequest }),
                 { mode: 0o600 },
             );
+            const original = corpus.cases.find((item) => item.id === c.id);
+            if (!original) throw new Error("missing_case");
+            coverage.push({
+                ...projectOrdinalCoverage(
+                    c.id,
+                    original.lines.map((line) => line.ordinal),
+                    firstRequest.messages[1].content,
+                ),
+                requestSHA256: requestHash(firstRequest),
+            });
+        }
+        writeFileSync(resolve(dir, "ordinal-coverage.json"), JSON.stringify(coverage, null, 2), {
+            mode: 0o600,
+        });
         console.log(`rendered cases=${selected.map((c) => c.id).join(",")} providerCalls=0`);
         return;
     }
     if (args.includes("--prepare")) {
         const dir = ".cortexkit/internal-docs/investigations/two-pass-small-trial";
         mkdirSync(dir, { recursive: true, mode: 0o700 });
-        writeFileSync(resolve(dir, "preparation.md"), selectionReport(corpus.cases, selected), {
-            mode: 0o600,
-        });
+        writeFileSync(
+            resolve(dir, "preparation.md"),
+            selectionReport(corpus.cases, selected, config.turnOneThinking),
+            {
+                mode: 0o600,
+            },
+        );
         logger("", (text) => process.stdout.write(text))(
             `prepared cases=${selected.map((c) => c.id).join(",")} corpusCases=${corpus.cases.length} providerCalls=0`,
         );
@@ -305,7 +341,9 @@ async function main() {
     if (process.platform !== "darwin") throw new Error("credential_broker_trusted_host_required");
     if (!args.includes("--enrollment")) throw new Error("credential_enrollment_path_required");
     // Validate and build all first requests before opening the vault or spending anything.
-    selected.forEach(turnOne);
+    selected.forEach((c) => {
+        turnOne(c, config.turnOneThinking);
+    });
     const source = await macCredentialSource(option("--enrollment"));
     let material = "";
     try {

@@ -16,4 +16,4 @@ allowed_fact_ids: {{ALLOWED_FACT_IDS}}
    - `conflict`: it contradicts a neighbour, and the chunk doesn't settle which is right.
    - `new`: no neighbour covers it.
 4. Write `check` before `action`. Example: `"check": "A proposes it at [410-412]; U accepts at [415]. Not built in this chunk; the text starts with Decided:. Passes."`
-5. In `removed`, `replaced` and `added`, cite only a source block of that fact, by its printed start ordinal, with an exact excerpt. Only that fact's neighbours are eligible targets.
+5. In `removed`, `replaced` and `added`, `block` is the start ordinal printed on one of that fact's source blocks, and `excerpt` is exact text from that block. Only that fact's neighbours are eligible targets.

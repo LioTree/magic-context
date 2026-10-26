@@ -47,7 +47,10 @@ export function request(messages: Request["messages"]): Request {
         stream: false,
     };
 }
-export function turnOne(c: ReplayCase): Request {
+export function turnOne(
+    c: ReplayCase,
+    thinking: Request["thinking"]["type"] = "disabled",
+): Request {
     const transcript = section(c.userPrompt, "new_messages", true);
     // Remove only the builder's separators, not whitespace in the recorded transcript itself.
     const inputSource = transcript.slice(
@@ -64,10 +67,12 @@ export function turnOne(c: ReplayCase): Request {
         memoryEnabled: true,
         anchoredFacts: true,
     });
-    return request([
+    const first = request([
         { role: "system", content: historianSystemPrompt(true) },
         { role: "user", content: `${user}\n\n${HISTORIAN_FORMAT_INSTRUCTION}` },
     ]);
+    first.thinking = { type: thinking };
+    return first;
 }
 
 export interface MemoryDraft {

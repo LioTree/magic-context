@@ -4,7 +4,7 @@ import { join, resolve } from "node:path";
 import { macCredentialSource } from "../two-pass-activation-runs/container-launcher";
 import configJSON from "./deepseek.json";
 import { mockCases, mockReply, mockServer } from "./mock";
-import { memoryDrafts, turnOne, turnTwo } from "./prompts";
+import { memoryDrafts, request, turnOne, turnTwo } from "./prompts";
 import { cost, DeepSeek, Ledger, logger, parseUsage, retryDelay, sanitizer } from "./provider";
 import { mechanicalClaim } from "./report";
 import { type Config, runTrial, validateConfig } from "./run";
@@ -108,9 +108,14 @@ describe("direct DeepSeek small trial", () => {
             tmp.close();
         }
     });
-    test("turn-two thinking is trial-configurable without changing turn one or conversation bytes", async () => {
+    test("thinking is independently trial-configurable per turn with disabled defaults", async () => {
         const c = fixtures[0];
         const first = turnOne(c);
+        const firstEnabled = turnOne(c, "enabled");
+        expect(first).toEqual(turnOne(c, "disabled"));
+        expect(JSON.stringify(first)).toBe(JSON.stringify(request(first.messages)));
+        expect(firstEnabled.thinking).toEqual({ type: "enabled" });
+        expect({ ...firstEnabled, thinking: first.thinking }).toEqual(first);
         const reply = mockReply(first).choices[0].message.content;
         const production = await turnTwo(c, first, reply);
         const thinking = await turnTwo(c, first, reply, "enabled");
@@ -118,9 +123,39 @@ describe("direct DeepSeek small trial", () => {
         expect(production.request.thinking).toEqual({ type: "disabled" });
         expect(thinking.request.thinking).toEqual({ type: "enabled" });
         expect(thinking.request.messages).toEqual(production.request.messages);
+        const both = await turnTwo(c, firstEnabled, reply, "enabled");
+        expect(both.request.thinking).toEqual({ type: "enabled" });
+        expect(both.request.messages.slice(0, 2)).toEqual(firstEnabled.messages);
         expect(() => validateConfig({ ...config, turnTwoThinking: "other" as "enabled" })).toThrow(
             "invalid_trial_config",
         );
+        expect(() => validateConfig({ ...config, turnOneThinking: "other" as "enabled" })).toThrow(
+            "invalid_trial_config",
+        );
+    });
+    test("runner applies turn-one thinking without implicitly enabling turn two", async () => {
+        const tmp = scratch(),
+            server = mockServer();
+        try {
+            const result = await runTrial({
+                config: { ...config, turnOneThinking: "enabled" },
+                cases: fixtures,
+                material: "mock-key",
+                mode: "mock",
+                outputDir: tmp.dir,
+                mockEndpoint: server.url,
+                emit() {},
+            });
+            expect(result.failure).toBeUndefined();
+            expect(server.requests).toHaveLength(10);
+            for (let index = 0; index < server.requests.length; index++)
+                expect(server.requests[index].thinking).toEqual({
+                    type: index % 2 === 0 ? "enabled" : "disabled",
+                });
+        } finally {
+            server.stop();
+            tmp.close();
+        }
     });
     test("cap refusal happens before HTTP dispatch and survives in report", async () => {
         const tmp = scratch(),

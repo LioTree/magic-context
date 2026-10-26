@@ -1337,6 +1337,12 @@ export function readSessionChunk(
     }
 
     function recordFilteredNoise(meta: SessionChunkLine): void {
+        if (options.singleMessageLines && currentBlock) {
+            // Keep hidden ordinals on the preceding visible line before its range is formatted.
+            currentBlock.endOrdinal = meta.ordinal;
+            currentBlock.meta.push(meta);
+            return;
+        }
         pendingNoiseMeta.push(meta);
         if (!currentBlock) {
             highestScannedOrdinal = Math.max(highestScannedOrdinal, meta.ordinal);
@@ -1424,8 +1430,6 @@ export function readSessionChunk(
 
         const meta = { ordinal: msg.ordinal, messageId: msg.id };
         if (isHostUnservedRow(msg)) markHostUnservedRow(meta);
-        // Fact anchors need message boundaries, not a range merging unrelated claims.
-        if (options.singleMessageLines && !flushCurrentBlock()) break;
 
         // Skip user messages that are pure system notifications (background task
         // completions, internal initiator markers, system directives). These carry
@@ -1445,7 +1449,7 @@ export function readSessionChunk(
             // preceding assistant block (same "A" role since tool results follow
             // assistant tool-use messages in the compacted flow).
             const tcText = tcSummaries.join(" / ");
-            if (currentBlock && currentBlock.role === "A") {
+            if (!options.singleMessageLines && currentBlock && currentBlock.role === "A") {
                 currentBlock.endOrdinal = msg.ordinal;
                 currentBlock.parts.push(tcText);
                 currentBlock.partMeta.push({
@@ -1460,9 +1464,7 @@ export function readSessionChunk(
                 if (!flushCurrentBlock()) break;
                 currentBlock = {
                     role: "A",
-                    startOrdinal: options.singleMessageLines
-                        ? msg.ordinal
-                        : (pendingNoiseMeta[0]?.ordinal ?? msg.ordinal),
+                    startOrdinal: pendingNoiseMeta[0]?.ordinal ?? msg.ordinal,
                     endOrdinal: msg.ordinal,
                     parts: [tcText],
                     partMeta: [
@@ -1526,7 +1528,7 @@ export function readSessionChunk(
         // meaningful text (the no-text user branch returned above).
         const msgHasNarrative = textParts.length > 0;
 
-        if (currentBlock && currentBlock.role === role) {
+        if (!options.singleMessageLines && currentBlock && currentBlock.role === role) {
             currentBlock.endOrdinal = msg.ordinal;
             currentBlock.parts.push(text);
             currentBlock.partMeta.push({
@@ -1550,9 +1552,7 @@ export function readSessionChunk(
 
         currentBlock = {
             role,
-            startOrdinal: options.singleMessageLines
-                ? msg.ordinal
-                : (pendingNoiseMeta[0]?.ordinal ?? msg.ordinal),
+            startOrdinal: pendingNoiseMeta[0]?.ordinal ?? msg.ordinal,
             endOrdinal: msg.ordinal,
             parts: [text],
             partMeta: [

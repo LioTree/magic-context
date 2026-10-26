@@ -7,6 +7,7 @@ import {
 } from "../../src/hooks/magic-context/read-session-chunk";
 import type { RawMessage } from "../../src/hooks/magic-context/read-session-raw";
 import type { ReplayCase } from "../two-pass-live-replay/artifact-schema";
+import { assertOrdinalCoverage, projectOrdinalCoverage } from "./ordinal-coverage";
 
 export interface RawExport {
     case: number;
@@ -54,6 +55,13 @@ export function withRawInput(c: ReplayCase, raw: RawExport): ReplayCase {
             }),
     );
     const newMessages = `<new_messages>\n\nMessages ${chunk.startIndex}-${chunk.endIndex}:\n\n${chunk.text}\n\n</new_messages>`;
+    assertOrdinalCoverage(
+        projectOrdinalCoverage(
+            c.id,
+            c.lines.map((line) => line.ordinal),
+            newMessages,
+        ),
+    );
     return {
         ...c,
         userPrompt: c.userPrompt.replace(

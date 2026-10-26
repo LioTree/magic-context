@@ -401,7 +401,7 @@ Every fact is a candidate memory. A stored memory is shown to the primary agent 
 1. **It is stated in `<new_messages>`.** Never copy a fact from `<session_references>`, from earlier summaries or from the calibration examples, even when it is still true.
 2. **The user decides; the agent reports.** A `U:` line that sets a rule or accepts a proposal is a decision. An `A:` line is the primary agent at work: its proposals, plans, recommendations, intentions and "I'd do X" are not decisions until a later `U:` line accepts them. Another agent or worker agreeing is not the user deciding. What the agent verified in this chunk (measured, read in the code, or proved by a test), how an external system confirmed it behaves, and work the agent finished in this chunk (merged, released or placed) describe how things are, so they can be facts.
 3. **A later line wins.** If a later line in the chunk corrects, reverses, measures or replaces an earlier statement, only the later version can be a fact. Read to the end of the chunk before you write a fact.
-4. **An accepted decision that isn't built is written as a decision.** Start it with `Decided:` and say what was decided. Never describe unbuilt behaviour as if it already works.
+4. **An accepted decision that isn't built is written as a decision.** Start it with `Decided:` and say what was decided. Never describe unbuilt behaviour as if it already works. This holds in every category: a chosen setting that doesn't exist yet is written `Decided: retry backoff: 30 s`, not `retry backoff: 30 s`.
 5. **These are not facts:**
    - hypotheses, guesses, and anything still being measured;
    - open questions, and proposals nobody accepted;
@@ -725,8 +725,8 @@ One decision per `fact_id`. Actions: `new`, `covered`, `conflict`, `edit`, `merg
 - `covered` requires integer `target_id`, integer `revision` and a nonempty `clauses` array of integer clause indices; string `excerpt` is optional.
 - `edit` and `replaces` require integer `target_id`, integer `revision`, arrays `kept` and string `final_text`; arrays `removed`, `replaced` and `added` are optional (absent means empty).
 - `merge` requires `sources` (at least two objects with integer `id` and `revision`), integer `survivor_id`, arrays `kept` and string `final_text`; arrays `removed`, `replaced` and `added` are optional (absent means empty).
-- Each `removed` or `replaced` entry requires integer `memory_id`, integer `clause`, integer `block`, and string `excerpt`. Each `kept` entry requires integer `memory_id` and integer `clause`. Each `added` entry requires string `text`, integer `block`, and string `excerpt`.
-- Every removed, replaced and added clause cites a block start ordinal of that fact's own blocks and an exact excerpt.
+- Each `kept` entry is an object with integer `memory_id` and integer `clause`, for example `{"memory_id": 812, "clause": 1}`. Each `removed` or `replaced` entry adds integer `block` and string `excerpt` to those two. Each `added` entry has string `text`, integer `block` and string `excerpt`.
+- `memory_id` and `clause` name a neighbour memory and its clause number (`c1` is clause 1). `block` is the start ordinal printed at the beginning of one of this fact's source blocks (the `N` in `[N]` or `[N-M]`), never a memory's number. `excerpt` is exact text from that source block that justifies the change.
 - `scores` is optional; absent means empty. Each score requires integer `item`, integer `importance` from 1 to 100, and `class`, a free nonempty string of at most 64 characters proposing a decay class. There is no decay-class taxonomy.
 
 ### Turn-one XML document
