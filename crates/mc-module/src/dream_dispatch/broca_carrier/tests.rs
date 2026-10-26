@@ -1503,6 +1503,34 @@ fn broca_goldens_match_their_pinned_checksums() {
     assert!(describe.declares(caps::INPUT_TOKEN_CAP));
 }
 
+/// Broca 0.7 admission: the two new groups change nothing the dreamer
+/// negotiates. Both captures decode and negotiate the same retention, token
+/// cap and cancel point for the same request.
+#[test]
+fn broca_0_7_describe_negotiates_the_dream_child_unchanged() {
+    let load = |name: &str| {
+        let path = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("testdata")
+            .join("broca-0.7")
+            .join(name);
+        let reply: Value = serde_json::from_slice(&std::fs::read(&path).expect("read fixture"))
+            .unwrap_or_else(|error| panic!("{name}: {error}"));
+        let answer = crate::session_resolver::read_runner_reply(reply).expect("envelope");
+        check_describe(&answer).unwrap_or_else(|problems| panic!("{name}: {problems:?}"))
+    };
+    let before = load("role.describe.before.json");
+    let after = load("role.describe.after.json");
+    let fixture = Fixture::new(&[]);
+    let carrier = fixture.carrier(policy());
+    let request = fixture.request(&["ctx_memory"], 3);
+    let negotiated = |describe: &RoleDescribe| {
+        carrier
+            .negotiate(describe, &request, Some(100))
+            .unwrap_or_else(|error| panic!("{error:?}"))
+    };
+    assert_eq!(negotiated(&before), negotiated(&after));
+}
+
 #[tokio::test]
 async fn broca_child_golden_runner_stops_at_exactly_the_cap() {
     let f = Fixture::golden();

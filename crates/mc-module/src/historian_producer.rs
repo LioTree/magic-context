@@ -4654,6 +4654,44 @@ pub(crate) mod tests {
         producer.close().await;
     }
 
+    /// The summarizer's retention read keeps the 0.7 describe: the two new
+    /// groups change neither the retained lifetime nor the limit and follow
+    /// decisions built from the same answer.
+    #[test]
+    fn broca_0_7_describe_keeps_summarizer_retention_and_limits() {
+        let load = |name: &str| {
+            let path = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+                .join("testdata")
+                .join("broca-0.7")
+                .join(name);
+            let reply: Value = serde_json::from_slice(&std::fs::read(&path).expect("read fixture"))
+                .unwrap_or_else(|error| panic!("{name}: {error}"));
+            crate::session_resolver::read_runner_reply(reply).expect("envelope")
+        };
+        let before = load("role.describe.before.json");
+        let after = load("role.describe.after.json");
+        assert_eq!(
+            retention_from_role_describe(&before),
+            retention_from_role_describe(&after)
+        );
+        assert!(matches!(
+            retention_from_role_describe(&after),
+            crate::child_retention::ChildRetention::Seconds(_)
+        ));
+        assert_eq!(
+            crate::runner_limits::RunnerLimits::from_describe(&before),
+            crate::runner_limits::RunnerLimits::from_describe(&after)
+        );
+        assert_eq!(
+            crate::runner_follow::FollowCapabilities::from_describe(&before).missing(),
+            None
+        );
+        assert_eq!(
+            crate::runner_follow::FollowCapabilities::from_describe(&after).missing(),
+            None
+        );
+    }
+
     #[tokio::test]
     async fn bare_run_status_and_result_replies_are_refused_by_name() {
         let server = fake_server(json!({"state":"active","run_id":"run-1"}), vec![]).await;

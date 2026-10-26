@@ -1,0 +1,1 @@
+{"kind":"control","cursor":{"wal_seq":5,"sub_index":0},"unit":{"type":"message_boundary","mid":"m1"},"seq":9,"event":{"type":"tool_started","mid":"m1","tool_call_id":"approved-call","name":"work","arguments":"{}","started_at":502,"call_key":"8fc1fdb7-1e03-4f62-a690-6bcfe91075b6:5"}}

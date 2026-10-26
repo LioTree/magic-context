@@ -1478,6 +1478,41 @@ mod tests {
         assert!(decoded.delivery_refusals.lists.is_empty());
     }
 
+    /// Reminder-mode reset on describe change: the stored raw describe is
+    /// compared whole, so the two new 0.7 groups clear remembered refusals
+    /// while the descriptor itself still decodes and still promises delivery.
+    #[test]
+    fn broca_0_7_describe_change_resets_reminder_refusals() {
+        use cortexkit_role_llm_runner::describe::check_describe;
+        let before: Value = serde_json::from_slice(include_bytes!(
+            "../testdata/broca-0.7/role.describe.before.json"
+        ))
+        .unwrap();
+        let after: Value = serde_json::from_slice(include_bytes!(
+            "../testdata/broca-0.7/role.describe.after.json"
+        ))
+        .unwrap();
+        let before_answer =
+            crate::session_resolver::read_runner_reply(before).expect("before envelope");
+        let after_answer =
+            crate::session_resolver::read_runner_reply(after).expect("after envelope");
+        for answer in [&before_answer, &after_answer] {
+            let describe = check_describe(answer).unwrap_or_else(|problems| panic!("{problems:?}"));
+            assert!(describe.declares("delivery_order"));
+        }
+        let mut refusals = DeliveryRefusals::default();
+        refusals.use_description(&before_answer);
+        refusals.record(&[Mode::ToolResult]);
+        assert!(refusals.contains(&[Mode::ToolResult]));
+        // The same describe keeps remembered refusals.
+        refusals.use_description(&before_answer);
+        assert!(refusals.contains(&[Mode::ToolResult]));
+        // The 0.7 describe differs only by additive groups, yet the whole
+        // stored description changed, so the mode lists are cleared.
+        refusals.use_description(&after_answer);
+        assert!(!refusals.contains(&[Mode::ToolResult]));
+    }
+
     #[tokio::test]
     async fn fake_runner_requires_dedupe_per_kind() {
         let sends = sends().await;
