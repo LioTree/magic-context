@@ -452,7 +452,11 @@ fn missing_category_snapshot_never_guesses_placement() {
     legacy.as_object_mut().unwrap().remove("category_ids");
     set_pin(&store, legacy);
     admit(&store, "old-pin", "known naming category", 10);
-    assert!(events.lock().unwrap().is_empty());
+    let events = events.lock().unwrap();
+    assert_eq!(events.len(), 1);
+    assert!(events[0].owner.is_none());
+    assert!(events[0].origin_profile.is_none());
+    assert!(events[0].snapshot_digest.is_none());
     store
         .context_read(|conn| {
             assert_eq!(counts(conn), vec![1, 0, 0, 0, 0]);
@@ -508,7 +512,13 @@ fn no_project_and_degraded_origins() {
             })
             .unwrap();
     }
-    assert_eq!(events.lock().unwrap().len(), 4);
+    let events = events.lock().unwrap();
+    assert_eq!(events.len(), 6);
+    for event in &events[4..] {
+        assert!(event.owner.is_none());
+        assert!(event.origin_profile.is_none());
+        assert!(event.snapshot_digest.is_none());
+    }
 }
 
 #[test]
