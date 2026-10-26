@@ -6944,6 +6944,10 @@ impl McHandler {
         let Ok(loaded) = store.load_meta(&parsed.session_id) else {
             return Some("recovery_load_failed");
         };
+        let memory_enabled = historian_prompt::memory_enabled(
+            config.memory_enabled,
+            loaded.meta.memory_context.as_ref(),
+        );
         let phase = loaded.meta.historian.state.clone();
         if phase == HistorianPhase::Idle {
             return Some("recovered");
@@ -7109,7 +7113,7 @@ impl McHandler {
                         validate_options: historian_validate::ValidateOptions {
                             sequence_offset: prior_compartments.len() as u64 + 1,
                             in_emergency: false,
-                            memory_enabled: config.memory_enabled,
+                            memory_enabled,
                             auto_promote: config.auto_promote,
                             user_memory_collection_enabled: config.user_memory_collection_enabled,
                             force_keep_last_compartment: false,
@@ -7259,7 +7263,7 @@ impl McHandler {
                                 validate_options: historian_validate::ValidateOptions {
                                     sequence_offset: prior_compartments.len() as u64 + 1,
                                     in_emergency: false,
-                                    memory_enabled: config.memory_enabled,
+                                    memory_enabled,
                                     auto_promote: config.auto_promote,
                                     user_memory_collection_enabled: config
                                         .user_memory_collection_enabled,
@@ -7868,7 +7872,10 @@ impl McHandler {
                 .historian_max_output_tokens
                 .unwrap_or(historian_producer::HISTORIAN_MAX_OUTPUT_TOKENS),
             boundary,
-            memory_enabled: cfg.memory_enabled,
+            memory_enabled: historian_prompt::memory_enabled(
+                cfg.memory_enabled,
+                loaded.meta.memory_context.as_ref(),
+            ),
             auto_promote: cfg.auto_promote,
             user_memory_collection_enabled: cfg.user_memory_collection_enabled,
             user_observations_requested: cfg.user_observations_requested,
@@ -8151,7 +8158,10 @@ impl McHandler {
                 .historian_max_output_tokens
                 .unwrap_or(historian_producer::HISTORIAN_MAX_OUTPUT_TOKENS),
             boundary: boundary.clone(),
-            memory_enabled: cfg.memory_enabled,
+            memory_enabled: historian_prompt::memory_enabled(
+                cfg.memory_enabled,
+                loaded.meta.memory_context.as_ref(),
+            ),
             auto_promote: cfg.auto_promote,
             user_memory_collection_enabled: cfg.user_memory_collection_enabled,
             user_observations_requested: cfg.user_observations_requested,
@@ -10843,9 +10853,24 @@ impl McHandler {
                 loaded.core.boundary_id
             )
         };
+        let profile_summary = loaded
+            .meta
+            .memory_context
+            .as_ref()
+            .filter(|context| !historian_prompt::memory_enabled(true, Some(context)))
+            .map(|context| {
+                format!(
+                    ", memory profile {} (domain {}, pin {}, candidates {})",
+                    context["profile"]["state"].as_str().unwrap_or_default(),
+                    context["domain"],
+                    context["profile"]["pin"],
+                    context["profile"]["candidates"],
+                )
+            })
+            .unwrap_or_default();
         let summary = sanitize_status_text(
             &format!(
-                "session {short_session} (last active {age}): {} {}, coverage ordinal {coverage}, boundary {boundary}{raw_passthrough_summary}, {} pending {} ({} unserved, {} provider drops applied), {} {}, pending m1 delta {}, last historian: {historian}, {publish_health}, surface {surface}",
+                "session {short_session} (last active {age}){profile_summary}: {} {}, coverage ordinal {coverage}, boundary {boundary}{raw_passthrough_summary}, {} pending {} ({} unserved, {} provider drops applied), {} {}, pending m1 delta {}, last historian: {historian}, {publish_health}, surface {surface}",
                 compartment_count,
                 plural_word(compartment_count, "compartment"),
                 pending_drop_count,
@@ -10929,6 +10954,10 @@ impl McHandler {
             "runtime_store_error": self.runtime_store_error_value(&session_id),
             "single_store": store.context_domain_status(),
             "memory_sync": self.memory_sync.status(store),
+            "memory_profile": loaded.meta.memory_context.as_ref().map(|context| json!({
+                "domain": context["domain"],
+                "profile": context["profile"],
+            })),
             "publish_timing": store.load_publish_timing(&session_id).ok().flatten(),
             "tail_identity_re_adopt_count": loaded.meta.tail_identity_re_adopt_count,
             "fake_compaction": {
@@ -38616,6 +38645,155 @@ mod tests {
             .load_active_memories(route_project_root, 0)
             .unwrap()
             .is_empty());
+    }
+
+    fn historian_profile_context(state: &str) -> memory_profile::MemoryContext {
+        let mut context = memory_profile::resolve(
+            &memory_context::ContextAnswer::NotAnswering,
+            &memory_context::ContextAnswer::NotAnswering,
+            &[],
+        );
+        context.profile.state = state.into();
+        if matches!(state, "unresolved" | "conflict" | "blocked" | "unavailable") {
+            context.domain = Some("@acme/domain-legal".into());
+            context.profile.name = None;
+            context.profile.version = None;
+            context.profile.digest = None;
+            context.profile.resolution = None;
+            context.category_ids = None;
+        }
+        if matches!(state, "blocked" | "unavailable") {
+            context.profile.pin = Some(json!({
+                "name": "@acme/memory-legal", "version": "1.0.0",
+                "manifest_sha256": "missing-manifest",
+                "status": {"state": "revoked", "blocked": state == "blocked"},
+            }));
+        }
+        if state == "conflict" {
+            context.profile.candidates =
+                vec!["@acme/memory-legal".into(), "@acme/memory-other".into()];
+        }
+        context
+    }
+
+    async fn assert_profile_fake_fact(state: &str, degraded: bool, wrapup: bool) {
+        let producer = Arc::new(ProducerState::default());
+        *producer.fact_each_run.lock().unwrap() = Some("unsolicited historian fact".into());
+        let (handler, store, _dir, project) =
+            handler_with_store(Arc::clone(&producer), default_test_config());
+        let context = historian_profile_context(state);
+        memory_profile::persist_session_pin(&store, "ses", &context).unwrap();
+        let existing = insert_memory(
+            &store,
+            project.to_str().unwrap(),
+            "PROJECT_RULES",
+            "existing memory remains visible",
+            1,
+        );
+        let messages = if wrapup {
+            wrapup_messages(80, 1600)
+        } else {
+            big_messages()
+        };
+        if wrapup {
+            cache_wrapup_messages(&handler, messages.clone());
+            let response = tool_body(
+                handler
+                    .dispatch_value(
+                        7,
+                        json!({
+                            "method": "session.wrapup", "v": 1, "session_id": "ses",
+                        }),
+                    )
+                    .await,
+            );
+            assert_eq!(response["disposition"], "completed", "{state}: {response}");
+        } else {
+            let response = call_transform(&handler, messages.clone()).await;
+            assert_eq!(response["historian"]["fired"], true, "{state}: {response}");
+            assert!(m0_text(&response).contains("existing memory remains visible"));
+        }
+        wait_for_count(&producer.starts, 1).await;
+        wait_for_idle(&store).await;
+        for prompt in producer.prompts.lock().unwrap().iter() {
+            assert_eq!(
+                prompt.contains("<fact_extraction>disabled</fact_extraction>"),
+                degraded,
+                "{state}"
+            );
+            assert!(
+                !prompt.contains("<extraction>disabled</extraction>"),
+                "{state}"
+            );
+        }
+        let compartments = store.load_compartments("ses").unwrap();
+        assert!(
+            !compartments.is_empty(),
+            "{state}: summary must still publish"
+        );
+        let memories = store
+            .load_active_memories(project.to_str().unwrap(), 0)
+            .unwrap();
+        assert_eq!(
+            memories
+                .iter()
+                .filter(|memory| memory.content.starts_with("unsolicited historian fact "))
+                .count(),
+            usize::from(!degraded),
+            "{state}: unsolicited fact admission"
+        );
+        assert!(memories.iter().any(|memory| memory.id == existing));
+        assert_eq!(memories.len(), 1 + usize::from(!degraded), "{state}");
+        let folded = call_transform(&handler, messages).await;
+        assert!(
+            m0_text(&folded).contains("existing memory remains visible"),
+            "{state}"
+        );
+        assert!(m0_text(&folded).contains("autonomous summary"), "{state}");
+        let status = tool_body(
+            handler.handle_session_status_value(7, &json!({"v": 1, "session_id": "ses"})),
+        );
+        assert_eq!(status["memory_profile"]["domain"], json!(context.domain));
+        assert_eq!(
+            status["memory_profile"]["profile"],
+            serde_json::to_value(&context.profile).unwrap()
+        );
+        if degraded {
+            let summary = status["summary"].as_str().unwrap();
+            assert!(
+                summary.contains(state) && summary.contains("@acme/domain-legal"),
+                "{summary}"
+            );
+            if context.profile.pin.is_some() || !context.profile.candidates.is_empty() {
+                assert!(summary.contains("@acme/memory-legal"), "{summary}");
+            }
+        }
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn unresolved_profile_rejects_fake_fact() {
+        assert_profile_fake_fact("unresolved", true, false).await;
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn other_degraded_profiles_reject_fake_fact() {
+        for state in ["conflict", "blocked", "unavailable"] {
+            assert_profile_fake_fact(state, true, false).await;
+        }
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn degraded_profile_wrapup_rejects_fake_fact() {
+        for state in ["unresolved", "conflict", "blocked", "unavailable"] {
+            assert_profile_fake_fact(state, true, true).await;
+        }
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn fallback_profiles_still_admit_historian_facts() {
+        for state in ["resolved", "entorhinal_not_answering"] {
+            assert_profile_fake_fact(state, false, false).await;
+        }
     }
 
     #[tokio::test(flavor = "current_thread")]

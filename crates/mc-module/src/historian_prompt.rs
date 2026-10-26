@@ -187,6 +187,17 @@ pub struct CompartmentPromptInputs<'a> {
     pub extraction_free: bool,
 }
 
+/// Disable historian extraction and admission, not the rendering of existing memories.
+/// Sessions without a stored memory-profile context, and the Entorhinal-not-answering
+/// fallback, keep extraction and admission enabled when the project configuration allows them.
+pub(crate) fn memory_enabled(configured: bool, context: Option<&serde_json::Value>) -> bool {
+    configured
+        && !matches!(
+            context.and_then(|context| context["profile"]["state"].as_str()),
+            Some("unresolved" | "conflict" | "blocked" | "unavailable")
+        )
+}
+
 pub fn reference_seeds() -> &'static [ReferenceSeed] {
     REFERENCE_SEEDS
         .get_or_init(|| {
@@ -595,6 +606,29 @@ pub fn build_compartment_agent_prompt(inputs: &CompartmentPromptInputs<'_>) -> S
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn memory_enabled_preserves_fallbacks_and_disables_degraded_profiles() {
+        assert!(super::memory_enabled(true, None));
+        assert!(!super::memory_enabled(false, None));
+        for state in [
+            "resolved",
+            "entorhinal_not_answering",
+            "unresolved",
+            "conflict",
+            "blocked",
+            "unavailable",
+        ] {
+            let context = serde_json::json!({"profile": {"state": state}});
+            let enabled = matches!(state, "resolved" | "entorhinal_not_answering");
+            assert_eq!(
+                super::memory_enabled(true, Some(&context)),
+                enabled,
+                "{state}"
+            );
+            assert!(!super::memory_enabled(false, Some(&context)), "{state}");
+        }
+    }
+
     use super::*;
     use std::collections::HashSet;
 
