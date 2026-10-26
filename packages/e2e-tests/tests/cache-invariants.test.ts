@@ -636,7 +636,7 @@ forEachHost(import.meta.url, null, (host) => {
             h.mock.setDefault({ text: "K1 hard pressure", usage: EXECUTE_USAGE });
             await h.sendPrompt(sessionId, "K1 prepare natural rebuild.");
             await waitForUsage(EXECUTE_USAGE);
-            expireCache(sessionId);
+            await expireCache(sessionId);
             setDefer("K1 hard");
             await h.sendPrompt(sessionId, "K1 expired cache rebuild.");
             const hard = extractM0(mainAgentRequests(h.mock.requests()).at(-1)!.body)!;
