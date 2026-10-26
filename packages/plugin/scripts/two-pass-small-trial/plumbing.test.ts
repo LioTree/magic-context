@@ -1,4 +1,5 @@
 import { expect, test } from "bun:test";
+import { createHash } from "node:crypto";
 import { readFileSync } from "node:fs";
 import { resolveTurnOneFactAnchor } from "../../src/features/magic-context/memory/turn-one-publication";
 import { parseTurnTwoEnvelope } from "../../src/features/magic-context/memory/turn-two-envelope";
@@ -79,6 +80,40 @@ test("dedicated source files render without changing user-authored text", () => 
     expect(HISTORIAN_FACT_ANCHOR_INSTRUCTION).toBe(source("turn-one"));
     expect(TWO_PASS_TURN_ONE).toBe(source("turn-one"));
     expect(TWO_PASS_TURN_TWO).toBe(source("turn-two"));
+    const hash = (text: string) => createHash("sha256").update(text).digest("hex");
+    expect(hash(source("system"))).toBe(
+        "e5bbcf5c7176310648b7e203c4cef76520ed8b1c04777bc692a1a8a164886ac3",
+    );
+    expect(hash(source("turn-one"))).toBe(
+        "3b57ca8b5a9a59f4e8a9af8cf432706c770ae5783b4d5facf951a99bc37b17fc",
+    );
+    expect(hash(source("turn-two"))).toBe(
+        "daccd1f5a1526497f5c0bfae26abb128bcc0909ca321f1192a810a0078f393e8",
+    );
+});
+
+test("two-pass input keeps commit hashes in their sentence and the search prefix", () => {
+    const sentence =
+        "Committed the probe. Green run: daemon from a1b2c3d; red runs: daemon from b2c3d4e, then c3d4e5f.";
+    const messages = [
+        {
+            id: "commit-message",
+            ordinal: 1,
+            role: "assistant",
+            parts: [{ type: "text", text: sentence }],
+        },
+    ];
+    const render = (singleMessageLines: boolean) =>
+        withRawMessageProvider(
+            "commit-input-test",
+            { readMessages: () => messages, getMessageCount: () => 1 },
+            () => readSessionChunk("commit-input-test", 10000, 1, 2, { singleMessageLines }).text,
+        );
+    const prefix = "[1] A: commits: a1b2c3d, b2c3d4e, c3d4e5f ";
+    expect(render(false)).toBe(
+        `${prefix}Committed the probe. Green run: daemon from; red runs: daemon from, then.`,
+    );
+    expect(render(true)).toBe(`${prefix}${sentence}`);
 });
 
 test("whole-chunk and fourth-range anchors are unknown; three precise ranges resolve", () => {

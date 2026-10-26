@@ -1511,8 +1511,10 @@ export function readSessionChunk(
                             : [];
                   });
 
-        const compacted = compactTextForSummary(allParts.join(" / "), msg.role);
-        const text = compacted.text;
+        const messageText = allParts.join(" / ");
+        const compacted = compactTextForSummary(messageText, msg.role);
+        // Evidence keeps hashes in place; commitHashes still supplies the search prefix.
+        const text = options.singleMessageLines ? messageText : compacted.text;
 
         if (!text) {
             recordFilteredNoise(meta);
