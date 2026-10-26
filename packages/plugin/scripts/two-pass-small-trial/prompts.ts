@@ -13,6 +13,7 @@ import {
     TURN_TWO_PROMPT_MAX,
 } from "../../src/features/magic-context/memory/turn-two";
 import {
+    applyDecidedPrefix,
     fitTurnTwoPrompt,
     parseTurnTwoEnvelope,
     type TurnTwoPromptFact,
@@ -245,7 +246,7 @@ export function memoryDrafts(
                 factId: id,
                 action: decision.action,
                 category: fact.category,
-                text: fact.content,
+                text: applyDecidedPrefix(fact.content, decision.decided),
             });
         else if (["edit", "merge", "replaces"].includes(decision.action))
             drafts.push({

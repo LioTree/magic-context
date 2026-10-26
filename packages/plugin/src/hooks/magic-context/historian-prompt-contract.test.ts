@@ -85,7 +85,10 @@ test("turn-two user content carries notices and data, not a second format schema
     expect(prompt).toContain("Save first.");
     expect(prompt).toContain("allowed_fact_ids: [4]");
     expect(prompt).toContain(TWO_PASS_TURN_TWO.replace("{{ALLOWED_FACT_IDS}}", "[4]"));
-    for (const format of ["Reply with", "JSON", "target_id", "1-100", "decay class", "final_text"])
+    // The turn-two instructions name `final_text` once for the accepted-decision
+    // `Decided:` rule; the full per-action field schema still lives only in the
+    // system prompt, which these tokens guard against duplicating here.
+    for (const format of ["Reply with", "JSON", "target_id", "1-100", "decay class"])
         expect(prompt).not.toContain(format);
 });
 

@@ -70,6 +70,7 @@ import {
     type TurnTwoTrialAuthorization,
 } from "./turn-two-allowlist";
 import {
+    applyDecidedPrefix,
     fitTurnTwoPrompt,
     parseTurnTwoEnvelope,
     type TurnTwoDecision,
@@ -972,7 +973,10 @@ async function resolveFact(
             return applyMemoryAdmission(db, {
                 key,
                 operation: "new",
-                input,
+                input: {
+                    ...input,
+                    content: applyDecidedPrefix(input.content, decision.decided),
+                },
                 memoryEnabled: context.memoryEnabled,
                 autoPromote: context.autoPromote,
                 factId: fact.id,
