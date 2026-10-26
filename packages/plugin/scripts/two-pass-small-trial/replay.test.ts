@@ -1,7 +1,6 @@
 import { expect, test } from "bun:test";
-import { mkdirSync, mkdtempSync, realpathSync, rmSync } from "node:fs";
-import { tmpdir } from "node:os";
-import { join } from "node:path";
+import { mkdirSync, mkdtempSync, rmSync } from "node:fs";
+import { resolve } from "node:path";
 import { controlRun002 } from "./control-run-002";
 import { mockCases, mockReply } from "./mock";
 import { requestHash, turnOne, turnTwo } from "./prompts";
@@ -62,9 +61,7 @@ async function fixtures() {
     return { cases, saved, plan, key };
 }
 function scratch() {
-    // The Sonnet handoff only accepts a disposable root under <tmpdir>/magic-context,
-    // so build it there whatever TMPDIR the test runner was given.
-    const root = join(realpathSync(tmpdir()), "magic-context");
+    const root = resolve(import.meta.dir, "../../../../target/scratch/magic-context");
     mkdirSync(root, { recursive: true });
     return mkdtempSync(`${root}/verifier-replay-`);
 }
