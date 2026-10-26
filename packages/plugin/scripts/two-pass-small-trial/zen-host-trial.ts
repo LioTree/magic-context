@@ -1,21 +1,21 @@
 import { mkdirSync, readFileSync, writeFileSync } from "node:fs";
-import { join } from "node:path";
 import { networkInterfaces } from "node:os";
-import { Database } from "../../src/shared/sqlite";
-import { initializeDatabase } from "../../src/features/magic-context/storage-db";
-import { insertMemory } from "../../src/features/magic-context/memory/storage-memory";
-import { resolveProjectIdentityForSession } from "../../src/features/magic-context/memory/project-identity";
+import { join } from "node:path";
 import { memoryHistorySnapshot } from "../../src/features/magic-context/memory/history-applier";
-import { buildTurnOneAuthorizationRequest } from "../../src/features/magic-context/memory/turn-two";
-import { historianSystemPrompt } from "../../src/hooks/magic-context/compartment-prompt";
+import { resolveProjectIdentityForSession } from "../../src/features/magic-context/memory/project-identity";
+import { insertMemory } from "../../src/features/magic-context/memory/storage-memory";
 import { HISTORIAN_FORMAT_INSTRUCTION } from "../../src/features/magic-context/memory/turn-one-publication";
-import { CampaignLedger } from "../two-pass-live-replay/artifact-schema";
-import { attestHost, disposableEnvironment } from "../two-pass-live-replay/host-drivers";
+import { buildTurnOneAuthorizationRequest } from "../../src/features/magic-context/memory/turn-two";
+import { initializeDatabase } from "../../src/features/magic-context/storage-db";
+import { historianSystemPrompt } from "../../src/hooks/magic-context/compartment-prompt";
+import { Database } from "../../src/shared/sqlite";
 import { callMeter, readPluginStore } from "../two-pass-activation-runs/activation-driver";
 import { hostAdapter } from "../two-pass-activation-runs/host-adapters";
 import { sumProviderSteps } from "../two-pass-activation-runs/provider-meter";
-import { loadCases } from "./run";
+import { CampaignLedger } from "../two-pass-live-replay/artifact-schema";
+import { attestHost, disposableEnvironment } from "../two-pass-live-replay/host-drivers";
 import { turnOne } from "./prompts";
+import { loadCases } from "./run";
 
 const ZEN_PROVIDER_ID = "opencode";
 const ZEN_MODEL_ID = "deepseek-v4.1-flash-free";
@@ -25,7 +25,8 @@ const OUTPUT_CEILING = 32000;
 if (import.meta.main) {
     const [root, install, variantArg, outArg] = process.argv.slice(2);
     const variant = variantArg === "high" ? "high" : variantArg === "max" ? "max" : null;
-    if (!root || !install) throw new Error("usage: zen-host-trial.ts <root> <install> [high|max] [outDir]");
+    if (!root || !install)
+        throw new Error("usage: zen-host-trial.ts <root> <install> [high|max] [outDir]");
     mkdirSync(root, { recursive: true, mode: 0o700 });
     const outDir = outArg ?? join(root, "zen-host-001");
     mkdirSync(outDir, { recursive: true, mode: 0o700 });
@@ -99,7 +100,12 @@ if (import.meta.main) {
                 two_pass: false,
                 maxTokens: OUTPUT_CEILING,
             },
-            memory: { enabled: true, auto_promote: true, auto_search: { enabled: false }, git_commit_indexing: { enabled: false } },
+            memory: {
+                enabled: true,
+                auto_promote: true,
+                auto_search: { enabled: false },
+                git_commit_indexing: { enabled: false },
+            },
             embedding: { provider: "off" },
         },
     });
@@ -123,7 +129,11 @@ if (import.meta.main) {
                     content: m.content,
                     sourceType: "historian",
                 });
-                db.prepare("UPDATE memories SET id=?,revision=? WHERE id=?").run(m.id, m.revision, stored.id);
+                db.prepare("UPDATE memories SET id=?,revision=? WHERE id=?").run(
+                    m.id,
+                    m.revision,
+                    stored.id,
+                );
             }
             const seed = db.prepare("SELECT id FROM memories LIMIT 1").get();
             if (c.memories.length && !seed) throw new Error("seed_insert_failed");
@@ -133,46 +143,119 @@ if (import.meta.main) {
             db.close();
         }
         const firstRequest = turnOne(c, "enabled");
-        writeFileSync(join(outDir, `case-${c.id}-trial-first-request.json`), JSON.stringify(firstRequest, null, 2), { mode: 0o600 });
+        writeFileSync(
+            join(outDir, `case-${c.id}-trial-first-request.json`),
+            JSON.stringify(firstRequest, null, 2),
+            { mode: 0o600 },
+        );
         // For activation, send only the transcript (new_messages body), not the prebuilt historian prompt.
         // The plugin builds its own historian prompt (examples + references + transcript + format)
         // from session history; sending the prebuilt prompt would double-wrap examples/format
         // and fail validation (as observed: "no usable compartments").
         const newMessagesMatch = c.userPrompt.match(/<new_messages>[\s\S]*?<\/new_messages>/);
-        const transcriptOnly = newMessagesMatch ? newMessagesMatch[0].slice(0, 150_000) : (firstRequest.messages[1].content as string).slice(0, 150_000);
+        const transcriptOnly = newMessagesMatch
+            ? newMessagesMatch[0].slice(0, 150_000)
+            : (firstRequest.messages[1].content as string).slice(0, 150_000);
         let host: Awaited<ReturnType<typeof adapter.start>> | undefined;
         try {
-            host = await adapter.start({ installRoot: install, pluginEntrypoint, env: caseEnv, meter: callMeter(ledger, profile as never) });
+            host = await adapter.start({
+                installRoot: install,
+                pluginEntrypoint,
+                env: caseEnv,
+                meter: callMeter(ledger, profile as never),
+            });
             const before = await attestHost(caseRoot, caseEnv, host.pid);
-            if (before.proof.tool !== "lsof -Fpn") throw new Error("proof_requires_lsof_not_proc_fallback");
-            writeFileSync(join(outDir, `case-${c.id}-lsof-before.json`), JSON.stringify(before, null, 2), { mode: 0o600 });
+            if (before.proof.tool !== "lsof -Fpn")
+                throw new Error("proof_requires_lsof_not_proc_fallback");
+            writeFileSync(
+                join(outDir, `case-${c.id}-lsof-before.json`),
+                JSON.stringify(before, null, 2),
+                { mode: 0o600 },
+            );
             const promptText = transcriptOnly;
             const session = (await host.runSession(promptText)) as {
-                requests: Array<{ request: { path: string; body: string; providerHost?: string }; response: { status: number; body: string; contentType: string }; steps?: Array<{ inputTokens: number; outputTokens: number }> }>;
+                requests: Array<{
+                    request: { path: string; body: string; providerHost?: string };
+                    response: { status: number; body: string; contentType: string };
+                    steps?: Array<{ inputTokens: number; outputTokens: number }>;
+                }>;
                 carrier?: string;
                 sessionId?: string;
             };
-            if (host.carrier !== "opencode-session") throw new Error(`observed_carrier_mismatch:${host.carrier}`);
+            if (host.carrier !== "opencode-session")
+                throw new Error(`observed_carrier_mismatch:${host.carrier}`);
             const after = await attestHost(caseRoot, caseEnv, host.pid);
-            if (after.proof.tool !== "lsof -Fpn") throw new Error("proof_requires_lsof_not_proc_fallback");
-            writeFileSync(join(outDir, `case-${c.id}-lsof-after.json`), JSON.stringify(after, null, 2), { mode: 0o600 });
+            if (after.proof.tool !== "lsof -Fpn")
+                throw new Error("proof_requires_lsof_not_proc_fallback");
+            writeFileSync(
+                join(outDir, `case-${c.id}-lsof-after.json`),
+                JSON.stringify(after, null, 2),
+                { mode: 0o600 },
+            );
             if (host.storePath === null) throw new Error("plugin_store_unobservable");
             const store = readPluginStore(caseRoot, host.storePath);
-            const stages = (store.stages as Array<Record<string, unknown>>).filter((r) => r.stage === "turn_one" || r.stage === "turn_two");
-            const turnOneStage = (store.stages as Array<{ stage: string; state: string; reply_json: string | null; child_session_id: string | null }>).find((r) => r.stage === "turn_one" && r.state === "published");
-            const turnTwoStage = (store.stages as Array<{ stage: string; state: string; reply_json: string | null; child_session_id: string | null }>).find((r) => r.stage === "turn_two" && r.state === "resolved");
-            const firstReply = turnOneStage?.reply_json ? ((JSON.parse(turnOneStage.reply_json) as { text?: string }).text ?? turnOneStage.reply_json) : null;
-            const secondReply = turnTwoStage?.reply_json ? ((JSON.parse(turnTwoStage.reply_json) as { text?: string }).text ?? turnTwoStage.reply_json) : null;
-            if (firstReply) writeFileSync(join(outDir, `case-${c.id}-turn-one-reply.txt`), firstReply, { mode: 0o600 });
-            if (secondReply) writeFileSync(join(outDir, `case-${c.id}-turn-two-reply.txt`), secondReply, { mode: 0o600 });
-            writeFileSync(join(outDir, `case-${c.id}-provider-receipts.json`), JSON.stringify(session.requests, null, 2), { mode: 0o600 });
-            writeFileSync(join(outDir, `case-${c.id}-stages.json`), JSON.stringify(stages, null, 2), { mode: 0o600 });
+            const stages = (store.stages as Array<Record<string, unknown>>).filter(
+                (r) => r.stage === "turn_one" || r.stage === "turn_two",
+            );
+            const turnOneStage = (
+                store.stages as Array<{
+                    stage: string;
+                    state: string;
+                    reply_json: string | null;
+                    child_session_id: string | null;
+                }>
+            ).find((r) => r.stage === "turn_one" && r.state === "published");
+            const turnTwoStage = (
+                store.stages as Array<{
+                    stage: string;
+                    state: string;
+                    reply_json: string | null;
+                    child_session_id: string | null;
+                }>
+            ).find((r) => r.stage === "turn_two" && r.state === "resolved");
+            const firstReply = turnOneStage?.reply_json
+                ? ((JSON.parse(turnOneStage.reply_json) as { text?: string }).text ??
+                  turnOneStage.reply_json)
+                : null;
+            const secondReply = turnTwoStage?.reply_json
+                ? ((JSON.parse(turnTwoStage.reply_json) as { text?: string }).text ??
+                  turnTwoStage.reply_json)
+                : null;
+            if (firstReply)
+                writeFileSync(join(outDir, `case-${c.id}-turn-one-reply.txt`), firstReply, {
+                    mode: 0o600,
+                });
+            if (secondReply)
+                writeFileSync(join(outDir, `case-${c.id}-turn-two-reply.txt`), secondReply, {
+                    mode: 0o600,
+                });
+            writeFileSync(
+                join(outDir, `case-${c.id}-provider-receipts.json`),
+                JSON.stringify(session.requests, null, 2),
+                { mode: 0o600 },
+            );
+            writeFileSync(
+                join(outDir, `case-${c.id}-stages.json`),
+                JSON.stringify(stages, null, 2),
+                { mode: 0o600 },
+            );
             const historianRequests = session.requests.filter((r) => {
                 try {
-                    const body = JSON.parse(r.request.body) as { messages?: Array<{ role: string; content: unknown }>; system?: unknown };
+                    const body = JSON.parse(r.request.body) as {
+                        messages?: Array<{ role: string; content: unknown }>;
+                        system?: unknown;
+                    };
                     const text = (v: unknown): string =>
-                        typeof v === "string" ? v : Array.isArray(v) ? v.map(text).join("\n") : typeof (v as { text?: unknown })?.text === "string" ? (v as { text: string }).text : "";
-                    const sys = body.system ?? body.messages?.filter((m) => m.role === "system").map((m) => m.content);
+                        typeof v === "string"
+                            ? v
+                            : Array.isArray(v)
+                              ? v.map(text).join("\n")
+                              : typeof (v as { text?: unknown })?.text === "string"
+                                ? (v as { text: string }).text
+                                : "";
+                    const sys =
+                        body.system ??
+                        body.messages?.filter((m) => m.role === "system").map((m) => m.content);
                     return text(sys).includes(historianSystemPrompt(true).slice(0, 128));
                 } catch {
                     return false;
@@ -186,12 +269,40 @@ if (import.meta.main) {
                 providerRequestCount: session.requests.length,
                 turnOnePublished: !!turnOneStage,
                 turnTwoResolved: !!turnTwoStage,
-                sameChild: !!turnOneStage && !!turnTwoStage && turnOneStage.child_session_id === turnTwoStage.child_session_id,
+                sameChild:
+                    !!turnOneStage &&
+                    !!turnTwoStage &&
+                    turnOneStage.child_session_id === turnTwoStage.child_session_id,
                 firstReplyChars: firstReply?.length ?? 0,
                 secondReplyChars: secondReply?.length ?? 0,
                 usage: sumProviderSteps(session.requests.flatMap((r) => r.steps ?? [])),
-                maxTokensObserved: [...new Set(historianRequests.map((r) => { try { return (JSON.parse(r.request.body) as { max_tokens?: number }).max_tokens; } catch { return undefined; } }))],
-                reasoningFields: [...new Set(historianRequests.map((r) => { try { const b = JSON.parse(r.request.body) as Record<string, unknown>; return JSON.stringify({ reasoning: b.reasoning ?? null, thinking: b.thinking ?? null }); } catch { return "unparseable"; } }))],
+                maxTokensObserved: [
+                    ...new Set(
+                        historianRequests.map((r) => {
+                            try {
+                                return (JSON.parse(r.request.body) as { max_tokens?: number })
+                                    .max_tokens;
+                            } catch {
+                                return undefined;
+                            }
+                        }),
+                    ),
+                ],
+                reasoningFields: [
+                    ...new Set(
+                        historianRequests.map((r) => {
+                            try {
+                                const b = JSON.parse(r.request.body) as Record<string, unknown>;
+                                return JSON.stringify({
+                                    reasoning: b.reasoning ?? null,
+                                    thinking: b.thinking ?? null,
+                                });
+                            } catch {
+                                return "unparseable";
+                            }
+                        }),
+                    ),
+                ],
             });
             writeFileSync(
                 join(outDir, `transcript-case-${c.id}.md`),
@@ -204,8 +315,32 @@ if (import.meta.main) {
     }
     writeFileSync(
         join(outDir, "zen-host-summary.json"),
-        JSON.stringify({ lane: "opencode-1", carrier: "opencode-session", provider: ZEN_PROVIDER_ID, modelId: ZEN_MODEL_ID, variant, outputCeiling: OUTPUT_CEILING, network: "bridge-for-zen-provider-call", networkIsolation, ledger: ledger.rows, summary, actualUSDSpent: 0, credentials: "none (Zen free tier)" }, null, 2),
+        JSON.stringify(
+            {
+                lane: "opencode-1",
+                carrier: "opencode-session",
+                provider: ZEN_PROVIDER_ID,
+                modelId: ZEN_MODEL_ID,
+                variant,
+                outputCeiling: OUTPUT_CEILING,
+                network: "bridge-for-zen-provider-call",
+                networkIsolation,
+                ledger: ledger.rows,
+                summary,
+                actualUSDSpent: 0,
+                credentials: "none (Zen free tier)",
+            },
+            null,
+            2,
+        ),
         { mode: 0o600 },
     );
-    console.log(JSON.stringify({ lane: "opencode-1", carrier: "opencode-session", cases: summary.length, outDir }));
+    console.log(
+        JSON.stringify({
+            lane: "opencode-1",
+            carrier: "opencode-session",
+            cases: summary.length,
+            outDir,
+        }),
+    );
 }
