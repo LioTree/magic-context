@@ -10,6 +10,7 @@ pub mod context;
 pub mod curate_host;
 pub mod dispatcher;
 pub mod domain_control;
+mod entropy;
 pub mod executor;
 pub mod host_carrier;
 pub mod ownership;

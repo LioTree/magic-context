@@ -162,6 +162,10 @@ impl LiveRoute {
         handler.set_store_open_policy_for_test(StoreOpenPolicy {
             request_wait: if matches!(condition, StoreCondition::Delayed) {
                 Duration::from_millis(25)
+            } else if cfg!(windows) {
+                // A fresh Windows store includes cold migrations and WAL setup
+                // before the first catalog can be persisted.
+                Duration::from_secs(60)
             } else {
                 Duration::from_secs(10)
             },
@@ -221,7 +225,7 @@ impl LiveRoute {
                 self.identity.clone(),
                 serde_json::to_vec(&request).unwrap(),
                 CallOptions {
-                    timeout: Duration::from_secs(20),
+                    timeout: Duration::from_secs(if cfg!(windows) { 90 } else { 20 }),
                     ..Default::default()
                 },
             )
@@ -275,6 +279,8 @@ async fn first_composition_catalog_on_a_real_route_awaits_the_startup_open_witho
     let route = LiveRoute::start(StoreCondition::Fresh).await;
     route.catalog().await;
     route.assert_catalog_before_store_and_transform();
+    let refusal = route.catalog_refusal();
+    assert!(refusal.is_none(), "{refusal:?}");
     let store = route
         .handler
         .store
@@ -284,7 +290,6 @@ async fn first_composition_catalog_on_a_real_route_awaits_the_startup_open_witho
         .load_provider_catalog(&route.identity.project_root.to_string_lossy(), "s")
         .unwrap()
         .is_some());
-    assert!(route.catalog_refusal().is_none());
     route.consumer.close().await;
 }
 

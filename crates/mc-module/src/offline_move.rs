@@ -205,8 +205,12 @@ impl HolderCheck for Lsof {
 
 #[cfg(windows)]
 impl HolderCheck for Lsof {
-    fn holders(&self, _files: &[PathBuf]) -> Result<Vec<String>, String> {
-        Err("open-file enumeration is unsupported on Windows".into())
+    fn holders(&self, files: &[PathBuf]) -> Result<Vec<String>, String> {
+        if files.iter().any(|path| path.exists()) {
+            Err("open-file enumeration is unsupported on Windows".into())
+        } else {
+            Ok(Vec::new())
+        }
     }
 }
 

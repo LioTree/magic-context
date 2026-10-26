@@ -508,8 +508,16 @@ fn move_refuses_while_another_process_holds_a_store() {
 #[cfg(windows)]
 #[test]
 fn open_file_holder_check_is_explicitly_unsupported_on_windows() {
+    assert!(Lsof.holders(&[]).unwrap().is_empty());
+    let directory = tempfile::tempdir().unwrap();
+    let path = directory.path().join("store.db");
+    assert!(Lsof
+        .holders(std::slice::from_ref(&path))
+        .unwrap()
+        .is_empty());
+    std::fs::write(&path, b"fixture").unwrap();
     assert_eq!(
-        Lsof.holders(&[]).unwrap_err(),
+        Lsof.holders(&[path]).unwrap_err(),
         "open-file enumeration is unsupported on Windows"
     );
 }

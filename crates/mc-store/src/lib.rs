@@ -4414,7 +4414,9 @@ fn historian_owner_dead(pid: i64) -> bool {
             .args(["/FO", "CSV", "/NH"])
             .output()
             .is_ok_and(|output| {
-                output.status.success() && windows_process_table_proves_absent(pid, &output.stdout)
+                output.status.success()
+                    && output.stderr.is_empty()
+                    && windows_process_table_proves_absent(pid, &output.stdout)
             })
     }
     #[cfg(not(any(unix, windows)))]

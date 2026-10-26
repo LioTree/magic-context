@@ -13,6 +13,7 @@
 
 use super::context::{ChildEvent, ChildObserver, TaskContext, TaskToolRouter, ToolError};
 use super::domain_control::available;
+use super::entropy::secret;
 use crate::child_retention::{self, child_policy, ChildRetention, ReleaseOutcome, RetentionMember};
 use crate::dream_runner::{CarrierError, ChildRequest, Completion, DreamCarrier, Usage};
 use crate::historian_runner::{HistorianRunnerKind, RunnerSource};
@@ -27,7 +28,6 @@ use mc_store::dream_scheduler::budget::{BudgetAction, TokenBudget};
 use mc_store::dream_scheduler::SqliteDreamScheduler;
 use serde_json::{json, Map, Value};
 use std::collections::HashMap;
-use std::io::Read;
 use std::path::Path;
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
@@ -57,15 +57,6 @@ fn error(message: impl Into<String>) -> CarrierError {
         message: message.into(),
         retryable: false,
     }
-}
-
-fn secret() -> Result<String, CarrierError> {
-    let mut bytes = [0_u8; 32];
-    // Without OS entropy the session id would be guessable; refuse instead.
-    std::fs::File::open("/dev/urandom")
-        .and_then(|mut f| f.read_exact(&mut bytes))
-        .map_err(|e| error(e.to_string()))?;
-    Ok(bytes.iter().map(|b| format!("{b:02x}")).collect())
 }
 
 /// A failed llm-runner op. `outcome_unknown` means the request may have reached

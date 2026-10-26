@@ -3,6 +3,7 @@
 
 use super::context::{ChildEvent, ChildObserver, TaskContext, TaskToolRouter};
 use super::domain_control::available;
+use super::entropy::secret;
 use crate::dream_runner::{CarrierError, ChildRequest, Completion, DreamCarrier, Usage};
 use mc_store::dream_scheduler::{
     budget::{BudgetAction, TokenBudget},
@@ -11,8 +12,6 @@ use mc_store::dream_scheduler::{
 use serde_json::{json, Value};
 use sha2::{Digest, Sha256};
 use std::collections::{BTreeMap, HashMap};
-use std::fs;
-use std::io::Read;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex, OnceLock};
@@ -32,15 +31,6 @@ fn error(message: impl Into<String>) -> CarrierError {
         message: message.into(),
         retryable: false,
     }
-}
-
-fn secret() -> Result<String, CarrierError> {
-    let mut bytes = [0_u8; 32];
-    // Failure to obtain OS entropy is unavailability, never a predictable credential.
-    fs::File::open("/dev/urandom")
-        .and_then(|mut f| f.read_exact(&mut bytes))
-        .map_err(|e| error(e.to_string()))?;
-    Ok(bytes.iter().map(|b| format!("{b:02x}")).collect())
 }
 
 fn field<'a>(v: &'a Value, key: &str) -> Result<&'a str, String> {

@@ -996,12 +996,22 @@ mod tests {
 
     /// `(input, identity)` pairs printed by the host's `resolveProjectIdentity` for paths that
     /// do not exist, which is its `dir:` fallback of the resolved path.
+    #[cfg(not(windows))]
     const DIRECTORY_GOLDEN: &[(&str, &str)] = &[
         ("/work/api", "dir:e02ef1f35c06"),
         ("/work/api/", "dir:e02ef1f35c06"),
         ("/work/./x/../api", "dir:e02ef1f35c06"),
         ("/tmp/n\u{e4}me dir", "dir:93e3ea277593"),
         ("/", "dir:6666cd76f969"),
+    ];
+
+    #[cfg(windows)]
+    const DIRECTORY_GOLDEN: &[(&str, &str)] = &[
+        (r"C:\work\api", "dir:7f55d5fe53ba"),
+        (r"C:\work\api\", "dir:7f55d5fe53ba"),
+        (r"C:\work\.\x\..\api", "dir:7f55d5fe53ba"),
+        (r"C:\tmp\näme dir", "dir:ae8c0f4fb42c"),
+        (r"C:\", "dir:2f158c4731d7"),
     ];
 
     /// The root commit the host's `resolveProjectIdentityForSession` resolves for the fixed
@@ -1305,11 +1315,14 @@ mod tests {
 
     #[test]
     fn directory_keys_follow_the_hosts_spelling_rules() {
-        assert_eq!(project_directory_key(Path::new("/work/api/")), "/work/api");
-        assert_eq!(
-            project_directory_key(Path::new("/work/./x/../api")),
-            "/work/api"
-        );
+        #[cfg(not(windows))]
+        {
+            assert_eq!(project_directory_key(Path::new("/work/api/")), "/work/api");
+            assert_eq!(
+                project_directory_key(Path::new("/work/./x/../api")),
+                "/work/api"
+            );
+        }
         assert_eq!(
             project_directory_key(Path::new("C:\\Users\\Me\\Repo\\")),
             "c:/users/me/repo"
@@ -1381,8 +1394,15 @@ mod pin_tests {
     fn relocate(value: &mut Value, root: &Path) {
         #[cfg(windows)]
         let native_root = root.to_str().unwrap().replace('\\', "/");
+        // Windows sidecar records contain case-folded directory keys, not the
+        // filesystem's original mixed-case spelling.
         #[cfg(windows)]
-        let root = Path::new(native_root.strip_prefix("//?/").unwrap_or(&native_root));
+        let root_binding = native_root
+            .strip_prefix("//?/")
+            .unwrap_or(&native_root)
+            .to_lowercase();
+        #[cfg(windows)]
+        let root = Path::new(&root_binding);
         match value {
             Value::String(string) => *string = string.replace("<fixture>", root.to_str().unwrap()),
             Value::Array(values) => values.iter_mut().for_each(|value| relocate(value, root)),
