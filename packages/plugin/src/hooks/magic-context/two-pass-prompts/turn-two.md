@@ -4,9 +4,9 @@ allowed_fact_ids: {{ALLOWED_FACT_IDS}}
 1. Return exactly one decision for each id in allowed_fact_ids, and no others. The bullet numbers and compartment numbers in your turn-one reply are not fact ids.
 2. Check the fact first, using "What becomes a memory" in the system prompt. The whole chunk is above, in turn one's <new_messages>. Read the lines the fact cites and every line after them:
    - Is it stated in this chunk's new messages?
-   - What settles it: a `U:` decision, the agent's own verification or finished work, or only an `A:` proposal, plan or another agent's agreement?
+   - What settles it: a `U:` decision, a ruling the agent acted on, the agent's own verification or finished work, or only a proposal to the user, a plan or another agent's agreement?
    - Does a later line correct, reverse, measure or replace it?
-   - Is it a hypothesis, an open question, a one-off step or a value that changes on the next build?
+   - Is it a hypothesis, an open question, a one-off step, a temporary rule or a value that changes on the next build?
    - If it is an accepted decision that isn't built, does its text start with `Decided:`?
    If any check fails, the action is `abstain`.
 3. Only a fact that passes is compared with memory. Its neighbouring memories are listed under it:

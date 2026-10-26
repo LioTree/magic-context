@@ -61,7 +61,7 @@ A user instruction like "always commit + build after every fix" describes how th
 - Input notation:
   - `[N]` or `[N-M]` is a stable raw message ordinal range.
   - `U:` means user.
-  - `A:` means assistant: the primary agent, which you write about as "I" in compartments. Its proposals and plans are not decisions; only the user decides (see "What becomes a memory").
+  - `A:` means assistant: the primary agent, which you write about as "I" in compartments. A proposal it puts to the user is not a decision until the user accepts it (see "What becomes a memory").
   - `TC:` is a compact summary of a tool call ("TC: read(foo.ts)"). Use them to understand what was done; do not copy them verbatim. If a chunk is dominated by `TC:` runs, derive the narrative from what those tools were doing collectively.
   - `commits: ...` lists commit hashes mentioned in a work unit; keep relevant ones in narrative.
 
@@ -399,13 +399,14 @@ Facts capture stable properties of the project that survive past any single comp
 Every fact is a candidate memory. A stored memory is shown to the primary agent in every later session as true. A wrong memory misleads it for months. A missing one costs little, because the compartment narrative still holds what happened. Apply these rules to every fact, in order:
 
 1. **It is stated in `<new_messages>`.** Never copy a fact from `<session_references>`, from earlier summaries or from the calibration examples, even when it is still true.
-2. **The user decides; the agent reports.** A `U:` line that sets a rule or accepts a proposal is a decision. An `A:` line is the primary agent at work: its proposals, plans, recommendations, intentions and "I'd do X" are not decisions until a later `U:` line accepts them. Another agent or worker agreeing is not the user deciding. What the agent verified in this chunk (measured, read in the code, or proved by a test), how an external system confirmed it behaves, and work the agent finished in this chunk (merged, released or placed) describe how things are, so they can be facts.
+2. **A decision is made by the user, or made and acted on by the agent.** A `U:` line that sets a rule or accepts a proposal is a decision. The agent also decides things inside its own work: when an `A:` line rules something and the agent acts on it in this chunk (tells a worker to do it, or does it itself), that is a decision too. A proposal the agent puts to the user, or one still waiting for the user's answer, is not a decision until a later `U:` line accepts it. Plans, recommendations, intentions and "I'd do X" are not decisions. Another agent or worker agreeing is not a decision. What the agent verified in this chunk (measured, read in the code, or proved by a test), how an external system confirmed it behaves, and work the agent finished in this chunk (merged, released or placed) describe how things are, so they can be facts.
 3. **A later line wins.** If a later line in the chunk corrects, reverses, measures or replaces an earlier statement, only the later version can be a fact. Read to the end of the chunk before you write a fact.
 4. **An accepted decision that isn't built is written as a decision.** Start it with `Decided:` and say what was decided. Never describe unbuilt behaviour as if it already works. This holds in every category: a chosen setting that doesn't exist yet is written `Decided: retry backoff: 30 s`, not `retry backoff: 30 s`.
 5. **These are not facts:**
    - hypotheses, guesses, and anything still being measured;
    - open questions, and proposals nobody accepted;
    - one-off steps: a single test run, one bisect, one audit's checklist, the order work happened in;
+   - temporary rules that only hold until something ships, gets fixed or gets answered;
    - values that change on the next build, deploy or run: commit ids, placed builds, counts, sizes, versions, the state at one moment.
 6. **When in doubt, leave it out.**
 
