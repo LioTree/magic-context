@@ -1,7 +1,6 @@
 import { spawn, execFile } from "node:child_process";
 import { randomBytes, randomUUID } from "node:crypto";
 import { mkdirSync, readFileSync, writeFileSync } from "node:fs";
-import { createRequire } from "node:module";
 import { join, resolve } from "node:path";
 import { promisify } from "node:util";
 import { containerInvocation, selectedJobs, validateRunConfig, type ContainerRunConfig } from "./container-config";
@@ -17,8 +16,11 @@ export interface CredentialSource {
 /** Construct only on the trusted Mac. Neither connection nor enrollment crosses the stdin boundary. */
 export async function macCredentialSource(enrollmentPath: string): Promise<CredentialSource> {
     if (process.platform !== "darwin") throw new Error("credential_broker_trusted_host_required");
-    const require = createRequire(new URL("../../../e2e-tests/package.json", import.meta.url));
-    const { ClaustrumClient } = require("@cortexkit/claustrum-client") as typeof import("../../../e2e-tests/node_modules/@cortexkit/claustrum-client");
+    // The client is ESM-only (its exports declare only "import"), so require() cannot resolve it.
+    // Import the e2e-tests package's installed copy directly; the plugin does not depend on it.
+    const { ClaustrumClient } = (await import(
+        new URL("../../../e2e-tests/node_modules/@cortexkit/claustrum-client/dist/index.js", import.meta.url).href
+    )) as typeof import("../../../e2e-tests/node_modules/@cortexkit/claustrum-client");
     let enrollment = JSON.parse(readFileSync(enrollmentPath, "utf8")).token;
     if (typeof enrollment !== "string" || !enrollment) throw new Error("credential_enrollment_required");
     const client = await ClaustrumClient.connect({ logger() {} });
