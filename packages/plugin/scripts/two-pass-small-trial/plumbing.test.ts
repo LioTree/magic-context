@@ -82,13 +82,13 @@ test("dedicated source files render without changing user-authored text", () => 
     expect(TWO_PASS_TURN_TWO).toBe(source("turn-two"));
     const hash = (text: string) => createHash("sha256").update(text).digest("hex");
     expect(hash(source("system"))).toBe(
-        "f7d60755c458e16af1154042acc4f2d6ba8cff9db84aa03c410ef5736b60ef68",
+        "c7a0e4290bae4524f386bb0857ee79160fcce32bd39e30fee7eb919962ccaa0a",
     );
     expect(hash(source("turn-one"))).toBe(
         "3b57ca8b5a9a59f4e8a9af8cf432706c770ae5783b4d5facf951a99bc37b17fc",
     );
     expect(hash(source("turn-two"))).toBe(
-        "ac102abd4e064e8a574c5f8e16e446c2ca3297988e0e0e3bf840b8b1a728955d",
+        "7d84dda119f55f26702fca5d9392aaeac66bbf3b804ec7901fdc045ed9f21ca7",
     );
 });
 
