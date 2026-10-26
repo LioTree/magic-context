@@ -98,6 +98,30 @@ impl FrozenEdits {
         }
     }
 
+    pub(super) fn matching_sources(
+        &self,
+        mid_index: &BTreeMap<String, u64>,
+        entries: &BTreeMap<u64, Arc<HeldEntry>>,
+    ) -> Result<Self, HandlerOutcome> {
+        let mut matched = Self::default();
+        let mut sources = HashMap::new();
+        for part in self.parts.values() {
+            let Some(ordinal) = mid_index.get(&part.mid) else {
+                continue;
+            };
+            if !sources.contains_key(ordinal) {
+                sources.insert(*ordinal, entries[ordinal].read()?);
+            }
+            let entry = &sources[ordinal];
+            if entry.tags.iter().any(|row| row.part == part.part)
+                && served_part_digest(entry, &part.part).ok().as_ref() == Some(&part.digest)
+            {
+                matched.insert(part.clone());
+            }
+        }
+        Ok(matched)
+    }
+
     pub(super) fn stamp_version(&mut self, version: u64) {
         for part in self.parts.values_mut() {
             part.ack_version = part.ack_version.max(version);

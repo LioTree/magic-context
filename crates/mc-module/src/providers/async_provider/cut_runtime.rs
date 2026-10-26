@@ -859,7 +859,14 @@ impl McHandler {
                 "descending Setup needs a lineage",
             ));
         }
+        // The selected cut certifies this lineage's prefix. Reset sources can
+        // belong to an abandoned branch and must not overwrite that selection.
+        state.resync_sources = None;
         state.lineage = request.lineage_id.clone();
+        state.ack_lineage_root = request.lineage_id.clone();
+        state.ack_selection_pending = false;
+        state.pending_native_acks.clear();
+        state.native_setup_predecessor = None;
         state.generation = state.next_generation()?;
         state.lineage_first_ordinal = first;
         state.journal = Journal::new_record();
@@ -1070,6 +1077,7 @@ impl McHandler {
         if first == 0 {
             return Ok(());
         }
+        state.native_setup_predecessor = None;
         if state.lineage.is_some() && state.lineage != head.lineage_id {
             return Err(transient("async lineage changed"));
         }

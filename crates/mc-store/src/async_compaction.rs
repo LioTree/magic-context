@@ -613,8 +613,10 @@ impl McStore {
                     .prepare("SELECT version,engine_json FROM mc_async_compaction_views WHERE session_ref=?1 AND engine_json IS NOT NULL ORDER BY version")?
                     .query_map([session_ref], |row| Ok((row.get(0)?, row.get(1)?)))?
                     .collect::<rusqlite::Result<_>>()?;
+                // Equality probes use the existing (session_ref, slot) key.
+                // Excluding archive prefixes would still visit every cold key.
                 let baselines = conn
-                    .prepare("SELECT slot,view_json FROM mc_async_compaction_baselines WHERE session_ref=?1 AND slot NOT GLOB 'undo-native-edits:*' AND slot NOT GLOB 'published-cut:*' AND slot NOT GLOB 'published-cut-meta:*' AND slot NOT GLOB 'published-cut-candidate:*' AND slot NOT GLOB 'published-cut-root:*' AND slot NOT GLOB 'cut-history:*' AND slot NOT GLOB 'cut:*'")?
+                    .prepare("SELECT slot,view_json FROM mc_async_compaction_baselines WHERE session_ref=?1 AND slot IN ('applied','produced','frozen_edits','retired_native_edits','pending-cut-stage')")?
                     .query_map([session_ref], |row| Ok((row.get(0)?, row.get(1)?)))?
                     .collect::<rusqlite::Result<_>>()?;
                 Ok(Some(AsyncCompactionRows {
@@ -1046,6 +1048,79 @@ mod tests {
     use std::time::Instant;
 
     #[test]
+    fn final_ordinary_load_work_is_independent_of_retained_cut_count() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = McStore::open(&StorageDescriptor {
+            module_id: "magic-context".into(),
+            storage_namespace: "mc_cache".into(),
+            isolation: Isolation::Module,
+            backend: StorageBackend::Sqlite {
+                path: dir.path().join("store.db").to_string_lossy().into_owned(),
+            },
+        })
+        .unwrap();
+        // Extract the actual loader statement so a query fix cannot leave a
+        // copied, obsolete SQL string masquerading as a production witness.
+        let source = include_str!("async_compaction.rs");
+        let loader = source
+            .split_once("pub fn load_async_compaction_rows(")
+            .unwrap()
+            .1;
+        let query = loader
+            .lines()
+            .find_map(|line| {
+                line.trim()
+                    .strip_prefix(".prepare(\"SELECT slot,view_json")
+                    .and_then(|rest| rest.strip_suffix("\")?"))
+                    .map(|rest| format!("SELECT slot,view_json{rest}"))
+            })
+            .unwrap();
+        let mut measurements = Vec::new();
+        for cuts in [8, 128, 512] {
+            let mut save = store.async_compaction_save("ref", "key", "session", "{}");
+            save.baseline("frozen_edits", Some("live".into()));
+            for first in 0..cuts {
+                for prefix in [
+                    "published-cut",
+                    "published-cut-meta",
+                    "published-cut-candidate",
+                    "published-cut-root",
+                    "cut-history",
+                ] {
+                    save.baseline(
+                        format!("{prefix}:{first:020}:branch"),
+                        Some("archive".repeat(128)),
+                    );
+                }
+            }
+            save.commit().unwrap();
+            assert_eq!(
+                store
+                    .load_async_compaction_rows("ref")
+                    .unwrap()
+                    .unwrap()
+                    .baselines,
+                vec![("frozen_edits".into(), "live".into())]
+            );
+            let steps = store.inner.with_read(|conn| {
+                let plan = conn.prepare(&format!("EXPLAIN QUERY PLAN {query}"))?
+                    .query_map(["ref"], |row| row.get::<_, String>(3))?
+                    .collect::<rusqlite::Result<Vec<_>>>()?;
+                let mut stmt = conn.prepare(&query)?;
+                let rows = stmt.query_map(["ref"], |row| row.get::<_, String>(0))?
+                    .collect::<rusqlite::Result<Vec<_>>>()?;
+                assert_eq!(rows, vec!["frozen_edits"]);
+                let steps = stmt.get_status(rusqlite::StatementStatus::VmStep);
+                eprintln!("FINAL ordinary-load cuts={cuts} archive_rows={} hot_rows={} vm_steps={steps} plan={plan:?}", cuts * 5, rows.len());
+                Ok(steps)
+            }).unwrap();
+            measurements.push(steps);
+        }
+        assert!(measurements[2] <= measurements[0] * 2 + 100,
+            "ordinary load still walks retained cuts: VM steps {measurements:?} for 8/128/512 cuts with identical returned hot rows");
+    }
+
+    #[test]
     fn undo_edit_archives_are_not_hydrated_on_ordinary_loads() {
         let dir = tempfile::tempdir().unwrap();
         let store = McStore::open(&StorageDescriptor {
@@ -1258,6 +1333,52 @@ mod tests {
                 .as_deref(),
             Some("without-cut")
         );
+    }
+
+    #[test]
+    fn final_f03_active_cut_root_change_prevents_archive_deletion() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = McStore::open(&StorageDescriptor {
+            module_id: "magic-context".into(),
+            storage_namespace: "mc_cache".into(),
+            isolation: Isolation::Module,
+            backend: StorageBackend::Sqlite {
+                path: dir.path().join("store.db").to_string_lossy().into_owned(),
+            },
+        })
+        .unwrap();
+        let mut save = store.async_compaction_save("ref", "key", "session", "{}");
+        save.baseline(
+            "cut:100",
+            Some(r#"{"recovery_history_ref":{"root":"c:old"}}"#.into()),
+        );
+        save.immutable_baseline("cut-history:c:old", "old payload".into());
+        save.commit().unwrap();
+        let (roots, objects) = store.async_cut_history_index("ref").unwrap();
+        assert_eq!(objects, vec!["cut-history:c:old".to_owned()]);
+        // After taking the root snapshot, change only cut:100 from c:old to c:new.
+        let mut save = store.async_compaction_save("ref", "key", "session", "{}");
+        save.baseline(
+            "cut:100",
+            Some(r#"{"recovery_history_ref":{"root":"c:new"}}"#.into()),
+        );
+        save.immutable_baseline("cut-history:c:new", "new payload".into());
+        save.commit().unwrap();
+        assert!(!store
+            .discard_async_cut_history_objects("ref", &objects, &roots)
+            .unwrap());
+        assert!(store
+            .load_async_compaction_baseline("ref", "cut-history:c:old")
+            .unwrap()
+            .is_some());
+        let (current_roots, _) = store.async_cut_history_index("ref").unwrap();
+        assert!(store
+            .discard_async_cut_history_objects("ref", &objects, &current_roots)
+            .unwrap());
+        assert!(store
+            .load_async_compaction_baseline("ref", "cut-history:c:old")
+            .unwrap()
+            .is_none());
     }
 
     #[test]

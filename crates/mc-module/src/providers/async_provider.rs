@@ -177,6 +177,10 @@ enum ReadProgress {
 #[derive(Default)]
 pub(crate) struct Runtime {
     #[cfg(test)]
+    policy_probe_enabled: std::sync::atomic::AtomicBool,
+    #[cfg(test)]
+    policy_probe: Mutex<Option<PolicyProbe>>,
+    #[cfg(test)]
     completed_notice: std::sync::atomic::AtomicU64,
     #[cfg(test)]
     historian_evaluations: std::sync::atomic::AtomicU64,
@@ -318,6 +322,18 @@ pub(crate) struct AsyncRecord {
     #[serde(skip)]
     applied_view: Option<EngineView>,
     lineage: Option<String>,
+    /// Explicit selection starts a new acknowledgement-ancestry root. Verified
+    /// source descents may extend it; acknowledgement headers never do.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    ack_lineage_root: Option<String>,
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    ack_selection_pending: bool,
+    /// Source-only receipts survive partial reads until the actual lineage can
+    /// qualify them. The owner comes from the stored public view, not the ack.
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+    pending_native_acks: BTreeMap<u64, String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    native_setup_predecessor: Option<SetupNativePredecessor>,
     /// The held transcript, stored one row per ordinal in
     /// `mc_async_compaction_entries`.
     #[serde(skip)]
@@ -403,6 +419,50 @@ fn deserialize_logical_prefix<'de, D: serde::Deserializer<'de>>(
     Ok(serde_json::from_value(value).ok().map(Arc::new))
 }
 type State = AsyncRecord;
+
+#[cfg(test)]
+type PolicyProbe = (u64, Option<u64>, Vec<String>);
+
+#[derive(Serialize, Deserialize)]
+struct SetupNativePredecessor {
+    lineage: String,
+    replaced_by: String,
+    #[serde(default)]
+    ack_seq: u64,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    ack_version: Option<u64>,
+}
+
+#[derive(Serialize, Deserialize, PartialEq, Eq)]
+struct VerifiedAckDescent {
+    lineage: String,
+    parent: String,
+    root: String,
+    through: u64,
+}
+
+fn ack_descent_slot(lineage: &str) -> String {
+    format!(
+        "verified-lineage:{}",
+        contract::digest::content_digest(&json!(lineage))
+    )
+}
+
+fn log_foreign_ack_once(reference: &str, version: u64) {
+    static LOGGED: OnceLock<Mutex<HashSet<String>>> = OnceLock::new();
+    if LOGGED
+        .get_or_init(Default::default)
+        .lock()
+        .expect("foreign ack log")
+        .insert(reference.to_owned())
+    {
+        tracing::warn!(
+            session_ref = reference,
+            version,
+            "ignoring acknowledgement without a verified current compaction lineage"
+        );
+    }
+}
 
 /// The error code of an engine refusal that retrying the same input cannot
 /// clear: the conversation's state or transcript breaks the engine's
@@ -600,6 +660,10 @@ struct DropSource {
 #[derive(Serialize, Deserialize)]
 struct ResyncSources {
     namespace: String,
+    #[serde(default)]
+    lineage: Option<String>,
+    #[serde(default)]
+    from_start: bool,
     history: Vec<HistorySource>,
     drops: Vec<DropSource>,
     queued_count: usize,
@@ -853,6 +917,252 @@ pub(super) fn route_records(
 }
 
 impl State {
+    fn remember_verified_ack_descent(
+        &mut self,
+        store: &McStore,
+        lineage: &str,
+        parent: &str,
+        through: u64,
+    ) -> Result<(), HandlerOutcome> {
+        let root = self
+            .ack_lineage_root
+            .get_or_insert_with(|| parent.to_owned())
+            .clone();
+        let record = VerifiedAckDescent {
+            lineage: lineage.to_owned(),
+            parent: parent.to_owned(),
+            root,
+            through,
+        };
+        let slot = ack_descent_slot(lineage);
+        if let Some(raw) = store
+            .load_async_compaction_baseline(&self.reference(), &slot)
+            .map_err(transient)?
+        {
+            if serde_json::from_str::<VerifiedAckDescent>(&raw)
+                .ok()
+                .as_ref()
+                != Some(&record)
+            {
+                // Reused or damaged lineage identities cannot grant ancestry.
+                self.ack_lineage_root = Some(lineage.to_owned());
+            }
+            return Ok(());
+        }
+        let reference = self.reference();
+        let key = self.key.store_key().conversation_key();
+        let header = serde_json::to_string(self).map_err(transient)?;
+        let mut save = store.async_compaction_save(&reference, &key, &self.key.session, &header);
+        save.immutable_baseline(slot, serde_json::to_string(&record).map_err(transient)?);
+        save.commit().map_err(transient)?;
+        Ok(())
+    }
+
+    fn recorded_ack_ancestor(
+        &self,
+        store: &McStore,
+        ancestor: &str,
+    ) -> Result<bool, HandlerOutcome> {
+        let (Some(current), Some(root)) = (&self.lineage, &self.ack_lineage_root) else {
+            return Ok(false);
+        };
+        let mut cursor = current.clone();
+        let mut visited = HashSet::new();
+        while cursor != *root && visited.insert(cursor.clone()) {
+            let Some(raw) = store
+                .load_async_compaction_baseline(&self.reference(), &ack_descent_slot(&cursor))
+                .map_err(transient)?
+            else {
+                return Ok(false);
+            };
+            let Ok(record) = serde_json::from_str::<VerifiedAckDescent>(&raw) else {
+                return Ok(false);
+            };
+            if record.lineage != cursor || record.root != *root {
+                return Ok(false);
+            }
+            if record.parent == ancestor {
+                return Ok(true);
+            }
+            cursor = record.parent;
+        }
+        Ok(false)
+    }
+
+    fn record_restored_ack_descent(&mut self, store: &McStore) -> Result<(), HandlerOutcome> {
+        let Some(current) = self.lineage.clone() else {
+            return Ok(());
+        };
+        let Some(sources) = &self.resync_sources else {
+            return Ok(());
+        };
+        if sources.lineage.as_deref() == Some(current.as_str())
+            || self.ack_lineage_root.as_deref() == Some(current.as_str())
+        {
+            return Ok(());
+        }
+        // A lost-state restore can omit descends_from. Certify it independently
+        // of acknowledgements only when the entire previously held transcript
+        // prefix, starting at zero, is still present with identical identities.
+        let complete = self.ack_lineage_root.is_some()
+            && sources.from_start
+            && self.lineage_first_ordinal == 0
+            && !sources.messages.is_empty()
+            && sources
+                .messages
+                .iter()
+                .enumerate()
+                .all(|(ordinal, source)| {
+                    self.entries
+                        .get(&(ordinal as u64))
+                        .filter(|entry| entry.mid == source.mid)
+                        .and_then(|entry| entry.read().ok())
+                        .and_then(|entry| served_digest(&entry).ok())
+                        .as_deref()
+                        == Some(source.digest.as_str())
+                });
+        if complete {
+            if let Some(parent) = sources.lineage.clone() {
+                let through = sources.messages.len() as u64 - 1;
+                self.remember_verified_ack_descent(store, &current, &parent, through)?;
+                return Ok(());
+            }
+        }
+        self.ack_lineage_root = Some(current);
+        Ok(())
+    }
+
+    fn applied_lineage(
+        &self,
+        store: &McStore,
+        version: u64,
+    ) -> Result<Option<String>, HandlerOutcome> {
+        // Public ownership is separate from a rebased engine range/counter.
+        // Older cache rows without that metadata fall back to the public view.
+        if let Some(lineage) = self
+            .published_engine
+            .get(&version)
+            .and_then(|view| view.publication_lineage.as_ref())
+        {
+            return Ok(Some(lineage.clone()));
+        }
+        store
+            .load_async_compaction_view(&self.reference(), version)
+            .map_err(transient)?
+            .map(|raw| {
+                serde_json::from_str::<view::CompactionView>(&raw)
+                    .map(|view| view.lineage_id)
+                    .map_err(transient)
+            })
+            .transpose()
+    }
+
+    fn normalize_notice_ack(
+        &self,
+        store: &McStore,
+        notice: &mut notice::AdvanceNotice,
+    ) -> Result<(), HandlerOutcome> {
+        let acknowledged_lineage = notice
+            .applied_view_version
+            .map(|version| self.applied_lineage(store, version))
+            .transpose()?
+            .flatten();
+        let foreign_ack = if notice.applied_view_version.is_some() {
+            self.lineage.is_none() || acknowledged_lineage.as_deref() != self.lineage.as_deref()
+        } else {
+            false
+        };
+        if foreign_ack {
+            let recorded_ancestor = acknowledged_lineage
+                .as_deref()
+                .map(|lineage| self.recorded_ack_ancestor(store, lineage))
+                .transpose()?
+                .unwrap_or(false);
+            // resolve_native_acks qualifies native source evidence separately.
+            // Foreign publications supply no view, summary, baseline or pass
+            // facts. Unrelated acknowledgements are ignored rather than retried.
+            if !recorded_ancestor
+                && !acknowledged_lineage
+                    .as_deref()
+                    .is_some_and(|owner| self.is_native_setup_predecessor(owner))
+            {
+                log_foreign_ack_once(
+                    &self.reference(),
+                    notice
+                        .applied_view_version
+                        .expect("foreign acknowledgement"),
+                );
+            }
+            let rejected = notice
+                .applied_view_version
+                .expect("foreign acknowledgement");
+            notice.events.retain(|event| match event {
+                // Do not reassign the rejected applied_view_version's marker
+                // or companion facts to the current-lineage baseline.
+                notice::Event::MarkerOutcome { .. } => false,
+                notice::Event::ViewDeferred { view_version, .. }
+                | notice::Event::ViewRefused { view_version, .. }
+                | notice::Event::ViewCompanion { view_version, .. } => *view_version != rejected,
+                _ => true,
+            });
+            notice.applied_view_version = match self.applied {
+                Some(version)
+                    if self.lineage.is_some()
+                        && self.applied_lineage(store, version)?.as_deref()
+                            == self.lineage.as_deref() =>
+                {
+                    Some(version)
+                }
+                _ => None,
+            };
+        }
+        Ok(())
+    }
+
+    fn adopt_notice_ack(
+        &mut self,
+        store: &McStore,
+        notice: &mut notice::AdvanceNotice,
+    ) -> Result<(), HandlerOutcome> {
+        self.remember_notice_native_ack(store, notice)?;
+        self.resolve_native_acks(store)?;
+        self.normalize_notice_ack(store, notice)?;
+        if let Some(version) = notice.applied_view_version.filter(|version| {
+            self.frozen_edits_version != Some(*version)
+                && !notice.events.iter().any(|event| {
+                    matches!(event,
+                    notice::Event::ViewDeferred { view_version, .. }
+                    | notice::Event::ViewRefused { view_version, .. } if view_version == version)
+                })
+        }) {
+            self.capture_frozen_version(store, version)?;
+            self.frozen_edits_version = Some(version);
+        }
+        self.applied = notice.applied_view_version;
+        // Repeated acknowledgements do not rewrite an unchanged baseline.
+        if let Some(applied) = self
+            .applied
+            .and_then(|version| self.published_engine.get(&version))
+            .filter(|view| Some(&view.identity.1.lineage_id) == self.lineage.as_ref())
+            .filter(|view| {
+                self.applied_view.as_ref().map(|held| &held.identity) != Some(&view.identity)
+            })
+        {
+            self.applied_view = Some(applied.clone());
+        }
+        self.acknowledgements = notice.events.iter().map(notice::Event::token).collect();
+        for token in &self.acknowledgements {
+            if let Some(outcome) = token.strip_prefix("marker_outcome:") {
+                if let Some((result, cut)) = outcome.split_once(':') {
+                    self.marker_outcomes.insert(cut.into(), result.into());
+                }
+            }
+        }
+        self.conditions = Some(notice.to_headers());
+        // Accepted wire facts must survive even if the next engine pass fails.
+        self.save(store, &[])
+    }
+
     fn runner_identity(&self) -> session_resolver::RunnerBindIdentity {
         self.runner_identity.clone()
     }
@@ -952,7 +1262,17 @@ impl State {
             })
             .fold(applied, u64::min)
         });
+        let retain_from = retain_from.map(|floor| {
+            self.native_setup_predecessor
+                .as_ref()
+                .and_then(|prior| prior.ack_version)
+                .map_or(floor, |version| floor.min(version))
+        });
         if let Some(floor) = retain_from {
+            let floor = self
+                .pending_native_acks
+                .first_key_value()
+                .map_or(floor, |(version, _)| floor.min(*version));
             self.retired_frozen.retain_from(floor);
         }
         let mut appended = Vec::new();
@@ -1169,6 +1489,10 @@ impl State {
     /// takes it on. A held conversation already bound to a lineage, or one
     /// a resync emptied, has nothing to rebind.
     fn adopt_first_lineage(&mut self, lineage: &str) -> Result<(), HandlerOutcome> {
+        if self.ack_selection_pending {
+            self.ack_lineage_root = Some(lineage.to_owned());
+            self.ack_selection_pending = false;
+        }
         let unbound = |view: &Option<EngineView>| {
             view.as_ref()
                 .is_some_and(|view| view.identity.1.lineage_id.is_empty())
@@ -1428,21 +1752,152 @@ impl State {
         store: &McStore,
         version: u64,
     ) -> Result<(), HandlerOutcome> {
+        if let Some(edits) = self.frozen_version_sources(store, version)? {
+            self.frozen_edits.merge(&edits);
+        }
+        Ok(())
+    }
+
+    fn frozen_version_sources(
+        &self,
+        store: &McStore,
+        version: u64,
+    ) -> Result<Option<Arc<frozen_edits::FrozenEdits>>, HandlerOutcome> {
         if let Some(edits) = self
             .published_engine
             .get(&version)
             .and_then(|view| view.frozen_edits.as_ref())
             .or_else(|| self.retired_frozen.views.get(&version))
         {
-            self.frozen_edits.merge(edits);
+            return Ok(Some(Arc::clone(edits)));
         } else if let Some(raw) = store
             .load_async_compaction_view(&self.reference(), version)
             .map_err(transient)?
         {
-            // Older stored views lack publication-time provenance. Preserve only
-            // edits for which this conversation still holds a source identity.
-            let view = serde_json::from_str(&raw).map_err(transient)?;
-            self.frozen_edits.capture(&view, &self.entries)?;
+            // Legacy views have no publication provenance. Only held rows from
+            // that same lineage can supply their original source identities.
+            let view: view::CompactionView = serde_json::from_str(&raw).map_err(transient)?;
+            if Some(&view.lineage_id) == self.lineage.as_ref() {
+                let mut edits = frozen_edits::FrozenEdits::default();
+                edits.capture(&view, &self.entries)?;
+                return Ok(Some(Arc::new(edits)));
+            }
+        }
+        Ok(None)
+    }
+
+    fn remember_frozen_version(
+        &mut self,
+        store: &McStore,
+        version: u64,
+    ) -> Result<(), HandlerOutcome> {
+        if !self.retired_frozen.views.contains_key(&version) {
+            if let Some(edits) = self.frozen_version_sources(store, version)? {
+                // This is publication evidence, not an accepted acknowledgement.
+                // Cache it through reset/partial reads. resolve_native_acks checks
+                // publication ownership and stored ancestry after paging completes.
+                self.retired_frozen.views.insert(version, edits);
+                self.retired_frozen.dirty = true;
+            }
+        }
+        Ok(())
+    }
+
+    fn remember_notice_native_ack(
+        &mut self,
+        store: &McStore,
+        notice: &notice::AdvanceNotice,
+    ) -> Result<(), HandlerOutcome> {
+        if let Some(version) = notice.applied_view_version.filter(|version| {
+            self.native_setup_predecessor.is_some()
+                && !notice.events.iter().any(|event| {
+                    matches!(event,
+                    notice::Event::ViewDeferred { view_version, .. }
+                    | notice::Event::ViewRefused { view_version, .. } if view_version == version)
+                })
+        }) {
+            let owner = self.applied_lineage(store, version)?;
+            let predecessor = owner
+                .as_deref()
+                .is_some_and(|owner| self.is_native_setup_predecessor(owner));
+            let current = self.lineage.is_some() && owner == self.lineage;
+            if let Some(prior) = self
+                .native_setup_predecessor
+                .as_mut()
+                .filter(|prior| (predecessor || current) && notice.seq >= prior.ack_seq)
+            {
+                prior.ack_seq = notice.seq;
+                prior.ack_version = predecessor.then_some(version);
+            }
+        }
+        if let Some(version) = notice.applied_view_version.filter(|version| {
+            self.frozen_edits_version != Some(*version)
+                && !notice.events.iter().any(|event| {
+                    matches!(event,
+                    notice::Event::ViewDeferred { view_version, .. }
+                    | notice::Event::ViewRefused { view_version, .. } if view_version == version)
+                })
+        }) {
+            self.remember_frozen_version(store, version)?;
+            if self.retired_frozen.views.contains_key(&version) {
+                if let Some(owner) = self.applied_lineage(store, version)? {
+                    self.pending_native_acks.entry(version).or_insert(owner);
+                }
+            }
+        }
+        Ok(())
+    }
+
+    fn is_native_setup_predecessor(&self, owner: &str) -> bool {
+        self.native_setup_predecessor.as_ref().is_some_and(|prior| {
+            prior.lineage == owner && self.lineage.as_deref() == Some(prior.replaced_by.as_str())
+        })
+    }
+
+    fn resolve_native_acks(&mut self, store: &McStore) -> Result<(), HandlerOutcome> {
+        let Some(current) = &self.lineage else {
+            return Ok(());
+        };
+        let mut resolved = Vec::new();
+        for (version, owner) in &self.pending_native_acks {
+            if owner == current || self.recorded_ack_ancestor(store, owner)? {
+                let edits = self
+                    .frozen_version_sources(store, *version)?
+                    .ok_or_else(|| transient("native acknowledgement provenance missing"))?;
+                // These are acknowledged source facts, including temporarily
+                // absent parts. Replay checks the current identity and digest;
+                // no ancestor view, summary or pass facts are adopted here.
+                self.frozen_edits.merge(&edits);
+            } else if !self.is_native_setup_predecessor(owner) {
+                log_foreign_ack_once(&self.reference(), *version);
+            }
+            resolved.push(*version);
+        }
+        for version in resolved {
+            self.pending_native_acks.remove(&version);
+        }
+        if let Some(version) = self
+            .native_setup_predecessor
+            .as_ref()
+            .filter(|prior| self.is_native_setup_predecessor(&prior.lineage))
+            .and_then(|prior| prior.ack_version)
+        {
+            // Contract §§5.1–5.2 makes applied_view_version a durable ACK:
+            // the next view is built against what the runner renders now.
+            // Remember only that public version when its sources are absent;
+            // no native fact transfers until an exact source is present. A
+            // later notice need not repeat the ACK when those sources return.
+            // Only the directly replaced lineage qualifies; its summaries,
+            // coverage, baselines and pass facts remain forbidden.
+            let matched = self
+                .frozen_version_sources(store, version)?
+                .map(|edits| edits.matching_sources(&self.mid_index, &self.entries))
+                .transpose()?
+                .unwrap_or_default();
+            if matched.retained_bytes == 0 {
+                log_foreign_ack_once(&self.reference(), version);
+            }
+            self.frozen_edits.merge(&matched);
         }
         Ok(())
     }
@@ -1569,6 +2024,12 @@ impl State {
             });
             self.resync_sources = Some(ResyncSources {
                 namespace,
+                lineage: self.lineage.clone(),
+                from_start: self.lineage_first_ordinal == 0
+                    && self
+                        .entries
+                        .first_key_value()
+                        .is_some_and(|(ordinal, _)| *ordinal == 0),
                 history,
                 drops,
                 queued_count: queued.len(),
@@ -2031,6 +2492,22 @@ impl McHandler {
                 prior.capture_resync_sources(store)?;
                 state.resync_sources = prior.resync_sources.take();
                 state.frozen_edits.merge(&prior.frozen_edits);
+                for version in prior.published_engine.keys().copied().collect::<Vec<_>>() {
+                    prior.remember_frozen_version(store, version)?;
+                }
+                state.retired_frozen = prior.retired_frozen;
+                state.retired_frozen.dirty = true;
+                if !unsafe_existing {
+                    state.native_setup_predecessor = prior
+                        .lineage
+                        .zip(request.lineage_id.clone())
+                        .map(|(lineage, replaced_by)| SetupNativePredecessor {
+                            lineage,
+                            replaced_by,
+                            ack_seq: 0,
+                            ack_version: None,
+                        });
+                }
                 for archive in store.load_async_undo_edits(&reference).map_err(transient)? {
                     state
                         .frozen_edits
@@ -2278,6 +2755,10 @@ impl McHandler {
             produced_view: None,
             applied_view: None,
             lineage: request.lineage_id.clone(),
+            ack_lineage_root: request.lineage_id.clone(),
+            ack_selection_pending: request.lineage_id.is_none(),
+            pending_native_acks: BTreeMap::new(),
+            native_setup_predecessor: None,
             entries: Default::default(),
             mid_index: BTreeMap::new(),
             aggregates: Default::default(),
@@ -3697,7 +4178,7 @@ impl McHandler {
         account: &str,
         message: &cortexkit_bus_trait::Message,
     ) -> Result<(), HandlerOutcome> {
-        let notice = notice::AdvanceNotice::from_headers(&message.headers)
+        let mut notice = notice::AdvanceNotice::from_headers(&message.headers)
             .map_err(|e| invalid_field("notice", e.name()))?;
         if bus_id(&notice.session_ref, "advanced", notice.seq) != message.id
             || notice.digest() != message.digest.to_string()
@@ -3798,18 +4279,13 @@ impl McHandler {
             return Ok(());
         }
         let duplicate = notice.seq <= state.seq;
-        // A historian replacement can move its covered message range backward.
-        // Capture acknowledged edits before coverage pruning evicts their engine units.
-        if !duplicate {
-            if let Some(version) = notice.applied_view_version.filter(|version| {
-                state.frozen_edits_version != Some(*version)
-                    && !notice.events.iter().any(|event| matches!(event,
-                        notice::Event::ViewDeferred { view_version, .. }
-                        | notice::Event::ViewRefused { view_version, .. } if view_version == version))
-            }) {
-                state.capture_frozen_version(store, version)?;
-                state.frozen_edits_version = Some(version);
-            }
+        state.remember_notice_native_ack(store, &notice)?;
+        if notice.seq < state.seq && state.completed_seq < state.seq {
+            // An older retry cannot complete a newer notice's partial read.
+            // Preserve its source receipt without replacing the newer facts.
+            state.save(store, &[])?;
+            self.checkin(state);
+            return Ok(());
         }
         let mut descended = false;
         if let Some(lineage) = message
@@ -3835,6 +4311,7 @@ impl McHandler {
             };
             if let Some(through) = through {
                 let parent = state.lineage.clone().expect("held lineage");
+                state.remember_verified_ack_descent(store, lineage, &parent, through)?;
                 // A fork can cut away source identities needed by a later restore.
                 // Capture acknowledged edits before dropping those held entries.
                 if let Some(version) = state.applied {
@@ -3876,28 +4353,6 @@ impl McHandler {
             }
         }
         if !duplicate {
-            state.applied = notice.applied_view_version;
-            // Re-assign (and so re-store) the baseline only when the runner
-            // acknowledges a different view; it repeats its applied version on
-            // every notice.
-            if let Some(applied) = state
-                .applied
-                .and_then(|version| state.published_engine.get(&version))
-                .filter(|view| Some(&view.identity.1.lineage_id) == state.lineage.as_ref())
-                .filter(|view| {
-                    state.applied_view.as_ref().map(|held| &held.identity) != Some(&view.identity)
-                })
-            {
-                state.applied_view = Some(applied.clone());
-            }
-            state.acknowledgements = notice.events.iter().map(notice::Event::token).collect();
-            for token in &state.acknowledgements {
-                if let Some(outcome) = token.strip_prefix("marker_outcome:") {
-                    if let Some((result, cut)) = outcome.split_once(':') {
-                        state.marker_outcomes.insert(cut.into(), result.into());
-                    }
-                }
-            }
             state.seq = notice.seq;
             state.conditions = Some(notice.to_headers());
         }
@@ -3961,13 +4416,43 @@ impl McHandler {
         }
         #[cfg(test)]
         drop(phase);
+        state.record_restored_ack_descent(store)?;
         #[cfg(test)]
         let phase = scaling_tests::save_meter::start_kind(&notice.session_ref, "phase:index");
         state.ingest_read(store, codec)?;
+        if state.completed_seq < notice.seq || resuming {
+            // Reset clears the read lineage, and ingestion normalizes served
+            // source parts. Validate acknowledgements only after both recover.
+            state.adopt_notice_ack(store, &mut notice)?;
+        } else {
+            state.normalize_notice_ack(store, &mut notice)?;
+            if !state.pending_native_acks.is_empty() {
+                state.resolve_native_acks(store)?;
+                state.save(store, &[])?;
+            }
+        }
         #[cfg(test)]
         drop(phase);
         #[cfg(test)]
         let phase = scaling_tests::save_meter::start_kind(&notice.session_ref, "phase:policy");
+        #[cfg(test)]
+        if self
+            .provider_store
+            .async_runtime
+            .policy_probe_enabled
+            .load(std::sync::atomic::Ordering::Relaxed)
+        {
+            *self
+                .provider_store
+                .async_runtime
+                .policy_probe
+                .lock()
+                .unwrap() = Some((
+                notice.seq,
+                notice.applied_view_version,
+                notice.events.iter().map(notice::Event::token).collect(),
+            ));
+        }
         self.advance_async_policy(&mut state, &notice, codec)?;
         #[cfg(test)]
         drop(phase);
@@ -4164,6 +4649,11 @@ impl McHandler {
                     #[cfg(test)]
                     let held = held.counted_as(state.reference());
                     state.entries.insert(entry.ordinal, Arc::new(held));
+                    // Undo can reintroduce an archived source after the first
+                    // post-Setup read. Look up the newly held window again so
+                    // an acknowledged drop cannot disappear on a later page.
+                    state.pending_undo_edits |=
+                        state.cut_first_ordinal.is_some() || state.setup.descends_from.is_some();
                 }
             }
             let Some(next) = page["next_from_ordinal"].as_u64() else {
@@ -4787,11 +5277,13 @@ impl McHandler {
             view: &'a transform::compaction::View,
             native_frozen_edits: &'a frozen_edits::FrozenEdits,
             history_through: Option<u64>,
+            publication_lineage: &'a str,
         }
         let engine_json: Arc<str> = serde_json::to_string(&PublishedEngine {
             view: &candidate,
             native_frozen_edits: &frozen_edits,
             history_through: coverage,
+            publication_lineage: &view.lineage_id,
         })
         .map_err(transient)?
         .into();
@@ -4806,7 +5298,8 @@ impl McHandler {
         state.published_engine.insert(
             version,
             EngineView::with_json(&candidate, Arc::clone(&engine_json))
-                .with_frozen_edits(frozen_edits),
+                .with_frozen_edits(frozen_edits)
+                .with_publication_lineage(view.lineage_id.clone()),
         );
         // The produced baseline is this published view; adopting after the
         // insert shares its serialized form instead of serializing it again.

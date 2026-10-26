@@ -113,6 +113,7 @@ pub(super) struct EngineView {
     pub(super) identity: ViewIdentity,
     pub(super) json: Arc<str>,
     pub(super) frozen_edits: Option<Arc<frozen_edits::FrozenEdits>>,
+    pub(super) publication_lineage: Option<String>,
 }
 
 impl EngineView {
@@ -128,11 +129,17 @@ impl EngineView {
             identity: view_identity(view),
             json,
             frozen_edits: None,
+            publication_lineage: None,
         }
     }
 
     pub(super) fn with_frozen_edits(mut self, edits: frozen_edits::FrozenEdits) -> Self {
         self.frozen_edits = Some(Arc::new(edits));
+        self
+    }
+
+    pub(super) fn with_publication_lineage(mut self, lineage: String) -> Self {
+        self.publication_lineage = Some(lineage);
         self
     }
 
@@ -146,12 +153,15 @@ impl EngineView {
             replacement: Vec<serde::de::IgnoredAny>,
             #[serde(default)]
             native_frozen_edits: Option<frozen_edits::FrozenEdits>,
+            #[serde(default)]
+            publication_lineage: Option<String>,
         }
         let head: Head = serde_json::from_str(&json).map_err(transient)?;
         Ok(Self {
             identity: (head.version, head.range, head.replacement.len()),
             json: json.into(),
             frozen_edits: head.native_frozen_edits.map(Arc::new),
+            publication_lineage: head.publication_lineage,
         })
     }
 
