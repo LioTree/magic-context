@@ -15985,26 +15985,16 @@ impl McHandler {
                             let automated_tx = agent_tx.automated();
                             let tx = if automated { &automated_tx } else { agent_tx };
                             if automated { tx.check_memory_revisions(&expected_revisions)?; }
-                            let (mut memory, superseded_ids) = tx
-                                .merge_memories_canonical(
+                            let (memory, superseded_ids) = tx
+                                .merge_memories_canonical_with_category(
                                     memory_project,
                                     &ids,
                                     content,
                                     Some(conversation_key),
                                     now_ms(),
+                                    category,
                                 )
                                 .map_err(|error| request_context.render_mutation_error(error))?;
-                            if category.is_some_and(|category| category != memory.category) {
-                                memory = tx
-                                    .update_memory_content(
-                                        memory_project,
-                                        memory.id,
-                                        content,
-                                        category,
-                                        now_ms(),
-                                    )
-                                    .map_err(|error| request_context.render_mutation_error(error))?;
-                            }
                             let rendered_inputs = ids.clone();
                             let mut lines = superseded_ids.iter().map(|id| format!("  <superseded id=\"{id}\" by=\"{}\"/>",memory.id)).collect::<Vec<_>>();
                             let shown = shown_projection.as_ref().is_some_and(|shown| shown.shows_text(memory.id,&memory.content));

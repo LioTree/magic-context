@@ -44,6 +44,7 @@ pub struct RetrospectiveHost<C: DreamCarrier> {
     store: Arc<McStore>,
     context: Arc<TaskContext>,
     attempts: Vec<Attempt>,
+    authority: Option<mc_store::memory_levels::RunAuthority>,
 }
 
 impl<C: DreamCarrier> RetrospectiveHost<C> {
@@ -53,11 +54,20 @@ impl<C: DreamCarrier> RetrospectiveHost<C> {
             store,
             context,
             attempts: Vec::new(),
+            authority: None,
         }
     }
 
     pub fn attempts(&self) -> &[Attempt] {
         &self.attempts
+    }
+
+    pub fn with_authority(
+        mut self,
+        authority: Option<mc_store::memory_levels::RunAuthority>,
+    ) -> Self {
+        self.authority = authority;
+        self
     }
 
     /// Reads the authoritative context checkpoint, then runs gate/deepen without
@@ -198,7 +208,9 @@ impl<C: DreamCarrier> RetrospectiveHost<C> {
             &commit,
             |tx| self.check_commit_fence(tx),
             |tx| {
-                let mut actions = MemoryActions::default();
+                let mut actions = MemoryActions::with_memory_writer(
+                    self.store.run_memory_writer(self.authority.clone()),
+                );
                 for (index, row) in batch.memory_writes.iter().enumerate() {
                     let key = format!(
                         "dream:retrospective:{project}:{}:{index}",
@@ -726,6 +738,72 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn dream_host_create_placement_and_hook_uses_run_authority() {
+        use mc_store::memory_levels::*;
+        let f = Fixture::new(TaskName::Retrospective);
+        let events = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
+        let captured = events.clone();
+        f.store
+            .set_memory_create_hook(Some(std::sync::Arc::new(move |_, event| {
+                captured.lock().unwrap().push(event.clone());
+                Ok(())
+            })));
+        let authority = RunAuthority {
+            project_id: Some("run-project".into()),
+            profile: Some(OriginProfile {
+                name: "@cortexkit/memory-swe".into(),
+                version: "1.0.0".into(),
+                digest: "run-profile".into(),
+            }),
+            state: "resolved".into(),
+            snapshot_digest: Some("run-snapshot".into()),
+            category_ids: std::collections::BTreeMap::from([(
+                "PROJECT_RULES".into(),
+                "swe:project-rules".into(),
+            )]),
+        };
+        let mut host = f.host(f.carrier()).with_authority(Some(authority));
+        let result = host
+            .run_retrospective(&FixtureReader, &ScanOptions::default(), true)
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(result.memory_written, 1);
+        let events = events.lock().unwrap();
+        assert_eq!(events.len(), 1);
+        let event = &events[0];
+        assert_eq!(event.actor, Actor::Dreamer);
+        assert_eq!(event.kind, CreateKind::Create);
+        assert_eq!(event.session_id, None);
+        assert_eq!(event.ordinals, Vec::<i64>::new());
+        assert_eq!(
+            event.owner,
+            Some(Owner {
+                kind: "project".into(),
+                id: "run-project".into()
+            })
+        );
+        assert_eq!(event.writer_project_id.as_deref(), Some("run-project"));
+        assert_eq!(
+            event.origin_profile.as_ref().unwrap().name,
+            "@cortexkit/memory-swe"
+        );
+        assert_eq!(
+            event.effective_category_id.as_deref(),
+            Some("swe:project-rules")
+        );
+        assert_eq!(event.snapshot_digest.as_deref(), Some("run-snapshot"));
+        let conn = rusqlite::Connection::open(&f.context_path).unwrap();
+        assert_eq!(
+            read_placement(&conn, event.memory_id)
+                .unwrap()
+                .unwrap()
+                .owner,
+            event.owner.clone().unwrap()
+        );
+    }
+
+    #[tokio::test]
     async fn dream_retrospective_effects_and_watermark_commit_together() {
         let f = Fixture::new(TaskName::Retrospective);
         let mut host = f.host(f.carrier());
@@ -736,6 +814,9 @@ mod tests {
             .unwrap();
         assert_eq!(result.memory_written, 1);
         assert_eq!(result.observations_inserted, 2);
+        assert_eq!(f.scalar("SELECT COUNT(*) FROM memory_placement"), 0);
+        assert_eq!(f.scalar("SELECT COUNT(*) FROM memory_ops"), 0);
+        assert_eq!(f.scalar("SELECT COUNT(*) FROM memory_outbox"), 0);
         assert_eq!(
             f.scalar("SELECT retrospective_watermark_ms FROM task_schedule_state"),
             300

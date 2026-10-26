@@ -42,6 +42,15 @@ impl<C: CurateCarrier> CurateHost<C> {
         context: Arc<TaskContext>,
         carrier: impl FnOnce(Arc<dyn TaskToolRouter>) -> C,
     ) -> Self {
+        Self::new_with_authority(store, context, carrier, None)
+    }
+
+    pub fn new_with_authority(
+        store: Arc<McStore>,
+        context: Arc<TaskContext>,
+        carrier: impl FnOnce(Arc<dyn TaskToolRouter>) -> C,
+        authority: Option<mc_store::memory_levels::RunAuthority>,
+    ) -> Self {
         let run = json!([
             context.scope.project.0,
             context.scope.session.0,
@@ -49,11 +58,15 @@ impl<C: CurateCarrier> CurateHost<C> {
             context.task_lease.invocation.0
         ])
         .to_string();
+        let actions = MemoryActions::with_memory_writer(store.run_memory_writer(authority));
         let router = Arc::new(CurateRouter {
             store,
             context,
             run,
-            state: Mutex::new(RouterState::default()),
+            state: Mutex::new(RouterState {
+                actions,
+                ..Default::default()
+            }),
         });
         Self {
             carrier: RoutedCarrier {

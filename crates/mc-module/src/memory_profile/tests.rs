@@ -744,3 +744,75 @@ async fn new_transform_session_pins_only_after_successful_proof() {
         .memory_context
         .is_some());
 }
+
+#[test]
+fn session_category_snapshot_has_fixed_size_and_frozen_lookup() {
+    let pin = outcome(None, vec![], &[]);
+    let ids = pin.category_ids.as_ref().unwrap();
+    assert_eq!(ids.len(), 19);
+    assert_eq!(
+        serde_json::to_vec(ids).unwrap().len(),
+        679,
+        "per-session snapshot byte budget"
+    );
+    assert_eq!(ids.get("NAMING").map(String::as_str), Some("swe:naming"));
+    assert_eq!(
+        ids.get("KNOWN_ISSUES").map(String::as_str),
+        Some("swe:constraints")
+    );
+    let decoded: MemoryContext =
+        serde_json::from_value(serde_json::to_value(&pin).unwrap()).unwrap();
+    assert_eq!(decoded.category_ids, pin.category_ids);
+}
+
+#[test]
+fn test_profile_without_writer_mappings_stores_null_origin_category() {
+    let mut profile = bundled::swe().unwrap();
+    profile.body["serves"] = json!(["@test/domain"]);
+    profile.body["default_for"] = json!(["@test/domain"]);
+    profile.body["categories"]
+        .as_array_mut()
+        .unwrap()
+        .retain(|category| category["tag"] != "NAMING");
+    let map = profile.body["category_map"].as_object_mut().unwrap();
+    map.remove("NAMING");
+    map.remove("KNOWN_ISSUES");
+    let pin = outcome(Some("@test/domain"), vec![], &[profile]);
+    let authority = mc_store::memory_levels::RunAuthority::from_session_pin(
+        &serde_json::to_value(pin).unwrap(),
+        "test-profile",
+    )
+    .unwrap();
+    assert!(authority.project_id.is_some());
+    assert!(!authority.category_ids.contains_key("NAMING"));
+    assert!(!authority.category_ids.contains_key("KNOWN_ISSUES"));
+    let mut conn = rusqlite::Connection::open_in_memory().unwrap();
+    conn.execute_batch(
+        &include_str!("../../../mc-store/testdata/context_schema/schema.sql")
+            .replace(":applied_at", "0"),
+    )
+    .unwrap();
+    let tx = conn.transaction().unwrap();
+    tx.execute("INSERT INTO memories(project_path,category,content,normalized_hash,created_at,updated_at,first_seen_at,last_seen_at) VALUES('project','NAMING','unmapped naming','hash',1,1,1,1)",[]).unwrap();
+    let id = tx.last_insert_rowid();
+    mc_store::memory_levels::MemoryWriter {
+        authority: Some(authority),
+        ..Default::default()
+    }
+    .created(
+        &tx,
+        id,
+        mc_store::memory_levels::Actor::MainAgent,
+        mc_store::memory_levels::CreateKind::Create,
+        Some("test-profile"),
+        None,
+        1,
+    )
+    .unwrap();
+    tx.commit().unwrap();
+    let placement = mc_store::memory_levels::read_placement(&conn, id)
+        .unwrap()
+        .unwrap();
+    assert!(placement.origin_profile.is_some());
+    assert_eq!(placement.origin_category, None);
+}
