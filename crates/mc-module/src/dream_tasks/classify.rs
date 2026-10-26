@@ -595,6 +595,7 @@ pub trait TaskHost: DreamCarrier {
     fn normalize_files(&self, files: &[String]) -> Result<Vec<String>, String>;
     fn budget_finalized(&self) -> bool;
     fn record_attempts(&mut self, task: &str, attempts: &[dream_runner::Attempt]);
+    fn record_map_attempted(&mut self, _ids: &[i64]) {}
     fn commit_classifications(
         &mut self,
         rows: &[ClassificationUpdate],
@@ -767,6 +768,7 @@ pub async fn run_map(
             &prompt,
             map_batch_slice_ms(remaining, batches.len() - i),
         );
+        host.record_map_attempted(&ids);
         let run = dream_runner::run_dream_task(
             activated,
             context.route_config,

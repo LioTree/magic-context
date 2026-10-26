@@ -747,6 +747,18 @@ impl Run<'_> {
                 transport,
                 published,
                 &self.handles.wiring.tasks,
+            )
+            .with_project_context(
+                Arc::new(crate::memory_context::MemoryContextReader::new(
+                    self.handles.runs.connection_file.clone(),
+                    subc_protocol::BindIdentity::new(
+                        captured.directory.clone(),
+                        self.harness,
+                        self.session,
+                    ),
+                )),
+                captured.directory.clone(),
+                self.harness,
             ),
         };
         let Ok(runtime) = tokio::runtime::Builder::new_current_thread()
@@ -900,7 +912,10 @@ impl RoutedRun<'_> {
                     },
                     OPERATIONAL_TASKS,
                     OPERATIONAL_TASKS,
-                ),
+                ).with_project_context(Arc::new(crate::memory_context::MemoryContextReader::new(
+                    self.handles.runs.connection_file.clone(),
+                    subc_protocol::BindIdentity::new(captured.directory.clone(), "magic-context", ROUTED_STORE_SESSION),
+                )), captured.directory.clone(), ""),
             };
             drive(
                 dispatcher,
