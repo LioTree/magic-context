@@ -529,3 +529,107 @@ async fn fresh_setup_late_summary_ack_cannot_restore_predecessor_history() {
         .unwrap()
         .contains_key("applied_view_version"));
 }
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn fresh_setup_native_ack_survives_absent_source_without_header_repeat() {
+    let (mut pair, reduced) = setup_predecessor_fixture().await;
+    assert_eq!(resident_notice_at(&mut pair, 1_000, Some(13)).await, "ok");
+    let state = load(pair.resident.store(), &pair.reference)
+        .unwrap()
+        .unwrap();
+    assert!(!state.entries.contains_key(&166));
+    assert!(!state.frozen_edits.served("m166", "0", &reduced));
+    assert_eq!(
+        state.native_setup_predecessor.as_ref().unwrap().ack_version,
+        Some(13)
+    );
+    assert!(state.pending_native_acks.is_empty());
+    pair.resident
+        .h
+        .provider_store
+        .async_runtime
+        .resident
+        .lock()
+        .unwrap()
+        .forget(&pair.reference);
+    pair.append(180);
+    review_complete_turn(&pair);
+    assert_eq!(resident_notice_at(&mut pair, 1_000, None).await, "ok");
+    let state = load(pair.resident.store(), &pair.reference)
+        .unwrap()
+        .unwrap();
+    assert!(state.frozen_edits.served("m166", "0", &reduced));
+    assert_eq!(state.applied, None);
+    assert!(!state
+        .conditions
+        .as_ref()
+        .unwrap()
+        .contains_key("applied_view_version"));
+    let request = json!({"method":"compaction.ride","params":{"session_ref":pair.reference,"cause":"surface_change","deadline_ms":10_000}});
+    pair.resident.dispatch(request).await;
+    let (version, view, _, _) = newest_view(&pair).unwrap();
+    assert_eq!(view.lineage_id, "undo-source");
+    assert_eq!(
+        resident_notice_at(&mut pair, 1_000, Some(version)).await,
+        "ok"
+    );
+    let state = load(pair.resident.store(), &pair.reference)
+        .unwrap()
+        .unwrap();
+    assert_eq!(
+        state.native_setup_predecessor.as_ref().unwrap().ack_version,
+        None
+    );
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn ride_native_ack_before_undo_remains_durable_when_sources_return() {
+    review_session_inner(
+        Profile::Broca,
+        1_779_034_251,
+        12,
+        true,
+        Some(vec![0, 1, 2, 3, 4, 5, 6, 9, 10, 11]),
+        true,
+    )
+    .await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn reverted_cut_setup_native_ack_remains_durable_when_sources_return() {
+    review_session_inner(
+        Profile::OpenCode,
+        1_779_034_264,
+        12,
+        true,
+        Some(vec![0, 1, 2, 3, 4, 5, 6, 9, 10, 11]),
+        true,
+    )
+    .await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn command_native_ack_before_undo_remains_durable_when_sources_return() {
+    review_session_inner(
+        Profile::Anthropic,
+        1_779_034_270,
+        12,
+        true,
+        Some(vec![0, 1, 2, 3, 4, 5, 6, 9, 10, 11]),
+        true,
+    )
+    .await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn selected_cut_undo_facts_follow_sources_read_after_the_first_window() {
+    review_session_inner(
+        Profile::Pi,
+        1_779_034_041,
+        12,
+        true,
+        Some(vec![0, 1, 2, 3, 4, 5, 6, 9, 10, 11]),
+        true,
+    )
+    .await;
+}

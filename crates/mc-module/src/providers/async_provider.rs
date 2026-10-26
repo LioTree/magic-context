@@ -412,6 +412,10 @@ type PolicyProbe = (u64, Option<u64>, Vec<String>);
 struct SetupNativePredecessor {
     lineage: String,
     replaced_by: String,
+    #[serde(default)]
+    ack_seq: u64,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    ack_version: Option<u64>,
 }
 
 #[derive(Serialize, Deserialize, PartialEq, Eq)]
@@ -1215,6 +1219,12 @@ impl State {
             })
             .fold(applied, u64::min)
         });
+        let retain_from = retain_from.map(|floor| {
+            self.native_setup_predecessor
+                .as_ref()
+                .and_then(|prior| prior.ack_version)
+                .map_or(floor, |version| floor.min(version))
+        });
         if let Some(floor) = retain_from {
             let floor = self
                 .pending_native_acks
@@ -1756,6 +1766,28 @@ impl State {
         notice: &notice::AdvanceNotice,
     ) -> Result<(), HandlerOutcome> {
         if let Some(version) = notice.applied_view_version.filter(|version| {
+            self.native_setup_predecessor.is_some()
+                && !notice.events.iter().any(|event| {
+                    matches!(event,
+                    notice::Event::ViewDeferred { view_version, .. }
+                    | notice::Event::ViewRefused { view_version, .. } if view_version == version)
+                })
+        }) {
+            let owner = self.applied_lineage(store, version)?;
+            let predecessor = owner
+                .as_deref()
+                .is_some_and(|owner| self.is_native_setup_predecessor(owner));
+            let current = self.lineage.is_some() && owner == self.lineage;
+            if let Some(prior) = self
+                .native_setup_predecessor
+                .as_mut()
+                .filter(|prior| (predecessor || current) && notice.seq >= prior.ack_seq)
+            {
+                prior.ack_seq = notice.seq;
+                prior.ack_version = predecessor.then_some(version);
+            }
+        }
+        if let Some(version) = notice.applied_view_version.filter(|version| {
             self.frozen_edits_version != Some(*version)
                 && !notice.events.iter().any(|event| {
                     matches!(event,
@@ -1793,29 +1825,36 @@ impl State {
                 // absent parts. Replay checks the current identity and digest;
                 // no ancestor view, summary or pass facts are adopted here.
                 self.frozen_edits.merge(&edits);
-            } else if self.is_native_setup_predecessor(owner) {
-                // Contract §§5.1–5.2 makes applied_view_version the runner's
-                // durable ACK: the next view is built against what it renders
-                // now. Discarding that ACK after a fresh Setup would restore
-                // dropped content. Only the directly replaced lineage can
-                // supply native edits, and only for exact sources present now;
-                // its summaries, coverage and view state remain forbidden.
-                let matched = self
-                    .frozen_version_sources(store, *version)?
-                    .map(|edits| edits.matching_sources(&self.mid_index, &self.entries))
-                    .transpose()?
-                    .unwrap_or_default();
-                if matched.retained_bytes == 0 {
-                    log_foreign_ack_once(&self.reference(), *version);
-                }
-                self.frozen_edits.merge(&matched);
-            } else {
+            } else if !self.is_native_setup_predecessor(owner) {
                 log_foreign_ack_once(&self.reference(), *version);
             }
             resolved.push(*version);
         }
         for version in resolved {
             self.pending_native_acks.remove(&version);
+        }
+        if let Some(version) = self
+            .native_setup_predecessor
+            .as_ref()
+            .filter(|prior| self.is_native_setup_predecessor(&prior.lineage))
+            .and_then(|prior| prior.ack_version)
+        {
+            // Contract §§5.1–5.2 makes applied_view_version a durable ACK:
+            // the next view is built against what the runner renders now.
+            // Remember only that public version when its sources are absent;
+            // no native fact transfers until an exact source is present. A
+            // later notice need not repeat the ACK when those sources return.
+            // Only the directly replaced lineage qualifies; its summaries,
+            // coverage, baselines and pass facts remain forbidden.
+            let matched = self
+                .frozen_version_sources(store, version)?
+                .map(|edits| edits.matching_sources(&self.mid_index, &self.entries))
+                .transpose()?
+                .unwrap_or_default();
+            if matched.retained_bytes == 0 {
+                log_foreign_ack_once(&self.reference(), version);
+            }
+            self.frozen_edits.merge(&matched);
         }
         Ok(())
     }
@@ -2422,6 +2461,8 @@ impl McHandler {
                         .map(|(lineage, replaced_by)| SetupNativePredecessor {
                             lineage,
                             replaced_by,
+                            ack_seq: 0,
+                            ack_version: None,
                         });
                 }
                 for archive in store.load_async_undo_edits(&reference).map_err(transient)? {
@@ -4570,6 +4611,11 @@ impl McHandler {
                     #[cfg(test)]
                     let held = held.counted_as(state.reference());
                     state.entries.insert(entry.ordinal, Arc::new(held));
+                    // Undo can reintroduce an archived source after the first
+                    // post-Setup read. Look up the newly held window again so
+                    // an acknowledged drop cannot disappear on a later page.
+                    state.pending_undo_edits |=
+                        state.cut_first_ordinal.is_some() || state.setup.descends_from.is_some();
                 }
             }
             let Some(next) = page["next_from_ordinal"].as_u64() else {
