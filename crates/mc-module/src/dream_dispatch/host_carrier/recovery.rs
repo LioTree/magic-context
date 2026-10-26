@@ -105,9 +105,7 @@ fn private_file(path: &Path) -> std::io::Result<File> {
 }
 
 fn sync_directory(root: &Path) -> Result<(), CarrierError> {
-    File::open(root)
-        .and_then(|d| d.sync_all())
-        .map_err(|e| error(e.to_string()))
+    mc_store::private_permissions::sync_directory(root).map_err(|e| error(e.to_string()))
 }
 
 fn persist(path: &Path, marker: &Marker, replacing: bool) -> Result<(), CarrierError> {
@@ -152,7 +150,21 @@ fn lock(root: &Path, key: &str) -> Result<nix::fcntl::Flock<File>, CarrierError>
         .map_err(|(_, e)| error(format!("unavailable: recovery_lock: {e}")))
 }
 
-#[cfg(not(unix))]
+#[cfg(windows)]
+fn lock(root: &Path, key: &str) -> Result<File, CarrierError> {
+    let file = OpenOptions::new()
+        .read(true)
+        .write(true)
+        .create(true)
+        .truncate(false)
+        .open(root.join(format!("{key}.lock")))
+        .map_err(|e| error(e.to_string()))?;
+    file.try_lock()
+        .map_err(|e| error(format!("unavailable: recovery_lock: {e}")))?;
+    Ok(file)
+}
+
+#[cfg(not(any(unix, windows)))]
 fn lock(_root: &Path, _key: &str) -> Result<File, CarrierError> {
     Err(error("unavailable: recovery_lock_unsupported"))
 }
@@ -261,4 +273,44 @@ pub(super) fn release(path: &Path, entry_id: &str, epoch: &str) -> Result<(), Ca
         sync_directory(root)?;
     }
     Ok(())
+}
+
+#[cfg(all(test, windows))]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn marker_persist_round_trips_and_replaces_existing_file() {
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("marker.json");
+        let mut marker = Marker {
+            version: 1,
+            epoch: "first".into(),
+            entry_id: "entry".into(),
+            child_id: "child".into(),
+            invocation: "invocation".into(),
+            deadline_ms: 10,
+            task_deadline_ms: 20,
+            lease_renewal_ms: 0,
+            lease_expiry_ms: 30,
+            recovery: None,
+        };
+        persist(&path, &marker, false).unwrap();
+        let loaded: Marker = serde_json::from_slice(&read_bounded(&path).unwrap()).unwrap();
+        assert_eq!(loaded.epoch, "first");
+        marker.epoch = "replacement".into();
+        persist(&path, &marker, true).unwrap();
+        let loaded: Marker = serde_json::from_slice(&read_bounded(&path).unwrap()).unwrap();
+        assert_eq!(loaded.epoch, "replacement");
+        assert!(loaded.validate());
+    }
+
+    #[test]
+    fn recovery_lock_serializes_and_releases() {
+        let directory = tempfile::tempdir().unwrap();
+        let first = lock(directory.path(), "claim").unwrap();
+        assert!(lock(directory.path(), "claim").is_err());
+        drop(first);
+        drop(lock(directory.path(), "claim").unwrap());
+    }
 }

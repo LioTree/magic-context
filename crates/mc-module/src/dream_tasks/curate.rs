@@ -804,7 +804,11 @@ mod tests {
             harness: "opencode",
             project_path: "project-a",
             parent_session_id: "session-a",
-            directory: Path::new("/fixture"),
+            directory: Path::new(if cfg!(windows) {
+                r"C:\fixture"
+            } else {
+                "/fixture"
+            }),
             timeout: Duration::from_secs(60),
             token_budget: Some(5000),
             language: Some("tr"),
@@ -971,7 +975,14 @@ mod tests {
             assert_eq!(request.allowed_tools, &["ctx_memory"]);
             assert_eq!(request.max_steps, 150);
             assert_eq!(request.parent_session_id, "session-a");
-            assert_eq!(request.directory, Path::new("/fixture"));
+            assert_eq!(
+                request.directory,
+                Path::new(if cfg!(windows) {
+                    r"C:\fixture"
+                } else {
+                    "/fixture"
+                })
+            );
             assert_eq!(request.model.as_ref().unwrap().model, "synapse/curator");
             assert_eq!(request.temperature, None);
             assert_eq!(request.token_budget, Some(5000));

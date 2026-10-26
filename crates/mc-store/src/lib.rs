@@ -4392,11 +4392,62 @@ fn historian_owner_dead(pid: i64) -> bool {
                     && String::from_utf8_lossy(&output.stderr).contains("No such process")
             })
     }
-    #[cfg(not(unix))]
+    #[cfg(windows)]
+    {
+        let Ok(pid) = u32::try_from(pid) else {
+            return false;
+        };
+        if pid == 0 {
+            return false;
+        }
+        // Do not let a tasklist.exe in the project's directory impersonate the probe.
+        let Some(system_root) = std::env::var_os("SystemRoot").map(PathBuf::from) else {
+            return false;
+        };
+        if !system_root.is_absolute() {
+            return false;
+        }
+        // A complete CSV process table proves absence without depending on the
+        // localized "no matching tasks" message. Failed or malformed probes
+        // remain inconclusive and must not reclaim a live owner's lease.
+        std::process::Command::new(system_root.join("System32").join("tasklist.exe"))
+            .args(["/FO", "CSV", "/NH"])
+            .output()
+            .is_ok_and(|output| {
+                output.status.success()
+                    && output.stderr.is_empty()
+                    && windows_process_table_proves_absent(pid, &output.stdout)
+            })
+    }
+    #[cfg(not(any(unix, windows)))]
     {
         let _ = pid;
         false
     }
+}
+
+#[cfg(windows)]
+fn windows_process_table_proves_absent(pid: u32, bytes: &[u8]) -> bool {
+    let mut saw_process = false;
+    for line in String::from_utf8_lossy(bytes).lines() {
+        let line = line.trim();
+        if line.is_empty() {
+            continue;
+        }
+        if !line.starts_with('"') || !line.ends_with('"') {
+            return false;
+        }
+        let mut fields = line.split("\",\"");
+        let _image = fields.next();
+        let Some(Ok(listed_pid)) = fields.next().map(str::parse::<u32>) else {
+            return false;
+        };
+        if fields.count() < 3 || listed_pid == pid {
+            return false;
+        }
+        saw_process = true;
+    }
+    saw_process
 }
 
 fn historian_lease_held(
@@ -27062,6 +27113,34 @@ mod tests {
             .context_read(|conn| historian_lease_held(conn, "ses", "ts-wrapup"))
             .unwrap());
         assert_eq!(store.load_compartments("ses").unwrap().len(), 1);
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn windows_owner_liveness_protects_live_and_unknown_pids() {
+        assert!(!historian_owner_dead(i64::from(std::process::id())));
+        assert!(historian_owner_dead(i64::from(i32::MAX)));
+        assert!(!historian_owner_dead(0));
+        assert!(!historian_owner_dead(-1));
+        assert!(!historian_owner_dead(i64::MAX));
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn windows_owner_liveness_requires_a_complete_process_table() {
+        let table = b"\"System\",\"4\",\"Services\",\"0\",\"8 K\"\r\n\"worker.exe\",\"100\",\"Console\",\"1\",\"12 K\"\r\n";
+        assert!(windows_process_table_proves_absent(200, table));
+        assert!(!windows_process_table_proves_absent(100, table));
+        assert!(!windows_process_table_proves_absent(200, b""));
+        assert!(!windows_process_table_proves_absent(200, b"Access denied"));
+        assert!(!windows_process_table_proves_absent(
+            200,
+            b"\"worker.exe\",\"invalid\",\"Console\",\"1\",\"12 K\""
+        ));
+        assert!(!windows_process_table_proves_absent(
+            200,
+            b"\"worker.exe\",\"100\""
+        ));
     }
 
     #[test]

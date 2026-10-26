@@ -427,9 +427,9 @@ mod tests {
                             {
                                 assert_eq!(target, route_target());
                                 assert_eq!(identity.session, "instance");
-                                let bind = serde_json::to_value(&identity).unwrap().to_string();
-                                assert!(bind.contains(project.to_str().unwrap()));
-                                assert!(bind.contains("test-harness"));
+                                let bind = serde_json::to_value(&identity).unwrap();
+                                assert_eq!(bind["project_root"].as_str(), project.to_str());
+                                assert_eq!(bind["harness"].as_str(), Some("test-harness"));
                                 (
                                     FrameType::Response,
                                     serde_json::to_vec(&ClientControlResponse::RouteOpen {

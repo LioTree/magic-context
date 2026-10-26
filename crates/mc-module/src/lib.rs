@@ -22185,6 +22185,11 @@ mod tests {
     mod scripted_historian_pairs;
 
     mod i4_roots {
+        const RECORDED_PROJECT: &str = if cfg!(windows) {
+            r"C:\recorded\project"
+        } else {
+            "/recorded/project"
+        };
         use super::*;
         use crate::background::{self, ConfigInput, DreamCarrier, DreamRequest, DreamRole};
         use crate::config_parity::{
@@ -22232,7 +22237,7 @@ mod tests {
                 resolver: resolver.clone(),
                 request: ConfigResolveRequest {
                     user_config_path: String::new(),
-                    project_root: "/recorded/project".into(),
+                    project_root: RECORDED_PROJECT.into(),
                     generation: Generation(1),
                 },
             };
@@ -22274,7 +22279,7 @@ mod tests {
                 self.calls.push("open");
                 assert_eq!(request.runner.kind, HistorianRunnerKind::Broca);
                 assert_eq!(request.temperature, None);
-                assert_eq!(request.directory, Path::new("/recorded/project"));
+                assert_eq!(request.directory, Path::new(RECORDED_PROJECT));
                 self.models
                     .push(request.model.as_ref().unwrap().model.clone());
                 Ok(format!("child-{}", self.models.len()))
@@ -22332,7 +22337,7 @@ mod tests {
                                 role,
                                 harness: "opencode",
                                 parent_session_id: "ses",
-                                directory: Path::new("/recorded/project"),
+                                directory: Path::new(RECORDED_PROJECT),
                                 system: "recorded system",
                                 prompt: "recorded input",
                                 timeout: Duration::from_secs(1),
@@ -22495,7 +22500,7 @@ mod tests {
                         role: DreamRole::Curate,
                         harness: "opencode",
                         parent_session_id: "ses",
-                        directory: Path::new("/recorded/project"),
+                        directory: Path::new(RECORDED_PROJECT),
                         system: "recorded memory-task system",
                         prompt: "recorded memory-task input",
                         timeout: Duration::from_secs(1),

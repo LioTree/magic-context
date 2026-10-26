@@ -567,7 +567,11 @@ mod tests {
             role: DreamRole::Classifier,
             harness: "opencode",
             parent_session_id: "parent",
-            directory: Path::new("/fixture/project"),
+            directory: Path::new(if cfg!(windows) {
+                r"C:\fixture\project"
+            } else {
+                "/fixture/project"
+            }),
             system: "system",
             prompt: "prompt",
             timeout: Duration::from_secs(5),
@@ -713,7 +717,14 @@ mod tests {
                 assert_eq!(sent.allowed_tools, tools.as_slice());
                 assert_eq!(sent.max_steps, *steps);
                 assert_eq!(sent.temperature, None);
-                assert_eq!(sent.directory, Path::new("/fixture/project"));
+                assert_eq!(
+                    sent.directory,
+                    Path::new(if cfg!(windows) {
+                        r"C:\fixture\project"
+                    } else {
+                        "/fixture/project"
+                    })
+                );
                 assert_eq!(sent.parent_session_id, "parent");
                 assert_eq!(sent.system, "system");
                 assert_eq!(sent.prompt, "prompt");
