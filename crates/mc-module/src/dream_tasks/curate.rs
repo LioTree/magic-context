@@ -340,11 +340,12 @@ impl Tools<'_> {
     }
 }
 
-pub fn system_prompt() -> &'static str {
+pub fn system_prompt() -> Result<&'static str, String> {
     crate::persona_host::dream::system(crate::persona_host::dream::Kind::Curate)
+        .map_err(|error| format!("mc_persona_invalid: {error}"))
 }
 
-pub fn build_prompt(project: &str, category: &str, chunk: &Chunk) -> String {
+pub fn build_prompt(project: &str, category: &str, chunk: &Chunk) -> Result<String, String> {
     let candidates = if chunk.cross_chunk_candidates.is_empty() {
         "(none)".into()
     } else {
@@ -361,6 +362,7 @@ pub fn build_prompt(project: &str, category: &str, chunk: &Chunk) -> String {
             ..Default::default()
         },
     )
+    .map_err(|error| format!("mc_persona_invalid: {error}"))
 }
 
 #[derive(Debug, Default, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -525,8 +527,17 @@ pub async fn run(
             attempts: Vec::new(),
         };
     };
+    let system = match system_prompt() {
+        Ok(system) => system,
+        Err(error) => {
+            return RunResult {
+                result: Err(Failure::Validation(error)),
+                attempts: Vec::new(),
+            }
+        }
+    };
     let system = crate::historian_prompt::with_content_language_directive(
-        system_prompt(),
+        system,
         context.language,
         Default::default(),
     );
@@ -554,7 +565,15 @@ pub async fn run(
                 attempts,
             };
         }
-        let prompt = build_prompt(context.project_path, plan.category, chunk);
+        let prompt = match build_prompt(context.project_path, plan.category, chunk) {
+            Ok(prompt) => prompt,
+            Err(error) => {
+                return RunResult {
+                    result: Err(Failure::Validation(error)),
+                    attempts,
+                }
+            }
+        };
         let result = run_dream_task(
             activated,
             config,
@@ -1585,18 +1604,18 @@ mod tests {
                     json!({
                         "ids":chunk.memories.iter().map(|m|m.id).collect::<Vec<_>>(),
                         "candidates":chunk.cross_chunk_candidates,
-                        "sha":sha(&build_prompt("/repo","PROJECT_RULES",chunk)),
+                        "sha":sha(&build_prompt("/repo","PROJECT_RULES",chunk).unwrap()),
                     })
                 })
                 .collect();
             assert_eq!(json!(actual), case["chunks"]);
         }
         assert_eq!(
-            sha(system_prompt()),
+            sha(system_prompt().unwrap()),
             "31cb8223887fd5fedb6968cb5d49cde5841f59235a85349ecba80fe487036eb3"
         );
         let localized = crate::historian_prompt::with_content_language_directive(
-            system_prompt(),
+            system_prompt().unwrap(),
             Some("tr"),
             Default::default(),
         );

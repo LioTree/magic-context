@@ -71,7 +71,8 @@ fn dream_persona_sources_normalize_lf_and_crlf_for_every_variant() {
                 for mode in ["full", "broad"] {
                     for (system_turn, key) in [(true, "system"), (false, "task")] {
                         let got = render(&persona, &input, mode, system_turn).unwrap();
-                        let embedded = render(embedded(kind), &input, mode, system_turn).unwrap();
+                        let embedded =
+                            render(embedded(kind).unwrap(), &input, mode, system_turn).unwrap();
                         assert_eq!(
                             (got.text.as_str(), got.digest),
                             (embedded.text.as_str(), embedded.digest),
@@ -142,7 +143,10 @@ fn dream_repository_wording_needs_matching_checksum_approval() {
             )
             .unwrap()
         };
-        assert_eq!(render_system(&ApprovalSet::new()).text, system(kind));
+        assert_eq!(
+            render_system(&ApprovalSet::new()).text,
+            system(kind).unwrap()
+        );
         let approved = approval(kind, &tiers, &key);
         assert_eq!(render_system(&approved).text, "Approved wording");
         repo_file(
@@ -151,7 +155,7 @@ fn dream_repository_wording_needs_matching_checksum_approval() {
             "---\ngeneration: {temperature: 0.9}\n---\n",
         );
         let changed = render_system(&approved);
-        assert_eq!(changed.text, system(kind));
+        assert_eq!(changed.text, system(kind).unwrap());
         assert_eq!(
             changed.report.tiers.last().unwrap().approval,
             ApprovalState::Changed

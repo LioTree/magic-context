@@ -107,13 +107,13 @@ fn capture() -> Value {
             .collect(),
         cross_chunk_candidates: CANDIDATES.iter().map(|s| (*s).into()).collect(),
     };
-    let curate_system = curate::system_prompt();
+    let curate_system = curate::system_prompt().unwrap();
     record(
         "curate",
         "curate",
         "full",
         curate_system,
-        curate::build_prompt(PROJECT, CATEGORY, &chunk),
+        curate::build_prompt(PROJECT, CATEGORY, &chunk).unwrap(),
     );
     let no_candidates = curate::Chunk {
         memories: chunk.memories.clone(),
@@ -124,7 +124,7 @@ fn capture() -> Value {
         "curate",
         "full",
         curate_system,
-        curate::build_prompt(PROJECT, CATEGORY, &no_candidates),
+        curate::build_prompt(PROJECT, CATEGORY, &no_candidates).unwrap(),
     );
     let empty_chunk = curate::Chunk {
         memories: vec![],
@@ -135,7 +135,7 @@ fn capture() -> Value {
         "curate",
         "full",
         curate_system,
-        curate::build_prompt(PROJECT, CATEGORY, &empty_chunk),
+        curate::build_prompt(PROJECT, CATEGORY, &empty_chunk).unwrap(),
     );
 
     let pool: Vec<_> = CONTENTS
@@ -144,27 +144,27 @@ fn capture() -> Value {
         .map(|(index, content)| classify_memory(index as i64 + 1, content, true))
         .collect();
     let anchors = [classify_memory(3, ANCHOR, false)];
-    let classify_system = classify::classify_system_prompt();
+    let classify_system = classify::classify_system_prompt().unwrap();
     record(
         "classify",
         "classify",
         "full",
         classify_system,
-        classify::build_classify_prompt(PROJECT, &pool, &anchors),
+        classify::build_classify_prompt(PROJECT, &pool, &anchors).unwrap(),
     );
     record(
         "classify_no_anchors",
         "classify",
         "full",
         classify_system,
-        classify::build_classify_prompt(PROJECT, &pool, &[]),
+        classify::build_classify_prompt(PROJECT, &pool, &[]).unwrap(),
     );
     record(
         "classify_empty",
         "classify",
         "full",
         classify_system,
-        classify::build_classify_prompt(PROJECT, &[], &[]),
+        classify::build_classify_prompt(PROJECT, &[], &[]).unwrap(),
     );
 
     let inputs: Vec<_> = CONTENTS
@@ -177,13 +177,13 @@ fn capture() -> Value {
             candidates: vec![],
         })
         .collect();
-    let map_system = classify::map_system_prompt();
+    let map_system = classify::map_system_prompt().unwrap();
     record(
         "map",
         "map",
         "full",
         map_system,
-        classify::build_map_prompt(PROJECT, &inputs),
+        classify::build_map_prompt(PROJECT, &inputs).unwrap(),
     );
     let mut likely = inputs.clone();
     likely[0].candidates = vec![PATH.into(), "src/other.rs".into()];
@@ -192,14 +192,14 @@ fn capture() -> Value {
         "map",
         "full",
         map_system,
-        classify::build_map_prompt(PROJECT, &likely),
+        classify::build_map_prompt(PROJECT, &likely).unwrap(),
     );
     record(
         "map_empty",
         "map",
         "full",
         map_system,
-        classify::build_map_prompt(PROJECT, &[]),
+        classify::build_map_prompt(PROJECT, &[]).unwrap(),
     );
 
     let batch: Vec<_> = CONTENTS
@@ -216,22 +216,23 @@ fn capture() -> Value {
             memory_ids: vec![1, 2],
         }],
     };
-    let verify_system = verify::system_prompt();
-    let broad_prompt =
-        |batch: &[verify::Memory]| verify::build_prompt_with_mode(PROJECT, batch, None, "broad");
+    let verify_system = verify::system_prompt().unwrap();
+    let broad_prompt = |batch: &[verify::Memory]| {
+        verify::build_prompt_with_mode(PROJECT, batch, None, "broad").unwrap()
+    };
     record(
         "verify",
         "verify",
         "full",
         verify_system,
-        verify::build_prompt(PROJECT, &batch, None),
+        verify::build_prompt(PROJECT, &batch, None).unwrap(),
     );
     record(
         "verify_diff",
         "verify",
         "full",
         verify_system,
-        verify::build_prompt(PROJECT, &batch, Some(&evidence)),
+        verify::build_prompt(PROJECT, &batch, Some(&evidence)).unwrap(),
     );
     record(
         "verify_broad",
@@ -245,7 +246,7 @@ fn capture() -> Value {
         "verify",
         "full",
         verify_system,
-        verify::build_prompt(PROJECT, &[], None),
+        verify::build_prompt(PROJECT, &[], None).unwrap(),
     );
     record(
         "verify_broad_empty",
@@ -256,13 +257,13 @@ fn capture() -> Value {
     );
 
     let snapshot = review_snapshot();
-    let review_system = review_system();
+    let review_system = review_system().unwrap();
     record(
         "review_user",
         "review_user",
         "full",
         review_system,
-        review_prompt(&snapshot, 3),
+        review_prompt(&snapshot, 3).unwrap(),
     );
     let empty = ReviewSnapshot {
         candidates: vec![],
@@ -274,7 +275,7 @@ fn capture() -> Value {
         "review_user",
         "full",
         review_system,
-        review_prompt(&empty, 3),
+        review_prompt(&empty, 3).unwrap(),
     );
     let mut escaped = review_snapshot();
     escaped.candidates[0].content = "Candidate α\n\"quoted\" \\ path\t{{ braces }}".into();
@@ -285,7 +286,7 @@ fn capture() -> Value {
         "review_user",
         "full",
         review_system,
-        review_prompt(&escaped, 3),
+        review_prompt(&escaped, 3).unwrap(),
     );
     json!({
         "base_commit": "7bf675a0d39f5f86fe0568aa2f1dcea6df309945",

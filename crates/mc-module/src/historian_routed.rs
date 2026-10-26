@@ -336,9 +336,15 @@ pub(crate) async fn run_routed_summary(
         summary.fallback_temperature,
     ) {
         Ok(frozen) => frozen,
-        Err(FreezeError::Store(error)) => return Err(error.into()),
+        Err(FreezeError::Store(error)) => {
+            return Err(HistorianDriveError::Producer(
+                persona_host::summary_refusal(summary.session_id, error),
+            ))
+        }
         Err(FreezeError::Persona(error)) => {
-            return refuse_without_send(&summary, "mc_persona_invalid", &error.to_string(), None)
+            return Err(HistorianDriveError::Producer(
+                persona_host::summary_refusal(summary.session_id, error),
+            ))
         }
     };
     let scope = SummaryScope {
@@ -560,7 +566,14 @@ pub(crate) fn freeze_summary_persona(
         if let Some(frozen) = &loaded.meta.summary_persona {
             return Ok(frozen.as_ref().clone());
         }
-        let frozen = render_frozen(routing, project_root, language, fallback_temperature)?;
+        let frozen = render_frozen(
+            routing,
+            project_root,
+            language,
+            fallback_temperature,
+            loaded.meta.memory_context.as_ref(),
+            session_id,
+        )?;
         let mut meta = loaded.meta.clone();
         meta.summary_persona = Some(Box::new(frozen.clone()));
         match store.commit_meta(session_id, loaded.row_version, &meta) {
@@ -585,11 +598,14 @@ fn render_frozen(
     project_root: &Path,
     language: Option<&str>,
     fallback_temperature: Option<f64>,
+    memory_context: Option<&serde_json::Value>,
+    session_id: &str,
 ) -> Result<FrozenSummaryPersona, PersonaError> {
     let tiers = routing.persona_tiers(project_root)?;
     let persona = persona_host::load_summary(&tiers, &ApprovalSet::new(), None)?;
     let context = persona_host::SummaryContext {
         language: persona_host::LanguageContext::new(language, Default::default()),
+        memory_profile: persona_host::MemoryProfile::summary(memory_context, session_id)?,
         ..Default::default()
     };
     let rendered = persona_host::render_summary(&persona, &context)?;
@@ -681,15 +697,15 @@ impl<'s> Runner<RoutedScope<'s>> for SummaryRunner<'_> {
         };
         let mut repair: Option<String> = None;
         loop {
-            let mut request = summary.firing.as_fire_request(
+            let mut request = summary.firing.as_fire_request_with_system(
                 summary.store,
                 summary.session_id,
                 summary.project_path,
                 summary.harness,
                 summary.project_slug,
                 summary.language,
+                std::borrow::Cow::Borrowed(self.frozen.bytes.as_str()),
             );
-            request.system = std::borrow::Cow::Borrowed(self.frozen.bytes.as_str());
             request.temperature = self.frozen.temperature;
             request.rust_background_enabled = summary.rust_background_enabled;
             request.await_timeout = summary.await_timeout;

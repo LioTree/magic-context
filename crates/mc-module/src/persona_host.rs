@@ -189,6 +189,125 @@ pub struct ProjectContext {
 pub struct SummaryContext {
     pub language: LanguageContext,
     pub project: ProjectContext,
+    pub memory_profile: MemoryProfile,
+}
+
+/// Captured prompt text plus the identity of the validated profile that produced
+/// it. Persona rendering uses this value rather than reloading package files or
+/// rechecking the process-wide parity mode.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize)]
+pub struct MemoryProfile {
+    pub present: bool,
+    pub supplies: bool,
+    pub name: Option<String>,
+    pub version: Option<String>,
+    pub digest: Option<String>,
+    pub task: Option<String>,
+    #[serde(skip)]
+    fragment: String,
+}
+
+impl MemoryProfile {
+    pub(crate) fn summary(
+        pin: Option<&serde_json::Value>,
+        session: &str,
+    ) -> Result<Self, PersonaError> {
+        let Some(pin) = pin else {
+            return Ok(Self::default());
+        };
+        let pin: crate::memory_profile::MemoryContext = serde_json::from_value(pin.clone())
+            .map_err(|e| PersonaError::InvalidContext {
+                field: "memory_profile".into(),
+                reason: e.to_string(),
+            })?;
+        let profile = crate::memory_profile::documents::bundled_swe().map_err(profile_error)?;
+        if pin.profile.name.as_deref() != Some(&profile.name)
+            || pin.profile.version.as_deref() != Some(&profile.version)
+            || pin.profile.digest.as_deref() != Some(&profile.digest)
+        {
+            if first_profile_notice(session, "memory_profile_mismatch") {
+                tracing::warn!(session, pinned_name = ?pin.profile.name,
+                    pinned_version = ?pin.profile.version, pinned_digest = ?pin.profile.digest,
+                    bundled_name = %profile.name, bundled_version = %profile.version,
+                    bundled_digest = %profile.digest,
+                    "pinned memory profile does not match bundled profile");
+            }
+            // The profile resolver/status integration owns recording a degraded
+            // state. The persona layer preserves the existing prompt bytes here.
+            return Ok(Self::default());
+        }
+        Self::capture(&profile, pin.profile.parity, Some("historian/system"), None)
+    }
+
+    fn capture(
+        profile: &crate::memory_profile::Profile,
+        parity: bool,
+        document: Option<&str>,
+        task: Option<&str>,
+    ) -> Result<Self, PersonaError> {
+        let fragment = if parity {
+            String::new()
+        } else if let Some(document) = document {
+            crate::memory_profile::documents::render(profile, document, Some("xml"))
+                .map_err(profile_error)?
+        } else {
+            String::new()
+        };
+        Ok(Self {
+            present: true,
+            supplies: !fragment.is_empty(),
+            name: Some(profile.name.clone()),
+            version: Some(profile.version.clone()),
+            digest: Some(profile.digest.clone()),
+            task: task.map(str::to_owned),
+            fragment,
+        })
+    }
+}
+
+fn first_profile_notice(session: &str, kind: &'static str) -> bool {
+    static NOTICES: OnceLock<std::sync::Mutex<std::collections::HashSet<(String, &'static str)>>> =
+        OnceLock::new();
+    NOTICES
+        .get_or_init(Default::default)
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
+        .insert((session.to_owned(), kind))
+}
+
+pub(crate) fn summary_refusal(
+    session: &str,
+    error: impl std::fmt::Display,
+) -> crate::historian_producer::HistorianProducerError {
+    let detail = error.to_string();
+    if first_profile_notice(session, "mc_persona_invalid") {
+        tracing::warn!(session, error = %detail, "mc_persona_invalid: summary persona refused");
+    }
+    crate::historian_producer::HistorianProducerError::Subc(
+        crate::historian_producer::ProducerErrorBody::untagged("mc_persona_invalid", &detail),
+    )
+}
+
+fn profile_error(error: crate::memory_profile::Refusal) -> PersonaError {
+    PersonaError::InvalidContext {
+        field: "memory_profile".into(),
+        reason: format!("{}: {}", error.code, error.detail),
+    }
+}
+
+fn guard_profile(
+    role: &LoadedRole,
+    profile: &MemoryProfile,
+    rendered: Rendered,
+) -> Result<Rendered, PersonaError> {
+    if profile.supplies && !rendered.text.contains(&profile.fragment) {
+        let tier = role.tiers().iter().rev().find(|t| t.used);
+        return Err(PersonaError::InvalidContext {
+            field: "mc_persona_invalid".into(),
+            reason: serde_json::json!({"persona": role.manifest().name(), "tier": tier.map(|t| &t.name), "file": tier.map(|t| format!("{}/PERSONA.md", t.relative_path)), "error": "memory_profile_dropped"}).to_string(),
+        });
+    }
+    Ok(rendered)
 }
 
 #[derive(Serialize)]
@@ -205,6 +324,7 @@ struct ModuleContext<'a> {
     language: &'a LanguageContext,
     project: &'a ProjectContext,
     output: OutputContext,
+    memory_profile: &'a MemoryProfile,
 }
 
 /// The compiled base works without any persona files on the host filesystem.
@@ -311,18 +431,21 @@ pub fn render_summary(
     persona: &SummaryPersona,
     context: &SummaryContext,
 ) -> Result<Rendered, PersonaError> {
-    persona.role.render(
+    let rendered = persona.role.render(
         &render_context(SUMMARY_ROLE, context, persona.routing()),
-        &fragments()?,
-    )
+        &fragments_with_profile(&context.memory_profile)?,
+    )?;
+    guard_profile(&persona.role, &context.memory_profile, rendered)
 }
 
 fn fragments() -> Result<FragmentSources, PersonaError> {
+    fragments_with_profile(&MemoryProfile::default())
+}
+
+fn fragments_with_profile(profile: &MemoryProfile) -> Result<FragmentSources, PersonaError> {
     FragmentSources::new()
         .with("mc/language@1", LANGUAGE_FRAGMENT)?
-        // persona/v1 has no optional-slot syntax. Supply the absent profile as
-        // an empty module-owned fragment, never as a repository-controlled file.
-        .with("mc/memory-profile@1", "")
+        .with("mc/memory-profile@1", profile.fragment.clone())
 }
 
 fn render_context<'a>(
@@ -343,6 +466,7 @@ fn render_context<'a>(
                 format: "xml",
                 schema_text: HISTORIAN_SYSTEM_PROMPT,
             },
+            memory_profile: &context.memory_profile,
         },
     )
 }
@@ -390,23 +514,60 @@ fn context_for<T>(
     }
 }
 
-fn embedded_summary() -> &'static SummaryPersona {
+/// A failed initialization is not cached, so the next firing can retry it.
+fn cached<T>(
+    cache: &OnceLock<T>,
+    build: impl FnOnce() -> Result<T, PersonaError>,
+) -> Result<&T, PersonaError> {
+    if let Some(value) = cache.get() {
+        return Ok(value);
+    }
+    let value = build()?;
+    let _ = cache.set(value);
+    cache.get().ok_or_else(|| PersonaError::InvalidContext {
+        field: "persona_cache".into(),
+        reason: "successful persona initialization was not retained".into(),
+    })
+}
+
+fn embedded_summary() -> Result<&'static SummaryPersona, PersonaError> {
     static BASE: OnceLock<SummaryPersona> = OnceLock::new();
-    BASE.get_or_init(|| {
+    cached(&BASE, || {
         let tiers = [Tier::embedded(
             "base",
             cortexkit_persona::TrustClass::Operator,
             embedded_base(),
-        )
-        .expect("fixed base tier")];
-        load_summary(&tiers, &ApprovalSet::new(), None).expect("valid compiled summary persona")
+        )?];
+        load_summary(&tiers, &ApprovalSet::new(), None)
     })
 }
 
 /// Legacy callers use the embedded persona until lineage freezing adopts the
 /// caller's loaded ladder. No operator files are read on this compatibility path.
 pub fn render_embedded_summary(context: &SummaryContext) -> Result<Rendered, PersonaError> {
-    render_summary(embedded_summary(), context)
+    render_summary(embedded_summary()?, context)
+}
+
+/// The legacy model-chain summarizer rebuilds its system prompt for each request
+/// from `ModuleMeta::memory_context`, written once at session bind. The routed
+/// summarizer captures the same profile selection in `FrozenSummaryPersona` via
+/// `historian_routed::freeze_summary_persona` and reuses those bytes thereafter.
+pub(crate) fn render_session_summary(
+    store: &mc_store::McStore,
+    session: &str,
+    language: Option<&str>,
+) -> Result<Rendered, PersonaError> {
+    let loaded = store
+        .load_meta(session)
+        .map_err(|e| PersonaError::InvalidContext {
+            field: "memory_profile".into(),
+            reason: e.to_string(),
+        })?;
+    render_embedded_summary(&SummaryContext {
+        language: LanguageContext::new(language, LanguageOptions::default()),
+        memory_profile: MemoryProfile::summary(loaded.meta.memory_context.as_ref(), session)?,
+        ..Default::default()
+    })
 }
 
 /// Render the same qualified fragment for non-summary hidden agents. The small
@@ -417,19 +578,15 @@ pub fn render_language_directive(
     options: LanguageOptions,
 ) -> Result<String, PersonaError> {
     static LANGUAGE: OnceLock<LoadedRole> = OnceLock::new();
-    let persona = LANGUAGE.get_or_init(|| {
-        let base = EmbeddedTier::new()
-            .with_file("language", "PERSONA.md", LANGUAGE_PERSONA)
-            .expect("fixed language wrapper path");
-        let tiers = [
-            Tier::embedded("base", cortexkit_persona::TrustClass::Operator, base)
-                .expect("fixed base tier"),
-        ];
-        PersonaEngine::new(MODULE)
-            .expect("fixed module id")
-            .load(LoadRequest::new("language", &tiers, &ApprovalSet::new()))
-            .expect("valid compiled language wrapper")
-    });
+    let persona = cached(&LANGUAGE, || {
+        let base = EmbeddedTier::new().with_file("language", "PERSONA.md", LANGUAGE_PERSONA)?;
+        let tiers = [Tier::embedded(
+            "base",
+            cortexkit_persona::TrustClass::Operator,
+            base,
+        )?];
+        PersonaEngine::new(MODULE)?.load(LoadRequest::new("language", &tiers, &ApprovalSet::new()))
+    })?;
     let context = SummaryContext {
         language: LanguageContext::new(language, options),
         ..Default::default()
@@ -444,3 +601,376 @@ pub fn render_language_directive(
 
 #[cfg(test)]
 mod tests;
+
+#[cfg(test)]
+pub(crate) fn capture_profile_logs(run: impl FnOnce()) -> String {
+    #[derive(Clone)]
+    struct Writer(Arc<std::sync::Mutex<Vec<u8>>>);
+    impl std::io::Write for Writer {
+        fn write(&mut self, bytes: &[u8]) -> std::io::Result<usize> {
+            self.0.lock().unwrap().extend_from_slice(bytes);
+            Ok(bytes.len())
+        }
+        fn flush(&mut self) -> std::io::Result<()> {
+            Ok(())
+        }
+    }
+    let bytes = Arc::new(std::sync::Mutex::new(Vec::new()));
+    let writer = Writer(bytes.clone());
+    let subscriber = tracing_subscriber::fmt()
+        .without_time()
+        .with_ansi(false)
+        .with_max_level(tracing::Level::WARN)
+        .with_writer(move || writer.clone())
+        .finish();
+    tracing::subscriber::with_default(subscriber, run);
+    let output = bytes.lock().unwrap().clone();
+    String::from_utf8(output).unwrap()
+}
+
+#[cfg(test)]
+mod profile_tests {
+    use super::*;
+    use crate::memory_profile::documents;
+    use serde_json::{json, Value};
+
+    fn pin(parity: bool) -> Value {
+        let mut context = crate::memory_profile::resolve(
+            &crate::memory_context::ContextAnswer::NotAnswering,
+            &crate::memory_context::ContextAnswer::NotAnswering,
+            &[],
+        );
+        context.profile.parity = parity;
+        serde_json::to_value(context).unwrap()
+    }
+
+    #[test]
+    fn unmatched_profile_keeps_bytes_and_logs_identity_once_per_session() {
+        let root = tempfile::tempdir().unwrap();
+        let session = format!("mismatched-{}", root.path().display());
+        let store = mc_store::McStore::open_for_test(&crate::dev_descriptor_at(
+            root.path().to_str().unwrap(),
+        ))
+        .unwrap();
+        let mut value = pin(false);
+        value["profile"]["name"] = json!("@acme/memory-missing");
+        value["profile"]["version"] = json!("9.8.7");
+        value["profile"]["digest"] = json!("missing-profile-digest");
+        set_pin(&store, &session, value);
+        let logs = capture_profile_logs(|| {
+            for _ in 0..2 {
+                let result = render_session_summary(&store, &session, None).unwrap();
+                assert_eq!(
+                    result.text,
+                    include_str!("../testdata/historian-system-prompt.txt")
+                );
+                assert_eq!(
+                    result.digest.hex(),
+                    "590649b1f6b2428940cb925586342be58bdecc3ee4d64153d2f73ec5251532bd"
+                );
+            }
+        });
+        assert_eq!(
+            logs.matches("pinned memory profile does not match bundled profile")
+                .count(),
+            1,
+            "{logs}"
+        );
+        let bundled = documents::bundled_swe().unwrap();
+        for value in [
+            "pinned_name",
+            "pinned_version",
+            "pinned_digest",
+            "bundled_name",
+            "bundled_version",
+            "bundled_digest",
+            "@acme/memory-missing",
+            "9.8.7",
+            "missing-profile-digest",
+            &bundled.name,
+            &bundled.version,
+            &bundled.digest,
+            &session,
+        ] {
+            assert!(logs.contains(value), "missing {value}: {logs}");
+        }
+    }
+
+    #[test]
+    fn failed_persona_initialization_is_not_cached() {
+        let cache = OnceLock::new();
+        let error = cached::<String>(&cache, || {
+            Err(PersonaError::InvalidContext {
+                field: "memory_profile".into(),
+                reason: "temporary profile render failure".into(),
+            })
+        })
+        .unwrap_err();
+        assert!(error
+            .to_string()
+            .contains("temporary profile render failure"));
+        assert!(cache.get().is_none());
+        assert_eq!(
+            cached(&cache, || Ok("recovered".to_owned())).unwrap(),
+            "recovered"
+        );
+    }
+
+    #[test]
+    fn pinned_parity_summary_ignores_nonparity_process_mode() {
+        documents::with_parity_mode(false, || {
+            let context = SummaryContext {
+                memory_profile: MemoryProfile::summary(Some(&pin(true)), "profile-test").unwrap(),
+                ..Default::default()
+            };
+            assert!(context.memory_profile.present);
+            assert!(!context.memory_profile.supplies);
+            assert!(context.memory_profile.fragment.is_empty());
+            assert_eq!(context.memory_profile.task, None);
+            assert_eq!(
+                render_embedded_summary(&context).unwrap().text,
+                include_str!("../testdata/historian-system-prompt.txt")
+            );
+        });
+    }
+
+    #[test]
+    fn acme_summary_replaces_own_system_and_freezes_loaded_bytes() {
+        let disk = tempfile::tempdir().unwrap();
+        let source = documents::tests::acme();
+        let package = source.packages.last().unwrap();
+        std::fs::write(disk.path().join("ck.json"), &package.ck_bytes).unwrap();
+        for (path, bytes) in &package.files {
+            let path = disk.path().join(path);
+            std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+            std::fs::write(path, bytes).unwrap();
+        }
+        let profile = documents::tests::acme_from(disk.path());
+        let fragment =
+            MemoryProfile::capture(&profile, false, Some("historian/system"), None).unwrap();
+        let context = SummaryContext {
+            memory_profile: fragment.clone(),
+            ..Default::default()
+        };
+        let rendered = render_embedded_summary(&context).unwrap();
+        assert_eq!(rendered.text, fragment.fragment);
+        assert_ne!(
+            rendered.digest,
+            render_embedded_summary(&SummaryContext::default())
+                .unwrap()
+                .digest
+        );
+        assert!(fragment.supplies);
+        assert_eq!(fragment.task, None);
+        assert_eq!(
+            serde_json::to_value(&fragment).unwrap(),
+            json!({"present":true,"supplies":true,"name":profile.name,"version":profile.version,"digest":profile.digest,"task":null})
+        );
+        std::fs::write(
+            disk.path().join("prompts/historian/persona.md"),
+            "changed profile bytes\n",
+        )
+        .unwrap();
+        assert_eq!(render_embedded_summary(&context).unwrap(), rendered);
+    }
+
+    fn repository(root: &Path, body: &str) -> (Vec<Tier>, ApprovalSet, ProjectKey) {
+        use cortexkit_persona::Approval;
+        let persona = root.join("repo/.cortexkit/magic-context/roles/mc_summary");
+        std::fs::create_dir_all(persona.join("fragments/mc")).unwrap();
+        std::fs::write(persona.join("PERSONA.md"), body).unwrap();
+        std::fs::write(
+            persona.join("fragments/mc/memory-profile@1.md"),
+            "repository shadow",
+        )
+        .unwrap();
+        let tiers =
+            tier_ladder_with_config_home(&root.join("config"), None, Some(&root.join("repo")))
+                .unwrap();
+        let key = ProjectKey::new("profile-test").unwrap();
+        let loaded = load_summary(&tiers, &ApprovalSet::new(), Some(&key)).unwrap();
+        let tier = loaded.role.tiers().last().unwrap();
+        let mut approvals = ApprovalSet::new();
+        approvals.insert(Approval {
+            module: MODULE.into(),
+            role: SUMMARY_ROLE.into(),
+            project_key: key.clone(),
+            relative_path: tier.relative_path.clone(),
+            layer_digest: tier.layer_digest.unwrap(),
+        });
+        (tiers, approvals, key)
+    }
+
+    #[test]
+    fn dropped_profile_fragment_refuses_after_repository_render() {
+        let root = tempfile::tempdir().unwrap();
+        let (tiers, approvals, key) = repository(root.path(), "---\n---\n{% block instructions %}replacement{% endblock %}{% block memory_profile %}{% endblock %}{% block language %}{% endblock %}");
+        let persona = load_summary(&tiers, &approvals, Some(&key)).unwrap();
+        let context = SummaryContext {
+            memory_profile: MemoryProfile::summary(Some(&pin(false)), "profile-test").unwrap(),
+            ..Default::default()
+        };
+        let error = render_summary(&persona, &context).unwrap_err();
+        assert!(
+            matches!(error, PersonaError::InvalidContext { ref field, .. } if field == "mc_persona_invalid")
+        );
+        let text = error.to_string();
+        for expected in [
+            "memory_profile_dropped",
+            "mc_summary",
+            "project",
+            "PERSONA.md",
+        ] {
+            assert!(text.contains(expected), "{text}");
+        }
+    }
+
+    #[test]
+    fn repository_fragment_cannot_shadow_module_profile() {
+        let root = tempfile::tempdir().unwrap();
+        let (tiers, approvals, key) = repository(root.path(), "---\n---\n");
+        let persona = load_summary(&tiers, &approvals, Some(&key)).unwrap();
+        let context = SummaryContext {
+            memory_profile: MemoryProfile::summary(Some(&pin(false)), "profile-test").unwrap(),
+            ..Default::default()
+        };
+        assert_eq!(
+            render_summary(&persona, &context).unwrap().text,
+            context.memory_profile.fragment
+        );
+    }
+
+    struct FreezeRouting;
+    #[subc_client_rs::async_trait]
+    impl crate::historian_routed::SummaryRouting for FreezeRouting {
+        fn routing_support(&self) -> Result<(), crate::historian_routed::RoutingSupportRefusal> {
+            unreachable!()
+        }
+        async fn catalog(&self) -> Result<crate::model_work::RoutingCatalog, String> {
+            unreachable!()
+        }
+        async fn select(
+            &self,
+            _: &str,
+            _: &crate::historian_routed::SummaryScope,
+            _: &crate::model_work::SelectParams,
+        ) -> Result<crate::runner_choices::RoutedChoice, cortexkit_role_routing::errors::Refusal>
+        {
+            unreachable!()
+        }
+        async fn report(
+            &self,
+            _: &str,
+            _: &crate::historian_routed::SummaryScope,
+            _: &cortexkit_role_routing::report::ReportRequest,
+        ) -> Result<
+            cortexkit_role_routing::report::ReportAnswer,
+            cortexkit_role_routing::errors::Refusal,
+        > {
+            unreachable!()
+        }
+        async fn connect_runner(
+            &self,
+            _: &crate::historian_routed::SummaryScope,
+            _: &str,
+        ) -> Result<
+            Box<dyn crate::historian::HistorianProducerDriver + Send>,
+            crate::historian_producer::HistorianProducerError,
+        > {
+            unreachable!()
+        }
+        fn persona_tiers(&self, _: &Path) -> Result<Vec<Tier>, PersonaError> {
+            Ok(vec![Tier::embedded(
+                "base",
+                TrustClass::Operator,
+                embedded_base(),
+            )
+            .unwrap()])
+        }
+    }
+
+    fn set_pin(store: &mc_store::McStore, session: &str, value: Value) {
+        let loaded = store.load_meta(session).unwrap();
+        let mut meta = loaded.meta;
+        meta.memory_context = Some(value);
+        store
+            .commit_meta(session, loaded.row_version, &meta)
+            .unwrap();
+    }
+
+    #[test]
+    fn routed_summary_freeze_ignores_late_pin() {
+        let root = tempfile::tempdir().unwrap();
+        let store = mc_store::McStore::open_for_test(&crate::dev_descriptor_at(
+            root.path().to_str().unwrap(),
+        ))
+        .unwrap();
+        let freeze = || {
+            crate::historian_routed::freeze_summary_persona(
+                &store,
+                "session",
+                &FreezeRouting,
+                root.path(),
+                None,
+                None,
+            )
+            .unwrap()
+        };
+        let before = freeze();
+        assert_eq!(
+            before.bytes,
+            include_str!("../testdata/historian-system-prompt.txt")
+        );
+        assert_eq!(
+            before.render_digest,
+            cortexkit_persona::Digest::of(before.bytes.as_bytes()).hex()
+        );
+        set_pin(&store, "session", pin(false));
+        assert_eq!(freeze(), before);
+    }
+
+    #[test]
+    fn chain_summary_uses_stored_pin_without_creating_freeze() {
+        let root = tempfile::tempdir().unwrap();
+        let store = mc_store::McStore::open_for_test(&crate::dev_descriptor_at(
+            root.path().to_str().unwrap(),
+        ))
+        .unwrap();
+        let unpinned = render_session_summary(&store, "session", None).unwrap();
+        assert_eq!(
+            unpinned.text,
+            include_str!("../testdata/historian-system-prompt.txt")
+        );
+        assert_eq!(
+            unpinned.digest.hex(),
+            "590649b1f6b2428940cb925586342be58bdecc3ee4d64153d2f73ec5251532bd"
+        );
+        set_pin(&store, "session", pin(true));
+        assert_eq!(
+            render_session_summary(&store, "session", None)
+                .unwrap()
+                .bytes(),
+            unpinned.bytes()
+        );
+        let expected = MemoryProfile::summary(Some(&pin(false)), "profile-test").unwrap();
+        set_pin(&store, "nonparity", pin(false));
+        assert_eq!(
+            render_session_summary(&store, "nonparity", None)
+                .unwrap()
+                .text,
+            expected.fragment
+        );
+        assert!(store
+            .load_meta("session")
+            .unwrap()
+            .meta
+            .summary_persona
+            .is_none());
+        assert!(store
+            .load_meta("nonparity")
+            .unwrap()
+            .meta
+            .summary_persona
+            .is_none());
+    }
+}
