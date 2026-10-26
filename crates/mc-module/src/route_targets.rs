@@ -89,6 +89,12 @@ impl RouteTargetConfig {
     }
 
     pub(crate) fn target(&self, route: RegisteredRoute) -> Option<RouteTarget> {
+        if route == RegisteredRoute::EngramDeviceStreams {
+            return Some(RouteTarget::InternalService {
+                module_id: "engram".into(),
+                service_id: "device-streams".into(),
+            });
+        }
         if route == RegisteredRoute::EngramDoor {
             return crate::agent_data::ENABLED.then(|| RouteTarget::InternalService {
                 module_id: "engram".into(),
@@ -197,6 +203,7 @@ pub(crate) fn routed_module_target(module_id: &str) -> RouteTarget {
 /// constructing a `RouteTarget` directly.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum RegisteredRoute {
+    EngramDeviceStreams,
     EngramDoor,
     EntorhinalSessionRef,
     SessionResolve,
@@ -209,7 +216,8 @@ pub(crate) enum RegisteredRoute {
 }
 
 impl RegisteredRoute {
-    const ALL: [Self; 9] = [
+    const ALL: [Self; 10] = [
+        Self::EngramDeviceStreams,
         Self::SessionResolve,
         Self::HistorianRunner,
         Self::ProviderRunner,
@@ -223,6 +231,7 @@ impl RegisteredRoute {
 
     fn module_id(self, config: &RouteTargetConfig) -> Option<&str> {
         match self {
+            Self::EngramDeviceStreams => Some("engram"),
             Self::EngramDoor => crate::agent_data::ENABLED.then_some("engram"),
             Self::EntorhinalSessionRef => crate::agent_data::ENABLED.then_some("entorhinal"),
             Self::SessionResolve => Some(DEFAULT_THALAMUS_MODULE_ID),
@@ -240,6 +249,7 @@ impl RegisteredRoute {
     /// exhaustive so a new route has to state its own behaviors here.
     fn self_signals(self) -> Vec<SelfSignalDeclaration> {
         match self {
+            Self::EngramDeviceStreams => Vec::new(),
             Self::EngramDoor | Self::EntorhinalSessionRef => Vec::new(),
             // A lookup on the session registry: it spends nothing and shapes no surface.
             Self::SessionResolve => Vec::new(),
@@ -334,18 +344,8 @@ pub(crate) fn catalog_provider_target_for_test() -> RouteTarget {
 
 #[cfg(test)]
 pub(crate) fn expected_routes_for_tests(runner: &str) -> Vec<String> {
-    #[cfg(feature = "agent-data")]
     let routes = vec![
-        "thalamus",
-        runner,
-        "fusiform",
-        "ckbus",
         "engram",
-        "entorhinal",
-        "synapse",
-    ];
-    #[cfg(not(feature = "agent-data"))]
-    let routes = vec![
         "thalamus",
         runner,
         "fusiform",
@@ -634,8 +634,13 @@ mod tests {
                         module_id,
                         service_id,
                     } => {
-                        assert_eq!(route, RegisteredRoute::EngramDoor);
-                        assert_eq!(service_id, "session-door");
+                        match route {
+                            RegisteredRoute::EngramDoor => assert_eq!(service_id, "session-door"),
+                            RegisteredRoute::EngramDeviceStreams => {
+                                assert_eq!(service_id, "device-streams")
+                            }
+                            _ => panic!("unexpected internal service route {route:?}"),
+                        }
                         module_id
                     }
                 };

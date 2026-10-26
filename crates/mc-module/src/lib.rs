@@ -52,6 +52,7 @@ pub mod historian_routed;
 mod memory_actions;
 mod memory_context;
 mod memory_profile;
+mod memory_sync;
 mod model_work;
 pub mod persona_host;
 
@@ -4188,6 +4189,7 @@ pub struct McHandler {
     /// Project identities of route roots whose session the host has not recorded.
     project_identities: Arc<project_identity::ProjectIdentityResolver>,
     entorhinal: entorhinal_resolve::EntorhinalResolver,
+    memory_sync: Arc<memory_sync::Service>,
     binding_projects: Mutex<HashMap<u16, BindingProject>>,
     active_project_roots: Mutex<HashMap<String, PathBuf>>,
     /// Route roots inside a git checkout whose identity git could not give, with the
@@ -5273,6 +5275,7 @@ impl McHandler {
             .expect("bus connection file") = bus_connection_file;
         McHandler {
             agent_data,
+            memory_sync: memory_sync::Service::new(connection_file.clone(), module_id.clone()),
             move_visibility,
             registered_module_id: module_id,
             store,
@@ -5414,11 +5417,20 @@ impl McHandler {
         let coordinator = Arc::clone(&self.store_open);
         let prime_serving_wal = true;
         let dreams = self.dream_handles();
+        let memory_sync = Arc::clone(&self.memory_sync);
         tokio::spawn(async move {
             let _guard = StoreOpenWaiterGuard {
                 coordinator: Arc::clone(&coordinator),
             };
-            Self::run_store_open(store, coordinator, descriptor, prime_serving_wal, dreams).await;
+            Self::run_store_open(
+                store,
+                coordinator,
+                descriptor,
+                prime_serving_wal,
+                dreams,
+                memory_sync,
+            )
+            .await;
         });
     }
 
@@ -5428,6 +5440,7 @@ impl McHandler {
         descriptor: StorageDescriptor,
         prime_serving_wal: bool,
         _dreams: dream_dispatch::tick::DreamHandles,
+        memory_sync: Arc<memory_sync::Service>,
     ) {
         #[cfg(test)]
         {
@@ -5452,7 +5465,9 @@ impl McHandler {
                     );
                     return;
                 }
-                let _ = store_slot.set(Arc::new(opened));
+                let opened = Arc::new(opened);
+                memory_sync.install(&opened);
+                let _ = store_slot.set(opened);
                 coordinator.set_phase(STORE_OPENED);
                 #[cfg(not(test))]
                 _dreams.ensure_timer();
@@ -5523,7 +5538,9 @@ impl McHandler {
                         Self::abandon_lease_wait_on_shutdown(&coordinator, started.elapsed());
                         return;
                     }
-                    let _ = store_slot.set(Arc::new(opened));
+                    let opened = Arc::new(opened);
+                    memory_sync.install(&opened);
+                    let _ = store_slot.set(opened);
                     coordinator.set_phase(STORE_OPENED);
                     #[cfg(not(test))]
                     _dreams.ensure_timer();
@@ -5759,6 +5776,7 @@ impl McHandler {
             runner_choices: Arc::new(Mutex::new(runner_choices::RunnerChoiceLog::default())),
             project_identities: Arc::new(project_identity::ProjectIdentityResolver::new()),
             entorhinal: entorhinal_resolve::EntorhinalResolver::new(None),
+            memory_sync: memory_sync::Service::new(None, DEFAULT_MODULE_ID.into()),
             binding_projects: Mutex::default(),
             active_project_roots: Mutex::default(),
             memory_paused_routes: Arc::default(),
@@ -10910,6 +10928,7 @@ impl McHandler {
             "pass_trace": pass_trace,
             "runtime_store_error": self.runtime_store_error_value(&session_id),
             "single_store": store.context_domain_status(),
+            "memory_sync": self.memory_sync.status(store),
             "publish_timing": store.load_publish_timing(&session_id).ok().flatten(),
             "tail_identity_re_adopt_count": loaded.meta.tail_identity_re_adopt_count,
             "fake_compaction": {
@@ -22083,8 +22102,9 @@ mod tests {
             serde_json::json!({"wire_crate_version": "0.33.1"})
         );
         // The SDK version is truthful deployment metadata, not a wire-shape change.
-        // Normalize only /manifest/provenance/wire_crate_version to the old SDK;
-        // every other byte is compared to the measured 0.32.8 HELLO on 2462c22a.
+        // Normalize only /manifest/provenance/wire_crate_version to the old SDK
+        // so the measured HELLO fingerprint tracks intentional manifest changes
+        // independently from dependency upgrades, including the ENGRAM consumes edge.
         hello
             .manifest
             .provenance
@@ -22092,10 +22112,10 @@ mod tests {
             .unwrap()
             .wire_crate_version = Some("0.32.8".into());
         let current = serde_json::to_vec(&hello).unwrap();
-        assert_eq!(current.len(), 13_151);
+        assert_eq!(current.len(), 13_160);
         assert_eq!(
             format!("{:x}", Sha256::digest(&current)),
-            "ca9ea694c36322084bf5f81de7b5c4b9efdaed90a710aa16bfb497c373b33c77"
+            "e58c4dead80ba25591bfdb262a5fdd921446ed1438396f42761e9b8e8890ba6f"
         );
     }
 

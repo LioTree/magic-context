@@ -210,10 +210,10 @@ impl MemoryWriter {
         now: i64,
     ) -> rusqlite::Result<()> {
         let Some(a) = &self.authority else {
-            return Ok(());
+            return self.report_unplaced(conn, id, actor, kind, session);
         };
         let Some(project_id) = &a.project_id else {
-            return Ok(());
+            return self.report_unplaced(conn, id, actor, kind, session);
         };
         if conn.is_autocommit() {
             return Err(refuse("memory create requires a transaction"));
@@ -264,6 +264,47 @@ impl MemoryWriter {
             )?;
         }
         Ok(())
+    }
+
+    /// Report an unreplicated create without guessing ownership or writing placement.
+    fn report_unplaced(
+        &self,
+        conn: &Connection,
+        id: i64,
+        actor: Actor,
+        kind: CreateKind,
+        session: Option<&str>,
+    ) -> rusqlite::Result<()> {
+        let Some(hook) = &self.hook else {
+            return Ok(());
+        };
+        if conn.is_autocommit() {
+            return Err(refuse("memory create requires a transaction"));
+        }
+        let (category, content, importance, expires_at) = conn.query_row(
+            "SELECT category,content,importance,expires_at FROM memories WHERE id=?1",
+            [id],
+            |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?)),
+        )?;
+        hook(
+            conn,
+            &CreateEvent {
+                kind,
+                actor,
+                session_id: session.or(self.session_id.as_deref()).map(str::to_owned),
+                ordinals: self.ordinals.clone(),
+                memory_id: id,
+                writer_project_id: None,
+                owner: None,
+                category_tag: category,
+                effective_category_id: None,
+                importance,
+                expires_at,
+                content,
+                origin_profile: None,
+                snapshot_digest: None,
+            },
+        )
     }
 }
 

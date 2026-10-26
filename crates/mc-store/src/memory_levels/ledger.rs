@@ -1,6 +1,16 @@
 //! Device-local sync records. All mutations borrow the memory's transaction.
 use rusqlite::{params, Connection};
 
+impl crate::McStore {
+    /// Short, schema-fenced sync bookkeeping only; callers must do network work outside it.
+    pub fn with_memory_sync_write<T>(
+        &self,
+        write: impl FnOnce(&rusqlite::Transaction<'_>) -> rusqlite::Result<T>,
+    ) -> Result<T, crate::McStoreError> {
+        self.context_write(&["memory_ops", "memory_outbox", "memory_sync_state"], write)
+    }
+}
+
 #[allow(clippy::too_many_arguments)]
 pub fn append_op(
     conn: &Connection,
