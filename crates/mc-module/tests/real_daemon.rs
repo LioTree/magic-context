@@ -821,6 +821,7 @@ fn ensure_module_binary() -> PathBuf {
 
 struct DaemonBinaries {
     daemon: PathBuf,
+    #[cfg(unix)]
     cli: PathBuf,
 }
 
@@ -866,6 +867,7 @@ fn build_daemon_binaries(workspace: &Path) -> DaemonBinaries {
     );
     DaemonBinaries {
         daemon: dev_named_binary(&daemon_binary_path(&source, &cargo_args)),
+        #[cfg(unix)]
         cli: dev_named_binary(&target.join("debug/ck")),
     }
 }

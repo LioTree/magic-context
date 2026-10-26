@@ -668,16 +668,18 @@ async fn routed_code_read_provider_refuses_path_escape() {
         "../{}/secret.txt",
         outside.path().file_name().unwrap().to_string_lossy()
     );
-    let mut calls = vec![
+    let calls = vec![
         ("read", json!({"filePath": "inside.txt"})),
         ("read", json!({"filePath": traversal})),
         ("read", json!({"filePath": secret})),
     ];
     #[cfg(unix)]
-    {
+    let calls = {
+        let mut calls = calls;
         std::os::unix::fs::symlink(&secret, root.join("escape.txt")).unwrap();
         calls.push(("read", json!({"filePath": "escape.txt"})));
-    }
+        calls
+    };
     rig.wire.script(vec![step(1, calls), answer("done")]);
     rig.child_for(TaskName::Map, &["read"])
         .await

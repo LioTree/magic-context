@@ -249,6 +249,17 @@ fn spawn_recovers_when_a_writable_executable_handle_is_released() {
 }
 
 #[test]
+fn spawn_wrapper_returns_success_after_one_attempt() {
+    let mut attempts = 0;
+    let result = executable_staging::retry_spawn(|| {
+        attempts += 1;
+        Ok(42)
+    });
+    assert_eq!(result.unwrap(), 42);
+    assert_eq!(attempts, 1);
+}
+
+#[test]
 fn executable_busy_retry_uses_fifty_millisecond_backoff_then_succeeds() {
     use std::io::{self, ErrorKind};
     use std::time::Duration;

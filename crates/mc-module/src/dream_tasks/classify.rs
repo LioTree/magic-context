@@ -3139,7 +3139,7 @@ mod tests {
             trusted_config: trusted,
             harness: "pi",
             parent_session_id: "parent",
-            directory: Path::new("/repo"),
+            directory: Path::new(if cfg!(windows) { r"C:\repo" } else { "/repo" }),
             project: "/repo",
             deadline_ms: deadline,
             token_budget: Some(1000),

@@ -163,6 +163,7 @@ pub trait HolderCheck {
 /// `-wal`/`-shm` files, as the restart window job does.
 pub struct Lsof;
 
+#[cfg(not(windows))]
 impl HolderCheck for Lsof {
     fn holders(&self, files: &[PathBuf]) -> Result<Vec<String>, String> {
         let present: Vec<&PathBuf> = files.iter().filter(|path| path.exists()).collect();
@@ -199,6 +200,13 @@ impl HolderCheck for Lsof {
         holders.sort();
         holders.dedup();
         Ok(holders)
+    }
+}
+
+#[cfg(windows)]
+impl HolderCheck for Lsof {
+    fn holders(&self, _files: &[PathBuf]) -> Result<Vec<String>, String> {
+        Err("open-file enumeration is unsupported on Windows".into())
     }
 }
 

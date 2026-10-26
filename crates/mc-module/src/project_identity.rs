@@ -1033,7 +1033,10 @@ mod tests {
             .env("GIT_COMMITTER_EMAIL", "golden@example.invalid")
             .env("GIT_AUTHOR_DATE", "2001-01-01T00:00:00Z")
             .env("GIT_COMMITTER_DATE", "2001-01-01T00:00:00Z")
-            .env("GIT_CONFIG_GLOBAL", "/dev/null")
+            .env(
+                "GIT_CONFIG_GLOBAL",
+                if cfg!(windows) { "NUL" } else { "/dev/null" },
+            )
             .env("GIT_CONFIG_NOSYSTEM", "1")
             // Config injected through the environment (a shell or agent tool setting
             // core.hooksPath this way) would otherwise change the golden commit.
@@ -1337,7 +1340,10 @@ mod pin_tests {
         let mut child = Command::new("git")
             .args(args)
             .current_dir(cwd)
-            .env("GIT_CONFIG_GLOBAL", "/dev/null")
+            .env(
+                "GIT_CONFIG_GLOBAL",
+                if cfg!(windows) { "NUL" } else { "/dev/null" },
+            )
             .env("GIT_CONFIG_NOSYSTEM", "1")
             .env("GIT_CONFIG_COUNT", "0")
             .stdin(Stdio::piped())
@@ -1373,6 +1379,10 @@ mod pin_tests {
     }
 
     fn relocate(value: &mut Value, root: &Path) {
+        #[cfg(windows)]
+        let native_root = root.to_str().unwrap().replace('\\', "/");
+        #[cfg(windows)]
+        let root = Path::new(native_root.strip_prefix("//?/").unwrap_or(&native_root));
         match value {
             Value::String(string) => *string = string.replace("<fixture>", root.to_str().unwrap()),
             Value::Array(values) => values.iter_mut().for_each(|value| relocate(value, root)),
