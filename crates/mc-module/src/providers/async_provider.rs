@@ -521,6 +521,12 @@ fn engine_error(failure: transform::TransformError) -> HandlerOutcome {
     }
 }
 
+fn waiting_for_tool_result(failure: &HandlerOutcome) -> bool {
+    matches!(failure, HandlerOutcome::Error { code, message }
+        if code == "transient"
+            && message == "lineage protocol error: compaction range ends inside a tool arc")
+}
+
 /// Where an engine baseline (`last_produced` / `last_applied`) is stored.
 /// A baseline that is one of the retained published views is only named by
 /// version, so acknowledging a view never copies the whole transcript again.
@@ -2343,6 +2349,15 @@ impl McHandler {
                 }
                 let settled = match result {
                     Ok(()) => cursor.ack().await,
+                    Err(ref error) if waiting_for_tool_result(error) => {
+                        // llm-runner §11.1 and compaction-provider §5 require a
+                        // durable advance notice after each committed write,
+                        // including a tool result. Acknowledge this delivery
+                        // while waiting for that result instead of polling.
+                        // If its notice is lost, a later notice re-reads the
+                        // pending tool call and result.
+                        cursor.ack().await
+                    }
                     Err(HandlerOutcome::ErrorWithDetail { ref code, .. })
                         if code == "invalid_params" =>
                     {

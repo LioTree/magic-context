@@ -3,6 +3,8 @@ use crate::providers::async_provider::offline_first_pass as offline;
 use crate::session_resolver::ProviderRunner as _;
 use cortexkit_role_llm_runner::read::ReadPage;
 
+mod open_tool_wait;
+
 struct Golden {
     name: &'static str,
     bytes: &'static str,
