@@ -634,6 +634,13 @@ async fn stack26_wrapup_publication_survives_a_concurrent_conversation_call() {
 /// set up with harness `opencode`, the harness whose setup checks for standalone
 /// plugin state.
 async fn opencode_fixture(dir: &Path) -> (Rig, Arc<FakeSessionRunner>) {
+    opencode_fixture_with(dir, |_| {}).await
+}
+
+async fn opencode_fixture_with(
+    dir: &Path,
+    configure: impl FnOnce(&mut McHandler),
+) -> (Rig, Arc<FakeSessionRunner>) {
     let child = FakeSessionRunner::for_project(dir);
     let factory = child.factory();
     let rig = Rig::configured(
@@ -663,10 +670,283 @@ async fn opencode_fixture(dir: &Path) -> (Rig, Arc<FakeSessionRunner>) {
             handler.fixed_historian_settings = Some(json!({"historian":{"opencode":{
                 "model":"fixture/main", "fallback_models":["fixture/backup"]
             }}}));
+            configure(handler);
         },
     )
     .await;
     (rig, child)
+}
+
+async fn held_autonomous_historian(
+    dir: &Path,
+    conflicting_mid: Option<&str>,
+) -> (
+    Rig,
+    Arc<FakeSessionRunner>,
+    crate::providers::session_runner_fake::FakeSend,
+) {
+    let (rig, child) = opencode_fixture(dir).await;
+    rig.narrative(2);
+    rig.notice(1, 1_000, None).await;
+    rig.historian_evaluation_done().await;
+    rig.narrative(45);
+    {
+        let mut entries = rig.runner.entries.lock().unwrap();
+        for entry in entries.iter_mut().skip(2) {
+            entry.message["parts"][0]["text"] = json!(format!(
+                "narrative message {} with substantive user intent {}",
+                entry.ordinal,
+                "durable history details ".repeat(500)
+            ));
+        }
+        let mid = "m2_thalamus_v1_s";
+        entries[2].mid = mid.into();
+        entries[2].message["info"]["id"] = json!(mid);
+    }
+    if let Some(mid) = conflicting_mid {
+        let store = rig.h.store.get().unwrap();
+        let namespace = rig.state().namespace();
+        let mut loaded = store.load(&namespace).unwrap();
+        loaded
+            .meta
+            .block_identity_by_mid
+            .insert(mid.into(), Vec::new());
+        store
+            .commit(&namespace, loaded.row_version, &loaded.core, &loaded.meta)
+            .unwrap();
+    }
+    rig.notice(2, 50_000, None).await;
+    let send = tokio::time::timeout(Duration::from_secs(10), child.next_unfinished())
+        .await
+        .expect("autonomous summarizer child started");
+    (rig, child, send)
+}
+
+#[tokio::test]
+async fn autonomous_historian_publishes_unchanged_messages_before_the_first_view() {
+    let dir = tempfile::tempdir().unwrap();
+    let (rig, child, send) = held_autonomous_historian(dir.path(), None).await;
+    assert_eq!(rig.newest(), None, "no view has recorded source identities");
+    let before = rig.state();
+    let namespace = before.namespace();
+    let store = rig.h.store.get().unwrap();
+    let identities_before = store.load(&namespace).unwrap().meta.block_identity_by_mid;
+    assert_eq!(before.entries.len(), 45);
+
+    // No further notice, ride or parent write may populate identities while the
+    // child is held: publication must work from the already ingested messages.
+    child.finish(
+        &send.run_id,
+        crate::tests::historian_output_for_prompt(&send.prompt),
+    );
+    rig.historian_evaluation_done().await;
+    let after = rig.state();
+    assert_eq!(
+        before
+            .entries
+            .iter()
+            .map(|(n, entry)| (n, entry.raw()))
+            .collect::<Vec<_>>(),
+        after
+            .entries
+            .iter()
+            .map(|(n, entry)| (n, entry.raw()))
+            .collect::<Vec<_>>()
+    );
+    assert!(
+        !store.load_compartments(&namespace).unwrap().is_empty(),
+        "unchanged held messages must pass the publication fence before the first view ({} identity rows before release)",
+        identities_before.len()
+    );
+}
+
+#[tokio::test]
+async fn autonomous_historian_preserves_a_conflicting_selected_identity_for_the_fence() {
+    let dir = tempfile::tempdir().unwrap();
+    let mid = "m2_thalamus_v1_s";
+    let (rig, child, send) = held_autonomous_historian(dir.path(), Some(mid)).await;
+    let namespace = rig.state().namespace();
+    let store = rig.h.store.get().unwrap();
+    let held = store.load(&namespace).unwrap();
+    assert!(held.meta.block_identity_by_mid[mid].is_empty());
+    assert!(held
+        .meta
+        .historian
+        .selected_range_identities
+        .iter()
+        .any(|selected| selected.mid == mid));
+    child.finish(
+        &send.run_id,
+        crate::tests::historian_output_for_prompt(&send.prompt),
+    );
+    rig.historian_evaluation_done().await;
+    assert!(store.load_compartments(&namespace).unwrap().is_empty());
+    let failure = store
+        .load_meta(&namespace)
+        .unwrap()
+        .meta
+        .historian
+        .last_failure
+        .unwrap();
+    assert_eq!(
+        failure,
+        format!("publish rejected: selected historian message {mid} changed after firing")
+    );
+}
+
+#[tokio::test]
+async fn autonomous_historian_publishes_a_refit_expanded_range_with_missing_identities() {
+    let dir = tempfile::tempdir().unwrap();
+    let (rig, child) = opencode_fixture_with(dir.path(), |handler| {
+        let config = handler.fixed_config.as_mut().unwrap();
+        config.historian_context_limit_tokens = 1_000_000;
+        config.historian_context_limit_known = true;
+    })
+    .await;
+    rig.narrative(400);
+    for entry in rig.runner.entries.lock().unwrap().iter_mut() {
+        entry.message["info"]["role"] = json!(if entry.ordinal % 2 == 0 {
+            "user"
+        } else {
+            "assistant"
+        });
+        entry.message["parts"][0]["text"] = json!(format!(
+            "narrative message {} {}",
+            entry.ordinal,
+            "durable history details ".repeat(500)
+        ));
+    }
+    let store = rig.h.store.get().unwrap();
+    let mut state = rig.state();
+    let namespace = state.namespace();
+    let serial = rig.h.provider_serial.lock_for(&state.key).await;
+    rig.h
+        .read_async(&mut state, 0, Duration::from_secs(10))
+        .await
+        .unwrap();
+    state.resync = false;
+    state
+        .ingest_read(store, codec::Codec::OpencodeAiSdk)
+        .unwrap();
+    let loaded = store.load(&namespace).unwrap();
+    assert!(loaded.meta.block_identity_by_mid.is_empty());
+    if loaded.row_version.is_none() {
+        store
+            .commit(&namespace, None, &loaded.core, &loaded.meta)
+            .unwrap();
+    }
+    let fence = Arc::new(AsyncHistoryFence {
+        reference: rig.reference.clone(),
+        generation: state.generation,
+        key: state.key.clone(),
+        serial: Arc::clone(&rig.h.provider_serial),
+    });
+    let mut parsed = rig.h.async_historian_request(&state).unwrap();
+    parsed.usage = Some(mc_store::ModuleUsage {
+        current_total_input_tokens: 500_000,
+        context_limit_tokens: 1_000_000,
+        ..Default::default()
+    });
+    parsed.historian_model_chain = Some(vec!["opencode/small".into(), "fixture/main".into()]);
+    let config = rig.h.fixed_config.as_ref().unwrap();
+    let fixed_prompt = crate::historian_prompt::build_compartment_agent_prompt(
+        &crate::historian_prompt::CompartmentPromptInputs {
+            seed_examples: "",
+            session_references: "",
+            project_memory: "",
+            input_source: "Messages 0-399:\n\n",
+            memory_enabled: config.memory_enabled,
+            user_observations_requested: config.user_observations_requested,
+            extraction_free: false,
+        },
+    );
+    // Leave room for fixed instructions and a small source chunk. A window too
+    // small for the instructions uses oversize admission instead of shrinking.
+    let small_mass =
+        crate::decision_calibration::DecisionCalibration::for_model(Some("opencode/small"))
+            .provider_mass(
+                crate::decision_calibration::LocalMass {
+                    system: mc_tokenizer::estimate_tokens(
+                        crate::historian_prompt::HISTORIAN_SYSTEM_PROMPT,
+                    ) as f64,
+                    prose: (mc_tokenizer::estimate_tokens(&fixed_prompt) + 5_000) as f64,
+                    tools: 0.0,
+                },
+                true,
+            );
+    let small_input = (small_mass / 0.97).ceil() as usize + 1;
+    parsed.historian_model_limits = serde_json::from_value(json!({
+        "opencode/small":{"context":small_input + 8_000,"input":small_input,"output":8_000},
+        "fixture/main":{"context":1_000_000,"output":32_000}
+    }))
+    .unwrap();
+    let projection = fence
+        .prepare_input(
+            store,
+            historian_tail::InputWindow::default().through(Some(399)),
+            codec::Codec::OpencodeAiSdk,
+            &mut parsed,
+            &state.reminder_echoes,
+        )
+        .unwrap();
+    let mut timings = HistorianTriggerTimings::default();
+    let prepared = rig.h.prepare_historian_fire(
+        Arc::clone(store),
+        &parsed,
+        &rig.h.async_binding(&state),
+        &dir.path().to_string_lossy(),
+        &projection,
+        HistorianPrepareContext {
+            rust_background_enabled: Some(true),
+            now: now_ms(),
+            snapshot_generation: None,
+            publication_fence: Some(fence),
+            tag_snapshot: None,
+            async_coverage: Some(None),
+            reclaim_ride_available: false,
+            runner_lane: true,
+            timings: &mut timings,
+        },
+    );
+    let PreparedHistorianAction::FireReady(prepared) = prepared else {
+        panic!("expected initial firing")
+    };
+    assert_eq!(prepared.task.firing.model_chain[0], "opencode/small");
+    assert_eq!(
+        prepared.task.firing.model_limits["opencode/small"].input,
+        Some(small_input)
+    );
+    let initial = prepared.task.firing.selected_range_identities.clone();
+    drop(serial);
+    let firing = tokio::spawn(McHandler::execute_historian_firing_task(
+        Arc::clone(&rig.h.producer_factory),
+        prepared.task,
+    ));
+    let send = tokio::time::timeout(Duration::from_secs(10), child.next_unfinished())
+        .await
+        .unwrap();
+    assert_eq!(send.model, "fixture/main");
+    let refitted = store
+        .load_meta(&namespace)
+        .unwrap()
+        .meta
+        .historian
+        .selected_range_identities;
+    assert!(
+        refitted.len() > initial.len(),
+        "runtime Zen removal must expand the selected range: {} vs {}",
+        refitted.len(),
+        initial.len()
+    );
+    assert!(refitted
+        .iter()
+        .any(|selected| !initial.iter().any(|old| old.mid == selected.mid)));
+    child.finish(
+        &send.run_id,
+        crate::tests::historian_output_for_prompt(&send.prompt),
+    );
+    firing.await.unwrap().unwrap();
+    assert!(!store.load_compartments(&namespace).unwrap().is_empty());
 }
 
 /// Rows `crate::offline_move::has_standalone_state` would count for session `s`.
