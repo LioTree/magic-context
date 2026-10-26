@@ -668,6 +668,10 @@ export function commitTurnOnePublication(
         startMessage: row.startMessage,
         endMessage: row.endMessage,
     }));
+    // Published compartments are contiguous; their outer bounds describe the
+    // full published range, including citations that span compartment boundaries.
+    const publishedStart = Math.min(...ranges.map((range) => range.startMessage));
+    const publishedEnd = Math.max(...ranges.map((range) => range.endMessage));
     const insertFact = db.prepare(
         `INSERT OR IGNORE INTO memory_pending_facts(project_path,publication_id,fact_index,compartment_id,category,content,anchor_known,state,fact_attempts,reason)
          VALUES(?,?,?,?,?,?,?,'retryable',0,?)`,
@@ -694,9 +698,7 @@ export function commitTurnOnePublication(
             input.honourAnchors &&
             start !== undefined &&
             end !== undefined &&
-            !ranges.some(
-                (range) => start <= end && start >= range.startMessage && end <= range.endMessage,
-            )
+            (Math.min(start, end) < publishedStart || Math.max(start, end) > publishedEnd)
         )
             return;
         const factIndex = fact.factIndex ?? position;

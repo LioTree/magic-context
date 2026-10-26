@@ -1,5 +1,8 @@
 import { readFileSync } from "node:fs";
-import { validateHistorianOutput } from "../../src/hooks/magic-context/compartment-runner-validation";
+import {
+    shouldDiscardLastHistorianCompartment,
+    validateHistorianOutput,
+} from "../../src/hooks/magic-context/compartment-runner-validation";
 import configJSON from "./deepseek.json";
 import { requestHash, turnOne, turnTwo } from "./prompts";
 import { type Config, loadCases } from "./run";
@@ -56,6 +59,13 @@ for (const c of selected) {
     );
     if (!validation.ok) throw new Error(`invalid_recorded_summary:${c.id}`);
     const originalFacts = validation.facts ?? [];
+    const published = shouldDiscardLastHistorianCompartment(validation.compartments, {
+        endIndex: last.endOrdinal,
+    })
+        ? validation.compartments.slice(0, -1)
+        : validation.compartments;
+    const publishedStart = Math.min(...published.map((range) => range.startMessage));
+    const publishedEnd = Math.max(...published.map((range) => range.endMessage));
     const prompt = second.request.messages.at(-1)!.content;
     rows.push({
         caseId: c.id,
@@ -64,6 +74,33 @@ for (const c of selected) {
             (f) => originalFacts.findIndex((original) => original.content === f.content) + 1,
         ),
         publishedCount: second.facts.length + second.deferredFacts,
+        publishedRanges: published.map(({ startMessage, endMessage }) => ({
+            startMessage,
+            endMessage,
+        })),
+        factAnchors: originalFacts.map((fact, index) => {
+            const start = fact.anchor?.startOrdinal;
+            const end = fact.anchor?.endOrdinal;
+            let rangeCoverage = "unanchored";
+            if (start !== undefined && end !== undefined) {
+                if (Math.min(start, end) < publishedStart || Math.max(start, end) > publishedEnd)
+                    rangeCoverage = "unpublished";
+                else if (
+                    published.some(
+                        (range) => start >= range.startMessage && end <= range.endMessage,
+                    )
+                )
+                    rangeCoverage = "single-published";
+                else rangeCoverage = "cross-published";
+            }
+            return {
+                originalBullet: index + 1,
+                compartmentIndex: fact.anchor?.compartmentIndex,
+                startOrdinal: start,
+                endOrdinal: end,
+                rangeCoverage,
+            };
+        }),
         deferredFacts: second.deferredFacts,
         promptUnits: prompt.length,
         promptBytes: Buffer.byteLength(prompt),

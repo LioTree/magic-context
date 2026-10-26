@@ -239,8 +239,11 @@ ${compartmentXml(3, 4, "Earlier")}
                 compartment_id: null,
                 anchor_known: 0,
             },
-            // A range crossing compartments is not contained in any published
-            // compartment, so it is excluded rather than recorded as unknown.
+            {
+                content: "Fact citing lines across two compartments.",
+                compartment_id: null,
+                anchor_known: 0,
+            },
             // "Fact naming a compartment that was never emitted" is not recorded: an
             // index past the published compartments is dropped (keepPublishedFact).
         ]);

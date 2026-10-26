@@ -366,6 +366,39 @@ describe("published-fact policy shared with the Rust validator", () => {
 });
 
 describe("turn-one publication", () => {
+    test("a range spanning published compartments stays a candidate with an unknown anchor", () => {
+        const db = store();
+        try {
+            const result = commit(db, allocate(db), [
+                {
+                    category: "CONSTRAINTS",
+                    content: "Evidence spans two published compartments.",
+                    anchor: { compartmentIndex: 1, startOrdinal: 11, endOrdinal: 13 },
+                },
+            ]);
+            expect(result).toMatchObject({
+                candidatesInserted: 1,
+                anchoredCandidates: 0,
+                blocksStored: 0,
+            });
+            expect(
+                db
+                    .prepare(
+                        "SELECT content, anchor_known, compartment_id FROM memory_pending_facts",
+                    )
+                    .all(),
+            ).toEqual([
+                {
+                    content: "Evidence spans two published compartments.",
+                    anchor_known: 0,
+                    compartment_id: null,
+                },
+            ]);
+            expect(count(db, "memory_fact_block_links")).toBe(0);
+        } finally {
+            db.close();
+        }
+    });
     test("two-pass publication excludes cited ranges in a discarded compartment despite a kept label", () => {
         const db = store();
         try {
