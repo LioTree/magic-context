@@ -942,6 +942,9 @@ impl McHandler {
         // belong to an abandoned branch and must not overwrite that selection.
         state.resync_sources = None;
         state.lineage = request.lineage_id.clone();
+        state.ack_lineage_root = request.lineage_id.clone();
+        state.ack_selection_pending = false;
+        state.pending_native_acks.clear();
         state.generation = state.next_generation()?;
         state.lineage_first_ordinal = first;
         state.journal = Journal::new_record();

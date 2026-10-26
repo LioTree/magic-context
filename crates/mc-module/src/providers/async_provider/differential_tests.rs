@@ -634,6 +634,8 @@ impl Side {
 type Answer<'a> = std::pin::Pin<Box<dyn std::future::Future<Output = String> + Send + 'a>>;
 
 struct Pair {
+    observe_delivered_acks: bool,
+    last_delivered_ack: Option<(u64, String, u64, String)>,
     profile: Profile,
     transcript: Arc<Transcript>,
     resident: Side,
@@ -715,6 +717,8 @@ impl Pair {
         }
         let reference = session_ref(profile.harness(), &project.path().to_string_lossy(), "s");
         let mut pair = Self {
+            observe_delivered_acks: false,
+            last_delivered_ack: None,
             profile,
             transcript,
             resident,
@@ -1117,6 +1121,24 @@ impl Pair {
 
     /// Deliver `message` to both providers straight, as the bus loop does.
     async fn deliver(&mut self, message: cortexkit_bus_trait::Message) -> String {
+        if self.observe_delivered_acks {
+            let notice = notice::AdvanceNotice::from_headers(&message.headers).unwrap();
+            self.last_delivered_ack = notice.applied_view_version.map(|version| {
+                let raw = self
+                    .oracle
+                    .store()
+                    .load_async_compaction_view(&self.reference, version)
+                    .unwrap()
+                    .expect("the delivered acknowledgement names a known public view");
+                let published: view::CompactionView = serde_json::from_str(&raw).unwrap();
+                (
+                    notice.seq,
+                    notice.lineage_id.clone(),
+                    version,
+                    published.lineage_id,
+                )
+            });
+        }
         let label = format!(
             "notice {} est={} model={}",
             message.headers["seq"],

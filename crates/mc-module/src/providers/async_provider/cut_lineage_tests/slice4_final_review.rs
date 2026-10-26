@@ -1,6 +1,9 @@
 //! Independent campaigns for retained cuts and branch selection.
 use super::*;
 
+#[path = "slice4_ancestor_acks.rs"]
+mod ancestor_acks;
+
 async fn final_archive_fixture() -> (Pair, State, cut_seed::CutSeed) {
     let mut pair = Pair::open_with(Profile::Broca, false, Some("L"), false, false).await;
     pair.append(120);
@@ -690,11 +693,13 @@ async fn final_hundreds_of_cuts_revisit_every_evicted_target() {
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn final_same_ordinal_branches_refuse_ambiguity_and_return_exact_heads() {
+    let mut foreign_ack_deliveries = 0usize;
     let mut seeds = Rng(15_506_593_889_518_924_707 ^ 0xC07B_A11C);
     for profile in PROFILES {
         let seed = seeds.next();
         let mut rng = Rng(seed);
         let mut pair = Pair::open_with(profile, false, Some("L"), false, false).await;
+        pair.observe_delivered_acks = true;
         review_enable(&pair);
         pair.append(120);
         let original = pair.transcript.entries.lock().unwrap().clone();
@@ -812,6 +817,28 @@ async fn final_same_ordinal_branches_refuse_ambiguity_and_return_exact_heads() {
             // so a wrong summary produces a small, independent witness.
             pair.record_only = true;
             pair.notice(&mut rng, None).await;
+            if let Some((seq, delivered_lineage, version, owner)) = &pair.last_delivered_ack {
+                assert_eq!(delivered_lineage, &lineage);
+                if owner != &lineage {
+                    foreign_ack_deliveries += 1;
+                    eprintln!("FINAL foreign-ack {profile:?} seed={seed} selected={index} seq={seq} version={version} publication_lineage={owner} current_lineage={lineage}");
+                    for side in [&pair.resident, &pair.oracle] {
+                        let state = load(side.store(), &pair.reference).unwrap().unwrap();
+                        // No public view for this fresh return lineage existed
+                        // when the delivered notice selected its acknowledgement.
+                        assert_eq!(state.applied, None, "foreign ACK must not become the applied baseline: {profile:?} seq={seq} version={version}");
+                        assert!(state.conditions.as_ref().unwrap().get("applied_view_version").is_none(), "foreign ACK must not survive in notice conditions: {profile:?} seq={seq} version={version}");
+                        assert!(
+                            state.applied_view.as_ref().is_none_or(|view| view
+                                .identity
+                                .1
+                                .lineage_id
+                                == lineage),
+                            "the engine baseline must remain in the selected lineage"
+                        );
+                    }
+                }
+            }
             let (_, _, resident_model, _) = newest_view(&pair).unwrap();
             let (versions, _) = pair.oracle.views(&pair.reference);
             let oracle_view: view::CompactionView =
@@ -830,4 +857,8 @@ async fn final_same_ordinal_branches_refuse_ambiguity_and_return_exact_heads() {
         }
         eprintln!("FINAL branches {profile:?} seed={seed} variants=8 exact_returns=8 ambiguous_head=refused");
     }
+    assert!(
+        foreign_ack_deliveries > 0,
+        "the paired witness must actually deliver a known foreign-lineage acknowledgement"
+    );
 }
