@@ -758,6 +758,7 @@ impl Run<'_> {
                     ),
                 )),
                 captured.directory.clone(),
+                self.harness,
             ),
         };
         let Ok(runtime) = tokio::runtime::Builder::new_current_thread()
@@ -914,7 +915,7 @@ impl RoutedRun<'_> {
                 ).with_project_context(Arc::new(crate::memory_context::MemoryContextReader::new(
                     self.handles.runs.connection_file.clone(),
                     subc_protocol::BindIdentity::new(captured.directory.clone(), "magic-context", ROUTED_STORE_SESSION),
-                )), captured.directory.clone()),
+                )), captured.directory.clone(), ""),
             };
             drive(
                 dispatcher,

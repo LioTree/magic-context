@@ -5,6 +5,7 @@ use std::collections::{BTreeMap, BTreeSet};
 use std::future::Future;
 use std::path::Path;
 use std::pin::Pin;
+use std::process::Command;
 
 use mc_store::dream_scheduler::schedules::{ScheduleState, TaskName};
 use mc_store::memory_levels::RunAuthority;
@@ -73,6 +74,11 @@ pub(crate) struct Inputs {
     candidates: BTreeSet<i64>,
     history: Option<i64>,
     git: String,
+    #[serde(default)]
+    primers: String,
+    /// A complete input snapshot is unavailable; closing the gate would lose work.
+    #[serde(default)]
+    unavailable: bool,
 }
 
 impl Inputs {
@@ -85,6 +91,9 @@ impl Inputs {
     }
 
     pub(crate) fn due(&self, task: TaskName, state: &ScheduleState) -> bool {
+        if self.unavailable {
+            return true;
+        }
         let Some(prior) = state
             .inputs_watermark
             .as_ref()
@@ -114,7 +123,7 @@ impl Inputs {
                     .unwrap_or(0)
             }),
             TaskName::RefreshPrimers => {
-                !self.candidates.is_subset(&prior.candidates) || self.files != prior.files
+                !self.candidates.is_subset(&prior.candidates) || self.primers != prior.primers
             }
             TaskName::MaintainDocs => self.git != prior.git,
             TaskName::PromotePrimers | TaskName::EvaluateSmartNotes => true,
@@ -126,6 +135,7 @@ pub(crate) fn capture(
     store: &McStore,
     project: &str,
     root: &Path,
+    harness: &str,
     task: TaskName,
 ) -> Result<Inputs, String> {
     let mut inputs = Inputs::default();
@@ -164,7 +174,56 @@ pub(crate) fn capture(
             })
             .map_err(|error| error.to_string())?;
     }
+    if task == TaskName::Retrospective {
+        // ArchiveSessionReader::read_sessions/read_since consume these project,
+        // harness and non-subagent session rows and their archived message times.
+        inputs.history = store.with_context_read(|db| {
+            let installed: bool = db.query_row("SELECT EXISTS(SELECT 1 FROM sqlite_master WHERE type='table' AND name='raw_archive_messages')", [], |row| row.get(0))?;
+            if !installed { return Ok(None); }
+            db.query_row("SELECT MAX(CAST(json_extract(a.message_json,'$.createdAt') AS INTEGER)) FROM raw_archive_messages a JOIN session_projects sp ON sp.session_id=a.session_id JOIN schema_migrations_meta activity ON activity.key='retrospective_activity:' || sp.session_id LEFT JOIN session_meta m ON m.session_id=sp.session_id WHERE sp.project_path=?1 AND sp.harness=?2 AND COALESCE(m.is_subagent,0)=0 AND json_extract(a.message_json,'$.role')='user'", rusqlite::params![project,harness], |row| row.get(0))
+        }).map_err(|error| error.to_string())?;
+        inputs.unavailable = harness.is_empty();
+    }
+    if task == TaskName::MaintainDocs {
+        // docs-proposals.ts::docsChangeSet anchors its committed change set at HEAD.
+        match git_output(root, &["rev-parse", "--verify", "HEAD"]) {
+            Some(head) => inputs.git = String::from_utf8_lossy(&head).trim().to_owned(),
+            None => inputs.unavailable = true,
+        }
+    }
+    if task == TaskName::RefreshPrimers {
+        // PrimerHost::refresh reloads candidates, active primers and seed
+        // compartments before each investigator through load_dream_primers.
+        let snapshot = store
+            .load_dream_primers(project)
+            .map_err(|error| error.to_string())?;
+        inputs.candidates = snapshot
+            .candidates
+            .iter()
+            .filter_map(|row| row["id"].as_i64())
+            .collect();
+        inputs.primers = snapshot.input_hash;
+        // PrimerHost::refresh uses primers::refresh_queue to start investigators
+        // with read/glob tools, including untracked or ignored files. No persisted
+        // dependency index bounds those reads, so queued work stays always due.
+        // With no queued investigator, the store snapshot is the complete input.
+        let active = serde_json::from_value::<Vec<crate::dream_tasks::primers::Primer>>(
+            Value::Array(snapshot.primers),
+        )
+        .map_err(|error| error.to_string())?;
+        inputs.unavailable =
+            !crate::dream_tasks::primers::refresh_queue(project, &active).is_empty();
+    }
     Ok(inputs)
+}
+
+fn git_output(root: &Path, args: &[&str]) -> Option<Vec<u8>> {
+    let output = Command::new("git")
+        .current_dir(root)
+        .args(args)
+        .output()
+        .ok()?;
+    output.status.success().then_some(output.stdout)
 }
 
 fn file_inputs(root: &Path, paths: Vec<(i64, String)>) -> BTreeMap<String, String> {

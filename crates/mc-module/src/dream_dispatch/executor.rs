@@ -256,6 +256,7 @@ pub struct DreamExecutor<B: BrocaPorts> {
     parked: Arc<AtomicU64>,
     project_context: Option<Arc<dyn ProjectProfiles>>,
     project_directory: Option<PathBuf>,
+    project_harness: String,
     captured: Option<(String, Value, mc_store::memory_levels::RunAuthority)>,
 }
 
@@ -285,6 +286,7 @@ impl<B: BrocaPorts> DreamExecutor<B> {
             parked: Arc::default(),
             project_context: None,
             project_directory: None,
+            project_harness: String::new(),
             captured: None,
         }
     }
@@ -293,9 +295,11 @@ impl<B: BrocaPorts> DreamExecutor<B> {
         mut self,
         source: Arc<dyn ProjectProfiles>,
         directory: PathBuf,
+        harness: &str,
     ) -> Self {
         self.project_context = Some(source);
         self.project_directory = Some(directory);
+        self.project_harness = harness.to_owned();
         self
     }
 
@@ -312,7 +316,13 @@ impl<B: BrocaPorts> DreamExecutor<B> {
             Some(source) => source.read(&root.to_string_lossy()).await,
             None => due_inputs::unavailable_context(),
         };
-        let inputs = due_inputs::capture(&self.store, &scope.project.0, root, task)?;
+        let inputs = due_inputs::capture(
+            &self.store,
+            &scope.project.0,
+            root,
+            &self.project_harness,
+            task,
+        )?;
         Ok((inputs.watermark(), due_inputs::authority(&pin)))
     }
 
@@ -463,6 +473,9 @@ impl<B: BrocaPorts> TaskExecutor for DreamExecutor<B> {
     }
 
     async fn run(&mut self, context: &TaskContext) -> RunOutcome {
+        if self.project_harness.is_empty() {
+            self.project_harness = context.config.harness.clone();
+        }
         if self
             .captured
             .as_ref()

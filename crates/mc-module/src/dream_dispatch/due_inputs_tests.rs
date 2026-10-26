@@ -354,7 +354,7 @@ impl Rig {
             OPERATIONAL_TASKS,
             OPERATIONAL_TASKS,
         )
-        .with_project_context(source.clone(), root.clone());
+        .with_project_context(source.clone(), root.clone(), "opencode");
         let clock = Arc::new(TestClock(AtomicI64::new(60_000)));
         let dispatcher = Dispatcher {
             store,
@@ -413,6 +413,7 @@ impl Rig {
             &self.dispatcher.store,
             &self.dispatcher.scope.project.0,
             &self.dispatcher.config.directory,
+            &self.dispatcher.config.harness,
             task,
         )
         .unwrap()
@@ -659,6 +660,215 @@ async fn review_candidate_input() {
     );
 }
 
+async fn capture_gate_baseline(rig: &mut Rig, task: TaskName) -> ScheduleState {
+    rig.seed(task);
+    let mut state = rig.state(task);
+    state.inputs_watermark = None;
+    assert_eq!(
+        rig.dispatcher
+            .executor
+            .gate(task, &rig.dispatcher.scope, &state, "first")
+            .await
+            .unwrap(),
+        GateDecision::Run
+    );
+    state.inputs_watermark = Some(rig.inputs(task).watermark());
+    assert_eq!(
+        rig.dispatcher
+            .executor
+            .gate(task, &rig.dispatcher.scope, &state, "unchanged")
+            .await
+            .unwrap(),
+        GateDecision::Skip {
+            code: "inputs_unchanged".into()
+        }
+    );
+    state
+}
+
+fn archived_message(rig: &Rig, id: &str, ordinal: i64, role: &str, ts: i64) {
+    rig.dispatcher.store.with_context_conn_for_test(|tx| {
+        crate::dream_dispatch::session_reader::install_archive_for_test(tx)?;
+        crate::dream_dispatch::session_reader::archive_for_test(tx, "history", &json!({"id":id,"ordinal":ordinal,"role":role,"createdAt":ts,"parts":[{"type":"text","text":"User history for retrospective."}]}))?;
+        tx.execute("INSERT INTO schema_migrations_meta(key,value) VALUES('retrospective_activity:history',?1) ON CONFLICT(key) DO UPDATE SET value=excluded.value", [ts.to_string()])?;
+        Ok(())
+    }).unwrap();
+}
+
+#[tokio::test]
+async fn retrospective_capture_tracks_real_user_history() {
+    use crate::dream_dispatch::retrospective_host::SessionReader;
+    let mut rig = Rig::new();
+    let _ = mapped_repo(&rig);
+    rig.sql("INSERT INTO session_projects(session_id,harness,project_path,updated_at) VALUES('history','opencode',?1,1)");
+    archived_message(&rig, "user-1", 1, "user", 100);
+    let task = TaskName::Retrospective;
+    assert_eq!(rig.inputs(task).history, Some(100));
+    let mut state = capture_gate_baseline(&mut rig, task).await;
+    state.retrospective_watermark_ms = Some(100);
+    archived_message(&rig, "assistant", 2, "assistant", 200);
+    assert_eq!(
+        rig.dispatcher
+            .executor
+            .gate(task, &rig.dispatcher.scope, &state, "assistant")
+            .await
+            .unwrap(),
+        GateDecision::Skip {
+            code: "inputs_unchanged".into()
+        }
+    );
+    archived_message(&rig, "user-2", 3, "user", 300);
+    let reader = crate::dream_dispatch::session_reader::ArchiveSessionReader {
+        store: rig.dispatcher.store.clone(),
+        harness: "opencode".into(),
+        recency_cutoff_ms: None,
+    };
+    assert_eq!(
+        reader
+            .read_sessions(&rig.dispatcher.scope.project.0, 100)
+            .unwrap()[0]
+            .messages
+            .iter()
+            .filter(|row| row.role == "user")
+            .map(|row| row.ts)
+            .max(),
+        Some(300)
+    );
+    assert_eq!(rig.inputs(task).history, Some(300));
+    assert_eq!(
+        rig.dispatcher
+            .executor
+            .gate(task, &rig.dispatcher.scope, &state, "new-user")
+            .await
+            .unwrap(),
+        GateDecision::Run
+    );
+}
+
+#[tokio::test]
+async fn maintain_docs_capture_tracks_real_git_anchor() {
+    let mut rig = Rig::new();
+    let path = mapped_repo(&rig);
+    let task = TaskName::MaintainDocs;
+    assert!(!rig.inputs(task).git.is_empty());
+    let state = capture_gate_baseline(&mut rig, task).await;
+    std::fs::write(path, "New committed documentation input.").unwrap();
+    git(&rig.dispatcher.config.directory, &["add", "mapped.rs"]);
+    git(
+        &rig.dispatcher.config.directory,
+        &["commit", "-qm", "new input"],
+    );
+    assert_eq!(
+        rig.dispatcher
+            .executor
+            .gate(task, &rig.dispatcher.scope, &state, "new-head")
+            .await
+            .unwrap(),
+        GateDecision::Run
+    );
+}
+
+#[tokio::test]
+async fn refresh_primers_capture_tracks_real_snapshot_and_files() {
+    let mut rig = Rig::new();
+    let path = mapped_repo(&rig);
+    rig.sql("INSERT INTO primer_candidates(id,project_path,session_id,question,normalized_question,source_compartment_start,source_compartment_end,source_message_time,created_at) VALUES(1,?1,'primer','How is this configured?','how is this configured',1,1,1,1)");
+    rig.sql("INSERT INTO compartments(id,session_id,sequence,start_message,end_message,title,content,p1,created_at) VALUES(1,'primer',1,1,1,'Orientation','Primer context','Primer seed summary',1)");
+    rig.sql("INSERT INTO primers(id,project_path,question,answer,last_observed_at,answer_refreshed_at,source_candidate_ids,created_at,updated_at) VALUES(1,?1,'How is this configured?','Known answer',1,1,'[1]',1,1)");
+    let task = TaskName::RefreshPrimers;
+    let inputs = rig.inputs(task);
+    assert_eq!(inputs.candidates, BTreeSet::from([1]));
+    assert!(!inputs.primers.is_empty());
+    assert!(!inputs.unavailable);
+    let snapshot = rig
+        .dispatcher
+        .store
+        .load_dream_primers(&rig.dispatcher.scope.project.0)
+        .unwrap();
+    let active =
+        serde_json::from_value::<Vec<crate::dream_tasks::primers::Primer>>(json!(snapshot.primers))
+            .unwrap();
+    let candidates = serde_json::from_value::<Vec<crate::dream_tasks::primers::Candidate>>(json!(
+        snapshot.candidates
+    ))
+    .unwrap();
+    let compartments = serde_json::from_value::<Vec<crate::dream_tasks::primers::SeedCompartment>>(
+        json!(snapshot.compartments),
+    )
+    .unwrap();
+    let seed = crate::dream_tasks::primers::build_seed(
+        &active[0],
+        &candidates,
+        None,
+        &compartments,
+        |text| text.len().div_ceil(4),
+    );
+    assert!(seed.orientation.contains("Primer seed summary"));
+    let mut state = capture_gate_baseline(&mut rig, task).await;
+    for sql in [
+        "UPDATE primer_candidates SET question='Changed candidate question' WHERE id=1",
+        "UPDATE primers SET question='Changed active primer question' WHERE id=1",
+        "UPDATE compartments SET p1='Changed primer seed' WHERE id=1",
+        "INSERT INTO primer_candidates(id,project_path,session_id,question,normalized_question,source_message_time,created_at) VALUES(2,?1,'primer-2','A new candidate','a new candidate',2,2)",
+    ] {
+        rig.sql(sql);
+        assert_eq!(rig.dispatcher.executor.gate(task,&rig.dispatcher.scope,&state,"primer-change").await.unwrap(),GateDecision::Run);
+        state.inputs_watermark = Some(rig.inputs(task).watermark());
+        assert_eq!(rig.dispatcher.executor.gate(task,&rig.dispatcher.scope,&state,"primer-unchanged").await.unwrap(),GateDecision::Skip {code:"inputs_unchanged".into()});
+    }
+    rig.sql("UPDATE primers SET last_observed_at=2 WHERE id=1");
+    state.inputs_watermark = Some(rig.inputs(task).watermark());
+    assert!(rig.inputs(task).unavailable);
+    assert_eq!(
+        rig.dispatcher
+            .executor
+            .gate(task, &rig.dispatcher.scope, &state, "queued-unchanged")
+            .await
+            .unwrap(),
+        GateDecision::Run
+    );
+    std::fs::write(
+        rig.dispatcher.config.directory.join(".git/info/exclude"),
+        "ignored.rs\n",
+    )
+    .unwrap();
+    for path in [
+        path,
+        rig.dispatcher.config.directory.join("untracked.rs"),
+        rig.dispatcher.config.directory.join("ignored.rs"),
+    ] {
+        std::fs::write(&path, "Changed primer investigation input").unwrap();
+        assert_eq!(
+            rig.dispatcher
+                .executor
+                .gate(task, &rig.dispatcher.scope, &state, "file-change")
+                .await
+                .unwrap(),
+            GateDecision::Run
+        );
+        state.inputs_watermark = Some(rig.inputs(task).watermark());
+    }
+}
+
+#[tokio::test]
+async fn missing_git_anchor_remains_due_instead_of_freezing() {
+    let mut rig = Rig::new();
+    let task = TaskName::MaintainDocs;
+    rig.seed(task);
+    let state = rig.state(task);
+    assert!(rig.inputs(task).unavailable);
+    for _ in 0..2 {
+        assert_eq!(
+            rig.dispatcher
+                .executor
+                .gate(task, &rig.dispatcher.scope, &state, "unknown-input")
+                .await
+                .unwrap(),
+            GateDecision::Run
+        );
+    }
+}
+
 #[test]
 fn declarations_for_kinds_without_a_production_executor() {
     let rig = Rig::new();
@@ -698,7 +908,7 @@ fn declarations_for_kinds_without_a_production_executor() {
         (
             TaskName::RefreshPrimers,
             Inputs {
-                files: BTreeMap::from([("file".into(), "changed".into())]),
+                primers: "changed snapshot".into(),
                 ..base.clone()
             },
         ),
