@@ -126,4 +126,43 @@ describe("two-pass prompt fixes", () => {
         expect(fitted.facts.map((f) => f.factId)).toEqual([1]);
         expect(fitted.deferred.facts).toBe(1);
     });
+
+    test("decided true prefixes new drafts; false leaves text alone", async () => {
+        const first = turnOne(fixture);
+        const second = await turnTwo(fixture, first, mockReply(first).choices[0]!.message.content);
+        const decided = (value: unknown) =>
+            memoryDrafts(
+                JSON.stringify({
+                    result: {
+                        step: "turn_two",
+                        decisions: [
+                            {
+                                fact_id: 1,
+                                check: "Audit fixture.",
+                                action: "new",
+                                decided: value,
+                            },
+                        ],
+                    },
+                }),
+                second.facts,
+                fixture,
+            );
+        expect(decided(true)).toEqual([
+            {
+                factId: 1,
+                action: "new",
+                category: "CONSTRAINTS",
+                text: "Decided: Always serialize DeepSeek requests.",
+            },
+        ]);
+        expect(decided(false)).toEqual([
+            {
+                factId: 1,
+                action: "new",
+                category: "CONSTRAINTS",
+                text: "Always serialize DeepSeek requests.",
+            },
+        ]);
+    });
 });

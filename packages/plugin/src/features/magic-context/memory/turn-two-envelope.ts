@@ -58,6 +58,12 @@ export interface TurnTwoDecision {
     survivorId?: number;
     /** `covered`: the clause ordinals of `targetId` that cover the fact. */
     clauses?: number[];
+    /**
+     * `new` only: true when the historian judged the fact an accepted decision
+     * that is not built yet, so publication stores it with a `Decided:` prefix.
+     * Absent means false. Any other action carrying this field is malformed.
+     */
+    decided?: boolean;
     /** `covered`: an optional quote of the fact's evidence. */
     excerpt?: string;
     removed?: TurnTwoCitedClause[];
@@ -71,6 +77,19 @@ export interface TurnTwoScore {
     item: number;
     importance: number;
     proposedClass: string;
+}
+
+/** Prefix for a stored `new` memory the historian marked as an unbuilt decision. */
+export const DECIDED_PREFIX = "Decided: ";
+
+/**
+ * Apply the turn-two `decided` flag at publication: a `new` decision with
+ * `decided: true` stores the fact text with a `Decided: ` prefix, unless the
+ * text already starts with one. Absent or false stores the text unchanged.
+ */
+export function applyDecidedPrefix(content: string, decided?: boolean): string {
+    if (decided !== true) return content;
+    return content.startsWith(DECIDED_PREFIX) ? content : `${DECIDED_PREFIX}${content}`;
 }
 
 export type TurnTwoEnvelope =
@@ -141,6 +160,9 @@ function parseDecision(
     if (typeof action !== "string" || !TURN_TWO_ACTIONS.includes(action as TurnTwoAction))
         return null;
     if (typeof raw.check !== "string") return null;
+    // `decided` is a `new`-only field: any other action carrying it takes the
+    // existing invalid-decision path, as does a non-boolean value on `new`.
+    if (action !== "new" && "decided" in raw) return null;
     const decision: TurnTwoDecision = {
         factId,
         ordinal,
@@ -148,7 +170,13 @@ function parseDecision(
         check: raw.check,
     };
     switch (decision.action) {
-        case "new":
+        case "new": {
+            if (raw.decided !== undefined) {
+                if (typeof raw.decided !== "boolean") return null;
+                decision.decided = raw.decided;
+            }
+            return decision;
+        }
         case "abstain":
             return decision;
         case "retire":

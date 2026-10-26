@@ -36,7 +36,7 @@ import {
     registerTurnTwoChild,
     retainedTurnTwoChild,
 } from "./turn-two-children";
-import { coverageNotice, LEXICAL_ONLY_NOTICE } from "./turn-two-envelope";
+import { coverageNotice, LEXICAL_ONLY_NOTICE, parseTurnTwoEnvelope } from "./turn-two-envelope";
 import { authorizationFixture } from "./turn-two-test-fixtures.test";
 
 const PROJECT = "git:turn-two";
@@ -1939,6 +1939,153 @@ describe("turn two bounds and isolation", () => {
                 fact_attempts: 1,
                 reason: "missing_decision",
             });
+        } finally {
+            db.close();
+        }
+    });
+});
+
+describe("turn two decided prefix on new", () => {
+    function parse(decision: unknown) {
+        return parseTurnTwoEnvelope(
+            JSON.stringify({ result: { step: "turn_two", decisions: [decision] } }),
+            false,
+        );
+    }
+
+    test("parser accepts decided true and false on new", () => {
+        for (const decided of [true, false]) {
+            const parsed = parse({
+                fact_id: 1,
+                check: "Audit fixture.",
+                action: "new",
+                decided,
+            });
+            expect(parsed.ok).toBe(true);
+            if (!parsed.ok) continue;
+            expect(parsed.decisions.get(1)).toEqual({
+                factId: 1,
+                ordinal: 0,
+                action: "new",
+                check: "Audit fixture.",
+                decided,
+            });
+            expect(parsed.schemaValid).toBe(true);
+        }
+    });
+
+    test("parser refuses decided on covered, edit, abstain and conflict", () => {
+        for (const decision of [
+            {
+                fact_id: 1,
+                check: "Audit fixture.",
+                action: "covered",
+                target_id: 7,
+                revision: 1,
+                clauses: [1],
+                decided: true,
+            },
+            {
+                fact_id: 1,
+                check: "Audit fixture.",
+                action: "edit",
+                target_id: 7,
+                revision: 1,
+                removed: [],
+                replaced: [],
+                added: [],
+                kept: [],
+                final_text: "New rule.",
+                decided: false,
+            },
+            { fact_id: 1, check: "Audit fixture.", action: "abstain", decided: true },
+            {
+                fact_id: 1,
+                check: "Audit fixture.",
+                action: "conflict",
+                target_id: 7,
+                decided: true,
+            },
+        ]) {
+            const parsed = parse(decision);
+            expect(parsed.ok).toBe(true);
+            if (!parsed.ok) continue;
+            expect(parsed.decisions.get(1)).toBe("malformed");
+            expect(parsed.schemaValid).toBe(false);
+        }
+    });
+
+    test("parser refuses a non-boolean decided on new", () => {
+        for (const decided of ["yes", 1, 0, null]) {
+            const parsed = parse({
+                fact_id: 1,
+                check: "Audit fixture.",
+                action: "new",
+                decided,
+            });
+            expect(parsed.ok).toBe(true);
+            if (!parsed.ok) continue;
+            expect(parsed.decisions.get(1)).toBe("malformed");
+            expect(parsed.schemaValid).toBe(false);
+        }
+    });
+
+    test("publication stores Decided: text once for decided true", async () => {
+        const db = store();
+        try {
+            const { publicationId, factIds } = publish(db, [
+                { content: "Retry backoff: 30 s." },
+                { content: "Decided: Queue depth: 4." },
+            ]);
+            const stub = stubCarrier(() =>
+                reply([
+                    {
+                        fact_id: factIds[0],
+                        check: "Audit fixture.",
+                        action: "new",
+                        decided: true,
+                    },
+                    {
+                        fact_id: factIds[1],
+                        check: "Audit fixture.",
+                        action: "new",
+                        decided: true,
+                    },
+                ]),
+            );
+            await run(db, publicationId, stub.carrier);
+            expect(db.prepare("SELECT content FROM memories ORDER BY id").all()).toEqual([
+                { content: "Decided: Retry backoff: 30 s." },
+                { content: "Decided: Queue depth: 4." },
+            ]);
+        } finally {
+            db.close();
+        }
+    });
+
+    test("absent or false decided stores the text unchanged", async () => {
+        const db = store();
+        try {
+            const { publicationId, factIds } = publish(db, [
+                { content: "Plain rule one." },
+                { content: "Plain rule two." },
+            ]);
+            const stub = stubCarrier(() =>
+                reply([
+                    { fact_id: factIds[0], check: "Audit fixture.", action: "new" },
+                    {
+                        fact_id: factIds[1],
+                        check: "Audit fixture.",
+                        action: "new",
+                        decided: false,
+                    },
+                ]),
+            );
+            await run(db, publicationId, stub.carrier);
+            expect(db.prepare("SELECT content FROM memories ORDER BY id").all()).toEqual([
+                { content: "Plain rule one." },
+                { content: "Plain rule two." },
+            ]);
         } finally {
             db.close();
         }
