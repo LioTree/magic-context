@@ -677,6 +677,10 @@ mod profile_tests {
             "{logs}"
         );
         let bundled = documents::bundled_swe().unwrap();
+        // The tracing text formatter records string fields with Debug
+        // escaping, so a Windows temp path reaches the log with each
+        // backslash doubled. Compare against the encoded form the log holds.
+        let logged_session = session.replace('\\', "\\\\");
         for value in [
             "pinned_name",
             "pinned_version",
@@ -690,7 +694,7 @@ mod profile_tests {
             &bundled.name,
             &bundled.version,
             &bundled.digest,
-            &session,
+            &logged_session,
         ] {
             assert!(logs.contains(value), "missing {value}: {logs}");
         }
