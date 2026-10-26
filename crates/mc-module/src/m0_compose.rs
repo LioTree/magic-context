@@ -406,6 +406,7 @@ fn render_m0_retry(
                 covered_system_messages: inputs.covered_system_messages,
                 compartments: inputs.compartments,
                 memories: inputs.memories,
+                workspace_memory_block: inputs.workspace_memory_block,
                 source_name_by_id: inputs.source_name_by_id,
                 history_budget_tokens: inputs.history_budget_tokens,
                 decay_pressure_multiplier,
@@ -712,6 +713,9 @@ pub(crate) fn compose_m0_with_score_snapshot<S: M0Source + ?Sized>(
         .then(|| resolved_mural(inputs.mural))
         .flatten();
     timings.mural_ms += mural_start.elapsed().as_secs_f64() * 1000.0;
+    let workspace_memory_block = placements.workspace_id.as_deref().map(|workspace| {
+        crate::memory_render::render_workspace_memory_block(&workspace_memories, workspace)
+    });
     let mut m0_bytes = render_m0_retry(
         &M0Inputs {
             project_docs: &docs.rendered_block,
@@ -719,6 +723,7 @@ pub(crate) fn compose_m0_with_score_snapshot<S: M0Source + ?Sized>(
             covered_system_messages: inputs.covered_system_messages,
             compartments: &decay_compartments,
             memories: &project_memories,
+            workspace_memory_block: workspace_memory_block.as_deref(),
             source_name_by_id: &source_name_by_id,
             history_budget_tokens: inputs.history_budget_tokens,
             decay_pressure_multiplier: 1.0,
@@ -727,28 +732,6 @@ pub(crate) fn compose_m0_with_score_snapshot<S: M0Source + ?Sized>(
         incremental,
         timings,
     );
-    if let Some(workspace) = placements.workspace_id.as_deref() {
-        let workspace_block =
-            crate::memory_render::render_workspace_memory_block(&workspace_memories, workspace);
-        if !workspace_block.is_empty() {
-            let project_block = crate::memory_render::render_memory_block(
-                &project_memories,
-                "project-memory",
-                &source_name_by_id,
-            );
-            // The shared legacy renderer ends with project-memory. Insert the
-            // separately owned block there without changing any legacy framing.
-            if !project_block.is_empty() {
-                m0_bytes.truncate(m0_bytes.len() - project_block.len());
-                m0_bytes.push_str(&workspace_block);
-                m0_bytes.push_str("\n\n");
-                m0_bytes.push_str(&project_block);
-            } else {
-                m0_bytes.push_str("\n\n");
-                m0_bytes.push_str(&workspace_block);
-            }
-        }
-    }
     if mural.is_some() {
         m0_bytes.push_str("\n\n");
         m0_bytes.push_str(MEMORY_MURAL_BLOCK);
@@ -1250,6 +1233,7 @@ mod tests {
                 compartments: &decay_compartments,
                 memories: &[],
                 source_name_by_id: &HashMap::new(),
+                workspace_memory_block: None,
                 history_budget_tokens: inputs.history_budget_tokens,
                 decay_pressure_multiplier: 1.0,
             },
@@ -1296,6 +1280,7 @@ mod tests {
             compartments: &compartments,
             memories: &[],
             source_name_by_id: &source_names,
+            workspace_memory_block: None,
             history_budget_tokens: 300.0,
             decay_pressure_multiplier: 1.0,
         };
@@ -1330,6 +1315,7 @@ mod tests {
             compartments: &compartments,
             memories: &[],
             source_name_by_id: &source_names,
+            workspace_memory_block: None,
             history_budget_tokens: 0.0,
             decay_pressure_multiplier: 1.0,
         };
@@ -1355,6 +1341,7 @@ mod tests {
             compartments: &compartments,
             memories: &[],
             source_name_by_id: &source_names,
+            workspace_memory_block: None,
             history_budget_tokens: 300.0,
             decay_pressure_multiplier: 1.0,
         };
@@ -1412,6 +1399,7 @@ mod tests {
             compartments: &compartments,
             memories: &[],
             source_name_by_id: &source_names,
+            workspace_memory_block: None,
             history_budget_tokens: fixture.budget,
             decay_pressure_multiplier: 1.0,
         };

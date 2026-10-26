@@ -3951,6 +3951,7 @@ fn compose_additive_m0<S: crate::m0_compose::M0Source>(
             compartments: &[],
             memories: &rendered_memories,
             source_name_by_id: &source_name_by_id,
+            workspace_memory_block: None,
             history_budget_tokens: 0.0,
             decay_pressure_multiplier: 1.0,
         },

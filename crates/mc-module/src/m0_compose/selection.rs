@@ -91,96 +91,6 @@ pub fn visible_rows(
     (rows, owners)
 }
 
-fn legacy_order(left: &mc_store::StoredMemory, right: &mc_store::StoredMemory) -> Ordering {
-    (right.status == "permanent")
-        .cmp(&(left.status == "permanent"))
-        .then_with(|| {
-            right
-                .importance
-                .unwrap_or(i32::MIN)
-                .cmp(&left.importance.unwrap_or(i32::MIN))
-        })
-        .then_with(|| {
-            let left_at = left.last_seen_at.into_iter().chain(left.verified_at).max();
-            let right_at = right
-                .last_seen_at
-                .into_iter()
-                .chain(right.verified_at)
-                .max();
-            match (left_at, right_at) {
-                (None, None) => left.id.cmp(&right.id),
-                _ => right_at.cmp(&left_at),
-            }
-        })
-}
-
-/// Independent legacy path: keep its upfront wrapper charge and per-member floors.
-fn project_only(
-    mut rows: Vec<mc_store::StoredMemory>,
-    membership: Option<&mc_store::WorkspaceMembership>,
-    names: &HashMap<i64, String>,
-    budget: f64,
-    estimate: impl Fn(&str) -> usize + Copy,
-) -> Vec<mc_store::StoredMemory> {
-    rows.sort_by(legacy_order);
-    let mut selected = Vec::new();
-    let mut ids = HashSet::new();
-    let mut categories = HashSet::new();
-    let mut used = estimate("<project-memory>\n</project-memory>") as f64;
-    let budget = budget.max(1.0);
-    if let Some(membership) = membership {
-        for row in rows.iter().filter(|row| row.status == "permanent") {
-            admit_memory(
-                row.clone(),
-                &mut 0.0,
-                &mut selected,
-                &mut ids,
-                &mut categories,
-                &mut used,
-                budget,
-                names,
-                estimate,
-            );
-        }
-        let floor = (budget - used).max(0.0) / membership.union_identities.len().max(1) as f64;
-        for identity in &membership.union_identities {
-            let mut member_used = 0.0;
-            for row in rows
-                .iter()
-                .filter(|row| row.project_path == *identity && row.status != "permanent")
-            {
-                if member_used + memory_candidate_cost(row, &categories, names, estimate) <= floor {
-                    admit_memory(
-                        row.clone(),
-                        &mut member_used,
-                        &mut selected,
-                        &mut ids,
-                        &mut categories,
-                        &mut used,
-                        budget,
-                        names,
-                        estimate,
-                    );
-                }
-            }
-        }
-    }
-    for row in rows {
-        admit_memory(
-            row,
-            &mut 0.0,
-            &mut selected,
-            &mut ids,
-            &mut categories,
-            &mut used,
-            budget,
-            names,
-            estimate,
-        );
-    }
-    selected
-}
-
 struct LevelBudget {
     categories: HashSet<String>,
     used: f64,
@@ -221,12 +131,12 @@ pub fn select(
 ) -> Vec<mc_store::StoredMemory> {
     let level = |row: &mc_store::StoredMemory| usize::from(owners.contains_key(&row.id));
     if !rows.iter().any(|row| level(row) == 1) {
-        return project_only(rows, membership, names, budget, estimate);
+        return super::trim_memories_to_budget(rows, membership, names, budget, estimate);
     }
     let mixed = rows.iter().any(|row| level(row) == 0);
     let mut ordered = rows;
     if !mixed {
-        ordered.sort_by(legacy_order);
+        ordered.sort_by(super::memory_selection_order);
     } else {
         ordered.sort_by(|left, right| {
             // The mixed-level tie is independent of insertion order, including equal recency.
@@ -234,7 +144,7 @@ pub fn select(
             let mut right_key = right.clone();
             left_key.id = 0;
             right_key.id = 0;
-            legacy_order(&left_key, &right_key)
+            super::memory_selection_order(&left_key, &right_key)
                 .then_with(|| level(left).cmp(&level(right)))
                 .then_with(|| left.id.cmp(&right.id))
         });
@@ -415,78 +325,33 @@ mod tests {
     }
 
     #[test]
-    fn level_selection_differential_10000() {
-        let mut seed = 0xd1ff_e4e7_1a14_u64;
-        let mut next = || {
-            seed ^= seed << 13;
-            seed ^= seed >> 7;
-            seed ^= seed << 17;
-            seed
-        };
-        for case in 0..10_000 {
-            let mut rows = Vec::new();
-            for id in 1..=(next() % 25 + 2) {
-                let bits = next();
-                let mut row = row(
-                    id as i64,
-                    (next() % 200) as usize,
-                    if bits & 1 == 0 { "a" } else { "b" },
-                );
-                row.category = format!("C{}", bits % 4);
-                row.importance = if bits & 2 == 0 {
-                    None
-                } else {
-                    Some((bits % 5) as i32 * 25)
-                };
-                row.last_seen_at = if bits & 4 == 0 {
-                    None
-                } else {
-                    Some((bits % 3) as i64)
-                };
-                row.verified_at = if bits & 8 == 0 {
-                    None
-                } else {
-                    Some((bits % 7) as i64)
-                };
-                if bits % 11 == 0 {
-                    row.status = "permanent".into();
-                }
-                rows.push(row);
-            }
-            rows.reverse();
-            let budget = (next() % 2500) as f64;
-            for membership in [None, Some(union())] {
-                let names = membership
-                    .as_ref()
-                    .map(|m| workspace_source_names(&rows, m))
-                    .unwrap_or_default();
-                let expected = trim_memories_to_budget(
-                    rows.clone(),
-                    membership.as_ref(),
-                    &names,
-                    budget,
-                    str::len,
-                );
-                let actual = select(
+    fn no_workspace_selection_uses_legacy_selector() {
+        let mut permanent = row(3, 20, "a");
+        permanent.status = "permanent".into();
+        let rows = vec![row(2, 35, "b"), permanent, row(1, 70, "a")];
+        for membership in [None, Some(union())] {
+            let names = membership
+                .as_ref()
+                .map(|m| workspace_source_names(&rows, m))
+                .unwrap_or_default();
+            assert_eq!(
+                select(
                     rows.clone(),
                     &HashMap::new(),
                     None,
                     membership.as_ref(),
                     &names,
-                    budget,
-                    str::len,
-                );
-                assert_eq!(
-                    actual,
-                    expected,
-                    "case {case}, union={}",
-                    membership.is_some()
-                );
-                assert_eq!(
-                    crate::memory_render::render_memory_block(&actual, "project-memory", &names),
-                    crate::memory_render::render_memory_block(&expected, "project-memory", &names)
-                );
-            }
+                    100.0,
+                    estimate
+                ),
+                super::super::trim_memories_to_budget(
+                    rows.clone(),
+                    membership.as_ref(),
+                    &names,
+                    100.0,
+                    estimate
+                ),
+            );
         }
     }
 
