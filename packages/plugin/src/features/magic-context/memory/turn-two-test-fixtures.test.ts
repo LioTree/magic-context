@@ -42,13 +42,3 @@ export function authorizationFixture(
         },
     };
 }
-// Existing lifecycle tests supply settled evidence so they still exercise their
-// original revision, recovery and identity gates after the grounding fence.
-export const VERIFIER_TEST_QUOTE = "The source confirms the settled project rule.";
-export function verifiedTestDecisions(decisions: unknown[]): unknown[] {
-    return decisions.map((decision) =>
-        typeof decision === "object" && decision !== null
-            ? { evidence_quote: VERIFIER_TEST_QUOTE, status: "settled", ...decision }
-            : decision,
-    );
-}

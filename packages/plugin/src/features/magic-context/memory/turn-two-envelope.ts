@@ -25,14 +25,6 @@ export const TURN_TWO_ACTIONS = [
     "promote_rule",
 ] as const;
 export type TurnTwoAction = (typeof TURN_TWO_ACTIONS)[number];
-export const TURN_TWO_STATUSES = [
-    "settled",
-    "planned",
-    "hypothesis",
-    "snapshot",
-    "one_off",
-] as const;
-export type TurnTwoStatus = (typeof TURN_TWO_STATUSES)[number];
 
 export interface TurnTwoCitedClause {
     memoryId: number;
@@ -52,10 +44,6 @@ export interface TurnTwoDecision {
     /** Position of the decision in the reply's `decisions` array. */
     ordinal: number;
     action: TurnTwoAction;
-    /** Optional only for old replies; publication refuses writes without verification. */
-    evidenceQuote?: string;
-    status?: string;
-    reversedBy?: string;
     /** `covered`, `conflict`, `edit`, `replaces`, `retire`, `promote_rule`: the existing memory addressed. */
     targetId?: number;
     /** `covered`, `edit`, `replaces`: the revision of `targetId` the decision read. */
@@ -149,14 +137,6 @@ function parseDecision(
     if (typeof action !== "string" || !TURN_TWO_ACTIONS.includes(action as TurnTwoAction))
         return null;
     const decision: TurnTwoDecision = { factId, ordinal, action: action as TurnTwoAction };
-    for (const [wire, field] of [
-        ["evidence_quote", "evidenceQuote"],
-        ["status", "status"],
-        ["reversed_by", "reversedBy"],
-    ] as const) {
-        if (raw[wire] !== undefined && typeof raw[wire] !== "string") return null;
-        if (typeof raw[wire] === "string") decision[field] = raw[wire];
-    }
     switch (decision.action) {
         case "new":
         case "abstain":
@@ -363,12 +343,10 @@ export function buildTurnTwoPrompt(input: {
     deferred?: { facts: number; items: number };
 }): string {
     const lines: string[] = [
-        "Turn two: verify each candidate fact against its own source blocks BEFORE reconciling with memory.",
+        "Turn two: reconcile each candidate fact with existing project memory.",
         `allowed_fact_ids: ${JSON.stringify(input.facts.map((fact) => fact.factId))}`,
         "Return exactly one decision for each allowed fact_id and no others. Earlier reply bullets and compartment numbers are not fact ids. Unpublished and deferred facts are out of scope.",
-        "For each decision first report evidence_quote (a verbatim quote stating the fact from one of THIS fact's source blocks), status (settled|planned|hypothesis|snapshot|one_off), and optional reversed_by (a verbatim later quote in those blocks reversing or superseding it). Then choose the action. new, edit, merge and replaces require evidence_quote of at least 25 characters. covered writes nothing and needs no quote.",
-        "If the fact is not stated in its own source blocks, abstain: memory and earlier summaries are NOT evidence. If status is not settled, abstain. If a later line reverses the fact, abstain. Only then reconcile with eligible neighbouring memories using the existing action fields. Return these fields inside each decision, not prose.",
-        "Examples: 'run long compiles in the background, AFT 30-minute limit' copied from earlier memory but absent from this fact's blocks -> abstain (no evidence_quote). 'ck-mc refuses the paging field on non-final pages' followed by the fix accepting it -> quote both lines as evidence_quote and reversed_by, then abstain.",
+        "Before choosing new, edit, merge or replaces, check the conversation. If it treats the statement as a proposal, hypothesis, open question, or still to be measured or decided, choose abstain. Example: 'Gemini reasoning resend is tiny' while a reasoning-budget investigation is still measuring resend cost is a hypothesis, not a new memory.",
         "Source block refs and neighbour refs below point to the shared evidence tables. Cite a source block by its printed start ordinal in the block field, and only if that block is referenced by the fact being decided. Only that fact's neighbour refs are eligible targets.",
     ];
     if (input.lexicalOnly) lines.push(LEXICAL_ONLY_NOTICE);

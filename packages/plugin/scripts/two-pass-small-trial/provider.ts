@@ -20,7 +20,7 @@ export interface Request {
     model: "deepseek-flash";
     messages: Message[];
     temperature: 0.1;
-    max_tokens: number;
+    max_tokens: 32000;
     thinking: { type: "disabled" };
     stream: false;
 }
@@ -133,7 +133,7 @@ export class DeepSeek {
         private readonly input: {
             endpoint: string;
             material: string;
-            ledger: Pick<Ledger, "reserve" | "settle">;
+            ledger: Ledger;
             save(): void;
             log(text: string): void;
             sleep?: (ms: number) => Promise<void>;

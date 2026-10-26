@@ -77,11 +77,13 @@ describe("two-pass prompt fixes", () => {
 
     test("hypothesis veto is concrete and present only in the new turn-two message", () => {
         const prompt = buildTurnTwoPrompt({ facts: [fact(1)], items: [], lexicalOnly: false });
-        const rule = "If status is not settled, abstain.";
+        const rule = "Before choosing new, edit, merge or replaces, check the conversation.";
         expect(prompt).toContain(rule);
-        expect(prompt).toContain("status (settled|planned|hypothesis|snapshot|one_off)");
         expect(prompt).toContain(
-            "copied from earlier memory but absent from this fact's blocks -> abstain",
+            "proposal, hypothesis, open question, or still to be measured or decided, choose abstain",
+        );
+        expect(prompt).toContain(
+            "'Gemini reasoning resend is tiny' while a reasoning-budget investigation is still measuring resend cost is a hypothesis, not a new memory",
         );
         for (const message of turnOne(fixture).messages)
             expect(message.content).not.toContain(rule);

@@ -46,11 +46,7 @@ import {
     type TurnTwoStageReply,
 } from "./turn-two";
 import { retrieveTurnTwoNeighbours } from "./turn-two-retrieval";
-import {
-    authorizationFixture,
-    VERIFIER_TEST_QUOTE,
-    verifiedTestDecisions,
-} from "./turn-two-test-fixtures.test";
+import { authorizationFixture } from "./turn-two-test-fixtures.test";
 
 const PROJECT = "git:turn-two-review";
 const AUTHORIZATION = authorizationFixture(
@@ -81,10 +77,6 @@ function publish(
     db: Database,
     facts: Array<{ content: string; block?: { ordinal: number; parts: string[] } }>,
 ): { publicationId: string; factIds: number[] } {
-    facts = facts.map((fact, index) => ({
-        ...fact,
-        block: fact.block ?? { ordinal: index + 1, parts: [] },
-    }));
     const sessionId = `ses-review-${++sessionCounter}`;
     const send = allocateTurnOneSend(db, {
         projectPath: PROJECT,
@@ -103,7 +95,7 @@ function publish(
                       role: "user",
                       startOrdinal: fact.block.ordinal,
                       endOrdinal: fact.block.ordinal,
-                      parts: [...fact.block.parts, VERIFIER_TEST_QUOTE],
+                      parts: fact.block.parts,
                   },
               ]
             : [],
@@ -163,11 +155,7 @@ function passingVerdicts(request: CheckRequest): CheckReply {
 function reply(decisions: unknown[], scores?: unknown[]): TurnTwoStageReply {
     return {
         text: JSON.stringify({
-            result: {
-                step: "turn_two",
-                decisions: verifiedTestDecisions(decisions),
-                ...(scores ? { scores } : {}),
-            },
+            result: { step: "turn_two", decisions, ...(scores ? { scores } : {}) },
         }),
         lengthCapped: false,
         profile: PROFILE,
@@ -233,8 +221,6 @@ function editFixture(db: Database) {
         { content: "New rule replaces the old one", block: { ordinal: 42, parts: ["New rule."] } },
     ]);
     const decision = {
-        evidence_quote: VERIFIER_TEST_QUOTE,
-        status: "settled",
         fact_id: published.factIds[0],
         action: "edit",
         target_id: memory.id,
@@ -906,7 +892,7 @@ describe("S6 review probes: projection (passed at dafaede1)", () => {
                             role: "user",
                             startOrdinal: 42,
                             endOrdinal: 42,
-                            parts: ["New rule.", VERIFIER_TEST_QUOTE],
+                            parts: ["New rule."],
                         },
                     ],
                     candidateFacts: [
