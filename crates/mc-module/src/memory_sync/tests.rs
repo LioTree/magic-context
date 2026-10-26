@@ -206,13 +206,16 @@ struct FakeState {
     entries: BTreeMap<i64, Vec<u8>>,
     sends: Vec<(i64, Vec<u8>)>,
     heads: usize,
+    heads_times: Vec<tokio::time::Instant>,
+    append_times: Vec<tokio::time::Instant>,
     errors: VecDeque<String>,
     heads_errors: VecDeque<String>,
+    heads_error: Option<String>,
     lose_ack: bool,
 }
-#[derive(Default)]
+#[derive(Clone, Default)]
 struct Fake {
-    state: Mutex<FakeState>,
+    state: Arc<Mutex<FakeState>>,
 }
 impl Fake {
     fn fail(&self, error: &str) {
@@ -223,6 +226,10 @@ impl Engram for Fake {
     async fn heads(&self) -> Result<Heads, String> {
         let mut s = self.state.lock().unwrap();
         s.heads += 1;
+        s.heads_times.push(tokio::time::Instant::now());
+        if let Some(error) = &s.heads_error {
+            return Err(error.clone());
+        }
         if let Some(error) = s.heads_errors.pop_front() {
             return Err(error);
         }
@@ -231,6 +238,7 @@ impl Engram for Fake {
     async fn append(&self, seq: i64, bytes: &[u8]) -> Result<i64, String> {
         let mut s = self.state.lock().unwrap();
         s.sends.push((seq, bytes.to_vec()));
+        s.append_times.push(tokio::time::Instant::now());
         if let Some(error) = s.errors.pop_front() {
             return Err(error);
         }
@@ -972,4 +980,155 @@ fn production_unknown_owner_reports_no_authority_and_null_project() {
             json!([id])
         );
     }
+}
+
+fn spawn_fake_service(
+    service: &Arc<Service>,
+    store: &Arc<mc_store::McStore>,
+    fake: &Fake,
+) -> tokio::task::JoinHandle<()> {
+    tokio::spawn(Service::run(
+        Arc::downgrade(service),
+        Arc::downgrade(store),
+        fake.clone(),
+    ))
+}
+
+async fn settle_service() {
+    for _ in 0..8 {
+        tokio::task::yield_now().await;
+    }
+}
+
+async fn elapse_service(duration: std::time::Duration) {
+    tokio::time::advance(duration).await;
+    settle_service().await;
+}
+
+#[tokio::test(start_paused = true)]
+async fn enrolled_idle_refreshes_heads_at_most_every_fifteen_minutes() {
+    use std::time::Duration;
+    let directory = tempfile::tempdir().unwrap();
+    let (store, service) = real_store(directory.path());
+    let fake = Fake::default();
+    let worker = spawn_fake_service(&service, &store, &fake);
+    settle_service().await;
+    assert_eq!(fake.state.lock().unwrap().heads, 1);
+    for expected in 2..=4 {
+        elapse_service(Duration::from_secs(900) - Duration::from_millis(1)).await;
+        assert_eq!(fake.state.lock().unwrap().heads, expected - 1);
+        elapse_service(Duration::from_millis(1)).await;
+        assert_eq!(fake.state.lock().unwrap().heads, expected);
+    }
+    let times = fake.state.lock().unwrap().heads_times.clone();
+    for pair in times.windows(2) {
+        assert_eq!(pair[1] - pair[0], Duration::from_secs(900));
+    }
+    worker.abort();
+    let _ = worker.await;
+}
+
+#[tokio::test(start_paused = true)]
+async fn unreachable_heads_back_off_to_thirty_minutes() {
+    use std::time::Duration;
+    for error in ["unavailable", "timeout"] {
+        let directory = tempfile::tempdir().unwrap();
+        let (store, service) = real_store(directory.path());
+        let fake = Fake::default();
+        fake.state.lock().unwrap().heads_error = Some(error.into());
+        let worker = spawn_fake_service(&service, &store, &fake);
+        settle_service().await;
+        for delay in [1, 2, 4, 8, 16, 32, 64, 128, 256, 512, 1024, 1800, 1800] {
+            let before = fake.state.lock().unwrap().heads;
+            elapse_service(Duration::from_secs(delay) - Duration::from_millis(1)).await;
+            assert_eq!(fake.state.lock().unwrap().heads, before, "{error}: {delay}");
+            elapse_service(Duration::from_millis(1)).await;
+            let state = fake.state.lock().unwrap();
+            assert_eq!(state.heads, before + 1, "{error}: {delay}");
+            assert_eq!(
+                state.heads_times[before] - state.heads_times[before - 1],
+                Duration::from_secs(delay)
+            );
+        }
+        worker.abort();
+        let _ = worker.await;
+    }
+}
+
+#[tokio::test(start_paused = true)]
+async fn inactive_accounts_refresh_at_thirty_minutes() {
+    use std::time::Duration;
+    for (error, state) in [
+        ("key_unavailable", "not_enrolled"),
+        ("not_member", "credential_invalid"),
+    ] {
+        let directory = tempfile::tempdir().unwrap();
+        let (store, service) = real_store(directory.path());
+        let fake = Fake::default();
+        fake.state.lock().unwrap().heads_error = Some(error.into());
+        let worker = spawn_fake_service(&service, &store, &fake);
+        settle_service().await;
+        assert_eq!(service.status(&store)["state"], state);
+        assert_eq!(fake.state.lock().unwrap().heads, 1);
+        elapse_service(Duration::from_secs(1800) - Duration::from_millis(1)).await;
+        assert_eq!(fake.state.lock().unwrap().heads, 1);
+        elapse_service(Duration::from_millis(1)).await;
+        assert_eq!(fake.state.lock().unwrap().heads, 2);
+        worker.abort();
+        let _ = worker.await;
+    }
+}
+
+#[tokio::test(start_paused = true)]
+async fn queued_create_wakes_long_backoff_and_appends_within_one_second() {
+    use std::time::Duration;
+    let directory = tempfile::tempdir().unwrap();
+    let (store, service) = real_store(directory.path());
+    store
+        .with_memory_sync_write(|c| account::refresh(c, &Ok(heads(0))))
+        .unwrap();
+    let fake = Fake::default();
+    fake.state.lock().unwrap().heads_error = Some("unavailable".into());
+    let worker = spawn_fake_service(&service, &store, &fake);
+    settle_service().await;
+    for delay in [1, 2, 4, 8, 16, 32, 64, 128, 256, 512, 1024] {
+        elapse_service(Duration::from_secs(delay)).await;
+    }
+    assert_eq!(fake.state.lock().unwrap().heads, 12);
+    fake.state.lock().unwrap().heads_error = None;
+    let queued_at = tokio::time::Instant::now();
+    admit_real(&store, "wake-during-backoff").unwrap();
+    settle_service().await;
+    elapse_service(Duration::from_secs(1)).await;
+    {
+        let state = fake.state.lock().unwrap();
+        assert_eq!(state.sends.len(), 1);
+        assert!(state.append_times[0] - queued_at <= Duration::from_secs(1));
+    }
+    worker.abort();
+    let _ = worker.await;
+}
+
+#[tokio::test(start_paused = true)]
+async fn uncertain_batch_retries_without_another_create_notification() {
+    use std::time::Duration;
+    let directory = tempfile::tempdir().unwrap();
+    let (store, service) = real_store(directory.path());
+    let fake = Fake::default();
+    let worker = spawn_fake_service(&service, &store, &fake);
+    settle_service().await;
+    fake.state.lock().unwrap().lose_ack = true;
+    admit_real(&store, "uncertain-wake").unwrap();
+    settle_service().await;
+    assert_eq!(fake.state.lock().unwrap().sends.len(), 1);
+    let heads_before_retry = fake.state.lock().unwrap().heads;
+    elapse_service(Duration::from_secs(2)).await;
+    {
+        let state = fake.state.lock().unwrap();
+        assert_eq!(state.sends.len(), 2);
+        assert_eq!(state.sends[0], state.sends[1]);
+        assert_eq!(state.heads, heads_before_retry);
+    }
+    worker.abort();
+    let _ = worker.await;
 }

@@ -11,6 +11,7 @@ pub(super) trait Engram: Send + Sync {
     async fn append(&self, seq: i64, bytes: &[u8]) -> Result<i64, String>;
 }
 
+#[derive(Clone)]
 pub(super) struct Wire {
     pub file: std::path::PathBuf,
     pub module_id: String,
@@ -61,7 +62,7 @@ impl Wire {
                         .unwrap(),
                     CallOptions {
                         timeout: budget,
-                        route_retry_deadline: budget,
+                        route_retry_deadline: std::time::Duration::from_millis(500),
                         consumer_identity: Some(caller.clone()),
                         ..CallOptions::default()
                     },

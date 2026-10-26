@@ -13,11 +13,17 @@ mod tests;
 use mc_store::memory_levels::{ledger, CreateEvent, CreateHook};
 use rusqlite::Connection;
 use std::sync::{Arc, Mutex};
+use std::time::Duration;
+
+const IDLE_REFRESH: Duration = Duration::from_secs(15 * 60);
+const INITIAL_RETRY: Duration = Duration::from_secs(1);
+const MAX_RETRY: Duration = Duration::from_secs(30 * 60);
 
 #[derive(Default)]
 pub(crate) struct Status {
     last: Mutex<String>,
     unreplicated: Mutex<std::collections::BTreeMap<String, u64>>,
+    work: tokio::sync::Notify,
 }
 
 impl Status {
@@ -43,7 +49,7 @@ pub(crate) fn hook(status: Arc<Status>) -> CreateHook {
                 status.set(format!("unreplicated create {}: {reason}", event.memory_id));
             }
             Err(ref e) => status.set(format!("sync storage: {e}")),
-            _ => {}
+            Ok(None) => status.work.notify_one(),
         }
         outcome.map(|_| ())
     })
@@ -131,35 +137,79 @@ impl Service {
 
     pub(crate) fn install(self: &Arc<Self>, store: &Arc<mc_store::McStore>) {
         store.set_memory_create_hook(Some(hook(self.status.clone())));
-        if self.wire.is_none() {
+        let Some(wire) = self.wire.clone() else {
             return;
-        }
-        let service = Arc::downgrade(self);
-        let store = Arc::downgrade(store);
-        tokio::spawn(async move {
-            let holder = format!("{}-{}", std::process::id(), crate::now_ms());
-            let mut backoff = 1;
-            loop {
-                let (Some(service), Some(store)) = (service.upgrade(), store.upgrade()) else {
-                    return;
-                };
-                match service.cycle(&store, &holder).await {
-                    Ok(()) => backoff = 1,
-                    Err(error) => {
-                        service.status.set(error);
-                        backoff = (backoff * 2).min(60);
-                    }
-                }
-                drop(service);
-                drop(store);
-                tokio::time::sleep(std::time::Duration::from_secs(backoff)).await;
-            }
-        });
+        };
+        tokio::spawn(Self::run(Arc::downgrade(self), Arc::downgrade(store), wire));
     }
 
-    async fn cycle(&self, store: &mc_store::McStore, holder: &str) -> Result<(), String> {
-        self.cycle_with(self.wire.as_ref().ok_or("unavailable")?, store, holder)
-            .await
+    async fn run<E: engram::Engram>(
+        service: std::sync::Weak<Self>,
+        store: std::sync::Weak<mc_store::McStore>,
+        wire: E,
+    ) {
+        let holder = format!("{}-{}", std::process::id(), crate::now_ms());
+        let mut retry = INITIAL_RETRY;
+        loop {
+            let (Some(current), Some(active_store)) = (service.upgrade(), store.upgrade()) else {
+                return;
+            };
+            let status = current.status.clone();
+            let mut result = current.cycle_with(&wire, &active_store, &holder).await;
+            let (inactive, pending) = match Self::scheduling_state(&active_store) {
+                Ok(state) => state,
+                Err(error) => {
+                    result = Err(error);
+                    (false, true)
+                }
+            };
+            if let Err(error) = result.as_ref() {
+                status.set(error);
+            }
+            let delay = if inactive {
+                retry = MAX_RETRY;
+                MAX_RETRY
+            } else if result.is_ok() && !pending {
+                retry = INITIAL_RETRY;
+                IDLE_REFRESH
+            } else {
+                let delay = retry;
+                retry = retry.saturating_mul(2).min(MAX_RETRY);
+                delay
+            };
+            drop(current);
+            drop(active_store);
+            let deadline = tokio::time::Instant::now() + delay;
+            loop {
+                tokio::select! {
+                    _ = tokio::time::sleep_until(deadline) => break,
+                    _ = status.work.notified() => {
+                        let Some(active_store) = store.upgrade() else { return; };
+                        match Self::scheduling_state(&active_store) {
+                            Ok((_, true)) => break,
+                            // A signal may describe work the last cycle already drained
+                            // or a rolled-back create. Neither warrants a stream.heads refresh.
+                            Ok((_, false)) => {},
+                            Err(error) => { status.set(error); break; }
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    fn scheduling_state(store: &mc_store::McStore) -> Result<(bool, bool), String> {
+        // The hook signals inside the create transaction. Serialize this read
+        // with its commit before deciding whether the notification has work.
+        store.with_memory_sync_write(|conn| {
+            let Some(account) = account::cached(conn)? else { return Ok((false, false)); };
+            let inactive = matches!(account.state.as_str(), "not_enrolled" | "credential_invalid");
+            let pending = conn.query_row(
+                "SELECT EXISTS(SELECT 1 FROM memory_outbox WHERE account=?1 AND device=?2 AND appended_seq IS NULL AND coalesce(last_error,'')!='seq_reused')",
+                rusqlite::params![account.account,account.device], |row| row.get(0),
+            )?;
+            Ok((inactive, pending))
+        }).map_err(|error| error.to_string())
     }
 
     async fn cycle_with<E: engram::Engram>(
