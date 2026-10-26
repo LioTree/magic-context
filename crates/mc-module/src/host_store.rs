@@ -338,19 +338,19 @@ fn counted<T>(result: Result<T, HostStoreError>) -> Result<T, HostStoreError> {
 pub const DOMAIN_TABLE_FINGERPRINTS: &[(&str, &str)] = &[
     (
         "memory_sync_state",
-        "e5a9a34428cf9ae8c58d574498e8db0fb2a175ff703c38bb4a50430d27f28dec",
+        "98a4afad6f4f8feb32a919aa1ea3e7bcd212859dfa024eccf999d8ce5fda0993",
     ),
     (
         "memory_placement",
-        "b4da8f888f40954bc5920b0eee3d5466dcd159350330bba1f3da7c59fb5edb87",
+        "7c02d9d8646999934501c18aee3fbf0da3488d35b00b99b2792f44062b16c1b6",
     ),
     (
         "memory_outbox",
-        "fe82a64fd3ad0a7fb5e8a693a0ee0ddf131c0167b656960d9ae28286e3f48ef6",
+        "7e7e383e2b53e67f08e939cb524fd7368a954d1295a686ebe11cb15ee245d3e1",
     ),
     (
         "memory_ops",
-        "ca0d5704d865bc6d87ed47ecd9bebead6658f8d640a04fc33a76dc362817693a",
+        "e4232d019e6a6fae8fc7e6d8228383f416c75a211d304ea57b0abf56f7dab37f",
     ),
     (
         "compartment_history_versions",
