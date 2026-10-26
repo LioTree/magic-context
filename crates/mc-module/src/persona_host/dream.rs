@@ -123,6 +123,8 @@ pub struct DreamPersona {
     kind: Kind,
     role: LoadedRole,
     routing: Routing,
+    profile: crate::memory_profile::Profile,
+    parity: bool,
 }
 
 impl DreamPersona {
@@ -185,6 +187,8 @@ pub fn load(
         kind,
         role,
         routing,
+        profile: crate::memory_profile::documents::bundled_swe().map_err(profile_error)?,
+        parity: crate::memory_profile::documents::parity_mode(),
     })
 }
 
@@ -204,6 +208,7 @@ struct Context<'a> {
     tools: Vec<Tool>,
     output: DreamOutput,
     input: &'a Input<'a>,
+    memory_profile: &'a MemoryProfile,
 }
 
 #[derive(Serialize)]
@@ -222,6 +227,7 @@ pub fn render(
     system: bool,
 ) -> Result<Rendered, PersonaError> {
     let kind = persona.kind;
+    let profile = memory_profile(persona, mode)?;
     let mut routing = persona.routing().clone();
     if kind == Kind::Verify && mode == "broad" && routing.consumer == "mc.dream.verify" {
         routing.consumer = "mc.dream.verify-broad".into();
@@ -258,16 +264,50 @@ pub fn render(
                 .to_owned(),
         },
         input,
+        memory_profile: &profile,
     };
-    persona.role.render(
+    let rendered = persona.role.render(
         &context_for(kind.id(), &routing, &ProjectContext::default(), module),
-        &FragmentSources::new(),
+        &fragments_with_profile(&profile)?,
+    )?;
+    if system {
+        guard_profile(&persona.role, &profile, rendered)
+    } else {
+        Ok(rendered)
+    }
+}
+
+fn memory_profile(persona: &DreamPersona, mode: &str) -> Result<MemoryProfile, PersonaError> {
+    let kind = match persona.kind {
+        Kind::Curate => "curate",
+        Kind::Classify => "classify-memories",
+        Kind::Map => "map-memories",
+        Kind::Verify if mode == "broad" => "verify-broad",
+        Kind::Verify => "verify",
+        Kind::ReviewUser => "review-user-memories",
+    };
+    let task = persona.profile.body["tasks"]
+        .as_array()
+        .into_iter()
+        .flatten()
+        .find(|t| t["kind"] == kind);
+    MemoryProfile::capture(
+        &persona.profile,
+        persona.parity,
+        task.and_then(|t| t["prompts"]["system"].as_str()),
+        task.and_then(|t| t["id"].as_str()),
     )
 }
 
 fn embedded(kind: Kind) -> &'static DreamPersona {
-    static BASE: OnceLock<Vec<DreamPersona>> = OnceLock::new();
-    &BASE.get_or_init(|| {
+    static PARITY: OnceLock<Vec<DreamPersona>> = OnceLock::new();
+    static RESOLVED: OnceLock<Vec<DreamPersona>> = OnceLock::new();
+    let base = if crate::memory_profile::documents::parity_mode() {
+        &PARITY
+    } else {
+        &RESOLVED
+    };
+    &base.get_or_init(|| {
         let tiers = [
             Tier::embedded("base", TrustClass::Operator, embedded_base()).expect("fixed base tier"),
         ];
@@ -293,8 +333,14 @@ pub fn task_with_mode(kind: Kind, input: &Input<'_>, mode: &str) -> String {
 
 /// One immutable system prefix per role; batches never re-render it.
 pub fn system(kind: Kind) -> &'static str {
-    static SYSTEMS: OnceLock<Vec<String>> = OnceLock::new();
-    &SYSTEMS.get_or_init(|| {
+    static PARITY: OnceLock<Vec<String>> = OnceLock::new();
+    static RESOLVED: OnceLock<Vec<String>> = OnceLock::new();
+    let systems = if crate::memory_profile::documents::parity_mode() {
+        &PARITY
+    } else {
+        &RESOLVED
+    };
+    &systems.get_or_init(|| {
         KINDS
             .iter()
             .map(|kind| {
@@ -308,3 +354,110 @@ pub fn system(kind: Kind) -> &'static str {
 
 #[cfg(test)]
 mod tests;
+
+#[cfg(test)]
+mod profile_tests {
+    use super::*;
+    use crate::memory_profile::documents;
+
+    fn forced(kind: Kind, acme: bool) -> DreamPersona {
+        let tiers = [Tier::embedded("base", TrustClass::Operator, embedded_base()).unwrap()];
+        let mut persona = documents::with_parity_mode(false, || {
+            load(kind, &tiers, &ApprovalSet::new(), None).unwrap()
+        });
+        if acme {
+            persona.profile = documents::tests::acme();
+        }
+        persona
+    }
+
+    #[test]
+    fn verify_broad_records_its_task_with_shared_system_bytes() {
+        let persona = forced(Kind::Verify, false);
+        let full = memory_profile(&persona, "full").unwrap();
+        let broad = memory_profile(&persona, "broad").unwrap();
+        assert_eq!(full.task.as_deref(), Some("swe:verify"));
+        assert_eq!(broad.task.as_deref(), Some("swe:verify-broad"));
+        let expected = include_str!(
+            "../../testdata/memory_profile/resolved-swe/rendered/dreamer/swe-verify/system.md"
+        );
+        for (mode, fragment) in [("full", full), ("broad", broad)] {
+            assert!(fragment.present && fragment.supplies);
+            assert_eq!(fragment.fragment, expected);
+            assert_eq!(
+                render(&persona, &Input::default(), mode, true)
+                    .unwrap()
+                    .text,
+                expected
+            );
+        }
+    }
+
+    #[test]
+    fn acme_dream_uses_only_matching_review_user_system() {
+        for kind in KINDS {
+            let persona = forced(kind, true);
+            let fragment = memory_profile(&persona, "full").unwrap();
+            assert!(fragment.present);
+            assert_eq!(fragment.name.as_deref(), Some("@acme/memory-legal"));
+            assert!(fragment.version.is_some() && fragment.digest.is_some());
+            let output = render(&persona, &Input::default(), "full", true).unwrap();
+            if kind == Kind::ReviewUser {
+                assert_eq!(fragment.task.as_deref(), Some("base:review-user-memories"));
+                assert!(fragment.supplies);
+                assert_eq!(
+                    output.text,
+                    documents::render(
+                        &persona.profile,
+                        "dreamer/base:review-user-memories/system",
+                        None
+                    )
+                    .unwrap()
+                );
+            } else {
+                assert_eq!(fragment.task, None);
+                assert!(!fragment.supplies);
+                assert!(fragment.fragment.is_empty());
+                assert_eq!(
+                    output.text,
+                    kind.files()[2]
+                        .1
+                        .replace("\r\n", "\n")
+                        .trim_end_matches('\n')
+                );
+            }
+            let task = render(&persona, &Input::default(), "full", false).unwrap();
+            assert_eq!(
+                task.text,
+                render(embedded(kind), &Input::default(), "full", false)
+                    .unwrap()
+                    .text
+            );
+        }
+    }
+
+    #[test]
+    fn parity_dream_fragments_are_empty_and_mode_is_captured_at_load() {
+        for kind in KINDS {
+            let tiers = [Tier::embedded("base", TrustClass::Operator, embedded_base()).unwrap()];
+            let persona = documents::with_parity_mode(true, || {
+                load(kind, &tiers, &ApprovalSet::new(), None).unwrap()
+            });
+            documents::with_parity_mode(false, || {
+                let fragment = memory_profile(&persona, "full").unwrap();
+                assert!(fragment.present);
+                assert!(!fragment.supplies);
+                assert!(fragment.fragment.is_empty());
+                assert_eq!(
+                    render(&persona, &Input::default(), "full", true)
+                        .unwrap()
+                        .text,
+                    kind.files()[2]
+                        .1
+                        .replace("\r\n", "\n")
+                        .trim_end_matches('\n')
+                );
+            });
+        }
+    }
+}

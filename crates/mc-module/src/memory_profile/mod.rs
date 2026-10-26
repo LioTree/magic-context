@@ -2,6 +2,8 @@
 #![allow(dead_code)]
 
 mod bundled;
+pub(crate) mod documents;
+mod frames;
 mod load;
 mod resolve;
 mod schema;

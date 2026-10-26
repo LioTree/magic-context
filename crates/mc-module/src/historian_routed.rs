@@ -560,7 +560,13 @@ pub(crate) fn freeze_summary_persona(
         if let Some(frozen) = &loaded.meta.summary_persona {
             return Ok(frozen.as_ref().clone());
         }
-        let frozen = render_frozen(routing, project_root, language, fallback_temperature)?;
+        let frozen = render_frozen(
+            routing,
+            project_root,
+            language,
+            fallback_temperature,
+            loaded.meta.memory_context.as_ref(),
+        )?;
         let mut meta = loaded.meta.clone();
         meta.summary_persona = Some(Box::new(frozen.clone()));
         match store.commit_meta(session_id, loaded.row_version, &meta) {
@@ -585,11 +591,13 @@ fn render_frozen(
     project_root: &Path,
     language: Option<&str>,
     fallback_temperature: Option<f64>,
+    memory_context: Option<&serde_json::Value>,
 ) -> Result<FrozenSummaryPersona, PersonaError> {
     let tiers = routing.persona_tiers(project_root)?;
     let persona = persona_host::load_summary(&tiers, &ApprovalSet::new(), None)?;
     let context = persona_host::SummaryContext {
         language: persona_host::LanguageContext::new(language, Default::default()),
+        memory_profile: persona_host::MemoryProfile::summary(memory_context)?,
         ..Default::default()
     };
     let rendered = persona_host::render_summary(&persona, &context)?;

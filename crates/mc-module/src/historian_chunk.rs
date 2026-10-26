@@ -806,10 +806,10 @@ impl AssembledHistorianFiring {
             // The role-scoped historian system prompt. The assembler builds the USER
             // prompt (chunk + references); content-language guidance belongs only on this
             // producer request, never on the transform-served prompt surface.
-            system: crate::historian_prompt::with_content_language_directive(
-                crate::historian_prompt::HISTORIAN_SYSTEM_PROMPT,
-                content_language,
-                crate::historian_prompt::ContentLanguageDirectiveOptions::default(),
+            system: std::borrow::Cow::Owned(
+                crate::persona_host::render_session_summary(store, session_id, content_language)
+                    .expect("stored summary profile must render")
+                    .text,
             ),
             content_language,
             prompt: &self.prompt,
