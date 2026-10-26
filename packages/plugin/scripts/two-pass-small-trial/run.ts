@@ -224,6 +224,11 @@ export async function runTrial(input: {
 
 async function main() {
     const args = process.argv.slice(2);
+    if (args.includes("--replay")) {
+        const { replayMain } = await import("./replay");
+        await replayMain(args);
+        return;
+    }
     const option = (name: string) => args[args.indexOf(name) + 1];
     if (
         !args.includes("--config") ||

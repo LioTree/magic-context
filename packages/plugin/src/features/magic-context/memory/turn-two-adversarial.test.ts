@@ -20,7 +20,11 @@ import {
     type TurnTwoRunInput,
     type TurnTwoStageReply,
 } from "./turn-two";
-import { authorizationFixture } from "./turn-two-test-fixtures.test";
+import {
+    authorizationFixture,
+    VERIFIER_TEST_QUOTE,
+    verifiedTestDecisions,
+} from "./turn-two-test-fixtures.test";
 
 const PROJECT = "git:turn-two-adversarial";
 const A = authorizationFixture(
@@ -69,7 +73,14 @@ function fixture(
             compartments: [
                 { id: 1, startMessage: 1, endMessage: 2, replyStartMessage: 1, replyEndMessage: 2 },
             ],
-            blocks: [{ role: "user", startOrdinal: 1, endOrdinal: 1, parts: ["New rule."] }],
+            blocks: [
+                {
+                    role: "user",
+                    startOrdinal: 1,
+                    endOrdinal: 1,
+                    parts: ["New rule.", VERIFIER_TEST_QUOTE],
+                },
+            ],
             candidateFacts: Array.from({ length: count }, (_, index) => ({
                 category: "CONSTRAINTS",
                 content: `New rule ${index}.`,
@@ -92,7 +103,9 @@ function rows(f: ReturnType<typeof fixture>) {
 }
 function answer(decisions: unknown[], scores?: unknown[], profile = A.profile): TurnTwoStageReply {
     return {
-        text: JSON.stringify({ result: { step: "turn_two", decisions, scores } }),
+        text: JSON.stringify({
+            result: { step: "turn_two", decisions: verifiedTestDecisions(decisions), scores },
+        }),
         profile,
         lengthCapped: false,
     };
