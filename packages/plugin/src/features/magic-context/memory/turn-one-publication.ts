@@ -686,6 +686,19 @@ export function commitTurnOnePublication(
     let blocksStored = 0;
     input.candidateFacts.forEach((fact, position) => {
         if (!isPromotableFact(fact)) return;
+        // A compartment label cannot authorize evidence from an unpublished tail.
+        // Unanchored facts still follow the caller's existing publication policy.
+        const start = fact.anchor?.startOrdinal;
+        const end = fact.anchor?.endOrdinal;
+        if (
+            input.honourAnchors &&
+            start !== undefined &&
+            end !== undefined &&
+            !ranges.some(
+                (range) => start <= end && start >= range.startMessage && end <= range.endMessage,
+            )
+        )
+            return;
         const factIndex = fact.factIndex ?? position;
         const resolved =
             input.honourAnchors && bound

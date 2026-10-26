@@ -82,15 +82,9 @@ test("turn-two user content carries notices and data, not a second format schema
     expect(prompt).toContain("## Fact 4");
     expect(prompt).toContain("## Agent memories to score");
     expect(prompt).toContain("Save first.");
-    for (const format of [
-        "Reply with",
-        "JSON",
-        "fact_id",
-        "target_id",
-        "1-100",
-        "decay class",
-        "final_text",
-    ])
+    expect(prompt).toContain("allowed_fact_ids: [4]");
+    expect(prompt).toContain("exactly one decision for each allowed fact_id and no others");
+    for (const format of ["Reply with", "JSON", "target_id", "1-100", "decay class", "final_text"])
         expect(prompt).not.toContain(format);
 });
 

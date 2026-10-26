@@ -13,7 +13,7 @@ import {
     TURN_TWO_PROMPT_MAX,
 } from "../../src/features/magic-context/memory/turn-two";
 import {
-    buildTurnTwoPrompt,
+    fitTurnTwoPrompt,
     parseTurnTwoEnvelope,
     type TurnTwoPromptFact,
 } from "../../src/features/magic-context/memory/turn-two-envelope";
@@ -184,27 +184,15 @@ export async function turnTwo(c: ReplayCase, first: Request, reply: string): Pro
             });
         }
         if (facts.length === 0) throw new Error("turn_two_no_published_facts");
-        const selected: TurnTwoPromptFact[] = [];
-        for (const fact of facts) {
-            selected.push(fact);
-            if (
-                selected.length > 1 &&
-                buildTurnTwoPrompt({
-                    facts: selected,
-                    items: [],
-                    lexicalOnly: true,
-                    deferred: { facts: facts.length, items: 0 },
-                }).length > TURN_TWO_PROMPT_MAX
-            )
-                selected.pop();
-        }
-        const deferredFacts = facts.length - selected.length;
-        const second = buildTurnTwoPrompt({
-            facts: selected,
+        const fitted = fitTurnTwoPrompt({
+            facts,
             items: [],
             lexicalOnly: true,
-            deferred: { facts: deferredFacts, items: 0 },
+            maxLength: TURN_TWO_PROMPT_MAX,
         });
+        const selected = fitted.facts;
+        const deferredFacts = fitted.deferred.facts;
+        const second = fitted.prompt;
         return {
             request: request([
                 ...first.messages,
@@ -224,13 +212,18 @@ export function memoryDrafts(
     reply: string,
     facts: TurnTwoPromptFact[],
     c: ReplayCase,
+    diagnostics: { extraFactIds: number[] } = { extraFactIds: [] },
 ): MemoryDraft[] {
     const parsed = parseTurnTwoEnvelope(reply, false);
-    if (!parsed.ok || !parsed.schemaValid) throw new Error("turn_two_schema_invalid");
+    if (!parsed.ok) throw new Error("turn_two_schema_invalid");
     const drafts: MemoryDraft[] = [];
     for (const [id, decision] of parsed.decisions) {
         const fact = facts.find((f) => f.factId === id);
-        if (!fact || decision === "malformed") throw new Error("turn_two_unknown_fact");
+        if (!fact) {
+            diagnostics.extraFactIds.push(id);
+            continue;
+        }
+        if (decision === "malformed") throw new Error("turn_two_schema_invalid");
         if (decision.action === "new")
             drafts.push({
                 factId: id,

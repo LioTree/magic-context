@@ -366,6 +366,52 @@ describe("published-fact policy shared with the Rust validator", () => {
 });
 
 describe("turn-one publication", () => {
+    test("two-pass publication excludes cited ranges in a discarded compartment despite a kept label", () => {
+        const db = store();
+        try {
+            const send = allocate(db);
+            const result = commitTurnOnePublication(db, {
+                send,
+                projectPath: PROJECT,
+                sessionId: SESSION,
+                honourAnchors: true,
+                compartments: [
+                    {
+                        id: 101,
+                        startMessage: 10,
+                        endMessage: 12,
+                        replyStartMessage: 10,
+                        replyEndMessage: 12,
+                    },
+                ],
+                blocks: BLOCKS,
+                candidateFacts: [
+                    {
+                        category: "CONSTRAINTS",
+                        content: "Tail fact with a kept label",
+                        anchor: { compartmentIndex: 1, startOrdinal: 13, endOrdinal: 14 },
+                    },
+                    {
+                        category: "CONSTRAINTS",
+                        content: "Retained evidence",
+                        anchor: { compartmentIndex: 1, startOrdinal: 10, endOrdinal: 10 },
+                    },
+                    { category: "CONSTRAINTS", content: "No anchor" },
+                    {
+                        category: "CONSTRAINTS",
+                        content: "Crosses the boundary",
+                        anchor: { compartmentIndex: 1, startOrdinal: 12, endOrdinal: 13 },
+                    },
+                ],
+            });
+            expect(result.candidatesInserted).toBe(2);
+            expect(
+                db.prepare("SELECT content FROM memory_pending_facts ORDER BY fact_index").all(),
+            ).toEqual([{ content: "Retained evidence" }, { content: "No anchor" }]);
+        } finally {
+            db.close();
+        }
+    });
     test("every production lane is dormant", () => {
         expect(resolveTurnOneLane()).toBe("dormant");
         expect(resolveTurnOneLane("enabled")).toBe("enabled");
@@ -499,6 +545,7 @@ describe("turn-one publication", () => {
                 },
                 // Unknown anchors are never guessed.
                 { category: "NAMING", content: "No anchor given." },
+                // Cited evidence outside the publication is excluded, not stored as unknown.
                 {
                     category: "NAMING",
                     content: "Discarded tail.",
@@ -508,7 +555,7 @@ describe("turn-one publication", () => {
                 { category: "EPISODE", content: "Not durable." },
             ]);
             expect(result).toMatchObject({
-                candidatesInserted: 5,
+                candidatesInserted: 4,
                 anchoredCandidates: 3,
                 blocksStored: 3,
                 authorityElsewhere: false,
@@ -546,14 +593,6 @@ describe("turn-one publication", () => {
                 },
                 {
                     fact_index: 3,
-                    compartment_id: null,
-                    anchor_known: 0,
-                    state: "retryable",
-                    fact_attempts: 0,
-                    reason: null,
-                },
-                {
-                    fact_index: 4,
                     compartment_id: null,
                     anchor_known: 0,
                     state: "retryable",

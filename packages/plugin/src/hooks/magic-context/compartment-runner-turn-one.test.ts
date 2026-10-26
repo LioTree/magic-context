@@ -295,7 +295,38 @@ const REPLY_WITH_FACTS = `<output><compartments>
 </facts>
 </output>`;
 
+const REPLY_WITH_MISLABELLED_TAIL = `<output><compartments>
+<compartment start="3" end="3" title="Head"><p1>Retained head.</p1></compartment>
+<compartment start="4" end="4" title="Tail"><p1>Discarded tail.</p1></compartment>
+</compartments><facts><CONSTRAINTS>
+* [at_compartment=1 messages=4] Uploads are capped at 64 KiB.
+</CONSTRAINTS></facts></output>`;
+
 describe("historian turn one on a dormant lane (production default)", () => {
+    it("one-pass still promotes a kept-label fact citing the discarded tail", async () => {
+        useTempDataHome("turn-one-dormant-tail-");
+        const sessionId = "ses-dormant-tail";
+        const directory = "/tmp/turn-one-dormant-tail";
+        createOpenCodeSession(sessionId);
+        const db = openDatabase();
+        seedPriorCompartment(db, sessionId);
+        const { client } = historianClient(directory, () => REPLY_WITH_MISLABELLED_TAIL);
+        await runHistorian(db, sessionId, client, directory, {
+            memoryLifecycleValidatedProfiles: [],
+        });
+        expect(
+            getCompartments(db, sessionId).map((row) => [row.startMessage, row.endMessage]),
+        ).toEqual([
+            [1, 2],
+            [3, 3],
+        ]);
+        expect(
+            getMemoriesByProject(db, resolveProjectIdentity(directory)).map(
+                (memory) => memory.content,
+            ),
+        ).toEqual(["Uploads are capped at 64 KiB."]);
+        expect(pendingFacts(db)).toEqual([]);
+    });
     it("empty allowlist sends the XML artifact, parses and promotes, and commits the publication once", async () => {
         useTempDataHome("turn-one-dormant-ts-");
         const sessionId = "ses-dormant-ts";
@@ -412,6 +443,24 @@ describe("historian turn one on a dormant lane (production default)", () => {
 });
 
 describe("historian turn one on an enabled lane", () => {
+    it("two-pass excludes the same mislabelled tail that one-pass still promotes", async () => {
+        useTempDataHome("turn-one-enabled-tail-");
+        const sessionId = "ses-enabled-tail";
+        const directory = "/tmp/turn-one-enabled-tail";
+        createOpenCodeSession(sessionId);
+        const db = openDatabase();
+        seedPriorCompartment(db, sessionId);
+        const { client } = historianClient(directory, () => REPLY_WITH_MISLABELLED_TAIL);
+        await runHistorian(db, sessionId, client, directory, { memoryLifecycleLane: "enabled" });
+        expect(
+            getCompartments(db, sessionId).map((row) => [row.startMessage, row.endMessage]),
+        ).toEqual([
+            [1, 2],
+            [3, 3],
+        ]);
+        expect(pendingFacts(db)).toEqual([]);
+        expect(getMemoriesByProject(db, resolveProjectIdentity(directory))).toEqual([]);
+    });
     it("invalid trial sends nothing even when the allowlist matches", async () => {
         useTempDataHome("turn-one-invalid-trial-");
         const sessionId = "ses-invalid-trial";
