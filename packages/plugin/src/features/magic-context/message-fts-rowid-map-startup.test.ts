@@ -17,6 +17,11 @@ test("startup FTS map backfill must not synchronously wait for the production fi
     const db = new Database(path);
     initializeDatabase(db);
     runMigrations(db);
+    // Exercise real pending legacy work, not the fresh-store no-op path.
+    db.prepare(
+        "INSERT INTO message_history_fts(session_id,message_ordinal,message_id,role,content) VALUES('legacy',1,'m1','user','private text')",
+    ).run();
+    db.exec("UPDATE message_fts_rowid_map_backfill_state SET completed=0 WHERE id=1");
     db.exec("PRAGMA journal_mode=WAL; PRAGMA busy_timeout=5000");
     const blocker = new Database(path);
     blocker.exec("BEGIN IMMEDIATE");

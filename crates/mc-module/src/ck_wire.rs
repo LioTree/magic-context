@@ -19,6 +19,13 @@ use sha2::{Digest, Sha256};
 #[cfg(test)]
 thread_local! {
     static UNCOMPACTED_REFERENCE: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+    static PROJECTION_WORK: std::cell::Cell<(usize, usize)> = const { std::cell::Cell::new((0, 0)) };
+}
+
+/// Take and reset actual message/block visits on this thread, not elapsed time.
+#[cfg(test)]
+pub(crate) fn take_projection_work() -> (usize, usize) {
+    PROJECTION_WORK.with(|work| work.replace((0, 0)))
 }
 
 /// Test-only reference to the former ownership model. Scope the flag to the current-thread
@@ -656,6 +663,11 @@ fn project_messages_from_state(
     mut builder: FlatProjectionBuilder,
 ) -> Result<FlatProjection, CkWireError> {
     for msg in messages {
+        #[cfg(test)]
+        PROJECTION_WORK.with(|work| {
+            let (messages, blocks) = work.get();
+            work.set((messages + 1, blocks));
+        });
         if msg.mid.contains('#') {
             return Err(CkWireError::MidContainsReservedHash(msg.mid.clone()));
         }
@@ -691,6 +703,11 @@ fn project_messages_from_state(
 
         let mut identities = Vec::new();
         for (index, block) in msg.ck.content.iter().enumerate() {
+            #[cfg(test)]
+            PROJECTION_WORK.with(|work| {
+                let (messages, blocks) = work.get();
+                work.set((messages, blocks + 1));
+            });
             let id = block_id(&msg.mid, index);
             let arc_id = arc_for_block(
                 &msg.mid,

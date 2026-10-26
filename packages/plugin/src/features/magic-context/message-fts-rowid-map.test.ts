@@ -1,6 +1,6 @@
 /// <reference types="bun-types" />
 
-import { afterEach, describe, expect, test } from "bun:test";
+import { afterEach, describe, expect, spyOn, test } from "bun:test";
 import { rmSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
@@ -14,6 +14,7 @@ import {
 import {
     backfillMessageFtsRowidMapBatch,
     getMessageFtsRowidMapBackfillProgress,
+    startMessageFtsRowidMapBackfill,
 } from "./message-fts-rowid-map";
 import { clearIndexedMessages } from "./message-index";
 import { runMigrations } from "./migrations";
@@ -30,6 +31,8 @@ function createDb(path = ":memory:"): Database {
 }
 
 function insertLegacyFtsRows(db: Database, count: number, sessionId = "legacy"): void {
+    // These raw inserts model a store predating canonical rowid-map writes.
+    db.prepare("UPDATE message_fts_rowid_map_backfill_state SET completed=0 WHERE id=1").run();
     const insert = db.prepare(
         "INSERT INTO message_history_fts (session_id, message_ordinal, message_id, role, content) VALUES (?, ?, ?, ?, ?)",
     );
@@ -52,6 +55,55 @@ afterEach(() => {
 });
 
 describe("message FTS rowid map", () => {
+    test("a fresh completed backfill does not acquire a writer behind a foreground lock", async () => {
+        const directory = createTestTempDirFromPath(join(tmpdir(), "message-fts-rowid-complete-"));
+        tempDirectories.push(directory);
+        const path = join(directory, "context.db");
+        const db = createDb(path);
+        const lock = new Database(path);
+        const exec = db.exec.bind(db);
+        let begins = 0;
+        const observe = spyOn(db, "exec").mockImplementation((sql) => {
+            if (sql === "BEGIN IMMEDIATE") begins++;
+            return exec(sql);
+        });
+        try {
+            db.exec("PRAGMA busy_timeout=0");
+            expect(getMessageFtsRowidMapBackfillProgress(db).completed).toBe(true);
+            lock.exec("BEGIN IMMEDIATE");
+            expect(backfillMessageFtsRowidMapBatch(db)).toEqual({
+                processed: 0,
+                watermarkRowid: 0,
+                completed: true,
+            });
+            await startMessageFtsRowidMapBackfill(db);
+            expect(begins).toBe(0);
+        } finally {
+            observe.mockRestore();
+            if (lock.inTransaction) lock.exec("ROLLBACK");
+            closeQuietly(lock);
+            closeQuietly(db);
+        }
+    });
+
+    test("initialization preserves pending legacy backfill and recognizes nonempty old FTS", () => {
+        const db = createDb();
+        try {
+            insertLegacyFtsRows(db, 3);
+            initializeDatabase(db);
+            expect(getMessageFtsRowidMapBackfillProgress(db).completed).toBe(false);
+            db.exec("DROP TABLE message_fts_rowid_map_backfill_state");
+            initializeDatabase(db);
+            expect(getMessageFtsRowidMapBackfillProgress(db).completed).toBe(false);
+            expect(backfillMessageFtsRowidMapBatch(db)).toMatchObject({
+                processed: 3,
+                completed: true,
+            });
+        } finally {
+            closeQuietly(db);
+        }
+    });
+
     test("caps a maintenance transaction at 100 FTS rows even for oversized requests", () => {
         const db = createDb();
         try {

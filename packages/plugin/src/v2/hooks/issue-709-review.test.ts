@@ -495,7 +495,7 @@ async function fixture(
             vision.mockRestore();
             clock.mockRestore();
             _resetDreamTimerForTests();
-            closeDatabase();
+            await closeDatabase();
             raw.close();
             resetLkgSlotsForTest();
             resetCtxReduceRegisteredGloballyForTest();

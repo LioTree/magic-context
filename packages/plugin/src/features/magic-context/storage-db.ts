@@ -1710,9 +1710,10 @@ CREATE INDEX IF NOT EXISTS idx_dream_queue_pending ON dream_queue(started_at, en
       completed INTEGER NOT NULL DEFAULT 0 CHECK(completed IN (0, 1)),
       updated_at INTEGER NOT NULL DEFAULT 0
     );
+    -- Empty new stores have no legacy FTS rows; current index writers record mappings directly.
     INSERT OR IGNORE INTO message_fts_rowid_map_backfill_state
       (id, watermark_rowid, completed, updated_at)
-    VALUES (1, 0, 0, 0);
+    SELECT 1, 0, CASE WHEN EXISTS (SELECT 1 FROM message_history_fts LIMIT 1) THEN 0 ELSE 1 END, 0;
 
     CREATE TABLE IF NOT EXISTS message_time_backfill_state (
       id INTEGER PRIMARY KEY CHECK(id = 1),

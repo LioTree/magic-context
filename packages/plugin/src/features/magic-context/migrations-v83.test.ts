@@ -45,7 +45,7 @@ describe("migration v83: indexed message FTS rowid access", () => {
             );
             expect(
                 db.prepare("SELECT * FROM message_fts_rowid_map_backfill_state").get(),
-            ).toMatchObject({ id: 1, watermark_rowid: 0, completed: 0 });
+            ).toMatchObject({ id: 1, watermark_rowid: 0, completed: 1 });
             expect(LATEST_SUPPORTED_VERSION).toBe(LATEST_MIGRATION_VERSION);
         } finally {
             closeQuietly(db);

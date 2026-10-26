@@ -129,6 +129,10 @@ export function backfillMessageFtsRowidMapBatch(
     db: Database,
     batchSize = MESSAGE_FTS_ROWID_MAP_BACKFILL_BATCH_SIZE,
 ): MessageFtsRowidMapBackfillProgress {
+    // Finished maintenance is read-only, including while a foreground writer
+    // owns the database. Recheck under the lock below if work is still pending.
+    const current = getBackfillState(db);
+    if (current.completed) return current;
     const boundedBatchSize = Number.isFinite(batchSize)
         ? Math.min(MESSAGE_FTS_ROWID_MAP_BACKFILL_BATCH_SIZE, Math.max(1, Math.floor(batchSize)))
         : MESSAGE_FTS_ROWID_MAP_BACKFILL_BATCH_SIZE;
