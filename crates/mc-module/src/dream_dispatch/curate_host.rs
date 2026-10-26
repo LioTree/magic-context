@@ -153,9 +153,13 @@ impl<C: CurateCarrier> CurateHost<C> {
                     |tx| router.check_commit_fence(tx),
                 )
                 .map_err(|e| CurateError::Store(e.to_string()))?;
-            *router.state.lock().unwrap_or_else(|e| e.into_inner()) = RouterState {
+            let mut state = router.state.lock().unwrap_or_else(|e| e.into_inner());
+            // The actions carry the run's memory writer and its authority.
+            let actions = std::mem::take(&mut state.actions);
+            *state = RouterState {
                 category: Some(plan.category),
                 revisions,
+                actions,
                 ..RouterState::default()
             };
         }

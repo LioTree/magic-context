@@ -18,6 +18,7 @@ use std::time::Duration;
 /// `routed::registry::REGISTRATIONS`. A new task registers there, next to its
 /// host; this dispatcher never lists tasks itself.
 pub use super::routed::registry::OPERATIONAL_TASKS;
+pub use mc_store::dream_scheduler::GateDecision;
 
 /// An executor that could not start any work, for a reason that says nothing
 /// about the task (an earlier process's child may still be running), reports a
@@ -29,12 +30,13 @@ pub const ABANDON_PREFIX: &str = "abandon:";
 #[allow(async_fn_in_trait)]
 pub trait TaskExecutor {
     fn operational_tasks(&self) -> &[TaskName];
-    fn gate(
+    async fn gate(
         &mut self,
         task: TaskName,
         scope: &StoreScope,
         state: &ScheduleState,
-    ) -> Result<bool, String>;
+        invocation: &str,
+    ) -> Result<GateDecision, String>;
     async fn run(&mut self, context: &TaskContext) -> RunOutcome;
 }
 
@@ -44,7 +46,13 @@ impl TaskExecutor for UnavailableTasks {
     fn operational_tasks(&self) -> &[TaskName] {
         OPERATIONAL_TASKS
     }
-    fn gate(&mut self, _: TaskName, _: &StoreScope, _: &ScheduleState) -> Result<bool, String> {
+    async fn gate(
+        &mut self,
+        _: TaskName,
+        _: &StoreScope,
+        _: &ScheduleState,
+        _: &str,
+    ) -> Result<GateDecision, String> {
         Err("unavailable_capability".into())
     }
     async fn run(&mut self, _: &TaskContext) -> RunOutcome {
@@ -232,26 +240,59 @@ impl<E: TaskExecutor> Dispatcher<E> {
             token_budget: task.default_budget().unwrap_or(2_500_000),
             manual_force: manual.is_some(),
         };
+        let gate_store = self.store.clone();
+        let gate_scheduler = self.scheduler.clone();
+        let gate_scope = self.scope.clone();
+        let gate_config = self.config.clone();
+        let gate_domain = domain.clone();
+        let gate_cancel = cancellation.clone();
+        let gate_clock = self.clock.clone();
         let executor = &mut self.executor;
-        let lease =
-            match available(
-                self.scheduler
-                    .claim_task_checked(&claim, task, manual, |state| {
-                        executor
-                            .gate(task, &self.scope, state)
-                            .map_err(|_| mc_store::dream_scheduler::Error::Refused("gate_error"))
-                    }),
-            ) {
-                Ok(lease) => lease,
-                Err(reason) => {
-                    // A closed gate advanced the Rust slot as skipped.
-                    if reason == "gate_closed" {
-                        self.publish_progress(task);
+        let lease = match available(
+            self.scheduler
+                .claim_task_checked_async(&claim, task, manual, |state, lease| async move {
+                    let invocation = lease.invocation.0.clone();
+                    if task == TaskName::Curate {
+                        let context = TaskContext {
+                            task,
+                            scope: gate_scope.clone(),
+                            config: gate_config,
+                            domain_lease: gate_domain.clone(),
+                            task_lease: lease.clone(),
+                            cancellation: gate_cancel.clone(),
+                            clock: gate_clock.clone(),
+                            deadline_ms,
+                            control: Arc::new(DomainControl::new(
+                                gate_store.clone(),
+                                gate_scheduler,
+                                gate_domain,
+                                lease,
+                                gate_cancel,
+                                gate_clock,
+                                deadline_ms,
+                            )),
+                        };
+                        super::due_inputs::expire_on_curate(&gate_store, &context).map_err(
+                            |_| mc_store::dream_scheduler::Error::Refused("expiry_error"),
+                        )?;
                     }
-                    let _ = self.store.release_dream_domain(&domain);
-                    return DispatchOutcome::Refused(reason);
+                    executor
+                        .gate(task, &gate_scope, &state, &invocation)
+                        .await
+                        .map_err(|_| mc_store::dream_scheduler::Error::Refused("gate_error"))
+                })
+                .await,
+        ) {
+            Ok(lease) => lease,
+            Err(reason) => {
+                // A closed gate advanced the task's due slot as skipped.
+                if reason == "gate_closed" {
+                    self.publish_progress(task);
                 }
-            };
+                let _ = self.store.release_dream_domain(&domain);
+                return DispatchOutcome::Refused(reason);
+            }
+        };
         let control = DomainControl::new(
             self.store.clone(),
             self.scheduler.clone(),
