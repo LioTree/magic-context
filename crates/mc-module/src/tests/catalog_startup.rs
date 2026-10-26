@@ -162,10 +162,6 @@ impl LiveRoute {
         handler.set_store_open_policy_for_test(StoreOpenPolicy {
             request_wait: if matches!(condition, StoreCondition::Delayed) {
                 Duration::from_millis(25)
-            } else if cfg!(windows) {
-                // A fresh Windows store includes cold migrations and WAL setup
-                // before the first catalog can be persisted.
-                Duration::from_secs(60)
             } else {
                 Duration::from_secs(10)
             },
@@ -225,7 +221,7 @@ impl LiveRoute {
                 self.identity.clone(),
                 serde_json::to_vec(&request).unwrap(),
                 CallOptions {
-                    timeout: Duration::from_secs(if cfg!(windows) { 90 } else { 20 }),
+                    timeout: Duration::from_secs(20),
                     ..Default::default()
                 },
             )
@@ -281,13 +277,32 @@ async fn first_composition_catalog_on_a_real_route_awaits_the_startup_open_witho
     route.assert_catalog_before_store_and_transform();
     let refusal = route.catalog_refusal();
     assert!(refusal.is_none(), "{refusal:?}");
+    // Persistence uses the effective binding, whose Windows spelling may differ
+    // from the caller's. It must still name the same directory and session.
+    let binding = route
+        .handler
+        .bindings
+        .lock()
+        .unwrap()
+        .values()
+        .next()
+        .unwrap()
+        .clone();
+    assert_eq!(
+        std::fs::canonicalize(&binding.project_root).unwrap(),
+        std::fs::canonicalize(&route.identity.project_root).unwrap()
+    );
+    assert_eq!(binding.session.trim(), route.identity.session);
     let store = route
         .handler
         .store
         .get()
         .expect("catalog joined the coordinator's open");
     assert!(store
-        .load_provider_catalog(&route.identity.project_root.to_string_lossy(), "s")
+        .load_provider_catalog(
+            &binding.project_root.to_string_lossy(),
+            binding.session.trim()
+        )
         .unwrap()
         .is_some());
     route.consumer.close().await;
