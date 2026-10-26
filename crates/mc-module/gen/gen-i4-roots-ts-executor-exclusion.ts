@@ -20,7 +20,7 @@ const referencePath = resolve(
 const oracleSources = [
     [
         "packages/plugin/src/features/magic-context/dreamer/task-scheduler.ts",
-        "c782b9adc86283754e09bbb932026ff471c2519c6d660c938aed61a153127014",
+        "5bb2da535f025421c21a3278f96f190b0d63978649f40225430c1b68ab1b8093",
     ],
     [
         "packages/plugin/src/features/magic-context/dreamer/task-registry.ts",

@@ -848,6 +848,7 @@ test("Pi already-cold held pass keeps every signed block when no binding bytes c
 	const fake = createFakePi();
 	registerPiContextHandler(fake.pi as never, {
 		db,
+		signedThinkingHold: "on",
 		protectedTokens: 4000,
 		heuristics: { keepReasoningTokens: 10000 },
 		injection: {
@@ -1137,6 +1138,7 @@ test("Pi empty message shells do not relax signed-prefix target protection", asy
 	const fake = createFakePi();
 	registerPiContextHandler(fake.pi as never, {
 		db,
+		signedThinkingHold: "on",
 		protectedTokens: 4000,
 		injection: {
 			injectionBudgetTokens: 1000,

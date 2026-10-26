@@ -12,7 +12,7 @@ test("i4_roots TypeScript executor reference matches the pinned oracle", () => {
         windowsHide: true,
     });
 
-    expect(result.exitCode).toBe(0);
+    expect(result.exitCode, new TextDecoder().decode(result.stderr)).toBe(0);
     expect(result.stdout.toString()).toContain(
         "i4_roots TypeScript executor exclusion reference matches the pinned oracle",
     );

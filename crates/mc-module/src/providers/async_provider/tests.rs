@@ -615,6 +615,7 @@ impl Rig {
         if answer["answer"] == "view" {
             Some(decode(&answer["view"]).unwrap())
         } else {
+            eprintln!("ride {cause} returned without a view: {answer}");
             None
         }
     }

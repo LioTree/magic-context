@@ -6,6 +6,7 @@ import {
 	queuePendingOp,
 	updateSessionMeta,
 } from "../../plugin/src/features/magic-context/storage";
+import * as sessionCollections from "../../plugin/src/features/magic-context/storage-session-collections";
 import * as executeModule from "../../plugin/src/hooks/magic-context/execute-reclaim";
 import {
 	__test,
@@ -217,6 +218,8 @@ test("native marker failure prevents execute admissions until authorization succ
 			admissions.push({ estimate: args.reclaimableTokens, allowed });
 		return allowed;
 	});
+	let restoreNativeWrite: (() => void) | undefined;
+	let blockedNativeWrites = 0;
 	try {
 		const warm = await pass(40);
 		expect(JSON.stringify(warm)).not.toContain(
@@ -227,9 +230,34 @@ test("native marker failure prevents execute admissions until authorization succ
 		);
 		if (!tag) throw new Error("Missing native tool tag");
 		queuePendingOp(db, id, tag.tagNumber, "drop");
-		db.exec(
-			`CREATE TRIGGER fail_native_write BEFORE UPDATE OF trailing_blank_decisions ON session_meta WHEN COALESCE(json_extract(NEW.trailing_blank_decisions,'$.piNative.toolInputs'),'{}') != COALESCE(json_extract(NULLIF(OLD.trailing_blank_decisions,''),'$.piNative.toolInputs'),'{}') BEGIN SELECT RAISE(FAIL,'native persistence failure'); END;`,
-		);
+		const updateCollection = sessionCollections.updateSessionMetaCollection;
+		const nativeWrite = spyOn(
+			sessionCollections,
+			"updateSessionMetaCollection",
+		).mockImplementation((target, sessionId, column, value, expected) => {
+			if (
+				target === db &&
+				sessionId === id &&
+				column === "trailing_blank_decisions"
+			) {
+				const before = JSON.parse(
+					String(
+						sessionCollections.readSessionMetaCollection(db, id, column) ||
+							"{}",
+					),
+				);
+				const after = JSON.parse(value || "{}");
+				if (
+					JSON.stringify(before.piNative?.toolInputs ?? {}) !==
+					JSON.stringify(after.piNative?.toolInputs ?? {})
+				) {
+					blockedNativeWrites++;
+					throw new Error("native persistence failure");
+				}
+			}
+			return updateCollection(target, sessionId, column, value, expected);
+		});
+		restoreNativeWrite = () => nativeWrite.mockRestore();
 		admissions.length = 0;
 		const before = busts;
 		const removedJsonBytes: number[] = [];
@@ -248,6 +276,7 @@ test("native marker failure prevents execute admissions until authorization succ
 				removedJsonBytes,
 				busts: busts - before,
 				pending: getPendingOps(db, id).length,
+				blockedNativeWrites,
 			}),
 		);
 		expect(getPendingOps(db, id)).toHaveLength(1);
@@ -255,13 +284,15 @@ test("native marker failure prevents execute admissions until authorization succ
 		expect(admissions.filter((a) => a.allowed)).toHaveLength(0);
 		expect(admissions.every((a) => a.estimate === 0)).toBe(true);
 		expect(busts).toBe(before);
-		db.exec("DROP TRIGGER fail_native_write");
+		expect(blockedNativeWrites).toBeGreaterThan(0);
+		restoreNativeWrite();
+		restoreNativeWrite = undefined;
 		expect(await pass(76)).toEqual(warm);
 		expect(await pass(76)).toEqual(warm);
 		const replay = JSON.stringify(
 			db
 				.prepare(
-					"SELECT trailing_blank_decisions FROM session_meta WHERE session_id = ?",
+					`SELECT ${sessionCollections.sessionMetaCollectionSelect("trailing_blank_decisions", "trailing_blank_decisions", db)} FROM session_meta WHERE session_id = ?`,
 				)
 				.get(id),
 		);
@@ -270,6 +301,7 @@ test("native marker failure prevents execute admissions until authorization succ
 		expect(getPendingOps(db, id)).toHaveLength(0);
 		expect(busts).toBe(before + 1);
 	} finally {
+		restoreNativeWrite?.();
 		spy.mockRestore();
 		restore();
 		clearContextHandlerSession(id);
@@ -285,7 +317,9 @@ test("failure to clear execute state serves the prepared drop and stable defer",
 		expect(await h.pass(76)).toEqual(warm);
 		expect(await h.pass(77)).toEqual(warm);
 		h.db.exec(
-			`CREATE TRIGGER fail_execute_clear BEFORE UPDATE OF trailing_blank_decisions ON session_meta WHEN json_extract(OLD.trailing_blank_decisions,'$.executeReclaim.heldPasses')>0 AND json_extract(NEW.trailing_blank_decisions,'$.executeReclaim.heldPasses')=0 BEGIN SELECT RAISE(ABORT,'execute clear write failed'); END;`,
+			`CREATE TRIGGER fail_execute_clear BEFORE INSERT ON session_meta_chunks
+             WHEN NEW.column_name='trailing_blank_decisions' AND CAST(NEW.body AS TEXT) LIKE '%"heldPasses":0%'
+             BEGIN SELECT RAISE(ABORT,'execute clear write failed'); END;`,
 		);
 		const before = h.rebuilds;
 		let failure: unknown;
@@ -297,7 +331,7 @@ test("failure to clear execute state serves the prepared drop and stable defer",
 		}
 		const row = h.db
 			.prepare(
-				"SELECT trailing_blank_decisions FROM session_meta WHERE session_id=?",
+				`SELECT ${sessionCollections.sessionMetaCollectionSelect("trailing_blank_decisions", "trailing_blank_decisions", h.db)} FROM session_meta WHERE session_id=?`,
 			)
 			.get(h.id) as { trailing_blank_decisions: string };
 		const state = JSON.parse(row.trailing_blank_decisions).executeReclaim;
@@ -355,7 +389,7 @@ for (const [count, busy] of [
 			const prepare = db.prepare.bind(db);
 			const document = () =>
 				prepare(
-					"SELECT trailing_blank_decisions FROM session_meta WHERE session_id=?",
+					`SELECT ${sessionCollections.sessionMetaCollectionSelect("trailing_blank_decisions", "trailing_blank_decisions", db)} FROM session_meta WHERE session_id=?`,
 				).get(id);
 			const before = document();
 			const observation = {
@@ -379,29 +413,21 @@ for (const [count, busy] of [
 				if (sql === "COMMIT") observation.commits++;
 				return exec(sql);
 			}) as typeof db.exec;
-			db.prepare = ((sql: string) => {
-				const statement = prepare(sql);
+			const updateCollection = sessionCollections.updateSessionMetaCollection;
+			// Count logical marker publications; chunk storage can use several SQL
+			// pieces for the one publication prepared for each native candidate.
+			const writeSpy = spyOn(
+				sessionCollections,
+				"updateSessionMetaCollection",
+			).mockImplementation((target, sessionId, column, value, expected) => {
 				if (
-					!sql.startsWith(
-						"UPDATE session_meta SET trailing_blank_decisions = ?",
-					)
+					target === db &&
+					sessionId === id &&
+					column === "trailing_blank_decisions"
 				)
-					return statement;
-				return new Proxy(statement, {
-					get(target, key) {
-						const value = Reflect.get(target, key);
-						if (key === "run")
-							return (...values: unknown[]) => {
-								observation.writes++;
-								return (value as (...values: unknown[]) => unknown).apply(
-									target,
-									values,
-								);
-							};
-						return typeof value === "function" ? value.bind(target) : value;
-					},
-				});
-			}) as typeof db.prepare;
+					observation.writes++;
+				return updateCollection(target, sessionId, column, value, expected);
+			});
 			const start = performance.now();
 			try {
 				observation.tokens = originalEstimate({
@@ -417,7 +443,7 @@ for (const [count, busy] of [
 			} finally {
 				observation.elapsedMs = performance.now() - start;
 				db.exec = exec;
-				db.prepare = prepare;
+				writeSpy.mockRestore();
 				expect(document()).toEqual(before);
 				observations.push(observation);
 			}

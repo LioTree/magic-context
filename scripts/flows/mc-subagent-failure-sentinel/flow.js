@@ -26,8 +26,8 @@ const SETTLE_MS = 5 * 60000;
 // primary's fallback when it has task `fallback`, the same subagent and session,
 // and starts between 5 seconds before and this long after the primary ends.
 const FALLBACK_START_WINDOW_MS = 120000;
-const QUOTA_ERROR =
-  /account pool has no account|quota|rate[ _-]?limit|too many requests|\b429\b|resource_exhausted|usage limit/i;
+const RECOVERABLE_ERROR =
+  /account pool has no account|quota|rate[ _-]?limit|too many requests|\b429\b|resource_exhausted|usage limit|producer_prompt_exceeds_window|prompt timed out after/i;
 // prefrontal-core refuses a digest body over this many UTF-8 bytes.
 const BODY_MAX_BYTES = 4096;
 const CONTENT_PREFIX = 'Magic Context subagent failure sentinel: ';
@@ -73,28 +73,48 @@ function alertKey(alert) {
   return JSON.stringify([alert.rule, alert.subagent, alert.task, klass]);
 }
 
-// Ids of quota or rate-limit failures that a completed fallback attempt recovered.
-// The run produced its result on the fallback model, so the primary's quota error
-// is expected while that provider is exhausted and is not worth a wake. A fallback
-// that also fails leaves the primary unrecovered, so its failure stays eligible for
-// the alert rules.
+// Routine failures are recovered when any later attempt in their fallback chain
+// completes. Intermediate non-routine failures remain eligible for alerts.
 function recoveredByFallback(rows) {
+  const byParent = new Map();
+  const unlinked = new Map();
+  const positions = new Map();
+  for (const [index, row] of rows.entries()) {
+    positions.set(row, index);
+    if (row.parent_invocation_id !== null && row.parent_invocation_id !== undefined) {
+      const children = byParent.get(row.parent_invocation_id) || [];
+      children.push(row);
+      byParent.set(row.parent_invocation_id, children);
+    } else if (row.parent_invocation_id === null && row.task === 'fallback') {
+      let sessions = unlinked.get(row.subagent);
+      if (!sessions) { sessions = new Map(); unlinked.set(row.subagent, sessions); }
+      const attempts = sessions.get(row.session_id) || [];
+      attempts.push(row);
+      sessions.set(row.session_id, attempts);
+    }
+  }
+  // Index links once: QuickJS has no JIT, and retained windows can contain
+  // thousands of unrelated rows that need not be scanned for every chain step.
+  const nextAttempts = (row) => (byParent.get(row.id) || []).concat(
+    ((unlinked.get(row.subagent) || new Map()).get(row.session_id) || []).filter(
+      (candidate) => candidate.started_at >= row.ended_at - 5000 &&
+        candidate.started_at <= row.ended_at + FALLBACK_START_WINDOW_MS,
+    ),
+  ).sort((a, b) => positions.get(a) - positions.get(b));
+  const reachesCompletion = (row, seen) => {
+    for (const next of nextAttempts(row)) {
+      if (seen.has(next.id)) continue;
+      if (next.status === 'completed') return true;
+      seen.add(next.id);
+      if (reachesCompletion(next, seen)) return true;
+    }
+    return false;
+  };
   const recovered = new Set();
   for (const row of rows) {
     if (row.status !== 'failed' && row.status !== 'timed_out') continue;
-    if (!QUOTA_ERROR.test(row.error === null || row.error === undefined ? '' : row.error)) continue;
-    const fallbackCompleted = rows.some(
-      (candidate) =>
-        candidate.status === 'completed' &&
-        (candidate.parent_invocation_id === row.id ||
-          (candidate.parent_invocation_id === null &&
-            candidate.task === 'fallback' &&
-            candidate.subagent === row.subagent &&
-            candidate.session_id === row.session_id &&
-            candidate.started_at >= row.ended_at - 5000 &&
-            candidate.started_at <= row.ended_at + FALLBACK_START_WINDOW_MS)),
-    );
-    if (fallbackCompleted) recovered.add(row.id);
+    if (!RECOVERABLE_ERROR.test(row.error === null || row.error === undefined ? '' : row.error)) continue;
+    if (reachesCompletion(row, new Set([row.id]))) recovered.add(row.id);
   }
   return recovered;
 }
@@ -179,7 +199,7 @@ function invalidState() {
 // which class each stand-in has, so `evaluateFailures` runs unchanged on the
 // same rows the script would read.
 
-const STATE_VERSION = 2;
+const STATE_VERSION = 3;
 const OLDER_KEY = 'older';
 const STATUSES = ['completed', 'failed', 'timed_out', 'empty', 'aborted'];
 // basal refuses a kv value over 64 KiB of JSON, so a stored list is split into
@@ -196,10 +216,13 @@ const failed = (row) => row.status === 'failed' || row.status === 'timed_out';
 const hourOf = (endedAt) => Math.floor(endedAt / HOUR);
 // Records are kept from this hour on: one whole hour before `now - 48h`, so a
 // failure has long had its fallback recorded before it leaves the records.
+// Operational assumption: configured runs use a handful of attempts of at most 20 minutes each.
+// A fallback chain completes within hours; the horizon covers any real chain.
+// Only a chain whose first attempt is outside this horizon has an incomplete prefix.
 const firstKeptHour = (now) => hourOf(now - 2 * DAY) - 1;
 
 // A 64-bit class hash written with the letters a-p only. Neither the hash nor a
-// stand-in error built from it can match QUOTA_ERROR, which looks for words
+// stand-in error built from it can match RECOVERABLE_ERROR, which looks for words
 // and `429`.
 const classIds = new Map();
 function classId(klass) {
@@ -221,31 +244,36 @@ function classId(klass) {
 }
 
 // The stand-in error of a stored failure: its class hash, plus the word `quota`
-// when the original error matched QUOTA_ERROR, so the fallback exclusion
+// when the original error matched RECOVERABLE_ERROR, so the fallback exclusion
 // treats it as the original.
-function standIn(cls, quota) {
-  return '\u0000\u0001' + cls + (quota ? ' quota' : '');
+function standIn(cls, routine) {
+  return '\u0000\u0001' + cls + (routine ? ' quota' : '');
 }
 
 // A row's stored form is an item { group: [subagent, task], rec }, where rec is
-// [id, ended_at, status, ...]. Failures add [class hash, quota 0|1,
-// session_id]; a completed row with a parent adds [parent]; a completed
-// `fallback` row without one adds [null, session_id, started_at], which is all
-// an unlinked fallback match reads. In kv, `group` becomes an index into the
+// [id, ended_at, status, ...]. Failures add [class hash, routine 0|1,
+// session_id], followed by a parent, or [null, started_at] for an unlinked
+// fallback. Other statuses retain those same links too, so a failed or empty
+// intermediate attempt can lead to a completed child. In kv, `group` becomes an index into the
 // part's group table, written after ended_at.
 function itemOf(row) {
   const status = STATUSES.indexOf(row.status);
   const task = row.task === undefined ? null : row.task;
   const item = { group: [row.subagent, task], rec: [row.id, row.ended_at, status < 0 ? row.status : status] };
-  if (failed(row)) {
-    const error = row.error === null || row.error === undefined ? '' : row.error;
-    item.rec.push(classId(errorClass(row.error)), QUOTA_ERROR.test(error) ? 1 : 0, row.session_id);
-    return item;
-  }
-  if (row.status !== 'completed') return item;
   const parent = row.parent_invocation_id === null || row.parent_invocation_id === undefined
     ? null
     : row.parent_invocation_id;
+  if (failed(row)) {
+    const error = row.error === null || row.error === undefined ? '' : row.error;
+    item.rec.push(classId(errorClass(row.error)), RECOVERABLE_ERROR.test(error) ? 1 : 0, row.session_id);
+    if (parent !== null) item.rec.push(parent);
+    else if (task === 'fallback') item.rec.push(null, row.started_at);
+    return item;
+  }
+  if (row.status !== 'completed') {
+    item.rec.push(parent, row.session_id, row.started_at);
+    return item;
+  }
   if (parent !== null) item.rec.push(parent);
   else if (task === 'fallback') item.rec.push(null, row.session_id, row.started_at);
   return item;
@@ -273,7 +301,9 @@ function rowOf(item) {
   if (failed(row)) {
     row.error = standIn(rec[3], rec[4] === 1);
     row.session_id = rec[5];
-  } else if (status === 'completed' && rec.length > 3) {
+    if (rec.length > 6) row.parent_invocation_id = rec[6];
+    if (rec.length > 7) row.started_at = rec[7];
+  } else if (rec.length > 3) {
     row.parent_invocation_id = rec[3];
     if (rec.length > 4) {
       row.session_id = rec[4];
@@ -366,9 +396,9 @@ function mergeOlder(older, entry) {
 }
 
 // Missing state starts the cursor five minutes back, as the script's first run
-// did. Missing state, or the first release's state (version 1: cursor and
-// dedupe keys only), keeps its cursor and dedupe keys and is bootstrapped from
-// the seven-day window before the run goes on.
+// did. Earlier state keeps its cursor and dedupe keys and is bootstrapped from
+// the seven-day window. Version 2 records omitted intermediate fallback links,
+// so refreshing those rows is necessary before evaluating whole chains.
 function loadState(stored, now) {
   if (stored === null || stored === undefined) {
     return {
@@ -378,7 +408,7 @@ function loadState(stored, now) {
   }
   if (typeof stored !== 'object') invalidState();
   const cursor = stored.cursor;
-  if ((stored.version !== 1 && stored.version !== STATE_VERSION) || !cursor || !Number.isSafeInteger(cursor.ended_at) ||
+  if ((stored.version !== 1 && stored.version !== 2 && stored.version !== STATE_VERSION) || !cursor || !Number.isSafeInteger(cursor.ended_at) ||
     !Number.isSafeInteger(cursor.id) || !stored.sent || typeof stored.sent !== 'object') {
     invalidState();
   }
@@ -393,6 +423,13 @@ function loadState(stored, now) {
     !Array.isArray(stored.hours) ||
     !stored.hours.every((hour) => Array.isArray(hour) && Number.isSafeInteger(hour[0]) && Number.isSafeInteger(hour[1]) && Number.isSafeInteger(hour[2]))) {
     invalidState();
+  }
+  if (stored.version === 2) {
+    return {
+      state: { ...stored, version: STATE_VERSION, records_since: null },
+      bootstrap: true,
+      rebuild: true,
+    };
   }
   return { state: stored, bootstrap: false };
 }
@@ -483,7 +520,8 @@ async function openHour(hour) {
 // count a row twice.
 async function fold(row) {
   const hour = await openHour(hourOf(row.ended_at));
-  if (hour.items.has(row.id)) return;
+  // Replacing the same id does not count it twice, and refreshes old records'
+  // missing fallback links during the version-2 bootstrap.
   hour.items.set(row.id, itemOf(row));
   hour.dirty = true;
 }
@@ -497,6 +535,7 @@ let bootstrapRows = 0;
 // MAX_HISTORY rows the state is complete only back to the oldest row read, and
 // rules needing a longer window wait, as the script's cut-off history did.
 if (loaded.bootstrap) {
+  if (loaded.rebuild) olderParts = (await loadParts(OLDER_KEY)).length;
   const boot = await readRows({ query: 'window', after: now - 7 * DAY, until: state.cursor.ended_at }, 'before', MAX_HISTORY);
   bootstrapRows = boot.rows.length;
   state.complete_since = boot.more ? boot.rows[boot.rows.length - 1].ended_at : now - 7 * DAY;
@@ -518,18 +557,14 @@ let bounded = next.more;
 const evaluate = fresh.some(failed);
 const cutoff = firstKeptHour(now);
 const recordBytes = state.hours.reduce((sum, hour) => sum + hour[2], 0);
-// How many hours after the leaving ones a leaving run reads. A fallback ends
-// within minutes of its primary, so these hold every fallback that can still
-// change whether a leaving failure was recovered.
-const RECOVERY_HOURS = 2;
 // A quiet run reads and writes only the hours its new rows fall in. Every
 // stored hour is read when the rules run or when the records near their
-// budget (about 160 bytes a new row is assumed). When hours leave the records,
-// the leaving hours and the RECOVERY_HOURS after them are read.
-const readAll = loaded.bootstrap || evaluate || recordBytes + 160 * fresh.length > RECORD_BUDGET_BYTES;
+// budget (about 160 bytes a new row is assumed). Retiring an hour also reads
+// the retained window: a completed chain can span several long model attempts.
 const leaving = state.hours.some((hour) => hour[0] < cutoff) || fresh.some((row) => hourOf(row.ended_at) < cutoff);
+const readAll = loaded.bootstrap || evaluate || leaving || recordBytes + 160 * fresh.length > RECORD_BUDGET_BYTES;
 for (const hour of state.hours) {
-  if (readAll || (leaving && hour[0] < cutoff + RECOVERY_HOURS)) await openHour(hour[0]);
+  if (readAll) await openHour(hour[0]);
 }
 if ((readAll || leaving) && !olderOpen) {
   const parts = await loadParts(OLDER_KEY);
@@ -629,7 +664,13 @@ if (readAll || leaving) {
     const recovered = recoveredByFallback(all);
     for (const index of dropped) {
       for (const item of hours.get(index).items.values()) {
-        if (!failed(rowOf(item)) || recovered.has(item.rec[0])) continue;
+        const row = rowOf(item);
+        if (!failed(row) || recovered.has(item.rec[0])) continue;
+        if (next.more && index < cutoff && RECOVERABLE_ERROR.test(row.error || '')) {
+          // An old first attempt can retire while its completed fallback is
+          // still in the cursor backlog. Its discarded prefix is incomplete.
+          state.complete_since = Math.max(state.complete_since, (index + 1) * HOUR);
+        }
         mergeOlder(older, { subagent: item.group[0], task: item.group[1], cls: item.rec[3], ended_at: item.rec[1] });
         olderDirty = true;
       }

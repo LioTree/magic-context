@@ -387,6 +387,16 @@ describe("doctor repair-db", () => {
             INSERT INTO salvage_sequence VALUES(1000, 'deleted high water');
             DELETE FROM salvage_sequence;
             INSERT INTO salvage_sequence VALUES(2, 'kept');`);
+            // Complete the source statistics before salvage. Missing trim-index
+            // estimates are intentionally repaired on open, not preserved as stale data.
+            source.exec("ANALYZE tags");
+            const sourceStatistics = source
+                .prepare("SELECT tbl, idx, stat FROM sqlite_stat1 ORDER BY tbl, idx")
+                .all() as Array<{ tbl: string; idx: string | null; stat: string }>;
+            expect(sourceStatistics.map((row) => row.idx)).toContain(
+                "idx_tags_session_message_nocase",
+            );
+            expect(sourceStatistics.map((row) => row.idx)).toContain("idx_tags_session_tool_owner");
             source.close();
             corruptLastTagLeaf(dbPath);
             const prompts = new MockPrompts();
@@ -406,9 +416,11 @@ describe("doctor repair-db", () => {
                         )
                         .get(),
                 ).toEqual({ n: 26 });
-                expect(recovered.prepare("SELECT count(*) AS n FROM sqlite_stat1").get()).toEqual({
-                    n: 4,
-                });
+                expect(
+                    recovered
+                        .prepare("SELECT tbl, idx, stat FROM sqlite_stat1 ORDER BY tbl, idx")
+                        .all(),
+                ).toEqual(sourceStatistics);
             } finally {
                 recovered.close();
             }

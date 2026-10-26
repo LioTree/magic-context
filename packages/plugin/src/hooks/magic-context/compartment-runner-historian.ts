@@ -208,7 +208,7 @@ export function createV1HiddenCompletionExecutor(
                 rememberV1HiddenRun(id, run);
                 runIdentities.set(id, run);
             }
-            if (id && run.kind !== "dreamer-task") {
+            if (id && (run.kind === "historian" || run.kind === "historian-editor")) {
                 historianChildren.add(id);
                 rememberHistorianOutputCap(id, run.maxOutputTokens);
             }

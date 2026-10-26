@@ -1196,7 +1196,7 @@ mod parity_runtime_tests {
             assert_eq!(refused["isError"], true);
             assert_eq!(
                 refused["content"][0]["text"],
-                "Error: 'drop' must be provided."
+                r#"Error: 'drop' must be provided as a string of tag numbers, for example {"drop": "3-5,8"}."#
             );
         }
     }

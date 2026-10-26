@@ -10,7 +10,7 @@ export const slowUnits = [
     ["plugin", "src/features/magic-context/smart-notes/http-timeout.test.ts", ["slow sweeps admit fewer notes instead of cutting the next request short"]],
     ["plugin", "src/v2/hooks/oc2-lkg-replay.test.ts", ["2.0.22", "2.1.0"].map((host) => `OC2 replay differential: busy turns serve only matching saved requests, byte for byte (${host})`)],
     ["plugin", "src/v2/hooks/issue-750-defer-after-execute.test.ts", ["openai", "anthropic"].map((provider) => `issue 750 differential: ${provider} defer passes replay their predecessor`)],
-    ["plugin", "src/v2/hooks/feature-parity-differential.test.ts", ["v2 disabled features preserve baseline bytes over randomized passes"]],
+    ["plugin", "src/v2/hooks/feature-parity-differential.test.ts", [1, 2, 3, 4].map((shard) => `v2 disabled features preserve baseline bytes over randomized passes shard ${shard}/4`)],
     ["plugin", "src/v2/hooks/issue-709-review.test.ts", ["issue 709 review: features-on real OC2 hook replays defer bytes over seeded passes"]],
     ["plugin", "src/hooks/magic-context/oc-stall-r2-ordinal-review.test.ts", [
         "ordinal differential: compaction, ties, time moves, suffix deletes, reused rowids, reinserted summaries and scan interleaving",
@@ -57,7 +57,7 @@ async function run(dry: boolean) {
             }
         }
     }
-    console.log(dry ? `Dry selection passed: ${selected} registrations (19 normal, 21 slow), no test bodies executed` : "Slow unit lane passed");
+    console.log(dry ? `Dry selection passed: ${selected} registrations (22 normal, 24 slow), no test bodies executed` : "Slow unit lane passed");
 }
 
 if (import.meta.main) {

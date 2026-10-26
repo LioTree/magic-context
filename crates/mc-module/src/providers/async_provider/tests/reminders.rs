@@ -485,7 +485,15 @@ async fn delivered_reminders_tool_result_array_strips_without_breaking_pairing_o
         result(4, json!("real output scalar reminder"), None),
     ];
     rig.notice(1, 5000, None).await;
+    let initial = rig.newest();
     send(&rig, "replacement reminder", "replacement").await;
+    rig.runner
+        .entries
+        .lock()
+        .unwrap()
+        .push(user(5, &["replacement reminder"]));
+    rig.notice(2, 5000, initial).await;
+    assert_eq!(rig.newest(), initial, "supersession cannot buy a rebuild");
     let view = rig.ride("ttl_expired").await.unwrap();
     let rendered = rig.render_anthropic(&view);
     let result = rendered

@@ -36308,11 +36308,15 @@ mod tests {
             "closed advertisement does not add runtime key validation"
         );
         for (name, arguments, refusal) in [
-            ("ctx_reduce", json!({}), "Error: 'drop' must be provided."),
+            (
+                "ctx_reduce",
+                json!({}),
+                r#"Error: 'drop' must be provided as a string of tag numbers, for example {"drop": "3-5,8"}."#,
+            ),
             (
                 "ctx_reduce",
                 json!({"drop":false}),
-                "Error: 'drop' must be provided.",
+                r#"Error: 'drop' must be provided as a string of tag numbers, for example {"drop": "3-5,8"}."#,
             ),
             (
                 "ctx_search",

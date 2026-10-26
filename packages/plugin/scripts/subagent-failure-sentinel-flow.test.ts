@@ -669,3 +669,123 @@ test("the flow parses and evaluates identically under QuickJS", async () => {
         vm.dispose();
     }
 });
+
+for (const middleStatus of ["failed", "empty", "aborted"] as const) {
+    test(`persisted ${middleStatus} fallback chains survive retirement after more than two hours`, async () => {
+        seed(NOW - SETTLE);
+        const first = attempt({ session: "chain", status: "failed", time: NOW, error: QUOTA, task: "chain-main" });
+        const middle = attempt({ session: "chain", status: middleStatus, time: NOW + HOUR, error: middleStatus === "failed" ? QUOTA : null, task: "fallback", parent: first });
+        await step(at(NOW + HOUR));
+
+        const later = attempt({ session: "chain", status: "timed_out", time: NOW + 2 * HOUR, error: "prompt timed out after 3600000ms", task: "fallback" });
+        db.query("UPDATE subagent_invocations SET started_at=(SELECT ended_at+1000 FROM subagent_invocations WHERE id=?) WHERE id=?").run(middle, later);
+        attempt({ session: "chain", status: "completed", time: NOW + 3 * HOUR, task: "fallback", parent: later });
+        for (let index = 1; index <= 6; index++)
+            attempt({ session: `other-${index}`, status: "completed", time: NOW + 3 * HOUR + index * 1_000, task: "chain-main" });
+        for (let index = 7; index <= 8; index++)
+            attempt({ session: `new-${index}`, status: "failed", time: NOW + 3 * HOUR + index * 1_000, error: QUOTA, task: "chain-main" });
+        const alerts = await step(at(NOW + 3 * HOUR + 20_000));
+        const shares = alerts.filter((alert) => alert.rule === "failure_share" && alert.task === "chain-main");
+        expect(shares).toHaveLength(1);
+        expect(shares[0]!.count).toBe(2);
+        const primaryHour = Math.floor(NOW / HOUR);
+        expect((kvStore.get("state") as { hours: number[][] }).hours.some((hour) => hour[0] === primaryHour)).toBe(true);
+        const retiringKeys = [...kvStore.keys()].filter((key) => key.startsWith(`hour:${primaryHour}#`));
+        expect(retiringKeys.length).toBeGreaterThan(0);
+
+        const retirement = (Math.floor(NOW / HOUR) + 2) * HOUR + 2 * DAY;
+        await step(retirement);
+        expect((kvStore.get("state") as { hours: number[][] }).hours.some((hour) => hour[0] === primaryHour)).toBe(false);
+        for (const key of retiringKeys) expect(kvStore.has(key)).toBe(false);
+        expect(kvStore.has("older#0")).toBe(false);
+        expect(kvBytes()).toBeLessThanOrEqual(1024 * 1024);
+    });
+}
+
+test("version 3 state without record bookkeeping refuses without advancing its cursor", async () => {
+    const cursor = { ended_at: NOW - SETTLE, id: 0 };
+    kvStore.set("state", { version: 3, cursor, sent: {} });
+    await expect(runFlow(NOW)).rejects.toThrow("invalid failure sentinel state");
+    expect((kvStore.get("state") as { cursor: unknown }).cursor).toEqual(cursor);
+});
+
+for (const mixed of [false, true]) {
+    test(`version 2 ${mixed ? "mixed" : "legacy"} records rebootstrap links without losing cursor or dedupe`, async () => {
+        seed(NOW - 30 * 60_000);
+        const first = attempt({ session: "migration", status: "failed", time: NOW - 20 * 60_000, error: "producer_prompt_exceeds_window", task: "migration-main" });
+        const middle = attempt({ session: "migration", status: "failed", time: NOW - 10 * 60_000, error: QUOTA, task: "fallback", parent: first });
+        attempt({ session: "migration", status: "completed", time: NOW - 9 * 60_000, task: "fallback", parent: middle });
+        await step(at(NOW));
+
+        type Stored = { version: number; cursor: { ended_at: number; id: number }; sent: Record<string, { at: number; count: number }>; hours: [number, number, number][]; older_bytes: number };
+        type Part = { g: unknown[]; r: unknown[][] };
+        const state = kvStore.get("state") as Stored;
+        const cursor = { ...state.cursor };
+        const sent = { at: NOW, count: 1 };
+        const dedupeKey = JSON.stringify(["new_class", "historian", "dedupe-main", "rate limit"]);
+        state.version = 2;
+        state.sent[dedupeKey] = sent;
+        const referencePath = join(root, "state.json");
+        const reference = JSON.parse(readFileSync(referencePath, "utf8"));
+        reference.sent[dedupeKey] = sent;
+        writeFileSync(referencePath, `${JSON.stringify(reference)}\n`);
+        for (const hour of state.hours) {
+            let bytes = 0;
+            for (let index = 0; index < hour[1]; index++) {
+                const part = kvStore.get(`hour:${hour[0]}#${index}`) as Part;
+                for (const record of part.r) {
+                    if (record[3] === 1 || record[3] === 2) {
+                        if (!mixed || record[0] !== middle) record.length = 7;
+                        // The old predicate did not mark pre-send refusals routine.
+                        if (record[0] === first) record[5] = 0;
+                    } else if (record[3] !== 0) record.length = 4;
+                }
+                bytes += jsonBytes(part);
+            }
+            hour[2] = bytes;
+        }
+        const oldSummary = { g: [["historian", "stale"]], r: [[0, "aaaaaaaaaaaaaaaa", NOW - 3 * DAY]] };
+        kvStore.set("older#0", oldSummary);
+        kvStore.set("older#1", oldSummary);
+        state.older_bytes = 2 * jsonBytes(oldSummary);
+        const beforeReads = opCalls.length;
+        await step(at(NOW + 60_000));
+        const upgraded = kvStore.get("state") as Stored;
+        expect(upgraded.version).toBe(3);
+        expect(upgraded.cursor).toEqual(cursor);
+        expect(upgraded.sent[dedupeKey]).toEqual(sent);
+        expect(opCalls.slice(beforeReads).some((call) => call.query === "window" && call.after === at(NOW + 60_000) - 7 * DAY && call.until === cursor.ended_at)).toBe(true);
+        expect(kvStore.has("older#0")).toBe(false);
+        expect(kvStore.has("older#1")).toBe(false);
+        const records = [...kvStore.entries()]
+            .filter(([key]) => key.startsWith("hour:"))
+            .flatMap(([, part]) => (part as Part).r);
+        expect(records.find((record) => record[0] === first)![5]).toBe(1);
+        expect(records.find((record) => record[0] === middle)![7]).toBe(first);
+        expect(kvBytes()).toBeLessThanOrEqual(1024 * 1024);
+
+        attempt({ session: "new-work", status: "failed", time: NOW + 2 * 60_000, error: "producer_prompt_exceeds_window", task: "migration-main" });
+        attempt({ session: "deduped-work", status: "failed", time: NOW + 2 * 60_000 + 1, error: "rate limit", task: "dedupe-main" });
+        const alerts = await step(at(NOW + 3 * 60_000));
+        expect(alerts.some((alert) => alert.rule === "new_class" && alert.task === "migration-main")).toBe(true);
+        expect(alerts.some((alert) => alert.task === "dedupe-main")).toBe(false);
+    });
+}
+
+for (const routine of [false, true]) {
+    test(`retiring a ${routine ? "routine" : "non-routine"} first attempt behind a cursor backlog records exact completeness`, async () => {
+        const firstTime = NOW - 3 * DAY;
+        seed(firstTime - SETTLE);
+        const first = attempt({ session: "backlog", status: "failed", time: firstTime, error: routine ? QUOTA : "missing credentials", task: "backlog-main" });
+        await runFlow(at(firstTime));
+        const before = (kvStore.get("state") as { complete_since: number }).complete_since;
+        for (let index = 1; index <= 600; index++)
+            attempt({ session: `filler-${index}`, status: "completed", time: firstTime + index * 1_000, task: "unrelated" });
+        attempt({ session: "backlog", status: "completed", time: firstTime + 601_000, task: "fallback", parent: first });
+        const page = await runFlow(NOW);
+        expect(page.bounded).toBe(true);
+        expect(page.watermark.ended_at).toBe(firstTime + 500_000);
+        const state = kvStore.get("state") as { complete_since: number };
+        expect(state.complete_since).toBe(routine ? (Math.floor(firstTime / HOUR) + 1) * HOUR : before);
+    });
+}

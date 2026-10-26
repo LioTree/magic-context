@@ -104,12 +104,18 @@ async fn randomized_reminder_base_head_view_replay_320_notices() {
         }
         let permitted = n > 0 && rng % 11 < 2;
         if permitted {
-            rides += 1;
+            // Pending strips do not authorize a rebuild by themselves. Only a
+            // published replacement view can make those edits visible.
             if let Some(view) = rig.ride("ttl_expired").await {
+                let published = current.as_ref().map(|previous| previous.view_version)
+                    != Some(view.view_version);
                 current = Some(view);
-            }
-            for ordinal in sent.iter().rev().skip(1) {
-                stripped.insert(*ordinal);
+                if published {
+                    rides += 1;
+                    for ordinal in sent.iter().rev().skip(1) {
+                        stripped.insert(*ordinal);
+                    }
+                }
             }
         }
         let rendered = if let Some(view) = current.as_ref() {
@@ -145,7 +151,7 @@ async fn randomized_reminder_base_head_view_replay_320_notices() {
         snapshots.push(json!({"notice":n+1,"permitted":permitted,"sent":sent,"stripped":stripped,"messages":rendered}));
     }
     assert!(rides >= 30 && sent.len() >= 70 && stripped.len() >= 60);
-    println!("reminder replay: 320 notices, {rides} permitted rides, {} exact deliveries, {} frozen strips", sent.len(), stripped.len());
+    println!("reminder replay: 320 notices, {rides} published rides, {} exact deliveries, {} frozen strips", sent.len(), stripped.len());
     if let Some(path) = std::env::var_os("MC_REMINDER_REPLAY_OUT") {
         std::fs::write(path, serde_json::to_vec(&snapshots).unwrap()).unwrap();
     }

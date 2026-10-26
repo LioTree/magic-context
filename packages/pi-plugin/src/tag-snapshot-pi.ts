@@ -578,7 +578,11 @@ export function createPiTagSnapshotReader(db: Database) {
 		const firstOwnAllocation =
 			snapshot.firstAllocationPending &&
 			snapshot.revision !== row.local &&
-			ownFirstAllocation.get(sessionId, row.foreign_revision);
+			ownFirstAllocation.get(
+				sessionId,
+				row.foreign_revision,
+				snapshot.firstAllocationPending,
+			);
 		if (
 			!ownVersionAdvance ||
 			(snapshot.foreignRevision !== row.foreign_revision && !firstOwnAllocation)

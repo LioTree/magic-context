@@ -11,7 +11,7 @@ for (const generation of ["v1", "v2"] as const) {
             "../../features/magic-context/storage"
         );
         const { dropSlot } = await import("./lkg-slot");
-        const { Database } = await import("../../shared/sqlite");
+        const { Database, isSqliteTransactionOpen } = await import("../../shared/sqlite");
         const fixture = createAutoSearchReplayFixture(
             generation === "v1" ? "opencode" : "opencode2",
             `busy-${generation}`,
@@ -67,40 +67,36 @@ for (const generation of ["v1", "v2"] as const) {
                 updatedAt: Date.now(),
             });
             db.exec("PRAGMA busy_timeout=1");
-            const prepare = db.prepare.bind(db);
+            const collections = await import(
+                "../../features/magic-context/storage-session-collections"
+            );
+            const updateCollection = collections.updateSessionMetaCollection;
             let reached = 0;
             let sqliteCode: unknown;
-            const spy = spyOn(db, "prepare").mockImplementation(((sql: string) => {
-                const statement = prepare(sql);
-                if (
-                    sql !==
-                    "UPDATE session_meta SET trailing_blank_decisions = ? WHERE session_id = ? AND trailing_blank_decisions IS ?"
-                )
-                    return statement;
-                return new Proxy(statement, {
-                    get(target, key) {
-                        if (key === "run")
-                            return (...args: unknown[]) => {
-                                if (!String(args[0]).includes('"heldPasses":1'))
-                                    return (target.run as (...a: unknown[]) => unknown)(...args);
-                                reached++;
-                                const lock = new Database(join(fixture.directory, "context.db"));
-                                lock.exec("BEGIN IMMEDIATE");
-                                try {
-                                    return (target.run as (...a: unknown[]) => unknown)(...args);
-                                } catch (error) {
-                                    sqliteCode = (error as { code?: string }).code;
-                                    throw error;
-                                } finally {
-                                    lock.exec("ROLLBACK");
-                                    lock.close();
-                                }
-                            };
-                        const value = Reflect.get(target, key);
-                        return typeof value === "function" ? value.bind(target) : value;
-                    },
-                });
-            }) as typeof db.prepare);
+            const spy = spyOn(collections, "updateSessionMetaCollection").mockImplementation(
+                (target, sessionId, column, value, expected) => {
+                    if (
+                        target !== db ||
+                        sessionId !== id ||
+                        column !== "trailing_blank_decisions" ||
+                        !String(value).includes('"heldPasses":1')
+                    )
+                        return updateCollection(target, sessionId, column, value, expected);
+                    reached++;
+                    expect(isSqliteTransactionOpen(db)).toBe(false);
+                    const lock = new Database(join(fixture.directory, "context.db"));
+                    lock.exec("BEGIN IMMEDIATE");
+                    try {
+                        return updateCollection(target, sessionId, column, value, expected);
+                    } catch (error) {
+                        sqliteCode = (error as { code?: string }).code;
+                        throw error;
+                    } finally {
+                        lock.exec("ROLLBACK");
+                        lock.close();
+                    }
+                },
+            );
             let failure: unknown;
             let served: unknown;
             try {
@@ -317,7 +313,9 @@ test("failed counter or floor-mark prerequisite declines worthwhile reclaim for 
             usableWindow: 100000,
         };
         h.db.exec(
-            `CREATE TRIGGER fail_execute_state BEFORE UPDATE OF trailing_blank_decisions ON session_meta BEGIN SELECT RAISE(FAIL, 'state persistence failed'); END;`,
+            `CREATE TRIGGER fail_execute_state BEFORE INSERT ON session_meta_chunks
+             WHEN NEW.column_name='trailing_blank_decisions' AND CAST(NEW.body AS TEXT) LIKE '%"heldPasses":%'
+             BEGIN SELECT RAISE(FAIL, 'state persistence failed'); END;`,
         );
         expect(originateExecuteReclaim(args)).toBe(false);
         expect(readExecuteReclaimState(h.db, h.sessionId).heldPasses).toBe(0);
@@ -325,7 +323,9 @@ test("failed counter or floor-mark prerequisite declines worthwhile reclaim for 
         maintainExecuteFloorMark(h.db, h.sessionId, "prompt", false);
         expect(originateExecuteReclaim(args)).toBe(true);
         h.db.exec(
-            `CREATE TRIGGER fail_floor_state BEFORE UPDATE OF trailing_blank_decisions ON session_meta WHEN json_extract(NEW.trailing_blank_decisions,'$.executeReclaim.floorOrdinal') IS NOT NULL BEGIN SELECT RAISE(FAIL, 'floor persistence failed'); END;`,
+            `CREATE TRIGGER fail_floor_state BEFORE INSERT ON session_meta_chunks
+             WHEN NEW.column_name='trailing_blank_decisions' AND CAST(NEW.body AS TEXT) LIKE '%"floorOrdinal":3%'
+             BEGIN SELECT RAISE(FAIL, 'floor persistence failed'); END;`,
         );
         expect(
             writeExecuteReclaimState(h.db, h.sessionId, {

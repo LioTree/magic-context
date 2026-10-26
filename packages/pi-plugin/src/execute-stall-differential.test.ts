@@ -5,6 +5,7 @@ import { dirname } from "node:path";
 import { getPendingOps } from "@magic-context/core/features/magic-context/storage";
 import { reclaimRidePermitted } from "@magic-context/core/hooks/magic-context/cache-busting-signals";
 import { openCodeRideHarness } from "@magic-context/core/hooks/magic-context/deferred-ride-evidence.test";
+import { sessionMetaCollectionSelect } from "../../plugin/src/features/magic-context/storage-session-collections";
 import { __test } from "./context-handler";
 import { rideHarness } from "./deferred-ride-evidence.test";
 
@@ -133,7 +134,7 @@ test("execute differential: 300 deterministic randomized passes per host", async
 					else if (oc?.lastTrigger?.shouldFire) publishNext = true;
 					const row = h.db
 						.prepare(
-							"SELECT trailing_blank_decisions FROM session_meta WHERE session_id=?",
+							`SELECT ${sessionMetaCollectionSelect("trailing_blank_decisions", "trailing_blank_decisions", h.db)} FROM session_meta WHERE session_id=?`,
 						)
 						.get(h.id) as { trailing_blank_decisions: string };
 					const floor =

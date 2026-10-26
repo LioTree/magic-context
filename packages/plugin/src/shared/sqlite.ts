@@ -725,12 +725,15 @@ function installTransactionRouting(db: BetterSqlite3.Database, readonly: boolean
         writable: true,
         value: (sql: string) => {
             const statement = nativePrepare(sql);
-            observeRollbackForms(db, statement, sql, true, true);
             // SELECT/EXPLAIN cannot acquire a writer. Treat CTEs conservatively:
             // WITH can introduce INSERT/UPDATE/DELETE as well as a read query.
-            {
-                const writes = !readonly && !/^\s*(?:SELECT|EXPLAIN|PRAGMA)\b/i.test(sql);
-                const changesTagIdentity = writes && mayChangeTagIdentity(sql);
+            // Read methods stay native; a deadline-aware connection already
+            // enforces its read deadline underneath this routing layer.
+            const reads = /^\s*(?:SELECT|EXPLAIN|PRAGMA)\b/i.test(sql);
+            const writes = !readonly && !reads;
+            if (!reads) observeRollbackForms(db, statement, sql, true, writes);
+            if (writes) {
+                const changesTagIdentity = mayChangeTagIdentity(sql);
                 for (const method of ["run", "get", "all"] as const) {
                     const execute = statement[method].bind(statement);
                     Object.defineProperty(statement, method, {
@@ -739,9 +742,7 @@ function installTransactionRouting(db: BetterSqlite3.Database, readonly: boolean
                         value: (...args: any[]) => {
                             const wasInTransaction = isInTransaction(db);
                             try {
-                                return writes
-                                    ? withAutocommitTimeout(db, () => execute(...args))
-                                    : execute(...args);
+                                return withAutocommitTimeout(db, () => execute(...args));
                             } catch (error) {
                                 // SQLite can roll back a transaction automatically, without an explicit ROLLBACK.
                                 if (wasInTransaction && !isInTransaction(db))
@@ -767,7 +768,8 @@ function installTransactionRouting(db: BetterSqlite3.Database, readonly: boolean
             writable: true,
             value: (sql: string, ...args: unknown[]) => {
                 const statement = nativeQuery(sql, ...args);
-                observeRollbackForms(db, statement, sql, true);
+                if (!/^\s*(?:SELECT|EXPLAIN|PRAGMA)\b/i.test(sql))
+                    observeRollbackForms(db, statement, sql, true);
                 return statement;
             },
         });
