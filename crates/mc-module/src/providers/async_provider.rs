@@ -166,7 +166,7 @@ pub(crate) struct Runtime {
     #[cfg(test)]
     policy_probe_enabled: std::sync::atomic::AtomicBool,
     #[cfg(test)]
-    policy_probe: Mutex<Option<(u64, Option<u64>, Vec<String>)>>,
+    policy_probe: Mutex<Option<PolicyProbe>>,
     #[cfg(test)]
     completed_notice: std::sync::atomic::AtomicU64,
     #[cfg(test)]
@@ -317,6 +317,8 @@ pub(crate) struct AsyncRecord {
     /// qualify them. The owner comes from the stored public view, not the ack.
     #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
     pending_native_acks: BTreeMap<u64, String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    native_setup_predecessor: Option<SetupNativePredecessor>,
     /// The held transcript, stored one row per ordinal in
     /// `mc_async_compaction_entries`.
     #[serde(skip)]
@@ -402,6 +404,15 @@ fn deserialize_logical_prefix<'de, D: serde::Deserializer<'de>>(
     Ok(serde_json::from_value(value).ok().map(Arc::new))
 }
 type State = AsyncRecord;
+
+#[cfg(test)]
+type PolicyProbe = (u64, Option<u64>, Vec<String>);
+
+#[derive(Serialize, Deserialize)]
+struct SetupNativePredecessor {
+    lineage: String,
+    replaced_by: String,
+}
 
 #[derive(Serialize, Deserialize, PartialEq, Eq)]
 struct VerifiedAckDescent {
@@ -1017,7 +1028,11 @@ impl State {
             // resolve_native_acks qualifies native source evidence separately.
             // Foreign publications supply no view, summary, baseline or pass
             // facts. Unrelated acknowledgements are ignored rather than retried.
-            if !recorded_ancestor {
+            if !recorded_ancestor
+                && !acknowledged_lineage
+                    .as_deref()
+                    .is_some_and(|owner| self.is_native_setup_predecessor(owner))
+            {
                 log_foreign_ack_once(
                     &self.reference(),
                     notice
@@ -1758,6 +1773,12 @@ impl State {
         Ok(())
     }
 
+    fn is_native_setup_predecessor(&self, owner: &str) -> bool {
+        self.native_setup_predecessor.as_ref().is_some_and(|prior| {
+            prior.lineage == owner && self.lineage.as_deref() == Some(prior.replaced_by.as_str())
+        })
+    }
+
     fn resolve_native_acks(&mut self, store: &McStore) -> Result<(), HandlerOutcome> {
         let Some(current) = &self.lineage else {
             return Ok(());
@@ -1772,6 +1793,22 @@ impl State {
                 // absent parts. Replay checks the current identity and digest;
                 // no ancestor view, summary or pass facts are adopted here.
                 self.frozen_edits.merge(&edits);
+            } else if self.is_native_setup_predecessor(owner) {
+                // Contract §§5.1–5.2 makes applied_view_version the runner's
+                // durable ACK: the next view is built against what it renders
+                // now. Discarding that ACK after a fresh Setup would restore
+                // dropped content. Only the directly replaced lineage can
+                // supply native edits, and only for exact sources present now;
+                // its summaries, coverage and view state remain forbidden.
+                let matched = self
+                    .frozen_version_sources(store, *version)?
+                    .map(|edits| edits.matching_sources(&self.mid_index, &self.entries))
+                    .transpose()?
+                    .unwrap_or_default();
+                if matched.retained_bytes == 0 {
+                    log_foreign_ack_once(&self.reference(), *version);
+                }
+                self.frozen_edits.merge(&matched);
             } else {
                 log_foreign_ack_once(&self.reference(), *version);
             }
@@ -2373,6 +2410,20 @@ impl McHandler {
                 prior.capture_resync_sources(store)?;
                 state.resync_sources = prior.resync_sources.take();
                 state.frozen_edits.merge(&prior.frozen_edits);
+                for version in prior.published_engine.keys().copied().collect::<Vec<_>>() {
+                    prior.remember_frozen_version(store, version)?;
+                }
+                state.retired_frozen = prior.retired_frozen;
+                state.retired_frozen.dirty = true;
+                if !unsafe_existing {
+                    state.native_setup_predecessor = prior
+                        .lineage
+                        .zip(request.lineage_id.clone())
+                        .map(|(lineage, replaced_by)| SetupNativePredecessor {
+                            lineage,
+                            replaced_by,
+                        });
+                }
                 for archive in store.load_async_undo_edits(&reference).map_err(transient)? {
                     state
                         .frozen_edits
@@ -2630,6 +2681,7 @@ impl McHandler {
             ack_lineage_root: request.lineage_id.clone(),
             ack_selection_pending: request.lineage_id.is_none(),
             pending_native_acks: BTreeMap::new(),
+            native_setup_predecessor: None,
             entries: Default::default(),
             mid_index: BTreeMap::new(),
             aggregates: Default::default(),

@@ -296,7 +296,7 @@ pub(super) struct HistoryRef {
 
 #[derive(Serialize, Deserialize)]
 enum HistoryObject {
-    Compartment(mc_store::StoredCompartment),
+    Compartment(Box<mc_store::StoredCompartment>),
     Branch(String, String),
 }
 
@@ -329,7 +329,7 @@ impl CutSeed {
         };
         let mut level = compartments
             .into_iter()
-            .map(|row| keep(HistoryObject::Compartment(row)))
+            .map(|row| keep(HistoryObject::Compartment(Box::new(row))))
             .collect::<Result<Vec<_>, _>>()?;
         while level.len() > 1 {
             let mut next = Vec::with_capacity(level.len().div_ceil(2));
@@ -397,7 +397,7 @@ impl CutSeed {
                         "retained history is missing; start a full lineage",
                     )
                 })?;
-            let value: Value = serde_json::from_str(&raw).map_err(transient)?;
+            let value: Value = serde_json::from_str(raw).map_err(transient)?;
             if contract::digest::content_digest(&value) != id.rsplit(':').next().unwrap_or_default()
             {
                 return Err(error(
@@ -406,7 +406,7 @@ impl CutSeed {
                 ));
             }
             match serde_json::from_value::<HistoryObject>(value).map_err(transient)? {
-                HistoryObject::Compartment(row) => rows.push(row),
+                HistoryObject::Compartment(row) => rows.push(*row),
                 HistoryObject::Branch(left, right) => {
                     pending.push(right);
                     pending.push(left);
@@ -731,13 +731,12 @@ impl AsyncRecord {
             }
         }
         let garbage = objects.difference(&live).cloned().collect::<Vec<_>>();
-        if !garbage.is_empty() {
-            if !store
+        if !garbage.is_empty()
+            && !store
                 .discard_async_cut_history_objects(&reference, &garbage, &expected_roots)
                 .map_err(transient)?
-            {
-                return Ok(());
-            }
+        {
+            return Ok(());
         }
         self.cut_history_gc_pending = false;
         Ok(())

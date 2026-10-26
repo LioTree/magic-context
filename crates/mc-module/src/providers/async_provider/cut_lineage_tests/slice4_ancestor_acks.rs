@@ -368,3 +368,164 @@ async fn older_ack_notice_cannot_complete_a_newer_partial_read() {
 async fn duplicate_ancestor_ack_supplies_no_foreign_policy_facts() {
     ancestor_reintroduced_source(ReintroducedSource::CompletedDuplicate).await;
 }
+
+async fn setup_predecessor_fixture() -> (Pair, String) {
+    let mut pair = Pair::open_with(Profile::Broca, false, Some("L"), false, false).await;
+    pair.append(200);
+    review_history(&mut pair, 155).await;
+    pair.notice(&mut Rng(0x3895), None).await;
+    let store = pair.resident.store();
+    let mut state = load(store, &pair.reference).unwrap().unwrap();
+    let reduced = serde_json::to_string(&json!({
+        "type":"tool_result", "tool_call_id":"call165", "is_error":false,
+        "output":{"kind":"text","text":"[dropped]"}
+    }))
+    .unwrap();
+    let engine = state.engine_with_baselines().unwrap();
+    let engine_json = serde_json::to_string(engine.last_produced.as_ref().unwrap()).unwrap();
+    let source_end = compact::lineage::MessageRef {
+        ordinal: 199,
+        mid: "m199".into(),
+    };
+    let native_version = store
+        .reserve_async_compaction_version(&pair.reference, 7)
+        .unwrap();
+    assert_eq!(native_version, 8);
+    let native = view::CompactionView::new(
+        &pair.reference,
+        native_version,
+        "L",
+        source_end.clone(),
+        vec![view::ViewRange::keep_with_edits(
+            0,
+            200,
+            vec![view::PartEdit::replace(166, "m166", "0", &reduced)],
+        )],
+    );
+    native.check().unwrap();
+    let mut provenance = frozen_edits::FrozenEdits::default();
+    provenance.capture(&native, &state.entries).unwrap();
+    state
+        .retired_frozen
+        .views
+        .insert(native_version, Arc::new(provenance));
+    state.retired_frozen.dirty = true;
+    store
+        .save_async_compaction_view(
+            &pair.reference,
+            native_version,
+            &serde_json::to_string(&native).unwrap(),
+            &engine_json,
+        )
+        .unwrap();
+    let summary_version = store
+        .reserve_async_compaction_version(&pair.reference, 12)
+        .unwrap();
+    assert_eq!(summary_version, 13);
+    let summary = view::CompactionView::new(
+        &pair.reference,
+        summary_version,
+        "L",
+        source_end,
+        vec![
+            view::ViewRange::replace(
+                0,
+                164,
+                r#"[{"type":"text","text":"abandoned summary from L"}]"#,
+            ),
+            view::ViewRange::keep_with_edits(
+                164,
+                200,
+                vec![view::PartEdit::replace(166, "m166", "0", &reduced)],
+            ),
+        ],
+    );
+    summary.check().unwrap();
+    let mut summary_sources = frozen_edits::FrozenEdits::default();
+    summary_sources.capture(&summary, &state.entries).unwrap();
+    state
+        .retired_frozen
+        .views
+        .insert(summary_version, Arc::new(summary_sources));
+    state.save(store, &[]).unwrap();
+    store
+        .save_async_compaction_view(
+            &pair.reference,
+            summary_version,
+            &serde_json::to_string(&summary).unwrap(),
+            &engine_json,
+        )
+        .unwrap();
+    revert_transcript(&pair, 15, "undo-source", 9_000, 4);
+    review_complete_turn(&pair);
+    let request = setup_request(&pair, "undo-source", None, "setup-undo-source");
+    let answer = pair.resident.dispatch(request).await;
+    assert_eq!(
+        serde_json::from_str::<Value>(&answer).unwrap()["answer"],
+        "ready"
+    );
+    (pair, reduced)
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn fresh_setup_late_ack_keeps_only_reappeared_native_sources() {
+    let (mut pair, reduced) = setup_predecessor_fixture().await;
+    assert_eq!(resident_notice_at(&mut pair, 1_000, Some(13)).await, "ok");
+    let state = load(pair.resident.store(), &pair.reference)
+        .unwrap()
+        .unwrap();
+    assert!(!state.entries.contains_key(&166));
+    assert!(!state.frozen_edits.served("m166", "0", &reduced));
+    assert!(
+        state.pending_native_acks.is_empty(),
+        "an absent source grants no dormant receipt"
+    );
+    pair.append(180);
+    review_complete_turn(&pair);
+    assert_eq!(resident_notice_at(&mut pair, 1_000, Some(8)).await, "ok");
+    let state = load(pair.resident.store(), &pair.reference)
+        .unwrap()
+        .unwrap();
+    assert!(state.frozen_edits.served("m166", "0", &reduced));
+    assert_eq!(
+        state.applied, None,
+        "the predecessor view is not a baseline"
+    );
+    assert!(!state
+        .conditions
+        .as_ref()
+        .unwrap()
+        .contains_key("applied_view_version"));
+    let request = json!({"method":"compaction.ride","params":{"session_ref":pair.reference,"cause":"surface_change","deadline_ms":10_000}});
+    pair.resident.dispatch(request).await;
+    let (_, view, model, _) = newest_view(&pair).unwrap();
+    assert!(view.ranges.iter().any(|range| matches!(range, view::ViewRange::Keep { edits, .. } if edits.iter().any(|edit| edit.mid == "m166" && edit.part == "0" && edit.bytes.as_deref() == Some(reduced.as_str())))));
+    assert!(!model.contains("abandoned summary from L"));
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn fresh_setup_late_summary_ack_cannot_restore_predecessor_history() {
+    let (mut pair, _) = setup_predecessor_fixture().await;
+    pair.append(180);
+    review_complete_turn(&pair);
+    assert_eq!(resident_notice_at(&mut pair, 1_000, Some(13)).await, "ok");
+    let request = json!({"method":"compaction.ride","params":{"session_ref":pair.reference,"cause":"surface_change","deadline_ms":10_000}});
+    pair.resident.dispatch(request).await;
+    let (_, view, model, _) = newest_view(&pair).unwrap();
+    assert_eq!(view.lineage_id, "undo-source");
+    assert!(!model.contains("abandoned summary from L"));
+    assert!(summaries_in(&model).iter().all(|through| *through <= 15));
+    let state = load(pair.resident.store(), &pair.reference)
+        .unwrap()
+        .unwrap();
+    assert_eq!(state.applied, None);
+    assert!(state
+        .applied_view
+        .as_ref()
+        .is_none_or(|view| view.identity.1.lineage_id == "undo-source"));
+    assert!(!state
+        .conditions
+        .as_ref()
+        .unwrap()
+        .contains_key("applied_view_version"));
+}

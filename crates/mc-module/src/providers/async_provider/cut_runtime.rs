@@ -749,84 +749,6 @@ impl AsyncRecord {
     }
 }
 
-#[cfg(test)]
-pub(super) mod measurements {
-    use super::*;
-    #[derive(Clone, Debug, Default)]
-    pub(crate) struct Stats {
-        pub max_prelude_bytes: usize,
-        pub largest_deferred_bytes: usize,
-        pub deferred_cuts: u64,
-        pub staged_cuts: u64,
-        pub opencode_reverts: u64,
-        pub pi_tree_switches: u64,
-        pub deferrals: BTreeMap<String, u64>,
-    }
-    fn rows() -> &'static Mutex<BTreeMap<usize, Stats>> {
-        static ROWS: OnceLock<Mutex<BTreeMap<usize, Stats>>> = OnceLock::new();
-        ROWS.get_or_init(|| Mutex::new(BTreeMap::new()))
-    }
-    pub(crate) fn prelude(store: &McStore, bytes: usize, deferred: bool) {
-        let mut rows = rows().lock().unwrap();
-        let stats = rows.entry(store as *const McStore as usize).or_default();
-        if deferred {
-            stats.deferred_cuts += 1;
-            stats.largest_deferred_bytes = stats.largest_deferred_bytes.max(bytes);
-        } else {
-            stats.max_prelude_bytes = stats.max_prelude_bytes.max(bytes);
-        }
-    }
-    pub(crate) fn staged(store: &McStore) {
-        rows()
-            .lock()
-            .unwrap()
-            .entry(store as *const McStore as usize)
-            .or_default()
-            .staged_cuts += 1;
-    }
-    pub(crate) fn deferred(store: &McStore, reason: &str) {
-        *rows()
-            .lock()
-            .unwrap()
-            .entry(store as *const McStore as usize)
-            .or_default()
-            .deferrals
-            .entry(reason.into())
-            .or_default() += 1;
-    }
-    pub(crate) fn host_rewind(store: &McStore, pi: bool) {
-        let mut rows = rows().lock().unwrap();
-        let stats = rows.entry(store as *const McStore as usize).or_default();
-        if pi {
-            stats.pi_tree_switches += 1;
-        } else {
-            stats.opencode_reverts += 1;
-        }
-    }
-    pub(crate) fn take(store: &McStore) -> Stats {
-        rows()
-            .lock()
-            .unwrap()
-            .remove(&(store as *const McStore as usize))
-            .unwrap_or_default()
-    }
-    impl Stats {
-        pub(crate) fn merge(&mut self, other: Self) {
-            self.max_prelude_bytes = self.max_prelude_bytes.max(other.max_prelude_bytes);
-            self.largest_deferred_bytes = self
-                .largest_deferred_bytes
-                .max(other.largest_deferred_bytes);
-            self.deferred_cuts += other.deferred_cuts;
-            self.staged_cuts += other.staged_cuts;
-            self.opencode_reverts += other.opencode_reverts;
-            self.pi_tree_switches += other.pi_tree_switches;
-            for (reason, count) in other.deferrals {
-                *self.deferrals.entry(reason).or_default() += count;
-            }
-        }
-    }
-}
-
 impl McHandler {
     pub(super) async fn setup_cut_descent(
         &self,
@@ -899,7 +821,6 @@ impl McHandler {
                 .load_async_compaction_entries_range(&state.reference(), first, i64::MAX as u64)
                 .map_err(transient)?
                 .into_iter()
-                .map(|(ordinal, raw)| (ordinal, raw))
                 .collect();
         }
         // A saved stage is immutable. A descendant gets its own namespace and
@@ -945,6 +866,7 @@ impl McHandler {
         state.ack_lineage_root = request.lineage_id.clone();
         state.ack_selection_pending = false;
         state.pending_native_acks.clear();
+        state.native_setup_predecessor = None;
         state.generation = state.next_generation()?;
         state.lineage_first_ordinal = first;
         state.journal = Journal::new_record();
@@ -1155,6 +1077,7 @@ impl McHandler {
         if first == 0 {
             return Ok(());
         }
+        state.native_setup_predecessor = None;
         if state.lineage.is_some() && state.lineage != head.lineage_id {
             return Err(transient("async lineage changed"));
         }
@@ -1264,5 +1187,83 @@ impl McHandler {
         state.begin_at_cut(store, seed, cut_seed::CutStart::Fresh)?;
         state.initial["initial"]["range"] = json!({"from":first,"to":first});
         Ok(())
+    }
+}
+
+#[cfg(test)]
+pub(super) mod measurements {
+    use super::*;
+    #[derive(Clone, Debug, Default)]
+    pub(crate) struct Stats {
+        pub max_prelude_bytes: usize,
+        pub largest_deferred_bytes: usize,
+        pub deferred_cuts: u64,
+        pub staged_cuts: u64,
+        pub opencode_reverts: u64,
+        pub pi_tree_switches: u64,
+        pub deferrals: BTreeMap<String, u64>,
+    }
+    fn rows() -> &'static Mutex<BTreeMap<usize, Stats>> {
+        static ROWS: OnceLock<Mutex<BTreeMap<usize, Stats>>> = OnceLock::new();
+        ROWS.get_or_init(|| Mutex::new(BTreeMap::new()))
+    }
+    pub(crate) fn prelude(store: &McStore, bytes: usize, deferred: bool) {
+        let mut rows = rows().lock().unwrap();
+        let stats = rows.entry(store as *const McStore as usize).or_default();
+        if deferred {
+            stats.deferred_cuts += 1;
+            stats.largest_deferred_bytes = stats.largest_deferred_bytes.max(bytes);
+        } else {
+            stats.max_prelude_bytes = stats.max_prelude_bytes.max(bytes);
+        }
+    }
+    pub(crate) fn staged(store: &McStore) {
+        rows()
+            .lock()
+            .unwrap()
+            .entry(store as *const McStore as usize)
+            .or_default()
+            .staged_cuts += 1;
+    }
+    pub(crate) fn deferred(store: &McStore, reason: &str) {
+        *rows()
+            .lock()
+            .unwrap()
+            .entry(store as *const McStore as usize)
+            .or_default()
+            .deferrals
+            .entry(reason.into())
+            .or_default() += 1;
+    }
+    pub(crate) fn host_rewind(store: &McStore, pi: bool) {
+        let mut rows = rows().lock().unwrap();
+        let stats = rows.entry(store as *const McStore as usize).or_default();
+        if pi {
+            stats.pi_tree_switches += 1;
+        } else {
+            stats.opencode_reverts += 1;
+        }
+    }
+    pub(crate) fn take(store: &McStore) -> Stats {
+        rows()
+            .lock()
+            .unwrap()
+            .remove(&(store as *const McStore as usize))
+            .unwrap_or_default()
+    }
+    impl Stats {
+        pub(crate) fn merge(&mut self, other: Self) {
+            self.max_prelude_bytes = self.max_prelude_bytes.max(other.max_prelude_bytes);
+            self.largest_deferred_bytes = self
+                .largest_deferred_bytes
+                .max(other.largest_deferred_bytes);
+            self.deferred_cuts += other.deferred_cuts;
+            self.staged_cuts += other.staged_cuts;
+            self.opencode_reverts += other.opencode_reverts;
+            self.pi_tree_switches += other.pi_tree_switches;
+            for (reason, count) in other.deferrals {
+                *self.deferrals.entry(reason).or_default() += count;
+            }
+        }
     }
 }
