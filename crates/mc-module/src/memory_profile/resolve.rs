@@ -27,6 +27,9 @@ pub(crate) struct ProfilePin {
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub(crate) struct MemoryContext {
     pub profile: ProfilePin,
+    /// Frozen effective ids, including legacy writer tags from category_map.
+    #[serde(default)]
+    pub category_ids: Option<std::collections::BTreeMap<String, String>>,
     pub project_id: Option<String>,
     pub workspace_id: Option<String>,
     pub domain: Option<String>,
@@ -53,6 +56,7 @@ pub(crate) fn resolve(
             pin: None,
             candidates: vec![],
         },
+        category_ids: Some(Default::default()),
         project_id: None,
         workspace_id: None,
         domain: None,
@@ -200,6 +204,21 @@ fn select(context: &mut MemoryContext, profile: &Profile, source: &str) {
     context.profile.version = Some(profile.version.clone());
     context.profile.digest = Some(profile.digest.clone());
     context.profile.resolution = Some(source.into());
+    let mut ids = std::collections::BTreeMap::new();
+    for category in list(&profile.body, "categories") {
+        let tag = text(category, "tag");
+        if let Some(id) = profile.effective_category(tag) {
+            ids.insert(tag.into(), id.into());
+        }
+    }
+    if let Some(map) = profile.body["category_map"].as_object() {
+        for tag in map.keys() {
+            if let Some(id) = profile.effective_category(tag) {
+                ids.insert(tag.clone(), id.into());
+            }
+        }
+    }
+    context.category_ids = Some(ids);
 }
 
 pub(crate) trait ContextSource {

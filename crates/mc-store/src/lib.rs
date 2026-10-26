@@ -42,6 +42,7 @@ mod async_compaction;
 mod cut_head;
 pub use cut_head::NamespaceHead;
 pub mod memory_history;
+pub mod memory_levels;
 pub mod memory_lifecycle;
 pub mod memory_projection;
 pub mod move_context;
@@ -7062,6 +7063,10 @@ impl std::error::Error for FacadeMemoryMutationError {}
 /// The `context.db` tables a facade command may write: memories and notes, plus every
 /// table the memory applier writes when a command admits a memory.
 const FACADE_COMMAND_TABLES: &[&str] = &[
+    "memory_placement",
+    "memory_ops",
+    "memory_outbox",
+    "memory_sync_state",
     "memories",
     "notes",
     "memory_embedding_watermarks",
@@ -7082,6 +7087,7 @@ const FACADE_COMMAND_TABLES: &[&str] = &[
 pub struct FacadeMutationTxn<'a> {
     tx: &'a rusqlite::Connection,
     automated: bool,
+    memory_writer: Option<memory_levels::MemoryWriter>,
 }
 
 /// Compose an automated memory mutation with its caller's accounting writes in an
@@ -7099,6 +7105,7 @@ pub fn with_automated_memory_mutation_tx<T>(
         &FacadeMutationTxn {
             tx: conn,
             automated: false,
+            memory_writer: None,
         }
         .automated(),
     )?;
@@ -7109,12 +7116,24 @@ pub fn with_automated_memory_mutation_tx<T>(
 }
 
 impl<'a> FacadeMutationTxn<'a> {
+    pub fn with_memory_writer(&self, writer: memory_levels::MemoryWriter) -> FacadeMutationTxn<'_> {
+        FacadeMutationTxn {
+            tx: self.tx,
+            automated: self.automated,
+            memory_writer: Some(writer),
+        }
+    }
+
+    fn memory_writer(&self) -> memory_levels::MemoryWriter {
+        self.memory_writer.clone().unwrap_or_default()
+    }
     /// Automated curation validates targets and saves their prior versions for undo,
     /// but does not enqueue a prompt update or record an agent fragment.
     pub fn automated(&self) -> FacadeMutationTxn<'_> {
         FacadeMutationTxn {
             tx: self.tx,
             automated: true,
+            memory_writer: None,
         }
     }
 
@@ -7191,7 +7210,12 @@ impl<'a> FacadeMutationTxn<'a> {
         &self,
         request: &memory_lifecycle::applier::AdmissionRequest<'_>,
     ) -> Result<memory_lifecycle::applier::ApplierReceipt, String> {
-        admit_memory_tx(self.tx, request).map_err(|error| error.to_string())
+        let mut writer = self.memory_writer();
+        if let Some(anchor) = request.classification_anchor {
+            writer.ordinals = vec![anchor.save_ordinal];
+        }
+        admit_memory_tx(self.tx, request, &writer, memory_levels::CreateKind::Create)
+            .map_err(|error| error.to_string())
     }
 
     pub fn update_memory_content(
@@ -7333,6 +7357,26 @@ impl<'a> FacadeMutationTxn<'a> {
         source_session_id: Option<&str>,
         now_ms: i64,
     ) -> Result<(StoredMemoryFull, Vec<i64>), FacadeMemoryMutationError> {
+        self.merge_memories_canonical_with_category(
+            project_path,
+            ids,
+            merged_content,
+            source_session_id,
+            now_ms,
+            None,
+        )
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    pub fn merge_memories_canonical_with_category(
+        &self,
+        project_path: &str,
+        ids: &[i64],
+        merged_content: &str,
+        source_session_id: Option<&str>,
+        now_ms: i64,
+        category_override: Option<&str>,
+    ) -> Result<(StoredMemoryFull, Vec<i64>), FacadeMemoryMutationError> {
         if ids.len() < 2 {
             return Err(FacadeMemoryMutationError::InvalidMerge);
         }
@@ -7357,6 +7401,9 @@ impl<'a> FacadeMutationTxn<'a> {
         }
 
         let category = rows[0].category.clone();
+        let mut writer = self.memory_writer();
+        writer.merge_owner = memory_levels::merge_owner(self.tx, ids, project_path, &writer)
+            .map_err(FacadeMemoryMutationError::storage)?;
         let normalized_hash = compute_normalized_memory_hash(merged_content);
         let matching = self
             .tx
@@ -7377,19 +7424,23 @@ impl<'a> FacadeMutationTxn<'a> {
         let target_id = if let Some(id) = matching {
             id
         } else {
-            self.insert_memory(InsertMemoryInput {
-                project_path,
-                route_project_root: None,
-                category: &category,
-                content: merged_content,
-                source_session_id,
-                source_type: Some(if self.automated { "dreamer" } else { "agent" }),
-                importance: Some(50),
-                expires_at: None,
-                metadata_json: None,
-                now_ms,
-            })
-            .map_err(FacadeMemoryMutationError::Storage)?
+            // Defer placement and the create hook until the survivor has its final
+            // category and merge aggregates, so the event describes the stored row.
+            let facade = self.with_memory_writer(Default::default());
+            facade
+                .insert_memory(InsertMemoryInput {
+                    project_path,
+                    route_project_root: None,
+                    category: &category,
+                    content: merged_content,
+                    source_session_id,
+                    source_type: Some(if self.automated { "dreamer" } else { "agent" }),
+                    importance: Some(50),
+                    expires_at: None,
+                    metadata_json: None,
+                    now_ms,
+                })
+                .map_err(FacadeMemoryMutationError::Storage)?
         };
         let source_ids = ids
             .iter()
@@ -7433,6 +7484,36 @@ impl<'a> FacadeMutationTxn<'a> {
             merged = load_memory_full_tx(self.tx, target_id)
                 .map_err(FacadeMemoryMutationError::storage)?
                 .ok_or(FacadeMemoryMutationError::Unavailable { id: target_id })?;
+        }
+        if let Some(category) = category_override.filter(|c| *c != merged.category) {
+            merged = self.update_memory_content(
+                project_path,
+                target_id,
+                merged_content,
+                Some(category),
+                now_ms,
+            )?;
+        }
+        if created_canonical {
+            writer
+                .created(
+                    self.tx,
+                    target_id,
+                    if self.automated {
+                        memory_levels::Actor::Dreamer
+                    } else {
+                        memory_levels::Actor::MainAgent
+                    },
+                    memory_levels::CreateKind::MergeSurvivor,
+                    if self.automated {
+                        None
+                    } else {
+                        source_session_id
+                    },
+                    None,
+                    now_ms,
+                )
+                .map_err(FacadeMemoryMutationError::storage)?;
         }
         Ok((merged, source_ids))
     }
@@ -7918,6 +7999,7 @@ impl<'a> FacadeMutationTxn<'a> {
 /// the module's lifetime, plus the installed [`ContextDomain`] for the rows in `context.db`.
 pub struct McStore {
     inner: Arc<SqliteStore>,
+    memory_create_hook: std::sync::RwLock<Option<memory_levels::CreateHook>>,
     move_path: Option<std::path::PathBuf>,
     native_snapshot_fallbacks: Mutex<HashMap<String, cache_codec::NativeSnapshotRejection>>,
     // Distinguishes independent stores in the process-local tag baseline cache. Production
@@ -8627,6 +8709,7 @@ impl McStore {
         }
         let store = McStore {
             inner: Arc::new(inner),
+            memory_create_hook: Default::default(),
             move_path: match &descriptor.backend {
                 cortexkit_store_types::StorageBackend::Sqlite { path } => {
                     Some(std::path::PathBuf::from(path))
@@ -8850,6 +8933,11 @@ impl McStore {
             }
         }
 
+        let memory_writer = if tool == "ctx_memory" && matches!(action, "write" | "merge") {
+            Some(self.session_memory_writer(Some(identity_scope))?)
+        } else {
+            None
+        };
         let response = self.context_write(FACADE_COMMAND_TABLES, |tx| {
             let audited = matches!(action, "update" | "archive" | "merge")
                 && matches!(tool, "ctx_memory" | "memory.curate");
@@ -8863,6 +8951,7 @@ impl McStore {
             let response = mutation(&FacadeMutationTxn {
                 tx,
                 automated: false,
+                memory_writer,
             })
             .map_err(|error| {
                 rusqlite::Error::ToSqlConversionFailure(Box::new(std::io::Error::other(error)))
@@ -14224,8 +14313,14 @@ impl McStore {
         project_path: &str,
         facts: &[FactCandidate],
     ) -> Result<Vec<PromotedRef>, McStoreError> {
-        let promoted = self.context_write(&["memories", "memory_embedding_watermarks"], |tx| {
-            promote_facts_tx(tx, project_path, facts, current_time_ms())
+        let writers = facts
+            .iter()
+            .map(|fact| self.session_memory_writer(fact.source_session_id.as_deref()))
+            .collect::<Result<Vec<_>, _>>()?;
+        let mut tables = vec!["memories", "memory_embedding_watermarks"];
+        tables.extend(memory_levels::CREATE_TABLES);
+        let promoted = self.context_write(&tables, |tx| {
+            promote_facts_with_writers_tx(tx, project_path, facts, current_time_ms(), &writers)
         })?;
         Ok(promoted)
     }
@@ -14320,8 +14415,13 @@ impl McStore {
         &self,
         request: &memory_lifecycle::applier::AdmissionRequest<'_>,
     ) -> Result<memory_lifecycle::applier::ApplierReceipt, McStoreError> {
+        let mut writer = self.session_memory_writer(request.source_session_id)?;
+        writer.ordinals = request
+            .classification_anchor
+            .map(|a| vec![a.save_ordinal])
+            .unwrap_or_default();
         self.context_write(memory_lifecycle::applier::ADMISSION_TABLES, |tx| {
-            admit_memory_tx(tx, request)
+            admit_memory_tx(tx, request, &writer, memory_levels::CreateKind::Create)
         })
     }
 
@@ -14524,6 +14624,11 @@ impl McStore {
                 }
                 source_rows.push(source);
             }
+
+            let ids = std::iter::once(target_id)
+                .chain(source_rows.iter().map(|row| row.id))
+                .collect::<Vec<_>>();
+            memory_levels::merge_owner(tx, &ids, project_path, &Default::default())?;
 
             let normalized_hash = compute_normalized_memory_hash(merged_content);
             let duplicate_id = tx
@@ -17735,8 +17840,12 @@ fn admission_for_insert<'a>(
 fn admit_memory_tx(
     tx: &rusqlite::Connection,
     request: &memory_lifecycle::applier::AdmissionRequest<'_>,
+    writer: &memory_levels::MemoryWriter,
+    kind: memory_levels::CreateKind,
 ) -> rusqlite::Result<memory_lifecycle::applier::ApplierReceipt> {
-    let receipt = memory_lifecycle::applier::apply_memory_admission_tx(tx, request)?;
+    let receipt = memory_lifecycle::applier::apply_memory_admission_with_writer_tx(
+        tx, request, writer, kind,
+    )?;
     if receipt.inserted == Some(true) {
         if let Some(id) = receipt.applied_memory_id() {
             raise_embedding_watermark_tx(tx, request.project_path, id, request.now_ms)?;
@@ -17745,11 +17854,22 @@ fn admit_memory_tx(
     Ok(receipt)
 }
 
+#[cfg(test)]
 fn promote_facts_tx(
     tx: &rusqlite::Connection,
     project_path: &str,
     facts: &[FactCandidate],
     now_ms: i64,
+) -> rusqlite::Result<Vec<PromotedRef>> {
+    promote_facts_with_writers_tx(tx, project_path, facts, now_ms, &[])
+}
+
+fn promote_facts_with_writers_tx(
+    tx: &rusqlite::Connection,
+    project_path: &str,
+    facts: &[FactCandidate],
+    now_ms: i64,
+    writers: &[memory_levels::MemoryWriter],
 ) -> rusqlite::Result<Vec<PromotedRef>> {
     // The module writes no memory for a project whose memories the TypeScript host owns.
     // The rest of the fold (compartments, facts, events) still publishes.
@@ -17786,7 +17906,7 @@ fn promote_facts_tx(
         })?;
     let mut promoted = Vec::new();
 
-    for fact in facts {
+    for (index, fact) in facts.iter().enumerate() {
         if fact.category.trim().is_empty() || fact.content.trim().is_empty() {
             continue;
         }
@@ -17817,6 +17937,17 @@ fn promote_facts_tx(
             ],
         )?;
         let memory_id = tx.last_insert_rowid();
+        if let Some(writer) = writers.get(index) {
+            writer.created(
+                tx,
+                memory_id,
+                memory_levels::Actor::Historian,
+                memory_levels::CreateKind::Create,
+                fact.source_session_id.as_deref(),
+                None,
+                now_ms,
+            )?;
+        }
         active_content.insert(fact.content.clone());
         promoted.push(PromotedRef {
             memory_id,
