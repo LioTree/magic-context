@@ -696,14 +696,22 @@ fn archived_message(rig: &Rig, id: &str, ordinal: i64, role: &str, ts: i64) {
 }
 
 #[tokio::test]
-async fn retrospective_capture_tracks_real_user_history() {
-    use crate::dream_dispatch::retrospective_host::SessionReader;
+async fn retrospective_capture_tracks_archive_ordinals() {
     let mut rig = Rig::new();
     let _ = mapped_repo(&rig);
     rig.sql("INSERT INTO session_projects(session_id,harness,project_path,updated_at) VALUES('history','opencode',?1,1)");
     archived_message(&rig, "user-1", 1, "user", 100);
+    rig.sql("INSERT INTO session_projects(session_id,harness,project_path,updated_at) VALUES('second','opencode',?1,1)");
+    rig.dispatcher.store.with_context_conn_for_test(|tx| {
+        crate::dream_dispatch::session_reader::archive_for_test(tx,"second",&json!({"id":"second-10","ordinal":10,"role":"user","createdAt":100,"parts":[]}))?;
+        tx.execute("INSERT INTO schema_migrations_meta(key,value) VALUES('retrospective_activity:second','100')",[])?;
+        Ok(())
+    }).unwrap();
     let task = TaskName::Retrospective;
-    assert_eq!(rig.inputs(task).history, Some(100));
+    assert_eq!(
+        rig.inputs(task).archive_ordinals,
+        BTreeMap::from([("history".into(), 1), ("second".into(), 10)])
+    );
     let mut state = capture_gate_baseline(&mut rig, task).await;
     state.retrospective_watermark_ms = Some(100);
     archived_message(&rig, "assistant", 2, "assistant", 200);
@@ -713,28 +721,24 @@ async fn retrospective_capture_tracks_real_user_history() {
             .gate(task, &rig.dispatcher.scope, &state, "assistant")
             .await
             .unwrap(),
+        GateDecision::Run
+    );
+    state.inputs_watermark = Some(rig.inputs(task).watermark());
+    assert_eq!(
+        rig.dispatcher
+            .executor
+            .gate(task, &rig.dispatcher.scope, &state, "unchanged-ordinals")
+            .await
+            .unwrap(),
         GateDecision::Skip {
             code: "inputs_unchanged".into()
         }
     );
     archived_message(&rig, "user-2", 3, "user", 300);
-    let reader = crate::dream_dispatch::session_reader::ArchiveSessionReader {
-        store: rig.dispatcher.store.clone(),
-        harness: "opencode".into(),
-        recency_cutoff_ms: None,
-    };
     assert_eq!(
-        reader
-            .read_sessions(&rig.dispatcher.scope.project.0, 100)
-            .unwrap()[0]
-            .messages
-            .iter()
-            .filter(|row| row.role == "user")
-            .map(|row| row.ts)
-            .max(),
-        Some(300)
+        rig.inputs(task).archive_ordinals,
+        BTreeMap::from([("history".into(), 3), ("second".into(), 10)])
     );
-    assert_eq!(rig.inputs(task).history, Some(300));
     assert_eq!(
         rig.dispatcher
             .executor
@@ -894,7 +898,7 @@ fn declarations_for_kinds_without_a_production_executor() {
         (
             TaskName::Retrospective,
             Inputs {
-                history: Some(2),
+                archive_ordinals: BTreeMap::from([("session".into(), 2)]),
                 ..base.clone()
             },
         ),

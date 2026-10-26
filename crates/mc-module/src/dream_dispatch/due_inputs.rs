@@ -72,7 +72,8 @@ pub(crate) struct Inputs {
     attempted: BTreeSet<i64>,
     files: BTreeMap<String, String>,
     candidates: BTreeSet<i64>,
-    history: Option<i64>,
+    #[serde(default)]
+    archive_ordinals: BTreeMap<String, i64>,
     git: String,
     #[serde(default)]
     primers: String,
@@ -116,12 +117,7 @@ impl Inputs {
                         .any(|(path, hash)| prior.files.get(path) != Some(hash))
             }
             TaskName::ReviewUserMemories => !self.candidates.is_subset(&prior.candidates),
-            TaskName::Retrospective => self.history.is_some_and(|at| {
-                at > state
-                    .retrospective_watermark_ms
-                    .or(prior.history)
-                    .unwrap_or(0)
-            }),
+            TaskName::Retrospective => self.archive_ordinals != prior.archive_ordinals,
             TaskName::RefreshPrimers => {
                 !self.candidates.is_subset(&prior.candidates) || self.primers != prior.primers
             }
@@ -175,12 +171,15 @@ pub(crate) fn capture(
             .map_err(|error| error.to_string())?;
     }
     if task == TaskName::Retrospective {
-        // ArchiveSessionReader::read_sessions/read_since consume these project,
-        // harness and non-subagent session rows and their archived message times.
-        inputs.history = store.with_context_read(|db| {
+        // ArchiveSessionReader::read_sessions uses this project/harness session
+        // set. The covering (session_id, message_ordinal) index supplies each
+        // maximum without parsing full message JSON on idle claims. Any appended
+        // message reopens the gate, including assistant-only activity.
+        inputs.archive_ordinals = store.with_context_read(|db| {
             let installed: bool = db.query_row("SELECT EXISTS(SELECT 1 FROM sqlite_master WHERE type='table' AND name='raw_archive_messages')", [], |row| row.get(0))?;
-            if !installed { return Ok(None); }
-            db.query_row("SELECT MAX(CAST(json_extract(a.message_json,'$.createdAt') AS INTEGER)) FROM raw_archive_messages a JOIN session_projects sp ON sp.session_id=a.session_id JOIN schema_migrations_meta activity ON activity.key='retrospective_activity:' || sp.session_id LEFT JOIN session_meta m ON m.session_id=sp.session_id WHERE sp.project_path=?1 AND sp.harness=?2 AND COALESCE(m.is_subagent,0)=0 AND json_extract(a.message_json,'$.role')='user'", rusqlite::params![project,harness], |row| row.get(0))
+            if !installed { return Ok(BTreeMap::new()); }
+            db.prepare("SELECT sp.session_id, (SELECT MAX(a.message_ordinal) FROM raw_archive_messages a WHERE a.session_id=sp.session_id) FROM session_projects sp JOIN schema_migrations_meta activity ON activity.key='retrospective_activity:' || sp.session_id LEFT JOIN session_meta m ON m.session_id=sp.session_id WHERE sp.project_path=?1 AND sp.harness=?2 AND COALESCE(m.is_subagent,0)=0 ORDER BY sp.session_id")?
+                .query_map(rusqlite::params![project,harness], |row| Ok((row.get(0)?,row.get::<_,Option<i64>>(1)?.unwrap_or(0))))?.collect()
         }).map_err(|error| error.to_string())?;
         inputs.unavailable = harness.is_empty();
     }
