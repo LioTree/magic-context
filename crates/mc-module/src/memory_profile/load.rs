@@ -112,7 +112,8 @@ impl Package {
         if e["schema"] != "ck-package/v1"
             || e["kind"] != "memory-profile"
             || !grammar.is_match(text(e, "name"))
-            || semver::Version::parse(text(e, "version")).is_err()
+            || semver::Version::parse(text(e, "version"))
+                .map_or(true, |version| !version.build.is_empty())
         {
             return Err(refuse(
                 "profile_schema_invalid",

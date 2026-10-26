@@ -133,6 +133,28 @@ fn prompt_section_override_preserves_inherited_condition() {
     assert_eq!(section["_from"], "@cortexkit/memory-swe");
 }
 
+#[test]
+fn envelope_rejects_version_build_metadata() {
+    let mut packages = bundled::packages();
+    packages[1].env["version"] = "1.0.0+build".into();
+    assert_eq!(
+        load_chain(&packages).unwrap_err().code,
+        "profile_schema_invalid"
+    );
+}
+
+#[test]
+fn schema_integer_accepts_integral_json_number() {
+    let mut body = bundled::packages()[1].env["body"].clone();
+    body["categories"][0]["render_order"] = json!(1.0);
+    schema::validate(&body).unwrap();
+    body["categories"][0]["render_order"] = json!(1.5);
+    assert_eq!(
+        schema::validate(&body).unwrap_err().code,
+        "profile_schema_invalid"
+    );
+}
+
 fn entry<'a>(body: &'a mut Value, collection: &str, id: &str) -> &'a mut Value {
     body[collection]
         .as_array_mut()

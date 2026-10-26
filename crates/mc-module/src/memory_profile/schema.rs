@@ -69,7 +69,11 @@ fn check(s: &Value, v: &Value, root: &Value, at: &str) -> std::result::Result<()
             "string" => v.is_string(),
             "boolean" => v.is_boolean(),
             "number" => v.is_number(),
-            "integer" => v.as_i64().is_some() || v.as_u64().is_some(),
+            "integer" => {
+                v.as_i64().is_some()
+                    || v.as_u64().is_some()
+                    || v.as_f64().is_some_and(|number| number.fract() == 0.0)
+            }
             _ => false,
         };
         if !types
