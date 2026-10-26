@@ -987,8 +987,8 @@ mod tests {
         });
         store.with_context_conn_for_test(|conn| {
             mark_ts_owned(conn);
-            apply_fold_tx(conn, "ses", &write)?;
-            apply_fold_tx(conn, "ses", &write)?;
+            apply_fold_tx(conn, "ses", &write, &Default::default())?;
+            apply_fold_tx(conn, "ses", &write, &Default::default())?;
             assert_eq!(lifecycle_counts(conn), [1,2,1,0]);
             let facts = conn.prepare("SELECT content,anchor_known,state,fact_attempts,reason,reserved_stage_key,compartment_id
                 FROM memory_pending_facts ORDER BY fact_index")?.query_map([], |row| Ok((row.get::<_, String>(0)?, row.get::<_, i64>(1)?, row.get::<_, String>(2)?, row.get::<_, i64>(3)?, row.get::<_, String>(4)?, row.get::<_, Option<String>>(5)?, row.get::<_, Option<i64>>(6)?)))?.collect::<Result<Vec<_>,_>>()?;
@@ -1055,7 +1055,7 @@ mod tests {
             .unwrap();
         store
             .with_context_conn_for_test(|conn| {
-                apply_fold_tx(conn, "ses", &write)?;
+                apply_fold_tx(conn, "ses", &write, &Default::default())?;
                 Ok(())
             })
             .unwrap();

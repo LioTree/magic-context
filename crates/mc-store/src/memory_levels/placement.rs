@@ -115,6 +115,7 @@ pub struct CreateEvent {
     pub snapshot_digest: Option<String>,
 }
 
+/// Only write on the supplied transaction; never commit it or send network work.
 pub type CreateHook = Arc<dyn Fn(&Connection, &CreateEvent) -> rusqlite::Result<()> + Send + Sync>;
 
 #[derive(Clone, Default)]
