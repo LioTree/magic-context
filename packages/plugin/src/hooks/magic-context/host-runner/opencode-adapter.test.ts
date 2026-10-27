@@ -518,7 +518,13 @@ for (const host of ["v1", "v2"] as const)
         });
         test("first post-rebuild hook timeout refuses without publishing an untagged append", async () => {
             const meters: ProviderPassMeters[] = [];
-            const f = fixture(host, { emitMeters: (row) => meters.push(row) });
+            // The client stamps each hook deadline before persisting its fence, skips the
+            // transport if the deadline has passed by send time, and rejects answers read
+            // after it. On a loaded machine's wall clock, a 5 ms budget can expire before
+            // the last hook is sent (so it is never counted) or before an earlier hook's
+            // immediate answer is read (so an earlier pass refuses as late). A frozen
+            // clock leaves only the transport's own timeout timer, the path under test.
+            const f = fixture(host, { emitMeters: (row) => meters.push(row), now: () => 1000 });
             f.setReply((w) =>
                 w.method === "transform.declare"
                     ? {
@@ -544,8 +550,13 @@ for (const host of ["v1", "v2"] as const)
             };
             const previous = JSON.stringify(output.messages);
             f.setReply((w) => (w.method === "transform.hook" ? new Promise(() => {}) : undefined));
+            const hooksBefore = f.wires.filter((w) => w.method === "transform.hook").length;
             await expect(f.adapter.run("session", input, output, f.meta)).rejects.toThrow(
                 "Provider hook did not complete before its fence: timeout",
+            );
+            // The hook reached the module and then timed out there.
+            expect(f.wires.filter((w) => w.method === "transform.hook").length - hooksBefore).toBe(
+                1,
             );
             expect(JSON.stringify(output.messages)).toBe(previous);
             expect(f.stored()!.views.at(-1)!.version).toBe(view);

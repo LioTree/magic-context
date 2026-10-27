@@ -279,7 +279,10 @@ describe("H3 review controls", () => {
         const pending = new Promise<unknown>((done) => {
             resolve = done;
         });
-        const h = harness(() => pending, { engineBudgetMs: 10 });
+        // A frozen clock keeps the send-time deadline check from expiring the 10 ms
+        // budget before dispatch on a slow machine; the transport's timeout timer
+        // still fires after the budget and produces the timeout under test.
+        const h = harness(() => pending, { now: () => 1, engineBudgetMs: 10 });
         const received: string[] = [];
         const result = await h.client.bootstrap(state, step, async (page) => {
             received.push(page.status);

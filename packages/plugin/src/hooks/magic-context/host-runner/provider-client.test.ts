@@ -534,7 +534,10 @@ describe("host provider transport", () => {
             const state = record();
             append(state, "m1", "raw");
             const late = deferred<unknown>();
-            const h = harness(() => late.promise, { engineBudgetMs: 5 });
+            // A frozen clock keeps the send-time deadline check from expiring the
+            // 5 ms budget before dispatch on a slow machine; the transport's timeout
+            // timer still fires after the budget and is what this test exercises.
+            const h = harness(() => late.promise, { now: () => 1, engineBudgetMs: 5 });
             const pending =
                 operation === "declare"
                     ? h.client.declare({ params: {} })
@@ -791,7 +794,10 @@ describe("host provider transport", () => {
                     bound_ms: 0,
                 };
             },
-            { engineBudgetMs: 100 },
+            // Each page is encoded after its fence stamps the deadline. A frozen clock
+            // keeps a slow encode of these 2 MB pages from expiring the budget before
+            // dispatch, so only the first page's transport timer times out.
+            { now: () => 1, engineBudgetMs: 100 },
         );
         const first = await h.client.bootstrap(state, step, async () => {});
         expect(first).toMatchObject({ status: "unavailable", reason: "timeout" });
