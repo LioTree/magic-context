@@ -2,6 +2,7 @@ use super::*;
 use cortexkit_bus_inmemory::{InMemoryBus, InMemoryConfig};
 mod broca_0_7;
 mod broca_tag_rows;
+mod contract_update;
 mod conversation_identity_probe;
 mod descriptors_read;
 mod full_array_setup;
@@ -40,6 +41,8 @@ struct Runner {
     describes: std::sync::atomic::AtomicU64,
     /// A page to answer every `session.read` with, verbatim.
     page_override: Mutex<Option<Value>>,
+    /// A `session.head` answer to give instead of `{"first_ordinal":0}`.
+    head_override: Mutex<Option<Value>>,
     history_requests: Mutex<Vec<Value>>,
 }
 
@@ -132,6 +135,9 @@ impl session_resolver::ProviderRunner for Runner {
             );
         }
         if method == "session.head" {
+            if let Some(head) = self.head_override.lock().unwrap().clone() {
+                return Ok(head);
+            }
             return Ok(json!({"first_ordinal":0}));
         }
         if method == "session.history" {

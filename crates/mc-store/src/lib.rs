@@ -5523,6 +5523,11 @@ pub struct McTagRow {
     pub source_bytes: std::sync::Arc<[u8]>,
 }
 
+/// The newest compartment's stored end ordinal: one probe of the
+/// `(session_id, sequence)` unique index, read backwards.
+const NEWEST_COMPARTMENT_END_SQL: &str =
+    "SELECT end_message FROM compartments WHERE session_id = ?1 ORDER BY sequence DESC LIMIT 1";
+
 const NEWEST_TOOL_TAGS_SQL: &str = "SELECT tag_number, block_id, kind, token_count, created_at_ms
      FROM mc_tags WHERE session_id=?1 AND tag_number<=?2
        AND kind IN ('tool', 'tool_call', 'tool_result')
@@ -13107,6 +13112,22 @@ impl McStore {
         Ok(exists != 0)
     }
 
+    /// The stored end ordinal of the session's newest compartment (its highest
+    /// `sequence`), or `None` when it has none. Compartments are stored in
+    /// sequence order over consecutive message ranges, so the newest one ends
+    /// furthest. This is one probe of the `(session_id, sequence)` unique
+    /// index, whatever the number of compartments, for callers on a per-notice
+    /// budget. It reads stored coordinates only: resolved context boundaries
+    /// (`load_compartment_boundaries`) are not applied.
+    pub fn newest_compartment_end(&self, session_id: &str) -> Result<Option<i64>, McStoreError> {
+        self.context_read(|conn| {
+            conn.query_row(NEWEST_COMPARTMENT_END_SQL, params![session_id], |r| {
+                r.get(0)
+            })
+            .optional()
+        })
+    }
+
     /// Resolve and persist one fake-compaction lineage edge under the store's writer fence.
     /// The method owns every row participating in adoption so callers cannot observe a copied
     /// compartment set without its marker, anchor, ordinal base, or prior-lineage publish fence.
@@ -19463,6 +19484,62 @@ mod tests {
             plan.iter().any(|detail| detail
                 .contains("SEARCH mc_tags USING INDEX sqlite_autoindex_mc_tags_1")
                 && detail.contains("session_id=? AND tag_number<?")),
+            "{plan:?}"
+        );
+        assert!(
+            !plan
+                .iter()
+                .any(|detail| detail.contains("SCAN") || detail.contains("TEMP B-TREE")),
+            "{plan:?}"
+        );
+    }
+
+    /// `newest_compartment_end` names the highest sequence's end, `None` for a
+    /// session without compartments, and reads it through the session's unique
+    /// index without scanning its compartments or sorting them.
+    #[test]
+    fn newest_compartment_end_is_one_index_probe() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = McStore::open_for_test(&descriptor(dir.path())).unwrap();
+        let compartment = |sequence: i64, start: i64, end: i64| StoredCompartment {
+            sequence,
+            start_message: start,
+            end_message: end,
+            end_message_id: format!("m{end}#0"),
+            title: "history".into(),
+            content: format!("summary {sequence}"),
+            importance: 50,
+            ..Default::default()
+        };
+        assert_eq!(store.newest_compartment_end("s").unwrap(), None);
+        store
+            .replace_compartments(
+                "s",
+                &[
+                    compartment(1, 0, 10),
+                    compartment(2, 11, 20),
+                    compartment(3, 21, 30),
+                ],
+            )
+            .unwrap();
+        store
+            .replace_compartments("other", &[compartment(1, 0, 99)])
+            .unwrap();
+        assert_eq!(store.newest_compartment_end("s").unwrap(), Some(30));
+        assert_eq!(store.newest_compartment_end("other").unwrap(), Some(99));
+        assert_eq!(store.newest_compartment_end("none").unwrap(), None);
+        let plan = store
+            .context_read(|conn| {
+                conn.prepare(&format!("EXPLAIN QUERY PLAN {NEWEST_COMPARTMENT_END_SQL}"))?
+                    .query_map(params!["s"], |row| row.get::<_, String>(3))?
+                    .collect::<rusqlite::Result<Vec<_>>>()
+            })
+            .unwrap();
+        eprintln!("newest-compartment-end query plan: {plan:?}");
+        assert!(
+            plan.iter().any(|detail| detail
+                .contains("SEARCH compartments USING INDEX sqlite_autoindex_compartments_1")
+                && detail.contains("session_id=?")),
             "{plan:?}"
         );
         assert!(
