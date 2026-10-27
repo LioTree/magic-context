@@ -1,6 +1,6 @@
 import { Database } from "bun:sqlite";
 import { expect, test } from "bun:test";
-import { mkdirSync, mkdtempSync, readFileSync, rmSync, symlinkSync, writeFileSync } from "node:fs";
+import { mkdirSync, mkdtempSync, readFileSync, rmSync, symlinkSync, watch, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join, resolve } from "node:path";
 import ts from "../../../plugin/node_modules/typescript";
@@ -11,17 +11,47 @@ import { gaDatabasePath, V2StoreReader } from "../../../plugin/src/v2/store-read
 import { getCompartmentLeaseBlocker } from "../../../plugin/src/features/magic-context/compartment-lease";
 
 const names = ["applyDeferredCompactionMarker", "reconcileMarkerRepresentation", "setPendingCompactionMarkerState", "updateCompactionMarkerAfterPublication"];
+
+async function waitForWriterDrain(trace: string, sessionId: string, messageIds: string[]) {
+    expect(messageIds.length).toBeGreaterThan(0);
+    const rows = () => readFileSync(trace, "utf8").split("\n").filter(Boolean).map(line => JSON.parse(line));
+    const drained = () => {
+        const events = rows();
+        const index = events.filter(row => row.kind === "index");
+        const settled = new Map(index.filter(row => row.sessionId === sessionId && row.messageId).map(row => [row.messageId, row.outcome]));
+        const queue = index.at(-1)?.queue;
+        const embeddings = events.filter(row => row.kind === "embeddings" && row.sessionId === sessionId);
+        return messageIds.every(id => {
+            const outcome = settled.get(id);
+            return outcome?.status === "indexed" || (outcome?.status === "skipped" && /already (completed|current)|inserted=false/.test(outcome.reason));
+        }) && queue?.incrementalTimers === 0 && queue.pendingIncremental === 0 && queue.activeSessionLocks === 0
+            && embeddings.filter(row => row.status === "started").length === embeddings.filter(row => row.status !== "started").length;
+    };
+    // File notifications carry producer completion, not a guessed quiet window.
+    // Watch before checking so a worker finishing during setup cannot be missed.
+    await new Promise<void>((resolve, reject) => {
+        const watcher = watch(trace, check);
+        const timer = setTimeout(() => finish(new Error(`context writers did not drain: ${JSON.stringify(rows().slice(-10))}`)), 15000);
+        function finish(error?: Error) { clearTimeout(timer); watcher.close(); error ? reject(error) : resolve(); }
+        function check() { try { if (drained()) finish(); } catch (error) { finish(error as Error); } }
+        check();
+    });
+    console.info("I10_WRITERS_DRAINED", JSON.stringify({ sessionId, messages: messageIds.length, last: rows().at(-1) }));
+}
+
 async function instrument() {
     const root = mkdtempSync(join(tmpdir(), "mc-s3-markers-"));
     const trace = join(root, "calls.jsonl");
     const phaseTrace = join(root, "publication.jsonl");
+    const writerTrace = join(root, "writers.jsonl");
     writeFileSync(trace, "");
     writeFileSync(phaseTrace, "");
+    writeFileSync(writerTrace, "");
     symlinkSync(resolve(import.meta.dir, "../../../plugin/node_modules"), join(root, "node_modules"), "dir");
     writeFileSync(join(root, "package.json"), JSON.stringify({ type: "module", main: "index.js" }));
     const found = new Set<string>();
-    const build = await Bun.build({ entrypoints: [join(import.meta.dir, "marker-s3-plugin.ts")], outdir: root, naming: "index.js", target: "node", format: "esm", define: { "process.env.NODE_ENV": '"production"', "process.env.MC_S3_PHASE_TRACE": JSON.stringify(phaseTrace) }, external: ["@opencode-ai/plugin", "onnxruntime-node", "onnxruntime-web", "sharp", "bun:sqlite", "node:sqlite"], plugins: [{ name: "marker-counters", setup(builder) {
-        builder.onLoad({ filter: /(?:compaction-marker-manager|transform-postprocess-phase|storage-meta-persisted)\.ts$/ }, async ({ path }) => {
+    const build = await Bun.build({ entrypoints: [join(import.meta.dir, "marker-s3-plugin.ts")], outdir: root, naming: "index.js", target: "node", format: "esm", define: { "process.env.NODE_ENV": '"production"', "process.env.MC_S3_PHASE_TRACE": JSON.stringify(phaseTrace), "process.env.MC_S3_WRITER_TRACE": JSON.stringify(writerTrace) }, external: ["@opencode-ai/plugin", "onnxruntime-node", "onnxruntime-web", "sharp", "bun:sqlite", "node:sqlite"], plugins: [{ name: "marker-counters", setup(builder) {
+        builder.onLoad({ filter: /(?:compaction-marker-manager|transform-postprocess-phase|storage-meta-persisted|historian-publish-stage-logger)\.ts$/ }, async ({ path }) => {
             let source = readFileSync(path, "utf8");
             const tree = ts.createSourceFile(path, source, ts.ScriptTarget.Latest, true, ts.ScriptKind.TS);
             const insertions: Array<{ position: number; text: string }> = [];
@@ -30,6 +60,10 @@ async function instrument() {
                 found.add(name);
                 const session = name === "reconcileMarkerRepresentation" ? "options.sessionId" : "sessionId";
                 insertions.push({ position: node.body.getStart(tree) + 1, text: `\n__s3Record(${JSON.stringify(trace)}, JSON.stringify({name:${JSON.stringify(name)},sessionID:${session}})+'\\n');\n` });
+            }
+            for (const node of tree.statements) if (ts.isFunctionDeclaration(node) && node.body && node.name && ["startHistorianPublishStage", "finishHistorianPublishStage"].includes(node.name.text)) {
+                const status = node.name.text.startsWith("start") ? '"started"' : "status";
+                insertions.push({ position: node.body.getStart(tree) + 1, text: `\nif(stage==='embeddings') __s3Record(${JSON.stringify(writerTrace)}, JSON.stringify({kind:'embeddings',sessionId,status:${status}})+'\\n');\n` });
             }
             for (const insert of insertions.sort((a,b) => b.position-a.position)) source = source.slice(0, insert.position) + insert.text + source.slice(insert.position);
             return { contents: `import {appendFileSync as __s3Record} from 'node:fs';\n${source}`, loader: "ts" };
@@ -43,7 +77,7 @@ async function instrument() {
     const markerWorker = await Bun.build({ entrypoints: [join(import.meta.dir, "../../../plugin/src/features/magic-context/compaction-marker-candidates-worker.ts")], outdir: root, naming: "compaction-marker-candidates-worker.js", target: "node", format: "esm", external: ["bun:sqlite", "node:sqlite"] });
     if (!markerWorker.success) throw new Error(markerWorker.logs.join("\n"));
     expect([...found].sort()).toEqual([...names].sort());
-    return { root, calls: (sessionID: string) => readFileSync(trace, "utf8").split("\n").filter(Boolean).map(line => JSON.parse(line)).filter(call => call.sessionID === sessionID), phases: (sessionId: string) => readFileSync(phaseTrace, "utf8").split("\n").filter(Boolean).map(line => JSON.parse(line)).filter(row => row.sessionId === sessionId).map(row => row.phase) };
+    return { root, writerTrace, calls: (sessionID: string) => readFileSync(trace, "utf8").split("\n").filter(Boolean).map(line => JSON.parse(line)).filter(call => call.sessionID === sessionID), phases: (sessionId: string) => readFileSync(phaseTrace, "utf8").split("\n").filter(Boolean).map(line => JSON.parse(line)).filter(row => row.sessionId === sessionId).map(row => row.phase) };
 }
 const usage = { input_tokens: 100, output_tokens: 10 };
 function historian(body: unknown) {
@@ -116,6 +150,19 @@ test("I10 real-host counters: v2 fold plus historian publication plus ten turns 
         for (let index=0;index<3;index++) await v1.sendPrompt(session, `direct source ${index} ${"bounded history ".repeat(700)}`);
         await v1.waitForMockQuiescence();
         await until(() => getCompartmentLeaseBlocker(v1.contextDb() as never, session) === null);
+        const controlSessionClient = v1.client.session as typeof v1.client.session & {
+            messages(options: { path: { id: string } }): Promise<{ data?: unknown }>;
+        };
+        const source = await controlSessionClient.messages({ path: { id: session } });
+        const terminalIds = (source.data as Array<{ info: { id: string; role: string; summary?: boolean; time?: { completed?: number }; finish?: string } }>)
+            .filter(({ info }) => !info.summary && (info.role === "user" || (info.role === "assistant" && (info.time?.completed !== undefined || info.finish !== undefined))))
+            .slice(-2)
+            .map(({ info }) => info.id);
+        // Logical historian leases and provider responses do not join the
+        // terminal-message index workers or detached publication registration.
+        // Observe the last real turn and the whole queue, not older folded rows
+        // whose terminal events predate the current indexing source.
+        await waitForWriterDrain(fixture.writerTrace, session, terminalIds);
         // Exercise the same short ownership overlap on every platform. A tool
         // error is not a successful positive control merely because HTTP finished.
         const leaseControl = new Database(v1.contextDbPath());
@@ -125,9 +172,6 @@ test("I10 real-host counters: v2 fold plus historian publication plus ten turns 
                 .run(session, "s3-background-lease-control", process.pid, Date.now(), Date.now() + 1000);
         } finally { leaseControl.close(); }
         await v1.sendPrompt(session, "Run direct marker control");
-        const controlSessionClient = v1.client.session as typeof v1.client.session & {
-            messages(options: { path: { id: string } }): Promise<{ data?: unknown }>;
-        };
         const controlResponse = await controlSessionClient.messages({ path: { id: session } });
         const controlMessages = controlResponse.data ?? [];
         const controlParts = (Array.isArray(controlMessages) ? controlMessages : [])

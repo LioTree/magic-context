@@ -8,6 +8,7 @@ import { resolveWrapupProtectedTailBoundary } from "../../../plugin/src/hooks/ma
 import { setRawMessageProvider } from "../../../plugin/src/hooks/magic-context/read-session-chunk";
 import { runCompartmentAgent } from "../../../plugin/src/hooks/magic-context/compartment-runner-incremental";
 import { getActiveCompartmentRun } from "../../../plugin/src/hooks/magic-context/compartment-runner";
+import { __setIncrementalIndexSettledForTests, __setReconciliationSettledForTests, getMessageIndexQueueHeapStats } from "../../../plugin/src/features/magic-context/message-index-async";
 
 async function publicationReady(sessionId: string) {
     const active = getActiveCompartmentRun(sessionId);
@@ -33,6 +34,15 @@ export default {
         if (!state) throw new Error("marker observer requires an isolated XDG directory");
         process.env.MAGIC_CONTEXT_LOG_PATH = join(state, "marker.log");
         const hooks = await plugin.server(context);
+        // Observe the host's own index module. A lease-free session can still
+        // have an off-thread terminal-message writer holding the SQLite lock.
+        const indexSettled = (sessionId: string, messageId: string | null, outcome: unknown) => {
+            const trace = process.env.MC_S3_WRITER_TRACE;
+            if (!trace) throw new Error("missing isolated writer trace");
+            appendFileSync(trace, `${JSON.stringify({ kind: "index", sessionId, messageId, outcome, queue: getMessageIndexQueueHeapStats() })}\n`);
+        };
+        __setIncrementalIndexSettledForTests((sessionId, messageId, outcome) => indexSettled(sessionId, messageId, outcome));
+        __setReconciliationSettledForTests((sessionId, outcome) => indexSettled(sessionId, null, outcome));
         const sources = new Map<string, any[]>();
         return {
             ...hooks,
