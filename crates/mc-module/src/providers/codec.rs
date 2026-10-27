@@ -370,13 +370,185 @@ enum NativeBlock {
 #[derive(Clone, Debug, Serialize, Deserialize)]
 #[serde(tag = "kind", rename_all = "snake_case", deny_unknown_fields)]
 enum NativeOutput {
-    Text { text: String },
-    Json { value: Value },
-    Denied { reason: String },
-    Error { message: String },
+    Text {
+        text: String,
+    },
+    Json {
+        value: Value,
+    },
+    Denied {
+        reason: String,
+    },
+    // The tool-plane outage shape: `message` plus five optional siblings, in
+    // the Broca capture's order (`kind`, `message`, `module`, `code`,
+    // `detail`, `nothing_sent`, `retry`). These fields come from
+    // broca-protocol's `ToolOutput::Error` and are not in the llm-runner
+    // contract yet. Absent siblings are omitted on re-encode rather than
+    // written as null, so today's plain `{"kind":"error","message":...}`
+    // still round-trips byte-identically. `deny_unknown_fields` still refuses
+    // anything else, so real shape drift keeps failing as `history_unreadable`
+    // instead of being misread.
+    Error {
+        message: String,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        module: Option<String>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        code: Option<String>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        detail: Option<String>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        nothing_sent: Option<bool>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        retry: Option<String>,
+    },
+}
+
+/// Model-visible text for an owned-broca `Error` output: `message` plus one
+/// line per present field, in broca-protocol's `ToolOutput::error_model_text`
+/// order. `nothing_sent` contributes its line only when true; absent fields
+/// contribute nothing, and lines are joined with `\n` and no trailing
+/// newline. A plain error renders as `message` alone, exactly as today.
+fn error_model_text(
+    message: &str,
+    module: Option<&str>,
+    code: Option<&str>,
+    detail: Option<&str>,
+    nothing_sent: bool,
+    retry: Option<&str>,
+) -> String {
+    let mut text = message.to_string();
+    if let Some(module) = module {
+        text.push_str("\nmodule: ");
+        text.push_str(module);
+    }
+    if let Some(code) = code {
+        text.push_str("\ncode: ");
+        text.push_str(code);
+    }
+    if let Some(detail) = detail {
+        text.push_str("\ndetail: ");
+        text.push_str(detail);
+    }
+    if nothing_sent {
+        text.push_str("\nnothing was sent");
+    }
+    if let Some(retry) = retry {
+        text.push_str("\nretry: ");
+        text.push_str(retry);
+    }
+    text
+}
+
+/// SUBC runner contract 0.7.8 `module` grammar: 1 to 128 bytes, every byte
+/// printable ASCII 0x21-0x7E (no space, no control characters). That covers
+/// re-exported ids like `fed:<peer>:<module>`.
+fn error_module_grammar_ok(value: &str) -> bool {
+    let bytes = value.as_bytes();
+    !bytes.is_empty() && bytes.len() <= 128 && bytes.iter().all(|byte| (0x21..=0x7E).contains(byte))
+}
+
+/// SUBC runner contract 0.7.8 `code` grammar: `^[a-z][a-z0-9_]{0,63}$`,
+/// lowercase snake case starting with a letter, 1 to 64 bytes.
+fn error_code_grammar_ok(value: &str) -> bool {
+    let bytes = value.as_bytes();
+    !bytes.is_empty()
+        && bytes.len() <= 64
+        && bytes[0].is_ascii_lowercase()
+        && bytes
+            .iter()
+            .all(|byte| byte.is_ascii_lowercase() || byte.is_ascii_digit() || *byte == b'_')
+}
+
+/// SUBC runner contract 0.7.8 member rules for an owned-broca `Error` output,
+/// checked on the wire value before typed decode (which would erase `null`
+/// into `None`): `nothing_sent` is the JSON literal `true` when present;
+/// a present string member must be non-empty; no member may be `null`;
+/// string members must not contain a newline (each renders as one
+/// model-text line, so one would forge a line); `detail` and `retry` have
+/// byte limits over the decoded string; and `module`/`code` must meet their
+/// grammars. Violations are refused as `history_unreadable` naming the
+/// member and the rule.
+fn check_error_output(output: &Value) -> Result<(), HandlerOutcome> {
+    let refused = |member: &str, rule: String| {
+        error(
+            "history_unreadable",
+            format!("owned-broca error output member {member} {rule}"),
+        )
+    };
+    if output
+        .get("nothing_sent")
+        .is_some_and(|value| value != &Value::Bool(true))
+    {
+        return Err(refused(
+            "nothing_sent",
+            "must be the literal true when present".into(),
+        ));
+    }
+    for key in ["module", "code", "detail", "retry"] {
+        match output.get(key) {
+            None => {}
+            Some(Value::Null) => {
+                return Err(refused(key, "must not be null".into()));
+            }
+            Some(Value::String(text)) => {
+                if text.is_empty() {
+                    return Err(refused(key, "must not be empty when present".into()));
+                }
+                if text.contains('\n') || text.contains('\r') {
+                    return Err(refused(
+                        key,
+                        "must not contain a newline, which would forge a line in the model text"
+                            .into(),
+                    ));
+                }
+                let limit = match key {
+                    "detail" => Some(1024),
+                    "retry" => Some(256),
+                    _ => None,
+                };
+                if let Some(limit) = limit {
+                    if text.len() > limit {
+                        return Err(refused(
+                            key,
+                            format!(
+                                "is {} bytes, over the {limit}-byte runner-contract limit",
+                                text.len()
+                            ),
+                        ));
+                    }
+                }
+                let grammar_ok = match key {
+                    "module" => error_module_grammar_ok(text),
+                    "code" => error_code_grammar_ok(text),
+                    _ => true,
+                };
+                if !grammar_ok {
+                    return Err(refused(key, "breaks its runner-contract grammar".into()));
+                }
+            }
+            Some(_) => {
+                return Err(refused(key, "must be a string".into()));
+            }
+        }
+    }
+    Ok(())
 }
 
 fn native(message: &Value) -> Result<NativeMessage, HandlerOutcome> {
+    for block in message
+        .get("content")
+        .and_then(Value::as_array)
+        .into_iter()
+        .flatten()
+    {
+        let is_error_output = block.get("type").and_then(Value::as_str) == Some("tool_result")
+            && block.pointer("/output/kind").and_then(Value::as_str) == Some("error");
+        if is_error_output {
+            if let Some(output) = block.get("output") {
+                check_error_output(output)?;
+            }
+        }
+    }
     let parsed: NativeMessage =
         serde_json::from_value(message.clone()).map_err(|e| error("history_unreadable", e))?;
     if !["system", "user", "assistant", "tool"].contains(&parsed.role.as_str()) {
@@ -436,7 +608,27 @@ pub fn decode_message(
                     NativeOutput::Denied { reason } => CkOutputKind::ExecutionDenied {
                         reason: Some(reason),
                     },
-                    NativeOutput::Error { message } => CkOutputKind::ErrorText { text: message },
+                    // The composed model text reaches the CK type, so
+                    // summarizer input, tag text, token estimates and ctx_expand
+                    // all see what the model sees. The structured siblings stay
+                    // on the retained native block for re-encoding.
+                    NativeOutput::Error {
+                        message,
+                        module,
+                        code,
+                        detail,
+                        nothing_sent,
+                        retry,
+                    } => CkOutputKind::ErrorText {
+                        text: error_model_text(
+                            &message,
+                            module.as_deref(),
+                            code.as_deref(),
+                            detail.as_deref(),
+                            nothing_sent.unwrap_or(false),
+                            retry.as_deref(),
+                        ),
+                    },
                 };
                 CkKind::ToolResult {
                     id: tool_call_id,
@@ -537,6 +729,39 @@ pub fn encode_message(message: &ck_wire::CkWireMessage) -> Result<Value, Handler
                             == Some("text")
                         {
                             json!({"kind":"text","text":text})
+                        } else if let Some(output) =
+                            raw.and_then(|v| v.get("output")).filter(|output| {
+                                output.get("kind").and_then(Value::as_str) == Some("error")
+                                    && output.get("message").and_then(Value::as_str).is_some()
+                            })
+                        {
+                            // Rebuild the outage shape in the Broca capture's
+                            // order. The structured fields ride the retained
+                            // native block, never the CK text: an unchanged
+                            // block serves the retained output verbatim, so the
+                            // runner gets back exactly its bytes. An edited
+                            // block (tag prefix, drop placeholder, reminder)
+                            // carries the edit in `message` with the siblings
+                            // preserved alongside. Absent siblings stay absent.
+                            let composed = error_model_text(
+                                output["message"].as_str().unwrap_or_default(),
+                                output.get("module").and_then(Value::as_str),
+                                output.get("code").and_then(Value::as_str),
+                                output.get("detail").and_then(Value::as_str),
+                                output.get("nothing_sent").and_then(Value::as_bool) == Some(true),
+                                output.get("retry").and_then(Value::as_str),
+                            );
+                            if text == &composed {
+                                output.clone()
+                            } else {
+                                let mut value = json!({"kind":"error","message":text});
+                                for key in ["module", "code", "detail", "nothing_sent", "retry"] {
+                                    if let Some(field) = output.get(key) {
+                                        value[key] = field.clone();
+                                    }
+                                }
+                                value
+                            }
                         } else {
                             json!({"kind":"error","message":text})
                         }

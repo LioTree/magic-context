@@ -21845,7 +21845,6 @@ mod tests {
     // slice merged together. Kept in its own files so the sequences it executes
     // read as one argument instead of being scattered through this module.
     mod broca_0_7_samples;
-    mod tool_outage_1027;
     mod broca_contract;
     mod explicit_flush;
     mod gate_a1_b0;
@@ -21855,6 +21854,7 @@ mod tests {
     mod per_pass_cost;
     mod perf_audit_canonical;
     mod perf_audit_wire;
+    mod tool_outage_1027;
     // Only the profiling harness can construct the scoped override. Differential
     // predicates can read it without exposing a switch to other test suites.
     pub(crate) fn per_pass_differentials_disabled() -> bool {
