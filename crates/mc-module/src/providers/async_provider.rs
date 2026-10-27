@@ -8,6 +8,7 @@ use serde::Deserialize;
 mod contract_policy;
 mod cut_runtime;
 mod cut_seed;
+mod decision_log;
 #[cfg(test)]
 mod differential_tests;
 mod emptied_messages;
@@ -18,6 +19,7 @@ mod historian_tail;
 mod history_expand;
 mod moved_session;
 pub(crate) mod offline_first_pass;
+mod pruned_reread;
 pub(crate) mod reminder_echoes;
 mod resident;
 #[cfg(test)]
@@ -205,6 +207,9 @@ pub(crate) struct Runtime {
     pub(crate) full_input_only: std::sync::atomic::AtomicBool,
     #[cfg(test)]
     pub(crate) record_notice_decisions: std::sync::atomic::AtomicBool,
+    /// Every async decision line this handler logged, for tests.
+    #[cfg(test)]
+    pub(crate) decision_lines: Mutex<Vec<String>>,
 }
 
 #[derive(Serialize, Deserialize)]
@@ -248,6 +253,15 @@ pub(crate) struct AsyncRecord {
     /// skipped pass would not look at.
     #[serde(default, skip_serializing_if = "std::ops::Not::not")]
     engine_failed: bool,
+    /// A transcript re-read accepted parts the runner pruned at rest (see
+    /// `pruned_reread`). The runner's next request no longer matches its
+    /// prompt cache, so the next engine pass runs once as a rebuild, as for
+    /// a model or account change, and then this is cleared.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pruned_rebuild_pending: bool,
+    /// What the last engine pass decided, for the notice decision log line.
+    #[serde(skip)]
+    last_pass: Option<decision_log::Pass>,
     #[serde(default)]
     last_discarded_drops: usize,
     #[serde(default)]
@@ -577,6 +591,9 @@ struct Journal {
     forget_tags_of: Vec<String>,
     /// Stored entries below this ordinal go on the next save (a cut).
     truncate_below: Option<u64>,
+    /// Stored entries rewritten in place on the next save: re-reads that
+    /// differ only in reasoning the runner pruned at rest.
+    replaced: BTreeSet<u64>,
     /// The cut seed changed and is written on the next save.
     cut_seed_dirty: bool,
     /// Identities of the baselines as last stored.
@@ -1289,6 +1306,24 @@ impl State {
                 self.entry_index(*ordinal)?,
             ));
         }
+        // An entry not yet stored goes out with the appended ones, already in
+        // its replaced form; only stored ones are rewritten.
+        let mut replaced = Vec::new();
+        for ordinal in &self.journal.replaced {
+            if self
+                .journal
+                .persisted_through
+                .is_some_and(|through| *ordinal <= through)
+            {
+                if let Some(entry) = self.entries.get(ordinal) {
+                    replaced.push((
+                        *ordinal,
+                        entry.raw().to_owned(),
+                        self.entry_index(*ordinal)?,
+                    ));
+                }
+            }
+        }
         let namespace = self.namespace();
         self.prepare_cut_metadata(store)?;
         if self.journal.cut_seed_dirty {
@@ -1362,6 +1397,9 @@ impl State {
         for (ordinal, entry, index) in appended {
             save.append_entry(ordinal, entry, index);
         }
+        for (ordinal, entry, index) in replaced {
+            save.replace_entry(ordinal, entry, index);
+        }
         for (slot, view) in baselines {
             save.baseline(slot, view.map(|json| json.to_string()));
         }
@@ -1393,6 +1431,7 @@ impl State {
         }
         self.journal.truncate = None;
         self.journal.truncate_below = None;
+        self.journal.replaced.clear();
         self.journal.cut_seed_dirty = false;
         self.pending_cut_seeds.clear();
         self.pending_cut_metadata.clear();
@@ -2110,6 +2149,7 @@ fn with_checkpoint(answer: Value, checkpoint: Option<contract::setup::SetupCheck
     if let Some(wait) = decoded.ride_wait_ms() {
         built = built.with_ride_wait_ms(wait);
     }
+    built = built.with_accepts(decoded.accepts().to_vec());
     if let Some(checkpoint) = checkpoint {
         built = built.with_checkpoint(checkpoint);
     }
@@ -2203,6 +2243,7 @@ fn load(store: &McStore, reference: &str) -> Result<Option<State>, HandlerOutcom
         indexed_through: through,
         truncate: None,
         truncate_below: None,
+        replaced: BTreeSet::new(),
         cut_seed_dirty: false,
         clear_published: false,
         forget_tags_of: Vec::new(),
@@ -2735,6 +2776,8 @@ impl McHandler {
             partial_read_seq: None,
             failure: None,
             engine_failed: false,
+            pruned_rebuild_pending: false,
+            last_pass: None,
             last_discarded_drops: 0,
             last_transferred_drops: 0,
             tag_index: BTreeMap::new(),
@@ -2847,7 +2890,11 @@ impl McHandler {
             decode(&serde_json::to_value(wire).map_err(transient)?)?,
         )
         .with_ceiling(CeilingPolicy::new(0.95, 300_000).with_on_overflow())
-        .with_cache_ttl(state.cache_policy.resolve(&request.model));
+        .with_cache_ttl(state.cache_policy.resolve(&request.model))
+        // ck-mc accepts a re-read whose only change is reasoning the runner
+        // pruned at rest (`pruned_reread`), so the runner may prune this
+        // session once it is archived and idle.
+        .with_accepts(vec![compact::setup::ACCEPTS_PRUNED_REASONING.into()]);
         if let Some(cap) = request.ride_wait_max_ms {
             if cap == 0 {
                 return Err(invalid_field("ride_wait_max_ms", "must be positive"));
@@ -4492,6 +4539,9 @@ impl McHandler {
         }
         #[cfg(test)]
         drop(skip_phase);
+        let facts = self.decision_facts(&state);
+        let already_completed = state.completed_seq >= notice.seq && !resynced;
+        state.last_pass = None;
         if run_engine {
             if let Err(error) = self.publish_async(0, &mut state, codec, resynced) {
                 drop(state);
@@ -4500,6 +4550,34 @@ impl McHandler {
             }
             state.engine_failed = false;
         }
+        let (decision, why) = match &state.last_pass {
+            Some(pass) if pass.published => (
+                decision_log::Decision::Execute,
+                decision_log::pass_why(pass),
+            ),
+            Some(pass) => (decision_log::Decision::Defer, decision_log::pass_why(pass)),
+            None if already_completed => (
+                decision_log::Decision::Defer,
+                "notice_already_completed".into(),
+            ),
+            None if run_engine => (decision_log::Decision::Defer, "nothing_to_read".into()),
+            None => (
+                decision_log::Decision::Defer,
+                "engine_skipped_no_work".into(),
+            ),
+        };
+        self.log_decision(decision_log::line(
+            &notice.session_ref,
+            &format!("notice seq={}", notice.seq),
+            decision,
+            &why,
+            &facts,
+            &notice
+                .events
+                .iter()
+                .map(decision_log::event_name)
+                .collect::<Vec<_>>(),
+        ));
         state.completed_seq = state.seq;
         let drops_applied = store
             .load_pending_agent_drops(&state.namespace())
@@ -4624,6 +4702,7 @@ impl McHandler {
             }
             state.lineage = Some(lineage.into());
             let entries: Vec<ReadMessage> = decode(&page["messages"])?;
+            let pruned = pruned_reread::listed(&page);
             if entries.is_empty()
                 && state
                     .entries
@@ -4645,8 +4724,16 @@ impl McHandler {
                     .checked_add(1)
                     .ok_or_else(|| invalid("ordinal exhausted"))?;
                 if let Some(held) = state.entries.get(&entry.ordinal) {
-                    if !stable_entry(&held.read()?, &entry) {
-                        return Err(transient("async entry changed on re-read"));
+                    let held = held.read()?;
+                    if !stable_entry(&held, &entry) {
+                        // The one change a re-read may carry: reasoning the
+                        // runner pruned at rest, listed on the page with the
+                        // parts' write-time digests.
+                        let listed = pruned.get(&entry.mid).map_or(&[][..], Vec::as_slice);
+                        if !pruned_reread::accepts(&held, &entry, listed) {
+                            return Err(transient("async entry changed on re-read"));
+                        }
+                        state.accept_pruned_reread(&entry, listed.len())?;
                     }
                 } else {
                     let codec =
@@ -4964,9 +5051,14 @@ impl McHandler {
         codec: codec::Codec,
         ride: bool,
     ) -> Result<Option<view::CompactionView>, HandlerOutcome> {
+        state.last_pass = None;
         if state.resync || state.entries.is_empty() {
             return Ok(None);
         }
+        // A re-read that accepted pruned reasoning makes this one pass a
+        // rebuild, exactly as a rewrite ride does.
+        let pruned_rebuild = state.pruned_rebuild_pending;
+        let ride = ride || pruned_rebuild;
         let store = self
             .store
             .get()
@@ -5021,6 +5113,14 @@ impl McHandler {
 
         let (template, output) =
             self.async_engine(channel, &binding, state, codec, &status, &mut engine)?;
+        state.pruned_rebuild_pending = false;
+        state.last_pass = Some(decision_log::Pass {
+            action: output.engine.response.action.clone(),
+            reason: output.engine.response.materialize_reason.clone(),
+            rebuild: ride,
+            pruned_rebuild,
+            published: false,
+        });
 
         #[cfg(test)]
         cut_seed::pass_trace::record(
@@ -5339,6 +5439,9 @@ impl McHandler {
                     .map_err(transient)?;
             }
         }
+        if let Some(pass) = &mut state.last_pass {
+            pass.published = true;
+        }
         Ok(Some(view))
     }
 
@@ -5399,9 +5502,12 @@ impl McHandler {
         params: &Value,
     ) -> Result<Vec<u8>, HandlerOutcome> {
         let request: ride::RideRequest = decode(params)?;
-        request
-            .check()
-            .map_err(|e| invalid_field("deadline_ms", e.name()))?;
+        request.check().map_err(|e| match e {
+            // A missing or malformed account label is refused by its own
+            // member; the label itself is never echoed.
+            ride::RideProblem::Account => invalid_field("account", e.name()),
+            _ => invalid_field("deadline_ms", e.name()),
+        })?;
         if matches!(request.cause, ride::RideCause::Unknown(_)) {
             return bytes(&ride::RideAnswer::nothing());
         }
@@ -5468,11 +5574,12 @@ impl McHandler {
             state.reindex()?;
             let rows = state.unsaved_tag_rows(codec)?;
             state.save(store, &rows)?;
+            let facts = self.decision_facts(&state);
             let worker = self.provider_historian_worker();
             let cache_ttl = state.cache_ttl();
             let store = Arc::clone(store);
             let reference = request.session_ref.clone();
-            let view = tokio::task::spawn_blocking(move || {
+            let (view, pass) = tokio::task::spawn_blocking(move || {
                 let _serial = _serial;
                 let view = match worker.publish_async(0, &mut state, codec, true) {
                     Ok(view) => view,
@@ -5484,11 +5591,30 @@ impl McHandler {
                 };
                 state.engine_failed = false;
                 state.save(&store, &[])?;
+                let pass = state.last_pass.clone();
                 worker.checkin(state);
-                Ok::<_, HandlerOutcome>(view)
+                Ok::<_, HandlerOutcome>((view, pass))
             })
             .await
             .map_err(transient)??;
+            // A ride folds whatever its rebuild allows; the line names the
+            // cause, never an account label.
+            self.log_decision(decision_log::line(
+                &request.session_ref,
+                &format!("ride cause={}", request.cause.as_str()),
+                if matches!(request.cause, ride::RideCause::Ceiling) {
+                    decision_log::Decision::Ceiling
+                } else {
+                    decision_log::Decision::Ride
+                },
+                &match (&pass, &view) {
+                    (Some(pass), Some(_)) => decision_log::pass_why(pass),
+                    (Some(pass), None) => format!("{}+nothing", decision_log::pass_why(pass)),
+                    (None, _) => "nothing_to_rebuild".into(),
+                },
+                &facts,
+                &[],
+            ));
             self.announce_async_views().await?;
             match view {
                 Some(view) => bytes(&ride::RideAnswer::view(view).with_cache_ttl(cache_ttl)),
@@ -5759,7 +5885,24 @@ impl crate::historian::HistorianPublicationFence for AsyncHistoryFence {
         if state.resync {
             return Err(reject("conversation is resyncing".into()));
         }
-        store.publish_historian_chunk(request)
+        let compartments = request.compartments.len();
+        let through = request
+            .compartments
+            .iter()
+            .map(|compartment| compartment.end_message)
+            .max();
+        let published = store.publish_historian_chunk(request);
+        if published.is_ok() {
+            // The summary is durable now; whether a view carries it is the
+            // next notice's or ride's decision, which its own line reports.
+            tracing::info!(
+                session_ref = %self.reference,
+                compartments,
+                through = ?through,
+                "async summary completed"
+            );
+        }
+        published
     }
 }
 
@@ -6259,6 +6402,7 @@ impl McHandler {
             ),
             (meta.last_model_key != model, "model_changed"),
             (state.engine_failed, "previous_engine_pass_failed"),
+            (state.pruned_rebuild_pending, "pruned_reasoning_rebuild"),
             (state.restored_head.is_some(), "restored_head"),
             (
                 state.engine.preset != transform::compaction::Preset::Head,
@@ -6373,7 +6517,24 @@ impl McHandler {
             .checkout(store, reference)?
             .ok_or_else(|| transient("async session disappeared"))?;
         let codec = codec::Codec::from_params(&Value::Object(state.setup.params.clone()))?;
+        let facts = self.decision_facts(&state);
         self.publish_async(0, &mut state, codec, false)?;
+        let (decision, why) = match &state.last_pass {
+            Some(pass) if pass.published => (
+                decision_log::Decision::Execute,
+                decision_log::pass_why(pass),
+            ),
+            Some(pass) => (decision_log::Decision::Defer, decision_log::pass_why(pass)),
+            None => (decision_log::Decision::Defer, "nothing_to_read".into()),
+        };
+        self.log_decision(decision_log::line(
+            reference,
+            "wake",
+            decision,
+            &why,
+            &facts,
+            &[],
+        ));
         state.save(store, &[])?;
         self.checkin(state);
         drop(_serial);

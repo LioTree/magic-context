@@ -2,6 +2,7 @@ use super::*;
 use cortexkit_bus_inmemory::{InMemoryBus, InMemoryConfig};
 mod broca_0_7;
 mod broca_tag_rows;
+mod contract_update;
 mod conversation_identity_probe;
 mod descriptors_read;
 mod full_array_setup;
@@ -40,6 +41,12 @@ struct Runner {
     describes: std::sync::atomic::AtomicU64,
     /// A page to answer every `session.read` with, verbatim.
     page_override: Mutex<Option<Value>>,
+    /// A `session.head` answer to give instead of `{"first_ordinal":0}`.
+    head_override: Mutex<Option<Value>>,
+    /// Messages served pruned at rest, by ordinal: the served body and the
+    /// page's `pruned_reasoning` rows for it. The entry in `entries` stays
+    /// the original, so its digests stay the write-time ones.
+    pruned: Mutex<BTreeMap<u64, (Value, Vec<Value>)>>,
     history_requests: Mutex<Vec<Value>>,
 }
 
@@ -132,6 +139,9 @@ impl session_resolver::ProviderRunner for Runner {
             );
         }
         if method == "session.head" {
+            if let Some(head) = self.head_override.lock().unwrap().clone() {
+                return Ok(head);
+            }
             return Ok(json!({"first_ordinal":0}));
         }
         if method == "session.history" {
@@ -195,6 +205,8 @@ impl session_resolver::ProviderRunner for Runner {
             .as_u64()
             .expect("range read, never tail");
         let entries = self.entries.lock().unwrap();
+        let pruned = self.pruned.lock().unwrap();
+        let mut pruned_rows = Vec::new();
         let messages = entries
             .iter()
             .filter(|e| e.ordinal >= from)
@@ -204,9 +216,19 @@ impl session_resolver::ProviderRunner for Runner {
                     size => size,
                 },
             )
-            .map(serve_descriptors)
+            .map(|entry| {
+                let mut served = serve_descriptors(entry);
+                if let Some((message, rows)) = pruned.get(&entry.ordinal) {
+                    served.message = message.clone();
+                    pruned_rows.extend(rows.iter().cloned());
+                }
+                served
+            })
             .collect::<Vec<_>>();
         let mut page = json!({"lineage_id":lineage,"messages":messages});
+        if !pruned_rows.is_empty() {
+            page["pruned_reasoning"] = json!(pruned_rows);
+        }
         if let Some(last) = messages
             .last()
             .filter(|last| entries.last().is_some_and(|end| end.ordinal > last.ordinal))

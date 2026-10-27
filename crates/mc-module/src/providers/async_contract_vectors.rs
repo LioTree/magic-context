@@ -1,5 +1,7 @@
-//! Public-API async contract vectors from published compaction-provider 0.5.1.
-//! Their expected digests come from the contract's independent implementation.
+//! Public-API async contract vectors from published compaction-provider
+//! 0.7.2 (`async.json`, `setup.json`, `setup-accepts.json`, copied byte for
+//! byte). Their expected digests come from the contract's independent
+//! implementation.
 use crate::sha256_hex;
 mod vectors {
     use serde::{de::DeserializeOwned, Serialize};
@@ -459,11 +461,26 @@ fn ride_vectors() {
         [
             RideCause::TtlExpired,
             RideCause::ModelChange,
+            RideCause::AccountChange,
             RideCause::SurfaceChange,
             RideCause::Ceiling,
             RideCause::Unknown("provider_switch".into()),
         ]
     );
+    // compaction-provider 0.7.2: every valid account label round-trips and is
+    // the validated label the request reports for that cause.
+    let accounts = vectors::cases(ride, "account_requests");
+    assert!(!accounts.is_empty());
+    for case in accounts {
+        let request: RideRequest = vectors::round_trip(name(case), &case["params"]);
+        assert_eq!(request.check(), Ok(()), "{}", name(case));
+        assert_eq!(
+            request.account(),
+            case["account"].as_str(),
+            "{}",
+            name(case)
+        );
+    }
     for case in vectors::cases(ride, "requests_refused") {
         let request: RideRequest = serde_json::from_value(case["params"].clone()).unwrap();
         assert_eq!(
@@ -551,6 +568,18 @@ fn ceiling_absent_keeps_existing_setup_bytes() {
             assert_eq!(ceiling, None, "{}", name(case));
         }
     }
+}
+
+/// compaction-provider 0.7.1: a ready answer's `accepts` round-trips and
+/// names the exact pruning permission ck-mc's Setup sends.
+#[test]
+fn setup_accepts_vector_names_pruned_reasoning() {
+    let raw = vectors::load("setup-accepts.json");
+    let answer: SetupAnswer = vectors::round_trip("setup accepts", &raw);
+    assert_eq!(
+        answer.accepts(),
+        &[cortexkit_role_compaction_provider::setup::ACCEPTS_PRUNED_REASONING]
+    );
 }
 
 #[test]

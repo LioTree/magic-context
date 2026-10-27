@@ -92,6 +92,9 @@ drive-fault = []
 # snapshot without using the serving code's policy resolver.
 flate2 = { version = "1", default-features = false, features = ["rust_backend"] }
 cortexkit-role-agent-data = { version = "0.2.4", features = ["test-vectors"] }
+# llm-runner's packaged vectors (archive pruning, head members) for the
+# decode-path tests of members newer than the contract ck-mc was built on.
+cortexkit-role-llm-runner = { version = "=0.7.9", features = ["test-vectors"] }
 cpu-time = "1"
 subc-core = { workspace = true }
 # Embedded real-daemon coverage of HELLO_ACK/open versus the first plan fetch.
