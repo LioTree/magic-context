@@ -19,7 +19,6 @@ mod historian_tail;
 mod history_expand;
 mod moved_session;
 pub(crate) mod offline_first_pass;
-mod pruned_reread;
 pub(crate) mod reminder_echoes;
 mod resident;
 #[cfg(test)]
@@ -253,12 +252,6 @@ pub(crate) struct AsyncRecord {
     /// skipped pass would not look at.
     #[serde(default, skip_serializing_if = "std::ops::Not::not")]
     engine_failed: bool,
-    /// A transcript re-read accepted parts the runner pruned at rest (see
-    /// `pruned_reread`). The runner's next request no longer matches its
-    /// prompt cache, so the next engine pass runs once as a rebuild, as for
-    /// a model or account change, and then this is cleared.
-    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
-    pruned_rebuild_pending: bool,
     /// What the last engine pass decided, for the notice decision log line.
     #[serde(skip)]
     last_pass: Option<decision_log::Pass>,
@@ -591,9 +584,6 @@ struct Journal {
     forget_tags_of: Vec<String>,
     /// Stored entries below this ordinal go on the next save (a cut).
     truncate_below: Option<u64>,
-    /// Stored entries rewritten in place on the next save: re-reads that
-    /// differ only in reasoning the runner pruned at rest.
-    replaced: BTreeSet<u64>,
     /// The cut seed changed and is written on the next save.
     cut_seed_dirty: bool,
     /// Identities of the baselines as last stored.
@@ -1306,24 +1296,6 @@ impl State {
                 self.entry_index(*ordinal)?,
             ));
         }
-        // An entry not yet stored goes out with the appended ones, already in
-        // its replaced form; only stored ones are rewritten.
-        let mut replaced = Vec::new();
-        for ordinal in &self.journal.replaced {
-            if self
-                .journal
-                .persisted_through
-                .is_some_and(|through| *ordinal <= through)
-            {
-                if let Some(entry) = self.entries.get(ordinal) {
-                    replaced.push((
-                        *ordinal,
-                        entry.raw().to_owned(),
-                        self.entry_index(*ordinal)?,
-                    ));
-                }
-            }
-        }
         let namespace = self.namespace();
         self.prepare_cut_metadata(store)?;
         if self.journal.cut_seed_dirty {
@@ -1397,9 +1369,6 @@ impl State {
         for (ordinal, entry, index) in appended {
             save.append_entry(ordinal, entry, index);
         }
-        for (ordinal, entry, index) in replaced {
-            save.replace_entry(ordinal, entry, index);
-        }
         for (slot, view) in baselines {
             save.baseline(slot, view.map(|json| json.to_string()));
         }
@@ -1431,7 +1400,6 @@ impl State {
         }
         self.journal.truncate = None;
         self.journal.truncate_below = None;
-        self.journal.replaced.clear();
         self.journal.cut_seed_dirty = false;
         self.pending_cut_seeds.clear();
         self.pending_cut_metadata.clear();
@@ -2149,7 +2117,6 @@ fn with_checkpoint(answer: Value, checkpoint: Option<contract::setup::SetupCheck
     if let Some(wait) = decoded.ride_wait_ms() {
         built = built.with_ride_wait_ms(wait);
     }
-    built = built.with_accepts(decoded.accepts().to_vec());
     if let Some(checkpoint) = checkpoint {
         built = built.with_checkpoint(checkpoint);
     }
@@ -2243,7 +2210,6 @@ fn load(store: &McStore, reference: &str) -> Result<Option<State>, HandlerOutcom
         indexed_through: through,
         truncate: None,
         truncate_below: None,
-        replaced: BTreeSet::new(),
         cut_seed_dirty: false,
         clear_published: false,
         forget_tags_of: Vec::new(),
@@ -2776,7 +2742,6 @@ impl McHandler {
             partial_read_seq: None,
             failure: None,
             engine_failed: false,
-            pruned_rebuild_pending: false,
             last_pass: None,
             last_discarded_drops: 0,
             last_transferred_drops: 0,
@@ -2890,11 +2855,7 @@ impl McHandler {
             decode(&serde_json::to_value(wire).map_err(transient)?)?,
         )
         .with_ceiling(CeilingPolicy::new(0.95, 300_000).with_on_overflow())
-        .with_cache_ttl(state.cache_policy.resolve(&request.model))
-        // ck-mc accepts a re-read whose only change is reasoning the runner
-        // pruned at rest (`pruned_reread`), so the runner may prune this
-        // session once it is archived and idle.
-        .with_accepts(vec![compact::setup::ACCEPTS_PRUNED_REASONING.into()]);
+        .with_cache_ttl(state.cache_policy.resolve(&request.model));
         if let Some(cap) = request.ride_wait_max_ms {
             if cap == 0 {
                 return Err(invalid_field("ride_wait_max_ms", "must be positive"));
@@ -4702,7 +4663,6 @@ impl McHandler {
             }
             state.lineage = Some(lineage.into());
             let entries: Vec<ReadMessage> = decode(&page["messages"])?;
-            let pruned = pruned_reread::listed(&page);
             if entries.is_empty()
                 && state
                     .entries
@@ -4724,16 +4684,8 @@ impl McHandler {
                     .checked_add(1)
                     .ok_or_else(|| invalid("ordinal exhausted"))?;
                 if let Some(held) = state.entries.get(&entry.ordinal) {
-                    let held = held.read()?;
-                    if !stable_entry(&held, &entry) {
-                        // The one change a re-read may carry: reasoning the
-                        // runner pruned at rest, listed on the page with the
-                        // parts' write-time digests.
-                        let listed = pruned.get(&entry.mid).map_or(&[][..], Vec::as_slice);
-                        if !pruned_reread::accepts(&held, &entry, listed) {
-                            return Err(transient("async entry changed on re-read"));
-                        }
-                        state.accept_pruned_reread(&entry, listed.len())?;
+                    if !stable_entry(&held.read()?, &entry) {
+                        return Err(transient("async entry changed on re-read"));
                     }
                 } else {
                     let codec =
@@ -5055,10 +5007,6 @@ impl McHandler {
         if state.resync || state.entries.is_empty() {
             return Ok(None);
         }
-        // A re-read that accepted pruned reasoning makes this one pass a
-        // rebuild, exactly as a rewrite ride does.
-        let pruned_rebuild = state.pruned_rebuild_pending;
-        let ride = ride || pruned_rebuild;
         let store = self
             .store
             .get()
@@ -5113,12 +5061,10 @@ impl McHandler {
 
         let (template, output) =
             self.async_engine(channel, &binding, state, codec, &status, &mut engine)?;
-        state.pruned_rebuild_pending = false;
         state.last_pass = Some(decision_log::Pass {
             action: output.engine.response.action.clone(),
             reason: output.engine.response.materialize_reason.clone(),
             rebuild: ride,
-            pruned_rebuild,
             published: false,
         });
 
@@ -6402,7 +6348,6 @@ impl McHandler {
             ),
             (meta.last_model_key != model, "model_changed"),
             (state.engine_failed, "previous_engine_pass_failed"),
-            (state.pruned_rebuild_pending, "pruned_reasoning_rebuild"),
             (state.restored_head.is_some(), "restored_head"),
             (
                 state.engine.preset != transform::compaction::Preset::Head,

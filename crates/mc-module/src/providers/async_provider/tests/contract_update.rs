@@ -1,8 +1,6 @@
-//! compaction-provider 0.7.2's account change, 0.7.1's pruned-reasoning
-//! re-reads (with llm-runner 0.7.4's archive pruning), and the async
-//! decision log.
+//! compaction-provider 0.7.2's account change, the async decision log, and
+//! the reasoning shapes llm-runner 0.7.4's archive pruning serves.
 use super::*;
-use cortexkit_role_llm_runner::archive_prunes_reasoning::kinds;
 
 const ACCOUNT: &str = "Route_1.a-b";
 
@@ -176,220 +174,18 @@ async fn account_change_notice_event_is_recorded_and_never_rebuilds() {
     assert!(!line.contains(ACCOUNT), "the label is never logged: {line}");
 }
 
-/// The last held message of the pruning fixture: an assistant message whose
-/// reasoning part comes before its text.
-const PRUNED_ORDINAL: u64 = 39;
-
-fn reasoning_fixture(rig: &Rig) -> (Value, Value) {
-    let mut entries = rig.runner.entries.lock().unwrap();
-    let entry = entries
-        .iter_mut()
-        .find(|entry| entry.ordinal == PRUNED_ORDINAL)
-        .unwrap();
-    let original = json!({"id":"p39r","type":"reasoning","text":"weighing which file to read next","metadata":{"anthropic":{"signature":"invented-signature-39"}}});
-    let text = entry.message["parts"][0].clone();
-    entry.message["parts"] = json!([original.clone(), text]);
-    entry.tags = vec![
-        tags::PartTag::untagged("0"),
-        tags::PartTag::tagged("1", format!("§{}§", 100 + PRUNED_ORDINAL * 3)),
-    ];
-    let mut pruned = entry.message.clone();
-    pruned["parts"][0] = json!({"id":"p39r","type":"reasoning","text":""});
-    (original, pruned)
-}
-
-/// Serve message 39 pruned at rest, listing its reasoning part as `kind`
-/// with `sha256`.
-fn prune(rig: &Rig, pruned: Value, kind: &str, sha256: String, bytes: u64) {
-    rig.runner.pruned.lock().unwrap().insert(
-        PRUNED_ORDINAL,
-        (
-            pruned,
-            vec![json!({"mid":format!("m{PRUNED_ORDINAL}"),"part":"0","kind":kind,"bytes":bytes,"sha256":sha256})],
-        ),
-    );
-}
-
-async fn pruning_rig(dir: &Path) -> (Rig, Value, Value) {
-    let rig = Rig::new(dir).await;
-    rig.fill(40);
-    let (original, pruned) = reasoning_fixture(&rig);
-    rig.notice(1, 1_000, None).await;
-    assert_eq!(rig.newest(), None);
-    rig.queue(&[163, 166, 169]).await;
-    (rig, original, pruned)
-}
-
-/// llm-runner 0.7.4 / compaction-provider 0.7.1: after the runner prunes
-/// reasoning in an archived idle session, the re-read of a held message may
-/// differ from the held copy only in the parts the page lists in
-/// `pruned_reasoning`, with matching write-time digests. ck-mc accepts that
-/// instead of refusing "async entry changed on re-read": the held copy and
-/// its stored row are replaced in place, the lineage and generation do not
-/// move, and the notice runs exactly one rebuild, which also lands the
-/// pending cleanup. The next notice is ordinary again.
+/// ck-mc does not opt in to archive pruning: its Setup ready answer carries
+/// no `accepts` member, so no runner prunes reasoning in a session ck-mc
+/// compacts. Opting in waits for compaction-provider's revised pruning
+/// contract; until then a re-read that differs is refused and the session
+/// is read again from scratch, as before.
 #[tokio::test]
-async fn pruned_reasoning_reread_is_accepted_with_one_rebuild() {
-    let dir = tempfile::tempdir().unwrap();
-    let (rig, original, pruned) = pruning_rig(dir.path()).await;
-    let control_dir = tempfile::tempdir().unwrap();
-    let (control, _, _) = pruning_rig(control_dir.path()).await;
-    let before = rig.state();
-    prune(
-        &rig,
-        pruned.clone(),
-        kinds::REASONING,
-        contract::digest::content_digest(&original),
-        serde_jcs::to_vec(&original).unwrap().len() as u64,
-    );
-    rig.notice(2, 1_000, None).await;
-    control.notice(2, 1_000, None).await;
-    assert_eq!(control.newest(), None, "without pruning the notice defers");
-    let rebuilt = rig.newest().expect("the pruned re-read rebuilds once");
-    let after = rig.state();
-    assert_eq!(after.generation, before.generation, "no reset");
-    assert_eq!(after.lineage, before.lineage);
-    assert!(!after.resync);
-    assert!(!after.pruned_rebuild_pending, "the one rebuild is spent");
-    let held = after.entries.get(&PRUNED_ORDINAL).unwrap().read().unwrap();
-    assert_eq!(held.message, pruned, "the stored row holds the pruned copy");
-    assert_eq!(
-        held.part_digests,
-        before
-            .entries
-            .get(&PRUNED_ORDINAL)
-            .unwrap()
-            .read()
-            .unwrap()
-            .part_digests
-    );
-    let line = notice_line(&rig, 2);
-    assert!(line.starts_with("async decision execute "), "{line}");
-    assert!(line.contains("+pruned_reasoning_rebuild"), "{line}");
-    assert!(
-        rig.pending_targets().len() < 3,
-        "the rebuild landed the cleanup"
-    );
-    rig.notice(3, 1_000, Some(rebuilt)).await;
-    assert_eq!(
-        rig.newest(),
-        Some(rebuilt),
-        "the next notice does not rebuild again"
-    );
-    assert!(!notice_line(&rig, 3).contains("pruned_reasoning_rebuild"));
-}
-
-/// The re-read rule is narrow: a listed digest that is not the part's
-/// write-time digest, a kind the contract does not define, an unlisted
-/// change and a listed part whose type changed are each still a changed
-/// transcript, refused exactly as before.
-#[tokio::test]
-async fn pruned_reasoning_reread_outside_the_rule_is_still_refused() {
-    let dir = tempfile::tempdir().unwrap();
-    let (rig, original, pruned) = pruning_rig(dir.path()).await;
-    let digest = contract::digest::content_digest(&original);
-    let bytes = serde_jcs::to_vec(&original).unwrap().len() as u64;
-    let mut retyped = pruned.clone();
-    retyped["parts"][0]["type"] = json!("text");
-    let mut unlisted = pruned.clone();
-    unlisted["parts"][1]["text"] = json!("rewritten text");
-    for (name, served, kind, sha256) in [
-        (
-            "wrong digest",
-            pruned.clone(),
-            kinds::REASONING,
-            "0".repeat(64),
-        ),
-        (
-            "unknown kind",
-            pruned.clone(),
-            "future_kind",
-            digest.clone(),
-        ),
-        (
-            "unlisted change",
-            unlisted,
-            kinds::REASONING,
-            digest.clone(),
-        ),
-        ("type changed", retyped, kinds::REASONING, digest.clone()),
-    ] {
-        prune(&rig, served, kind, sha256, bytes);
-        let mut state = rig.state();
-        let from = state.read_from();
-        let read = rig
-            .h
-            .read_async_resumable(&mut state, from, Duration::from_secs(5))
-            .await;
-        match read {
-            Err(HandlerOutcome::Error { message, .. }) => {
-                assert_eq!(message, "async entry changed on re-read", "{name}")
-            }
-            other => panic!("{name}: {:?}", other.map(|_| ())),
-        }
-        assert!(!state.pruned_rebuild_pending, "{name}");
-    }
-    // Without any listing the changed message is refused too.
-    rig.runner.pruned.lock().unwrap().clear();
-    rig.runner
-        .pruned
-        .lock()
-        .unwrap()
-        .insert(PRUNED_ORDINAL, (pruned, Vec::new()));
-    let mut state = rig.state();
-    let from = state.read_from();
-    assert!(rig
-        .h
-        .read_async_resumable(&mut state, from, Duration::from_secs(5))
-        .await
-        .is_err());
-}
-
-/// The resident path and the full-recompute oracle agree on a pruned
-/// re-read: the same views, versions and decisions on both sides.
-#[tokio::test]
-async fn pruned_reasoning_reread_matches_the_full_recompute_oracle() {
-    let dir = tempfile::tempdir().unwrap();
-    let (rig, original, pruned) = pruning_rig(dir.path()).await;
-    let oracle_dir = tempfile::tempdir().unwrap();
-    let (oracle, _, _) = pruning_rig(oracle_dir.path()).await;
-    oracle
-        .h
-        .provider_store
-        .async_runtime
-        .resident
-        .lock()
-        .unwrap()
-        .oracle = true;
-    for side in [&rig, &oracle] {
-        prune(
-            side,
-            pruned.clone(),
-            kinds::REASONING,
-            contract::digest::content_digest(&original),
-            serde_jcs::to_vec(&original).unwrap().len() as u64,
-        );
-        side.notice(2, 1_000, None).await;
-    }
-    let resident_view = rig.get(rig.newest().unwrap()).await;
-    let oracle_view = oracle.get(oracle.newest().unwrap()).await;
-    assert_eq!(resident_view.view_version, oracle_view.view_version);
-    assert_eq!(resident_view.ranges, oracle_view.ranges);
-    assert_eq!(rig.render(&resident_view), oracle.render(&oracle_view));
-}
-
-/// Setup's ready answer opts in to archive pruning: compaction-provider
-/// 0.7.1's `accepts: ["pruned_reasoning"]`, the exact name.
-#[tokio::test]
-async fn setup_answer_accepts_pruned_reasoning() {
+async fn setup_answer_does_not_opt_in_to_archive_pruning() {
     let dir = tempfile::tempdir().unwrap();
     let rig = Rig::new(dir.path()).await;
     let answer: compact::setup::SetupAnswer = decode(&rig.state().initial).unwrap();
-    assert_eq!(
-        answer.accepts(),
-        &[compact::setup::ACCEPTS_PRUNED_REASONING]
-    );
-    assert_eq!(rig.state().initial["accepts"], json!(["pruned_reasoning"]));
+    assert!(answer.accepts().is_empty());
+    assert!(rig.state().initial.get("accepts").is_none());
 }
 
 /// A finished summary at low usage publishes nothing; the next notice at

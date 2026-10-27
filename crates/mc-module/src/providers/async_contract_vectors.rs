@@ -1,7 +1,6 @@
 //! Public-API async contract vectors from published compaction-provider
-//! 0.7.2 (`async.json`, `setup.json`, `setup-accepts.json`, copied byte for
-//! byte). Their expected digests come from the contract's independent
-//! implementation.
+//! 0.7.2 (`async.json`, `setup.json`, copied byte for byte). Their expected
+//! digests come from the contract's independent implementation.
 use crate::sha256_hex;
 mod vectors {
     use serde::{de::DeserializeOwned, Serialize};
@@ -568,18 +567,6 @@ fn ceiling_absent_keeps_existing_setup_bytes() {
             assert_eq!(ceiling, None, "{}", name(case));
         }
     }
-}
-
-/// compaction-provider 0.7.1: a ready answer's `accepts` round-trips and
-/// names the exact pruning permission ck-mc's Setup sends.
-#[test]
-fn setup_accepts_vector_names_pruned_reasoning() {
-    let raw = vectors::load("setup-accepts.json");
-    let answer: SetupAnswer = vectors::round_trip("setup accepts", &raw);
-    assert_eq!(
-        answer.accepts(),
-        &[cortexkit_role_compaction_provider::setup::ACCEPTS_PRUNED_REASONING]
-    );
 }
 
 #[test]
