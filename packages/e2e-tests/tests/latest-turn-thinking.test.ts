@@ -428,7 +428,7 @@ for (const { band, mode } of [{ band: 76, mode: "drops" }, { band: 85, mode: "dr
 				const reclaimLine = "pending ops WILL APPLY — reason=ride=executeReclaim (scheduler=execute)";
 				await h.waitFor(() => readFileSync(logPath, "utf8").slice(beforeUserLog).includes(reclaimLine), { timeoutMs: 5000, label: "execute reclaim log line" }).catch(() => undefined);
 				expect(readFileSync(logPath, "utf8").slice(beforeUserLog)).toContain(reclaimLine);
-				const frozenThinking = () => h.contextDb().query("SELECT merged_reasoning_stripped_ids FROM session_meta WHERE session_id = ?").get(childId);
+				const frozenThinking = () => h.contextDb().query(`SELECT ${sessionMetaFieldSelect("merged_reasoning_stripped_ids")} FROM session_meta WHERE session_id = ?`).get(childId);
 				const frozen = frozenThinking();
 				expect(bytes(frozen)).not.toMatch(/null|\[\]/);
 				const rebuiltBody = workerRequest();

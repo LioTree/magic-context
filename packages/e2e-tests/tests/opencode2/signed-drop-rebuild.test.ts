@@ -4,6 +4,7 @@ import { writeFileSync } from "node:fs";
 import { join } from "node:path";
 import { OpenCode } from "@opencode/client";
 import { MockProvider } from "../../src/mock-provider/server";
+import { sessionMetaFieldSelect } from "../../src/session-meta-fields";
 import {
 	inspectOpenFiles,
 	isolation,
@@ -191,7 +192,7 @@ async function runSignedReclaimScenario(held: boolean) {
 				.filter((part) => part.type === "thinking"),
 		).toEqual([]);
 		expect(pending()).toHaveLength(0);
-		const frozen = () => db.query("SELECT merged_reasoning_stripped_ids FROM session_meta WHERE session_id = ?").get(session.id);
+		const frozen = () => db.query(`SELECT ${sessionMetaFieldSelect("merged_reasoning_stripped_ids")} FROM session_meta WHERE session_id = ?`).get(session.id);
 		const stripped = frozen();
 		expect(JSON.stringify(stripped)).not.toMatch(/null|\[\]/);
 		await prompt("Defer with no newly queued reductions; finish.");
