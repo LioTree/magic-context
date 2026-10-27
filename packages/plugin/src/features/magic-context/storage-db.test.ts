@@ -116,9 +116,7 @@ function setLinuxIdentityProbe(processStartTicks = 10_000): void {
 
 function reportNoLiveHarnessProcesses(): void {
     __setRpcIdentityTestHooks({ platform: "linux" });
-    __setAsyncProcessProbeForTests(async () =>
-        "41001 1 Mon Jan 01 00:00:00 2024 bun test\n",
-    );
+    __setAsyncProcessProbeForTests(async () => "41001 1 Mon Jan 01 00:00:00 2024 bun test\n");
 }
 
 afterEach(() => {
