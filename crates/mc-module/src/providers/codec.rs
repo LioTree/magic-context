@@ -439,12 +439,14 @@ fn error_model_text(
     text
 }
 
-/// SUBC runner contract 0.7.8 `module` grammar: 1 to 128 bytes, every byte
-/// printable ASCII 0x21-0x7E (no space, no control characters). That covers
-/// re-exported ids like `fed:<peer>:<module>`.
+/// Runner contract `module` rule: 1 to 255 bytes of UTF-8 with no control
+/// character. It matches the widest module id the subc daemon registers
+/// (spaces, non-ASCII and re-exported `fed:<peer>:<module>` ids included), so
+/// a real outage on any registered module never refuses a history page.
+/// Excluding control characters also excludes `\n` and `\r`, so the value
+/// still renders as a single model-text line.
 fn error_module_grammar_ok(value: &str) -> bool {
-    let bytes = value.as_bytes();
-    !bytes.is_empty() && bytes.len() <= 128 && bytes.iter().all(|byte| (0x21..=0x7E).contains(byte))
+    !value.is_empty() && value.len() <= 255 && !value.chars().any(char::is_control)
 }
 
 /// SUBC runner contract 0.7.8 `code` grammar: `^[a-z][a-z0-9_]{0,63}$`,

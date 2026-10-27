@@ -465,20 +465,32 @@ fn tool_outage_detail_retry_length_limits() {
     }
 }
 
-/// Grammar boundaries from the runner contract: `module` is 1-128 bytes of
-/// printable ASCII (no space); `code` is `^[a-z][a-z0-9_]{0,63}$`.
+/// Grammar boundaries from the runner contract: `module` is 1-255 bytes of
+/// UTF-8 with no control character; `code` is `^[a-z][a-z0-9_]{0,63}$`.
 #[test]
 fn tool_outage_module_code_grammar_boundaries() {
-    let module_128 = "a".repeat(128);
-    let module_129 = "a".repeat(129);
+    let module_255 = "a".repeat(255);
+    let module_256 = "a".repeat(256);
+    // 253 ASCII bytes plus a two-byte character: 255 bytes, then 256 bytes.
+    let module_255_multibyte = format!("{}é", "a".repeat(253));
+    let module_256_multibyte = format!("{}é", "a".repeat(254));
+    assert_eq!(module_255_multibyte.len(), 255);
+    assert_eq!(module_256_multibyte.len(), 256);
     for (value, ok) in [
         ("", false),
         ("a", true),
         ("fed:peer:work", true),
-        ("has space", false),
+        ("prefrontal-core", true),
+        ("sidekick-lead-ab-8163", true),
+        ("has space", true),
+        ("modulé", true),
         ("tab\there", false),
-        (module_128.as_str(), true),
-        (module_129.as_str(), false),
+        ("line\nbreak", false),
+        ("del\u{7f}char", false),
+        (module_255.as_str(), true),
+        (module_256.as_str(), false),
+        (module_255_multibyte.as_str(), true),
+        (module_256_multibyte.as_str(), false),
     ] {
         let native = serde_json::json!({"role":"tool","content":[{"type":"tool_result","tool_call_id":"c","output":{"kind":"error","message":"boom","module":value},"is_error":true}]});
         let inbound = crate::providers::codec::InboundMessage {
