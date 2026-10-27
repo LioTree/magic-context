@@ -16,6 +16,7 @@ import { homedir, tmpdir } from "node:os";
 import { dirname, join } from "node:path";
 import {
     __resetRpcIdentityTestHooks,
+    __setAsyncProcessProbeForTests,
     __setRpcIdentityTestHooks,
     type AsyncProcessInspection,
     inspectWindowsProcessesSync,
@@ -113,11 +114,19 @@ function setLinuxIdentityProbe(processStartTicks = 10_000): void {
     });
 }
 
+function reportNoLiveHarnessProcesses(): void {
+    __setRpcIdentityTestHooks({ platform: "linux" });
+    __setAsyncProcessProbeForTests(async () =>
+        "41001 1 Mon Jan 01 00:00:00 2024 bun test\n",
+    );
+}
+
 afterEach(() => {
     closeDatabase();
     __resetRpcDiscoveryFsForTests();
     __resetSchemaFenceStateForTests();
     __resetRpcIdentityTestHooks();
+    __setAsyncProcessProbeForTests();
     __resetStoragePrivatePermissionEnforcementForTests();
     if (originalXdgDataHome === undefined) delete process.env.XDG_DATA_HOME;
     else process.env.XDG_DATA_HOME = originalXdgDataHome;
@@ -266,6 +275,9 @@ describe("explicit shared storage resolution", () => {
     it("reports the same finite boot busy timeout installed before the first schema read", async () => {
         useTempDataHome("storage-db-boot-busy-timeout-");
         const diagnostics: string[] = [];
+        // Other unit workers can run mock Pi processes. Keep boot diagnostics
+        // independent of the shared-store migration refusal those processes cause.
+        reportNoLiveHarnessProcesses();
         const db = await openDatabaseAsync({
             busyTimeoutMs: 0,
             onBootBusyTimeout: (message) => diagnostics.push(message),
@@ -306,6 +318,7 @@ describe("explicit shared storage resolution", () => {
     it("reports bounded boot phase timings for an async open", async () => {
         const dataHome = useTempDataHome("storage-db-boot-timing-");
         let timings: { openMs: number; guardMs: number; migrateMs: number } | undefined;
+        reportNoLiveHarnessProcesses();
 
         const db = await openDatabaseAsync({
             onBootTimings: (observed) => {
