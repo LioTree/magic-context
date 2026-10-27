@@ -357,6 +357,10 @@ import {
 	preparePiToolRemovalMeasurements,
 } from "./native-replay-state-pi";
 import { hasVisibleNoteReadCallPi } from "./note-visibility-pi";
+import {
+	clearPiAbandonedMessageIds,
+	resolvePiAbandonedMessageIds,
+} from "./pi-abandoned-message-ids";
 import { adaptPiAppendCompaction } from "./pi-append-compaction";
 import { PI_CONTEXT_BUDGET, PiContextDeadlineError } from "./pi-context-budget";
 import {
@@ -5958,6 +5962,14 @@ export function registerPiContextHandler(
 									options.db,
 								),
 							decisions: postTransformSnapshot?.autoSearchDecisions,
+							// Exclude ids a rewound entry left behind: Pi keeps them in the
+							// session file, so their index rows would otherwise be quotable
+							// after a /tree jump.
+							abandonedMessageIds: resolvePiAbandonedMessageIds(
+								ctx,
+								sessionId,
+								branchEntries,
+							)?.abandoned,
 							options: {
 								enabled: true,
 								scoreThreshold: options.autoSearch.scoreThreshold,
@@ -12158,6 +12170,7 @@ export function clearContextHandlerSession(sessionId: string): void {
 	cancelPiTagSnapshotSession(sessionId);
 	lastServedSystemHashBySession.delete(sessionId);
 	clearPiHistoryBoundaryRepairSession(sessionId);
+	clearPiAbandonedMessageIds(sessionId);
 	clearPiUpperReclaimSession(sessionId);
 	invalidateTrueRawTokenCache({ sessionId, reason: "pi.branch.changed" });
 	clearPiLiveUsageClassification(sessionId);

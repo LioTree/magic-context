@@ -40,6 +40,7 @@ import {
 } from "@magic-context/core/tools/ctx-search/date-range";
 import { unwrapImitatedReducedArgs } from "@magic-context/core/tools/unwrap-imitated-reduced-args";
 import { type Static, Type } from "typebox";
+import { resolvePiAbandonedMessageIds } from "../pi-abandoned-message-ids";
 
 const DEFAULT_LIMIT = 10;
 
@@ -205,6 +206,12 @@ export function createCtxSearchTool(
 			const messageOrdinalCutoff =
 				lastCompartmentEnd >= 0 ? lastCompartmentEnd : 0;
 
+			// Pi keeps abandoned branch entries in the session file, so their index
+			// rows outlive the rewind and stay searchable once a compartment moves the
+			// ordinal cutoff past them. Exclude exactly those ids; null (unknown)
+			// leaves the lane unfiltered rather than guessing.
+			const abandonedMessageIds = resolvePiAbandonedMessageIds(ctx, sessionId);
+
 			// Hard-filter memories already rendered in <session-history>.
 			const visibleMemoryIds = getVisibleMemoryIds(deps.db, sessionId);
 			const diagnostics = createUnifiedSearchDiagnostics();
@@ -267,6 +274,7 @@ export function createCtxSearchTool(
 					},
 					isEmbeddingRuntimeEnabled: () => embeddingEnabled === true,
 					maxMessageOrdinal: messageOrdinalCutoff,
+					excludedMessageIds: abandonedMessageIds?.abandoned ?? null,
 					gitCommitsEnabled,
 					sources: normalizeSources(params.sources),
 					visibleMemoryIds,

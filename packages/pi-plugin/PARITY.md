@@ -1132,6 +1132,43 @@ OMP source references, shipped in 18.2.6:
 The overlay test preserves exact 100K/160K denominators, the stale-before-reload
 assertion, and the same session ID through the OMP restart.
 
+## 37. Rewound history leaves searchable index rows on the Pi hosts
+
+**HOST-IMPOSED, Pi and OMP:** a rewind (`/tree`, `/clone` from an earlier point)
+moves the session leaf; it never deletes the abandoned entries, which stay in the
+session JSONL and keep their `context.db` index rows (`message_history_fts` keyed
+by `(session_id, message_id)`). OpenCode is the opposite: its rewind deletes the
+messages, and the plugin clears and rebuilds the session index on
+`message.removed` (v1) / `session.revert.committed` (v2).
+
+`ctx_search`'s message lane bounds hits by an ordinal cutoff
+(`maxMessageOrdinal`, the last compartment end) and never by branch membership, so
+the abandoned rows are unreachable only until a compartment publish moves the
+cutoff past them — after which they surface again. Ordinals cannot express the
+bound either: they are positional, and a new branch reuses the ordinals the
+abandoned one vacated.
+
+**Mechanism:** `pi-abandoned-message-ids.ts` classifies `getBranch()` against
+`getEntries()` and hands the difference to the lane as
+`UnifiedSearchOptions.excludedMessageIds`, a deny-list applied to every message
+statement (plain, relaxed, probe-batched, date-bounded). Hits it removes are
+counted in
+diagnostics, so `ctx_search` says why results disappeared instead of silently
+returning fewer. `ctx_search` and Pi auto-search both pass it; the set is memoized
+on `(sessionId, leafId)` because `getEntries()` copies the whole file.
+
+**The deny-list must NOT be an allow-list of live ids.** A compartment exists
+because its messages left the live context, so a legitimate hit is normally
+off-branch by construction — scoping to the branch hides the archive the lane is
+for. Only ids the file still holds but the leaf no longer reaches are excluded,
+because their presence in the file is what distinguishes a rewind from a
+compaction. A host that cannot enumerate entries (`getEntries` absent or throwing)
+returns null, which leaves the lane unfiltered rather than claiming an empty
+abandoned set.
+
+**OpenCode and Rust are untouched:** `excludedMessageIds` is null there, so the
+lane keeps its previous cost and results.
+
 ## Static decision calibration
 
 Pi history rendering and the shared canonical protected-token walk use the same static seeds as OpenCode/Rust. Provider-reported SDK usage remains unscaled. The raw/replay fit helper recounts the supplied array and requires explicit system/tool observations; the storage-failure catch currently has no complete held observations and must refuse rather than admit on serialized byte size alone. Media and unsupported message shapes cannot establish fit. Historian fit uses assembled user/system text and independently resolves each selected model's window. Provider framing and subprocess-added prompt content remain outside MC's observed representation.

@@ -124,6 +124,13 @@ export interface CapturedQueryEmbedding {
 export interface UnifiedSearchDiagnostics {
     suppressedVisibleMemoryIds: number[];
     suppressedLiveMessageMatches: number;
+    /**
+     * Raw-message hits whose message id the host still holds but no longer
+     * reaches from the active leaf — i.e. a rewind abandoned them. Pi and OMP keep
+     * every branch's entries in the session file, so their index rows outlive the
+     * branch and would otherwise stay searchable.
+     */
+    suppressedRewoundMessageMatches: number;
     gitCommitUnavailable: "no_git_repository" | null;
 }
 
@@ -131,6 +138,7 @@ export function createUnifiedSearchDiagnostics(): UnifiedSearchDiagnostics {
     return {
         suppressedVisibleMemoryIds: [],
         suppressedLiveMessageMatches: 0,
+        suppressedRewoundMessageMatches: 0,
         gitCommitUnavailable: null,
     };
 }
@@ -164,6 +172,13 @@ export interface UnifiedSearchOptions {
     isEmbeddingRuntimeEnabled?: () => boolean;
     /** Only return message-history hits with ordinal ≤ this value (e.g. last compartment end). -1 or omit to search all. */
     maxMessageOrdinal?: number;
+    /**
+     * Message ids a rewind abandoned; see
+     * {@link MessageHistorySearchRequest.excludedMessageIds}. Hosts whose rewind
+     * keeps abandoned records pass this so stale index rows cannot be returned;
+     * every other caller leaves it null and pays nothing.
+     */
+    excludedMessageIds?: ReadonlySet<string> | null;
     /** Include indexed git commits in the result set. Default false — the
      *  feature is gated behind experimental.git_commit_indexing config. */
     gitCommitsEnabled?: boolean;
@@ -263,12 +278,23 @@ export interface MessageHistorySearchRequest {
     /** The caller wants diagnostics; this also selects the diagnostic statements. */
     collectDiagnostics: boolean;
     dateRange: { from: number; to: number } | null;
+    /**
+     * Message ids a rewind abandoned. When set, hits for these ids are dropped and
+     * counted. Omit or pass null where the host deletes abandoned records
+     * (OpenCode 1 and 2), so the lane keeps its existing behaviour and cost.
+     *
+     * This is a deny-list on purpose: a compartment exists because its messages
+     * left the live context, so an allow-list of live ids would also hide the
+     * legitimate archive.
+     */
+    excludedMessageIds?: ReadonlySet<string> | null;
 }
 
 export interface MessageHistorySearchOutcome {
     results: MessageSearchResult[];
     laneResults?: MessageSearchResult[];
     suppressedLiveMessageMatches: number;
+    suppressedRewoundMessageMatches: number;
 }
 
 /** The message-history lane of {@link unifiedSearch}, callable from a worker. */
@@ -288,6 +314,7 @@ export function searchMessageHistory(
         maxOrdinal: request.maxOrdinal,
         probes: request.probes,
         relaxedRecall: request.relaxedRecall,
+        excludedMessageIds: request.excludedMessageIds ?? null,
         diagnostics,
         dateRange: request.dateRange,
         capture,
@@ -296,6 +323,7 @@ export function searchMessageHistory(
         results,
         laneResults: capture?.results,
         suppressedLiveMessageMatches: diagnostics?.suppressedLiveMessageMatches ?? 0,
+        suppressedRewoundMessageMatches: diagnostics?.suppressedRewoundMessageMatches ?? 0,
     };
 }
 
@@ -1384,6 +1412,8 @@ function searchMessages(args: {
      * original single-query behavior (unchanged for NL queries / hot path). */
     probes?: string[];
     relaxedRecall?: boolean;
+    /** Message ids a rewind abandoned. Null searches the whole index. */
+    excludedMessageIds?: ReadonlySet<string> | null;
     diagnostics?: UnifiedSearchDiagnostics;
     dateRange: InclusiveDateRange | null;
     capture?: { limit: number; results: MessageSearchResult[] };
@@ -1393,16 +1423,53 @@ function searchMessages(args: {
     );
 }
 
+/**
+ * Drop rows the host no longer counts as live history and remember how many
+ * distinct messages that removed.
+ *
+ * Pi and OMP keep every entry of a rewound branch in the session file, so their
+ * index rows outlive the branch that produced them. Filtering by message id here
+ * is the only place that knows both the index rows and the host's membership
+ * test; the ordinal cutoff cannot express it because ordinals are positional and
+ * a new branch reuses them.
+ *
+ * The test is deliberately a DENY-list (`excluded.has`), not an allow-list:
+ * compaction moves a message off the live branch while keeping it searchable on
+ * purpose, so an allow-list would hide the entire archive this lane exists for.
+ */
+function dropOffBranchRows(
+    rows: NormalizedMessageRow[],
+    excludedMessageIds: ReadonlySet<string> | null,
+    suppressed: Set<string>,
+): NormalizedMessageRow[] {
+    if (excludedMessageIds === null) return rows;
+    const kept: NormalizedMessageRow[] = [];
+    for (const row of rows) {
+        if (excludedMessageIds.has(row.messageId)) suppressed.add(row.messageId);
+        else kept.push(row);
+    }
+    return kept;
+}
+
 function searchMessagesInSnapshot(
     args: Parameters<typeof searchMessages>[0],
     sessionFirst: boolean,
 ): MessageSearchResult[] {
     const cutoff = args.maxOrdinal != null && args.maxOrdinal >= 0 ? args.maxOrdinal : null;
-    const baselineFetchLimit = cutoff !== null ? args.limit * 3 : args.limit;
+    const excludedMessageIds = args.excludedMessageIds ?? null;
+    const suppressedRewound = new Set<string>();
+    // A branch filter removes rows the FTS ranking considered relevant, so ask
+    // for headroom before slicing; the per-message dedupe below still bounds the
+    // count reported to the caller.
+    const branchFetchMultiplier = excludedMessageIds === null ? 1 : 4;
+    const baselineFetchLimit =
+        cutoff !== null
+            ? args.limit * 3 * branchFetchMultiplier
+            : args.limit * branchFetchMultiplier;
     const captureFetchLimit = args.capture
         ? cutoff !== null
-            ? args.capture.limit * 3
-            : args.capture.limit
+            ? args.capture.limit * 3 * branchFetchMultiplier
+            : args.capture.limit * branchFetchMultiplier
         : 0;
     const fetchLimit = Math.max(baselineFetchLimit, captureFetchLimit);
 
@@ -1440,7 +1507,7 @@ function searchMessagesInSnapshot(
         }
         // Exact conjunctions remain the ranking authority; only empty searches
         // need a disjunction to recover a relevant term from a long question.
-        const rows =
+        const rawRows =
             outcome.rows.length > 0 || !args.relaxedRecall
                 ? outcome.rows
                 : runMessageFtsQuery(
@@ -1452,6 +1519,10 @@ function searchMessagesInSnapshot(
                       args.dateRange,
                       sessionFirst,
                   );
+        const rows = dropOffBranchRows(rawRows, excludedMessageIds, suppressedRewound);
+        if (args.diagnostics) {
+            args.diagnostics.suppressedRewoundMessageMatches = suppressedRewound.size;
+        }
         const renderRows = (limit: number) => {
             const filtered = rows.slice(0, limit);
             return filtered.map(
@@ -1519,7 +1590,11 @@ function searchMessagesInSnapshot(
     let queryIndex = 0;
     if (baseQuery.length > 0) {
         queryLists.push({
-            rows: baseOutcome?.rows ?? rowsByQuery[queryIndex] ?? [],
+            rows: dropOffBranchRows(
+                baseOutcome?.rows ?? rowsByQuery[queryIndex] ?? [],
+                excludedMessageIds,
+                suppressedRewound,
+            ),
             // The full query is AND-joined and inherently discriminative.
             weight: 1,
         });
@@ -1529,9 +1604,19 @@ function searchMessagesInSnapshot(
     sanitizedProbes.forEach((entry, probeIndex) => {
         const weight = probeDiscriminationWeight(probeCounts[probeIndex] ?? 0, corpusSize);
         probeWeights.set(entry.probe, weight);
-        queryLists.push({ rows: rowsByQuery[queryIndex] ?? [], weight });
+        queryLists.push({
+            rows: dropOffBranchRows(
+                rowsByQuery[queryIndex] ?? [],
+                excludedMessageIds,
+                suppressedRewound,
+            ),
+            weight,
+        });
         queryIndex += 1;
     });
+    if (args.diagnostics) {
+        args.diagnostics.suppressedRewoundMessageMatches = suppressedRewound.size;
+    }
 
     const rankProbeLists = (rowLimit: number, resultLimit: number) => {
         const fused = new Map<string, { row: NormalizedMessageRow; score: number }>();
@@ -2315,6 +2400,7 @@ export async function unifiedSearch(
     if (options.diagnostics) {
         options.diagnostics.suppressedVisibleMemoryIds = [];
         options.diagnostics.suppressedLiveMessageMatches = 0;
+        options.diagnostics.suppressedRewoundMessageMatches = 0;
         options.diagnostics.gitCommitUnavailable = null;
     }
 
@@ -2402,6 +2488,7 @@ export async function unifiedSearch(
             relaxedRecall: options.explicitSearch,
             collectDiagnostics: options.diagnostics !== undefined,
             dateRange,
+            excludedMessageIds: options.excludedMessageIds ?? null,
         };
         // Explicit searches with literal probes count every probe's matches
         // across the session; a caller can move that work off its thread.
@@ -2417,6 +2504,8 @@ export async function unifiedSearch(
         const outcome = delegated ?? searchMessageHistory(db, messageRequest);
         if (options.diagnostics) {
             options.diagnostics.suppressedLiveMessageMatches = outcome.suppressedLiveMessageMatches;
+            options.diagnostics.suppressedRewoundMessageMatches =
+                outcome.suppressedRewoundMessageMatches;
         }
         messageResults = outcome.results.filter(
             (result) => result.messageId !== options.excludeMessageId,
@@ -2734,6 +2823,12 @@ function formatSearchDiagnosticLines(
         const count = diagnostics.suppressedLiveMessageMatches;
         lines.push(
             `Message history: ${count} raw-message ${count === 1 ? "match is" : "matches are"} newer than the last compartment boundary (already in your context).`,
+        );
+    }
+    if (diagnostics.suppressedRewoundMessageMatches > 0) {
+        const count = diagnostics.suppressedRewoundMessageMatches;
+        lines.push(
+            `Message history: ${count} additional ${count === 1 ? "match was" : "matches were"} suppressed because ${count === 1 ? "it is" : "they are"} no longer on the active conversation branch (rewound or replaced history).`,
         );
     }
     if (diagnostics.gitCommitUnavailable === "no_git_repository") {

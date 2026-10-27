@@ -281,12 +281,18 @@ export async function runAutoSearchHintForPi(args: {
 	ensureProjectRegistered?: () => Promise<void>;
 	/** Per-context projection loaded with note anchors so sticky replay reads session_meta once. */
 	decisions?: readonly AutoSearchHintDecision[];
+	/**
+	 * Ids a rewind abandoned, resolved by the caller that already holds the branch.
+	 * Null or omitted leaves the message lane unfiltered.
+	 */
+	abandonedMessageIds?: ReadonlySet<string> | null;
 	passGuard?: { assert(): void; wait<T>(pending: Promise<T>): Promise<T> };
 }): Promise<AgentMessage[]> {
 	const startedAt = performance.now();
 	args.passGuard?.assert();
 	const wait = args.passGuard?.wait ?? (<T>(pending: Promise<T>) => pending);
 	const { sessionId, db, messages, options, entryIdByRef } = args;
+	const abandonedMessageIds = args.abandonedMessageIds ?? null;
 	const entryIds =
 		args.entryIds === undefined
 			? messages.map((message, index) => {
@@ -437,6 +443,7 @@ export async function runAutoSearchHintForPi(args: {
 									0,
 									getLastCompartmentEndMessage(db, sessionId),
 								),
+								excludedMessageIds: abandonedMessageIds,
 								excludeMessageId: userMsgId,
 								memoryEnabled,
 								embeddingEnabled,
