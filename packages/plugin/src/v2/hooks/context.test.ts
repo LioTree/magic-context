@@ -18,6 +18,7 @@ import {
 import vectors from "../../../../../test-vectors/project-resolve-v1/resolve.json";
 import * as configLoader from "../../config";
 import { MagicContextConfigSchema } from "../../config/schema/magic-context";
+import { ENTORHINAL_RESOLVE_DEADLINE_MS } from "../../features/magic-context/memory/entorhinal-resolve";
 import { readGitCheckoutMetadata } from "../../features/magic-context/memory/git-common-dir";
 import {
     __resetProjectIdentityForTests,
@@ -128,16 +129,28 @@ async function fakeEndpoint(directory: string) {
     const daemonId = new Uint8Array(16).fill(7);
     const serverNonce = new Uint8Array(32).fill(5);
     const sockets = new Set<Socket>();
+    const timers = new Set<ReturnType<typeof setTimeout>>();
     const reply = structuredClone(vectors[0].reply);
     reply.result!.canonicalRoot = directory;
     let release: (() => void) | undefined;
+    // Once released, later resolve receipts reply at once: the move is recorded
+    // in microtasks while the resolve receipt needs a full handshake, so the
+    // release normally latches before the receipt and the hold only engages
+    // when scheduling inverts that order.
+    let released = false;
     const fake = {
         connectionFile,
         up: true,
         hold: false,
+        // Server-side reply delay in ms, applied after any hold. Lets one test
+        // force a post-deadline reply without depending on machine timing.
+        delay: 0,
         calls: [] as Record<string, unknown>[],
         onResolve: () => {},
-        release: () => release?.(),
+        release: () => {
+            released = true;
+            release?.();
+        },
     };
     const send = (socket: Socket, request: EnvelopeHeader, body: unknown) =>
         socket.write(
@@ -187,13 +200,22 @@ async function fakeEndpoint(directory: string) {
                         socket.destroy();
                         return;
                     }
-                    const held = fake.hold
-                        ? new Promise<void>((resolve) => {
-                              release = resolve;
-                          })
-                        : undefined;
+                    const held =
+                        fake.hold && !released
+                            ? new Promise<void>((resolve) => {
+                                  release = resolve;
+                              })
+                            : undefined;
                     fake.onResolve();
                     await held;
+                    if (fake.delay > 0)
+                        await new Promise<void>((resolve) => {
+                            const timer = setTimeout(() => {
+                                timers.delete(timer);
+                                resolve();
+                            }, fake.delay);
+                            timers.add(timer);
+                        });
                     if (!socket.destroyed) send(socket, call.header, reply);
                 } else send(socket, call.header, {});
             }
@@ -216,6 +238,7 @@ async function fakeEndpoint(directory: string) {
     chmodSync(connectionFile, 0o600);
     cleanups.push(async () => {
         fake.release();
+        for (const timer of timers) clearTimeout(timer);
         for (const socket of sockets) socket.destroy();
         await new Promise<void>((resolve) => server.close(() => resolve()));
     });
@@ -318,12 +341,11 @@ test("resumed v2 context awaits its decision before managed readers and renders 
         entries.push(readSessionIdentityDecision(session, directory));
         remember(messages);
     });
-    const called = new Promise<void>((resolve) => {
-        fake.onResolve = resolve;
-    });
     const first = draft(session);
     const pending = host.context(first);
-    await called;
+    // The held reply cannot complete before this release, so the pass is
+    // provably still waiting on its decision here without first serializing
+    // behind the multi-hop handshake inside the 500ms resolve deadline.
     expect(entries).toEqual([]);
     expect(host.row(session)).toBeUndefined();
     fake.release();
@@ -412,19 +434,48 @@ test("v2 observed move supersedes an initial pending decision", async () => {
     const pending = awaitSessionIdentityDecision(session, before, {
         connectionFile: fake.connectionFile,
     });
-    await called;
+    // Wait for the receipt before starting the move: the handshake finishes
+    // while nothing else competes for the loop, so the concurrent transform
+    // below cannot starve the in-flight resolve before it is even sent.
     // Release the old reply when the move is recorded, not after the full
     // transform: cold rendering may outlast the independent 500ms RPC deadline.
+    // The latched hold still guarantees the reply lands after the move is
+    // recorded, and the pending promise resolves to the moved-to decision
+    // whether the late reply beats the deadline or falls back (a post-deadline
+    // reply is covered by the timeout control below, not asserted here).
+    await called;
     spyOn(logger, "log").mockImplementation((message) => {
         if (message.includes("directory moved")) fake.release();
     });
     const moved = host.context(draft(session));
-    expect(await pending).toEqual({ directory, identity: "pj-DESTINATION" });
+    // Await the pass first: it records the move (and the release above), so a
+    // pass that dies before the move fails here with its real error instead of
+    // hanging below on the still-held reply. The late `before` answer then
+    // resolves the pending promise to the moved-to decision whether it beats
+    // the 500ms deadline or falls back, so this test asserts only that
+    // supersession and never the race between the reply and the deadline
+    // (a post-deadline reply is covered by the timeout control below).
     await moved;
+    expect(await pending).toEqual({ directory, identity: "pj-DESTINATION" });
     expect(host.row(session)).toBe("pj-DESTINATION");
-    expect(readRememberedProjectIdentity(before)?.identity).toBe(projectId);
     await host.context(draft(session));
     expect(host.row(session)).toBe("pj-DESTINATION");
+    expect(fake.calls).toHaveLength(1);
+});
+
+test("a resolve slower than the Entorhinal deadline falls back without pinning pj", async () => {
+    const directory = folder("slow-resolve");
+    const fake = await fakeEndpoint(directory);
+    // The receipt causally postdates the attempt start, so any overshoot past
+    // the deadline deterministically takes the timeout path. This control proves
+    // a real timeout still falls back instead of pinning the registered identity.
+    fake.delay = ENTORHINAL_RESOLVE_DEADLINE_MS + 1;
+    const session = "ses-v2-slow-resolve";
+    const decision = await awaitSessionIdentityDecision(session, directory, {
+        connectionFile: fake.connectionFile,
+    });
+    expect(decision).toEqual({ directory, identity: fallbackIdentity });
+    expect(readRememberedProjectIdentity(directory)?.identity).toBe(fallbackIdentity);
     expect(fake.calls).toHaveLength(1);
 });
 
