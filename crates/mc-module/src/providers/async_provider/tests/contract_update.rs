@@ -336,3 +336,59 @@ fn empty_reasoning_decodes_in_all_four_formats() {
         );
     }
 }
+
+/// `summary_waiting` on a decision line, read in a fixed number of store
+/// reads: false with no compartments, false when the newest compartment ends
+/// at or below the coverage a published view has, and true when it ends past
+/// it (or when nothing is covered yet).
+#[tokio::test]
+async fn summary_waiting_compares_the_newest_compartment_end_with_coverage() {
+    let dir = tempfile::tempdir().unwrap();
+    let rig = Rig::new(dir.path()).await;
+    rig.fill(40);
+    rig.notice(1, 1_000, None).await;
+    let store = rig.h.store.get().unwrap();
+    let namespace = rig.state().namespace();
+    let waiting = || rig.h.decision_facts(&rig.state()).summary_waiting;
+    let cover = |coverage: Option<u64>| {
+        let loaded = store.load_meta(&namespace).unwrap();
+        let mut meta = loaded.meta;
+        meta.coverage_ordinal = coverage;
+        store
+            .commit_meta(&namespace, loaded.row_version, &meta)
+            .unwrap();
+    };
+    assert_eq!(waiting(), Some(false), "no compartments");
+    let compartment = |sequence: i64, start: i64, end: i64| mc_store::StoredCompartment {
+        sequence,
+        start_message: start,
+        end_message: end,
+        end_message_id: format!("m{end}#0"),
+        title: "history".into(),
+        content: format!("summary {sequence}"),
+        p1: Some(format!("summary {sequence}")),
+        importance: 50,
+        ..Default::default()
+    };
+    store
+        .replace_compartments(&namespace, &[compartment(1, 0, 10), compartment(2, 11, 20)])
+        .unwrap();
+    for (coverage, expected) in [
+        (Some(20), false),
+        (Some(25), false),
+        (Some(19), true),
+        (Some(10), true),
+        (None, true),
+    ] {
+        cover(coverage);
+        assert_eq!(waiting(), Some(expected), "coverage {coverage:?}");
+    }
+    for (end, coverage, expected) in [(20, Some(20), false), (21, Some(20), true), (0, None, true)]
+    {
+        assert_eq!(
+            decision_log::summary_waiting(end, coverage),
+            expected,
+            "end {end} coverage {coverage:?}"
+        );
+    }
+}

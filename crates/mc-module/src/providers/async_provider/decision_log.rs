@@ -93,6 +93,12 @@ pub(super) fn line(
     line
 }
 
+/// Whether a finished summary waits: the newest compartment ends past the
+/// last ordinal a published view covers (or nothing is covered yet).
+pub(super) fn summary_waiting(newest_end: i64, coverage: Option<u64>) -> bool {
+    coverage.is_none_or(|covered| newest_end > covered as i64)
+}
+
 /// Why a notice's engine pass decided what it did.
 pub(super) fn pass_why(pass: &Pass) -> String {
     let mut why = format!("engine_{}", pass.action);
@@ -106,10 +112,25 @@ pub(super) fn pass_why(pass: &Pass) -> String {
     why
 }
 
+/// Whether decision lines are wanted: INFO is enabled for this module's
+/// target. When it is not, no figure is read for them. Test builds always
+/// keep them, so tests can read the lines without installing a subscriber.
+pub(super) fn enabled() -> bool {
+    cfg!(test) || tracing::enabled!(tracing::Level::INFO)
+}
+
 impl McHandler {
     /// The usage, threshold and waiting-summary figures for `state` as its
-    /// latest notice left them. A figure that cannot be read is `None`.
+    /// latest notice left them. A figure that cannot be read is `None`; with
+    /// decision lines disabled nothing is read and every figure is `None`.
+    ///
+    /// This runs on every notice, so it reads a fixed amount whatever the
+    /// session's size: the record's own conditions, the meta row's coverage,
+    /// and the newest compartment's end in one index probe.
     pub(super) fn decision_facts(&self, state: &State) -> Facts {
+        if !enabled() {
+            return Facts::default();
+        }
         let notice = state
             .conditions
             .as_ref()
@@ -135,18 +156,11 @@ impl McHandler {
         );
         let summary_waiting = self.store.get().and_then(|store| {
             let namespace = state.namespace();
-            if !store.has_compartments(&namespace).ok()? {
+            let Some(end) = store.newest_compartment_end(&namespace).ok()? else {
                 return Some(false);
-            }
-            let end = store
-                .load_compartment_boundaries(&namespace)
-                .ok()?
-                .iter()
-                .map(|row| row.end_message)
-                .max()
-                .unwrap_or(0);
+            };
             let coverage = store.load_meta(&namespace).ok()?.meta.coverage_ordinal;
-            Some(coverage.is_none_or(|covered| end > covered as i64))
+            Some(summary_waiting(end, coverage))
         });
         Facts {
             usage_percent,
@@ -157,6 +171,9 @@ impl McHandler {
 
     /// Write one decision line at INFO, and keep it for tests.
     pub(super) fn log_decision(&self, line: String) {
+        if !enabled() {
+            return;
+        }
         tracing::info!("{line}");
         #[cfg(test)]
         self.provider_store
