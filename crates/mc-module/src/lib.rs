@@ -16283,11 +16283,17 @@ impl McHandler {
             .or_else(|| non_empty_string_arg(args, "content").map(|_| "write"))
             .unwrap_or("read");
         // `note_ids` is the only id field on both the model-facing schema and
-        // the TS adapter's wire. `write` ignores required-surface filler;
-        // targeted `read` and `dismiss` accept one to fifty IDs, while `update`
-        // addresses exactly one note.
+        // the TS adapter's wire. The schema marks it required, so providers that
+        // send only required arguments always carry it: `write` ignores it, and
+        // an empty list on `read` is the plain listing read, the same as leaving
+        // it out. A non-empty list on `read` and `dismiss` takes one to fifty
+        // IDs, while `update` addresses exactly one note.
+        let plain_read = action == "read"
+            && args
+                .get("note_ids")
+                .is_none_or(|value| value.as_array().is_some_and(Vec::is_empty));
         let note_ids = match action {
-            "update" | "dismiss" | "read" if action != "read" || args.get("note_ids").is_some() => {
+            "update" | "dismiss" | "read" if !plain_read => {
                 let max = if action == "update" { 1 } else { 50 };
                 let error = if action == "update" {
                     "Error: 'note_ids' must contain exactly one positive integer id when action is 'update'."
@@ -34041,10 +34047,9 @@ mod tests {
             properties["note_ids"],
             json!({
                 "type": "array",
-                "minItems": 1,
                 "maxItems": 50,
                 "items": { "type": "integer", "minimum": 1, "maximum": 9007199254740991_i64 },
-                "description": "Note ids: one for update, 1–50 for dismiss or read (read returns full bodies). Ignored by write."
+                "description": "Note ids: one for update, 1–50 for dismiss, or 1–50 to read those notes in full. Write and a plain read take an empty list."
             })
         );
     }
@@ -47029,6 +47034,231 @@ mod tests {
             "required-all output drifted for: {}",
             mismatches.join(", ")
         );
+    }
+
+    // The ctx_note and ctx_memory schemas mark their key arguments required, so
+    // providers that send only required arguments always carry `note_ids`, `ids`,
+    // `content` and `category`, filled with an empty or unrelated value where the
+    // action has no use for them. These calls go through the real facade argument
+    // decoding and handlers.
+    #[tokio::test(flavor = "current_thread")]
+    async fn ctx_note_required_note_ids_accept_empty_lists_where_unused() {
+        let resolver = FakeSessionResolver::with(&[("ses", FakeResolve::Hit("ses".to_string()))]);
+        let (handler, _store, _dir, _project) = handler_with_store_and_resolver(
+            Arc::new(ProducerState::default()),
+            default_test_config(),
+            resolver,
+        );
+
+        let written = tool_text(
+            call_facade(
+                &handler,
+                "ctx_note",
+                json!({"action": "write", "content": "remember the lattice", "note_ids": []}),
+            )
+            .await,
+        );
+        assert!(written.starts_with("Saved session note #1."), "{written}");
+
+        let plain = tool_text(call_facade(&handler, "ctx_note", json!({"action": "read"})).await);
+        assert!(plain.contains("remember the lattice"), "{plain}");
+        let empty_list = tool_text(
+            call_facade(
+                &handler,
+                "ctx_note",
+                json!({"action": "read", "content": "", "note_ids": []}),
+            )
+            .await,
+        );
+        assert_eq!(empty_list, plain);
+
+        let targeted = tool_text(
+            call_facade(
+                &handler,
+                "ctx_note",
+                json!({"action": "read", "content": "", "note_ids": [1]}),
+            )
+            .await,
+        );
+        assert!(targeted.starts_with("## Notes by ID"), "{targeted}");
+        assert!(targeted.contains("remember the lattice"), "{targeted}");
+
+        let dismiss = call_facade(
+            &handler,
+            "ctx_note",
+            json!({"action": "dismiss", "content": "", "note_ids": []}),
+        )
+        .await;
+        assert_eq!(
+            tool_text(dismiss),
+            "Error: 'note_ids' must contain 1 to 50 positive integer ids when action is 'dismiss'."
+        );
+        let update = call_facade(
+            &handler,
+            "ctx_note",
+            json!({"action": "update", "content": "changed", "note_ids": []}),
+        )
+        .await;
+        assert_eq!(
+            tool_text(update),
+            "Error: 'note_ids' must contain exactly one positive integer id when action is 'update'."
+        );
+        let still_active =
+            tool_text(call_facade(&handler, "ctx_note", json!({"action": "read"})).await);
+        assert_eq!(still_active, plain);
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn ctx_memory_required_arguments_accept_values_the_action_does_not_use() {
+        let resolver = FakeSessionResolver::with(&[("ses", FakeResolve::Hit("ses".to_string()))]);
+        let (handler, store, _dir, project) = handler_with_store_and_resolver(
+            Arc::new(ProducerState::default()),
+            default_test_config(),
+            resolver,
+        );
+        let project = project.to_str().unwrap();
+
+        // write: an empty ids list is ignored; empty content is still refused.
+        let written = tool_text(
+            call_facade(
+                &handler,
+                "ctx_memory",
+                json!({
+                    "action": "write",
+                    "content": "Written with an empty id list.",
+                    "category": "PROJECT_RULES",
+                    "ids": []
+                }),
+            )
+            .await,
+        );
+        assert!(written.starts_with("Saved memory [ID: "), "{written}");
+        let empty_content = tool_text(
+            call_facade(
+                &handler,
+                "ctx_memory",
+                json!({"action": "write", "content": "", "category": "PROJECT_RULES", "ids": []}),
+            )
+            .await,
+        );
+        assert_eq!(
+            empty_content,
+            "Error: 'content' is required when action is 'write'."
+        );
+
+        // get: content and an unrelated category are ignored; empty ids are refused.
+        let get_id = insert_memory(&store, project, "PROJECT_RULES", "Get this fact.", 20);
+        let got = tool_text(
+            call_facade(
+                &handler,
+                "ctx_memory",
+                json!({"action": "get", "ids": [get_id], "content": "", "category": "CONSTRAINTS"}),
+            )
+            .await,
+        );
+        assert!(
+            got.contains(&format!("Memory [ID: {get_id}] in PROJECT_RULES")),
+            "{got}"
+        );
+        assert!(got.contains("Get this fact."), "{got}");
+        let get_empty = call_facade(
+            &handler,
+            "ctx_memory",
+            json!({"action": "get", "ids": [], "content": "", "category": "CONSTRAINTS"}),
+        )
+        .await;
+        assert!(tool_is_error(get_empty));
+
+        // archive: content and an unrelated category are ignored.
+        let archive_id = insert_memory(&store, project, "PROJECT_RULES", "Archive this fact.", 30);
+        let archived = tool_text(
+            call_facade(
+                &handler,
+                "ctx_memory",
+                json!({
+                    "action": "archive",
+                    "ids": [archive_id],
+                    "content": "",
+                    "category": "CONSTRAINTS"
+                }),
+            )
+            .await,
+        );
+        assert_eq!(archived, format!("Archived memory IDs [{archive_id}]."));
+
+        // update: the category sent is the one the memory ends up in. Sending its
+        // current category keeps it; sending another moves it; an empty value
+        // keeps it as well.
+        let update_id = insert_memory(&store, project, "ARCHITECTURE", "Original fact.", 40);
+        let kept = tool_text(
+            call_facade(
+                &handler,
+                "ctx_memory",
+                json!({
+                    "action": "update",
+                    "ids": [update_id],
+                    "content": "Updated fact.",
+                    "category": "ARCHITECTURE"
+                }),
+            )
+            .await,
+        );
+        assert_eq!(
+            kept,
+            format!("Updated memory [ID: {update_id}] in ARCHITECTURE.")
+        );
+        let moved = tool_text(
+            call_facade(
+                &handler,
+                "ctx_memory",
+                json!({
+                    "action": "update",
+                    "ids": [update_id],
+                    "content": "Updated fact, renamed.",
+                    "category": "NAMING"
+                }),
+            )
+            .await,
+        );
+        assert_eq!(
+            moved,
+            format!("Updated memory [ID: {update_id}] in NAMING.")
+        );
+        let empty_category = tool_text(
+            call_facade(
+                &handler,
+                "ctx_memory",
+                json!({
+                    "action": "update",
+                    "ids": [update_id],
+                    "content": "Updated fact, once more.",
+                    "category": ""
+                }),
+            )
+            .await,
+        );
+        assert_eq!(
+            empty_category,
+            format!("Updated memory [ID: {update_id}] in NAMING.")
+        );
+
+        // merge: the category sent is the merged memory's category.
+        let first = insert_memory(&store, project, "CONSTRAINTS", "Merge source one.", 50);
+        let second = insert_memory(&store, project, "CONSTRAINTS", "Merge source two.", 60);
+        let merged = tool_text(
+            call_facade(
+                &handler,
+                "ctx_memory",
+                json!({
+                    "action": "merge",
+                    "ids": [first, second],
+                    "content": "Merged fact.",
+                    "category": "CONFIG_VALUES"
+                }),
+            )
+            .await,
+        );
+        assert!(merged.contains("in CONFIG_VALUES"), "{merged}");
     }
 
     #[tokio::test(flavor = "current_thread")]
