@@ -44,8 +44,14 @@ if (import.meta.main) {
         peakUSDPerMillion: { hit: 0.006, miss: 0.3, output: 1.2 },
         outputDir: ".cortexkit/internal-docs/investigations/two-pass-small-trial/paid-run-001",
     });
-    const targets = selected.filter((c) => [0, 8, 10, 12, 35].includes(c.id));
-    if (targets.length !== 5) throw new Error("zen_five_cases_required");
+    const targets = selected.filter((c) => {
+        // Default order stays 0,8,10,12,35. CASES=0 (comma-separated) runs a subset,
+        // e.g. case 0 only to validate turn_one published + turn_two resolved before spending quota on all five.
+        const only = (process.env.CASES ?? "").split(",").map((part) => part.trim()).filter(Boolean);
+        return only.length ? only.includes(String(c.id)) : [0, 8, 10, 12, 35].includes(c.id);
+    });
+    if (!process.env.CASES && targets.length !== 5) throw new Error("zen_five_cases_required");
+    if (!targets.length) throw new Error("zen_no_cases_selected");
     const interfaces = networkInterfaces();
     const networkIsolation = { interfaces, routes: readFileSync("/proc/net/route", "utf8") };
     const ledger = new CampaignLedger();
@@ -176,7 +182,7 @@ if (import.meta.main) {
             const session = (await host.runSession(promptText)) as {
                 requests: Array<{
                     request: { path: string; body: string; providerHost?: string };
-                    response: { status: number; body: string; contentType: string };
+                    response: { status: number; body: string; contentType: string; responseHeaders?: Record<string, string> };
                     steps?: Array<{ inputTokens: number; outputTokens: number }>;
                 }>;
                 carrier?: string;
@@ -234,6 +240,21 @@ if (import.meta.main) {
                 JSON.stringify(session.requests, null, 2),
                 { mode: 0o600 },
             );
+            for (const receipt of session.requests) {
+                // Container stdout carries status + every response header per request so the
+                // free tier's rate-limit/reset window is readable even if later stages time out.
+                console.log(
+                    JSON.stringify({
+                        caseId: c.id,
+                        path: receipt.request.path,
+                        status: receipt.response.status,
+                        contentType: receipt.response.contentType,
+                        responseHeaders: receipt.response.responseHeaders ?? null,
+                        rawBytes: receipt.response.body.length,
+                        rawPreview: receipt.response.body.slice(0, 500),
+                    }),
+                );
+            }
             writeFileSync(
                 join(outDir, `case-${c.id}-stages.json`),
                 JSON.stringify(stages, null, 2),

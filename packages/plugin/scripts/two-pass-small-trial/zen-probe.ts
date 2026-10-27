@@ -89,7 +89,7 @@ if (import.meta.main) {
         const session = (await host.runSession("Say hello in one short sentence.")) as {
             requests: Array<{
                 request: { path: string; body: string; providerHost?: string };
-                response: { status: number; body: string; contentType: string };
+                response: { status: number; body: string; contentType: string; responseHeaders?: Record<string, string> };
                 steps?: Array<{ inputTokens: number; outputTokens: number }>;
             }>;
         };
@@ -143,6 +143,7 @@ if (import.meta.main) {
                 JSON.stringify({
                     status: r.response.status,
                     contentType: r.response.contentType ?? null,
+                    responseHeaders: r.response.responseHeaders ?? null,
                     steps: steps ?? null,
                     rawBytes: r.response.body.length,
                     rawPreview: r.response.body.slice(0, 2000),

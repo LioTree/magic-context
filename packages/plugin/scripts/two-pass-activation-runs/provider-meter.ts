@@ -64,7 +64,7 @@ export function sumProviderSteps(steps: readonly UsageStep[]): UsageStep {
 export interface DispatchReceipt {
     reservation: number;
     request: { path: string; body: string; providerHost?: string };
-    response: { status: number; body: string; contentType: string };
+    response: { status: number; body: string; contentType: string; responseHeaders: Record<string, string> };
     steps?: UsageStep[];
 }
 
@@ -72,8 +72,7 @@ export interface DispatchReceipt {
 export async function meteredDispatch(input: {
     meter: CallMeter;
     bound: CallBound;
-    dispatch(): Promise<{ status: number; body: string; contentType: string }>;
-}) {
+    dispatch(): Promise<{ status: number; body: string; contentType: string; responseHeaders?: Record<string, string> }>;}) {
     const reservation = input.meter.beforeSend(input.bound);
     const response = await input.dispatch();
     // Error responses without usage retain the reservation; they are not free calls.
@@ -130,7 +129,9 @@ export async function mockMeteringProxy(input: {
                         method: request.method, headers: forwardHeaders(request.headers, input.forwardCredentials), body,
                         redirect: "error", signal: AbortSignal.timeout(120_000),
                     });
-                    return { status: reply.status, body: await reply.text(), contentType: reply.headers.get("content-type") ?? "application/json" };
+                    // Record every upstream response header (rate-limit/reset hints live here,
+                    // not in the body). The host-facing reply still carries only status/body/content-type.
+                    return { status: reply.status, body: await reply.text(), contentType: reply.headers.get("content-type") ?? "application/json", responseHeaders: Object.fromEntries(reply.headers.entries()) };
                 },
             });
             receipts.push(redact({ ...result, request: { path, body, providerHost: target.host } }, input.secrets) as DispatchReceipt);
