@@ -562,47 +562,83 @@ fn tool_outage_each_field_composes_its_own_line() {
     }
 }
 
-/// When ck-mc edits an outage error's text in a view (tag prefix, drop
-/// placeholder, reminder), the edit flows into `message` and the structured
-/// siblings are preserved alongside: the runner still gets the fields, with
-/// the edited text. Unchanged blocks instead serve the retained original
-/// verbatim (covered by the round-trip tests above).
-#[test]
-fn tool_outage_edited_text_keeps_the_siblings() {
+/// Renders a re-encoded error output the way Broca does: `message` plus one
+/// line per present sibling, in field order. This mirrors broca-protocol's
+/// `ToolOutput::error_model_text` and is the independent check that a
+/// re-encoded output renders exactly the CK text it was built from.
+fn broca_model_text(output: &Value) -> String {
+    assert_eq!(output["kind"], serde_json::json!("error"));
+    let mut text = output["message"].as_str().expect("message").to_string();
+    for (key, prefix) in [
+        ("module", "\nmodule: "),
+        ("code", "\ncode: "),
+        ("detail", "\ndetail: "),
+    ] {
+        if let Some(field) = output.get(key).and_then(Value::as_str) {
+            text.push_str(prefix);
+            text.push_str(field);
+        }
+    }
+    if output.get("nothing_sent") == Some(&Value::Bool(true)) {
+        text.push_str("\nnothing was sent");
+    }
+    if let Some(retry) = output.get("retry").and_then(Value::as_str) {
+        text.push_str("\nretry: ");
+        text.push_str(retry);
+    }
+    text
+}
+
+/// Decodes the m2 capture and returns its CK tool-result text plus the
+/// decoded ingress message for editing.
+fn outage_m2() -> (String, crate::ck_wire::CkIngressMessage) {
     let reply = corpus_json("session_read.reply.json");
     let answer = crate::session_resolver::read_runner_reply(reply).expect("envelope");
     let messages: Vec<ReadMessage> =
         crate::providers::decode(&answer["messages"]).expect("messages decode");
     let entry = messages
-        .iter()
+        .into_iter()
         .find(|entry| entry.ordinal == 2)
         .expect("tool");
     let inbound = crate::providers::codec::InboundMessage {
         ordinal: entry.ordinal,
         mid: entry.mid.clone(),
-        message: entry.message.clone(),
+        message: entry.message,
     };
-    let mut decoded = crate::providers::codec::Codec::OwnedBroca
+    let decoded = crate::providers::codec::Codec::OwnedBroca
         .decode_message(&inbound)
         .expect("outage decodes");
-    // Mimic a tag prefix, which prepends to the error text in place.
+    let crate::ck_wire::CkKind::ToolResult { output, .. } = &decoded.ck.content[0].kind else {
+        panic!("m2 must decode to a tool result");
+    };
+    let text = crate::tail_hygiene::tool_output_content(&output.kind);
+    (text, decoded)
+}
+
+/// A prefix edit (tag prefix, reminder) keeps the siblings with the suffix
+/// stripped from `message`: Broca's rendering of the re-encoded output
+/// equals the edited CK text, with no duplicated field lines.
+#[test]
+fn tool_outage_prefix_edit_keeps_siblings_without_duplication() {
+    let (composed, mut decoded) = outage_m2();
     let crate::ck_wire::CkKind::ToolResult { output, .. } = &mut decoded.ck.content[0].kind else {
         panic!("m2 must decode to a tool result");
     };
     let crate::ck_wire::CkOutputKind::ErrorText { text } = &mut output.kind else {
         panic!("m2 must decode to error text");
     };
+    assert_eq!(*text, composed, "the CK text starts as the composed text");
     text.insert_str(0, "§12§ ");
+    let edited = text.clone();
     decoded.ck.mark_modified();
     decoded.ck.content[0].mark_modified();
     let encoded = crate::providers::codec::encode_message(&decoded.ck).expect("encodes");
     let output = encoded.pointer("/content/0/output").expect("output");
     assert_eq!(output["kind"], serde_json::json!("error"));
-    assert!(
-        output["message"]
-            .as_str()
-            .is_some_and(|message| message.starts_with("§12§ tool plane unavailable\n")),
-        "the edit is carried in message: {output}"
+    // The suffix is stripped: `message` holds only the edited first line.
+    assert_eq!(
+        output["message"],
+        serde_json::json!("§12§ tool plane unavailable")
     );
     for (key, value) in [
         ("module", serde_json::json!("aft")),
@@ -618,6 +654,94 @@ fn tool_outage_edited_text_keeps_the_siblings() {
             .is_some_and(|retry| !retry.is_empty()),
         "sibling retry is preserved"
     );
+    assert_eq!(
+        broca_model_text(output),
+        edited,
+        "Broca's rendering equals the edited CK text, with no duplicated lines"
+    );
+}
+
+/// A drop placeholder or any edit to the field lines becomes a plain error:
+/// the edited text is kept as `message` with no siblings, so Broca renders
+/// exactly the placeholder. A plain error with an edit round-trips the same
+/// way, and a re-encoded plain error carries no siblings (it passes 0.7.8).
+#[test]
+fn tool_outage_placeholder_and_field_edits_become_plain_errors() {
+    let (composed, mut decoded) = outage_m2();
+    // A drop placeholder replaces the whole text.
+    let crate::ck_wire::CkKind::ToolResult { output, .. } = &mut decoded.ck.content[0].kind else {
+        panic!("m2 must decode to a tool result");
+    };
+    let crate::ck_wire::CkOutputKind::ErrorText { text } = &mut output.kind else {
+        panic!("m2 must decode to error text");
+    };
+    *text = "[dropped §12§]".to_string();
+    decoded.ck.mark_modified();
+    decoded.ck.content[0].mark_modified();
+    let encoded = crate::providers::codec::encode_message(&decoded.ck).expect("encodes");
+    let output = encoded.pointer("/content/0/output").expect("output");
+    assert_eq!(
+        output,
+        &serde_json::json!({"kind":"error","message":"[dropped §12§]"}),
+        "a placeholder drops the siblings entirely"
+    );
+    assert_eq!(broca_model_text(output), "[dropped §12§]");
+    // An edit that alters a field line also becomes a plain error.
+    let (_, mut decoded) = outage_m2();
+    let crate::ck_wire::CkKind::ToolResult { output, .. } = &mut decoded.ck.content[0].kind else {
+        panic!("m2 must decode to a tool result");
+    };
+    let crate::ck_wire::CkOutputKind::ErrorText { text } = &mut output.kind else {
+        panic!("m2 must decode to error text");
+    };
+    *text = composed.replace("code: target_unavailable", "code: nope");
+    let edited = text.clone();
+    decoded.ck.mark_modified();
+    decoded.ck.content[0].mark_modified();
+    let encoded = crate::providers::codec::encode_message(&decoded.ck).expect("encodes");
+    let output = encoded.pointer("/content/0/output").expect("output");
+    assert_eq!(
+        output,
+        &serde_json::json!({"kind":"error","message":edited}),
+        "a field-line edit drops the siblings"
+    );
+    assert_eq!(broca_model_text(output), edited);
+    // A plain error with an edit stays a plain error with no siblings.
+    let native = serde_json::json!({"role":"tool","content":[{"type":"tool_result","tool_call_id":"c","output":{"kind":"error","message":"boom"},"is_error":true}]});
+    let inbound = crate::providers::codec::InboundMessage {
+        ordinal: 9,
+        mid: "m9".into(),
+        message: native,
+    };
+    let mut decoded = crate::providers::codec::Codec::OwnedBroca
+        .decode_message(&inbound)
+        .expect("plain error decodes");
+    let crate::ck_wire::CkKind::ToolResult { output, .. } = &mut decoded.ck.content[0].kind else {
+        panic!("must decode to a tool result");
+    };
+    let crate::ck_wire::CkOutputKind::ErrorText { text } = &mut output.kind else {
+        panic!("must decode to error text");
+    };
+    *text = "boom!".to_string();
+    decoded.ck.mark_modified();
+    decoded.ck.content[0].mark_modified();
+    let encoded = crate::providers::codec::encode_message(&decoded.ck).expect("encodes");
+    let output = encoded.pointer("/content/0/output").expect("output");
+    assert_eq!(
+        output,
+        &serde_json::json!({"kind":"error","message":"boom!"}),
+        "a re-encoded plain error carries no siblings"
+    );
+    // And it still passes the 0.7.8 rules on the way back in.
+    let native = serde_json::json!({"role":"tool","content":[{"type":"tool_result","tool_call_id":"c","output":output,"is_error":true}]});
+    let inbound = crate::providers::codec::InboundMessage {
+        ordinal: 9,
+        mid: "m9".into(),
+        message: native,
+    };
+    crate::providers::codec::Codec::OwnedBroca
+        .decode_message(&inbound)
+        .expect("re-encoded plain error decodes");
 }
 /// runner's bytes for that part: the view path re-encodes from the retained
 /// original, so the siblings survive it.
@@ -799,10 +923,10 @@ fn tool_outage_wal_tool_result_record_shape() {
     assert_eq!(output["code"], serde_json::json!("target_unavailable"));
 }
 
-/// Once decoded (or for any pre-outage error with the same `message`), every
-/// model-visible rendering reads only the `message` text: the extra siblings
-/// never reach the CK type, so summarizer input, ctx_expand views and tag text
-/// stay byte-identical for the plain `message`.
+/// A plain error renders as `message` alone: every model-visible rendering
+/// reads the CK text as-is, so summarizer input, ctx_expand views and tag
+/// text see exactly it. (For an attributed error that text is the composed
+/// model text, covered by the m2 and per-field tests above.)
 #[test]
 fn tool_outage_model_visible_text_stays_the_plain_message() {
     use crate::ck_wire::{CkOutputKind, CkToolOutput};

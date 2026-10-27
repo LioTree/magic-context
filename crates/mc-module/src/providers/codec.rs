@@ -737,30 +737,53 @@ pub fn encode_message(message: &ck_wire::CkWireMessage) -> Result<Value, Handler
                         {
                             // Rebuild the outage shape in the Broca capture's
                             // order. The structured fields ride the retained
-                            // native block, never the CK text: an unchanged
+                            // native block, never the CK text. An unchanged
                             // block serves the retained output verbatim, so the
                             // runner gets back exactly its bytes. An edited
-                            // block (tag prefix, drop placeholder, reminder)
-                            // carries the edit in `message` with the siblings
-                            // preserved alongside. Absent siblings stay absent.
+                            // block is reconciled against the retained field
+                            // lines so that what Broca renders to the model
+                            // (`message` plus one line per sibling) always
+                            // equals the edited CK text: a prefix edit keeps
+                            // the siblings with the suffix stripped from
+                            // `message`, while a placeholder or any edit to
+                            // the field lines becomes a plain error with no
+                            // siblings. Absent siblings stay absent.
+                            //
+                            // `suffix` is the field-lines tail of the composed
+                            // text the retained output renders as (empty for a
+                            // plain error); `composed` starts with `message`,
+                            // so this split is always on a char boundary.
+                            let retained_message = output["message"].as_str().unwrap_or_default();
                             let composed = error_model_text(
-                                output["message"].as_str().unwrap_or_default(),
+                                retained_message,
                                 output.get("module").and_then(Value::as_str),
                                 output.get("code").and_then(Value::as_str),
                                 output.get("detail").and_then(Value::as_str),
                                 output.get("nothing_sent").and_then(Value::as_bool) == Some(true),
                                 output.get("retry").and_then(Value::as_str),
                             );
+                            let suffix = &composed[retained_message.len()..];
                             if text == &composed {
                                 output.clone()
-                            } else {
-                                let mut value = json!({"kind":"error","message":text});
-                                for key in ["module", "code", "detail", "nothing_sent", "retry"] {
-                                    if let Some(field) = output.get(key) {
-                                        value[key] = field.clone();
+                            } else if !suffix.is_empty() {
+                                match text.strip_suffix(suffix) {
+                                    Some(head) => {
+                                        let mut value = json!({"kind":"error","message":head});
+                                        for key in
+                                            ["module", "code", "detail", "nothing_sent", "retry"]
+                                        {
+                                            if let Some(field) = output.get(key) {
+                                                value[key] = field.clone();
+                                            }
+                                        }
+                                        value
                                     }
+                                    // The field lines changed: keep only the
+                                    // edited text, as a plain error.
+                                    None => json!({"kind":"error","message":text}),
                                 }
-                                value
+                            } else {
+                                json!({"kind":"error","message":text})
                             }
                         } else {
                             json!({"kind":"error","message":text})
