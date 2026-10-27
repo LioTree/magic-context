@@ -240,6 +240,42 @@ fn current_database_is_idempotent_and_keeps_data() {
 }
 
 #[test]
+fn bootstrap_completes_empty_fts_but_preserves_pending_legacy_work() {
+    let temp = TempDir::new().unwrap();
+    let path = temp.path().join("context.db");
+    install(&path);
+    let connection = Connection::open(&path).unwrap();
+    let completed = || {
+        connection
+            .query_row(
+                "SELECT completed FROM message_fts_rowid_map_backfill_state WHERE id = 1",
+                [],
+                |row| row.get::<_, i64>(0),
+            )
+            .unwrap()
+    };
+    assert_eq!(completed(), 1);
+    connection
+        .execute_batch(
+            "INSERT INTO message_history_fts
+                 (session_id, message_ordinal, message_id, role, content)
+             VALUES ('legacy', 1, 'm1', 'user', 'legacy text');
+             UPDATE message_fts_rowid_map_backfill_state SET completed = 0 WHERE id = 1;",
+        )
+        .unwrap();
+    install(&path);
+    assert_eq!(completed(), 0);
+    assert_eq!(
+        connection
+            .query_row("SELECT COUNT(*) FROM message_history_fts", [], |row| {
+                row.get::<_, i64>(0)
+            })
+            .unwrap(),
+        1
+    );
+}
+
+#[test]
 fn concurrent_bootstraps_install_once() {
     let temp = TempDir::new().unwrap();
     let path = temp.path().join("context.db");

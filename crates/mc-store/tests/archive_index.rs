@@ -471,6 +471,12 @@ fn legacy_rowid_map_backfill_is_bounded_and_durable() {
     let temp = temp();
     let path = temp.path().join("context.db");
     let mut db = database(&path);
+    // Model pending maintenance for rows inserted before canonical rowid mapping.
+    db.execute(
+        "UPDATE message_fts_rowid_map_backfill_state SET completed = 0 WHERE id = 1",
+        [],
+    )
+    .unwrap();
     for ordinal in 1..=205 {
         db.execute(
             "INSERT INTO message_history_fts(session_id,message_ordinal,message_id,role,content)
@@ -514,6 +520,12 @@ fn legacy_unmapped_revision_defers_until_backfill_is_complete() {
     )
     .unwrap();
     db.execute("DELETE FROM message_fts_rowid_map", []).unwrap();
+    // Removing canonical mappings models an unfinished legacy backfill.
+    db.execute(
+        "UPDATE message_fts_rowid_map_backfill_state SET completed = 0 WHERE id = 1",
+        [],
+    )
+    .unwrap();
     let edit = message("id", 1, "replacement");
     store::ingest(
         &mut db,

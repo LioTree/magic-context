@@ -1981,7 +1981,7 @@ INSERT INTO schema_migrations (version, description, applied_at) VALUES
 (103, 'isolate session render payloads and chunk growing replay metadata', :applied_at);
 
 INSERT INTO "message_fts_rowid_map_backfill_state" ("completed", "id", "updated_at", "watermark_rowid") VALUES
-(0, 1, 0, 0);
+(1, 1, 0, 0);
 
 INSERT INTO "message_time_backfill_state" ("completed", "cursor_ordinal", "cursor_session_id", "id", "updated_at") VALUES
 (0, 0, '', 1, 0);
