@@ -2626,4 +2626,41 @@ pub(crate) mod tests {
         assert_eq!(fold_stamp("fold-.ark"), None);
         assert_eq!(fold_stamp("fold-12x.ark"), None);
     }
+
+    /// Tool-outage 1027: the real `tool_result` WAL record with the five new
+    /// `ToolOutput::Error` siblings rides a `tool-times/v1` gated frame. The
+    /// dashboard reader never parses tool output: the record is skipped, the
+    /// run keeps its steps, and no compatibility note appears. The record is
+    /// embedded byte-identical to
+    /// `corpus-readonly/tool-outage-1027/tool_result.record.json` because
+    /// that directory is git-ignored and absent on remote builders.
+    #[test]
+    fn tool_outage_error_record_keeps_its_steps() {
+        let envelope: Value = serde_json::from_str(r###"{"requires":["tool-times/v1"],"record":{"type":"tool_result","finished_at_ms":1793072655539,"batch_id":"run-sid-ymgP4z4dgxRoNVq2lh3pG4-b1","result":{"tool_call_id":"call-1","output":{"kind":"error","message":"tool plane unavailable","module":"aft","code":"target_unavailable","detail":"supervised_not_registered","nothing_sent":true,"retry":"the module is restarting or unavailable; retry the call in a minute"},"is_error":true},"outcome":"completed"}}"###)
+        .expect("tool_result record parses");
+        assert_eq!(envelope["requires"], serde_json::json!(["tool-times/v1"]));
+        let record = envelope["record"].clone();
+        assert_eq!(record["type"], serde_json::json!("tool_result"));
+        assert_eq!(record["result"]["output"]["kind"], serde_json::json!("error"));
+        assert_eq!(
+            record["result"]["output"]["message"],
+            serde_json::json!("tool plane unavailable")
+        );
+        let bytes = wal_bytes(&[
+            run_started("r-outage", 1_000),
+            step_started(1),
+            attempt(1, 1_010),
+            envelope,
+            step_finished(1, usage(10, 0, 0, 10)),
+        ]);
+        let mut cursor = WalCursor::default();
+        cursor.advance(
+            &mut std::io::Cursor::new(&bytes),
+            bytes.len() as u64,
+            READ_BUDGET_BYTES,
+        );
+        assert_eq!(cursor.failed, None, "outage record must not fail the WAL");
+        assert_eq!(cursor.fold.activity_note, None, "tool-times/v1 is known");
+        assert_eq!(step_ids(&cursor.fold.runs), [("r-outage".to_string(), 1)]);
+    }
 }
