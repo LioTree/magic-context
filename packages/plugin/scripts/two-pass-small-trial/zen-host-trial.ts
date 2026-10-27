@@ -47,7 +47,10 @@ if (import.meta.main) {
     const targets = selected.filter((c) => {
         // Default order stays 0,8,10,12,35. CASES=0 (comma-separated) runs a subset,
         // e.g. case 0 only to validate turn_one published + turn_two resolved before spending quota on all five.
-        const only = (process.env.CASES ?? "").split(",").map((part) => part.trim()).filter(Boolean);
+        const only = (process.env.CASES ?? "")
+            .split(",")
+            .map((part) => part.trim())
+            .filter(Boolean);
         return only.length ? only.includes(String(c.id)) : [0, 8, 10, 12, 35].includes(c.id);
     });
     if (!process.env.CASES && targets.length !== 5) throw new Error("zen_five_cases_required");
@@ -182,7 +185,12 @@ if (import.meta.main) {
             const session = (await host.runSession(promptText)) as {
                 requests: Array<{
                     request: { path: string; body: string; providerHost?: string };
-                    response: { status: number; body: string; contentType: string; responseHeaders?: Record<string, string> };
+                    response: {
+                        status: number;
+                        body: string;
+                        contentType: string;
+                        responseHeaders?: Record<string, string>;
+                    };
                     steps?: Array<{ inputTokens: number; outputTokens: number }>;
                 }>;
                 carrier?: string;

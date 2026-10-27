@@ -1,4 +1,4 @@
-import { mkdirSync, readFileSync, writeFileSync } from "node:fs";
+import { mkdirSync, writeFileSync } from "node:fs";
 import { networkInterfaces } from "node:os";
 import { join } from "node:path";
 import { callMeter } from "../two-pass-activation-runs/activation-driver";
@@ -89,7 +89,12 @@ if (import.meta.main) {
         const session = (await host.runSession("Say hello in one short sentence.")) as {
             requests: Array<{
                 request: { path: string; body: string; providerHost?: string };
-                response: { status: number; body: string; contentType: string; responseHeaders?: Record<string, string> };
+                response: {
+                    status: number;
+                    body: string;
+                    contentType: string;
+                    responseHeaders?: Record<string, string>;
+                };
                 steps?: Array<{ inputTokens: number; outputTokens: number }>;
             }>;
         };
