@@ -67,6 +67,14 @@
             "hosts": ["opencode"]
         },
         {
+            "path": "tests/pi-rewound-search.test.ts",
+            "tier": "ts-only",
+            "invocation": { "ts": true, "rust": false },
+            "rationale": "A real Pi and OMP host rewinds with tree navigation, continues, publishes history on the new branch and then asks ctx_search about both the abandoned turn and the still-reachable one: the rewound message stays out of the results while the compacted archive is still returned.",
+            "contract_refs": ["FOLD-UNDER-PRESSURE"],
+            "hosts": ["pi", "omp"]
+        },
+        {
             "path": "tests/pi-tree-history.test.ts",
             "tier": "ts-only",
             "invocation": { "ts": true, "rust": false },
